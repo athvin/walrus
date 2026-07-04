@@ -43,7 +43,9 @@ optional mode**. **Why it's non-negotiable:** `streaming 'on'` is the *only* mec
 gives us to receive a multi-million-row transaction **incrementally, before it commits**, instead
 of buffering the whole thing first. Without it, one large write OOMs the sink (or backs the slot
 up until the WAL runs away) — and surviving exactly those large transactions is the reason this
-tool exists. If we can't stream them, walrus doesn't work. The stream is decoded from Postgres's
+tool exists. If we can't stream them, walrus doesn't work. (The version-by-version rationale and
+the concrete pitfalls of running *without* streaming are laid out in
+[§1.1](#11-source-side-setup-one-time-via-migrationjob).) The stream is decoded from Postgres's
 built-in **pgoutput** plugin, so to be
 unmistakable about the layering: **pgoutput is the output plugin (the on-the-wire message format
 we decode), while `proto_version '2'` and `streaming 'on'` are the `START_REPLICATION` options
@@ -254,11 +256,71 @@ CREATE PUBLICATION walrus_pub FOR TABLE orders, customers, ...   -- or FOR ALL T
   protocol that *permits* streaming, but with `streaming 'off'` (the default) each transaction
   is still buffered until commit. **`streaming 'on'`** is what actually streams large
   in-progress transactions, and it in turn *requires* `proto_version >= 2` [3][4]. So
-  `proto_version '2'` **alone does not** give you the large-transaction behavior — you need
-  the pair. v3 adds two-phase-commit streaming (PG15+), v4 adds *parallel apply* of a single
-  large txn (PG16+); neither is needed since we stage to files, so **v2 + `streaming 'on'` is
-  the target**. Because `proto_version` is a connection option (not a slot property), you can
-  change it by reconnecting — no slot recreation — so make both configurable.
+  `proto_version '2'` **alone does not** give you the large-transaction behavior — you need the
+  pair (**why `v2` is the target, what each version adds, and the pitfalls of running *without*
+  streaming are spelled out just below**). Because `proto_version` is a connection option (not a
+  slot property), you can change it by reconnecting — no slot recreation — so make both
+  configurable.
+
+#### Why `proto_version '2'` + `streaming 'on'` (and the pitfalls it avoids)
+
+The pair isn't a tuning preference — it's forced by how logical decoding behaves **without**
+streaming. This is the single most consequential protocol decision in the design, so the reasoning
+is made explicit here rather than left implied.
+
+**What each protocol version adds** (a per-connection `pgoutput` option, never a slot property [21]):
+
+| `proto_version` | Server | What it adds |
+|---|---|---|
+| `1` | PG 10+ | Baseline logical-replication messages (`Begin`/`Commit`, `Relation`, `Insert`/`Update`/`Delete`, `Truncate`). **No streaming** — every transaction is buffered until commit. |
+| **`2`** | **PG 14+** | **Streaming of in-progress (large) transactions** — `Stream Start`/`Stop`/`Commit`/`Abort` frames plus an `xid` on every change message. **← walrus's target.** |
+| `3` | PG 15+ | Streaming of **two-phase-commit** (prepared) transactions. |
+| `4` | PG 16+ | **Parallel apply** of a single large streamed transaction on the subscriber. |
+
+We target **`v2`**: it is the *minimum* version that supports streaming, and v3/v4 add nothing we
+use — walrus stages to files and reconciles downstream, so two-phase-commit streaming and
+subscriber-side parallel apply are irrelevant [3][4].
+
+**The pitfall of *not* streaming** (`streaming 'off'`, the default — the failure walrus must
+avoid). With streaming off, the walsender **cannot emit a single row of a transaction until it
+decodes that transaction's `COMMIT`**. To hold everything until then it accumulates the
+transaction's *entire* decoded change-set in the **reorder buffer** — in memory up to
+`logical_decoding_work_mem`, then **spilled to disk** under `pg_replslot/` once that limit is
+crossed [14][19]. For the multi-million-row transactions walrus exists to survive, that produces
+four distinct failures:
+
+- **Memory *and* disk pressure on the source primary** — borne by the database we replicate
+  *from*, not by our sink. One large transaction can spill gigabytes to the primary's disk before
+  a single change reaches us [14].
+- **WAL runaway → slot loss.** The slot's `restart_lsn` / `confirmed_flush_lsn` cannot advance
+  while a large transaction is open and undelivered, so retained WAL grows for its entire duration.
+  A long-enough transaction breaches `max_slot_wal_keep_size`, invalidates the slot
+  (`wal_status = 'lost'`), and triggers the
+  [total-restart](#18-single-slot-for-life--total-restart) disaster [12][13][14].
+- **A latency cliff.** The consumer receives *nothing* for the life of the transaction, then a
+  single flood at commit — the opposite of the steady, backpressure-safe drain the sink is built
+  around.
+- **Sink OOM.** Even if the primary survives, walrus would then have to buffer that whole
+  transaction in memory to convert it to Arrow → Parquet.
+
+Every one of these breaks the tool's core promise, and all four are provoked by exactly the
+workload — large writes — that walrus exists for. That is why the transport is **mandatory, not an
+optional mode** [14].
+
+**How `v2` + `streaming 'on'` removes the pitfall.** Once the *total* decoded changes across all
+in-progress transactions exceed `logical_decoding_work_mem`, the server streams the **largest
+in-progress top-level transaction to the consumer *before* it commits** — bounding server-side
+buffering and letting walrus drain it to S3 incrementally instead of waiting for commit. Small
+transactions still arrive whole at commit. The streaming mechanics (per-`xid` demultiplexing,
+`Stream Commit` / `Stream Abort`) are covered in the next bullet and
+[§1.6](#16-large-transaction-safety) [3][19].
+
+**Trade-offs we knowingly accept.** Streaming shifts work onto the *consumer*: walrus must
+demultiplex interleaved per-`xid` segments, keep streamed rows invisible until `Stream Commit`,
+and discard the rows of aborted top-level txns (`Stream Abort`) and of rolled-back subtransactions.
+Those rules — and why they keep us correct — live in [§1.6](#16-large-transaction-safety). We take
+on that consumer-side complexity deliberately: it is the price of never letting a large transaction
+threaten the source.
 - **Large-transaction handling (what actually streams).** `streaming 'on'` does **not** chop
   every transaction into pre-commit pieces. Streaming kicks in only when the **total** decoded
   changes across **all** in-progress transactions exceed `logical_decoding_work_mem`; at that
