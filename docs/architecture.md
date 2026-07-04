@@ -7,6 +7,17 @@
 > *not* confirm something, it is explicitly flagged as **⚠ unverified / spike needed** rather
 > than asserted.
 
+> **North star — self-healing on Kubernetes; eventual, not real-time.** The end goal is a service
+> that **runs on Kubernetes and keeps working through pod churn**: if a pod is rescheduled or
+> evicted, or a node is drained, the system **recovers on its own and resumes exactly where it
+> left off** — no data loss, no manual babysitting — and you **scale it by adding pods**, not by
+> re-architecting. That resilience is not bolted on: it falls out of durable checkpoints (the
+> slot's `confirmed_flush_lsn`, the manifest work-queue, and the loader's two watermarks) plus
+> fail-fast bootstrap, so *every* restart is just a resume. Delivery is **eventually consistent on
+> a tunable latency budget** — data arrives in a *reasonable* time and arrives *sooner* when you
+> loosen the cadence / memory-footprint / record-count knobs — but it is deliberately **not a
+> real-time system**. When correctness and speed conflict, walrus picks correctness.
+
 ---
 
 ## Context
@@ -25,9 +36,19 @@ shape the whole design:
 3. **Postgres has a huge type system**; DuckDB and Parquet have their own. We need a single,
    well-defined translation layer. Apache Arrow is the right intermediate representation.
 
+**The CDC transport everything is built on.** Walrus reads every change over **one** pgoutput
+logical-replication stream, negotiated per connection at **`proto_version '2'`** with
+**`streaming 'on'`** — this is the foundation of the design, not an optional mode. All CDC flows
+through this single stream: `streaming 'on'` lets the server hand us the largest **in-progress**
+transactions incrementally (before commit) so a 50-million-row transaction never has to be
+buffered whole, while smaller transactions still arrive complete at commit — same stream, same
+decoder, same Arrow → Parquet → S3 path [3][4]. The sink is, first and foremost, a fast, correct
+consumer of this stream, and Component 1 is organized around that.
+
 **Desired outcome.** Two cleanly separated Rust services on Kubernetes:
 
-- a **Postgres Sink** (`walrus-pg-sink`) that streams the WAL in memory, batches changes,
+- a **Postgres Sink** (`walrus-pg-sink`) that consumes that `proto_version 2` streaming pgoutput
+  stream in memory, batches changes,
   converts them to Arrow → Parquet, dumps files to S3, and records each file's location +
   LSN range in a Postgres control table — advancing the slot only after that is durable; and
 - a **Data Sink** (`walrus-loader`) that polls the control table on a user-chosen cadence,
@@ -35,14 +56,20 @@ shape the whole design:
   **transforms that log into `<table>`** — the current-state mirror. One `.duckdb` file per
   source table still holds; it now contains **two tables** (the raw log + the derived mirror).
 
-This is **near-real-time, not real-time**: the user picks the cadence. The goal is a fast,
-backpressure-safe pipeline that never lets the source WAL run away while the loader catches
-up on its own schedule.
+**Two non-negotiable missions, cleanly split.** The sink's one job is **speed and safety off the
+WAL**: take work off the WAL and land it in storage on the operator's terms (cadence / memory
+footprint / record count), advancing the slot only after durability — nothing more. The loader's
+one job is **accuracy**: reconcile that staged work back into the *exact shape the data has in
+Postgres*. This is **near-real-time, not real-time** — the user picks the cadence, and for the
+loader **real-time is explicitly not the priority; matching source truth is.** The goal is a
+fast, backpressure-safe pipeline that never lets the source WAL run away while the loader catches
+up, correctly, on its own schedule.
 
 ### Decisions locked in (from requirements)
 
 | Decision | Choice | Consequence for the design |
 |---|---|---|
+| CDC transport | **One pgoutput stream at `proto_version '2'` + `streaming 'on'`** | Every change flows over this single stream — the foundation of the design. Negotiated per-connection on `START_REPLICATION` (not a slot property); large in-progress txns stream incrementally so they never buffer whole, small txns still arrive at commit ([§1.1](#11-source-side-setup-one-time-via-migrationjob), [§1.6](#16-large-transaction-safety)). The consumer is **hand-rolled** — no framework owns slot management ([§1.2](#12-replication-consumer--hand-rolled)). |
 | DuckDB layout | **One `.duckdb` file per source table** — holding **two tables**: `<table>_raw` (append-only CDC log) + `<table>` (derived mirror) | Per-table single-writer loaders → natural parallelism & isolation; each file carries **two watermarks** (`raw_appended_lsn` ≥ `transformed_lsn`); cross-table point-in-time consistency is *relaxed*. |
 | Target semantics | **Current-state mirror (upsert/delete)** | The `<table>` mirror is the current state; the loader **first appends CDC rows verbatim to `<table>_raw`** (no dedup, meta retained), **then derives `<table>`** by dedup-to-latest + `MERGE INTO` on the (possibly composite) PK. Makes PK metadata, `REPLICA IDENTITY`, TOAST handling, and the DDL-audit table load-bearing. |
 | Transform primitive | **`MERGE INTO` (DuckDB ≥ 1.4.0 LTS)** | Single-statement insert/update/delete from `<table>_raw` → `<table>`; incremental-from-watermark by default, periodic full-rebuild (`CREATE OR REPLACE … AS SELECT`) for self-heal + compaction. `INSERT … ON CONFLICT` + `DELETE` is the < 1.4.0 fallback. |
@@ -63,9 +90,13 @@ up on its own schedule.
 **Goals**
 - Correct, ordered, effectively-once replication of DML into per-table **raw CDC logs + derived DuckDB mirrors**.
 - Bounded WAL growth under all conditions via correct slot-feedback checkpointing.
-- Handle **large transactions** without buffering them entirely in memory (streaming protocol v2) [3][4].
+- **Consume all CDC over one pgoutput stream** at `proto_version '2'` + `streaming 'on'` (the
+  transport the whole sink is built on), and thereby handle **large transactions** without
+  buffering them entirely in memory [3][4].
 - Capture **DDL / schema evolution** and apply it to the DuckDB targets.
 - **User-configurable cadence** for both flush (sink) and apply (loader). The loader apply is **two operations** — append-to-raw then transform-to-mirror — sharing one poll cadence in v1 (separate transactions, two watermarks), with a slower per-table **compaction/full-rebuild** cadence exposed separately.
+- **Eventual delivery on a tunable latency budget** — data reaches DuckDB in a *reasonable* time and *sooner* when the operator loosens the cadence / memory-footprint / record-count knobs. Explicitly **not** real-time; correctness is never traded for latency.
+- **Self-healing on Kubernetes** — the system survives pod rescheduling / eviction / node drain and **resumes exactly where it left off** with no data loss and no manual intervention (durable checkpoints + fail-fast bootstrap make every restart a resume). "**Scale by adding pods and it just works.**"
 - Cloud-native: S3 staging, Kubernetes deployment, horizontal-ish scaling by table sharding.
 
 **Non-goals (v1)**
@@ -87,7 +118,7 @@ up on its own schedule.
    │ walrus.ddl_audit  ←  event trigger (DDL)        │
    │ user tables ...                                 │
    └───────────────┬─────────────────────────────────┘
-                   │ pgoutput stream (DML + inline DDL-audit INSERTs)
+                   │ pgoutput v2 stream, streaming='on' (DML + inline DDL-audit INSERTs)
                    ▼
    ┌───────────────────────────────────────────────┐        CONTROL POSTGRES
    │  POSTGRES SINK  (walrus-pg-sink)               │        ┌────────────────┐
@@ -125,7 +156,17 @@ either can crash/restart independently without data loss (see [Delivery semantic
 
 ## Component 1 — Postgres Sink (`walrus-pg-sink`)
 
-The WAL reader. This is the latency- and correctness-critical service.
+> **Non-negotiable mission: drain the WAL to storage, fast, so the slot can never run away.**
+> `walrus-pg-sink` exists to **take work off the WAL and write it to durable storage** (Arrow →
+> Parquet → S3 + a manifest row), on the schedule the operator dictates — flushing when **any**
+> configured limit trips: the **cadence** (`max_fill_ms`), the **memory footprint**
+> (`max_bytes` / memory backpressure), or the **record count** (`max_rows`). It advances the
+> replication slot **only after** that write is durable, so the source WAL is bounded by
+> construction. That is its whole job. It does **not** interpret, dedup, reconcile, or model the
+> data into its final shape — it moves change events off the WAL and onto S3 verbatim, quickly
+> and safely. Everything downstream is `walrus-loader`'s concern.
+
+The WAL reader. This is the latency- and throughput-critical service.
 
 ### 1.1 Source-side setup (one-time, via migration/Job)
 
@@ -158,9 +199,11 @@ SELECT pg_create_logical_replication_slot('walrus_slot', 'pgoutput');
   *(A `UNIQUE NOT NULL` column via `REPLICA IDENTITY USING INDEX` could relax this later; out of
   scope for v1 by design.)*
 
-- **Protocol version (this is the "large transactions" knob).** The replication *slot* is a
-  plain `pgoutput` logical slot — there is **no special slot *type*** for large transactions.
-  The capability is negotiated **per connection** via options on `START_REPLICATION`:
+- **Protocol version & streaming — walrus's CDC transport.** Every change walrus replicates
+  arrives over this one stream. The replication *slot* is a plain `pgoutput` logical slot — the
+  protocol version is **not** baked into it (there is **no special slot *type*** for large
+  transactions) — so the transport is negotiated **per connection** via options on
+  `START_REPLICATION`:
 
   ```sql
   START_REPLICATION SLOT walrus_slot LOGICAL 0/0 (
@@ -192,24 +235,47 @@ SELECT pg_create_logical_replication_slot('walrus_slot', 'pgoutput');
   wire — the consumer demultiplexes per `xid`. This is what stops a 50M-row transaction from
   ballooning slot/WAL memory — see [1.6](#16-large-transaction-safety).
 
-### 1.2 Rust crate choice (recommendation)
+### 1.2 Replication consumer — hand-rolled
 
-Research surfaced two viable, primary-sourced Rust foundations [1][2]:
+We **hand-roll the replication consumer** rather than adopt a high-level framework. The linchpin
+of "don't let the WAL build up" is advancing `confirmed_flush_lsn` **only after** our S3 +
+manifest write is durable ([§1.5](#15-the-durability-checkpoint-wal-bounding-invariant)); that
+coupling is the whole point of the sink, so we want it **directly under our control**, not
+mediated by a framework's own slot-advance timing. Hand-rolling means we own — and can reason
+about — every one of these:
 
-| Option | What it gives us | Trade-off |
-|---|---|---|
-| **`supabase/etl`** (formerly `pg_replicate`) [1] | High-level framework *over* logical replication: **initial copy + streaming** of insert/update/delete/truncate/schema events, **batching + memory backpressure** (`BatchConfig{max_fill_ms, memory_budget_ratio, max_bytes}`, `MemoryBackpressureConfig`), parallel table sync, retries, and **pluggable destinations** (incl. a `DuckLake` sink over S3-compatible storage) [1]. | Opinionated; we must confirm it advances the slot **only after** our destination acks durability (critical — see ⚠ Open Q3). |
-| **`pgwire-replication`** [2] | Lean tokio crate that speaks `START_REPLICATION ... LOGICAL` + pgoutput **directly**, with explicit **`update_applied_lsn(lsn)`** + monotonic standby status updates — i.e. exact control over `confirmed_flush_lsn` advancement [2]. | Lower-level; we implement snapshot, batching, and the pgoutput message model ourselves (see film42's walkthrough [15]). |
+- **The replication connection.** Open a replication-mode connection and issue
+  `START_REPLICATION SLOT walrus_slot LOGICAL <lsn> (proto_version '2', streaming 'on', ...)` over
+  a thin, replication-capable Postgres client (e.g. `tokio-postgres`'s replication support or the
+  lean `pgwire-replication` crate [2]) — used only as the raw byte-stream / standby-status
+  plumbing, **not** as a framework.
+- **The pgoutput decoder.** Parse the pgoutput message model ourselves — `Begin`/`Commit`,
+  `Relation`, `Type`, `Insert`/`Update`/`Delete`, `Truncate`, and the v2 streaming frames
+  `Stream Start`/`Stop`/`Commit`/`Abort` — demultiplexing per `xid`
+  ([§1.6](#16-large-transaction-safety)). film42's walkthrough is the reference pattern for
+  exactly this [15].
+- **Slot-feedback / `confirmed_flush_lsn`.** Emit standby status updates ourselves so the slot
+  advances on **our** schedule (post-durability), and never past an open streamed txn.
+- **Snapshot / initial copy** ([§1.7](#17-snapshot--backfill-bootstrap)), **in-memory batching +
+  memory backpressure** ([§1.3](#13-in-memory-batching--cadence)), retries, and per-table
+  parallelism — all ours.
 
-**Recommendation:** **Build the sink on `supabase/etl`, implementing a *custom destination*** that does Arrow→Parquet→S3→manifest, because it already solves snapshot + streaming + batching + backpressure + slot management [1]. Keep `pgwire-replication` [2] as the fallback if etl's slot-advance timing can't be coupled to S3+manifest durability — because that coupling is the linchpin of "don't let the WAL build up." **A ~1-day spike to confirm etl's LSN-advance hook is the top de-risking task.**
+We deliberately **do not** build on `supabase/etl` (formerly `pg_replicate`) [1]: it solves
+initial-copy + streaming + batching + pluggable destinations, but it is an opinionated framework
+that would own slot management for us — the one thing we most need explicit control over. We still
+treat it (and its `BatchConfig` / `MemoryBackpressureConfig` shapes) as **prior art** to crib
+batching and backpressure design from [1]. The build cost this buys is the **hand-rolled pgoutput
+decoder + snapshot**, now the highest-effort area of Component 1 (see
+[Open questions](#open-questions--risks)).
 
 ### 1.3 In-memory batching & cadence
 
 The sink accumulates decoded changes in memory into per-(table, batch) Arrow builders and
 flushes a Parquet file when **any** threshold trips — all user-configurable:
 
-- `max_fill_ms` — wall-clock cadence (the primary "how often do we dump files" knob) [1].
-- `max_bytes` / `max_rows` — size caps so batches stay bounded [1].
+- `max_fill_ms` — wall-clock cadence (the primary "how often do we dump files" knob).
+- `max_bytes` / `max_rows` — size caps so batches stay bounded (batching + memory-backpressure
+  shape cribbed from etl's `BatchConfig` / `MemoryBackpressureConfig` as prior art [1]).
 - transaction-commit boundary — never split a committed txn's tail across the visibility line (see [1.6](#16-large-transaction-safety)).
 
 Larger cadence ⇒ larger batches ⇒ **more WAL retained between flushes** ⇒ better Parquet
@@ -225,8 +291,8 @@ compression but higher slot lag. This trade-off is the knob the user tunes.
   ```json
   {
     "op": "u",                       // i | u | d | t (truncate)
-    "lsn": "00000000000019A2B3C",    // zero-padded, sort-comparable form of the change LSN
-    "commit_lsn": "000000000001A00",
+    "lsn": "00000000019A2B3C",       // zero-padded to 16 hex (pg_lsn width), sort-comparable
+    "commit_lsn": "0000000000001A00",
     "commit_ts": "2026-07-04T12:00:00Z",     // UTC, RFC 3339 / ISO-8601 (`Z`)
     "xid": 918273,
     "epoch": 7,
@@ -310,8 +376,8 @@ in **commit order**, exactly as non-streaming mode guarantees.
 Per the "snapshot → then stream" choice:
 
 1. Create the slot; capture its **consistent snapshot LSN** (the slot's creation point).
-2. Export existing rows (`COPY`/`SELECT` at that snapshot, or etl's built-in *initial copy*
-   which "backfills the existing rows covered by a publication" [1]) → the *same* Arrow →
+2. Export existing rows via our own **initial copy** (`COPY`/`SELECT` at that snapshot LSN,
+   backfilling the rows covered by the publication) → the *same* Arrow →
    Parquet → S3 → manifest path, marked as `snapshot` files with `lsn_end = snapshot_lsn`.
 3. **Watermark handoff:** snapshot files are **appended into `<table>_raw`** (marked
    `kind='snapshot'`) alongside streamed files, so raw may briefly hold both the snapshot tail
@@ -393,9 +459,15 @@ gospel.
   placeholder for large columns that didn't change (not NULL, not the value). `<table>_raw`
   stores that sentinel **verbatim**; the **carry-forward runs in the transform** (raw → mirror),
   resolved **per column**: for any column named in the winning event's `unchanged_toast`, the
-  transform substitutes the current `<table>` value so the `MERGE` writes the real value, not the
-  sentinel/null. (The periodic full-rebuild unions the current mirror in as an LSN-floor baseline
-  so a TOAST value whose last real write was pruned from raw is never lost.)
+  transform substitutes the **last non-sentinel value for that PK, found by scanning `<table>_raw`
+  backward from the winning row's `lsn`** — *not* the current mirror value. This matters when the
+  write that set the TOAST value and a later unchanged-TOAST update land in the **same batch**
+  (e.g. `INSERT big='X'` @L100, then `UPDATE …, big=<sentinel>` @L200): the mirror has no row for
+  that PK yet, so a mirror-only lookup would write `NULL` and silently drop `'X'` even though it's
+  still sitting in raw at L100. The resolution is `COALESCE(` latest raw value ≤ winner.lsn where
+  the column isn't the sentinel `, current mirror value )`. (The periodic full-rebuild additionally
+  unions the current mirror in as an LSN-floor baseline, so a TOAST value whose last real write was
+  already pruned from raw is still never lost.)
 - **`REPLICA IDENTITY` (PK required).** Updates/deletes only carry key columns; with a
   `PRIMARY KEY` and default replica identity that key *is* the PK (**all columns of a composite
   PK**) — exactly what the MERGE needs. **Keyless tables are not supported** (rejected at preflight, see §1.1 and Non-goals);
@@ -416,7 +488,7 @@ Logical decoding **does not emit DDL** [3][5], so we capture it out-of-band usin
 -- Fixed-schema audit table (AWS DMS awsdms_ddl_audit shape) [6]
 CREATE TABLE walrus.ddl_audit (
   c_key    bigserial PRIMARY KEY,
-  c_time   timestamp,
+  c_time   timestamptz,   -- UTC (our metadata-timestamps rule; not the AWS bare `timestamp`)
   c_user   varchar(64),
   c_txn    varchar(16),
   c_tag    varchar(24),   -- 'CREATE TABLE' | 'ALTER TABLE' | 'DROP TABLE'
@@ -428,7 +500,7 @@ CREATE TABLE walrus.ddl_audit (
 
 -- SECURITY DEFINER function on ddl_command_end writes current_query() into the audit table [6]
 CREATE EVENT TRIGGER walrus_intercept_ddl ON ddl_command_end
-  EXECUTE PROCEDURE walrus.intercept_ddl();
+  EXECUTE FUNCTION walrus.intercept_ddl();   -- EXECUTE FUNCTION (PG11+ spelling; we target 14+)
 ```
 
 **Key elegance — DDL is ordered *inline* with DML.** Because `walrus.ddl_audit` is an
@@ -491,7 +563,7 @@ columns, widens types, or follows renames — it never destructively drops or ca
 | `RENAME COLUMN` | Yes | `ALTER TABLE RENAME COLUMN`; columns tracked by `attnum`/position so renames are unambiguous. | `ALTER TABLE RENAME COLUMN` (same logical column, tracked by `attnum`) so appends keep aligning. |
 | `RENAME TABLE` | Yes | re-map/rename the per-table DuckDB file; table identity tracked by a stable id, not name alone. | rename `<table>_raw` too (same file, same stable id). |
 | `NOT NULL` / `DEFAULT` / `CHECK` add/drop | No (metadata) | recorded for lineage; **not enforced** on the mirror in v1 (values still flow as DML). | **None** (raw never enforces constraints). |
-| `TRUNCATE` | n/a (stream op) | transform `DELETE`/`TRUNCATE`s mirror rows up to the truncate LSN. | the `t` op is **appended as a logged row** (raw is **not** truncated). |
+| `TRUNCATE` | n/a (stream op) | carries no tuple/PK, so it's **not** a `MERGE` branch: the transform **empties the mirror** as of the truncate LSN `T` (`DELETE FROM <table>`) and repopulates from rows with `lsn > T` ([§2.1](#21-the-raw-to-mirror-transform-model)). | the `t` op is **appended as a logged row** (raw is **not** truncated). |
 | `DROP TABLE` | Yes | drop/retire the DuckDB table; stop replicating it. | drop/retire `<table>_raw` and the file too. |
 | `CREATE TABLE` (added to publication) | new registry entry | PK preflight applies → create the `.duckdb` file with **both** `<table>` and `<table>_raw` + snapshot the new table. | created alongside the mirror (both live in the new file). |
 
@@ -579,6 +651,16 @@ by day and DROPping old partitions** instead of row-by-row deletes.
 
 ## Component 2 — Data Sink (`walrus-loader`)
 
+> **Non-negotiable mission: reconcile the staged work back into the exact shape the data has in
+> Postgres — accuracy over latency.** `walrus-loader` exists to turn the sink's stream of change
+> events into a DuckDB `<table>` mirror that **matches the source table as it stands in
+> Postgres** — same rows, same current values, same schema. **Real-time is explicitly not the
+> goal; correctness is.** The loader may run as far behind the cadence as it needs to, but when
+> it settles, `<table>` must be a faithful, current-state copy of the Postgres table (via the
+> append-to-`<table>_raw`-then-transform model). If there is ever a tension between "fast" and
+> "correct," the loader chooses **correct** — it is the accuracy authority of the system, and the
+> periodic full-rebuild exists precisely to self-heal any drift back to source truth.
+
 Owns the per-table DuckDB files. **One logical worker owns each `.duckdb` file** (DuckDB is
 single-writer) — and that one writer owns **both** tables in the file (`<table>_raw` +
 `<table>`), which is exactly why one-file-per-table gives clean parallelism.
@@ -602,13 +684,18 @@ single-writer) — and that one writer owns **both** tables in the file (`<table
    (and, per the [taxonomy](#per-change-type-handling-schema-evolution-semantics), to
    `<table>_raw`), driven by `ddl_manifest` + `schema_registry`, **before** transforming data
    past that LSN.
-5. **Dedup-to-latest per PK** over `<table>_raw` rows with `lsn > transformed_lsn` (window
-   `row_number() OVER (PARTITION BY pk ORDER BY lsn DESC)`), into a `TEMP` staging table;
-   substitute carried-forward values for any `unchanged_toast` columns from the current mirror.
-6. **`MERGE INTO <table>`** from the staging table (DuckDB ≥ 1.4.0): `WHEN MATCHED AND op='d'
-   THEN DELETE`, `WHEN MATCHED THEN UPDATE`, `WHEN NOT MATCHED AND op<>'d' THEN INSERT`; `t`
-   (truncate) deletes mirror rows up to the truncate LSN. Commit, then advance `transformed_lsn`
-   to the max LSN applied.
+5. **Apply truncates first.** A pgoutput `TRUNCATE` carries **no tuple/PK**, so it can't be a
+   `MERGE` join branch. Take `T = max(lsn)` of any `op='t'` row in the new tail; if present, the
+   mirror is empty as of `T`, so `DELETE FROM <table>` (a truncate wipes the whole table) and let
+   only rows with `lsn > T` repopulate it in the next step.
+6. **Dedup-to-latest per PK** over `<table>_raw` rows with `lsn > max(transformed_lsn, T)`
+   (window `row_number() OVER (PARTITION BY pk ORDER BY lsn DESC)`), **excluding `op='t'`**, into a
+   `TEMP` staging table; resolve any `unchanged_toast` columns by **scanning `<table>_raw` backward
+   from the winner's `lsn` for that PK** (current mirror only as a last resort — see the
+   [TOAST gotcha](#data-type-translation-postgres--arrow--parquet)). Then **`MERGE INTO <table>`**
+   from the staging table (DuckDB ≥ 1.4.0): `WHEN MATCHED AND op='d' THEN DELETE`, `WHEN MATCHED
+   THEN UPDATE`, `WHEN NOT MATCHED AND op<>'d' THEN INSERT`. Commit, then advance `transformed_lsn`
+   to the max LSN applied (including any truncate LSN).
 
 A slower, per-table **full-rebuild / compaction** job runs on its own cadence to self-heal drift,
 reclaim space, and prune `<table>_raw` below the retention floor — see
@@ -639,18 +726,27 @@ Each `.duckdb` file holds **two tables** for one source table:
 
 ```sql
 BEGIN;
+-- T := (SELECT max(lsn) FROM <table>_raw WHERE lsn > :transformed_lsn AND op = 't')  -- may be NULL
+-- 0. TRUNCATE has no tuple/PK, so it can't be a MERGE branch. If the tail contains one,
+--    the table is empty as of T: wipe the mirror, and apply only post-T rows below.
+DELETE FROM <table> WHERE :T IS NOT NULL;   -- no-op when the tail has no truncate
+
+-- 1. Dedup the post-truncate tail to the latest op per PK (truncate rows excluded).
 CREATE TEMP TABLE _batch AS
   SELECT * EXCLUDE (rn) FROM (
     SELECT *, row_number() OVER (PARTITION BY <pk> ORDER BY lsn DESC) AS rn
     FROM <table>_raw
-    WHERE lsn > :transformed_lsn            -- only the new tail
-  ) WHERE rn = 1;                           -- latest op per PK (dedup AFTER ranking)
--- carry unchanged_toast columns forward from the current mirror into _batch here
+    WHERE lsn > COALESCE(:T, :transformed_lsn) -- rows at/below a truncate are moot
+      AND op <> 't'                            -- truncate handled above, never in the MERGE
+  ) WHERE rn = 1;                              -- latest op per PK (dedup AFTER ranking)
+-- 2. Resolve unchanged_toast per column: for each column in s.unchanged_toast, replace the
+--    sentinel with the last NON-sentinel value for that PK found by scanning <table>_raw back
+--    from the winner's lsn; fall back to the current <table> value only if raw has none.
 MERGE INTO <table> t USING _batch s ON t.<pk> = s.<pk>
   WHEN MATCHED AND s.op = 'd'      THEN DELETE
   WHEN MATCHED                     THEN UPDATE SET <every non-key col> = s.<col>
   WHEN NOT MATCHED AND s.op <> 'd' THEN INSERT (<cols>) VALUES (s.<cols>);
-COMMIT;   -- then advance transformed_lsn = max(lsn) applied
+COMMIT;   -- then advance transformed_lsn = max(lsn) applied (including any truncate lsn)
 ```
 
 `<pk>` above denotes the table's **full primary-key column list**, which may be **composite**:
@@ -664,7 +760,9 @@ insert resurrect a key). `TEMP` staging never touches the persistent file. Cost 
 but the `MERGE` reconciles against the whole mirror so cross-batch state stays correct. `MERGE
 INTO` needs **no** PK/UNIQUE on the target and does insert/update/delete in one pass; the
 `INSERT … ON CONFLICT (pk) DO UPDATE` + separate `DELETE` fallback (DuckDB < 1.4.0) needs a
-PK/UNIQUE and a pre-deduped batch, and must list every non-key column in `SET`.
+PK/UNIQUE and a pre-deduped batch, and must list every non-key column in `SET`. The truncate
+pre-step (step 0/5) and the unchanged-TOAST back-scan (step 2/6) apply **identically** to the
+fallback path — it inherits the same gaps otherwise.
 
 **Transform — full-rebuild (periodic self-heal + compaction).** On a slower cadence (and after
 any drift/quarantine recovery), `CREATE OR REPLACE TABLE <table> AS SELECT …` window-dedups over
@@ -822,7 +920,7 @@ walrus/
 │   ├── common/                # config, LSN/types, manifest & registry models, errors
 │   ├── pg-to-arrow/           # Postgres → Arrow schema+value mapping (the risky spike)
 │   ├── control/               # sqlx models for manifest/checkpoint/ddl/registry
-│   ├── pg-sink/               # bin: replication consumer → Arrow → Parquet → S3 → manifest
+│   ├── pg-sink/               # bin: hand-rolled pgoutput consumer → Arrow → Parquet → S3 → manifest
 │   └── loader/                # bin: manifest poll → S3 → append→<tbl>_raw → transform (dedup/MERGE) → <tbl>
 ├── migrations/                # control-plane DDL + source DDL-trigger install
 └── deploy/                    # (later) k8s manifests, Dockerfiles
@@ -835,20 +933,24 @@ any clash with the external `arrow` (arrow-rs) dependency it uses. The two binar
 `walrus-loader` — the `walrus-` prefix there is the cluster-level service/image name, not the
 crate name.
 
-Key deps: `tokio`, **`supabase/etl`** (or `pgwire-replication` + `tokio-postgres`) [1][2],
-`arrow` + **`parquet`** [7][8], `object_store` (S3), **`duckdb`** (`appender-arrow`,
-`parquet`, `bundled`) [9][10], `sqlx` (control DB), `serde`, `tracing`, `metrics`.
+Key deps: `tokio`, a thin replication-capable Postgres client (**`tokio-postgres`** replication
+support or **`pgwire-replication`** [2]) — the pgoutput decoder is **ours**
+([§1.2](#12-replication-consumer--hand-rolled)) — `arrow` + **`parquet`** [7][8],
+`object_store` (S3), **`duckdb`** (`appender-arrow`, `parquet`, `bundled`) [9][10],
+`sqlx` (control DB), `serde`, `tracing`, `metrics`.
 
 ---
 
 ## Phased roadmap
 
 0. **Scaffold + control plane.** Workspace, control-table migrations, DDL trigger install, docker-compose (Postgres `wal_level=logical` + MinIO).
-1. **Thin end-to-end slice.** One table, simple types, streaming-only → Arrow → Parquet → S3 → manifest → loader **appends into `<tbl>_raw`, then transforms into `<tbl>`** in one DuckDB file. Prove both the append and the transform.
+1. **Thin end-to-end slice.** One table, simple types, stream path only (proto v2 + `streaming 'on'`, no snapshot yet) → Arrow → Parquet → S3 → manifest → loader **appends into `<tbl>_raw`, then transforms into `<tbl>`** in one DuckDB file. Prove both the append and the transform.
 2. **Full type mapping + DML correctness.** The [type table](#data-type-translation-postgres--arrow--parquet), NULLs, updates/deletes with `REPLICA IDENTITY` (incl. **composite PKs**); **the raw→mirror transform** (dedup-to-latest, **unchanged-TOAST** carry-forward) + the two-watermark checkpoint.
 3. **Snapshot/backfill** with watermark handoff.
 4. **DDL / schema evolution** applied in the loader from the audit stream.
-5. **Large-transaction streaming** (proto v2): speculative staging + commit/abort gating.
+5. **In-progress large-transaction handling.** proto v2 + `streaming 'on'` is the transport from
+   phase 1; this phase adds the *speculative staging* + `Stream Commit`/`Stream Abort` gating for
+   txns streamed before commit.
 6. **Scale & ops:** loader table-sharding, K8s manifests, leader election/HA, observability, backpressure tuning.
 7. **Resilience:** epoch/total-restart on slot loss/invalidation; orphan-slot cleanup.
 
@@ -862,9 +964,14 @@ Key deps: `tokio`, **`supabase/etl`** (or `pgwire-replication` + `tokio-postgres
    types. Owner of most implementation risk.
 2. **⚠ Event triggers aren't exhaustive** (verified caveat, refuted 0-3 claim). Need
    `sql_drop` + `Relation`-message reconciliation + periodic schema-diff to avoid drift.
-3. **⚠ Slot-advance coupling in `supabase/etl`.** Must confirm etl advances the slot **only
-   after** our custom destination acks S3+manifest durability. If not, drop to
-   `pgwire-replication`'s explicit `update_applied_lsn` [2]. *Top de-risking spike.*
+3. **⚠ Hand-rolled pgoutput decoder + snapshot (highest Component-1 effort).** Because we
+   **hand-roll** the replication consumer ([§1.2](#12-replication-consumer--hand-rolled)), the
+   slot-advance ↔ durability coupling — the linchpin of "don't let the WAL build up" — is **ours
+   by construction** rather than a framework hook to verify. The cost is that we now own the
+   pgoutput message model (incl. v2 `Stream *` frames + per-`xid` demux), the standby-status
+   feedback loop, and the consistent-snapshot handoff. Build against the message-format spec
+   [3][20] and film42's walkthrough [15]; test the streaming/abort and snapshot/stream-boundary
+   paths hard. *Top de-risking area of the sink.*
 4. **⚠ DuckDB single-writer HA + storage + query path.** PVC vs MotherDuck vs
    DuckLake-over-object-store; backup/restore of `.duckdb` files; how end users query them.
 5. **Relaxed cross-table consistency** from one-file-per-table — confirm acceptable for the
@@ -881,7 +988,7 @@ Key deps: `tokio`, **`supabase/etl`** (or `pgwire-replication` + `tokio-postgres
    tombstone edge cases — and PK *reuse* by a genuinely different logical row — are not yet
    formally handled. **Explicitly out of scope for now**; revisit with transform hardening.
 9. **Faster initial snapshot / backfill of large tables — deferred.** The consistent snapshot
-   ([bootstrap](#startup--bootstrap-fail-fast-preconditions)) is the slowest onboarding step
+   ([bootstrap](#startup--bootstrap-fail-fast-preflight)) is the slowest onboarding step
    for big tables. PeerDB's technique for making `pg_dump`/`pg_restore` ~5× faster (parallel,
    chunked **CTID-range** export with tuned settings) is a candidate optimization for our
    snapshot path — parallelize the initial per-table read instead of a single serial copy.
@@ -915,6 +1022,12 @@ Key deps: `tokio`, **`supabase/etl`** (or `pgwire-replication` + `tokio-postgres
   row equals the current source row after the transform.
 - **Types:** table exercising every mapped type incl. `numeric`, `jsonb`, arrays, `uuid`,
   `timestamptz`, `bytea`, NULLs, and an **unchanged-TOAST** update; assert round-trip fidelity.
+- **Intra-batch TOAST carry-forward:** `INSERT big='X'` then `UPDATE …, big=<unchanged-TOAST>`
+  for the same PK **within one batch** (mirror empty for that PK); assert the mirror ends with
+  `big='X'` (resolved by scanning `<table>_raw` back from the winner's LSN), **not** NULL.
+- **TRUNCATE:** stream a `TRUNCATE`, then re-`INSERT` rows after it in the same tail; assert the
+  transform empties the mirror as of the truncate LSN and keeps only the post-truncate rows —
+  and that a user `TRUNCATE` never stalls the pipeline (no NOT-NULL-PK insert of a truncate row).
 - **Large txn:** a multi-million-row transaction with `streaming='on'`; assert **memory and
   slot size stay bounded** and the txn appears atomically after commit; then a large txn that
   **aborts** and assert nothing leaks to DuckDB.
@@ -966,5 +1079,6 @@ Primary sources are Postgres/AWS/vendor docs and project repos; blogs are corrob
 
 > **Research caveats to remember:** the per-type Postgres→Arrow mapping (⚠ Open Q1) was not
 > source-verified; "event triggers fire on all DDL" was **refuted** (⚠ Open Q2); PeerDB's
-> internal connector code was used only to corroborate protocol facts, not verified directly;
-> `supabase/etl` destination statuses (DuckLake "in progress") are volatile as of 2026.
+> internal connector code was used only to corroborate protocol facts, not verified directly.
+> `supabase/etl` [1] is cited as **prior art only** — we hand-roll the consumer
+> ([§1.2](#12-replication-consumer--hand-rolled)), so its destination statuses don't affect us.
