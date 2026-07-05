@@ -10,8 +10,10 @@
 > **North star — self-healing on Kubernetes; eventual, not real-time.** The end goal is a service
 > that **runs on Kubernetes and keeps working through pod churn**: if a pod is rescheduled or
 > evicted, or a node is drained, the system **recovers on its own and resumes exactly where it
-> left off** — no data loss, no manual babysitting — and you **scale it by adding pods**, not by
-> re-architecting. That resilience is not bolted on: it falls out of durable checkpoints (the
+> left off** — no data loss, no manual babysitting. **Scaling today is vertical:** you give the
+> single active pod more compute (CPU/memory), *not* more pods — the "scale by adding pods and it
+> just works" story is a [deferred goal](#deferred-design-goals-to-solve-later), not yet real.
+> That resilience is not bolted on: it falls out of durable checkpoints (the
 > slot's `confirmed_flush_lsn`, the manifest work-queue, and the loader's two watermarks) plus
 > fail-fast bootstrap, so *every* restart is just a resume. Delivery is **eventually consistent on
 > a tunable latency budget** — data arrives in a *reasonable* time and arrives *sooner* when you
@@ -109,8 +111,8 @@ up, correctly, on its own schedule.
 - Capture **DDL / schema evolution** and apply it to the DuckDB targets.
 - **User-configurable cadence** for both flush (sink) and apply (loader). The loader apply is **two operations** — append-to-raw then transform-to-mirror — sharing one poll cadence in v1 (separate transactions, two watermarks), with a slower per-table **compaction/full-rebuild** cadence exposed separately.
 - **Eventual delivery on a tunable latency budget** — data reaches DuckDB in a *reasonable* time and *sooner* when the operator loosens the cadence / memory-footprint / record-count knobs. Explicitly **not** real-time; correctness is never traded for latency.
-- **Self-healing on Kubernetes** — the system survives pod rescheduling / eviction / node drain and **resumes exactly where it left off** with no data loss and no manual intervention (durable checkpoints + fail-fast bootstrap make every restart a resume). "**Scale by adding pods and it just works.**"
-- Cloud-native: S3 staging, Kubernetes deployment, horizontal-ish scaling by table sharding.
+- **Self-healing on Kubernetes** — the system survives pod rescheduling / eviction / node drain and **resumes exactly where it left off** with no data loss and no manual intervention (durable checkpoints + fail-fast bootstrap make every restart a resume). This is **resilience, not horizontal scale**: a replacement pod resumes where the old one stopped — it does *not* mean adding pods multiplies throughput (scaling is vertical today — see [Deferred design goals](#deferred-design-goals-to-solve-later)).
+- Cloud-native: S3 staging, Kubernetes deployment, and **vertical scaling today** — scale the single active sink/loader pod *up* (CPU/memory). Horizontal scale-out by loader table-sharding is a [deferred design goal](#deferred-design-goals-to-solve-later), not yet real.
 
 **Non-goals (v1)**
 - Real-time / sub-second latency.
@@ -123,7 +125,8 @@ up, correctly, on its own schedule.
   **leaf-partition** names (which v1 does not map to targets); preflight asserts the setting
   ([§1.1](#11-source-side-setup-one-time-via-migrationjob)).
 - **Tables without a `PRIMARY KEY`.** A PK is a hard prerequisite; keyless tables are rejected at preflight, never full-reloaded.
-- **Single-table reloads / re-syncs.** There is **no per-table recovery path**. If a lossy `ALTER COLUMN TYPE` cast fails, the table is quarantined + alerted and left as-is — an accepted terminal outcome, explicitly not solved in v1. (The only full re-sync that exists is the whole-system [total-restart](#18-single-slot-for-life--total-restart) on slot loss, which rebuilds *every* table — never just one.)
+- **Single-table reloads / re-syncs (not in v1).** There is **no per-table recovery path** yet. If a lossy `ALTER COLUMN TYPE` cast fails, the table is quarantined + alerted and left as-is — an accepted terminal outcome for v1. (The only full re-sync that exists today is the whole-system [total-restart](#18-single-slot-for-life--total-restart) on slot loss, which rebuilds *every* table — never just one.) This is a [deferred design goal](#deferred-design-goals-to-solve-later), **not a permanent non-goal** — the tool is intended to eventually own single-table reloads while streaming.
+- **Horizontal multi-pod scale-out.** v1 runs **one active sink pod and one active loader pod**; you scale by making them **bigger** (vertical — more CPU/memory), not by adding pods. Multi-pod loader table-sharding across replicas is a [deferred design goal](#deferred-design-goals-to-solve-later), not yet real.
 
 ---
 
@@ -521,7 +524,22 @@ Per the "snapshot → then stream" choice:
    `lsn_end = consistent_point` — **all snapshot files share this one commit LSN**, so the loader
    disambiguates them by `manifest_id`, never by `lsn_end` alone (see the
    [coordination contract](#coordination-contract-control-plane-tables)).
-3. **Watermark handoff:** snapshot files are **appended into `<table>_raw`** (marked
+3. **Parallel initial copy — a stated goal for the initial-load path.** The per-table copy in
+   step 2 is **serial today, and we intend to parallelize it** so first-time onboarding of a large
+   database is fast. Following [PeerDB's ~5× `pg_dump`/`pg_restore` technique](https://blog.peerdb.io/how-can-we-make-pgdump-and-pgrestore-5-times-faster)
+   (a 1.5 TB table dropping from ~1.5 days to ~7 hours), logically partition each large table into
+   **CTID ranges** and run **multiple `COPY` streams concurrently** — each worker opens its **own**
+   `REPEATABLE READ` read-only transaction and `SET TRANSACTION SNAPSHOT '<snapshot_name>'`, so
+   **all ranges read the one consistent MVCC snapshot** already exported in step 1 (no second slot,
+   no extra snapshot). Use **binary `COPY`**, **TID-range scans** (`WHERE ctid >= '(lo,0)' AND ctid
+   < '(hi,0)'`, which the planner serves as efficient tid-range scans), and a server-side cursor per
+   range to bound memory. Every range still emits `snapshot` files with `lsn_end = consistent_point`
+   and is disambiguated by `manifest_id` exactly as above, so this is a throughput optimization only
+   — it changes nothing about the watermark handoff below. *(Range-sizing, worker count vs. source
+   load, and skew on bloated tables are the open residuals — see
+   [Open questions](#open-questions--risks) Q9 and
+   [Deferred design goals](#deferred-design-goals-to-solve-later).)*
+4. **Watermark handoff:** snapshot files are **appended into `<table>_raw`** (marked
    `kind='snapshot'`) alongside streamed files, so raw may briefly hold both the snapshot tail
    and the stream head for the same PK. The **transform** collapses that overlap: dedup-to-latest
    by **`(commit_lsn, lsn)`** keeps the winning row (a streamed change has
@@ -542,18 +560,23 @@ Per the "snapshot → then stream" choice:
 > [§1.9](#19-slot-liveness--heartbeat--keepalive) exists to keep this one slot healthy forever so
 > we never have to open a second one.
 >
-> **Single-table reloads / re-syncs are a deliberate NON-goal for now.** There is **no per-table
-> recovery path** in v1 (see [Non-goals](#goals--non-goals)): a table that quarantines on a lossy
-> `ALTER COLUMN TYPE` cast is left as-is and alerted, *not* individually reloaded. The vision is
-> for the tool to eventually own single-table reloads too, but **we are explicitly not solving
-> that here** — the only full re-sync that exists is the whole-system total-restart, which rebuilds
-> *every* table together, never just one.
+> **Single-table reloads / re-syncs are a deferred design goal (not yet built).** There is **no
+> per-table recovery path** in v1 (see [Non-goals](#goals--non-goals) and
+> [Deferred design goals](#deferred-design-goals-to-solve-later)): a table that quarantines on a
+> lossy `ALTER COLUMN TYPE` cast is left as-is and alerted, *not* individually reloaded. The vision
+> is for the tool to eventually own single-table reloads too — **reloading one table while the WAL
+> stream keeps running for every other table** — but **we are explicitly not solving that here**;
+> the only full re-sync that exists today is the whole-system total-restart, which rebuilds *every*
+> table together, never just one.
 
 The system consumes **exactly one** logical replication slot for its **entire life** — there
 is no multi-slot sharding. That makes `walrus-pg-sink` inherently a **single active consumer of
-a single slot** (one active pod: StatefulSet `replicas=1` or leader-elected). The single sink is
-the decode/stage throughput ceiling; the **parallelism lever is the loader** (one worker per
-table/DuckDB file), which lives downstream of S3 and never touches the slot.
+a single slot** (one active pod: StatefulSet `replicas=1` or leader-elected), scaled **up** (more
+CPU/memory), never out. The single sink is the decode/stage throughput ceiling; the **parallelism
+lever is the loader** (one worker per table/DuckDB file), which lives downstream of S3 and never
+touches the slot — **today those workers run inside a single loader pod (scale it up)**; spreading
+tables across multiple loader pods is a [deferred design goal](#deferred-design-goals-to-solve-later),
+not yet real.
 
 **Epoch (generation).** The slot's lifetime = one **epoch**, tracked in
 `walrus.replication_state`. *Everything* is namespaced by epoch — the S3 prefix
@@ -786,7 +809,7 @@ columns, widens types, or follows renames — it never destructively drops or ca
 | `RENAME COLUMN` | Yes | `ALTER TABLE RENAME COLUMN`; columns tracked by `attnum`/position so renames are unambiguous. | `ALTER TABLE RENAME COLUMN` (same logical column, tracked by `attnum`) so appends keep aligning. |
 | `RENAME TABLE` | Yes | re-map/rename the per-table DuckDB file; table identity tracked by a stable id, not name alone. | rename `<table>_raw` too (same file, same stable id). |
 | `NOT NULL` / `DEFAULT` / `CHECK` add/drop | No (metadata) | recorded for lineage; **not enforced** on the mirror in v1 (values still flow as DML). | **None** (raw never enforces constraints). |
-| `TRUNCATE` | n/a (stream op) | carries no tuple/PK, so it's **not** a `MERGE` branch: the transform **empties the mirror** as of the truncate commit LSN `T` (`DELETE FROM <table>`) and repopulates from rows with `commit_lsn > T` ([§2.1](#21-the-raw-to-mirror-transform-model)). | the `t` op is **appended as a logged row** (raw is **not** truncated). |
+| `TRUNCATE` | n/a (stream op) | carries no tuple/PK, so it's **not** a `MERGE` branch: the transform **empties the mirror** as of the truncate tuple `(Ct, Lt) = (commit_lsn, lsn)` (`DELETE FROM <table>`) and repopulates from rows **strictly after `(Ct, Lt)`** — the tuple, not scalar `commit_lsn`, so a same-txn `TRUNCATE; INSERT` (shared `commit_lsn`) isn't dropped ([§2.1](#21-the-raw-to-mirror-transform-model)). | the `t` op is **appended as a logged row** (raw is **not** truncated). |
 | `DROP TABLE` | Yes | drop/retire the DuckDB table; stop replicating it. | drop/retire `<table>_raw` and the file too. |
 | `CREATE TABLE` (added to publication) | new registry entry | PK preflight applies → create the `.duckdb` file with **both** `<table>` and `<table>_raw` + snapshot the new table. | created alongside the mirror (both live in the new file). |
 
@@ -933,10 +956,14 @@ single-writer) — and that one writer owns **both** tables in the file (`<table
    `<table>_raw`), driven by `ddl_manifest` + `schema_registry`, **before** transforming data
    past that LSN.
 5. **Apply truncates first.** A pgoutput `TRUNCATE` carries **no tuple/PK**, so it can't be a
-   `MERGE` join branch. Take `T = max(commit_lsn)` of any `op='t'` row in the new tail; if present,
-   the mirror is empty as of `T`, so `DELETE FROM <table>` (a truncate wipes the whole table) and
-   let only rows with `commit_lsn > T` repopulate it in the next step.
-6. **Dedup-to-latest per PK** over `<table>_raw` rows with `commit_lsn > max(transformed_lsn, T)`
+   `MERGE` join branch. Take `(Ct, Lt) = (commit_lsn, lsn)` of the **latest** `op='t'` row in the
+   new tail; if present, the mirror is empty as of that truncate, so `DELETE FROM <table>` (a
+   truncate wipes the whole table) and let only rows **strictly after the tuple `(Ct, Lt)`**
+   repopulate it in the next step. The boundary is the `(commit_lsn, lsn)` **tuple**, not the scalar
+   `commit_lsn`: a `TRUNCATE; INSERT …` in **one transaction** shares a `commit_lsn`, so a
+   `commit_lsn > Ct` filter would wrongly drop those post-truncate inserts.
+6. **Dedup-to-latest per PK** over `<table>_raw` rows with `commit_lsn > transformed_lsn` **and
+   strictly after the truncate tuple `(Ct, Lt)`** when one is present
    (window `row_number() OVER (PARTITION BY pk ORDER BY commit_lsn DESC, lsn DESC)` — commit LSN
    first, row LSN as the intra-txn tiebreaker), **excluding `op='t'`**, into a `TEMP` staging
    table; resolve any `unchanged_toast` columns by **scanning `<table>_raw` backward from the
@@ -980,20 +1007,28 @@ Each `.duckdb` file holds **two tables** for one source table:
 
 ```sql
 BEGIN;
--- T := (SELECT max(commit_lsn) FROM <table>_raw WHERE commit_lsn > :transformed_lsn AND op = 't')  -- may be NULL
--- 0. TRUNCATE has no tuple/PK, so it can't be a MERGE branch. If the tail contains one,
---    the table is empty as of T: wipe the mirror, and apply only post-T rows below.
-DELETE FROM <table> WHERE :T IS NOT NULL;   -- no-op when the tail has no truncate
+-- (Ct, Lt) := the (commit_lsn, lsn) TUPLE of the LATEST truncate in the tail:
+--   SELECT commit_lsn, lsn FROM <table>_raw
+--   WHERE commit_lsn > :transformed_lsn AND op = 't'
+--   ORDER BY commit_lsn DESC, lsn DESC LIMIT 1;      -- both NULL if the tail has no truncate
+-- 0. TRUNCATE has no tuple/PK, so it can't be a MERGE branch. If the tail contains one, the
+--    mirror is empty as of that truncate: wipe it, and apply only rows AFTER (Ct, Lt) below.
+--    NOTE: the boundary is the TUPLE (commit_lsn, lsn), not the scalar commit_lsn — a
+--    `TRUNCATE; INSERT ...` in ONE transaction shares a commit_lsn, so a `commit_lsn > Ct`
+--    filter would drop those post-truncate inserts; `(commit_lsn, lsn) > (Ct, Lt)` keeps them.
+DELETE FROM <table> WHERE :Ct IS NOT NULL;   -- no-op when the tail has no truncate
 
 -- 1. Dedup the post-truncate tail to the latest op per PK (truncate rows excluded).
---    Order by commit_lsn (delivery/commit order); row lsn only breaks ties within one txn.
+--    Order by commit_lsn (delivery/commit order); row lsn breaks ties within one txn AND
+--    orders same-commit ops (e.g. TRUNCATE then INSERT in one transaction).
 CREATE TEMP TABLE _batch AS
   SELECT * EXCLUDE (rn) FROM (
     SELECT *, row_number() OVER (PARTITION BY <pk> ORDER BY commit_lsn DESC, lsn DESC) AS rn
     FROM <table>_raw
-    WHERE commit_lsn > COALESCE(:T, :transformed_lsn) -- rows at/below a truncate are moot
-      AND op <> 't'                                   -- truncate handled above, never in the MERGE
-  ) WHERE rn = 1;                                     -- latest op per PK (dedup AFTER ranking)
+    WHERE commit_lsn > :transformed_lsn                   -- only the un-transformed tail
+      AND (:Ct IS NULL OR (commit_lsn, lsn) > (:Ct, :Lt)) -- and strictly after any truncate tuple
+      AND op <> 't'                                       -- truncate handled above, never in the MERGE
+  ) WHERE rn = 1;                                         -- latest op per PK (dedup AFTER ranking)
 -- 2. Resolve unchanged_toast per column: for each column in s.unchanged_toast, replace the
 --    sentinel with the last NON-sentinel value for that PK found by scanning <table>_raw back
 --    from the winner's (commit_lsn, lsn); fall back to the current <table> value only if raw has none.
@@ -1018,6 +1053,45 @@ INTO` needs **no** PK/UNIQUE on the target and does insert/update/delete in one 
 PK/UNIQUE and a pre-deduped batch, and must list every non-key column in `SET`. The truncate
 pre-step (step 0/5) and the unchanged-TOAST back-scan (step 2/6) apply **identically** to the
 fallback path — it inherits the same gaps otherwise.
+
+**Intra-batch PK-churn collapse rule (normative).** Within a single transform window, for **every**
+primary key that appears, the transform applies **exactly one** action, derived from the single
+**latest** raw event for that key — the row maximizing the tuple `(commit_lsn, lsn)` among all
+non-truncate rows above the effective floor (the `rn = 1` winner). Any number of earlier events for
+that key in the window — an `insert`, then a `delete`, then another `insert`, in any mix — are
+**discarded before the `MERGE`**. The action is chosen **solely by the winner's `op`**:
+
+- winner `op ∈ {i, u}` → the key's mirror row **becomes the winner tuple** (INSERT if absent,
+  UPDATE all non-key columns if present);
+- winner `op = 'd'` → the key is **absent** from the mirror (DELETE if present, **no-op** if absent).
+
+So a sequence ending in insert/update (`… → i` / `… → u`, e.g. **`insert → delete → insert`** or
+`delete → insert`) yields the **last tuple**, regardless of any preceding delete; a sequence ending
+in delete (`… → d`, e.g. `insert → delete`, `insert → update → delete`) yields **absence**; and a
+delete for a key that was never in the mirror and is not re-inserted later in the window is a
+**no-op**. This is exactly why deletes are filtered **after** ranking, never before — pre-filtering
+`op='d'` would let a superseded earlier insert win and resurrect a deleted key.
+
+**PK reuse is resolved by definition.** When two inserts on one key carry different data
+(`insert(A) → delete → insert(B)`), the mirror resolves to the later tuple `B`. That is correct: the
+`<table>` mirror is a current-state snapshot holding **exactly one row per key** and cannot represent
+"two logically distinct rows that reused a PK" — the full `insert → delete → insert` history, and the
+fact that A and B are distinct logical rows, is preserved only in `<table>_raw`.
+
+**Set-based, at scale.** Because the winner is picked by `row_number() OVER (PARTITION BY <pk> …)`,
+every key's churn collapses **simultaneously in one pass** — the collapse is a natural byproduct of
+the partitioned window, with no per-key loop or correlated subquery, so it holds whether one key or
+millions of keys churn in the same batch.
+
+**Unit-testable by construction.** The dedup + collapse is **pure, self-contained SQL** parameterized
+only by `<table>`, the `<pk>` column list, and `:transformed_lsn`, reading exclusively from
+`<table>_raw` (plus `<table>` for the final `MERGE`) — no S3, no Postgres, no network, no Rust state.
+Because DuckDB is in-process (the `duckdb` crate, `bundled`), a unit test runs the **exact production
+transform SQL** against a `Connection::open_in_memory()`: seed `<table>_raw` with scripted `i`/`d`/`i`
+sequences across many PKs, run the transform, and assert the resulting `<table>`. Ship the transform
+as a single parameterized SQL template (a `const &str` / `.sql` in `crates/loader`) so the test and
+the loader share one source of truth (concrete cases in
+[Verification](#verification-how-well-prove-it-works-end-to-end-later)).
 
 **Transform — full-rebuild (periodic self-heal + compaction).** On a slower cadence (and after
 any drift/quarantine recovery), `CREATE OR REPLACE TABLE <table> AS SELECT …` window-dedups over
@@ -1152,7 +1226,7 @@ is greppable in `kubectl logs` / crash events.
 | Concern | Approach |
 |---|---|
 | **`walrus-pg-sink`** | **`StatefulSet` replicas=1** — exactly one active consumer of the **single, lifelong slot** ([§1.8](#18-single-slot-for-life--total-restart)) *or* `Deployment` + **leader election** (`coordination.k8s.io/Lease`). On failover, the new pod resumes from the slot's `confirmed_flush_lsn` — Postgres retained the WAL, so **no loss**. |
-| **`walrus-loader`** | **`StatefulSet`**, each replica owns a disjoint set of tables (consistent hashing) with a **PVC per replica** for the `.duckdb` files. Scale by resharding table ownership (not naive HPA — file ownership is exclusive). |
+| **`walrus-loader`** | **`StatefulSet` `replicas=1` today** — one active loader owns **all** `.duckdb` files on its PVC and runs one worker thread per table; scale it **up** (CPU/memory / more per-table workers). *Deferred:* spreading tables across multiple replicas (consistent hashing, PVC per replica, resharding table ownership — never naive HPA, since file ownership is exclusive) is a [deferred design goal](#deferred-design-goals-to-solve-later). |
 | **Control Postgres** | Small managed instance (or `walrus` schema in source). Holds manifest/checkpoint/ddl/registry. |
 | **S3 access** | IRSA / Workload Identity — no static keys. `object_store` (sink) + DuckDB `httpfs`/`SET s3_*` (loader) [11]. |
 | **Config / cadence** | `ConfigMap`: sink `max_fill_ms`/`max_bytes`/`max_rows`, loader poll interval (append + transform share it in v1) **plus** a slower, **per-table-overridable** transform **compaction/full-rebuild + raw-retention** cadence — the user's cadence control. Secrets for DB/S3 creds. |
@@ -1160,7 +1234,7 @@ is greppable in `kubectl logs` / crash events.
 | **WAL safety cap** | Set `max_slot_wal_keep_size` on source as a backstop; tune `logical_decoding_work_mem` for the streaming threshold [3]. **Alert on retained WAL well before the cap.** |
 | **Slot liveness** | A **heartbeat** `CronJob`/timer writes `walrus.heartbeat` (or emits `pg_logical_emit_message`) on an interval so an idle publication can't pin WAL; the sink sends keepalive feedback under `wal_sender_timeout` regardless of durability ([§1.9](#19-slot-liveness--heartbeat--keepalive)). |
 | **Health / probes** | `startupProbe` gates the fail-fast [bootstrap](#startup--bootstrap-fail-fast-preflight); `readinessProbe` holds work until bootstrap completes; `livenessProbe` = replication connection alive + slot lag < cap (sink) / apply loop progressing (loader). |
-| **Scaling (single-slot constraint)** | **No multi-slot sharding** — one slot for life. The sink is the single-stream ceiling; scale *out* on the **loader** (one worker per table/DuckDB file) and *up* on the sink pod (CPU/decode). If one sink truly can't keep up, that's a capacity conversation, not more slots. |
+| **Scaling (single-slot constraint)** | **No multi-slot sharding** — one slot for life, so the sink is the single-stream ceiling and scales **up** only (CPU/decode). **The loader today also runs single-active and scales up** (CPU/memory, more per-table worker threads). Scaling the loader *out* across pods (table-sharding) is a [deferred design goal](#deferred-design-goals-to-solve-later), not yet real. Capacity is a **vertical** conversation, not more slots or more pods. |
 
 ---
 
@@ -1220,8 +1294,41 @@ support or **`pgwire-replication`** [2]) — the pgoutput decoder is **ours**
    phase 1; this phase adds the *speculative staging* + `Stream Commit`/`Stream Abort` gating for
    txns streamed before commit, **incl. rolled-back-subtransaction exclusion**
    ([§1.6](#16-large-transaction-safety)).
-6. **Scale & ops:** loader table-sharding, K8s manifests, leader election/HA, observability, backpressure tuning.
+6. **Scale & ops:** K8s manifests, leader election/HA, observability, backpressure tuning — plus *(deferred)* multi-pod **loader table-sharding** for true horizontal scale-out (until then, scaling is vertical — see [Deferred design goals](#deferred-design-goals-to-solve-later)).
 7. **Resilience:** epoch/total-restart on slot loss/invalidation; orphan-slot cleanup.
+
+---
+
+## Deferred design goals (to solve later)
+
+> These are **intended capabilities, deliberately deferred** — not permanent
+> [non-goals](#goals--non-goals) and not open [unknowns/risks](#open-questions--risks). They are
+> features walrus plans to own, sequenced after the v1 slices above. Listed here so the "not yet"
+> is explicit and doesn't read as "never."
+
+1. **Single-table reload / re-sync while streaming.** Re-sync or reload **one** table — e.g. after
+   a quarantined lossy `ALTER COLUMN TYPE`, or on operator demand — **without a total-restart**,
+   while the single lifelong slot's WAL stream keeps flowing for **every other** table. Today the
+   only re-sync is the whole-system
+   [total-restart](#18-single-slot-for-life--total-restart), which rebuilds *every* table together;
+   there is **no per-table recovery path** ([§1.8](#18-single-slot-for-life--total-restart),
+   [Non-goals](#goals--non-goals)). Likely shape: copy the one table under a **fresh exported
+   snapshot**, then reconcile it against the live stream via a **per-table watermark handoff**
+   ([§1.7](#17-snapshot--backfill-bootstrap)), all without disturbing the slot or the other tables'
+   loaders.
+2. **True multi-pod horizontal scale-out (loader table-sharding).** Today walrus scales
+   **vertically** — one active sink pod and one active loader pod, each scaled *up* (CPU/memory;
+   the loader also via more per-table worker threads *within* the one pod). Horizontal scale-out —
+   **multiple loader replicas each owning a disjoint set of tables** (consistent hashing, PVC per
+   replica, exclusive file ownership guarded by a **fencing token** — see
+   [Open Q4](#open-questions--risks)) — is planned but **not yet real**. The **sink** stays a
+   single consumer of the one lifelong slot regardless
+   ([§1.8](#18-single-slot-for-life--total-restart)); horizontal scale is a **loader** story only.
+3. **Faster initial export / backfill (nearest-term).** Parallel **CTID-range** snapshotting of
+   large tables under the single exported snapshot — see
+   [§1.7](#17-snapshot--backfill-bootstrap) step 3 and [Open Q9](#open-questions--risks). Unlike (1)
+   and (2) it needs **no** new slot, epoch, or ownership machinery — only concurrent `COPY` under
+   the snapshot already exported at bootstrap — so it is the nearest-term of these goals.
 
 ---
 
@@ -1258,7 +1365,9 @@ support or **`pgwire-replication`** [2]) — the pgoutput decoder is **ours**
    DuckLake-over-object-store; backup/restore of `.duckdb` files; how end users query them.
    Two concrete residuals: (a) **loader ownership leases need fencing** — a lease + a
    `ReadWriteOnce` PVC still allows split-brain during table-ownership resharding if a demoted owner
-   keeps writing, so carry a **fencing token / generation number**; (b) **version currency** —
+   keeps writing, so carry a **fencing token / generation number** *(this residual applies only
+   once the deferred [multi-pod loader sharding](#deferred-design-goals-to-solve-later) path is
+   built — a single-active loader never reshards)*; (b) **version currency** —
    `MERGE INTO` needs DuckDB **≥ 1.4.0 LTS**, whose community support ends **2026-09-16**, so pin
    the latest 1.4.x patch and plan the next-LTS bump rather than shipping bare 1.4.0.
 5. **Relaxed cross-table consistency** from one-file-per-table — confirm acceptable for the
@@ -1268,18 +1377,25 @@ support or **`pgwire-replication`** [2]) — the pgoutput decoder is **ours**
    operator UX for a rejected/quarantined table (hard error vs skip-and-alert) and how to
    inventory existing source tables for PK coverage before onboarding.
 7. **Control-plane DB placement** — dedicated instance (recommended) vs a schema in source.
-8. **Intra-batch PK churn (`insert → delete → insert` on the same key) — deferred.** When one
-   batch/window contains an insert, then a delete, then another insert for the *same* primary
-   key, the loader's dedup-to-latest transform needs a precise, verified collapse rule.
-   Keeping the highest-LSN op per PK usually yields the right final state, but ordering /
-   tombstone edge cases — and PK *reuse* by a genuinely different logical row — are not yet
-   formally handled. **Explicitly out of scope for now**; revisit with transform hardening.
-9. **Faster initial snapshot / backfill of large tables — deferred.** The consistent snapshot
-   ([bootstrap](#startup--bootstrap-fail-fast-preflight)) is the slowest onboarding step
-   for big tables. PeerDB's technique for making `pg_dump`/`pg_restore` ~5× faster (parallel,
-   chunked **CTID-range** export with tuned settings) is a candidate optimization for our
-   snapshot path — parallelize the initial per-table read instead of a single serial copy.
-   Out of scope for v1; revisit when snapshot time becomes the bottleneck.
+8. **Intra-batch PK churn (`insert → delete → insert` on the same key) — specified.** When one
+   batch/window contains an insert, then a delete, then another insert for the *same* primary key,
+   the loader's dedup-to-latest transform collapses it to the **single latest `(commit_lsn, lsn)`
+   winner** per the normative **[Intra-batch PK-churn collapse rule](#21-the-raw-to-mirror-transform-model)**
+   in §2.1: `… → i/u` yields the last tuple, `… → d` yields absence, deletes are filtered **after**
+   ranking, and it runs set-based across arbitrarily many keys per batch. **PK reuse** (`i(A) → d →
+   i(B)`) resolves to `B` by the mirror's one-row-per-key contract (full history stays in
+   `<table>_raw`). Covered by dedicated unit tests (see
+   [Verification](#verification-how-well-prove-it-works-end-to-end-later)).
+9. **Faster initial snapshot / backfill of large tables — a stated goal (not deferred).** The
+   consistent snapshot ([bootstrap](#startup--bootstrap-fail-fast-preflight)) is the slowest
+   onboarding step for big tables, and speeding it up is now an explicit goal of the initial-load
+   path ([§1.7](#17-snapshot--backfill-bootstrap) step 3,
+   [Deferred design goals](#deferred-design-goals-to-solve-later)). The technique is **parallel
+   CTID-range export under the single exported snapshot**: partition each large table by CTID and
+   `COPY` multiple ranges concurrently under the same `SET TRANSACTION SNAPSHOT`, using binary
+   COPY + TID-range scans + cursors — following PeerDB's ~5× result. Residuals to confirm:
+   range-sizing heuristic, worker count vs. source load, and skew on bloated tables (many dead
+   tuples per CTID range).
    ([PeerDB: making pg_dump/pg_restore 5× faster](https://blog.peerdb.io/how-can-we-make-pgdump-and-pgrestore-5-times-faster))
 10. **Transform vs load cadence (v1 = one poll, two watermarks).** Append-to-raw and
     transform-to-mirror share the loader poll in v1 (two transactions, two watermarks); a slower
@@ -1317,6 +1433,19 @@ support or **`pgwire-replication`** [2]) — the pgoutput decoder is **ours**
 - **TRUNCATE:** stream a `TRUNCATE`, then re-`INSERT` rows after it in the same tail; assert the
   transform empties the mirror as of the truncate LSN and keeps only the post-truncate rows —
   and that a user `TRUNCATE` never stalls the pipeline (no NOT-NULL-PK insert of a truncate row).
+- **Intra-batch PK churn (`insert → delete → insert`, Open Q8):** in one transform window, seed
+  `<table>_raw` with **N** primary keys each carrying `i → d → i` (distinct `lsn`); run the
+  transform and assert every key's mirror row equals its **last** insert and `COUNT(*) = N` — no
+  delete survivors, no first-insert survivors (proves the partitioned-window collapse is set-based
+  across many keys). Add: keys with `i → d` and `i → u → d` plus a phantom `d` for a never-seen key
+  → assert **all absent** (delete-after-ranking + the `NOT MATCHED AND op<>'d'` guard); `i(A) → d →
+  i(B)` with `A ≠ B` and a `d → i` on a **pre-seeded** mirror key → assert mirror = `B` / the insert
+  data (last-tuple-wins across a tombstone, MATCHED-UPDATE path). Because the transform is pure SQL
+  on an in-memory DuckDB, this is a fast, hermetic unit test.
+- **Same-commit `TRUNCATE`-then-`INSERT` (truncate-boundary regression):** put a `TRUNCATE` and the
+  follow-up `INSERT`s in **one transaction** (shared `commit_lsn`); assert the post-truncate rows
+  **survive** — a guard for the `(commit_lsn, lsn)` **tuple** boundary (a scalar `commit_lsn > Ct`
+  filter would drop them).
 - **Large txn:** a multi-million-row transaction with `streaming='on'`; assert **memory and
   slot size stay bounded** and the txn appears atomically after commit; then a large txn that
   **aborts** and assert nothing leaks to DuckDB.
