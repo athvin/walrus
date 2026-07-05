@@ -654,34 +654,58 @@ first sketch and are non-negotiable.
 
 ## Data type translation (Postgres → Arrow → Parquet)
 
-Apache Arrow is the single intermediate representation. **⚠ This is the design's biggest
-unknown and highest-effort area:** research confirmed the Arrow↔Parquet *writer/reader*
-mechanics [7][8] but **could not source-verify a canonical per-type Postgres→Arrow mapping**.
-Treat the table below as the **conventional starting point to validate in a spike**, not
-gospel.
+> **⤷ Full treatment in [`walrus-pg-sink.md` §2](./walrus-pg-sink.md#2-data-type-conversion-postgres--arrow--parquet--duckdb).**
+> The spike this section once flagged is done. The table below is the **corrected summary** (three-tier
+> model; `interval` → 3 columns; ranges → 5 flat columns; multiranges → `LIST<STRUCT>`; the
+> `Decimal256`-doesn't-round-trip and unconstrained-`numeric` → `VARCHAR` fixes); the companion carries the
+> full per-type table, the descriptor, and the round-trip conformance tests.
 
-| Postgres type | Arrow `DataType` (proposed) | Notes / risk |
-|---|---|---|
-| `bool` | `Boolean` | |
-| `int2/4/8` | `Int16/32/64` | |
-| `float4/8` | `Float32/64` | |
-| `numeric(p,s)` | `Decimal128(p,s)` (p≤38) / `Decimal256` | ⚠ **unconstrained `numeric`** has no column-wide p/s → fall back to **`Utf8`** (what ADBC / `connector_arrow` do; a max-precision `Decimal` risks overflow/scale loss). Decide the DuckDB target type (VARCHAR vs DECIMAL+`CAST`) deliberately — a silent load `CAST` failure aborts the MERGE. |
-| `money` | `Decimal128(19,2)` or `Int64` | locale-sensitive; treat carefully. |
-| `char/varchar/text` | `Utf8` (`LargeUtf8` if huge) | |
-| `bytea` | `Binary` / `LargeBinary` | |
-| `uuid` | `FixedSizeBinary(16)` | ⚠ round-trips into DuckDB as **BLOB**, not `UUID`, unless the Parquet **UUID logical-type** annotation is emitted (arrow-rs omits it by default) → prefer canonical **text**, or cast on load. |
-| `json` / `jsonb` | `Utf8` (canonical text) + field metadata tag | DuckDB re-parses to `JSON`; keeping text is simplest and lossless. |
-| `date` | `Date32` | |
-| `time` | `Time64(Microsecond)` | |
-| `timetz` | `Utf8` or `Int64`+offset | ⚠ Arrow has no tz-aware time. |
-| `timestamp` | `Timestamp(Microsecond, None)` | |
-| `timestamptz` | `Timestamp(Microsecond, Some("UTC"))` | store normalized to UTC. |
-| `interval` | `Interval(MonthDayNano)` | ⚠ **no clean Parquet round-trip** — Parquet's interval logical type is month/day/**millis**, so nanoseconds truncate or the write is rejected → store as `bigint` µs (or text) unless verified end-to-end. |
-| arrays `T[]` | `List<T>` | nested arrays → nested `List`. |
-| `enum` | `Dictionary(Int32, Utf8)` or `Utf8` | enum labels come from catalog / `Type` messages. |
-| composite/row | `Struct<...>` | |
-| `inet/cidr/macaddr`, ranges, `tsvector`, `bit`, geometric, `hstore` | `Utf8` fallback (or `Map` for hstore) | ⚠ lossy-to-text unless we invest per-type. |
-| **NULL** (any) | Arrow **validity bitmap** (nullable field) | pgoutput signals null vs unchanged-TOAST distinctly — see below. |
+Apache Arrow is the single intermediate representation. **⚠ This was the design's biggest
+unknown and highest-effort area** — research confirmed the Arrow↔Parquet *writer/reader*
+mechanics [7][8], and the per-type Postgres→Arrow→Parquet→DuckDB mapping has since been
+**validated and source-cited** in
+[`walrus-pg-sink.md` §2](./walrus-pg-sink.md#2-data-type-conversion-postgres--arrow--parquet--duckdb).
+The table below is the **corrected summary**; the companion is authoritative (exact multi-column
+decompositions, the descriptor, and the round-trip conformance tests).
+
+| Tier | Postgres type | Arrow `DataType` | DuckDB target | 1:1? | Notes / emitted columns |
+|---|---|---|---|---|---|
+| 1 | `bool` | `Boolean` | `BOOLEAN` | ✅ | |
+| 1 | `int2/4/8` | `Int16/32/64` | `SMALLINT/INTEGER/BIGINT` | ✅ | |
+| 1 | `float4/8` | `Float32/64` | `FLOAT/DOUBLE` | ✅ | |
+| 1 | `numeric(p,s)`, **p≤38** | `Decimal128(p,s)` | `DECIMAL(p,s)` | ✅ | keep **distinct in code** from unconstrained numeric |
+| 3 | `numeric` unconstrained / **p>38** | `Utf8` | `VARCHAR` | ❌ | **not** `Decimal256` (DuckDB downcasts Parquet decimal p>38 → `DOUBLE`); `VARCHAR` is lossless, loader `CAST`s where provably safe |
+| 3 | `money` | `Decimal128(19,2)` | `DECIMAL(19,2)` | ⚠ | fraction digits = `lc_monetary` server setting → carry as metadata |
+| 1 | `char/varchar/text` | `Utf8` (`LargeUtf8` if huge) | `VARCHAR` | ⚠ | content 1:1; length + `char(n)` padding carried as metadata |
+| 1 | `bytea` | `Binary`/`LargeBinary` | `BLOB` | ✅ | |
+| 3 | `uuid` | `FixedSizeBinary(16)` **+ `arrow.uuid`** | `UUID` | ⚠ | native **only** with the `arrow.uuid` canonical extension (bare FSB(16) → BLOB); else `VARCHAR`+`CAST` |
+| 1 | `json` | `Utf8` | `JSON` | ✅ | verbatim, byte-lossless |
+| 1 | `jsonb` | `Utf8` | `JSON` | ⚠ | re-serialized (normalized), semantically lossless |
+| 1 | `date` | `Date32` | `DATE` | ✅ | |
+| 1 | `time` | `Time64(µs)` | `TIME` | ✅ | |
+| 2 | `timetz` | `Int64` + `Int32` | `TIMETZ` (rebuilt) | ❌ | **decompose** → `<c>_micros BIGINT` + `<c>_offset_seconds INTEGER` (Arrow has no tz-aware time) |
+| 1 | `timestamp` | `Timestamp(µs, None)` | `TIMESTAMP` | ✅ | **MICROS** (never MILLIS/NANOS) |
+| 1 | `timestamptz` | `Timestamp(µs, "UTC")` | `TIMESTAMPTZ` | ✅ | normalized UTC (`isAdjustedToUTC`) |
+| 2 | `interval` | 3 × int | `INTERVAL` (rebuilt) | ❌ | **decompose** → `<c>_months INT32` + `<c>_days INT32` + `<c>_micros INT64`. **Not** `Interval(MonthDayNano)` (arrow-rs *errors* writing it to Parquet), **not** single-int64-µs (lossy) |
+| 1 | arrays `T[]` | `List<T>` | `LIST(T)` | ⚠ | nested `List` for multi-dim; custom lower subscript bounds lost |
+| 1 | composite/row | `Struct<...>` | `STRUCT(...)` | ✅ | |
+| 1 | `hstore` | `Map<Utf8,Utf8>` | `MAP(VARCHAR,VARCHAR)` | ✅ | or canonical JSON text |
+| 3 | `enum` | `Utf8` | `ENUM` (via CAST) | ❌ | value lossless as text; **ordered label set** carried as metadata (DuckDB reads Parquet ENUM as VARCHAR) |
+| 2 | **range** (`int4range`…`tstzrange`) | 5 fields | 5 cols | ❌ | **decompose** → `<c>_lower`, `<c>_upper`, `<c>_lower_inc BOOL`, `<c>_upper_inc BOOL`, `<c>_empty BOOL` |
+| 2 | **multirange** (PG14+) | `List<Struct>` | `LIST(STRUCT(…))` | ❌ | `LIST(STRUCT(lower,upper,lower_inc,upper_inc))` |
+| 2 | geometric (`point`/`line`/`box`/`path`/`polygon`/`circle`) | `Struct`/`List` of doubles | `STRUCT`/`LIST` | ❌ | `path` carries `is_closed`; see companion §2.4 |
+| 3 | `bit`/`varbit` | `Utf8` (`'0'/'1'`) | `BIT` (via CAST) | ❌ | self-describing `'0'/'1'` string + bit length metadata |
+| 3 | `inet/cidr/macaddr(8)`, `tsvector/tsquery`, `pg_lsn`, `xid/xid8` | `Utf8` (canonical) | `VARCHAR` | ❌ | canonical text, round-trips via `::type` cast |
+| 3 | PostGIS `geometry`/`geography` | `Binary`+`Int32` | `BLOB`+`INTEGER` | ❌ | **deferred**; if needed `<c>_wkb BLOB` + `<c>_srid INTEGER` (native `GEOMETRY` only in DuckDB ≥1.5) |
+| 1 | `domain` | *(base type's mapping)* | *(base)* | ✅ | maps as the base type; domain name/constraints are catalog metadata |
+| — | **NULL** (any) | Arrow **validity bitmap** | (nullable) | — | pgoutput signals null vs unchanged-TOAST distinctly — see below |
+
+**Two rules the table encodes** (see [`walrus-pg-sink.md` §2.1](./walrus-pg-sink.md#21-the-one-rule-that-governs-everything-duckdb-reads-parquet-native-types)):
+DuckDB infers types from **Parquet-native logical types**, *not* arrow-rs's `ARROW:schema` metadata — so
+every distinction (UUID, `timestamptz` vs `timestamp`, decimal precision, JSON) must be a **real Parquet
+logical type**; and **all temporal types use MICROS**, never MILLIS/NANOS. *(DuckDB ≥1.5 adds a core
+`GEOMETRY` and a `VARIANT` type — absent from the pinned 1.4.x LTS — which would enable a 1:1 PostGIS
+mapping and richer json/hstore on the next-LTS bump.)*
 
 **Three correctness gotchas that must be in v1:**
 
@@ -719,6 +743,11 @@ Implementation: the `pg-to-arrow` crate maps the source relation schema (from pg
 
 ## DDL capture (schema evolution)
 
+> **⤷ Full treatment in [`walrus-pg-sink.md` §3](./walrus-pg-sink.md#3-ddl-capture--the-sinks-tap-on-the-source).**
+> The audit-table schema and framing below are **corrected inline** (structured `c_columns`/`c_dropped`
+> jsonb, `xid8` txid, GRANT the sequence; the `DROP COLUMN` and superuser-vs-`SECURITY DEFINER` fixes); the
+> companion adds the full `ddl_command_end` + `sql_drop` trigger/function bodies and the limitations checklist.
+
 Logical decoding **does not emit DDL** [3][5], so the source database **must have a DDL-capture
 trigger built on it** — a **required prerequisite** installed once on the source
 ([§1.1](#11-source-side-setup-one-time-via-migrationjob)), and the sole mechanism by which the
@@ -727,23 +756,33 @@ pattern** ([AWS: PostgreSQL as a DMS source](https://docs.aws.amazon.com/dms/lat
 [6]), adapted:
 
 ```sql
--- Fixed-schema audit table (AWS DMS awsdms_ddl_audit shape) [6]
+-- Audit table (AWS DMS awsdms_ddl_audit shape [6], corrected — full version in walrus-pg-sink.md §3.3)
 CREATE TABLE walrus.ddl_audit (
-  c_key    bigserial PRIMARY KEY,
-  c_time   timestamptz,   -- UTC (our metadata-timestamps rule; not the AWS bare `timestamp`)
-  c_user   varchar(64),
-  c_txn    varchar(16),
-  c_tag    varchar(24),   -- 'CREATE TABLE' | 'ALTER TABLE' | 'DROP TABLE'
-  c_oid    integer,
-  c_name   varchar(64),
-  c_schema varchar(64),
-  c_ddlqry text           -- raw DDL text (current_query())
+  c_key          bigserial PRIMARY KEY,
+  c_time         timestamptz NOT NULL DEFAULT now(),  -- UTC (our rule; not AWS's bare `timestamp`)
+  c_role         text        NOT NULL DEFAULT current_user,
+  c_txid         bigint      NOT NULL,   -- pg_current_xact_id() (xid8/bigint — NOT AWS's wraparound-ambiguous varchar(16))
+  c_lsn          pg_lsn,                 -- pg_current_wal_lsn() at capture — orders DDL vs data
+  c_event        text        NOT NULL,   -- 'ddl_command_end' | 'sql_drop'
+  c_tag          text        NOT NULL,   -- 'CREATE TABLE' | 'ALTER TABLE' | 'DROP TABLE' | 'COMMENT' | …
+  c_obj_schema   text,
+  c_obj_identity text,
+  c_rel_oid      oid,                    -- affected pg_class OID (pg_event_trigger_ddl_commands.objid)
+  c_columns      jsonb,                  -- STRUCTURED resulting column set [{name,format_type,attnum,not_null,default,is_generated,comment}]
+  c_dropped      jsonb,                  -- for sql_drop: dropped objects from pg_event_trigger_dropped_objects()
+  c_ddl_text     text                    -- raw current_query() — LINEAGE/DEBUG ONLY, never replayed
 );
+-- SECURITY DEFINER inserts by a non-owner also need the implicit sequence:
+--   GRANT USAGE, SELECT ON SEQUENCE walrus.ddl_audit_c_key_seq TO <writer_role>;
 
--- SECURITY DEFINER functions capture DDL into the audit table [6]. TWO triggers are needed:
+-- The functions snapshot DDL into the audit table [6]. TWO triggers are needed. (SECURITY DEFINER lets a
+-- non-owner's DDL still write the protected audit table — it is a CHOICE, not the privileged part;
+-- SUPERUSER is required to CREATE the EVENT TRIGGER, not to create the function.)
 --   ddl_command_end — fires for CREATE / ALTER / COMMENT / etc.; snapshots the resulting column set.
---   sql_drop        — REQUIRED to catch DROP TABLE / DROP COLUMN, which ddl_command_end does NOT
---                     enumerate (uses pg_event_trigger_dropped_objects()). See caveat below.
+--   sql_drop        — REQUIRED for the specific dropped-COLUMN identity ('table column', objsubid=attnum)
+--                     and CASCADE victims, via pg_event_trigger_dropped_objects(). (A DROP COLUMN's ALTER
+--                     is itself visible in ddl_command_end; only the exact dropped-column identity needs
+--                     sql_drop.) See caveat below.
 CREATE EVENT TRIGGER walrus_intercept_ddl  ON ddl_command_end
   EXECUTE FUNCTION walrus.intercept_ddl();   -- EXECUTE FUNCTION (PG11+ spelling; we target 14+)
 CREATE EVENT TRIGGER walrus_intercept_drop ON sql_drop
@@ -770,8 +809,10 @@ file of the new `schema_version` is appended) at that LSN before applying later 
 
 **⚠ Event triggers are NOT exhaustive** — a verified caveat from research: the claim that
 event triggers "reliably fire on all DDL events" was **refuted (0-3)**. Three concrete gaps:
-(a) `ddl_command_end` **does not fire for every command**; (b) **drops** (incl. `DROP COLUMN`)
-are only enumerable via the separate **`sql_drop`** event + `pg_event_trigger_dropped_objects()`;
+(a) `ddl_command_end` **does not fire for every command**; (b) the **specific dropped-column identity**
+(`'table column'`, `objsubid=attnum`) and CASCADE victims are only enumerable via the separate
+**`sql_drop`** event + `pg_event_trigger_dropped_objects()` — a `DROP COLUMN`'s `ALTER` is itself visible
+in `ddl_command_end`, so the earlier "does not enumerate drops" framing was overstated;
 and (c) event triggers fire for **no** command on **shared/global objects** (roles, databases,
 tablespaces) or on event triggers themselves — those are invisible to this mechanism (acceptable:
 walrus replicates *tables*, not globals). Mitigations:
@@ -786,7 +827,7 @@ walrus replicates *tables*, not globals). Mitigations:
 Capturing DDL is only half the job; each change class affects the pipeline differently. Two
 principles keep this tractable:
 
-- **Schema-diff, not DDL-text replay.** Rather than parse and re-execute the raw `c_ddlqry`
+- **Schema-diff, not DDL-text replay.** Rather than parse and re-execute the raw `c_ddl_text`
   across the Postgres→DuckDB dialect gap (fragile), the trigger *also* snapshots the affected
   table's **resulting column set** (name, type, `attnum`/position, nullability, comment) from
   the catalog at `ddl_command_end` into `schema_registry`. The loader derives the exact DuckDB
@@ -1223,17 +1264,40 @@ is greppable in `kubectl logs` / crash events.
 ### Kubernetes wiring
 - **`startupProbe`** gates the (possibly slow) bootstrap with a generous
   `failureThreshold × periodSeconds`; **`readinessProbe`** keeps the pod out of
-  rotation/work until bootstrap completes; **`livenessProbe`** covers the running loop.
+  rotation/work until bootstrap completes; **`livenessProbe`** = **true deadlock detection only** (the
+  replication/apply loop thread is alive) — **never** tied to slot lag (a pod catching up after an outage
+  has high lag by design; see the [deployment table](#kubernetes-deployment) /
+  [`walrus-pg-sink.md` §4.3](./walrus-pg-sink.md#43-probes--get-these-exactly-right)).
 - Optionally hoist the read-only environment checks (DB reachable, migrations current) into an
   **`initContainer`** so the main container only starts once the world is sane.
+
+### Graceful shutdown (SIGTERM drain)
+On `SIGTERM` (pod termination) each service drains before exit — full sequence in
+[`walrus-pg-sink.md` §4.5](./walrus-pg-sink.md#45-graceful-shutdown--the-missing-piece). The **sink**, in
+order: (1) stop requesting new WAL; (2) finish + flush the in-flight Arrow→Parquet→S3 batch and **COMMIT
+its manifest row**; (3) send a **final standby status update** advancing `confirmed_flush_lsn` (never past
+an open streamed txn, [§1.6](#16-large-transaction-safety)); (4) send `CopyDone` and close the replication
+connection; (5) **never drop the slot** — it persists server-side, so a replacement pod resumes from
+`confirmed_flush_lsn` (every restart is a *resume*; the loader's append+MERGE absorbs any at-least-once
+replay). Ensure the process is **PID 1 / under `tini` / exec-form** so `SIGTERM` isn't swallowed, set
+**`terminationGracePeriodSeconds` to the worst-case drain (60–120s, not the 30s default)**, and keep
+replying to keepalives during the drain (or keep it < `wal_sender_timeout` 60s) so the final feedback
+lands. The **loader** instead finishes its current append + transform, commits **both** watermarks, and
+releases its table lease + DuckDB writer lock. The **only** place the slot is ever dropped is an explicit
+**decommission** job ([§1.8](#18-single-slot-for-life--total-restart)).
 
 ---
 
 ## Kubernetes deployment
 
+> **⤷ Full treatment in [`walrus-pg-sink.md` §4](./walrus-pg-sink.md#4-kubernetes-pod-lifecycle).** The
+> **graceful-shutdown path** is specified there and summarized under
+> [Startup & bootstrap → Graceful shutdown](#startup--bootstrap-fail-fast-preflight); the probe / PDB /
+> topology hazards are **corrected inline** in the table below.
+
 | Concern | Approach |
 |---|---|
-| **`walrus-pg-sink`** | **`StatefulSet` replicas=1** — exactly one active consumer of the **single, lifelong slot** ([§1.8](#18-single-slot-for-life--total-restart)) *or* `Deployment` + **leader election** (`coordination.k8s.io/Lease`). On failover, the new pod resumes from the slot's `confirmed_flush_lsn` — Postgres retained the WAL, so **no loss**. |
+| **`walrus-pg-sink`** | **`StatefulSet` replicas=1** — exactly one active consumer of the **single, lifelong slot** ([§1.8](#18-single-slot-for-life--total-restart)) *or* `Deployment` + **leader election** (`coordination.k8s.io/Lease`). **The real split-brain guarantee is Postgres itself** — a second concurrent `START_REPLICATION` on an active slot *fails*, so a replacement pod retries the transient "slot is active" error with backoff; the Lease is only anti-thrash. On failover, the new pod resumes from the slot's `confirmed_flush_lsn` — Postgres retained the WAL, so **no loss**. |
 | **`walrus-loader`** | **`StatefulSet` `replicas=1` today** — one active loader owns **all** `.duckdb` files on its PVC and runs one worker thread per table; scale it **up** (CPU/memory / more per-table workers). *Deferred:* spreading tables across multiple replicas (consistent hashing, PVC per replica, resharding table ownership — never naive HPA, since file ownership is exclusive) is a [deferred design goal](#deferred-design-goals-to-solve-later). |
 | **Control Postgres** | Small managed instance (or `walrus` schema in source). Holds manifest/checkpoint/ddl/registry. |
 | **S3 access** | IRSA / Workload Identity — no static keys. `object_store` (sink) + DuckDB `httpfs`/`SET s3_*` (loader) [11]. |
@@ -1241,7 +1305,8 @@ is greppable in `kubectl logs` / crash events.
 | **Slot lifecycle** | Create the one slot+publication+DDL trigger via an init `Job`/migration; record its epoch in `replication_state`. If the slot is ever lost/invalidated → **total-restart** ([§1.8](#18-single-slot-for-life--total-restart)). **Orphan cleanup:** a decommissioned sink must *drop its slot* — an abandoned slot pins WAL forever [12]. |
 | **WAL safety cap** | Set `max_slot_wal_keep_size` on source as a backstop; tune `logical_decoding_work_mem` for the streaming threshold [3]. **Alert on retained WAL well before the cap.** |
 | **Slot liveness** | A **heartbeat** `CronJob`/timer writes `walrus.heartbeat` (or emits `pg_logical_emit_message`) on an interval so an idle publication can't pin WAL; the sink sends keepalive feedback under `wal_sender_timeout` regardless of durability ([§1.9](#19-slot-liveness--heartbeat--keepalive)). |
-| **Health / probes** | `startupProbe` gates the fail-fast [bootstrap](#startup--bootstrap-fail-fast-preflight); `readinessProbe` holds work until bootstrap completes; `livenessProbe` = replication connection alive + slot lag < cap (sink) / apply loop progressing (loader). |
+| **Health / probes** | `startupProbe` gates the fail-fast [bootstrap](#startup--bootstrap-fail-fast-preflight) (and suppresses liveness/readiness until it passes, so a long catch-up isn't killed); `readinessProbe` holds work until bootstrap completes; `livenessProbe` = **true deadlock detection only** — replication loop / apply loop **making progress**. ⚠ **Never** tie liveness to *slot lag* — a pod legitimately catching up after an outage has high lag by definition and would be killed into a restart loop. |
+| **PodDisruptionBudget** | Use **`maxUnavailable: 1`** or **no PDB** for the single-active sink and loader. ⚠ A single-replica PDB with **`minAvailable: 1`** makes the pod **unevictable** and permanently blocks `kubectl drain` / node upgrades — the opposite of the self-healing-through-node-drain goal. |
 | **Scaling (single-slot constraint)** | **No multi-slot sharding** — one slot for life, so the sink is the single-stream ceiling and scales **up** only (CPU/decode). **The loader today also runs single-active and scales up** (CPU/memory, more per-table worker threads). Scaling the loader *out* across pods (table-sharding) is a [deferred design goal](#deferred-design-goals-to-solve-later), not yet real. Capacity is a **vertical** conversation, not more slots or more pods. |
 
 ---
@@ -1268,7 +1333,7 @@ walrus/
 ├── Cargo.toml                 # workspace (name = walrus; member crates are unprefixed)
 ├── crates/
 │   ├── common/                # config, LSN/types, manifest & registry models, errors
-│   ├── pg-to-arrow/           # Postgres → Arrow schema+value mapping (the risky spike)
+│   ├── pg-to-arrow/           # Postgres → Arrow mapping (validated in walrus-pg-sink.md §2; high impl effort)
 │   ├── control/               # sqlx models for manifest/checkpoint/ddl/registry
 │   ├── pg-sink/               # bin: hand-rolled pgoutput consumer → Arrow → Parquet → S3 → manifest
 │   └── loader/                # bin: manifest poll → S3 → append→<tbl>_raw → transform (dedup/MERGE) → <tbl>
@@ -1352,10 +1417,13 @@ support or **`pgwire-replication`** [2]) — the pgoutput decoder is **ours**
 > + unconditional **keepalive** keep the single lifelong slot from stalling on WAL or timing out on
 > `wal_sender_timeout` ([§1.9](#19-slot-liveness--heartbeat--keepalive)).
 
-1. **⚠ Postgres→Arrow per-type mapping (highest effort, unverified).** Research confirmed the
-   Arrow/Parquet plumbing [7][8] but **not** a canonical per-type mapping. Spike: `numeric`
-   (unconstrained precision), `jsonb`, arrays of composites, `enum`, ranges, domains, custom
-   types. Owner of most implementation risk.
+1. **Postgres→Arrow per-type mapping — resolved (was the highest-effort unknown).** The canonical
+   per-type mapping is now **validated and source-cited** in
+   [`walrus-pg-sink.md` §2](./walrus-pg-sink.md#2-data-type-conversion-postgres--arrow--parquet--duckdb)
+   (three-tier model; `interval`→3 cols, ranges→5 flat cols, unconstrained/`p>38` `numeric`→`VARCHAR`
+   *not* `Decimal256`, `uuid` via the `arrow.uuid` extension, `enum`/`bit`/`timetz`/geometric handled).
+   The **residual is implementation + round-trip conformance testing** (companion §2.8), not an unverified
+   research spike — still the owner of most implementation effort.
 2. **⚠ Event triggers aren't exhaustive** (verified caveat, refuted 0-3 claim). The design now
    installs the **`sql_drop`** trigger for drops and requires `walrus.ddl_audit` to be published
    ([DDL capture](#ddl-capture-schema-evolution)); residual: **shared/global-object DDL** (roles,
@@ -1522,8 +1590,9 @@ Primary sources are Postgres/AWS/vendor docs and project repos; blogs are corrob
 20. PostgreSQL — Logical Replication Message Formats (Stream Start/Stop/Commit/Abort, per-message xid) — https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html *(primary)*
 21. PostgreSQL — `pgoutput.c` (parses `proto_version`/`streaming` from START_REPLICATION; slot has no such attribute) — https://github.com/postgres/postgres/blob/master/src/backend/replication/pgoutput/pgoutput.c *(primary)*
 
-> **Research caveats to remember:** the per-type Postgres→Arrow mapping (⚠ Open Q1) was not
-> source-verified; "event triggers fire on all DDL" was **refuted** (⚠ Open Q2); PeerDB's
+> **Research caveats to remember:** the per-type Postgres→Arrow mapping is now **source-cited** in
+> [`walrus-pg-sink.md` §2](./walrus-pg-sink.md#2-data-type-conversion-postgres--arrow--parquet--duckdb)
+> (Open Q1 resolved); "event triggers fire on all DDL" was **refuted** (⚠ Open Q2); PeerDB's
 > internal connector code was used only to corroborate protocol facts, not verified directly.
 > `supabase/etl` [1] is cited as **prior art only** — we hand-roll the consumer
 > ([§1.2](#12-replication-consumer--hand-rolled)), so its destination statuses don't affect us.
