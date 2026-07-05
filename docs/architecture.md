@@ -265,6 +265,14 @@ CREATE PUBLICATION walrus_pub FOR TABLE orders, customers, ...   -- or FOR ALL T
   slot property), you can change it by reconnecting — no slot recreation — so make both
   configurable.
 
+  > **Empirical companion:** every protocol claim in this section — that `proto_version` is a
+  > per-connection option (same slot at v1 vs v2 = identical bytes), that `v2 + streaming 'on'` is
+  > what chops a large transaction into `Stream Start/Stop/Commit` blocks, and the exact
+  > `Stream Abort` behavior for a rolled-back savepoint — is **captured from a live Postgres 16** in
+  > [`proto-version.md`](./proto-version.md), with a reproducible Docker harness
+  > ([`examples/proto-version/`](./examples/proto-version/)). Read it alongside this section and
+  > [§1.6](#16-large-transaction-safety) for the byte-level detail behind the consumer rules.
+
 #### Why `proto_version '2'` + `streaming 'on'` (and the pitfalls it avoids)
 
 The pair isn't a tuning preference — it's forced by how logical decoding behaves **without**
