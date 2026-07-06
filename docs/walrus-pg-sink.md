@@ -624,15 +624,30 @@ This is where the master sketch has a **self-healing hazard**, corrected here:
 > **⚠ Correction to `architecture.md`:** do **not** set `livenessProbe = "slot lag < cap"`. A pod
 > legitimately **catching up after an outage** has *high* lag *by definition* — a lag-based liveness
 > probe would kill it exactly when it's doing its job, producing a restart loop that never catches up.
-> Gate slow catch-up behind the `startupProbe`; reserve liveness for genuine hangs.
+> Gate slow catch-up behind the `startupProbe`; reserve liveness for genuine hangs. **The heartbeat
+> round-trip ([architecture.md §1.9](./architecture.md#19-slot-liveness--heartbeat--keepalive)) is the
+> same story:** a stale round-trip during a legitimate catch-up is expected, so it feeds a `degraded`
+> field on the **readiness/health** endpoint + an alert — **never** a `livenessProbe` kill, and never
+> a hard readiness gate that would loop.
 
 ### 4.4 Steady state
 
+- **Memory footprint — size the budget below the pod limit.** The sink's aggregate in-memory ceiling
+  `max_inflight_bytes` ([architecture.md §1.3](./architecture.md#13-in-memory-batching--cadence)) must
+  sit **below the container's memory `limit`**, with headroom for the Arrow builders + the Parquet
+  writer's row-group / dictionary / compression buffers — never the full limit, or a cgroup OOM-kill
+  beats the graceful spill-to-S3. Set the K8s memory `request` = `limit` (**Guaranteed** QoS) so the
+  pod isn't evicted under node pressure mid-drain. This is the concrete "the pod doesn't fall over"
+  wiring; the source's `logical_decoding_work_mem` does **not** help here (it bounds the *server's*
+  reorder buffer, not ours).
 - **Slot liveness** (keep, from [architecture.md §1.9](./architecture.md#19-slot-liveness--heartbeat--keepalive)):
-  a **heartbeat** (a published `walrus.heartbeat` write, or `pg_logical_emit_message`, PG14+) so an idle
-  publication can't pin WAL; and **unconditional keepalive** standby feedback on a sub-`wal_sender_timeout`
-  (60s) interval — **separate** from the durability checkpoint — so the walsender never drops the
-  connection [3][31].
+  a **sink-driven, idle-triggered heartbeat** — after `heartbeat_idle_after` of no activity on the
+  published tables the sink writes the one-row published `walrus.heartbeat` table (or
+  `pg_logical_emit_message`, PG14+) over a **separate ordinary SQL connection to the source**, and
+  treats the beat's **return through the stream as a round-trip liveness signal** (readiness/health
+  endpoint + alert, never a liveness-kill — §4.3); plus **unconditional keepalive** standby feedback
+  on a sub-`wal_sender_timeout` (60s) interval — **separate** from both the heartbeat and the
+  durability checkpoint — so the walsender never drops the connection [3][31].
 - **PodDisruptionBudget** (**missing from `architecture.md`, add it):** use **`maxUnavailable: 1`** or
   **no PDB at all**. A single-replica PDB with **`minAvailable: 1`** (= the replica count) makes the pod
   **unevictable** and permanently **blocks `kubectl drain` / node upgrades** [32] — directly contradicting
@@ -667,7 +682,10 @@ shutdown**. Specified here.
 **On `SIGTERM`, drain in order:**
 
 1. **stop requesting new WAL** (stop consuming from the stream);
-2. **finish and flush the in-flight** Arrow → Parquet → S3 batch and **COMMIT its manifest row**;
+2. **finish and flush the in-flight** Arrow → Parquet → S3 batch and **COMMIT its manifest row**
+   (in-flight **open, uncommitted** streamed-txn speculative buffers are **not** forced out — they
+   are simply dropped and re-stream on resume, since there is no `Stream Commit`/`Abort` yet to
+   resolve them; forcing them out would orphan speculative S3 files);
 3. send a **final standby status update** advancing `confirmed_flush_lsn` to the last durable batch —
    **never past an open streamed txn** ([architecture.md §1.6](./architecture.md#16-large-transaction-safety));
 4. send **`CopyDone`** and close the replication connection cleanly;
@@ -726,6 +744,8 @@ This doc is authoritative for the three areas; the following `architecture.md` r
 | K8s — no PDB guidance | **Dangerous default**: single-replica `minAvailable: 1` blocks node drain | [§4.4](#44-steady-state) |
 | K8s — StatefulSet vs Lease without the backstop | **Under-explained**: the Postgres single-active-slot rule is the real guarantee | [§4.1](#41-topology--the-real-correctness-backstop) |
 | K8s — `wal_sender_timeout` only tied to steady-state | **Gap**: also governs the shutdown drain | [§4.5](#45-graceful-shutdown--the-missing-piece) |
+| K8s — heartbeat "CronJob/timer writes it on an interval" | **Corrected**: the **sink itself** writes `walrus.heartbeat`, **idle-triggered**, over its own source SQL connection; the beat's round-trip feeds readiness/health (not a CronJob, not a liveness-kill) | [§4.4](#44-steady-state) |
+| K8s — no sink memory-budget-vs-limit guidance | **Added**: size the aggregate `max_inflight_bytes` **below** the container memory `limit` (request = limit → Guaranteed QoS) so a graceful spill-to-S3 beats a cgroup OOM-kill | [§4.4](#44-steady-state) |
 | Type/geo — pinned DuckDB 1.4.x | **Forward-compat note**: DuckDB ≥1.5 adds core `GEOMETRY` + `VARIANT` → revisit PostGIS/json mappings on the next-LTS bump | [§2.4 PostGIS](#postgis) |
 
 ---

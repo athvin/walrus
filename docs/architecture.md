@@ -1,8 +1,8 @@
 # Walrus — Postgres WAL → DuckDB Replication Service (Architecture Sketch)
 
 > **Status: design sketch for review.** This is a thorough, cited design intended to be read
-> and critiqued before any code is written. Findings are grounded in a deep-research pass
-> (24 sources fetched, 25 claims adversarially verified with 3-vote review, 23 confirmed).
+> and critiqued before any code is written. Findings are grounded in successive deep-research
+> passes — dozens of sources fetched and claims adversarially verified with 3-vote review.
 > Inline `[n]` markers reference the **[Sources](#sources)** section. Where research could
 > *not* confirm something, it is explicitly flagged as **⚠ unverified / spike needed** rather
 > than asserted.
@@ -96,6 +96,8 @@ up, correctly, on its own schedule.
 | DDL: drop column | **Physically drop on the `<table>` mirror** | True current-state mirror of the source shape. `<table>_raw` **retains** the column (nullable) to preserve verbatim CDC history; post-drop files fill it NULL. |
 | DDL: type change | **Apply in place on the `<table>` mirror; on cast failure → quarantine + alert (terminal)** | **Single-table reloads are out of scope** — a failed cast is *accepted, non-recovered*. `<table>_raw` **never casts history**: lossless widening applies the same `ALTER`; incompatible changes **widen the raw column to `VARCHAR`** so all schema_versions coexist. |
 | Metadata timestamps | **UTC only (RFC 3339 / ISO-8601, `Z`)** | Every datetime walrus records as metadata — `commit_ts`, `sink_processed_at`, control-table `*_at`, checkpoints — is UTC; never a local or source-server offset. |
+| Sink memory safety | **Aggregate in-flight budget (`max_inflight_bytes`) → flush/spill to S3** | Bounds *total* buffered memory (not one batch) so the pod can't OOM; on crossing, committed batches flush (→ ack up to the [§1.6](#16-large-transaction-safety) open-txn floor) and open-txn buffers spill **speculatively** to S3, with a reactive pause-polling backstop for the S3-slow edge ([§1.3](#13-in-memory-batching--cadence)). |
+| Slot liveness | **Sink-driven, idle-triggered heartbeat to a published `walrus.heartbeat` table + round-trip liveness** | An idle publication can't pin WAL: after N min of no activity the sink beats a one-row published table, and the beat's return through the stream doubles as WAL-consume/slot-advance liveness (health endpoint + alert, **never** a liveness-kill) ([§1.9](#19-slot-liveness--heartbeat--keepalive)). |
 
 ---
 
@@ -104,7 +106,8 @@ up, correctly, on its own schedule.
 **Goals**
 - Correct, ordered, effectively-once replication of DML into per-table **raw CDC logs + derived DuckDB mirrors**.
 - Bounded WAL growth under all conditions via correct slot-feedback checkpointing **and a
-  heartbeat** (so an idle publication over a busy database can't pin WAL — [§1.9](#19-slot-liveness--heartbeat--keepalive)).
+  sink-driven, idle-triggered heartbeat** (so an idle publication over a busy database can't pin WAL
+  — [§1.9](#19-slot-liveness--heartbeat--keepalive)).
 - **Consume all CDC over one pgoutput stream** at `proto_version '2'` + `streaming 'on'` (the
   transport the whole sink is built on), and thereby handle **large transactions** without
   buffering them entirely in memory [3][4].
@@ -137,6 +140,7 @@ up, correctly, on its own schedule.
    ┌───────────────────────────────────────────────┐
    │ publication  +  logical replication slot (v2)  │
    │ walrus.ddl_audit  ←  event trigger (DDL)        │
+   │ walrus.heartbeat  ←  sink idle beat (§1.9)      │
    │ user tables ...                                 │
    └───────────────┬─────────────────────────────────┘
                    │ pgoutput v2 stream, streaming='on' (DML + inline DDL-audit INSERTs)
@@ -180,8 +184,10 @@ either can crash/restart independently without data loss (see [Delivery semantic
 > **Non-negotiable mission: drain the WAL to storage, fast, so the slot can never run away.**
 > `walrus-pg-sink` exists to **take work off the WAL and write it to durable storage** (Arrow →
 > Parquet → S3 + a manifest row), on the schedule the operator dictates — flushing when **any**
-> configured limit trips: the **cadence** (`max_fill_ms`), the **memory footprint**
-> (`max_bytes` / memory backpressure), or the **record count** (`max_rows`). It advances the
+> configured limit trips: the **cadence** (`max_fill_ms`), the **per-batch size**
+> (`max_bytes` / `max_rows`), or — the knob that keeps the pod from OOMing — the **aggregate
+> in-memory ceiling** (`max_inflight_bytes`), which sheds buffered records to S3 before memory runs
+> out ([§1.3](#13-in-memory-batching--cadence)). It advances the
 > replication slot **only after** that write is durable, so the source WAL is bounded by
 > construction. That is its whole job. It does **not** interpret, dedup, reconcile, or model the
 > data into its final shape — it moves change events off the WAL and onto S3 verbatim, quickly
@@ -225,6 +231,21 @@ CREATE PUBLICATION walrus_pub FOR TABLE orders, customers, ...   -- or FOR ALL T
 --     CREATE EVENT TRIGGER walrus_intercept_drop ON sql_drop        EXECUTE FUNCTION walrus.intercept_drop();
 --   walrus.ddl_audit MUST be in walrus_pub (above) so its INSERTs ride the SAME slot, in commit
 --   order with the DML they describe — no separate DDL channel, no ordering guesswork.
+
+-- REQUIRED: the heartbeat table + the sink's write grant (so an idle publication can't pin WAL, §1.9).
+--   A single fixed row the sink UPDATEs (idle-triggered) over an ordinary SQL connection; the change
+--   rides THIS publication/slot in commit order. Obeys the mandatory-PK / REPLICA IDENTITY DEFAULT rule
+--   like any published table, but it is an INTERNAL table: consumed for slot-advance + liveness only —
+--   never snapshotted/backfilled and never materialized to a DuckDB file (see DDL capture).
+CREATE TABLE walrus.heartbeat (
+  id            integer     PRIMARY KEY,          -- single row, id = 1
+  beat_seq      bigint      NOT NULL DEFAULT 0,   -- monotonic; bumped each beat (round-trip token)
+  ts            timestamptz NOT NULL,             -- UTC (metadata rule): wall-clock of the beat
+  sink_instance text                              -- which sink wrote it (provenance)
+);
+INSERT INTO walrus.heartbeat (id, ts) VALUES (1, now()) ON CONFLICT DO NOTHING;   -- seed the one row
+GRANT INSERT, UPDATE ON walrus.heartbeat TO <sink_role>;                          -- the sink's write privilege
+ALTER PUBLICATION walrus_pub ADD TABLE walrus.heartbeat;   -- MUST be published (unless FOR ALL TABLES)
 ```
 
 - **Primary key is mandatory (hard edge).** Before a table is added to the publication,
@@ -396,9 +417,46 @@ The sink accumulates decoded changes in memory into per-(table, batch) Arrow bui
 flushes a Parquet file when **any** threshold trips — all user-configurable:
 
 - `max_fill_ms` — wall-clock cadence (the primary "how often do we dump files" knob).
-- `max_bytes` / `max_rows` — size caps so batches stay bounded (batching + memory-backpressure
-  shape cribbed from etl's `BatchConfig` / `MemoryBackpressureConfig` as prior art [1]).
+- `max_bytes` / `max_rows` — **per-batch** size caps so an individual batch stays bounded
+  (shape cribbed from etl's `BatchConfig` — `max_bytes` 8 MiB, `max_fill_ms` 10s — as prior art,
+  @ commit `64c2458` [1]).
+- `max_inflight_bytes` — an **aggregate, process-wide in-memory ceiling** summed across **all**
+  per-`(table, xid)` Arrow builders, *distinct* from the per-batch `max_bytes`. This is the knob
+  that keeps the pod from falling over: it bounds *total* buffered memory, not one batch. (etl
+  models the same split — a global `memory_budget_ratio` ≈ 0.2 of process memory, divided across
+  active streams, then min'd with the per-stream `max_bytes` [1]; Debezium bounds its queue by
+  `max.queue.size` **or** `max.queue.size.in.bytes`, blocking the reader when either trips [22].)
 - transaction-commit boundary — never split a committed txn's tail across the visibility line (see [1.6](#16-large-transaction-safety)).
+
+**When `max_inflight_bytes` is crossed, the sink sheds memory to S3 — and *freeing memory* and
+*advancing the slot* are two separable actions:**
+
+- **Complete (committed) batches → the normal path** (Arrow → Parquet → S3 PUT → manifest INSERT)
+  frees the memory at once. `confirmed_flush_lsn` then advances to that batch's `lsn_end` **only up
+  to — never past — the oldest still-open streamed transaction's floor**
+  ([§1.6](#16-large-transaction-safety)); if an older txn is still open, the memory is freed but the
+  slot holds at that floor. This is "push it to S3 and ack it off the WAL," under the same
+  commit-boundary and open-txn rules as every other flush.
+- **Open (uncommitted) streamed-txn buffers → speculative S3 staging**
+  ([§1.6](#16-large-transaction-safety)): written to S3 to free memory but kept **invisible** (no
+  `ready` manifest row, slot **not** advanced), resolved by `Stream Commit` (promote) or `Stream
+  Abort` (delete). This is what lets a 50-million-row *in-progress* transaction stay memory-bounded
+  even though it can't be acked early.
+- **Secondary backstop** (only if S3 can't drain fast enough — e.g. one giant open txn streaming
+  faster than we can PUT): fall back to the backpressure
+  [§1.5](#15-the-durability-checkpoint-wal-bounding-invariant) already describes — **stop requesting
+  new WAL** until memory drains (etl's separate reactive `MemoryBackpressureConfig`, ≈ 0.85 activate
+  / 0.75 resume hysteresis; Debezium's block-the-reader [1][22]). The trade is explicit: pausing
+  intake stalls `confirmed_flush_lsn`/`restart_lsn`, so retained WAL grows toward
+  `max_slot_wal_keep_size` — it trades OOM-risk for bounded slot growth, the same trade §1.5 makes.
+
+**Sizing.** Set the budget to a *fraction* of the pod's memory **limit**, leaving headroom for the
+Arrow builders plus the [§1.4](#14-arrow-conversion--parquet-write) Parquet writer's row-group /
+dictionary / compression buffers — never the full limit (etl's 0.2 ratio is the cited prior-art
+default; the exact Arrow/Parquet headroom is an [open question](#open-questions--risks)). Postgres's
+server-side `logical_decoding_work_mem` does **not** bound *our* memory — it triggers server-side
+streaming and *shifts* the pressure onto the consumer [19] — so it is no substitute for
+`max_inflight_bytes`.
 
 Larger cadence ⇒ larger batches ⇒ **more WAL retained between flushes** ⇒ better Parquet
 compression but higher slot lag. This trade-off is the knob the user tunes.
@@ -474,6 +532,13 @@ Ordering per batch: **PUT to S3 → COMMIT manifest INSERT → send standby stat
   sink naturally exerts **backpressure** by not advancing the slot; the slot grows only up
   to the safety cap `max_slot_wal_keep_size` (beyond which Postgres invalidates the slot —
   alert *well* before that) [12][13].
+- **A memory-ceiling flush is just another durable batch.** When `max_inflight_bytes`
+  ([§1.3](#13-in-memory-batching--cadence)) forces a flush, this invariant is unchanged — advance
+  `confirmed_flush_lsn` only after S3 + manifest are durable **and never past the oldest still-open
+  streamed txn** ([§1.6](#16-large-transaction-safety)), so *freeing memory* (the S3 write) and
+  *advancing the slot* stay separable. The reactive **pause-polling** backstop is this same
+  backpressure taken one step further — stop *requesting* WAL, not just stop advancing — for the rare
+  case where even flushing can't keep memory bounded (e.g. S3 slower than a giant open txn streams).
 - `restart_lsn` (WAL still needed to resume) vs `confirmed_flush_lsn` (consumer progress)
   are distinct — monitor both [13].
 - **This durability gate advances only `confirmed_flush_lsn`.** The *keepalive* feedback that
@@ -494,9 +559,10 @@ arrive whole at commit) [3][4]. Rules to stay correct while bounding memory:
   `Insert/Update/Delete/Relation/Truncate` (v2+) and the `Stream Start` first-segment flag, so
   each transaction's non-contiguous segments are reassembled correctly [3].
 - **Stage speculatively, commit-gate visibility.** Streamed sub-batches for an in-progress `xid`
-  may be written to S3 (to keep memory bounded), but we **do not write the `ready` manifest row
-  until we receive `Stream Commit`** for that txn. On **`Stream Abort`**, delete the speculative
-  S3 files and drop the buffered state.
+  are written to S3 — proactively, and in particular **whenever the aggregate `max_inflight_bytes`
+  budget is crossed** ([§1.3](#13-in-memory-batching--cadence)) — to keep memory bounded, but we
+  **do not write the `ready` manifest row until we receive `Stream Commit`** for that txn. On
+  **`Stream Abort`**, delete the speculative S3 files and drop the buffered state.
 - **Never advance the slot past an open txn.** `confirmed_flush_lsn` must **not** move past the
   oldest still-open streamed transaction — hold it at that txn's begin / first-segment LSN until
   its `Stream Commit`, so a crash can always re-stream an incomplete-or-aborted txn from the WAL.
@@ -620,21 +686,50 @@ Two things must keep working even when there is **nothing to replicate**, or the
 lifelong slot silently degrades into the very total-restart disaster [§1.8](#18-single-slot-for-life--total-restart) exists to avoid. Both were missing from the
 first sketch and are non-negotiable.
 
-- **Heartbeat — so an idle publication can't pin WAL forever.** `restart_lsn` /
-  `confirmed_flush_lsn` only advance when the consumer *confirms progress*, and the consumer only
-  receives events for **published** tables. So if the published tables are **idle while the rest
-  of the database is busy** (heavy WAL elsewhere), the sink produces no files, never confirms a
-  newer LSN, and **WAL grows without bound** until the slot invalidates (`wal_status='lost'`) —
-  the sink can be perfectly healthy and still detonate the whole system. This is a well-documented
-  production failure. Mitigation, both halves required:
-  1. Emit a **heartbeat** on an interval so there is always *something* recent in the slot to
-     confirm past: a periodic write to a tiny **published `walrus.heartbeat` table** (must be in
-     `walrus_pub`), **or** `pg_logical_emit_message()` (works with `pgoutput`, PG14+). Either gives
-     the sink a fresh LSN it can durably checkpoint, dragging `restart_lsn` forward.
-  2. Even with no pending rows, periodically **send a standby status update** advancing the
-     confirmed LSN to the safe point the heartbeat established.
+- **Heartbeat — so an idle publication can't pin WAL.** `restart_lsn` (the oldest WAL the slot
+  still needs) only advances *after* `confirmed_flush_lsn` does, and `confirmed_flush_lsn` only
+  advances when the consumer *confirms progress* — which it can do only for changes on **published**
+  tables. So if the published tables are **idle while the rest of the database is busy** (heavy WAL
+  elsewhere), the sink produces no files, never confirms a newer LSN, `restart_lsn` is stuck, and
+  retained WAL grows — **potentially without bound**: with the default `max_slot_wal_keep_size = -1`
+  it grows until the **source disk fills**; only if a cap is *set* does the slot instead invalidate
+  (`wal_status='lost'`) → [total-restart](#18-single-slot-for-life--total-restart). Either way the
+  sink can be perfectly healthy and still detonate the whole system — a well-documented production
+  failure [12][22][23][24]. **walrus's mitigation is a sink-driven, idle-triggered heartbeat:**
+  1. **Fire only when idle.** The sink tracks the last confirmed change on any published *user*
+     table (its last durable checkpoint). If `now − last_activity ≥ heartbeat_idle_after` **and**
+     `now − last_beat ≥ heartbeat_idle_after`, it fires **one** beat — a single-row
+     `UPDATE walrus.heartbeat SET beat_seq = beat_seq + 1, ts = now(), sink_instance = $me WHERE id = 1`
+     on a **separate ordinary SQL connection to the source** (distinct from the read-only replication
+     connection; `tokio-postgres` serves both, so no new dependency). Under steady write traffic the
+     beat is naturally **suppressed** — there is always fresh user-table WAL to confirm. The tiny
+     UPDATE rides the **published** `walrus.heartbeat` table (it **must** be in `walrus_pub`, or
+     `pgoutput` filters it out [22]) through the slot in commit order, giving the sink a fresh LSN it
+     can durably checkpoint → `confirmed_flush_lsn` advances → **`restart_lsn` follows and retained
+     WAL is released** [12][13]. (`pg_logical_emit_message()` is the table-less alternative, PG14+ —
+     see [`proto-version.md` §4](./proto-version.md#4-the-message-catalog-decoded-byte-by-byte).)
+  2. Even with no pending rows, periodically **send a standby status update** advancing the confirmed
+     LSN to the safe point the heartbeat established.
+
+  - **Round-trip = liveness.** The sink stamps each beat with a monotonic `beat_seq` before writing;
+    when it decodes *that* beat returning through the stream it records a successful **round-trip**
+    (source-write → WAL → decode → durable-confirm). Because the heartbeat is an
+    [internal table](#ddl-capture-schema-evolution) — consumed for slot-advance only, never staged to
+    S3 or mirrored to DuckDB — the round-trip proves the **sink's WAL-consume + slot-advance
+    liveness** (exactly what keeps the single lifelong slot healthy), **not** the downstream
+    S3 → loader → DuckDB half. Surface it as a `degraded` field on the **readiness/health endpoint**
+    (`now − last_successful_roundtrip > heartbeat_roundtrip_deadline`) plus a Prometheus alert —
+    **never** a `livenessProbe` kill and **never a hard readiness gate**: a legitimately catching-up
+    sink has a stale round-trip *by design*, the same reason liveness is never tied to slot lag
+    ([`walrus-pg-sink.md` §4.3](./walrus-pg-sink.md#43-probes--get-these-exactly-right)).
+
   Keep `max_slot_wal_keep_size` as the **backstop only**, and **alert on retained WAL well before
   it** — hitting that cap converts "bloat" into "slot lost → total-restart," which we never want.
+  *(PG18's `idle_replication_slot_timeout` is **not** a substitute: it only invalidates **inactive**
+  slots — those with no connected consumer. walrus's slot is always active, so it never fires on an
+  idle *publication*; and if the sink were ever disconnected long enough for it to apply, it would
+  **invalidate** the slot → total-restart. It is one more slot-death trigger the heartbeat guards
+  against, not a mitigation.)*
 
 - **Keepalive feedback is unconditional — and is *not* the same as advancing the slot.** The
   walsender drops the connection after **`wal_sender_timeout`** (default **60s**) if the consumer
@@ -806,6 +901,16 @@ file of the new `schema_version` is appended) at that LSN before applying later 
 > **Deviation from AWS:** the AWS function `INSERT`s then `DELETE`s the audit row in-txn
 > (DMS just needs to see the INSERT) [6]. **We keep the row** (drop the DELETE) so we retain
 > a durable, replayable schema history. We must still ensure the sink acts on the INSERT op.
+
+**Internal tables are consumed specially, never materialized.** Both `walrus.ddl_audit` and
+`walrus.heartbeat` are **published** so their writes ride the one slot, but they are **walrus's own
+internal tables, not user data**: the sink recognizes their relation OIDs and consumes them for
+control purposes only — `ddl_audit` → a `ddl_manifest` row + `schema_version` bump (above);
+`heartbeat` → slot-advance + round-trip liveness ([§1.9](#19-slot-liveness--heartbeat--keepalive)).
+Neither is **snapshotted/backfilled** ([§1.7](#17-snapshot--backfill-bootstrap)) nor materialized as
+a `<table>` / `<table>_raw` DuckDB file — the generic "published `CREATE TABLE` → snapshot → create
+the `.duckdb` file" rule in the
+[per-change-type table](#per-change-type-handling-schema-evolution-semantics) **excludes** them.
 
 **⚠ Event triggers are NOT exhaustive** — a verified caveat from research: the claim that
 event triggers "reliably fire on all DDL events" was **refuted (0-3)**. Three concrete gaps:
@@ -1235,8 +1340,10 @@ is greppable in `kubectl logs` / crash events.
    replication connection (capturing the **exported snapshot + `consistent_point`** for the
    initial-load path, [§1.7](#17-snapshot--backfill-bootstrap)) or terminal, per mode.
 5. **DDL capture + heartbeat installed** — verify `walrus.ddl_audit` + the `walrus_intercept_ddl`
-   (+ `sql_drop`) event triggers exist on the source, and that the `walrus.heartbeat` table +
-   its writer are in place ([§1.9](#19-slot-liveness--heartbeat--keepalive)); install or terminal.
+   (+ `sql_drop`) event triggers exist on the source, and that the `walrus.heartbeat` table exists,
+   is published, and the sink's **own source write connection** has `INSERT`/`UPDATE` on it (the sink
+   is the heartbeat writer — no external CronJob, [§1.9](#19-slot-liveness--heartbeat--keepalive));
+   install/grant or terminal.
 6. **Per-table PK preflight** — enumerate published tables; assert each has a `PRIMARY KEY` and
    a usable replica identity ([§1.1](#11-source-side-setup-one-time-via-migrationjob)). Keyless tables are **terminal in `strict` mode
    (default)**, or **quarantine + alert and continue** in `lenient` mode. *(Resolves Open-Q6's
@@ -1301,10 +1408,10 @@ releases its table lease + DuckDB writer lock. The **only** place the slot is ev
 | **`walrus-loader`** | **`StatefulSet` `replicas=1` today** — one active loader owns **all** `.duckdb` files on its PVC and runs one worker thread per table; scale it **up** (CPU/memory / more per-table workers). *Deferred:* spreading tables across multiple replicas (consistent hashing, PVC per replica, resharding table ownership — never naive HPA, since file ownership is exclusive) is a [deferred design goal](#deferred-design-goals-to-solve-later). |
 | **Control Postgres** | Small managed instance (or `walrus` schema in source). Holds manifest/checkpoint/ddl/registry. |
 | **S3 access** | IRSA / Workload Identity — no static keys. `object_store` (sink) + DuckDB `httpfs`/`SET s3_*` (loader) [11]. |
-| **Config / cadence** | `ConfigMap`: sink `max_fill_ms`/`max_bytes`/`max_rows`, loader poll interval (append + transform share it in v1) **plus** a slower, **per-table-overridable** transform **compaction/full-rebuild + raw-retention** cadence — the user's cadence control. Secrets for DB/S3 creds. |
+| **Config / cadence** | `ConfigMap`: sink `max_fill_ms`/`max_bytes`/`max_rows` **plus the aggregate `max_inflight_bytes` in-memory ceiling** (with optional reactive activate/resume backpressure thresholds) and the **heartbeat** knobs (`heartbeat_idle_after`, `heartbeat_roundtrip_deadline`), loader poll interval (append + transform share it in v1) **plus** a slower, **per-table-overridable** transform **compaction/full-rebuild + raw-retention** cadence — the user's cadence control. Secrets for DB/S3 creds. |
 | **Slot lifecycle** | Create the one slot+publication+DDL trigger via an init `Job`/migration; record its epoch in `replication_state`. If the slot is ever lost/invalidated → **total-restart** ([§1.8](#18-single-slot-for-life--total-restart)). **Orphan cleanup:** a decommissioned sink must *drop its slot* — an abandoned slot pins WAL forever [12]. |
 | **WAL safety cap** | Set `max_slot_wal_keep_size` on source as a backstop; tune `logical_decoding_work_mem` for the streaming threshold [3]. **Alert on retained WAL well before the cap.** |
-| **Slot liveness** | A **heartbeat** `CronJob`/timer writes `walrus.heartbeat` (or emits `pg_logical_emit_message`) on an interval so an idle publication can't pin WAL; the sink sends keepalive feedback under `wal_sender_timeout` regardless of durability ([§1.9](#19-slot-liveness--heartbeat--keepalive)). |
+| **Slot liveness** | The **sink itself** writes `walrus.heartbeat` (or emits `pg_logical_emit_message`) **idle-triggered** — only after `heartbeat_idle_after` of no published-table activity — over its own source SQL connection, so an idle publication can't pin WAL; the beat's round-trip feeds readiness/health (never a liveness-kill). **Unconditional** keepalive feedback under `wal_sender_timeout` is separate, sent regardless of durability ([§1.9](#19-slot-liveness--heartbeat--keepalive)). |
 | **Health / probes** | `startupProbe` gates the fail-fast [bootstrap](#startup--bootstrap-fail-fast-preflight) (and suppresses liveness/readiness until it passes, so a long catch-up isn't killed); `readinessProbe` holds work until bootstrap completes; `livenessProbe` = **true deadlock detection only** — replication loop / apply loop **making progress**. ⚠ **Never** tie liveness to *slot lag* — a pod legitimately catching up after an outage has high lag by definition and would be killed into a restart loop. |
 | **PodDisruptionBudget** | Use **`maxUnavailable: 1`** or **no PDB** for the single-active sink and loader. ⚠ A single-replica PDB with **`minAvailable: 1`** makes the pod **unevictable** and permanently blocks `kubectl drain` / node upgrades — the opposite of the self-healing-through-node-drain goal. |
 | **Scaling (single-slot constraint)** | **No multi-slot sharding** — one slot for life, so the sink is the single-stream ceiling and scales **up** only (CPU/decode). **The loader today also runs single-active and scales up** (CPU/memory, more per-table worker threads). Scaling the loader *out* across pods (table-sharding) is a [deferred design goal](#deferred-design-goals-to-solve-later), not yet real. Capacity is a **vertical** conversation, not more slots or more pods. |
@@ -1315,9 +1422,13 @@ releases its table lease + DuckDB writer lock. The **only** place the slot is ev
 
 Prometheus metrics: replication lag bytes (`pg_current_wal_lsn − confirmed_flush_lsn`),
 slot **retained WAL size** (alarm) and **`pg_replication_slots.wal_status`** (alert on
-`unreserved`/`lost`), **seconds since last heartbeat confirmed** and **since last standby-status
+`unreserved`/`lost`), **seconds since last heartbeat confirmed**, **heartbeat round-trip age** (`now −` last successful
+write→observe-return — the liveness signal, [§1.9](#19-slot-liveness--heartbeat--keepalive)) and
+**`beat_seq` gap**, and **seconds since last standby-status
 feedback** (both must stay well under `wal_sender_timeout` — [§1.9](#19-slot-liveness--heartbeat--keepalive)),
-batch flush latency & Parquet throughput, files `ready` per table (loader backlog),
+batch flush latency & Parquet throughput, **in-flight buffered memory bytes** + **memory-ceiling
+flush/spill count** + **speculative open-txn bytes staged** + **pause-polling activations**
+([§1.3](#13-in-memory-batching--cadence)), files `ready` per table (loader backlog),
 **raw-append lag** (`sink lsn_end − raw_appended_lsn`), **transform lag**
 (`raw_appended_lsn − transformed_lsn`), `<table>_raw` row-count / file-size growth, DDL events
 pending, aborted-txn count, failed-file count.
@@ -1359,14 +1470,16 @@ support or **`pgwire-replication`** [2]) — the pgoutput decoder is **ours**
 ## Phased roadmap
 
 0. **Scaffold + control plane.** Workspace, control-table migrations, DDL trigger install, docker-compose (Postgres `wal_level=logical` + MinIO).
-1. **Thin end-to-end slice.** One table, simple types, stream path only (proto v2 + `streaming 'on'`, no snapshot yet) → Arrow → Parquet → S3 → manifest → loader **appends into `<tbl>_raw`, then transforms into `<tbl>`** in one DuckDB file. Prove both the append and the transform, keyed on **`commit_lsn`** watermarks. Include the **heartbeat + keepalive** loop ([§1.9](#19-slot-liveness--heartbeat--keepalive)) from day one so the single slot can't stall.
+1. **Thin end-to-end slice.** One table, simple types, stream path only (proto v2 + `streaming 'on'`, no snapshot yet) → Arrow → Parquet → S3 → manifest → loader **appends into `<tbl>_raw`, then transforms into `<tbl>`** in one DuckDB file. Prove both the append and the transform, keyed on **`commit_lsn`** watermarks. Include the **idle-triggered heartbeat + round-trip liveness + unconditional keepalive** loop ([§1.9](#19-slot-liveness--heartbeat--keepalive)) from day one so the single slot can't stall.
 2. **Full type mapping + DML correctness.** The [type table](#data-type-translation-postgres--arrow--parquet), NULLs, updates/deletes with `REPLICA IDENTITY` (incl. **composite PKs**); **the raw→mirror transform** (dedup-to-latest, **unchanged-TOAST** carry-forward) + the two-watermark checkpoint.
 3. **Snapshot/backfill** with watermark handoff.
 4. **DDL / schema evolution** applied in the loader from the audit stream.
 5. **In-progress large-transaction handling.** proto v2 + `streaming 'on'` is the transport from
    phase 1; this phase adds the *speculative staging* + `Stream Commit`/`Stream Abort` gating for
    txns streamed before commit, **incl. rolled-back-subtransaction exclusion**
-   ([§1.6](#16-large-transaction-safety)).
+   ([§1.6](#16-large-transaction-safety)). This is also where the **aggregate `max_inflight_bytes`
+   ceiling** lands — the speculative spill is where it sheds open-txn buffers to S3
+   ([§1.3](#13-in-memory-batching--cadence)).
 6. **Scale & ops:** K8s manifests, leader election/HA, observability, backpressure tuning — plus *(deferred)* multi-pod **loader table-sharding** for true horizontal scale-out (until then, scaling is vertical — see [Deferred design goals](#deferred-design-goals-to-solve-later)).
 7. **Resilience:** epoch/total-restart on slot loss/invalidation; orphan-slot cleanup.
 
@@ -1413,8 +1526,9 @@ support or **`pgwire-replication`** [2]) — the pgoutput decoder is **ours**
 > [coordination contract](#coordination-contract-control-plane-tables) and
 > [§2.1](#21-the-raw-to-mirror-transform-model)). (b) **Snapshot export:** backfill runs under the
 > slot's **exported snapshot** (`SNAPSHOT 'export'` → `SET TRANSACTION SNAPSHOT`), not an impossible
-> "COPY at an LSN" ([§1.7](#17-snapshot--backfill-bootstrap)). (c) **Slot liveness:** a **heartbeat**
-> + unconditional **keepalive** keep the single lifelong slot from stalling on WAL or timing out on
+> "COPY at an LSN" ([§1.7](#17-snapshot--backfill-bootstrap)). (c) **Slot liveness:** a **sink-driven,
+> idle-triggered heartbeat** (whose round-trip also proves the sink is consuming/advancing) +
+> unconditional **keepalive** keep the single lifelong slot from stalling on WAL or timing out on
 > `wal_sender_timeout` ([§1.9](#19-slot-liveness--heartbeat--keepalive)).
 
 1. **Postgres→Arrow per-type mapping — resolved (was the highest-effort unknown).** The canonical
@@ -1492,6 +1606,21 @@ support or **`pgwire-replication`** [2]) — the pgoutput decoder is **ours**
     LSN** (not row LSN) removes the streaming-reorder class of loss; the residual hazard is a
     delete + re-insert straddling the watermark, which still needs a **per-PK max-applied-commit-LSN
     guard** to avoid silently resurrecting a killed row. The periodic full-rebuild is the safety net.
+14. **Sink in-memory budget sizing (`max_inflight_bytes`).** The aggregate ceiling
+    ([§1.3](#13-in-memory-batching--cadence)) bounds the pod's memory, but the right *ratio* of
+    budget to the K8s pod memory **limit** for an Arrow/Parquet sink is unsettled: etl uses ≈ 0.2 of
+    process memory [1], and no source quantifies the extra headroom for Arrow builder overhead +
+    Parquet row-group / dictionary / compression buffers on top of raw decoded-change bytes. Pick a
+    conservative default and validate under a large-transaction load test. Related: the concrete
+    mechanics of spilling an **open** streamed txn to S3 and discarding it on `Stream Abort`
+    ([§1.6](#16-large-transaction-safety)) are walrus-specific — neither Debezium nor etl documents a
+    consumer-side spill-the-open-transaction-to-object-store pattern to crib verbatim [22][1].
+15. **Heartbeat interval / idle threshold (`heartbeat_idle_after`).** Firing only after N minutes of
+    publication inactivity ([§1.9](#19-slot-liveness--heartbeat--keepalive)) is the right shape, but
+    the interval must sit well inside the WAL/disk headroom (and any `max_slot_wal_keep_size`);
+    ~5 min (AWS RDS's internal beat) is a reasonable order-of-magnitude default, with no authoritative
+    rule tying it to disk headroom [22][23]. Also settle `heartbeat_roundtrip_deadline` for the
+    liveness signal so a legitimately catching-up sink isn't flagged.
 
 ---
 
@@ -1522,9 +1651,11 @@ support or **`pgwire-replication`** [2]) — the pgoutput decoder is **ours**
   follow-up `INSERT`s in **one transaction** (shared `commit_lsn`); assert the post-truncate rows
   **survive** — a guard for the `(commit_lsn, lsn)` **tuple** boundary (a scalar `commit_lsn > Ct`
   filter would drop them).
-- **Large txn:** a multi-million-row transaction with `streaming='on'`; assert **memory and
-  slot size stay bounded** and the txn appears atomically after commit; then a large txn that
-  **aborts** and assert nothing leaks to DuckDB.
+- **Large txn:** a multi-million-row transaction with `streaming='on'`; assert the **aggregate
+  `max_inflight_bytes` ceiling fires** (open-txn buffers spill speculatively to S3,
+  [§1.3](#13-in-memory-batching--cadence) / [§1.6](#16-large-transaction-safety)) so **in-flight
+  memory and slot size stay bounded** and the txn appears atomically after commit; then a large txn
+  that **aborts** and assert nothing leaks to DuckDB (speculative S3 files deleted).
 - **Commit-order under streaming (regression guard for the row-LSN bug):** run a **large txn that
   commits *after*** a smaller, later-started txn, both touching an overlapping PK, with
   `streaming='on'`; assert the large txn's file is **not skipped** (its `lsn_end` is a commit LSN),
@@ -1536,8 +1667,12 @@ support or **`pgwire-replication`** [2]) — the pgoutput decoder is **ours**
 - **WAL-runaway chaos:** pause the loader, keep writing to source; assert slot grows only to
   the safety cap and alerts fire; resume and assert full catch-up with no loss/dupes.
 - **Idle-publication heartbeat:** keep the **published** tables idle while an **unpublished** part
-  of the DB churns WAL; assert the **heartbeat** keeps `restart_lsn`/`confirmed_flush_lsn` advancing
-  and retained WAL / `wal_status` stay healthy (WAL does **not** grow unbounded).
+  of the DB churns WAL; assert the sink fires a beat **only after `heartbeat_idle_after`** (and is
+  **suppressed** under active user-table writes), that the beat's **round-trip is observed** (the
+  written `beat_seq` returns through the stream and surfaces on the readiness/health endpoint), and
+  that this keeps `restart_lsn`/`confirmed_flush_lsn` advancing so retained WAL / `wal_status` stay
+  healthy (WAL does **not** grow unbounded). Also assert a legitimately catching-up sink with a
+  stale round-trip is **not** gated out of readiness.
 - **Keepalive vs durability (`wal_sender_timeout`):** stall the S3 flush (or run a long snapshot)
   past `wal_sender_timeout`; assert keepalive feedback keeps the walsender **connected** (no
   `terminating walsender` churn) while `confirmed_flush_lsn` does **not** advance until durable.
@@ -1568,7 +1703,7 @@ support or **`pgwire-replication`** [2]) — the pgoutput decoder is **ours**
 
 Primary sources are Postgres/AWS/vendor docs and project repos; blogs are corroborating.
 
-1. supabase/etl (formerly `pg_replicate`) — https://github.com/supabase/etl *(primary)*
+1. supabase/etl (formerly `pg_replicate`) — `BatchConfig` / `MemoryBackpressureConfig` / `BatchBudgetController` prior art, verified @ commit `64c2458` — https://github.com/supabase/etl *(primary)*
 2. `pgwire-replication` — https://github.com/vnvo/pgwire-replication *(primary)*
 3. PostgreSQL — Logical Replication Message Formats / Protocol — https://www.postgresql.org/docs/current/protocol-logical-replication.html *(primary)*
 4. PeerDB — Exploring versions of the Postgres logical replication protocol — https://blog.peerdb.io/exploring-versions-of-the-postgres-logical-replication-protocol *(blog)*
@@ -1589,6 +1724,9 @@ Primary sources are Postgres/AWS/vendor docs and project repos; blogs are corrob
 19. PostgreSQL — Streaming of Large Transactions for Logical Decoding — https://www.postgresql.org/docs/current/logicaldecoding-streaming.html *(primary)*
 20. PostgreSQL — Logical Replication Message Formats (Stream Start/Stop/Commit/Abort, per-message xid) — https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html *(primary)*
 21. PostgreSQL — `pgoutput.c` (parses `proto_version`/`streaming` from START_REPLICATION; slot has no such attribute) — https://github.com/postgres/postgres/blob/master/src/backend/replication/pgoutput/pgoutput.c *(primary)*
+22. Debezium — PostgreSQL connector configuration (`heartbeat.interval.ms` / `heartbeat.action.query` and the published heartbeat-table pattern; `max.queue.size` / `max.queue.size.in.bytes` block-the-reader backpressure) — https://debezium.io/documentation/reference/stable/connectors/postgresql.html *(primary)*
+23. PeerDB — heartbeat best practice / overcoming pitfalls of Postgres logical decoding (idle-publication WAL growth; periodic write to a published table advances the slot) — https://docs.peerdb.io/bestpractices/heartbeat *(primary)*
+24. Estuary — PostgreSQL (Amazon RDS) capture: heartbeat for low-traffic / idle publications — https://docs.estuary.dev/reference/Connectors/capture-connectors/PostgreSQL/amazon-rds-postgres/ *(secondary)*
 
 > **Research caveats to remember:** the per-type Postgres→Arrow mapping is now **source-cited** in
 > [`walrus-pg-sink.md` §2](./walrus-pg-sink.md#2-data-type-conversion-postgres--arrow--parquet--duckdb)

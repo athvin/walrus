@@ -244,6 +244,13 @@ appeared **before** `BEGIN`, while the transactional one appeared inside the txn
 `COMMIT` — proof the non-transactional variant isn't gated on commit, which is what lets it advance
 the slot while everything else is idle.
 
+> **walrus's default is the published `walrus.heartbeat` *table*, not this message.** A table gives a
+> durable last-beat record and a natural, decodable round-trip — the sink writes it, then observes its
+> own `beat_seq` return through the stream (the WAL-consume/slot-advance liveness signal in
+> [architecture.md §1.9](./architecture.md#19-slot-liveness--heartbeat--keepalive)).
+> `pg_logical_emit_message()` (shown here) is the **table-less alternative**; if used, prefer the
+> **non-transactional** form so an idle beat isn't gated on some unrelated open transaction.
+
 ## 5. TupleData and the unchanged-TOAST placeholder
 
 A `TupleData` is `Int16 column-count` then, per column, a format byte [20]:
