@@ -29,3 +29,7 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# Dev-only: the schema_registry round-trip test builds real TypeDescriptors from pg-to-arrow. Legal —
+# pg-to-arrow depends on `common` only, so there is NO cycle; the production DAG (control → common)
+# is unchanged.
+pg-to-arrow = { path = "../pg-to-arrow" }
