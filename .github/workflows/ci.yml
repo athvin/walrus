@@ -112,6 +112,12 @@ jobs:
       - name: Boot the dev stack (up --wait)
         run: docker compose -f deploy/docker/docker-compose.yml up --wait
 
+      # Apply the control schema before compiling: with DATABASE_URL set, sqlx's query! macros
+      # introspect the live DB at *compile* time, so the tables must exist first (the tests also
+      # re-run migrations idempotently at runtime). This also gives `sqlx prepare --check` a schema.
+      - name: Apply control migrations
+        run: sqlx migrate run --source migrations/control
+
       - name: Control integration tests (migrations schema/CHECK + file_manifest claim order)
         run: cargo test -p control --features integration
 
