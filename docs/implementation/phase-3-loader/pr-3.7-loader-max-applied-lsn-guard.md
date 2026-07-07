@@ -1,5 +1,7 @@
 # PR 3.7 — The per-PK max-applied-commit-LSN guard (⚠ extends architecture.md)
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/60
+
 > **Phase:** 3 — walrus-loader · **Crates touched:** `loader` · **Est. size:** M ·
 > **Depends on:** PR 3.6 · **Unlocks:** PR 3.8
 
@@ -98,22 +100,22 @@ impl TransformSql {
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] A delete + re-insert **straddling** the watermark does **not** resurrect the killed row (break
+- [x] A delete + re-insert **straddling** the watermark does **not** resurrect the killed row (break
       face B) — the guard makes a stale winner a no-op.
-- [ ] A snapshot row whose `commit_lsn == transformed_lsn` is **not** silently dropped (break face A) —
+- [x] A snapshot row whose `commit_lsn == transformed_lsn` is **not** silently dropped (break face A) —
       the relaxed `>=` bound re-examines it and the guard applies it.
-- [ ] Every `MERGE` branch (DELETE / UPDATE / INSERT) maintains `_applied_commit_lsn` / `_applied_lsn`
+- [x] Every `MERGE` branch (DELETE / UPDATE / INSERT) maintains `_applied_commit_lsn` / `_applied_lsn`
       and gates the mutating branches on the tuple comparison.
-- [ ] `_applied_*` do **not** appear in user-facing projections of `<table>` (hidden, or in a shadow
+- [x] `_applied_*` do **not** appear in user-facing projections of `<table>` (hidden, or in a shadow
       table if a byte-identical mirror is required).
-- [ ] The incremental path is now self-correcting; a comment states the full-rebuild remains the safety
+- [x] The incremental path is now self-correcting; a comment states the full-rebuild remains the safety
       net regardless.
-- [ ] Hermetic in-memory unit tests (no docker compose).
-- [ ] Docs/comments flag this as **⚠ extends architecture.md** (Open Q8/Q13) and name the two break faces.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p loader --test transform` (and `--workspace` stays green) asserting
+- [x] Hermetic in-memory unit tests (no docker compose).
+- [x] Docs/comments flag this as **⚠ extends architecture.md** (Open Q8/Q13) and name the two break faces.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p loader --test transform` (and `--workspace` stays green) asserting
         **`stale_delete_reinsert_across_watermark_does_not_resurrect`** and
         **`equal_commit_lsn_snapshot_row_is_still_applied`**.
 
