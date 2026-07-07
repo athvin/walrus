@@ -4,11 +4,15 @@
 pub mod config;
 pub mod error;
 pub mod lsn;
+pub mod pg_shape;
 pub mod sink_meta;
 pub mod telemetry;
+pub mod type_descriptor;
 
 pub use config::CommonConfig;
 pub use error::{Error, ExitCode, Result};
 pub use lsn::Lsn;
+pub use pg_shape::{PgColumn, PgRelation, ReplicaIdentity, TupleValue};
 pub use sink_meta::{Kind, Op, SinkMeta, UtcTimestamp};
 pub use telemetry::{init_tracing, TelemetryConfig};
+pub use type_descriptor::{Tier, TypeDescriptor, TypeMeta};
