@@ -33,5 +33,13 @@ pub const TSMULTIRANGE: u32 = 4533;
 pub const TSTZMULTIRANGE: u32 = 4534;
 pub const DATEMULTIRANGE: u32 = 4535;
 pub const INT8MULTIRANGE: u32 = 4536;
+// Native geometric types → STRUCT/LIST of doubles (PR 2.14).
+pub const POINT: u32 = 600;
+pub const LSEG: u32 = 601;
+pub const PATH: u32 = 602;
+pub const BOX: u32 = 603;
+pub const POLYGON: u32 = 604;
+pub const LINE: u32 = 628;
+pub const CIRCLE: u32 = 718;
 pub const NUMERIC: u32 = 1700;
 pub const JSONB: u32 = 3802;

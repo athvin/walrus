@@ -10,6 +10,7 @@
 
 pub mod batch;
 pub mod error;
+pub mod geometric;
 pub mod oids;
 pub mod parquet;
 pub mod range;

@@ -8,6 +8,7 @@
 //! move in lockstep — every `append_row` pushes exactly one slot to every column.
 
 use crate::error::Error;
+use crate::geometric::GeoKind;
 use crate::oids;
 use crate::range::RangeFamily;
 use crate::schema::{build_schema, tier1_data_type, SINK_META_COLUMN};
@@ -26,11 +27,12 @@ use std::sync::Arc;
 /// builders (PR 2.12). Ordering here MUST match `emit_fields` / `build_schema` (§2.4, PR 2.17's
 /// descriptor `emit[]` lists the same suffixes in the same order).
 enum Emit {
-    Scalar,     // 1 builder
-    Interval,   // 3 builders: _months(i32), _days(i32), _micros(i64)
-    Timetz,     // 2 builders: _micros(i64), _offset_seconds(i32)
-    Range,      // 5 builders: _lower, _upper, _lower_inc, _upper_inc, _empty
-    Multirange, // 1 builder: ListBuilder<StructBuilder>
+    Scalar,             // 1 builder
+    Interval,           // 3 builders: _months(i32), _days(i32), _micros(i64)
+    Timetz,             // 2 builders: _micros(i64), _offset_seconds(i32)
+    Range,              // 5 builders: _lower, _upper, _lower_inc, _upper_inc, _empty
+    Multirange,         // 1 builder: ListBuilder<StructBuilder>
+    Geometric(GeoKind), // 1 builder: a nested STRUCT / LIST<STRUCT> of doubles
 }
 
 /// Classify a source column into its fan-out shape. MUST stay in lockstep with `emit_fields` — the
@@ -49,6 +51,9 @@ fn emit_kind(col: &PgColumn) -> Result<Emit, Error> {
     }
     if RangeFamily::from_multirange_oid(col.type_oid).is_some() {
         return Ok(Emit::Multirange);
+    }
+    if let Some(kind) = crate::geometric::geo_kind(col.type_oid) {
+        return Ok(Emit::Geometric(kind));
     }
     Err(Error::NotTier1 {
         oid: col.type_oid,
@@ -123,6 +128,10 @@ impl BatchBuilder {
                     append_multirange(self.builders[bi].as_mut(), &fields[bi], value)?;
                     bi += 1;
                 }
+                Emit::Geometric(kind) => {
+                    append_geometric(self.builders[bi].as_mut(), &fields[bi], value, *kind)?;
+                    bi += 1;
+                }
             }
         }
         let json = serde_json::to_string(meta).map_err(|e| Error::ValueParse {
@@ -171,17 +180,29 @@ fn column_builder(field: &Field) -> Result<Box<dyn ArrayBuilder>, Error> {
         // `("item", …, nullable=true)`, matching `multirange_field`'s `Field::new_list_field`.
         DataType::List(item) => match item.data_type() {
             DataType::Struct(struct_fields) => {
-                let mut children = Vec::with_capacity(struct_fields.len());
-                for f in struct_fields.iter() {
-                    children.push(column_builder(f)?);
-                }
-                let sb = StructBuilder::new(struct_fields.clone(), children);
+                let sb = StructBuilder::new(
+                    struct_fields.clone(),
+                    struct_child_builders(struct_fields)?,
+                );
                 Box::new(ListBuilder::new(sb))
             }
             _ => make_builder(field.data_type(), 0),
         },
+        // Geometric STRUCTs (point/box/circle/line/path, PR 2.14). Recurse via `column_builder` so a
+        // nested Struct/List/Decimal/Timestamp child keeps its exact type (not `make_builder`'s default).
+        DataType::Struct(struct_fields) => Box::new(StructBuilder::new(
+            struct_fields.clone(),
+            struct_child_builders(struct_fields)?,
+        )),
         other => make_builder(other, 0),
     })
+}
+
+/// One `column_builder` per struct child, preserving each child's exact (possibly nested) type.
+fn struct_child_builders(
+    fields: &arrow::datatypes::Fields,
+) -> Result<Vec<Box<dyn ArrayBuilder>>, Error> {
+    fields.iter().map(|f| column_builder(f)).collect()
 }
 
 macro_rules! downcast {
@@ -521,6 +542,121 @@ fn opt_text_value(bound: &Option<String>) -> TupleValue {
         Some(s) => TupleValue::Text(s.clone()),
         None => TupleValue::Null,
     }
+}
+
+/// Append one geometric value onto its single nested builder. Each shape appends to *every* leaf for
+/// every row (a NULL appends nulls to all leaves + closes the struct/list null), keeping the nested
+/// child arrays length-locked — the invariant `StructBuilder` requires.
+fn append_geometric(
+    builder: &mut dyn ArrayBuilder,
+    field: &Field,
+    value: &TupleValue,
+    kind: GeoKind,
+) -> Result<(), Error> {
+    use crate::geometric as geo;
+    let col = field.name();
+    let s = match value {
+        TupleValue::Null | TupleValue::UnchangedToast => None,
+        _ => Some(text(value, col, field.data_type())?),
+    };
+    match kind {
+        GeoKind::Point => {
+            let sb = downcast!(builder, StructBuilder, col);
+            let pt = s.map(geo::parse_point).transpose()?;
+            push_doubles(sb, &[pt.map(|p| p.x), pt.map(|p| p.y)], col)?;
+        }
+        GeoKind::Line => {
+            let sb = downcast!(builder, StructBuilder, col);
+            let abc = s.map(geo::parse_line).transpose()?;
+            push_doubles(
+                sb,
+                &[abc.map(|v| v.0), abc.map(|v| v.1), abc.map(|v| v.2)],
+                col,
+            )?;
+        }
+        GeoKind::Circle => {
+            let sb = downcast!(builder, StructBuilder, col);
+            let xyr = s.map(geo::parse_circle).transpose()?;
+            push_doubles(
+                sb,
+                &[xyr.map(|v| v.0.x), xyr.map(|v| v.0.y), xyr.map(|v| v.1)],
+                col,
+            )?;
+        }
+        GeoKind::Lseg | GeoKind::Box => {
+            let sb = downcast!(builder, StructBuilder, col);
+            let pts = s.map(geo::parse_box).transpose()?;
+            push_point_child(sb, 0, pts.map(|(a, _)| a), col)?;
+            push_point_child(sb, 1, pts.map(|(_, b)| b), col)?;
+            sb.append(pts.is_some());
+        }
+        GeoKind::Path => {
+            let sb = downcast!(builder, StructBuilder, col);
+            let parsed = s.map(geo::parse_path).transpose()?;
+            match &parsed {
+                Some((closed, _)) => {
+                    struct_field::<BooleanBuilder>(sb, 0, col)?.append_value(*closed)
+                }
+                None => struct_field::<BooleanBuilder>(sb, 0, col)?.append_null(),
+            }
+            {
+                let lb = struct_field::<ListBuilder<StructBuilder>>(sb, 1, col)?;
+                match &parsed {
+                    Some((_, pts)) => push_points_list(lb, pts, col)?,
+                    None => lb.append_null(),
+                }
+            }
+            sb.append(parsed.is_some());
+        }
+        GeoKind::Polygon => {
+            let lb = downcast!(builder, ListBuilder<StructBuilder>, col);
+            match s {
+                Some(t) => push_points_list(lb, &geo::parse_polygon(t)?, col)?,
+                None => lb.append_null(),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Append `vals` to a struct's Float64 children by index, then close the struct (valid ⇔ all Some).
+fn push_doubles(sb: &mut StructBuilder, vals: &[Option<f64>], col: &str) -> Result<(), Error> {
+    for (i, v) in vals.iter().enumerate() {
+        let b = struct_field::<Float64Builder>(sb, i, col)?;
+        match v {
+            Some(x) => b.append_value(*x),
+            None => b.append_null(),
+        }
+    }
+    sb.append(vals.iter().all(Option::is_some));
+    Ok(())
+}
+
+/// Append a `Pt` (or null) into the `STRUCT(x,y)` child at struct index `idx`.
+fn push_point_child(
+    sb: &mut StructBuilder,
+    idx: usize,
+    pt: Option<crate::geometric::Pt>,
+    col: &str,
+) -> Result<(), Error> {
+    let child = struct_field::<StructBuilder>(sb, idx, col)?;
+    push_doubles(child, &[pt.map(|p| p.x), pt.map(|p| p.y)], col)
+}
+
+/// Append a run of points as `STRUCT(x,y)` members to a list builder, then close the (non-null) list.
+fn push_points_list(
+    lb: &mut ListBuilder<StructBuilder>,
+    pts: &[crate::geometric::Pt],
+    col: &str,
+) -> Result<(), Error> {
+    {
+        let psb = lb.values();
+        for p in pts {
+            push_doubles(psb, &[Some(p.x), Some(p.y)], col)?;
+        }
+    }
+    lb.append(true);
+    Ok(())
 }
 
 /// Append a parsed number to a `FromStr` builder, attributing a failure to the column.
@@ -1067,5 +1203,107 @@ mod tests {
         let lo = s.column(0).as_primitive::<arrow::datatypes::Int32Type>();
         assert_eq!(lo.value(0), 1);
         assert_eq!(lo.value(1), 7);
+    }
+
+    #[test]
+    fn geometric_point_round_trips_and_nulls() {
+        let rel = one_col_rel("loc", oids::POINT, -1);
+        let mut b = BatchBuilder::new(&rel).unwrap();
+        b.append_row(&[TupleValue::Text("(1,2)".to_string())], &meta(vec![]))
+            .unwrap();
+        b.append_row(&[TupleValue::Null], &meta(vec![])).unwrap();
+        let batch = b.finish().unwrap();
+        let s = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let x = s.column(0).as_primitive::<arrow::datatypes::Float64Type>();
+        let y = s.column(1).as_primitive::<arrow::datatypes::Float64Type>();
+        assert_eq!(x.value(0), 1.0);
+        assert_eq!(y.value(0), 2.0);
+        assert!(s.is_null(1), "a NULL point is a null struct row");
+    }
+
+    #[test]
+    fn geometric_box_nests_two_points() {
+        let rel = one_col_rel("bx", oids::BOX, -1);
+        let mut b = BatchBuilder::new(&rel).unwrap();
+        b.append_row(
+            &[TupleValue::Text("(2,3),(0,1)".to_string())],
+            &meta(vec![]),
+        )
+        .unwrap();
+        let batch = b.finish().unwrap();
+        let s = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let p1 = s.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+        let p2 = s.column(1).as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(
+            p1.column(0)
+                .as_primitive::<arrow::datatypes::Float64Type>()
+                .value(0),
+            2.0
+        ); // p1.x
+        assert_eq!(
+            p2.column(1)
+                .as_primitive::<arrow::datatypes::Float64Type>()
+                .value(0),
+            1.0
+        ); // p2.y
+    }
+
+    #[test]
+    fn geometric_path_open_vs_closed_only_differs_by_is_closed() {
+        let rel = one_col_rel("pth", oids::PATH, -1);
+        let mut b = BatchBuilder::new(&rel).unwrap();
+        b.append_row(
+            &[TupleValue::Text("[(0,0),(1,1)]".to_string())],
+            &meta(vec![]),
+        )
+        .unwrap(); // open
+        b.append_row(
+            &[TupleValue::Text("((0,0),(1,1))".to_string())],
+            &meta(vec![]),
+        )
+        .unwrap(); // closed
+        let batch = b.finish().unwrap();
+        let s = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let is_closed = s.column(0).as_boolean();
+        assert!(!is_closed.value(0), "brackets → open");
+        assert!(is_closed.value(1), "double parens → closed");
+        // Same points either way (the only difference is the flag).
+        let pts = s.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(pts.value_length(0), 2);
+        assert_eq!(pts.value_length(1), 2);
+    }
+
+    #[test]
+    fn geometric_polygon_is_list_of_points() {
+        let rel = one_col_rel("poly", oids::POLYGON, -1);
+        let mut b = BatchBuilder::new(&rel).unwrap();
+        b.append_row(
+            &[TupleValue::Text("((0,0),(1,0),(1,1))".to_string())],
+            &meta(vec![]),
+        )
+        .unwrap();
+        let batch = b.finish().unwrap();
+        let list = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(list.value_length(0), 3);
+        let members = list.value(0);
+        let s = members.as_any().downcast_ref::<StructArray>().unwrap();
+        let y = s.column(1).as_primitive::<arrow::datatypes::Float64Type>();
+        assert_eq!(y.value(2), 1.0);
     }
 }
