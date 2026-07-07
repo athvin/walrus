@@ -147,6 +147,10 @@ jobs:
       - name: Relation cache (compose)
         run: cargo test -p pg-sink --test relation_cache -- --ignored
 
+      # PR 2.23: micro-batching — a stream of inserts forms and seals a batch.
+      - name: Batching (compose)
+        run: cargo test -p pg-sink --test batching -- --ignored
+
       # PR 2.18/2.19: the sink pod-lifecycle shell against the live stack — full bootstrap (control +
       # S3 + source preflight) → /startup→/ready flip, SIGTERM exit 0, missing control DB → exit 11.
       - name: Sink pod-lifecycle smoke (health · SIGTERM · fail-fast exit code)
