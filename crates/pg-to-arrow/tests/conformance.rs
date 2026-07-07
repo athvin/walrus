@@ -482,3 +482,48 @@ fn system_types_carry_canonical_varchar() {
         assert_eq!(v, text, "oid {oid} value must be verbatim");
     }
 }
+
+// ---- uuid (native) + enum (PR 2.16) -------------------------------------------------------------
+
+#[test]
+fn uuid_reads_back_as_native_uuid() {
+    // The pinned-arrow-rs canary: the `arrow.uuid` extension → Parquet UUID → DuckDB UUID (not BLOB).
+    // If a bump ever drops the annotation this typeof flips to BLOB and fails here.
+    let u = "550e8400-e29b-41d4-a716-446655440000";
+    let (t, v) = typeof_and_value(oids::UUID, -1, u);
+    assert_eq!(
+        t, "UUID",
+        "arrow.uuid extension must yield a native DuckDB UUID"
+    );
+    assert_eq!(v, u);
+}
+
+#[test]
+fn uuid_varchar_fallback_casts_to_uuid() {
+    // The escape hatch: carry canonical text as VARCHAR; CAST(x AS UUID) on load recovers the value.
+    let u = "550e8400-e29b-41d4-a716-446655440000";
+    let field = pg_to_arrow::uuid_enum::uuid_as_varchar("c");
+    let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![field]));
+    let batch = arrow::array::RecordBatch::try_new(
+        schema,
+        vec![std::sync::Arc::new(arrow::array::StringArray::from(vec![
+            u,
+        ]))],
+    )
+    .unwrap();
+    let bytes = write_parquet_bytes(&batch).unwrap();
+    let rows = read_parquet_rows(
+        &bytes,
+        "SELECT typeof(CAST(c AS UUID)), CAST(CAST(c AS UUID) AS VARCHAR) FROM {p}",
+    );
+    assert_eq!(rows[0].0, "UUID");
+    assert_eq!(rows[0].1, u);
+}
+
+#[test]
+fn enum_reads_back_as_varchar_verbatim() {
+    // Enum OID is dynamic (≥16384); the interim rule maps non-builtin OIDs to enum→VARCHAR (PR 2.22).
+    let (t, v) = typeof_and_value(16400, -1, "shipped");
+    assert_eq!(t, "VARCHAR");
+    assert_eq!(v, "shipped");
+}

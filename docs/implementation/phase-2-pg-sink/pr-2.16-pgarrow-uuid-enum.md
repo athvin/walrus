@@ -1,5 +1,7 @@
 # PR 2.16 — `uuid` (native via `arrow.uuid`) + `enum` (VARCHAR + ordered labels)
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/36
+
 > **Phase:** 2 — walrus-pg-sink (2b: pg-to-arrow) · **Crates touched:** `pg-to-arrow` · **Est. size:** M ·
 > **Depends on:** PR 2.15 · **Unlocks:** PR 2.17
 
@@ -94,17 +96,17 @@ mod tests {
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `uuid_field` produces `FixedSizeBinary(16)` with `ARROW:extension:name = arrow.uuid`; append via
+- [x] `uuid_field` produces `FixedSizeBinary(16)` with `ARROW:extension:name = arrow.uuid`; append via
       `FixedSizeBinaryBuilder` from parsed 16-byte values.
-- [ ] **CI guard:** a conformance test writes a uuid column, `read_parquet`s it, and asserts
+- [x] **CI guard:** a conformance test writes a uuid column, `read_parquet`s it, and asserts
       `typeof(col) == 'UUID'` **and** the value — this is the pinned-arrow-rs canary.
-- [ ] A `uuid_as_varchar` fallback exists and its own conformance test proves `CAST(col AS UUID)` recovers the value.
-- [ ] `enum` maps to `Utf8`, value carried verbatim, and reads back as DuckDB `VARCHAR` (label set not yet applied).
-- [ ] `arrow`/`parquet`/`duckdb` are pinned to exact versions (comment references the UUID-annotation dependency).
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-to-arrow` and `cargo test -p pg-to-arrow --features conformance`
+- [x] A `uuid_as_varchar` fallback exists and its own conformance test proves `CAST(col AS UUID)` recovers the value.
+- [x] `enum` maps to `Utf8`, value carried verbatim, and reads back as DuckDB `VARCHAR` (label set not yet applied).
+- [x] `arrow`/`parquet`/`duckdb` are pinned to exact versions (comment references the UUID-annotation dependency).
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-to-arrow` and `cargo test -p pg-to-arrow --features conformance`
 
 ## Hints & gotchas
 

@@ -30,7 +30,12 @@ tokio = "1"
 sqlx = "0.8"
 anyhow = "1"
 hex = "0.4"
-arrow = "54"
-parquet = "54"
-duckdb = "1"
+# Pinned to EXACT versions (PR 2.16): DuckDB reads a native `UUID` only when arrow-rs annotates the
+# FixedSizeBinary(16) with the `arrow.uuid` canonical extension → Parquet UUID logical type. That
+# annotation is behaviour a minor bump could change, so the (CI-guarded) uuid mapping pins arrow +
+# parquet, and duckdb is pinned alongside for a stable read-back. §2.4 uuid.
+arrow = "=54.3.1"
+parquet = "=54.3.1"
+duckdb = "=1.10504.0"
+uuid = "1"
 tempfile = "3"

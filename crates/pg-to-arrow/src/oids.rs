@@ -55,5 +55,10 @@ pub const PG_LSN: u32 = 3220;
 pub const TSVECTOR: u32 = 3614;
 pub const TSQUERY: u32 = 3615;
 pub const XID8: u32 = 5069;
+// uuid → native DuckDB UUID via the arrow.uuid extension (PR 2.16).
+pub const UUID: u32 = 2950;
+// Postgres `FirstNormalObjectId`: user-defined types (incl. enums) get OIDs at/above this. The sink
+// treats a non-builtin OID as `enum → VARCHAR` for now; PR 2.22 resolves enum-ness from the catalog.
+pub const FIRST_NORMAL_OID: u32 = 16384;
 pub const NUMERIC: u32 = 1700;
 pub const JSONB: u32 = 3802;

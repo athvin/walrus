@@ -16,13 +16,17 @@ conformance = ["dep:duckdb"]
 
 [dependencies]
 common = { path = "../common" }
-arrow = { workspace = true }
-parquet = { workspace = true }
+# `canonical_extension_types` exposes the `Uuid` extension so the parquet writer emits the UUID
+# logical type (a plain FixedSizeBinary(16) reads back as BLOB, not UUID). §2.4 uuid, PR 2.16.
+arrow = { workspace = true, features = ["canonical_extension_types"] }
+parquet = { workspace = true, features = ["arrow_canonical_extension_types"] }
 thiserror = { workspace = true }
 serde_json = { workspace = true }
 # jiff parses canonical Postgres temporal text into micros/days; hex decodes bytea `\x…` text.
 jiff = { workspace = true }
 hex = { workspace = true }
+# uuid parses canonical UUID text into the 16 bytes the FixedSizeBinary(16) + arrow.uuid path needs.
+uuid = { workspace = true }
 duckdb = { workspace = true, features = ["bundled"], optional = true }
 
 [dev-dependencies]
