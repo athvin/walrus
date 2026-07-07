@@ -6,7 +6,7 @@
 
 use common::{ReplicaIdentity, TupleValue};
 use pg_sink::pgoutput::{
-    parse_message, parse_stream, parse_tuple, DecodeError, Message, Reader, StreamCtx,
+    parse_message, parse_stream, parse_tuple, DecodeError, Message, OldTupleKind, Reader, StreamCtx,
 };
 
 /// A ported row of `VECTORS`: bytes in, the golden render line out.
@@ -414,7 +414,51 @@ fn render(m: &Message) -> String {
                 render_tuple(new)
             )
         }
+        Message::Update {
+            xid,
+            relation_oid,
+            old_kind,
+            old,
+            new,
+        } => {
+            let pre = match xid {
+                Some(x) => format!("xid={x} "),
+                None => String::new(),
+            };
+            let oldstr = match (old_kind, old) {
+                (Some(k), Some(o)) => format!(" old[{}]={}", old_kind_char(*k), render_tuple(o)),
+                _ => String::new(),
+            };
+            format!(
+                "UPDATE        {pre}rel={relation_oid}{oldstr} new={}",
+                render_tuple(new)
+            )
+        }
+        Message::Delete {
+            xid,
+            relation_oid,
+            old_kind,
+            old,
+        } => {
+            let pre = match xid {
+                Some(x) => format!("xid={x} "),
+                None => String::new(),
+            };
+            format!(
+                "DELETE        {pre}rel={relation_oid} old[{}]={}",
+                old_kind_char(*old_kind),
+                render_tuple(old)
+            )
+        }
         _ => todo!("render arm added in a later PR"),
+    }
+}
+
+/// The old-image kind as its wire char: `Key` → `'K'`, `Full` → `'O'`.
+fn old_kind_char(k: OldTupleKind) -> char {
+    match k {
+        OldTupleKind::Key => 'K',
+        OldTupleKind::Full => 'O',
     }
 }
 
@@ -603,6 +647,99 @@ fn parse_tuple_rejects_unknown_format_byte() {
         parse_tuple(&mut reader),
         Err(DecodeError::BadTupleFormat { byte: b'x' })
     ));
+}
+
+#[test]
+fn update_delete_vectors_render() {
+    for name in [
+        "update_pk_change",
+        "delete_key",
+        "update_no_key_change",
+        "update_full_identity",
+        "delete_full_identity",
+        "update_composite_pk_partial",
+        "unchanged_toast_update",
+    ] {
+        let v = lookup(name);
+        assert_eq!(render(&decode(v.hex, v.streaming)), v.expected, "{name}");
+    }
+}
+
+#[test]
+fn non_key_update_has_no_old_image() {
+    // update_no_key_change: the byte after the OID was 'N', not 'K' → no old image.
+    match decode(lookup("update_no_key_change").hex, false) {
+        Message::Update { old_kind, old, .. } => {
+            assert_eq!(old_kind, None);
+            assert_eq!(old, None);
+        }
+        other => panic!("expected Update, got {other:?}"),
+    }
+}
+
+#[test]
+fn pk_changing_update_carries_key_only_old_image() {
+    match decode(lookup("update_pk_change").hex, false) {
+        Message::Update { old_kind, old, .. } => {
+            assert_eq!(old_kind, Some(OldTupleKind::Key));
+            let old = old.unwrap();
+            assert_eq!(old[0], TupleValue::Text("1".to_string()));
+            assert!(
+                old[1..].iter().all(|v| *v == TupleValue::Null),
+                "DEFAULT identity ships key columns only; the rest are NULL padding"
+            );
+        }
+        other => panic!("expected Update, got {other:?}"),
+    }
+}
+
+#[test]
+fn full_identity_update_carries_whole_old_row() {
+    match decode(lookup("update_full_identity").hex, false) {
+        Message::Update { old_kind, old, .. } => {
+            assert_eq!(old_kind, Some(OldTupleKind::Full));
+            assert_eq!(
+                old.unwrap(),
+                vec![
+                    TupleValue::Text("7".to_string()),
+                    TupleValue::Text("w".to_string()),
+                    TupleValue::Text("1".to_string()),
+                ]
+            );
+        }
+        other => panic!("expected Update, got {other:?}"),
+    }
+}
+
+#[test]
+fn composite_pk_old_image_carries_all_key_columns() {
+    // only region changed, but the old KEY image still ships BOTH key columns; non-key is NULL.
+    match decode(lookup("update_composite_pk_partial").hex, false) {
+        Message::Update { old_kind, old, .. } => {
+            assert_eq!(old_kind, Some(OldTupleKind::Key));
+            assert_eq!(
+                old.unwrap(),
+                vec![
+                    TupleValue::Text("us".to_string()),
+                    TupleValue::Text("1".to_string()),
+                    TupleValue::Null,
+                ]
+            );
+        }
+        other => panic!("expected Update, got {other:?}"),
+    }
+}
+
+#[test]
+fn null_and_unchanged_toast_are_distinct() {
+    match decode(lookup("unchanged_toast_update").hex, false) {
+        Message::Update { new, .. } => {
+            assert_eq!(new[2], TupleValue::Null);
+            assert_eq!(new[4], TupleValue::UnchangedToast);
+            assert_ne!(new[2], new[4]);
+        }
+        other => panic!("expected Update, got {other:?}"),
+    }
 }
 
 #[test]
