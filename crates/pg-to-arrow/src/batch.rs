@@ -41,6 +41,10 @@ fn emit_kind(col: &PgColumn) -> Result<Emit, Error> {
     if tier1_data_type(col.type_oid, col.type_modifier).is_some() {
         return Ok(Emit::Scalar);
     }
+    // Tier-3 carriers are a single Utf8 column → the same Scalar/append_value path (PR 2.15).
+    if crate::tier3::is_tier3_text(col.type_oid, col.type_modifier) {
+        return Ok(Emit::Scalar);
+    }
     match col.type_oid {
         oids::INTERVAL => return Ok(Emit::Interval),
         oids::TIMETZ => return Ok(Emit::Timetz),
