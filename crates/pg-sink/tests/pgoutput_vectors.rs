@@ -501,6 +501,33 @@ fn render(m: &Message) -> String {
                 fmt_bytes(content)
             )
         }
+        Message::StreamStart { xid, first_segment } => {
+            format!(
+                "STREAM START  xid={xid} first_segment={}",
+                if *first_segment { 1 } else { 0 }
+            )
+        }
+        Message::StreamStop => "STREAM STOP".to_string(),
+        Message::StreamCommit {
+            xid,
+            flags,
+            commit_lsn,
+            end_lsn,
+            commit_ts,
+        } => format!(
+            "STREAM COMMIT xid={xid} flags={flags} commit_lsn={} end_lsn={} commit_ts={}",
+            fmt_lsn(commit_lsn.as_u64()),
+            fmt_lsn(end_lsn.as_u64()),
+            fmt_ts(*commit_ts)
+        ),
+        Message::StreamAbort { top_xid, sub_xid } => {
+            let kind = if top_xid == sub_xid {
+                "WHOLE-TXN abort"
+            } else {
+                "SUBTRANSACTION rollback"
+            };
+            format!("STREAM ABORT  top_xid={top_xid} sub_xid={sub_xid}  <- {kind}")
+        }
         _ => todo!("render arm added in a later PR"),
     }
 }
@@ -878,6 +905,93 @@ fn message_transactional_flag() {
         }
         other => panic!("expected Message, got {other:?}"),
     }
+}
+
+#[test]
+fn stream_vectors_render() {
+    for name in [
+        "stream_start_first",
+        "stream_stop",
+        "stream_commit",
+        "stream_abort_subtransaction",
+        "stream_abort_whole_txn",
+        "streamed_insert_carries_xid",
+    ] {
+        let v = lookup(name);
+        assert_eq!(render(&decode(v.hex, v.streaming)), v.expected, "{name}");
+    }
+}
+
+/// FLAGSHIP: a rolled-back savepoint is NOT a whole-txn abort — discard only sub_xid's rows.
+#[test]
+fn subtransaction_abort_is_not_whole_txn() {
+    let m = decode(lookup("stream_abort_subtransaction").hex, true);
+    assert_eq!(m.is_whole_txn_abort(), Some(false));
+    match &m {
+        Message::StreamAbort { top_xid, sub_xid } => assert_eq!((*top_xid, *sub_xid), (757, 758)),
+        other => panic!("expected StreamAbort, got {other:?}"),
+    }
+}
+
+#[test]
+fn whole_txn_abort_flagged() {
+    let m = decode(lookup("stream_abort_whole_txn").hex, true);
+    assert_eq!(m.is_whole_txn_abort(), Some(true));
+    match &m {
+        Message::StreamAbort { top_xid, sub_xid } => {
+            assert_eq!((*top_xid, *sub_xid), (866, 866));
+        }
+        other => panic!("expected StreamAbort, got {other:?}"),
+    }
+}
+
+#[test]
+fn stream_start_stop_toggle_context() {
+    let mut ctx = StreamCtx::default();
+    assert!(!ctx.in_stream);
+
+    // Stream Start opens the streamed context.
+    let start_bytes = hex::decode(lookup("stream_start_first").hex).unwrap();
+    let start = parse_message(&mut Reader::new(&start_bytes), &mut ctx).unwrap();
+    assert!(matches!(
+        start,
+        Message::StreamStart {
+            xid: 753,
+            first_segment: true
+        }
+    ));
+    assert!(ctx.in_stream, "Start opened the streamed context");
+
+    // A streamed change now reads its sub-xid prefix.
+    let ins_bytes = hex::decode(lookup("streamed_insert_carries_xid").hex).unwrap();
+    match parse_message(&mut Reader::new(&ins_bytes), &mut ctx).unwrap() {
+        Message::Insert { xid, .. } => assert_eq!(xid, Some(753)),
+        other => panic!("expected Insert, got {other:?}"),
+    }
+
+    // Stream Stop closes it; a subsequent change would have no prefix.
+    parse_message(&mut Reader::new(b"E"), &mut ctx).unwrap();
+    assert!(!ctx.in_stream, "Stop closed the context");
+}
+
+#[test]
+fn parse_stream_preserves_streaming_context_across_messages() {
+    let mut raw = hex::decode(lookup("stream_start_first").hex).unwrap();
+    raw.push(0x0a);
+    raw.extend_from_slice(&hex::decode(lookup("streamed_insert_carries_xid").hex).unwrap());
+    raw.push(0x0a);
+    raw.push(b'E');
+    raw.push(0x0a);
+
+    let mut ctx = StreamCtx::default();
+    let msgs = parse_stream(&raw, &mut ctx).unwrap();
+    assert_eq!(msgs.len(), 3);
+    assert!(matches!(msgs[0], Message::StreamStart { xid: 753, .. }));
+    match &msgs[1] {
+        Message::Insert { xid, .. } => assert_eq!(*xid, Some(753)),
+        other => panic!("expected Insert, got {other:?}"),
+    }
+    assert!(matches!(msgs[2], Message::StreamStop));
 }
 
 #[test]
