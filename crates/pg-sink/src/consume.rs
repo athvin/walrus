@@ -55,7 +55,14 @@ pub async fn run_decode_loop(
     loop {
         tokio::select! {
             _ = token.cancelled() => {
-                tracing::info!("decode loop cancelled");
+                // SIGTERM/SIGINT: the loop has stopped consuming — now run the ordered drain (NOT
+                // cancellable; the caller bounds it by the K8s grace period). The slot is never dropped.
+                tracing::info!("decode loop cancelled; draining");
+                health.mark_terminating();
+                let outcome = crate::shutdown::drain(stream, router, sink, checkpoint, pool, epoch)
+                    .await
+                    .context("graceful drain")?;
+                tracing::info!(?outcome, "drain complete; slot left in place, resume on restart");
                 return Ok(());
             }
             _ = beat_check.tick() => {
@@ -373,6 +380,19 @@ impl BatchRouter {
             .values()
             .filter_map(TableBatcher::undurable_floor)
             .min()
+    }
+
+    /// Graceful-drain seal (PR 2.28): seal every table's in-flight **committed** batch, dropping any
+    /// open speculative buffers. The returned batches are flushed with the usual PUT → manifest → slot
+    /// ordering before the final standby update.
+    pub fn drain_committed(&mut self) -> anyhow::Result<Vec<SealedBatch>> {
+        let mut sealed = Vec::new();
+        for batcher in self.batchers.values_mut() {
+            if let Some(batch) = batcher.drain_committed().context("drain committed batch")? {
+                sealed.push(batch);
+            }
+        }
+        Ok(sealed)
     }
 }
 

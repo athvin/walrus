@@ -186,6 +186,24 @@ impl TableBatcher {
             .then_some(self.first_commit_lsn)
             .flatten()
     }
+
+    /// **Drop** the open (uncommitted) transaction's speculative buffer — on a graceful drain (PR 2.28)
+    /// these have no `Commit` yet, so forcing them out would orphan an S3 object with no way to resolve
+    /// it; they simply re-stream on resume (at-least-once). Committed rows are untouched.
+    pub fn drop_open_txn(&mut self) {
+        self.pending.clear();
+        self.pending_bytes = 0;
+    }
+
+    /// Seal the in-flight **committed** batch on drain: drop any open speculative buffer first, then
+    /// seal iff there are committed rows. `None` when nothing committed is in flight.
+    pub fn drain_committed(&mut self) -> Result<Option<SealedBatch>, BatchError> {
+        self.drop_open_txn();
+        if self.committed_rows == 0 {
+            return Ok(None);
+        }
+        self.seal().map(Some)
+    }
 }
 
 /// A rough running byte estimate of the buffered Arrow size (not the compressed Parquet size, which
@@ -358,6 +376,48 @@ mod tests {
         .unwrap();
         b.push(meta("0/10"), &row("1")); // open txn, no commit
         assert!(matches!(b.seal(), Err(BatchError::OpenTransaction)));
+    }
+
+    #[test]
+    fn drain_seals_committed_rows_and_drops_the_open_txn() {
+        let mut b = TableBatcher::new(
+            cached(),
+            triggers(u64::MAX, u64::MAX, Duration::from_secs(3600)), // never auto-flushes
+            Arc::new(SystemClock),
+        )
+        .unwrap();
+        // A committed txn (flush-eligible, but under all thresholds) plus an OPEN speculative txn.
+        b.push(meta("0/10"), &row("1"));
+        b.on_commit("0/20".parse().unwrap()).unwrap();
+        b.push(meta("0/30"), &row("2")); // open, uncommitted
+        assert!(b.has_open_txn());
+        let sealed = b
+            .drain_committed()
+            .unwrap()
+            .expect("committed rows seal on drain");
+        assert_eq!(sealed.row_count, 1, "only the committed row is sealed");
+        assert_eq!(sealed.lsn_end, "0/20".parse().unwrap());
+        assert!(
+            !b.has_open_txn(),
+            "the open speculative buffer was dropped, not forced out"
+        );
+        assert_eq!(b.committed_rows(), 0, "batch reset after drain");
+    }
+
+    #[test]
+    fn drain_with_nothing_committed_is_a_noop() {
+        let mut b = TableBatcher::new(
+            cached(),
+            triggers(u64::MAX, u64::MAX, Duration::from_secs(3600)),
+            Arc::new(SystemClock),
+        )
+        .unwrap();
+        b.push(meta("0/10"), &row("1")); // open only, never committed
+        assert!(
+            b.drain_committed().unwrap().is_none(),
+            "no committed rows → nothing to seal"
+        );
+        assert!(!b.has_open_txn(), "the open buffer is still dropped");
     }
 
     #[test]

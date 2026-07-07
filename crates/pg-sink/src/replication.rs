@@ -152,6 +152,18 @@ impl ReplicationStream {
         Ok(())
     }
 
+    /// Send `CopyDone` and flush — end our side of the CopyBoth stream on a graceful drain (PR 2.28).
+    /// The replication **slot is untouched** (never `DROP_REPLICATION_SLOT`); a replacement pod
+    /// resumes from `confirmed_flush_lsn`. `CopyDone` is a bare frame: tag `'c'`, Int32 length `4`.
+    pub async fn copy_done(&mut self) -> anyhow::Result<()> {
+        self.stream
+            .write_all(&[b'c', 0, 0, 0, 4])
+            .await
+            .context("write CopyDone")?;
+        self.stream.flush().await?;
+        Ok(())
+    }
+
     /// The highest received LSN (what the keepalive path reports as `write`).
     pub fn last_received(&self) -> Lsn {
         self.last_received
