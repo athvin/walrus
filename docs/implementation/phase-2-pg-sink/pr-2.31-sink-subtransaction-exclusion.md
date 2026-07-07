@@ -1,5 +1,7 @@
 # PR 2.31 — Exclude rolled-back subtransaction rows (the flagship correctness test)
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/51
+
 > **Phase:** 2 — walrus-pg-sink · **Crates touched:** `pg-sink` · **Est. size:** L ·
 > **Depends on:** PR 2.30 · **Unlocks:** PR 2.32
 
@@ -102,20 +104,20 @@ async fn savepoint_rollback_ready_file_has_exactly_6000_rows() { todo!() }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] The proto-version §9b scenario (kept-A / rolled-back / kept-B) produces a `ready` file with
+- [x] The proto-version §9b scenario (kept-A / rolled-back / kept-B) produces a `ready` file with
       **exactly 6000** rows — the 2762 rolled-back-savepoint rows are **never** present.
-- [ ] The top-level transaction still **commits** (survivors become visible) even though one of its
+- [x] The top-level transaction still **commits** (survivors become visible) even though one of its
       sub-xids aborted.
-- [ ] Aborted sub-xid rows never appear in any `ready` file and therefore **never reach `<table>_raw`**.
-- [ ] A new sub-xid opened *after* the rollback (kept-B, xid 859) is **kept**.
-- [ ] Survivors preserve commit order (kept-A before kept-B).
-- [ ] Docs/comments explain top-vs-sub xid and why "no `Stream Abort` for a whole txn decoded by the
+- [x] Aborted sub-xid rows never appear in any `ready` file and therefore **never reach `<table>_raw`**.
+- [x] A new sub-xid opened *after* the rollback (kept-B, xid 859) is **kept**.
+- [x] Survivors preserve commit order (kept-A before kept-B).
+- [x] Docs/comments explain top-vs-sub xid and why "no `Stream Abort` for a whole txn decoded by the
       SQL functions" does not apply to a live walsender.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` then
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` then
         `cargo test -p pg-sink --test subtransaction_exclusion -- --ignored` asserting
         **`savepoint_rollback_ready_file_has_exactly_6000_rows`**.
 
