@@ -9,4 +9,4 @@ rust-version.workspace = true
 workspace = true # inherit deny(warnings) + clippy::all from the workspace root
 
 [dependencies]
-# empty until PR 0.2 (errors + exit codes)
+thiserror = { workspace = true }
