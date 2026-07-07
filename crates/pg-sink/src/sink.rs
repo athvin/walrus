@@ -64,6 +64,13 @@ impl ParquetSink {
         }
     }
 
+    /// Best-effort delete of a staged object — used to clean up an aborted streamed txn's speculative
+    /// files (PR 2.30), which have no manifest row pointing at them.
+    pub async fn delete(&self, key: &Path) -> Result<(), SinkError> {
+        self.store.delete(key).await?;
+        Ok(())
+    }
+
     /// `<epoch>/<schema>/<table>/<lsn_end>-<uuid>.parquet`. `lsn_end` is zero-padded 16-hex so keys
     /// sort by commit LSN; `uuid` matches the batch's `batch_id`-style file identity.
     pub fn object_key(&self, schema: &str, table: &str, lsn_end: Lsn, uuid: &str) -> Path {

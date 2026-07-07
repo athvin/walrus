@@ -1,5 +1,7 @@
 # PR 2.30 — Stream a large transaction: per-xid demux, speculative staging, commit-gate
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/50
+
 > **Phase:** 2 — walrus-pg-sink · **Crates touched:** `pg-sink` · **Est. size:** L ·
 > **Depends on:** PR 2.29 · **Unlocks:** PR 2.31
 
@@ -124,20 +126,20 @@ async fn large_txn_single_ready_file_only_after_stream_commit() { todo!() }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] Under `logical_decoding_work_mem = 64kB`, an 8000-row committed transaction produces its
+- [x] Under `logical_decoding_work_mem = 64kB`, an 8000-row committed transaction produces its
       `ready` file(s) **only after `Stream Commit`** — never a `ready` row while the txn is open.
-- [ ] `confirmed_flush_lsn` is **held** at the open txn's begin/first-segment LSN for the whole open
+- [x] `confirmed_flush_lsn` is **held** at the open txn's begin/first-segment LSN for the whole open
       window, then advances on commit.
-- [ ] A whole-txn `Stream Abort {sub == top}` **deletes** the speculative S3 objects and writes **no**
+- [x] A whole-txn `Stream Abort {sub == top}` **deletes** the speculative S3 objects and writes **no**
       `ready` row.
-- [ ] Interleaved blocks for multiple in-progress xids are reassembled correctly via the first-segment
+- [x] Interleaved blocks for multiple in-progress xids are reassembled correctly via the first-segment
       flag (unit test with two xids).
-- [ ] Docs/comments explain "freeing memory (PUT) ≠ advancing the slot", tied to the §1.6 rules.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` then `cargo test -p pg-sink --test streaming_large_txn -- --ignored`
+- [x] Docs/comments explain "freeing memory (PUT) ≠ advancing the slot", tied to the §1.6 rules.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` then `cargo test -p pg-sink --test streaming_large_txn -- --ignored`
         asserting **`large_txn_single_ready_file_only_after_stream_commit`**.
 
 ## Hints & gotchas

@@ -108,6 +108,14 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
         cfg.instance.clone(),
     );
     let mut checkpoint = pg_sink::checkpoint::DurabilityCheckpoint::new(start_lsn);
+    // Large-transaction demux (§1.6): a txn over logical_decoding_work_mem streams before its commit.
+    let mut demux = pg_sink::stream_txn::StreamDemux::new(
+        triggers,
+        std::sync::Arc::new(pg_sink::batch::SystemClock),
+        epoch,
+        SCHEMA_VERSION,
+        cfg.instance.clone(),
+    );
 
     // The idle heartbeat rides a SEPARATE ordinary SQL connection (distinct from replication); its
     // beat writes the published `walrus.heartbeat`, whose round-trip through the stream advances the
@@ -127,6 +135,7 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
         &mut router,
         &sink,
         &mut checkpoint,
+        &mut demux,
         &mut heartbeat,
         &state,
         &ctx.control_pool,
