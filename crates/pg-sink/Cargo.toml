@@ -17,9 +17,29 @@ workspace = true
 
 [dependencies]
 common = { path = "../common" }
+# The sink writes to the control plane via `control`'s API; `sqlx` here only names the `PgPool`
+# `control::connect` returns (the shared control-plane handle the loop will use).
+control = { path = "../control" }
+sqlx = { workspace = true, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+] }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+serde = { workspace = true, features = ["derive"] }
+figment = { workspace = true, features = ["env", "toml", "yaml"] }
+humantime-serde = { workspace = true }
+tokio = { workspace = true, features = [
+    "macros",
+    "rt-multi-thread",
+    "signal",
+    "net",
+    "time",
+] }
+tokio-util = { workspace = true }
+axum = { workspace = true }
+object_store = { workspace = true, features = ["aws"] }
 bytes = { workspace = true }
 tracing = { workspace = true }
 

@@ -129,6 +129,11 @@ jobs:
       - name: sqlx offline cache is up to date (cargo sqlx prepare --check)
         run: cargo sqlx prepare --check --workspace
 
+      # PR 2.18: the sink pod-lifecycle shell against the live stack — /startup→/ready flips, SIGTERM
+      # exits 0, and a missing control DB yields the mapped ControlDb exit code.
+      - name: Sink pod-lifecycle smoke (health · SIGTERM · fail-fast exit code)
+        run: bash scripts/sink-smoke.sh
+
       - name: Tear down (remove volumes)
         if: always()
         run: docker compose -f deploy/docker/docker-compose.yml down -v
