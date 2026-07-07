@@ -1,5 +1,7 @@
 # PR 2.29 — Backfill existing rows from an exported snapshot, then stream
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/49
+
 > **Phase:** 2 — walrus-pg-sink · **Crates touched:** `pg-sink`, `common` · **Est. size:** L ·
 > **Depends on:** PR 2.28 · **Unlocks:** PR 2.30
 
@@ -116,21 +118,21 @@ async fn backfill_preloaded_rows_then_streams_post_consistent_point() { todo!() 
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] Preloaded rows in `orders`/`customers` produce `kind='snapshot'` manifest rows and snapshot
+- [x] Preloaded rows in `orders`/`customers` produce `kind='snapshot'` manifest rows and snapshot
       Parquet objects; **all snapshot files share one `lsn_end = consistent_point`**, disambiguated by
       manifest `id`.
-- [ ] Each table's copy runs in a read-only `REPEATABLE READ` transaction with
+- [x] Each table's copy runs in a read-only `REPEATABLE READ` transaction with
       `SET TRANSACTION SNAPSHOT '<snapshot_name>'` — asserted on the emitted SQL.
-- [ ] A row written **during** backfill is not double-counted: it appears as a post-`consistent_point`
+- [x] A row written **during** backfill is not double-counted: it appears as a post-`consistent_point`
       **stream** change once streaming begins, not in the snapshot files.
-- [ ] The replication connection stays open+idle for the snapshot's lifetime; a copy session that
+- [x] The replication connection stays open+idle for the snapshot's lifetime; a copy session that
       attaches after it closes is a terminal error (documented).
-- [ ] Docs/comments state "no COPY at an LSN — consistency is the exported MVCC snapshot".
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` then `cargo test -p pg-sink --test snapshot_backfill -- --ignored`
+- [x] Docs/comments state "no COPY at an LSN — consistency is the exported MVCC snapshot".
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` then `cargo test -p pg-sink --test snapshot_backfill -- --ignored`
         asserting **`backfill_preloaded_rows_then_streams_post_consistent_point`**.
 
 ## Hints & gotchas
