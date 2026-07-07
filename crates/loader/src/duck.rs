@@ -22,8 +22,11 @@ impl TableDb {
     }
 
     /// `CREATE TABLE IF NOT EXISTS` for BOTH the mirror `<table>` and the CDC log `<table>_raw`
-    /// (composite PK for at-least-once dedup). Initial shape only — DDL reconcile is PR 3.8/3.9.
-    pub fn ensure_tables(&self, rel: &PgRelation) -> Result<(), LoaderError> {
+    /// (composite PK for at-least-once dedup), the user-facing `<table>_current` view, and a
+    /// `_walrus_meta` row seeding this table's `schema_version` (PR 3.8's DDL-reconcile watermark).
+    /// The seed is `ON CONFLICT DO NOTHING`, so an EXISTING `.duckdb` keeps its persisted, already-
+    /// reconciled version across restarts — the additive DDL applier ([`crate::ddl`]) advances it.
+    pub fn ensure_tables(&self, rel: &PgRelation, schema_version: i64) -> Result<(), LoaderError> {
         let cols: Vec<String> = rel
             .columns
             .iter()
@@ -59,11 +62,14 @@ impl TableDb {
             t = rel.name
         );
         // The user-facing projection: the mirror WITHOUT the internal guard columns (DoD §7 "hidden from
-        // user projections"). Users read `<table>_current`; `_applied_*` never leak.
-        let user_view = format!(
-            "CREATE OR REPLACE VIEW \"{t}_current\" AS \
-             SELECT * EXCLUDE (\"_applied_commit_lsn\", \"_applied_lsn\") FROM \"{t}\";",
-            t = rel.name
+        // user projections"). Users read `<table>_current`; `_applied_*` never leak. Recreated by the DDL
+        // applier after any structural change (a `SELECT *` view binds its columns at creation time).
+        let user_view = user_view_sql(&rel.name);
+        // The per-table DDL-reconcile watermark (PR 3.8). Seeded once; the applier advances it.
+        let meta = format!(
+            "CREATE TABLE IF NOT EXISTS \"_walrus_meta\" (k VARCHAR PRIMARY KEY, v BIGINT); \
+             INSERT INTO \"_walrus_meta\" VALUES ('schema_version', {schema_version}) \
+             ON CONFLICT (k) DO NOTHING;"
         );
 
         // The CDC log: every change verbatim, with the intact `walrus_pg_sink_meta` JSON plus four
@@ -84,7 +90,9 @@ impl TableDb {
         );
 
         self.conn
-            .execute_batch(&format!("{mirror}; {applied_cols} {raw}; {user_view}"))
+            .execute_batch(&format!(
+                "{mirror}; {applied_cols} {raw}; {user_view} {meta}"
+            ))
             .map_err(|e| LoaderError::Duck(format!("ensure tables for {}: {e}", rel.name)))?;
         Ok(())
     }
@@ -114,11 +122,22 @@ impl TableDb {
     /// on the composite PK makes a replay idempotent. Returns rows appended. **Never touches the mirror.**
     pub fn append_parquet(&self, table: &str, s3_uri: &str) -> Result<u64, LoaderError> {
         let uri = s3_uri.replace('\'', "''");
-        // `SELECT *` yields the source columns + `walrus_pg_sink_meta` (its trailing Parquet column), in
-        // the same order as `<table>_raw`'s leading columns; the four promoted extracts follow.
+        // Map the file's columns into `<table>_raw` **by name**, not by position (PR 3.8). After an
+        // `ADD COLUMN`, DuckDB appends the new column at the physical END of `<table>_raw` (after the
+        // promoted columns), while the homogeneous file carries it in source order — a positional
+        // `SELECT *` would then shift the promoted extracts by one. An explicit column list also lets an
+        // OLDER-version file (fewer columns) NULL-fill the columns a later version added.
+        let file_cols = self.parquet_columns(&uri)?;
+        let quoted = file_cols
+            .iter()
+            .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(", ");
         let sql = format!(
             "INSERT INTO \"{table}_raw\" \
-             SELECT *, \
+                 ({quoted}, \"_walrus_op\", \"_walrus_commit_lsn\", \"_walrus_lsn\", \
+                  \"_walrus_sink_processed_at\") \
+             SELECT {quoted}, \
                  json_extract_string(walrus_pg_sink_meta, '$.op'), \
                  json_extract_string(walrus_pg_sink_meta, '$.commit_lsn'), \
                  json_extract_string(walrus_pg_sink_meta, '$.lsn'), \
@@ -132,10 +151,57 @@ impl TableDb {
         Ok(n as u64)
     }
 
+    /// The column names of a staged Parquet file, in file order (source columns + `walrus_pg_sink_meta`).
+    fn parquet_columns(&self, uri: &str) -> Result<Vec<String>, LoaderError> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("DESCRIBE SELECT * FROM read_parquet('{uri}')"))
+            .map_err(|e| LoaderError::Duck(format!("describe {uri}: {e}")))?;
+        let cols = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| LoaderError::Duck(format!("describe {uri}: {e}")))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| LoaderError::Duck(format!("describe {uri}: {e}")))?;
+        Ok(cols)
+    }
+
     /// The `.duckdb` connection (later PRs run the transform SQL through it).
     pub fn conn(&self) -> &duckdb::Connection {
         &self.conn
     }
+
+    /// This table's currently-reconciled `schema_version` (the `_walrus_meta` watermark). Persisted in
+    /// the `.duckdb` file, so a restart resumes at the exact version its columns are already at.
+    pub fn schema_version(&self) -> Result<i64, LoaderError> {
+        self.conn
+            .query_row(
+                "SELECT v FROM \"_walrus_meta\" WHERE k = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| LoaderError::Duck(format!("read schema_version: {e}")))
+    }
+
+    /// Advance the reconcile watermark after the additive DDL for `v` has been applied to both tables.
+    pub fn set_schema_version(&self, v: i64) -> Result<(), LoaderError> {
+        self.conn
+            .execute(
+                "UPDATE \"_walrus_meta\" SET v = ? WHERE k = 'schema_version'",
+                duckdb::params![v],
+            )
+            .map_err(|e| LoaderError::Duck(format!("set schema_version: {e}")))?;
+        Ok(())
+    }
+}
+
+/// The user-facing `<table>_current` view: the mirror minus the hidden `_applied_*` guard columns
+/// (§7). A `SELECT *` view binds its column list at creation, so the DDL applier ([`crate::ddl`])
+/// re-runs this after any structural change to pick up added/renamed columns.
+pub(crate) fn user_view_sql(table: &str) -> String {
+    format!(
+        "CREATE OR REPLACE VIEW \"{table}_current\" AS \
+         SELECT * EXCLUDE (\"_applied_commit_lsn\", \"_applied_lsn\") FROM \"{table}\";"
+    )
 }
 
 /// DuckDB S3/httpfs credentials for reading the staging bucket.
@@ -150,7 +216,7 @@ pub struct S3Access {
 
 /// Map a Postgres type OID to a DuckDB column type. Unknown types fall back to `VARCHAR` (the loader
 /// stages *text*-format tuples; the exact numeric/temporal fidelity is refined as the transform lands).
-fn duck_type(oid: u32) -> &'static str {
+pub(crate) fn duck_type(oid: u32) -> &'static str {
     match oid {
         21 => "SMALLINT",                   // int2
         23 => "INTEGER",                    // int4
