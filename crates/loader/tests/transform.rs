@@ -32,7 +32,7 @@ fn db() -> Connection {
     let c = Connection::open_in_memory().unwrap();
     c.execute_batch(
         "CREATE TABLE orders (id INTEGER PRIMARY KEY, status VARCHAR);
-         CREATE TABLE orders_raw (id INTEGER, status VARCHAR,
+         CREATE TABLE orders_raw (id INTEGER, status VARCHAR, walrus_pg_sink_meta VARCHAR,
              \"_walrus_op\" VARCHAR, \"_walrus_commit_lsn\" VARCHAR, \"_walrus_lsn\" VARCHAR);",
     )
     .unwrap();
@@ -43,7 +43,7 @@ fn db() -> Connection {
 fn seed(c: &Connection, rows: &[(i64, char, u64, u64, &str)]) {
     for (id, op, clsn, l, status) in rows {
         c.execute(
-            "INSERT INTO orders_raw VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO orders_raw VALUES (?, ?, '{}', ?, ?, ?)",
             duckdb::params![id, status, op.to_string(), lsn(*clsn), lsn(*l)],
         )
         .unwrap();
@@ -202,7 +202,7 @@ fn composite_pk_partition_and_join_expand_to_all_key_columns() {
     let c = Connection::open_in_memory().unwrap();
     c.execute_batch(
         "CREATE TABLE kv (k1 INTEGER, k2 INTEGER, val VARCHAR, PRIMARY KEY (k1, k2));
-         CREATE TABLE kv_raw (k1 INTEGER, k2 INTEGER, val VARCHAR,
+         CREATE TABLE kv_raw (k1 INTEGER, k2 INTEGER, val VARCHAR, walrus_pg_sink_meta VARCHAR,
              \"_walrus_op\" VARCHAR, \"_walrus_commit_lsn\" VARCHAR, \"_walrus_lsn\" VARCHAR);",
     )
     .unwrap();
@@ -240,7 +240,7 @@ fn composite_pk_partition_and_join_expand_to_all_key_columns() {
         (1, 2, "i", 1, "other"),
     ] {
         c.execute(
-            "INSERT INTO kv_raw VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO kv_raw VALUES (?, ?, ?, '{}', ?, ?, ?)",
             duckdb::params![k1, k2, val, op, lsn(1), lsn(l)],
         )
         .unwrap();
@@ -381,5 +381,141 @@ fn raw_retains_the_truncate_op_row() {
     assert_eq!(
         t_rows, 1,
         "the truncate op row is retained in <table>_raw (raw is never wiped)"
+    );
+}
+
+// ---- PR 3.6: unchanged-TOAST resolution — the raw back-scan (§5.6). ----
+
+fn docs_rel() -> PgRelation {
+    let col = |n: &str, oid: u32, k: bool| PgColumn {
+        name: n.into(),
+        type_oid: oid,
+        type_modifier: -1,
+        is_key: k,
+    };
+    PgRelation {
+        oid: 44,
+        schema: "public".into(),
+        name: "docs".into(),
+        replica_identity: ReplicaIdentity::Default,
+        columns: vec![
+            col("id", 23, true),
+            col("big", 25, false),
+            col("note", 25, false),
+        ],
+    }
+}
+
+fn docs_db() -> Connection {
+    let c = Connection::open_in_memory().unwrap();
+    c.execute_batch(
+        "CREATE TABLE docs (id INTEGER PRIMARY KEY, big VARCHAR, note VARCHAR);
+         CREATE TABLE docs_raw (id INTEGER, big VARCHAR, note VARCHAR, walrus_pg_sink_meta VARCHAR,
+             \"_walrus_op\" VARCHAR, \"_walrus_commit_lsn\" VARCHAR, \"_walrus_lsn\" VARCHAR);",
+    )
+    .unwrap();
+    c
+}
+
+/// `toast` is the JSON array text of the unchanged_toast list, e.g. `[]` or `["big"]`.
+#[allow(clippy::too_many_arguments)]
+fn docs_seed(
+    c: &Connection,
+    id: i64,
+    big: Option<&str>,
+    note: &str,
+    op: char,
+    clsn: u64,
+    l: u64,
+    toast: &str,
+) {
+    let meta = format!("{{\"unchanged_toast\":{toast}}}");
+    c.execute(
+        "INSERT INTO docs_raw VALUES (?, ?, ?, ?, ?, ?, ?)",
+        duckdb::params![id, big, note, meta, op.to_string(), lsn(clsn), lsn(l)],
+    )
+    .unwrap();
+}
+
+fn docs_transform(c: &Connection) {
+    apply_transform(
+        c,
+        &TransformSql::from_relation(&docs_rel()),
+        &common::Lsn::ZERO,
+    )
+    .unwrap();
+}
+
+/// §5.6 worked case: INSERT big='X' @100 then UPDATE big=<sentinel> @200 for the SAME pk, mirror empty.
+/// The mirror must end big='X' — resolved by back-scanning <table>_raw, NOT NULL (a mirror-only lookup
+/// has no row yet in this same-batch case).
+#[test]
+fn same_batch_unchanged_toast_carries_forward_the_prior_value() {
+    let c = docs_db();
+    docs_seed(&c, 1, Some("X"), "n1", 'i', 100, 1, "[]"); // sets big='X'
+    docs_seed(&c, 1, None, "n2", 'u', 100, 2, "[\"big\"]"); // unchanged-TOAST: big absent
+    docs_transform(&c);
+    let big: Option<String> = c
+        .query_row("SELECT big FROM docs WHERE id = 1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        big.as_deref(),
+        Some("X"),
+        "same-batch unchanged-TOAST carries forward the prior value"
+    );
+}
+
+/// When raw has no non-sentinel value for the column, resolution falls back to the CURRENT mirror value.
+#[test]
+fn unchanged_toast_falls_back_to_current_mirror_when_raw_has_none() {
+    let c = docs_db();
+    c.execute("INSERT INTO docs VALUES (1, 'Y', 'old')", [])
+        .unwrap(); // pre-existing mirror row
+    docs_seed(&c, 1, None, "n2", 'u', 100, 1, "[\"big\"]"); // only a sentinel in raw
+    docs_transform(&c);
+    let big: Option<String> = c
+        .query_row("SELECT big FROM docs WHERE id = 1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        big.as_deref(),
+        Some("Y"),
+        "fallback to the current mirror value, never NULL"
+    );
+}
+
+/// A real SQL NULL (empty unchanged_toast list) is NEVER treated as unchanged-TOAST — it stays NULL.
+#[test]
+fn real_null_is_not_treated_as_unchanged_toast() {
+    let c = docs_db();
+    docs_seed(&c, 1, None, "n1", 'i', 100, 1, "[]"); // big is a REAL null (not listed)
+    docs_transform(&c);
+    let (cnt, big): (i64, Option<String>) = c
+        .query_row(
+            "SELECT count(*), any_value(big) FROM docs WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(cnt, 1, "the row exists");
+    assert_eq!(big, None, "a real NULL stays NULL — not back-scanned");
+}
+
+/// A column NOT in the winner's unchanged_toast list passes through the winner's value untouched, even
+/// when a sibling column IS resolved.
+#[test]
+fn non_toast_columns_pass_through_untouched() {
+    let c = docs_db();
+    docs_seed(&c, 1, Some("X"), "oldnote", 'i', 100, 1, "[]");
+    docs_seed(&c, 1, None, "newnote", 'u', 100, 2, "[\"big\"]"); // big resolved; note passes through
+    docs_transform(&c);
+    let (big, note): (Option<String>, String) = c
+        .query_row("SELECT big, note FROM docs WHERE id = 1", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(big.as_deref(), Some("X"), "big resolved via back-scan");
+    assert_eq!(
+        note, "newnote",
+        "note (not listed) passes through the winner's value, not back-scanned"
     );
 }
