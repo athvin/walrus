@@ -174,6 +174,11 @@ jobs:
       - name: Graceful shutdown drain (compose)
         run: cargo test -p pg-sink --test graceful_shutdown -- --ignored --test-threads=1
 
+      # PR 2.29: snapshot backfill — preloaded rows produce kind='snapshot' files sharing one
+      # lsn_end=consistent_point; a row written after the export streams once (no double count).
+      - name: Snapshot backfill (compose)
+        run: cargo test -p pg-sink --test snapshot_backfill -- --ignored --test-threads=1
+
       # PR 2.18/2.19: the sink pod-lifecycle shell against the live stack — full bootstrap (control +
       # S3 + source preflight) → /startup→/ready flip, SIGTERM exit 0, missing control DB → exit 11.
       - name: Sink pod-lifecycle smoke (health · SIGTERM · fail-fast exit code)

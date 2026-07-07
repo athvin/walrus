@@ -83,6 +83,16 @@ impl ReplicationStream {
         start_lsn: Lsn,
         publication: &str,
     ) -> anyhow::Result<Self> {
+        let mut this = Self::connect(dsn).await?;
+        this.start_streaming(slot, start_lsn, publication).await?;
+        Ok(this)
+    }
+
+    /// Open a `replication=database` connection and complete the startup handshake **without** yet
+    /// issuing `START_REPLICATION` — the idle state a snapshot export needs (PR 2.29). The caller then
+    /// either [`create_replication_slot_export`](Self::create_replication_slot_export) or
+    /// [`start_streaming`](Self::start_streaming).
+    pub async fn connect(dsn: &str) -> anyhow::Result<Self> {
         let (host, port, user, database) = parse_dsn(dsn)?;
         let stream = TcpStream::connect((host.as_str(), port))
             .await
@@ -90,14 +100,72 @@ impl ReplicationStream {
         let mut this = ReplicationStream {
             stream,
             rbuf: BytesMut::with_capacity(16 * 1024),
-            last_received: start_lsn,
-            durable: start_lsn,
+            last_received: Lsn::ZERO,
+            durable: Lsn::ZERO,
             feedback_interval: DEFAULT_FEEDBACK_INTERVAL,
             feedback_deadline: Instant::now() + DEFAULT_FEEDBACK_INTERVAL,
         };
         this.startup(&user, &database).await?;
-        this.begin_replication(slot, start_lsn, publication).await?;
         Ok(this)
+    }
+
+    /// Issue `START_REPLICATION` from `start_lsn`, seeding the received/durable baselines. On its own
+    /// (after [`connect`](Self::connect)) this is the snapshot handoff: stream from `consistent_point`.
+    pub async fn start_streaming(
+        &mut self,
+        slot: &str,
+        start_lsn: Lsn,
+        publication: &str,
+    ) -> anyhow::Result<()> {
+        self.last_received = start_lsn;
+        self.durable = start_lsn;
+        self.feedback_deadline = Instant::now() + self.feedback_interval;
+        self.begin_replication(slot, start_lsn, publication).await
+    }
+
+    /// `CREATE_REPLICATION_SLOT <slot> LOGICAL pgoutput (SNAPSHOT 'export')` (PR 2.29). Returns
+    /// `(consistent_point, snapshot_name)`. **This connection now holds the exported snapshot** — keep
+    /// it strictly idle until every backfill session has run `SET TRANSACTION SNAPSHOT`; the next
+    /// command on it (e.g. `START_REPLICATION`) ends the snapshot. Unlike
+    /// `pg_create_logical_replication_slot()` (the SQL helper), the replication command is the *only*
+    /// way to export a `snapshot_name`.
+    pub async fn create_replication_slot_export(
+        &mut self,
+        slot: &str,
+    ) -> anyhow::Result<(Lsn, String)> {
+        // `NOEXPORT_SNAPSHOT`/`USE_SNAPSHOT` are the alternatives; `EXPORT` is what backfill needs.
+        let sql = format!("CREATE_REPLICATION_SLOT {slot} LOGICAL pgoutput (SNAPSHOT 'export')");
+        self.send_query(&sql).await?;
+        let mut data_row: Option<Vec<Option<String>>> = None;
+        loop {
+            let (tag, body) = self.read_message().await?;
+            match tag {
+                // RowDescription 'T' — the column order is fixed and documented; DataRow 'D' carries
+                // the values; CommandComplete 'C'; ReadyForQuery 'Z' ends the simple query.
+                b'T' | b'C' | b'N' | b'S' => {}
+                b'D' => data_row = Some(parse_data_row(&body)),
+                b'Z' => break,
+                b'E' => bail!("CREATE_REPLICATION_SLOT failed: {}", error_message(&body)),
+                other => bail!(
+                    "unexpected reply '{}' to CREATE_REPLICATION_SLOT",
+                    other as char
+                ),
+            }
+        }
+        let row = data_row.context("CREATE_REPLICATION_SLOT returned no row")?;
+        // Columns: 0 = slot_name, 1 = consistent_point, 2 = snapshot_name, 3 = output_plugin.
+        let consistent = row
+            .get(1)
+            .and_then(Clone::clone)
+            .context("CREATE_REPLICATION_SLOT row missing consistent_point")?;
+        let snapshot_name = row
+            .get(2)
+            .and_then(Clone::clone)
+            .context("CREATE_REPLICATION_SLOT row missing snapshot_name")?;
+        let consistent_point: Lsn = consistent
+            .parse()
+            .map_err(|e| anyhow!("parse consistent_point {consistent:?}: {e:?}"))?;
+        Ok((consistent_point, snapshot_name))
     }
 
     /// Override the unconditional-feedback cadence (must stay under the source's `wal_sender_timeout`).
@@ -363,6 +431,37 @@ fn build_standby_status(s: StandbyStatus) -> Vec<u8> {
     msg.extend_from_slice(&((4 + payload.len()) as u32).to_be_bytes());
     msg.extend_from_slice(&payload);
     msg
+}
+
+/// Parse a `DataRow` ('D') body: `Int16` column count, then per column an `Int32` length (`-1` =
+/// NULL) and that many bytes (UTF-8 text values, since walrus never enables binary output).
+fn parse_data_row(body: &[u8]) -> Vec<Option<String>> {
+    let mut out = Vec::new();
+    if body.len() < 2 {
+        return out;
+    }
+    let ncols = u16::from_be_bytes([body[0], body[1]]) as usize;
+    let mut i = 2;
+    for _ in 0..ncols {
+        if i + 4 > body.len() {
+            break;
+        }
+        let len = read_i32(&body[i..i + 4]);
+        i += 4;
+        if len < 0 {
+            out.push(None);
+            continue;
+        }
+        let len = len as usize;
+        if i + len > body.len() {
+            break;
+        }
+        out.push(Some(
+            String::from_utf8_lossy(&body[i..i + len]).into_owned(),
+        ));
+        i += len;
+    }
+    out
 }
 
 /// Take one framed backend message (`tag` + 4-byte self-inclusive length + body) from `buf`, or

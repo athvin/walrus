@@ -42,6 +42,11 @@ pub struct SinkConfig {
     /// A beat un-returned after this long marks the sink `degraded` (observability, never a kill).
     #[serde(with = "humantime_serde")]
     pub heartbeat_roundtrip_deadline: Duration,
+    /// `statement_timeout` for each initial-backfill copy session (PR 2.29). `0` = disabled — a huge
+    /// table's snapshot copy must not be killed mid-flight (the whole backfill is bounded by the slot's
+    /// WAL retention, not a per-statement clock).
+    #[serde(with = "humantime_serde")]
+    pub backfill_statement_timeout: Duration,
     /// Row-count flush threshold.
     pub max_rows: u64,
     /// Byte-size flush threshold.
@@ -74,6 +79,8 @@ impl Default for SinkConfig {
             max_fill: Duration::from_secs(5),
             heartbeat_idle_after: Duration::from_secs(10),
             heartbeat_roundtrip_deadline: Duration::from_secs(30),
+            backfill_statement_timeout: Duration::ZERO, // disabled — never kill a big table's copy
+
             max_rows: 100_000,
             max_bytes: 128 * 1024 * 1024,
             max_inflight_bytes: 512 * 1024 * 1024,
