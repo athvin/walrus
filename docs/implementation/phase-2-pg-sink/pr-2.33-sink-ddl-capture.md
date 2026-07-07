@@ -1,5 +1,7 @@
 # PR 2.33 — Consume `ddl_audit` inserts: `ddl_manifest` row, version bump, fresh file
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/53
+
 > **Phase:** 2 — walrus-pg-sink · **Crates touched:** `pg-sink`, `control`, `common`, `migrations/source` ·
 > **Est. size:** L · **Depends on:** PR 2.32 · **Unlocks:** PR 3.1
 
@@ -122,22 +124,22 @@ async fn alter_add_column_bumps_version_and_cuts_file() { todo!() }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] An `ALTER TABLE … ADD COLUMN` on the source produces a `ddl_manifest` row carrying the **DDL's
+- [x] An `ALTER TABLE … ADD COLUMN` on the source produces a `ddl_manifest` row carrying the **DDL's
       `c_lsn`**, and the affected table's structural `schema_version` bumps by one.
-- [ ] The next Parquet file for that table carries the **new** `schema_version`; the prior file carries
+- [x] The next Parquet file for that table carries the **new** `schema_version`; the prior file carries
       the **old** one — **one `schema_version` per file** (homogeneous-file rule), verified via the
       manifest.
-- [ ] A `COMMENT ON` is recorded but is **metadata-only** — it does **not** bump the structural version
+- [x] A `COMMENT ON` is recorded but is **metadata-only** — it does **not** bump the structural version
       nor cut a file.
-- [ ] `walrus.ddl_audit` and `walrus.heartbeat` are recognised as internal and **never** written to a
+- [x] `walrus.ddl_audit` and `walrus.heartbeat` are recognised as internal and **never** written to a
       `<table>`/`<table>_raw` file or manifest row (beyond their control effects).
-- [ ] Preflight fails **terminal** if the audit table or either event trigger is missing.
-- [ ] Docs/comments explain schema-diff-not-replay and why the audit table must be in `walrus_pub`.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` then `cargo test -p pg-sink --test ddl_capture -- --ignored`
+- [x] Preflight fails **terminal** if the audit table or either event trigger is missing.
+- [x] Docs/comments explain schema-diff-not-replay and why the audit table must be in `walrus_pub`.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` then `cargo test -p pg-sink --test ddl_capture -- --ignored`
         asserting **`alter_add_column_bumps_version_and_cuts_file`**.
 
 ## Hints & gotchas
