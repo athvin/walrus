@@ -109,6 +109,35 @@ pub enum Message {
         prefix: String,
         content: Bytes,
     },
+    /// `'S'`: Int32 **top-level** xid, Int8 first-segment flag (1 = first block for this xid).
+    /// Opens a streamed block — sets `ctx.in_stream`.
+    StreamStart { xid: u32, first_segment: bool },
+    /// `'E'`: no payload. Closes the current streamed block — clears `ctx.in_stream`.
+    StreamStop,
+    /// `'c'`: Int32 xid, Int8 flags, Int64 commit LSN, Int64 end LSN, Int64 commit ts.
+    StreamCommit {
+        xid: u32,
+        flags: u8,
+        commit_lsn: Lsn,
+        end_lsn: Lsn,
+        commit_ts: i64,
+    },
+    /// `'A'`: Int32 top xid, Int32 sub xid. Under `streaming 'on'` there are **no** trailing LSN/ts
+    /// fields (those exist only under `streaming 'parallel'`, v4, which walrus never enables).
+    /// `sub != top` is a rolled-back savepoint inside a *committing* transaction (§9b).
+    StreamAbort { top_xid: u32, sub_xid: u32 },
+}
+
+impl Message {
+    /// For a [`Message::StreamAbort`]: `Some(true)` when the WHOLE transaction aborted (`top == sub`,
+    /// §9a — drop everything), `Some(false)` for a rolled-back savepoint inside a committing txn
+    /// (`top != sub`, §9b — discard only the sub-xid's rows). `None` for any other message.
+    pub fn is_whole_txn_abort(&self) -> Option<bool> {
+        match self {
+            Message::StreamAbort { top_xid, sub_xid } => Some(top_xid == sub_xid),
+            _ => None,
+        }
+    }
 }
 
 /// Consume the fixed `'N'` marker that precedes a new tuple; a mismatch is an upstream framing
@@ -299,6 +328,30 @@ fn parse_one(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Message, De
                 content,
             })
         }
+        b'S' => {
+            let start_xid = reader.int32()?;
+            let first_segment = reader.byte1()? != 0;
+            ctx.in_stream = true; // opens the streamed block — the next change reads a sub-xid prefix
+            Ok(Message::StreamStart {
+                xid: start_xid,
+                first_segment,
+            })
+        }
+        b'E' => {
+            ctx.in_stream = false; // closes the block
+            Ok(Message::StreamStop)
+        }
+        b'c' => Ok(Message::StreamCommit {
+            xid: reader.int32()?,
+            flags: reader.byte1()?,
+            commit_lsn: reader.lsn()?,
+            end_lsn: reader.lsn()?,
+            commit_ts: reader.int64()?,
+        }),
+        b'A' => Ok(Message::StreamAbort {
+            top_xid: reader.int32()?,
+            sub_xid: reader.int32()?,
+        }),
         other => Err(DecodeError::UnknownMessage { byte: other }),
     }
 }
