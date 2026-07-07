@@ -1,5 +1,7 @@
 # PR 3.1 — `walrus-loader` skeleton: bootstrap (lease · DuckDB open · checkpoints) + health
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/54
+
 > **Phase:** 3 — walrus-loader · **Crates touched:** `loader` (bin+lib), `control` · **Est. size:** L ·
 > **Depends on:** PR 2.33 (phase boundary) · **Unlocks:** PR 3.2
 
@@ -141,21 +143,21 @@ async fn stale_lock_expired_lease_is_reclaimed_and_opened() { todo!() }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] Bootstrap creates `orders.duckdb` containing **both** `orders` and `orders_raw`, acquires the
+- [x] Bootstrap creates `orders.duckdb` containing **both** `orders` and `orders_raw`, acquires the
       ownership lease, loads both watermarks, and passes the S3 read check.
-- [ ] The lease + DuckDB file lock are acquired **before** any watermark is read (the fence precedes
+- [x] The lease + DuckDB file lock are acquired **before** any watermark is read (the fence precedes
       the read-then-write).
-- [ ] A second instance started against a **live** lease exits with a distinct terminal `ExitCode`.
-- [ ] A **stale** lock behind an **expired** lease is reclaimed and the file opened (no manual step).
-- [ ] `/startup` gates the slow bootstrap; `/ready` = leases held + files open; `/healthz` reflects
+- [x] A second instance started against a **live** lease exits with a distinct terminal `ExitCode`.
+- [x] A **stale** lock behind an **expired** lease is reclaimed and the file opened (no manual step).
+- [x] `/startup` gates the slow bootstrap; `/ready` = leases held + files open; `/healthz` reflects
       `last_poll_completed_at` and never any lag metric.
-- [ ] A corrupt checkpoint (`transformed_lsn > raw_appended_lsn`) is a terminal error.
-- [ ] Docs/comments explain lease-then-lock ordering and the fencing token's dormancy under `replicas=1`.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p loader` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` then `cargo test -p loader --test bootstrap -- --ignored`
+- [x] A corrupt checkpoint (`transformed_lsn > raw_appended_lsn`) is a terminal error.
+- [x] Docs/comments explain lease-then-lock ordering and the fencing token's dormancy under `replicas=1`.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p loader` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` then `cargo test -p loader --test bootstrap -- --ignored`
         asserting **`bootstrap_creates_duckdb_with_both_tables_and_takes_the_lease`** and
         **`second_instance_with_live_lease_exits_terminal`**.
 

@@ -1,0 +1,34 @@
+[package]
+name = "loader"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "loader"
+
+[[bin]]
+name = "walrus-loader"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+common = { path = "../common" }
+control = { path = "../control" }
+sqlx = { workspace = true, features = ["runtime-tokio", "tls-rustls", "postgres"] }
+# The loader materialises Parquet into DuckDB; `bundled` compiles DuckDB from source (cached in CI).
+duckdb = { workspace = true, features = ["bundled"] }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+figment = { workspace = true, features = ["env", "toml", "yaml"] }
+humantime-serde = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "net", "time"] }
+tokio-util = { workspace = true }
+axum = { workspace = true }
+object_store = { workspace = true, features = ["aws"] }
+tracing = { workspace = true }
