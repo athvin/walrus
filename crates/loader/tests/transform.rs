@@ -51,7 +51,12 @@ fn seed(c: &Connection, rows: &[(i64, char, u64, u64, &str)]) {
 }
 
 fn transform(c: &Connection) {
-    apply_transform(c, &TransformSql::from_relation(&orders_rel())).unwrap();
+    apply_transform(
+        c,
+        &TransformSql::from_relation(&orders_rel()),
+        &common::Lsn::ZERO,
+    )
+    .unwrap();
 }
 
 fn status_of(c: &Connection, id: i64) -> Option<String> {
@@ -240,7 +245,7 @@ fn composite_pk_partition_and_join_expand_to_all_key_columns() {
         )
         .unwrap();
     }
-    apply_transform(&c, &TransformSql::from_relation(&rel)).unwrap();
+    apply_transform(&c, &TransformSql::from_relation(&rel), &common::Lsn::ZERO).unwrap();
 
     let n: i64 = c
         .query_row("SELECT count(*) FROM kv", [], |r| r.get(0))

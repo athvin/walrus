@@ -3,6 +3,7 @@
 //! fail-fast [`bootstrap`] that proves exclusive ownership (control-plane [`lease`] + DuckDB file lock)
 //! and stands up [`health`] — no manifest file is claimed yet (that is PR 3.2).
 
+pub mod apply_loop;
 pub mod bootstrap;
 pub mod config;
 pub mod duck;
@@ -10,4 +11,5 @@ pub mod error;
 pub mod health;
 pub mod lease;
 pub mod phase_a;
+pub mod phase_b;
 pub mod transform;

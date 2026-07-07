@@ -23,6 +23,12 @@ pub struct LoaderConfig {
     /// The ownership-lease TTL; renewed well under it.
     #[serde(with = "humantime_serde")]
     pub lease_ttl: Duration,
+    /// The apply-loop poll cadence (incremental Phase A + Phase B). Distinct from the compaction /
+    /// retention knobs (PR 3.11), which are not wired here.
+    #[serde(with = "humantime_serde")]
+    pub poll_interval: Duration,
+    /// Manifest files claimed per Phase-A cycle.
+    pub max_files_per_cycle: i64,
     /// Bootstrap retry budget for transient deps.
     #[serde(with = "humantime_serde")]
     pub startup_deadline: Duration,
@@ -39,6 +45,8 @@ impl Default for LoaderConfig {
             instance: String::new(),
             duckdb_dir: String::new(),
             lease_ttl: Duration::from_secs(30),
+            poll_interval: Duration::from_secs(5),
+            max_files_per_cycle: 32,
             startup_deadline: Duration::from_secs(60),
             health_addr: SocketAddr::from(([0, 0, 0, 0], 8080)),
         }

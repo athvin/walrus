@@ -1,14 +1,15 @@
-//! Phase A against compose (`#[ignore]` — needs control PG + MinIO). A seeded `ready` Parquet is
-//! claimed and appended **verbatim** to `<table>_raw` (meta intact + op/commit_lsn/lsn/sink_processed_at
-//! promoted), the watermark advances and the queue row is deleted in one control txn, and a replay of
-//! the same file appends **zero** rows. The fixture Parquet is written by DuckDB itself.
+//! Phase B against compose (`#[ignore]` — needs control PG + MinIO). Append a seeded Parquet with
+//! intra-batch PK churn, then transform: the mirror `<table>` ends equal to the **current** source
+//! (one row per PK, latest values, deletes absent), `transformed_lsn` advances to `max(commit_lsn)`
+//! (never past `raw_appended_lsn`), and re-running the transform is byte-identical.
 //!
-//!   cargo test -p loader --test phase_a -- --ignored
+//!   cargo test -p loader --test phase_b -- --ignored
 
 use common::{Lsn, PgColumn, PgRelation, ReplicaIdentity};
 use loader::duck::{S3Access, TableDb};
 use loader::health::LoaderState;
 use loader::phase_a::{run_phase_a, TableCtx};
+use loader::phase_b::run_phase_b;
 use std::time::Duration;
 
 static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -46,12 +47,20 @@ fn orders() -> PgRelation {
 }
 
 fn tmpdir(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("walrus-loader-pa-{name}"));
+    let d = std::env::temp_dir().join(format!("walrus-loader-pb-{name}"));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
 }
 
+fn meta(op: &str, l: u64) -> String {
+    format!(
+        "{{\"op\":\"{op}\",\"commit_lsn\":\"0000000000000064\",\"lsn\":\"{:016X}\",\"sink_processed_at\":\"2026-07-07T12:00:{:02}Z\"}}",
+        l, l % 60
+    )
+}
+
+/// Fixture with intra-batch churn: key 1 (i→i final), key 2 (lone i), key 3 (i→d, deleted).
 fn write_fixture(epoch: i64) -> String {
     let w = duckdb::Connection::open_in_memory().unwrap();
     let a = s3();
@@ -63,38 +72,28 @@ fn write_fixture(epoch: i64) -> String {
     ))
     .unwrap();
     w.execute_batch(
-        "CREATE TABLE fixture (id INTEGER, status VARCHAR, walrus_pg_sink_meta VARCHAR);
-         INSERT INTO fixture VALUES
-           (1, 'a', '{\"op\":\"Insert\",\"commit_lsn\":\"0000000000000064\",\"lsn\":\"0000000000000064\",\"sink_processed_at\":\"2026-07-07T12:00:00Z\"}'),
-           (2, 'b', '{\"op\":\"Insert\",\"commit_lsn\":\"0000000000000064\",\"lsn\":\"0000000000000065\",\"sink_processed_at\":\"2026-07-07T12:00:01Z\"}');",
+        "CREATE TABLE fixture (id INTEGER, status VARCHAR, walrus_pg_sink_meta VARCHAR);",
     )
     .unwrap();
+    for (id, status, op, l) in [
+        (1, "v1", "i", 1u64),
+        (1, "final1", "i", 2),
+        (2, "keep2", "i", 3),
+        (3, "temp3", "i", 4),
+        (3, "temp3", "d", 5),
+    ] {
+        w.execute(
+            "INSERT INTO fixture VALUES (?, ?, ?)",
+            duckdb::params![id, status, meta(op, l)],
+        )
+        .unwrap();
+    }
     let uri = format!("s3://walrus/{epoch}/public/orders/fixture-{epoch}.parquet");
     w.execute_batch(&format!("COPY fixture TO '{uri}' (FORMAT PARQUET);"))
         .unwrap();
     uri
 }
 
-async fn seed_manifest(pool: &sqlx::PgPool, epoch: i64, uri: &str) {
-    control::insert_ready(
-        pool,
-        &control::NewManifestFile {
-            epoch,
-            source_schema: "public".into(),
-            source_table: "orders".into(),
-            s3_uri: uri.into(),
-            kind: "stream".into(),
-            row_count: 2,
-            lsn_start: "0/64".parse().unwrap(),
-            lsn_end: "0/64".parse().unwrap(),
-            schema_version: 1,
-        },
-    )
-    .await
-    .unwrap();
-}
-
-/// Fresh control state + an owned `TableCtx` (DuckDB in a temp dir).
 async fn setup(epoch: i64) -> (TableCtx, std::path::PathBuf) {
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
@@ -118,6 +117,23 @@ async fn setup(epoch: i64) -> (TableCtx, std::path::PathBuf) {
     control::ensure_checkpoint(&pool, epoch, "public", "orders")
         .await
         .unwrap();
+    let uri = write_fixture(epoch);
+    control::insert_ready(
+        &pool,
+        &control::NewManifestFile {
+            epoch,
+            source_schema: "public".into(),
+            source_table: "orders".into(),
+            s3_uri: uri,
+            kind: "stream".into(),
+            row_count: 5,
+            lsn_start: "0/64".parse().unwrap(),
+            lsn_end: "0/64".parse().unwrap(),
+            schema_version: 1,
+        },
+    )
+    .await
+    .unwrap();
     let dir = tmpdir(&epoch.to_string());
     let db = TableDb::open(&dir.join("orders.duckdb")).unwrap();
     db.ensure_tables(&orders()).unwrap();
@@ -136,103 +152,83 @@ async fn setup(epoch: i64) -> (TableCtx, std::path::PathBuf) {
     (ctx, dir)
 }
 
-fn raw_count(ctx: &TableCtx) -> i64 {
-    ctx.db
+fn mirror(ctx: &TableCtx) -> Vec<(i64, String)> {
+    let mut stmt = ctx
+        .db
         .conn()
-        .query_row("SELECT count(*) FROM orders_raw", [], |r| r.get(0))
-        .unwrap()
+        .prepare("SELECT id, status FROM orders ORDER BY id")
+        .unwrap();
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    rows.map(Result::unwrap).collect()
 }
 
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
-async fn appends_rows_verbatim_with_promoted_columns_and_meta_intact() {
+async fn mirror_equals_current_source_after_transform() {
     let _g = LOCK.lock().await;
-    let epoch = 3_200_001;
-    let uri = write_fixture(epoch);
+    let epoch = 3_400_001;
     let (ctx, dir) = setup(epoch).await;
-    seed_manifest(&ctx.pool, epoch, &uri).await;
 
-    let lsn = run_phase_a(&ctx).await.unwrap();
-    assert_eq!(lsn, Some("0/64".parse().unwrap()));
-    assert_eq!(raw_count(&ctx), 2, "both rows appended verbatim");
+    run_phase_a(&ctx).await.unwrap();
+    run_phase_b(&ctx).await.unwrap();
 
-    let (op, meta, promoted_lsn): (String, String, String) = ctx
-        .db
-        .conn()
-        .query_row(
-            "SELECT _walrus_op, walrus_pg_sink_meta, _walrus_lsn FROM orders_raw WHERE id = 1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .unwrap();
-    assert_eq!(op, "Insert", "op promoted from the meta");
-    assert!(
-        meta.contains("\"op\":\"Insert\""),
-        "walrus_pg_sink_meta kept intact"
-    );
     assert_eq!(
-        promoted_lsn, "0000000000000064",
-        "lsn promoted (sortable 16-hex)"
+        mirror(&ctx),
+        vec![(1, "final1".to_string()), (2, "keep2".to_string())],
+        "mirror = current source: key 1 latest insert, key 2 kept, key 3 (i→d) absent"
     );
-
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
-async fn advances_raw_watermark_and_deletes_the_claimed_manifest_rows() {
+async fn transformed_lsn_advances_to_max_applied_commit_lsn() {
     let _g = LOCK.lock().await;
-    let epoch = 3_200_002;
-    let uri = write_fixture(epoch);
+    let epoch = 3_400_002;
     let (ctx, dir) = setup(epoch).await;
-    seed_manifest(&ctx.pool, epoch, &uri).await;
 
     run_phase_a(&ctx).await.unwrap();
+    let applied = run_phase_b(&ctx).await.unwrap();
+    assert_eq!(
+        applied,
+        Some("0/64".parse().unwrap()),
+        "advanced to max(commit_lsn)"
+    );
 
     let cp = control::read_checkpoint(&ctx.pool, epoch, "public", "orders")
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(
-        cp.raw_appended_lsn,
-        "0/64".parse::<Lsn>().unwrap(),
-        "watermark = max(lsn_end)"
-    );
-    let remaining = control::claim_ready(&ctx.pool, epoch, "public", "orders", 100)
-        .await
-        .unwrap();
+    assert_eq!(cp.transformed_lsn, "0/64".parse::<Lsn>().unwrap());
     assert!(
-        remaining.is_empty(),
-        "claimed manifest rows deleted in the same control txn"
+        cp.transformed_lsn <= cp.raw_appended_lsn,
+        "the CHECK invariant holds"
     );
-    let mirror: i64 = ctx
-        .db
-        .conn()
-        .query_row("SELECT count(*) FROM orders", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(mirror, 0, "Phase A never writes the mirror");
-
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
-async fn re_running_the_same_file_appends_zero_rows() {
+async fn re_running_phase_b_is_idempotent() {
     let _g = LOCK.lock().await;
-    let epoch = 3_200_003;
-    let uri = write_fixture(epoch);
+    let epoch = 3_400_003;
     let (ctx, dir) = setup(epoch).await;
 
-    seed_manifest(&ctx.pool, epoch, &uri).await;
     run_phase_a(&ctx).await.unwrap();
-    assert_eq!(raw_count(&ctx), 2);
+    run_phase_b(&ctx).await.unwrap();
+    let first = mirror(&ctx);
 
-    seed_manifest(&ctx.pool, epoch, &uri).await;
-    run_phase_a(&ctx).await.unwrap();
+    // Reset the watermark so the WHOLE tail is re-transformed — the LWW dedup must pick the same winners.
+    sqlx::query("UPDATE walrus.loader_checkpoint SET transformed_lsn = '0/0' WHERE epoch = $1")
+        .bind(epoch)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+    run_phase_b(&ctx).await.unwrap();
     assert_eq!(
-        raw_count(&ctx),
-        2,
-        "ON CONFLICT DO NOTHING on the composite PK → zero new rows"
+        mirror(&ctx),
+        first,
+        "re-transforming the same tail is byte-identical"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
