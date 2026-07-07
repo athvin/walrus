@@ -8,7 +8,9 @@
 //! loader's job (PR 3.x), not the sink's.
 
 use crate::error::Error;
-use arrow::datatypes::{DataType, Field};
+use crate::range::RangeFamily;
+use arrow::datatypes::{DataType, Field, Fields};
+use std::sync::Arc;
 
 /// `<c>_months INT32`, `<c>_days INT32`, `<c>_micros INT64` — Postgres' *un-normalized* three-field
 /// interval (`'1 mon'` ≠ `'30 days'` ≠ `'720 hours'`), which is byte-identical to DuckDB's own
@@ -36,6 +38,44 @@ pub fn timetz_fields(name: &str) -> Vec<Field> {
         Field::new(format!("{name}_micros"), DataType::Int64, true),
         Field::new(format!("{name}_offset_seconds"), DataType::Int32, true),
     ]
+}
+
+/// The five flat sibling columns a `range` decomposes into (§2.4). Element type per family; all five
+/// share the whole-column NULL, so `_empty=false` + a NULL bound is a genuine *unbounded* side (which
+/// `lower_inf`/`upper_inf` derive from) — kept distinct from both `empty` and a NULL column.
+pub fn range_fields(name: &str, family: RangeFamily, atttypmod: i32) -> Vec<Field> {
+    let elem = family.elem_data_type(atttypmod);
+    vec![
+        Field::new(format!("{name}_lower"), elem.clone(), true),
+        Field::new(format!("{name}_upper"), elem, true),
+        Field::new(format!("{name}_lower_inc"), DataType::Boolean, true),
+        Field::new(format!("{name}_upper_inc"), DataType::Boolean, true),
+        Field::new(format!("{name}_empty"), DataType::Boolean, true),
+    ]
+}
+
+/// The 4-field struct a multirange member carries: `lower`/`upper` (nullable — a member may be
+/// unbounded) and the always-present `lower_inc`/`upper_inc`. Shared by the schema field and the
+/// builder so `RecordBatch::try_new` sees identical types.
+pub fn multirange_struct_fields(family: RangeFamily, atttypmod: i32) -> Fields {
+    let elem = family.elem_data_type(atttypmod);
+    vec![
+        Field::new("lower", elem.clone(), true),
+        Field::new("upper", elem, true),
+        Field::new("lower_inc", DataType::Boolean, false),
+        Field::new("upper_inc", DataType::Boolean, false),
+    ]
+    .into()
+}
+
+/// A `multirange` → one `LIST(STRUCT(lower, upper, lower_inc, upper_inc))` field (§2.4). Empty
+/// multirange = empty list; SQL NULL = NULL list — the two stay distinct via the outer list validity.
+pub fn multirange_field(name: &str, family: RangeFamily, atttypmod: i32) -> Field {
+    let item = Field::new_list_field(
+        DataType::Struct(multirange_struct_fields(family, atttypmod)),
+        true,
+    );
+    Field::new(name, DataType::List(Arc::new(item)), true)
 }
 
 fn parse_err(kind: &str, text: &str) -> Error {
