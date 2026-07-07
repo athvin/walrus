@@ -5,10 +5,27 @@
 //! `d→i`, phantom `d`). The same template is used by the hermetic tests here and by Phase B (PR 3.4).
 
 use crate::error::LoaderError;
-use common::PgRelation;
+use common::{Lsn, PgRelation};
 
 /// The transform template (single source of truth). Rendered by [`TransformSql::render`].
 pub const TRANSFORM_SQL: &str = include_str!("transform.sql");
+
+/// The latest `TRUNCATE` tuple `(Ct, Lt)` in the un-transformed tail — `(None, None)` if there is none.
+/// The wipe boundary is the **tuple**, never the scalar `commit_lsn`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TruncateBoundary {
+    pub ct: Option<Lsn>,
+    pub lt: Option<Lsn>,
+}
+
+impl TruncateBoundary {
+    pub fn none() -> Self {
+        TruncateBoundary::default()
+    }
+    pub fn is_some(&self) -> bool {
+        self.ct.is_some()
+    }
+}
 
 /// A table's column layout for rendering the transform. `pk`/`non_key`/`all` preserve source order.
 pub struct TransformSql {
@@ -41,10 +58,41 @@ impl TransformSql {
         }
     }
 
-    /// Render the full rendered SQL (dedup `CREATE TEMP TABLE _batch` + `MERGE INTO`) for this table,
-    /// reading only the un-transformed tail (`commit_lsn > after_lsn`) — generated from the **key list**,
-    /// so a composite PK expands to `PARTITION BY k1,k2` / `ON t.k1=s.k1 AND t.k2=s.k2`.
-    pub fn render(&self, after_lsn: &common::Lsn) -> String {
+    /// The latest `TRUNCATE` `(Ct, Lt)` in the tail (`op='t'`, `commit_lsn > after_lsn`), ordered by the
+    /// tuple. `(None, None)` if the tail holds no truncate — every downstream predicate is NULL-safe.
+    pub fn latest_truncate(
+        &self,
+        conn: &duckdb::Connection,
+        after_lsn: &Lsn,
+    ) -> Result<TruncateBoundary, LoaderError> {
+        let sql = format!(
+            "SELECT \"_walrus_commit_lsn\", \"_walrus_lsn\" FROM \"{}_raw\" \
+             WHERE \"_walrus_op\" = 't' AND \"_walrus_commit_lsn\" > '{}' \
+             ORDER BY \"_walrus_commit_lsn\" DESC, \"_walrus_lsn\" DESC LIMIT 1",
+            self.table, after_lsn
+        );
+        let row: Option<(String, String)> = conn
+            .query_row(&sql, [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .ok(); // no rows → no truncate
+        match row {
+            None => Ok(TruncateBoundary::none()),
+            Some((ct, lt)) => Ok(TruncateBoundary {
+                ct: Some(
+                    ct.parse()
+                        .map_err(|e| LoaderError::Internal(format!("parse Ct {ct:?}: {e:?}")))?,
+                ),
+                lt: Some(
+                    lt.parse()
+                        .map_err(|e| LoaderError::Internal(format!("parse Lt {lt:?}: {e:?}")))?,
+                ),
+            }),
+        }
+    }
+
+    /// Render the full rendered SQL (truncate wipe + dedup `CREATE TEMP TABLE _batch` + `MERGE INTO`),
+    /// reading only the un-transformed tail (`commit_lsn > after_lsn`, and — if the tail has a truncate —
+    /// only rows STRICTLY after the `(Ct, Lt)` tuple). Composite-PK-aware.
+    pub fn render(&self, after_lsn: &Lsn, boundary: &TruncateBoundary) -> String {
         let q = |c: &str| format!("\"{c}\"");
         let pk_list = self.pk.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
         let pk_join = self
@@ -71,6 +119,14 @@ impl TransformSql {
             .map(|c| format!("s.{}", q(c)))
             .collect::<Vec<_>>()
             .join(", ");
+        // The truncate wipe (whole mirror) + the tuple-boundary window filter — empty when no truncate.
+        let (truncate_wipe, truncate_bound) = match (boundary.ct, boundary.lt) {
+            (Some(ct), Some(lt)) => (
+                format!("DELETE FROM \"{}\";", self.table),
+                format!(" AND (\"_walrus_commit_lsn\", \"_walrus_lsn\") > ('{ct}', '{lt}')"),
+            ),
+            _ => (String::new(), String::new()),
+        };
         TRANSFORM_SQL
             .replace("{table}", &self.table)
             .replace("{pk_list}", &pk_list)
@@ -79,16 +135,20 @@ impl TransformSql {
             .replace("{insert_cols}", &insert_cols)
             .replace("{insert_vals}", &insert_vals)
             .replace("{after_lsn}", &after_lsn.to_string())
+            .replace("{truncate_wipe}", &truncate_wipe)
+            .replace("{truncate_bound}", &truncate_bound)
     }
 }
 
-/// Run the transform (dedup + MERGE) against `<table>_raw`, reading only `commit_lsn > after_lsn`.
-/// Phase B (PR 3.4) calls this inside a DuckDB transaction.
+/// Run the transform against `<table>_raw`, reading only `commit_lsn > after_lsn`: resolve the latest
+/// truncate `(Ct, Lt)`, wipe the mirror if present, then dedup + MERGE the post-boundary tail. Phase B
+/// (PR 3.4) calls this inside a DuckDB transaction so the wipe + repopulation are atomic.
 pub fn apply_transform(
     conn: &duckdb::Connection,
     t: &TransformSql,
-    after_lsn: &common::Lsn,
+    after_lsn: &Lsn,
 ) -> Result<(), LoaderError> {
-    conn.execute_batch(&t.render(after_lsn))
+    let boundary = t.latest_truncate(conn, after_lsn)?;
+    conn.execute_batch(&t.render(after_lsn, &boundary))
         .map_err(|e| LoaderError::Duck(format!("transform {}: {e}", t.table)))
 }

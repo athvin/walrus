@@ -263,3 +263,123 @@ fn composite_pk_partition_and_join_expand_to_all_key_columns() {
         .unwrap();
     assert_eq!(v12, "other", "(1,2) is independent of (1,1)");
 }
+
+// ---- PR 3.5: TRUNCATE — a mirror wipe keyed on the (commit_lsn, lsn) TUPLE, not the scalar. ----
+
+/// A truncate + re-inserts: the mirror is emptied as of the truncate (incl. pre-existing rows from
+/// earlier cycles) and holds ONLY the post-truncate rows.
+#[test]
+fn truncate_then_reinsert_keeps_only_post_truncate_rows() {
+    let c = db();
+    c.execute("INSERT INTO orders VALUES (99, 'pre-existing')", [])
+        .unwrap(); // an earlier-cycle row
+    seed(
+        &c,
+        &[
+            (1, 'i', 1, 1, "old"), // before the truncate
+            (0, 't', 1, 5, ""),    // TRUNCATE at (1, 5)
+            (1, 'i', 2, 6, "new"), // after the truncate (later commit)
+        ],
+    );
+    transform(&c);
+    assert_eq!(
+        status_of(&c, 1).as_deref(),
+        Some("new"),
+        "only the post-truncate insert survives"
+    );
+    assert_eq!(
+        status_of(&c, 99),
+        None,
+        "the wipe removed the pre-existing (earlier-cycle) row"
+    );
+    assert_eq!(mirror_count(&c), 1);
+}
+
+/// The subtlety this PR exists to nail: a SAME-transaction `TRUNCATE; INSERT` shares one commit_lsn;
+/// the tuple boundary `(commit_lsn, lsn) > (Ct, Lt)` keeps the inserts (the truncate's lsn is lower).
+#[test]
+fn same_commit_truncate_then_insert_survives_tuple_boundary() {
+    let c = db();
+    seed(&c, &[(0, 't', 100, 1, ""), (1, 'i', 100, 2, "kept")]); // shared commit_lsn 100
+    transform(&c);
+    assert_eq!(
+        status_of(&c, 1).as_deref(),
+        Some("kept"),
+        "post-truncate insert at the SAME commit_lsn survives via the tuple boundary"
+    );
+    assert_eq!(mirror_count(&c), 1);
+}
+
+/// The counterfactual: a SCALAR `commit_lsn > Ct` filter would drop the same-commit inserts.
+#[test]
+fn scalar_commit_lsn_boundary_would_drop_same_commit_inserts() {
+    let c = db();
+    seed(&c, &[(0, 't', 100, 1, ""), (1, 'i', 100, 2, "kept")]);
+    transform(&c);
+    assert_eq!(
+        status_of(&c, 1).as_deref(),
+        Some("kept"),
+        "tuple boundary keeps it (shipped)"
+    );
+
+    // A scalar `commit_lsn > '0000000000000064'` (= Ct) would exclude the insert (its commit_lsn == Ct).
+    let dropped: i64 = c
+        .query_row(
+            "SELECT count(*) FROM orders_raw WHERE \"_walrus_op\" <> 't' AND \"_walrus_commit_lsn\" > '0000000000000064'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        dropped, 0,
+        "a scalar boundary WOULD drop the same-commit insert — why we use the tuple"
+    );
+}
+
+/// A bare TRUNCATE never stalls: the max-commit-lsn scan (which Phase B advances `transformed_lsn` to)
+/// includes the `t` row, and `latest_truncate` resolves it.
+#[test]
+fn transformed_lsn_advances_past_a_truncate_only_tail() {
+    let c = db();
+    seed(&c, &[(0, 't', 100, 1, "")]); // ONLY a truncate
+    transform(&c);
+    let max_hex: Option<String> = c
+        .query_row(
+            "SELECT max(\"_walrus_commit_lsn\") FROM orders_raw WHERE \"_walrus_commit_lsn\" > '0000000000000000'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        max_hex.as_deref(),
+        Some("0000000000000064"),
+        "the max scan sees the truncate → watermark advances"
+    );
+    let b = TransformSql::from_relation(&orders_rel())
+        .latest_truncate(&c, &common::Lsn::ZERO)
+        .unwrap();
+    assert_eq!(
+        b.ct,
+        Some("0/64".parse().unwrap()),
+        "latest_truncate resolves the bare truncate"
+    );
+}
+
+/// `<table>_raw` is NEVER truncated — the `t` op stays a logged row (raw-vs-mirror asymmetry).
+#[test]
+fn raw_retains_the_truncate_op_row() {
+    let c = db();
+    seed(&c, &[(1, 'i', 1, 1, "x"), (0, 't', 1, 5, "")]);
+    transform(&c);
+    let t_rows: i64 = c
+        .query_row(
+            "SELECT count(*) FROM orders_raw WHERE \"_walrus_op\" = 't'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        t_rows, 1,
+        "the truncate op row is retained in <table>_raw (raw is never wiped)"
+    );
+}
