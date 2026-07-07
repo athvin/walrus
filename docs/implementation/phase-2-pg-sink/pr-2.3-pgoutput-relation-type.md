@@ -1,5 +1,7 @@
 # PR 2.3 — `Relation` and `Type` (the xid prefix + `typmod` → `numeric(p,s)`)
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/23
+
 > **Phase:** 2 — walrus-pg-sink (2a: the hand-rolled decoder) · **Crates touched:** `pg-sink` ·
 > **Est. size:** M · **Depends on:** PR 2.2 · **Unlocks:** PR 2.4
 
@@ -134,18 +136,18 @@ fn full_identity_flags_every_column_key() { todo!() }    // items: replident 'f'
 
 ## Definition of Done
 
-- [ ] `type_enum`, `relation_orders`, `relation_composite_pk`, `relation_full_identity_all_keys`,
+- [x] `type_enum`, `relation_orders`, `relation_composite_pk`, `relation_full_identity_all_keys`,
       `relation_after_add_column` all render to their golden lines.
-- [ ] `atttypmod(0xFFFFFFFF) == -1`; `numeric_precision_scale(655366) == Some((10, 2))`;
+- [x] `atttypmod(0xFFFFFFFF) == -1`; `numeric_precision_scale(655366) == Some((10, 2))`;
       `numeric_precision_scale(-1) == None`.
-- [ ] `relation_orders` → key columns are exactly `["id"]`, `replident == Default`.
-- [ ] `relation_full_identity_all_keys` → `replident == Full` and every `PgColumn.is_key`.
-- [ ] The xid prefix is consumed **only** when `ctx.in_stream`; a non-streamed `Relation`/`Type` has
+- [x] `relation_orders` → key columns are exactly `["id"]`, `replident == Default`.
+- [x] `relation_full_identity_all_keys` → `replident == Full` and every `PgColumn.is_key`.
+- [x] The xid prefix is consumed **only** when `ctx.in_stream`; a non-streamed `Relation`/`Type` has
       `xid == None` (proven directly once streaming lands in 2.7, but the branch exists now).
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink` (workspace stays green)
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink` (workspace stays green)
 
 ## Hints & gotchas
 
