@@ -12,3 +12,7 @@ workspace = true
 common = { path = "../common" }
 arrow = { workspace = true }
 thiserror = { workspace = true }
+serde_json = { workspace = true }
+# jiff parses canonical Postgres temporal text into micros/days; hex decodes bytea `\x…` text.
+jiff = { workspace = true }
+hex = { workspace = true }

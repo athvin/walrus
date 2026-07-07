@@ -1,5 +1,7 @@
 # PR 2.10 — Tier-1 `TupleValue` → Arrow builders → `RecordBatch`
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/30
+
 > **Phase:** 2 — walrus-pg-sink (2b: pg-to-arrow) · **Crates touched:** `pg-to-arrow`, `common` ·
 > **Est. size:** M · **Depends on:** PR 2.9 · **Unlocks:** PR 2.11
 
@@ -118,19 +120,19 @@ mod tests {
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `BatchBuilder::new` + repeated `append_row` + `finish` yields a `RecordBatch` whose column count =
+- [x] `BatchBuilder::new` + repeated `append_row` + `finish` yields a `RecordBatch` whose column count =
       source columns + 1, and whose schema equals `schema::build_schema(rel)`.
-- [ ] An `orders` insert (`id=42, amount=19.99, created_at=…, note='hi'`) round-trips into the batch with the
+- [x] An `orders` insert (`id=42, amount=19.99, created_at=…, note='hi'`) round-trips into the batch with the
       right typed arrays (assert via `as_primitive`/`as_string` downcasts).
-- [ ] `TupleValue::Null` and `TupleValue::UnchangedToast` both set validity false; a test asserts the TOAST
+- [x] `TupleValue::Null` and `TupleValue::UnchangedToast` both set validity false; a test asserts the TOAST
       column appears in the row's `SinkMeta.unchanged_toast` (populated upstream, echoed into the meta JSON).
-- [ ] A row with the wrong number of values fails with `Error::RowLenMismatch`; a non-numeric `"abc"` for an
+- [x] A row with the wrong number of values fails with `Error::RowLenMismatch`; a non-numeric `"abc"` for an
       `Int32` column fails with `Error::ValueParse { column: "id", .. }` naming the column.
-- [ ] The `walrus_pg_sink_meta` value equals `serde_json::to_string(&meta)` for that row.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-to-arrow` (and `--workspace` stays green)
+- [x] The `walrus_pg_sink_meta` value equals `serde_json::to_string(&meta)` for that row.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-to-arrow` (and `--workspace` stays green)
 
 ## Hints & gotchas
 

@@ -10,4 +10,16 @@ pub enum Error {
     NotTier1 { oid: u32, typmod: i32 },
     #[error("relation {relation} has no columns")]
     EmptyRelation { relation: String },
+    #[error("column {column}: cannot parse {value:?} as {data_type}")]
+    ValueParse {
+        column: String,
+        value: String,
+        data_type: String,
+    },
+    #[error("row has {got} values, relation has {expected} columns")]
+    RowLenMismatch { expected: usize, got: usize },
+    #[error("internal: builder downcast failed for column {column}")]
+    Downcast { column: String },
+    #[error("arrow error: {0}")]
+    Arrow(#[from] arrow::error::ArrowError),
 }

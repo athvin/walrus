@@ -8,9 +8,11 @@
 //! PR 2.9 builds the Tier-1 (native 1:1) Arrow schema; values (2.10), Parquet + DuckDB conformance
 //! (2.11), and the Tier-2/3 types (2.12+) follow.
 
+pub mod batch;
 pub mod error;
 pub mod oids;
 pub mod schema;
 
+pub use batch::BatchBuilder;
 pub use error::Error;
 pub use schema::{build_schema, tier1_data_type, tier1_field, SINK_META_COLUMN};

@@ -1457,6 +1457,9 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "common",
+ "hex",
+ "jiff",
+ "serde_json",
  "thiserror",
 ]
 
