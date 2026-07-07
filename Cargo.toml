@@ -45,3 +45,5 @@ tokio-util = "0.7"
 object_store = "0.11"
 # Replication-capable source connection + catalog preflight (PR 2.19); START_REPLICATION (PR 2.20).
 tokio-postgres = "0.7"
+# Hand-rolled replication wire protocol (PR 2.20): big-endian LSNs / clocks in CopyBoth frames.
+byteorder = "1"

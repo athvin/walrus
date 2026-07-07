@@ -11,4 +11,6 @@ pub mod config;
 pub mod health;
 pub mod pgoutput;
 pub mod preflight;
+pub mod replication;
 pub mod shutdown;
+pub mod slot;
