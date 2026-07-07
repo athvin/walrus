@@ -1,5 +1,7 @@
 # PR 2.26 — Durability checkpoint: advance `confirmed_flush_lsn` only after S3 + manifest
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/46
+
 > **Phase:** 2 — walrus-pg-sink (2c — the sink binary) · **Crates touched:** `pg-sink` (bin+lib) ·
 > **Est. size:** M · **Depends on:** PR 2.25 · **Unlocks:** PR 2.27
 
@@ -112,18 +114,18 @@ async fn keepalive_lsn_moves_while_confirmed_flush_holds() { todo!() }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `confirmed_flush_lsn` advances to a batch's `lsn_end` **only after** both the S3 PUT and the
+- [x] `confirmed_flush_lsn` advances to a batch's `lsn_end` **only after** both the S3 PUT and the
       manifest commit succeeded — the ordering is enforced, not incidental.
-- [ ] The standby reply carries **two distinct LSNs**: `write` = keepalive/received (unconditional),
+- [x] The standby reply carries **two distinct LSNs**: `write` = keepalive/received (unconditional),
       `flush`/`apply` = `confirmed_flush_lsn` (durable) — a stalled flush advances the former, not the latter.
-- [ ] `confirmed_flush_lsn` is never advanced past the open-txn floor (a no-op guard for now; wired for PR 2.30).
-- [ ] A kill between the PUT and the standby update causes the batch to **re-stream** on restart with no
+- [x] `confirmed_flush_lsn` is never advanced past the open-txn floor (a no-op guard for now; wired for PR 2.30).
+- [x] A kill between the PUT and the standby update causes the batch to **re-stream** on restart with no
       data loss (the loader's dedup would absorb the replay downstream).
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` then `cargo test -p pg-sink --test durability`: the slot advances to
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` then `cargo test -p pg-sink --test durability`: the slot advances to
         `lsn_end` only after flush; a crash between PUT and standby re-streams.
 
 ## Hints & gotchas
