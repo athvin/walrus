@@ -1,5 +1,7 @@
 # PR 2.15 — Tier-3 canonical-text carriers (numeric>38, bit, inet, tsvector, pg_lsn, xid…)
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/35
+
 > **Phase:** 2 — walrus-pg-sink (2b: pg-to-arrow) · **Crates touched:** `pg-to-arrow` · **Est. size:** M ·
 > **Depends on:** PR 2.14 · **Unlocks:** PR 2.16
 
@@ -94,17 +96,17 @@ mod tests {
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `numeric(10,2)` still maps to `Decimal128(10,2)` (no regression); `numeric` (unconstrained) and
+- [x] `numeric(10,2)` still maps to `Decimal128(10,2)` (no regression); `numeric` (unconstrained) and
       `numeric(40,10)` map to a single `Utf8` field with the value carried verbatim.
-- [ ] `bit`/`varbit` carry `'0'/'1'` text; `inet`/`cidr`/`macaddr(8)`/`tsvector`/`tsquery`/`pg_lsn`/`xid(8)`/`xml`
+- [x] `bit`/`varbit` carry `'0'/'1'` text; `inet`/`cidr`/`macaddr(8)`/`tsvector`/`tsquery`/`pg_lsn`/`xid(8)`/`xml`
       all map to `Utf8`.
-- [ ] Conformance: each reads back as DuckDB `VARCHAR` with the exact canonical string; a `p>38` value written
+- [x] Conformance: each reads back as DuckDB `VARCHAR` with the exact canonical string; a `p>38` value written
       as VARCHAR round-trips **exactly** where a Decimal path would downcast to `DOUBLE` and lose digits.
-- [ ] A comment records the DuckDB `p>38 → DOUBLE` downcast as the reason VARCHAR (not Decimal256) is used.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-to-arrow` and `cargo test -p pg-to-arrow --features conformance`
+- [x] A comment records the DuckDB `p>38 → DOUBLE` downcast as the reason VARCHAR (not Decimal256) is used.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-to-arrow` and `cargo test -p pg-to-arrow --features conformance`
 
 ## Hints & gotchas
 
