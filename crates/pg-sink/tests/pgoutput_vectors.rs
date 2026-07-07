@@ -4,8 +4,10 @@
 //! PRs 2.2–2.8 turn the vectors on family-by-family, TDD-style. PR 2.2 lights up `begin`, `commit`,
 //! and the `parse_stream` framing.
 
-use common::ReplicaIdentity;
-use pg_sink::pgoutput::{parse_message, parse_stream, DecodeError, Message, Reader, StreamCtx};
+use common::{ReplicaIdentity, TupleValue};
+use pg_sink::pgoutput::{
+    parse_message, parse_stream, parse_tuple, DecodeError, Message, Reader, StreamCtx,
+};
 
 /// A ported row of `VECTORS`: bytes in, the golden render line out.
 pub struct Vector {
@@ -398,8 +400,44 @@ fn render(m: &Message) -> String {
             };
             format!("TYPE          {pre}oid={oid} {namespace}.{name}")
         }
+        Message::Insert {
+            xid,
+            relation_oid,
+            new,
+        } => {
+            let pre = match xid {
+                Some(x) => format!("xid={x} "),
+                None => String::new(),
+            };
+            format!(
+                "INSERT        {pre}rel={relation_oid} new={}",
+                render_tuple(new)
+            )
+        }
         _ => todo!("render arm added in a later PR"),
     }
+}
+
+/// Render a tuple like `decode_pgoutput.py::render_tuple`.
+fn render_tuple(cols: &[TupleValue]) -> String {
+    let items: Vec<String> = cols
+        .iter()
+        .map(|c| match c {
+            TupleValue::Null => "NULL".to_string(),
+            TupleValue::UnchangedToast => "<unchanged-TOAST>".to_string(),
+            TupleValue::Text(s) => {
+                let shown = if s.chars().count() > 40 {
+                    let prefix: String = s.chars().take(37).collect();
+                    format!("{prefix}...")
+                } else {
+                    s.clone()
+                };
+                format!("'{shown}'")
+            }
+            TupleValue::Binary(b) => format!("0x{}", hex::encode(b)),
+        })
+        .collect();
+    format!("[{}]", items.join(", "))
 }
 
 #[test]
@@ -516,6 +554,55 @@ fn full_identity_flags_every_column_key() {
         }
         other => panic!("expected Relation, got {other:?}"),
     }
+}
+
+#[test]
+fn insert_vectors_render() {
+    for name in ["insert", "insert_generated_column_omitted"] {
+        let v = lookup(name);
+        assert_eq!(render(&decode(v.hex, v.streaming)), v.expected, "{name}");
+    }
+}
+
+#[test]
+fn insert_new_tuple_has_no_null_or_toast_here() {
+    // orders insert: all 5 columns are Text; none Null/UnchangedToast.
+    match decode(lookup("insert").hex, false) {
+        Message::Insert { new, .. } => {
+            assert_eq!(new.len(), 5);
+            assert!(new.iter().all(|v| matches!(v, TupleValue::Text(_))));
+        }
+        other => panic!("expected Insert, got {other:?}"),
+    }
+}
+
+#[test]
+fn generated_stored_column_is_omitted_from_tuple() {
+    // items insert has 3 columns (id, label, qty) — the GENERATED STORED col is absent.
+    match decode(lookup("insert_generated_column_omitted").hex, false) {
+        Message::Insert { new, .. } => assert_eq!(new.len(), 3),
+        other => panic!("expected Insert, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_tuple_distinguishes_null_and_unchanged_toast() {
+    // Int16 ncols=2, then 'n', 'u' — a real NULL vs an unchanged-TOAST placeholder.
+    let bytes = [0x00, 0x02, b'n', b'u'];
+    let mut reader = Reader::new(&bytes);
+    let cols = parse_tuple(&mut reader).unwrap();
+    assert_eq!(cols, vec![TupleValue::Null, TupleValue::UnchangedToast]);
+    assert_ne!(cols[0], cols[1]);
+}
+
+#[test]
+fn parse_tuple_rejects_unknown_format_byte() {
+    let bytes = [0x00, 0x01, b'x']; // ncols=1, bad format tag 'x'
+    let mut reader = Reader::new(&bytes);
+    assert!(matches!(
+        parse_tuple(&mut reader),
+        Err(DecodeError::BadTupleFormat { byte: b'x' })
+    ));
 }
 
 #[test]

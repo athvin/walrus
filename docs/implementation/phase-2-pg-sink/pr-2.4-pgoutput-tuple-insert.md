@@ -1,5 +1,7 @@
 # PR 2.4 — `TupleData` (`n`/`u`/`t`/`b`) and `Insert`
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/24
+
 > **Phase:** 2 — walrus-pg-sink (2a: the hand-rolled decoder) · **Crates touched:** `pg-sink` ·
 > **Est. size:** S · **Depends on:** PR 2.3 · **Unlocks:** PR 2.5
 
@@ -113,16 +115,16 @@ fn generated_stored_column_is_omitted_from_tuple() {
 
 ## Definition of Done
 
-- [ ] `parse_tuple` maps every format byte to the right `TupleValue`; `t`/`b` consume exactly their
+- [x] `parse_tuple` maps every format byte to the right `TupleValue`; `t`/`b` consume exactly their
       length-prefixed bytes; an unknown byte returns `BadTupleFormat` (no panic, no silent skip).
-- [ ] `insert` renders to `INSERT        rel=16397 new=['1', 'new', '19.99', 'happy', 'first']`.
-- [ ] `insert_generated_column_omitted` renders with exactly 3 tuple columns.
-- [ ] `TupleValue::Null` and `TupleValue::UnchangedToast` are constructed for `n`/`u` and are `!=` each
+- [x] `insert` renders to `INSERT        rel=16397 new=['1', 'new', '19.99', 'happy', 'first']`.
+- [x] `insert_generated_column_omitted` renders with exactly 3 tuple columns.
+- [x] `TupleValue::Null` and `TupleValue::UnchangedToast` are constructed for `n`/`u` and are `!=` each
       other (the distinction proven fully in 2.5's `unchanged_toast_update`).
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink` (workspace stays green)
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink` (workspace stays green)
 
 ## Hints & gotchas
 
