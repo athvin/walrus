@@ -2415,6 +2415,7 @@ name = "pg-sink"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrow 54.3.1",
  "axum",
  "byteorder",
  "bytes",
@@ -2425,7 +2426,9 @@ dependencies = [
  "humantime-serde",
  "jiff",
  "object_store",
+ "pg-to-arrow",
  "serde",
+ "serde_json",
  "sqlx",
  "thiserror",
  "tokio",

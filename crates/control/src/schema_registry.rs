@@ -8,7 +8,7 @@
 use crate::ControlError;
 use common::TypeDescriptor;
 use sqlx::types::Json;
-use sqlx::PgExecutor;
+use sqlx::{PgExecutor, Row};
 
 /// One `schema_version` of a table's type mapping.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,4 +107,56 @@ pub async fn read_latest_version(
     .await
     .map_err(ControlError::from_sqlx)?;
     Ok(rec.max_version)
+}
+
+/// The **latest** registry row for every `(source_schema, source_table)` under `epoch` — what the
+/// sink hydrates its relation cache from at bootstrap (step 7). A runtime query (not `query!`) so it
+/// needs no offline cache entry; the `jsonb` columns decode via `Json<_>` / `serde_json::Value`.
+pub async fn read_all_latest_registry(
+    ex: impl PgExecutor<'_>,
+    epoch: i64,
+) -> Result<Vec<RegistryRow>, ControlError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT r.epoch, r.source_schema, r.source_table, r.schema_version,
+               r.descriptors, r.columns
+        FROM walrus.schema_registry r
+        JOIN (
+            SELECT source_schema, source_table, MAX(schema_version) AS max_v
+            FROM walrus.schema_registry
+            WHERE epoch = $1
+            GROUP BY source_schema, source_table
+        ) latest
+          ON r.source_schema = latest.source_schema
+         AND r.source_table = latest.source_table
+         AND r.schema_version = latest.max_v
+        WHERE r.epoch = $1
+        "#,
+    )
+    .bind(epoch)
+    .fetch_all(ex)
+    .await
+    .map_err(ControlError::from_sqlx)?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(RegistryRow {
+                epoch: row.try_get("epoch").map_err(ControlError::from_sqlx)?,
+                source_schema: row
+                    .try_get("source_schema")
+                    .map_err(ControlError::from_sqlx)?,
+                source_table: row
+                    .try_get("source_table")
+                    .map_err(ControlError::from_sqlx)?,
+                schema_version: row
+                    .try_get("schema_version")
+                    .map_err(ControlError::from_sqlx)?,
+                descriptors: row
+                    .try_get::<Json<Vec<TypeDescriptor>>, _>("descriptors")
+                    .map_err(ControlError::from_sqlx)?
+                    .0,
+                columns: row.try_get("columns").map_err(ControlError::from_sqlx)?,
+            })
+        })
+        .collect()
 }
