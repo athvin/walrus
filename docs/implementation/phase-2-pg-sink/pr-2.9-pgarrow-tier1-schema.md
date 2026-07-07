@@ -1,5 +1,7 @@
 # PR 2.9 — Build the Tier-1 Arrow schema from a `PgRelation`
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/29
+
 > **Phase:** 2 — walrus-pg-sink (2b: pg-to-arrow) · **Crates touched:** `pg-to-arrow` (new), `common` ·
 > **Est. size:** M · **Depends on:** PR 1.2 (shape types), PR 2.8 (decoder complete) · **Unlocks:** PR 2.10
 
@@ -128,18 +130,18 @@ mod tests {
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `crates/pg-to-arrow` compiles as a workspace member depending on `common` only (no `pg-sink`/`control` edge).
-- [ ] A hand-built `orders` `PgRelation` (`id int4` PK, `amount numeric(10,2)`, `created_at timestamptz`,
+- [x] `crates/pg-to-arrow` compiles as a workspace member depending on `common` only (no `pg-sink`/`control` edge).
+- [x] A hand-built `orders` `PgRelation` (`id int4` PK, `amount numeric(10,2)`, `created_at timestamptz`,
       `note text`) → `build_schema` yields exactly those four Arrow fields + a trailing `walrus_pg_sink_meta` Utf8.
-- [ ] `timestamptz` → `Timestamp(Microsecond, Some("UTC"))`; `timestamp` → `Timestamp(Microsecond, None)`;
+- [x] `timestamptz` → `Timestamp(Microsecond, Some("UTC"))`; `timestamp` → `Timestamp(Microsecond, None)`;
       `time` → `Time64(Microsecond)` (all **MICROS**, asserted).
-- [ ] `numeric(10,2)` → `Decimal128(10, 2)`; `numeric` typmod `-1` returns `None` from `numeric_precision_scale`.
-- [ ] Non-Tier-1 OIDs (e.g. `interval` 1186) return `Error::NotTier1`, not a panic or a wrong field.
-- [ ] Comments explain the nullable-data / non-null-meta invariant and the two-numeric-cases split.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-to-arrow` (and `--workspace` stays green)
+- [x] `numeric(10,2)` → `Decimal128(10, 2)`; `numeric` typmod `-1` returns `None` from `numeric_precision_scale`.
+- [x] Non-Tier-1 OIDs (e.g. `interval` 1186) return `Error::NotTier1`, not a panic or a wrong field.
+- [x] Comments explain the nullable-data / non-null-meta invariant and the two-numeric-cases split.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-to-arrow` (and `--workspace` stays green)
 
 ## Hints & gotchas
 

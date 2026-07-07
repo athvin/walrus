@@ -187,7 +187,7 @@ Two deliberate structural notes:
 
 | ✅ | PR | Delivers | Design |
 |---|---|---|---|
-| ☐ | [2.9](./phase-2-pg-sink/pr-2.9-pgarrow-tier1-schema.md) | Tier-1 Arrow schema from `PgRelation` (MICROS, Decimal128) | sink §2.1 / §2.3 |
+| ✅ | [2.9](./phase-2-pg-sink/pr-2.9-pgarrow-tier1-schema.md) | Tier-1 Arrow schema from `PgRelation` (MICROS, Decimal128) | sink §2.1 / §2.3 |
 | ☐ | [2.10](./phase-2-pg-sink/pr-2.10-pgarrow-tier1-recordbatch.md) | Tier-1 `TupleValue` → Arrow builders → RecordBatch | sink §2 / §2.7 |
 | ☐ | [2.11](./phase-2-pg-sink/pr-2.11-pgarrow-parquet-duckdb-conformance.md) | Parquet write + DuckDB read-back conformance harness | sink §2.1 / §2.8 |
 | ☐ | [2.12](./phase-2-pg-sink/pr-2.12-pgarrow-interval-timetz.md) | Tier-2 `interval` (3 cols) + `timetz` (2 cols) | sink §2.4 |
