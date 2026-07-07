@@ -1,5 +1,7 @@
 # PR 3.3 — The raw→mirror transform SQL template + pure in-memory-DuckDB tests (crown jewel)
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/56
+
 > **Phase:** 3 — walrus-loader · **Crates touched:** `loader` · **Est. size:** L ·
 > **Depends on:** PR 3.2 · **Unlocks:** PR 3.4
 
@@ -113,21 +115,21 @@ fn seed(conn: &Connection, rows: &[(i64, char, &str, &str, Option<&str>)]) { tod
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] **`i→d→i` across N keys:** every mirror row equals its **last** insert and `COUNT(*) = N` — zero
+- [x] **`i→d→i` across N keys:** every mirror row equals its **last** insert and `COUNT(*) = N` — zero
       delete survivors, zero first-insert survivors.
-- [ ] **`i→d`, `i→u→d`, phantom `d`** → the key is **absent** from the mirror.
-- [ ] **`i(A)→d→i(B)` (A≠B)** → mirror = `B`; **`d→i` on a pre-seeded key** → mirror = the insert data
+- [x] **`i→d`, `i→u→d`, phantom `d`** → the key is **absent** from the mirror.
+- [x] **`i(A)→d→i(B)` (A≠B)** → mirror = `B`; **`d→i` on a pre-seeded key** → mirror = the insert data
       (last-tuple-wins across a tombstone, MATCHED-UPDATE branch).
-- [ ] A test proves that **pre-filtering `op='d'` before the window would resurrect** a deleted key,
+- [x] A test proves that **pre-filtering `op='d'` before the window would resurrect** a deleted key,
       and the shipped template (filter *after* ranking) does not.
-- [ ] The template renders correctly for a **composite** PK (`PARTITION BY k1,k2`; `ON t.k1=s.k1 AND
+- [x] The template renders correctly for a **composite** PK (`PARTITION BY k1,k2`; `ON t.k1=s.k1 AND
       t.k2=s.k2`), generated from the key list — not hard-coded to one column.
-- [ ] The tests run against `Connection::open_in_memory()` — **no docker compose**, no Postgres, no S3.
-- [ ] The transform ships as **one** template used by both the tests and (in PR 3.4) the loader.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p loader --test transform` (and `--workspace` stays green) — **no `--ignored`**,
+- [x] The tests run against `Connection::open_in_memory()` — **no docker compose**, no Postgres, no S3.
+- [x] The transform ships as **one** template used by both the tests and (in PR 3.4) the loader.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p loader --test transform` (and `--workspace` stays green) — **no `--ignored`**,
         these are pure and fast.
 
 ## Hints & gotchas
