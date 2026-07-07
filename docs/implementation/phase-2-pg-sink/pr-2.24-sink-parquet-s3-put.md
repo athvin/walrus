@@ -1,5 +1,7 @@
 # PR 2.24 — Arrow → Parquet → S3 PUT (`object_store`)
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/44
+
 > **Phase:** 2 — walrus-pg-sink (2c — the sink binary) · **Crates touched:** `pg-sink` (bin+lib),
 > `pg-to-arrow` · **Est. size:** M · **Depends on:** PR 2.23 · **Unlocks:** PR 2.25
 
@@ -118,18 +120,18 @@ async fn key_is_epoch_namespaced_and_lsn_sortable() { todo!() }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] A `SealedBatch` is encoded to Parquet (temporals **MICROS**, compression set) and streamed to S3
+- [x] A `SealedBatch` is encoded to Parquet (temporals **MICROS**, compression set) and streamed to S3
       via `object_store` **multipart** — no full local temp file.
-- [ ] The object key is exactly `<epoch>/<source_schema>/<table>/<lsn_end>-<batch_uuid>.parquet` with a
+- [x] The object key is exactly `<epoch>/<source_schema>/<table>/<lsn_end>-<batch_uuid>.parquet` with a
       **zero-padded 16-hex** `lsn_end`, so keys sort in commit order.
-- [ ] `put` returns a `WrittenObject` (with `s3_uri`, `lsn_end`, `row_count`, `schema_version`) **only
+- [x] `put` returns a `WrittenObject` (with `s3_uri`, `lsn_end`, `row_count`, `schema_version`) **only
       after** the upload is durable (`close()`/commit completed) — the load-bearing PUT-before-anything.
-- [ ] `walrus_pg_sink_meta.sink_processed_at` is a UTC `Z` timestamp stamped at write time.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` then `cargo test -p pg-sink --test parquet_put`: a flush lands an
+- [x] `walrus_pg_sink_meta.sink_processed_at` is a UTC `Z` timestamp stamped at write time.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` then `cargo test -p pg-sink --test parquet_put`: a flush lands an
         object at the expected key that DuckDB `read_parquet` reads back with the correct types + values.
 
 ## Hints & gotchas
