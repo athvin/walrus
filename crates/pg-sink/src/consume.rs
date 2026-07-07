@@ -35,6 +35,7 @@ pub async fn run_decode_loop(
     router: &mut BatchRouter,
     sink: &crate::sink::ParquetSink,
     checkpoint: &mut crate::checkpoint::DurabilityCheckpoint,
+    demux: &mut crate::stream_txn::StreamDemux,
     heartbeat: &mut Heartbeat,
     health: &HealthState,
     pool: &sqlx::PgPool,
@@ -140,6 +141,47 @@ pub async fn run_decode_loop(
                                         }
                                         health.set_degraded(heartbeat.degraded(Instant::now()));
                                     }
+                                }
+                                // --- Large-transaction streaming (§1.6, PR 2.30). A txn over
+                                // logical_decoding_work_mem arrives BEFORE its commit as interleaved
+                                // Stream blocks; the demux stages speculatively and commit-gates.
+                                Message::StreamStart { xid, first_segment } => {
+                                    demux.on_stream_start(*xid, *first_segment, frame_lsn);
+                                    checkpoint.set_open_txn_floor(demux.open_floor());
+                                }
+                                Message::StreamStop => demux.on_stream_stop(),
+                                m @ (Message::Insert { xid: Some(_), .. }
+                                | Message::Update { xid: Some(_), .. }
+                                | Message::Delete { xid: Some(_), .. }) => {
+                                    last_activity = Instant::now();
+                                    demux.on_change(cache, m, sink, frame_lsn).await?;
+                                }
+                                Message::StreamCommit { xid, commit_lsn, .. } => {
+                                    // Promote the speculative files to `ready` (lsn_end = commit_lsn),
+                                    // then advance the slot — clamped to any still-older open txn.
+                                    let objs = demux.on_stream_commit(*xid, *commit_lsn, sink).await?;
+                                    for obj in &objs {
+                                        crate::manifest::record_ready(pool, epoch, obj)
+                                            .await
+                                            .context("commit streamed manifest ready row")?;
+                                    }
+                                    checkpoint.set_open_txn_floor(demux.open_floor());
+                                    checkpoint.on_batch_durable(*commit_lsn);
+                                    checkpoint
+                                        .send(stream, false)
+                                        .await
+                                        .context("send streamed-commit standby status")?;
+                                    tracing::info!(
+                                        xid,
+                                        files = objs.len(),
+                                        commit_lsn = %commit_lsn,
+                                        confirmed_flush = %checkpoint.confirmed_flush(),
+                                        "streamed txn committed → ready"
+                                    );
+                                }
+                                Message::StreamAbort { top_xid, sub_xid } => {
+                                    demux.on_stream_abort(*top_xid, *sub_xid, sink).await?;
+                                    checkpoint.set_open_txn_floor(demux.open_floor());
                                 }
                                 other => {
                                     // A user change is activity — it suppresses the idle beat.

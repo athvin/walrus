@@ -22,3 +22,4 @@ pub mod shutdown;
 pub mod sink;
 pub mod slot;
 pub mod snapshot;
+pub mod stream_txn;

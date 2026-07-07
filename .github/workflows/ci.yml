@@ -179,6 +179,11 @@ jobs:
       - name: Snapshot backfill (compose)
         run: cargo test -p pg-sink --test snapshot_backfill -- --ignored --test-threads=1
 
+      # PR 2.30: large-txn streaming — an 8000-row txn (logical_decoding_work_mem=64kB) writes ready
+      # rows only after Stream Commit; a whole-txn abort writes none.
+      - name: Streaming large txn (compose)
+        run: cargo test -p pg-sink --test streaming_large_txn -- --ignored --test-threads=1
+
       # PR 2.18/2.19: the sink pod-lifecycle shell against the live stack — full bootstrap (control +
       # S3 + source preflight) → /startup→/ready flip, SIGTERM exit 0, missing control DB → exit 11.
       - name: Sink pod-lifecycle smoke (health · SIGTERM · fail-fast exit code)
