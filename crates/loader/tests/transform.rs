@@ -4,6 +4,7 @@
 
 use common::{PgColumn, PgRelation, ReplicaIdentity};
 use duckdb::Connection;
+use loader::duck::TableDb;
 use loader::transform::{apply_transform, TransformSql};
 
 fn orders_rel() -> PgRelation {
@@ -26,17 +27,39 @@ fn lsn(n: u64) -> String {
     format!("{n:016X}")
 }
 
-/// Fresh in-memory DB with `orders` (mirror) + `orders_raw` (CDC log, minimal columns the transform
-/// reads).
+/// Fresh in-memory DB with `orders` (mirror, incl. the hidden `_applied_*` guard columns — PR 3.7) +
+/// `orders_raw` (CDC log, minimal columns the transform reads).
 fn db() -> Connection {
     let c = Connection::open_in_memory().unwrap();
     c.execute_batch(
-        "CREATE TABLE orders (id INTEGER PRIMARY KEY, status VARCHAR);
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, status VARCHAR,
+             \"_applied_commit_lsn\" VARCHAR DEFAULT '0000000000000000',
+             \"_applied_lsn\" VARCHAR DEFAULT '0000000000000000');
          CREATE TABLE orders_raw (id INTEGER, status VARCHAR, walrus_pg_sink_meta VARCHAR,
              \"_walrus_op\" VARCHAR, \"_walrus_commit_lsn\" VARCHAR, \"_walrus_lsn\" VARCHAR);",
     )
     .unwrap();
     c
+}
+
+/// Pre-seed a mirror row with an EXPLICIT applied tuple `(ac, al)` — the guard's high-water mark for the
+/// per-PK max-applied straddle tests.
+fn seed_mirror(c: &Connection, id: i64, status: &str, ac: u64, al: u64) {
+    c.execute(
+        "INSERT INTO orders (id, status, \"_applied_commit_lsn\", \"_applied_lsn\") VALUES (?, ?, ?, ?)",
+        duckdb::params![id, status, lsn(ac), lsn(al)],
+    )
+    .unwrap();
+}
+
+/// The hidden guard tuple currently stamped on a mirror row.
+fn applied_of(c: &Connection, id: i64) -> Option<(String, String)> {
+    c.query_row(
+        "SELECT \"_applied_commit_lsn\", \"_applied_lsn\" FROM orders WHERE id = ?",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .ok()
 }
 
 /// Seed `orders_raw`: rows of (id, op, commit_lsn n, lsn n, status).
@@ -157,8 +180,8 @@ fn insert_a_delete_insert_b_resolves_to_b() {
 #[test]
 fn delete_then_insert_on_preseeded_key_updates_to_insert() {
     let c = db();
-    c.execute("INSERT INTO orders VALUES (7, 'old')", [])
-        .unwrap(); // pre-seeded mirror row
+    c.execute("INSERT INTO orders (id, status) VALUES (7, 'old')", [])
+        .unwrap(); // pre-seeded mirror row (applied tuple defaults to the low sentinel 0/0)
     seed(&c, &[(7, 'd', 2, 1, "old"), (7, 'i', 2, 2, "fresh")]);
     transform(&c);
     assert_eq!(
@@ -201,7 +224,9 @@ fn deletes_filtered_after_ranking_never_resurrect_a_deleted_key() {
 fn composite_pk_partition_and_join_expand_to_all_key_columns() {
     let c = Connection::open_in_memory().unwrap();
     c.execute_batch(
-        "CREATE TABLE kv (k1 INTEGER, k2 INTEGER, val VARCHAR, PRIMARY KEY (k1, k2));
+        "CREATE TABLE kv (k1 INTEGER, k2 INTEGER, val VARCHAR,
+             \"_applied_commit_lsn\" VARCHAR DEFAULT '0000000000000000',
+             \"_applied_lsn\" VARCHAR DEFAULT '0000000000000000', PRIMARY KEY (k1, k2));
          CREATE TABLE kv_raw (k1 INTEGER, k2 INTEGER, val VARCHAR, walrus_pg_sink_meta VARCHAR,
              \"_walrus_op\" VARCHAR, \"_walrus_commit_lsn\" VARCHAR, \"_walrus_lsn\" VARCHAR);",
     )
@@ -271,8 +296,11 @@ fn composite_pk_partition_and_join_expand_to_all_key_columns() {
 #[test]
 fn truncate_then_reinsert_keeps_only_post_truncate_rows() {
     let c = db();
-    c.execute("INSERT INTO orders VALUES (99, 'pre-existing')", [])
-        .unwrap(); // an earlier-cycle row
+    c.execute(
+        "INSERT INTO orders (id, status) VALUES (99, 'pre-existing')",
+        [],
+    )
+    .unwrap(); // an earlier-cycle row
     seed(
         &c,
         &[
@@ -409,7 +437,9 @@ fn docs_rel() -> PgRelation {
 fn docs_db() -> Connection {
     let c = Connection::open_in_memory().unwrap();
     c.execute_batch(
-        "CREATE TABLE docs (id INTEGER PRIMARY KEY, big VARCHAR, note VARCHAR);
+        "CREATE TABLE docs (id INTEGER PRIMARY KEY, big VARCHAR, note VARCHAR,
+             \"_applied_commit_lsn\" VARCHAR DEFAULT '0000000000000000',
+             \"_applied_lsn\" VARCHAR DEFAULT '0000000000000000');
          CREATE TABLE docs_raw (id INTEGER, big VARCHAR, note VARCHAR, walrus_pg_sink_meta VARCHAR,
              \"_walrus_op\" VARCHAR, \"_walrus_commit_lsn\" VARCHAR, \"_walrus_lsn\" VARCHAR);",
     )
@@ -469,8 +499,11 @@ fn same_batch_unchanged_toast_carries_forward_the_prior_value() {
 #[test]
 fn unchanged_toast_falls_back_to_current_mirror_when_raw_has_none() {
     let c = docs_db();
-    c.execute("INSERT INTO docs VALUES (1, 'Y', 'old')", [])
-        .unwrap(); // pre-existing mirror row
+    c.execute(
+        "INSERT INTO docs (id, big, note) VALUES (1, 'Y', 'old')",
+        [],
+    )
+    .unwrap(); // pre-existing mirror row
     docs_seed(&c, 1, None, "n2", 'u', 100, 1, "[\"big\"]"); // only a sentinel in raw
     docs_transform(&c);
     let big: Option<String> = c
@@ -518,4 +551,147 @@ fn non_toast_columns_pass_through_untouched() {
         note, "newnote",
         "note (not listed) passes through the winner's value, not back-scanned"
     );
+}
+
+// ---- PR 3.7: the per-PK max-applied `(commit_lsn, lsn)` guard (§7, ⚠ extends architecture.md). The
+// guarded MERGE + the relaxed `>=` window close the two straddle faces without losing idempotency. ----
+
+/// Break face B — a stale delete + re-insert straddling the watermark (older than what last shaped the
+/// mirror row) must NOT overwrite or resurrect it: the per-PK guard makes the stale winner a no-op.
+#[test]
+fn stale_delete_reinsert_across_watermark_does_not_resurrect() {
+    let c = db();
+    // The mirror row was last shaped by a NEWER tuple (200, 9).
+    seed_mirror(&c, 1, "current", 200, 9);
+    // A stale churn arriving late in the tail: delete then re-insert, both at an OLDER tuple.
+    seed(
+        &c,
+        &[
+            (1, 'd', 100, 1, "current"),
+            (1, 'i', 100, 2, "stale-reinsert"),
+        ],
+    );
+    transform(&c);
+    assert_eq!(
+        status_of(&c, 1).as_deref(),
+        Some("current"),
+        "the stale delete+reinsert is a no-op — the newer applied tuple wins"
+    );
+    assert_eq!(mirror_count(&c), 1);
+    assert_eq!(
+        applied_of(&c, 1),
+        Some((lsn(200), lsn(9))),
+        "the guard tuple is untouched by the rejected stale winner"
+    );
+}
+
+/// Break face A — a snapshot row whose `commit_lsn == transformed_lsn` (all snapshot rows carry
+/// `consistent_point`) is re-examined by the relaxed `>=` low bound and applied, never silently dropped.
+#[test]
+fn equal_commit_lsn_snapshot_row_is_still_applied() {
+    let c = db();
+    // transformed_lsn == 100; the snapshot row's commit_lsn is ALSO 100 (the equal-commit_lsn straddle).
+    let after: common::Lsn = "0/64".parse().unwrap();
+    assert_eq!(
+        after.to_string(),
+        lsn(100),
+        "sanity: after == commit_lsn 100"
+    );
+    seed(&c, &[(1, 'i', 100, 1, "snap")]);
+
+    // Counterfactual: a strict `commit_lsn > after` window would see NOTHING (the row is AT the bound).
+    let strict: i64 = c
+        .query_row(
+            "SELECT count(*) FROM orders_raw WHERE \"_walrus_commit_lsn\" > '0000000000000064'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        strict, 0,
+        "a strict `>` bound would exclude the snapshot row"
+    );
+
+    apply_transform(&c, &TransformSql::from_relation(&orders_rel()), &after).unwrap();
+    assert_eq!(
+        status_of(&c, 1).as_deref(),
+        Some("snap"),
+        "the `>=` bound re-examines the equal-commit_lsn snapshot row and the guard applies it"
+    );
+}
+
+/// The guard applies a genuinely-newer winner and rejects a genuinely-stale one, decided by the FULL
+/// `(commit_lsn, lsn)` tuple — proven side-by-side on two independent keys in one transform.
+#[test]
+fn guard_applies_newer_and_rejects_stale_by_tuple() {
+    let c = db();
+    seed_mirror(&c, 1, "old1", 100, 5); // key 1: applied at (100, 5)
+    seed_mirror(&c, 2, "old2", 100, 5); // key 2: applied at (100, 5)
+    seed(
+        &c,
+        &[
+            (1, 'u', 50, 9, "stale"), // older commit_lsn (50 < 100) despite a higher lsn — tuple loses
+            (2, 'u', 200, 1, "fresh"), // newer commit_lsn (200 > 100) despite a lower lsn — tuple wins
+        ],
+    );
+    transform(&c);
+    assert_eq!(
+        status_of(&c, 1).as_deref(),
+        Some("old1"),
+        "stale winner rejected — the tuple compares commit_lsn FIRST"
+    );
+    assert_eq!(
+        applied_of(&c, 1),
+        Some((lsn(100), lsn(5))),
+        "guard tuple unchanged"
+    );
+    assert_eq!(
+        status_of(&c, 2).as_deref(),
+        Some("fresh"),
+        "newer winner applied"
+    );
+    assert_eq!(
+        applied_of(&c, 2),
+        Some((lsn(200), lsn(1))),
+        "guard tuple advanced to the applied winner"
+    );
+}
+
+/// The hidden `_applied_*` guard columns live on the mirror table but NEVER appear in the user-facing
+/// `<table>_current` projection (DoD §7). Exercises the production `ensure_tables` schema.
+#[test]
+fn applied_columns_are_hidden_from_user_projections() {
+    let db = TableDb::open(std::path::Path::new(":memory:")).unwrap();
+    db.ensure_tables(&orders_rel()).unwrap();
+    let conn = db.conn();
+
+    let mirror_cols = columns_of(conn, "orders");
+    assert!(
+        mirror_cols.iter().any(|c| c == "_applied_commit_lsn")
+            && mirror_cols.iter().any(|c| c == "_applied_lsn"),
+        "the mirror table itself carries the guard columns: {mirror_cols:?}"
+    );
+
+    let view_cols = columns_of(conn, "orders_current");
+    assert_eq!(
+        view_cols,
+        vec!["id".to_string(), "status".to_string()],
+        "the user-facing view exposes ONLY the source columns"
+    );
+    assert!(
+        !view_cols.iter().any(|c| c.starts_with("_applied")),
+        "the guard columns never leak into a user projection"
+    );
+}
+
+/// Column names of a table/view, in ordinal order.
+fn columns_of(conn: &Connection, name: &str) -> Vec<String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_name = ? ORDER BY ordinal_position",
+        )
+        .unwrap();
+    let rows = stmt.query_map([name], |r| r.get::<_, String>(0)).unwrap();
+    rows.map(|r| r.unwrap()).collect()
 }

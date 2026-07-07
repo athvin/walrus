@@ -36,9 +36,15 @@ impl TableDb {
             .map(|c| format!("\"{}\"", c.name))
             .collect();
 
-        // The mirror: current row per key.
+        // The mirror: current row per key, plus two HIDDEN guard columns (§7, ⚠ extends architecture.md)
+        // recording the `(commit_lsn, lsn)` tuple that last shaped each row — the per-PK max-applied guard
+        // that makes a stale straddle winner a no-op. Seeded from the low sentinel `0/0`; a pre-3.7 mirror
+        // gains them via `ALTER … IF NOT EXISTS`, which back-fills existing rows with that sentinel (a
+        // too-low seed just means the first real event wins — which is correct).
         let mut mirror = format!(
-            "CREATE TABLE IF NOT EXISTS \"{}\" ({}",
+            "CREATE TABLE IF NOT EXISTS \"{}\" ({}, \
+             \"_applied_commit_lsn\" VARCHAR DEFAULT '0000000000000000', \
+             \"_applied_lsn\" VARCHAR DEFAULT '0000000000000000'",
             rel.name,
             cols.join(", ")
         );
@@ -46,6 +52,19 @@ impl TableDb {
             mirror.push_str(&format!(", PRIMARY KEY ({})", keys.join(", ")));
         }
         mirror.push(')');
+        // Idempotent back-fill for a mirror created before PR 3.7 (compose resume).
+        let applied_cols = format!(
+            "ALTER TABLE \"{t}\" ADD COLUMN IF NOT EXISTS \"_applied_commit_lsn\" VARCHAR DEFAULT '0000000000000000'; \
+             ALTER TABLE \"{t}\" ADD COLUMN IF NOT EXISTS \"_applied_lsn\" VARCHAR DEFAULT '0000000000000000';",
+            t = rel.name
+        );
+        // The user-facing projection: the mirror WITHOUT the internal guard columns (DoD §7 "hidden from
+        // user projections"). Users read `<table>_current`; `_applied_*` never leak.
+        let user_view = format!(
+            "CREATE OR REPLACE VIEW \"{t}_current\" AS \
+             SELECT * EXCLUDE (\"_applied_commit_lsn\", \"_applied_lsn\") FROM \"{t}\";",
+            t = rel.name
+        );
 
         // The CDC log: every change verbatim, with the intact `walrus_pg_sink_meta` JSON plus four
         // columns PROMOTED out of it (op / commit_lsn / lsn / sink_processed_at) as sortable 16-hex /
@@ -65,7 +84,7 @@ impl TableDb {
         );
 
         self.conn
-            .execute_batch(&format!("{mirror}; {raw};"))
+            .execute_batch(&format!("{mirror}; {applied_cols} {raw}; {user_view}"))
             .map_err(|e| LoaderError::Duck(format!("ensure tables for {}: {e}", rel.name)))?;
         Ok(())
     }

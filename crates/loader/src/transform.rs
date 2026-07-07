@@ -3,6 +3,13 @@
 //! latest change per PK (deletes stay *in* the window; the winner's `op` decides — the resurrection
 //! guard §5.3), then a three-branch `MERGE INTO` that collapses intra-batch PK churn (`i→d→i`, `i→u→d`,
 //! `d→i`, phantom `d`). The same template is used by the hermetic tests here and by Phase B (PR 3.4).
+//!
+//! **⚠ Extends architecture.md (§7, Open Q8/Q13):** the per-PK max-applied-`(commit_lsn, lsn)` guard.
+//! Each mutating MERGE branch is gated on `(s.commit_lsn, s.lsn) > (t._applied_commit_lsn, t._applied_lsn)`
+//! and the window low bound is relaxed to `>=`, together closing two straddle faces — (A) the
+//! equal-`commit_lsn` snapshot row and (B) a stale delete/re-insert across the watermark — while keeping
+//! the mirror idempotent (the guard makes a re-applied boundary row a no-op). The full-rebuild (PR 3.11)
+//! remains the safety net regardless; this makes the *incremental* path self-correcting.
 
 use crate::error::LoaderError;
 use common::{Lsn, PgRelation};
@@ -89,9 +96,10 @@ impl TransformSql {
         }
     }
 
-    /// Render the full rendered SQL (truncate wipe + dedup `CREATE TEMP TABLE _batch` + `MERGE INTO`),
-    /// reading only the un-transformed tail (`commit_lsn > after_lsn`, and — if the tail has a truncate —
-    /// only rows STRICTLY after the `(Ct, Lt)` tuple). Composite-PK-aware.
+    /// Render the full rendered SQL (truncate wipe + dedup `CREATE TEMP TABLE _batch` + guarded `MERGE
+    /// INTO`), reading the un-transformed tail (`commit_lsn >= after_lsn` — the `>=` re-examines the
+    /// equal-`commit_lsn` snapshot straddle, §7 break face A; and — if the tail has a truncate — only
+    /// rows STRICTLY after the `(Ct, Lt)` tuple). Composite-PK-aware.
     pub fn render(&self, after_lsn: &Lsn, boundary: &TruncateBoundary) -> String {
         let q = |c: &str| format!("\"{c}\"");
         let pk_list = self.pk.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
@@ -102,23 +110,34 @@ impl TransformSql {
             .collect::<Vec<_>>()
             .join(" AND ");
         // MATCHED UPDATE assigns the non-key columns; if a table is all-PK, a self-assignment keeps the
-        // UPDATE valid (a no-op) so `d→i` still lands via the MATCHED branch.
-        let set_cols = if self.non_key.is_empty() {
-            format!("{} = s.{}", q(&self.pk[0]), q(&self.pk[0]))
+        // UPDATE valid (a no-op) so `d→i` still lands via the MATCHED branch. Every UPDATE also stamps
+        // the hidden `_applied_*` guard columns with the winner's tuple (§7).
+        let mut set_parts: Vec<String> = if self.non_key.is_empty() {
+            vec![format!("{} = s.{}", q(&self.pk[0]), q(&self.pk[0]))]
         } else {
             self.non_key
                 .iter()
                 .map(|c| format!("{} = s.{}", q(c), q(c)))
-                .collect::<Vec<_>>()
-                .join(", ")
+                .collect()
         };
-        let insert_cols = self.all.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
-        let insert_vals = self
-            .all
-            .iter()
-            .map(|c| format!("s.{}", q(c)))
-            .collect::<Vec<_>>()
-            .join(", ");
+        set_parts.push("\"_applied_commit_lsn\" = s.\"_walrus_commit_lsn\"".into());
+        set_parts.push("\"_applied_lsn\" = s.\"_walrus_lsn\"".into());
+        let set_cols = set_parts.join(", ");
+        // INSERT carries the source columns PLUS the hidden guard columns seeded from the winner's tuple.
+        let mut insert_col_parts: Vec<String> = self.all.iter().map(|c| q(c)).collect();
+        insert_col_parts.push("\"_applied_commit_lsn\"".into());
+        insert_col_parts.push("\"_applied_lsn\"".into());
+        let insert_cols = insert_col_parts.join(", ");
+        let mut insert_val_parts: Vec<String> =
+            self.all.iter().map(|c| format!("s.{}", q(c))).collect();
+        insert_val_parts.push("s.\"_walrus_commit_lsn\"".into());
+        insert_val_parts.push("s.\"_walrus_lsn\"".into());
+        let insert_vals = insert_val_parts.join(", ");
+        // The per-PK max-applied guard (§7, ⚠ extends architecture.md): a MUTATING branch fires only when
+        // the winner's tuple is STRICTLY newer than what last shaped the mirror row. Row-value `>` is
+        // lexicographic in DuckDB — exactly the `(commit_lsn, lsn)` order; do NOT hand-decompose it.
+        let guard = "(s.\"_walrus_commit_lsn\", s.\"_walrus_lsn\") > \
+                     (t.\"_applied_commit_lsn\", t.\"_applied_lsn\")";
 
         // `_batch`'s SELECT list: PK columns pass through; each non-key column is unchanged-TOAST-
         // resolved (a raw back-scan gated by the winner's `unchanged_toast` meta list — see §5.6); the
@@ -150,7 +169,11 @@ impl TransformSql {
                 table = self.table,
             ));
         }
+        // `_walrus_op` rides along for the MERGE branches; `_walrus_commit_lsn`/`_walrus_lsn` for both the
+        // guard comparison and the `_applied_*` stamps.
         select_parts.push("s.\"_walrus_op\"".to_string());
+        select_parts.push("s.\"_walrus_commit_lsn\"".to_string());
+        select_parts.push("s.\"_walrus_lsn\"".to_string());
         let resolved_select = select_parts.join(", ");
         // The truncate wipe (whole mirror) + the tuple-boundary window filter — empty when no truncate.
         let (truncate_wipe, truncate_bound) = match (boundary.ct, boundary.lt) {
@@ -171,6 +194,7 @@ impl TransformSql {
             .replace("{truncate_wipe}", &truncate_wipe)
             .replace("{truncate_bound}", &truncate_bound)
             .replace("{resolved_select}", &resolved_select)
+            .replace("{guard}", guard)
     }
 }
 

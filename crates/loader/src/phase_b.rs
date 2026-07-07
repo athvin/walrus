@@ -54,7 +54,13 @@ pub async fn run_phase_b(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
 
     // Advance the watermark AFTER the DuckDB commit. The CHECK (transformed_lsn <= raw_appended_lsn)
     // holds because Phase A ran first this cycle.
-    // TODO(3.7): equal-commit_lsn snapshot straddle.
+    //
+    // The equal-`commit_lsn` snapshot straddle (§7 break face A) is handled INSIDE the transform: its
+    // window low bound is `>= after` (re-examines a row AT the watermark) and every mutating MERGE branch
+    // is gated on the per-PK `_applied_*` guard, so re-applying a boundary row is a no-op. The strict `>`
+    // max-scan above still gates WHETHER we run (no idle re-scan of the equal-`commit_lsn` snapshot bulk);
+    // proving the full equal-`lsn_end` split-batch boundary end-to-end is PR 3.10. The full-rebuild (PR
+    // 3.11) is the safety net regardless.
     control::advance_transformed(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table, max_lsn).await?;
     tracing::info!(
         table = %format_args!("{}.{}", ctx.schema, ctx.table),
