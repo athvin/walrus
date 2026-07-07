@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO walrus.file_manifest\n            (epoch, source_schema, source_table, s3_uri, kind, row_count,\n             lsn_start, lsn_end, schema_version, status)\n        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'ready')\n        RETURNING id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        {
+          "Custom": {
+            "name": "pg_lsn",
+            "kind": "Simple"
+          }
+        },
+        {
+          "Custom": {
+            "name": "pg_lsn",
+            "kind": "Simple"
+          }
+        },
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "70cacb4d4966ab4f50a7cd4322c5093686f83ae5c15b08a55bedae87940b4b45"
+}

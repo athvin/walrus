@@ -115,6 +115,45 @@ impl<'de> serde::Deserialize<'de> for Lsn {
     }
 }
 
+/// Postgres `pg_lsn` support (feature `sqlx`), delegating to sqlx's `PgLsn` so an `Lsn` binds and
+/// decodes as a native `pg_lsn` — which sorts as a WAL position, matching this newtype's ordering.
+#[cfg(feature = "sqlx")]
+mod sqlx_support {
+    use super::Lsn;
+    use sqlx::postgres::{PgArgumentBuffer, PgTypeInfo, PgValueRef};
+    use sqlx::{Decode, Encode, Postgres, Type, TypeInfo};
+
+    impl Type<Postgres> for Lsn {
+        fn type_info() -> PgTypeInfo {
+            // sqlx 0.8 has no built-in pg_lsn (OID 3220); resolve the type by name.
+            PgTypeInfo::with_name("pg_lsn")
+        }
+        fn compatible(ty: &PgTypeInfo) -> bool {
+            // Match by name so a catalog-resolved pg_lsn column (fetched by OID) is accepted the
+            // same as our `with_name` declaration — the default PartialEq would reject that.
+            ty.name().eq_ignore_ascii_case("pg_lsn")
+        }
+    }
+
+    impl<'q> Encode<'q, Postgres> for Lsn {
+        fn encode_by_ref(
+            &self,
+            buf: &mut PgArgumentBuffer,
+        ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+            // pg_lsn's binary wire format is an 8-byte big-endian integer — identical to int8, so
+            // reuse i64's encoder. `as i64` preserves the bit pattern.
+            <i64 as Encode<Postgres>>::encode_by_ref(&(self.as_u64() as i64), buf)
+        }
+    }
+
+    impl<'r> Decode<'r, Postgres> for Lsn {
+        fn decode(value: PgValueRef<'r>) -> Result<Self, sqlx::error::BoxDynError> {
+            let raw = <i64 as Decode<Postgres>>::decode(value)?;
+            Ok(Lsn::new(raw as u64))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

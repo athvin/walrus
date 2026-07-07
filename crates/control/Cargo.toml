@@ -14,7 +14,7 @@ workspace = true
 integration = []
 
 [dependencies]
-common = { path = "../common" }
+common = { path = "../common", features = ["sqlx"] }
 thiserror = { workspace = true }
 sqlx = { workspace = true, features = [
     "runtime-tokio",

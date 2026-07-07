@@ -1,2 +1,0 @@
-# sqlx offline query cache (workspace-level: written by `cargo sqlx prepare --workspace`).
-# Empty until PR 1.4 introduces the first compile-checked query!() macro.

@@ -121,6 +121,7 @@ dependencies = [
  "jiff",
  "serde",
  "serde_json",
+ "sqlx",
  "thiserror",
  "tracing",
  "tracing-subscriber",

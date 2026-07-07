@@ -112,8 +112,8 @@ jobs:
       - name: Boot the dev stack (up --wait)
         run: docker compose -f deploy/docker/docker-compose.yml up --wait
 
-      - name: Control migrations integration tests (apply schema + assert index/CHECK)
-        run: cargo test -p control --features integration --test migrations
+      - name: Control integration tests (migrations schema/CHECK + file_manifest claim order)
+        run: cargo test -p control --features integration
 
       - name: sqlx offline cache is up to date (cargo sqlx prepare --check)
         run: cargo sqlx prepare --check --workspace

@@ -8,6 +8,11 @@ rust-version.workspace = true
 [lints]
 workspace = true # inherit deny(warnings) + clippy::all from the workspace root
 
+[features]
+# Opt-in sqlx `Type`/`Encode`/`Decode` for `Lsn` <-> Postgres `pg_lsn` (delegating to sqlx's
+# PgLsn). Off by default so non-DB consumers of `common` don't pull sqlx; `control`/`loader` enable it.
+sqlx = ["dep:sqlx"]
+
 [dependencies]
 thiserror = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -19,6 +24,10 @@ humantime-serde = { workspace = true }
 # `Z` suffix, so UtcTimestamp cannot accidentally emit a local/offset datetime.
 jiff = { workspace = true }
 bytes = { workspace = true }
+sqlx = { workspace = true, optional = true, features = [
+    "runtime-tokio",
+    "postgres",
+] }
 
 [dev-dependencies]
 serde_json = { workspace = true }

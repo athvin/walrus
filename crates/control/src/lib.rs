@@ -6,5 +6,9 @@
 //! just the schema, the ability to apply it, and the connect path every later model reuses.
 
 pub mod db;
+pub mod manifest;
 
 pub use db::{connect, run_migrations, ControlError};
+pub use manifest::{
+    claim_ready, delete_claimed, insert_ready, mark_failed, ManifestRow, NewManifestFile,
+};
