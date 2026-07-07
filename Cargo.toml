@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/common", "crates/control"] # grows one crate at a time, following the DAG in docs/implementation/README.md
+members = ["crates/common", "crates/control", "crates/pg-sink"] # grows one crate at a time, following the DAG in docs/implementation/README.md
 
 [workspace.package]
 edition = "2021"
@@ -28,3 +28,5 @@ jiff = "0.2"
 bytes = "1"
 tokio = "1"
 sqlx = "0.8"
+anyhow = "1"
+hex = "0.4"
