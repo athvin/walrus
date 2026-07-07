@@ -39,6 +39,25 @@ impl RelationCache {
         self.by_key.get(&(oid, schema_version)).cloned()
     }
 
+    /// The cached shape for `oid` at its **highest** `schema_version` — used to stamp streamed changes
+    /// after a DDL bump (PR 2.33), so a change always lands in the latest-shape file.
+    pub fn latest_for(&self, oid: u32) -> Option<Arc<CachedRelation>> {
+        self.by_key
+            .iter()
+            .filter(|((o, _), _)| *o == oid)
+            .max_by_key(|((_, v), _)| *v)
+            .map(|(_, r)| r.clone())
+    }
+
+    /// The OID of a cached `schema.table` (any version) — the DDL-capture cut (PR 2.33) needs it to find
+    /// the affected table's batcher.
+    pub fn oid_for(&self, schema: &str, table: &str) -> Option<u32> {
+        self.by_key
+            .values()
+            .find(|r| r.relation.schema == schema && r.relation.name == table)
+            .map(|r| r.relation.oid)
+    }
+
     pub fn len(&self) -> usize {
         self.by_key.len()
     }

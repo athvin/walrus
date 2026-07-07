@@ -71,6 +71,8 @@ pub enum PreflightError {
     NoPrimaryKey { schema: String, table: String },
     #[error("missing REPLICATION privilege")]
     NoReplicationPriv,
+    #[error("DDL capture not installed: {detail} (apply migrations/source/0002_ddl_triggers.sql)")]
+    DdlCaptureMissing { detail: &'static str },
     #[error("preflight query failed: {0}")]
     Query(String),
 }
@@ -119,6 +121,41 @@ pub struct SourcePreflight<'a> {
 impl<'a> SourcePreflight<'a> {
     pub fn new(client: &'a Client, cfg: &'a SinkConfig) -> Self {
         SourcePreflight { client, cfg }
+    }
+
+    /// The DDL-capture tap is installed (PR 2.33): the `walrus.ddl_audit` table has the sink's columns
+    /// and **both** event triggers exist. Missing → terminal (schema changes would silently drift).
+    pub async fn assert_ddl_capture(&self) -> Result<(), PreflightError> {
+        if self
+            .first_text(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns
+                                WHERE table_schema='walrus' AND table_name='ddl_audit'
+                                  AND column_name='c_columns')::text",
+            )
+            .await?
+            != "true"
+        {
+            return Err(PreflightError::DdlCaptureMissing {
+                detail: "walrus.ddl_audit table/columns absent",
+            });
+        }
+        for (name, event) in [
+            ("walrus_intercept_ddl", "ddl_command_end"),
+            ("walrus_intercept_drop", "sql_drop"),
+        ] {
+            let present = self
+                .first_text(&format!(
+                    "SELECT EXISTS (SELECT 1 FROM pg_event_trigger
+                                    WHERE evtname='{name}' AND evtevent='{event}')::text",
+                ))
+                .await?;
+            if present != "true" {
+                return Err(PreflightError::DdlCaptureMissing {
+                    detail: "event trigger missing",
+                });
+            }
+        }
+        Ok(())
     }
 
     /// The role has `REPLICATION`, `wal_level = logical`, `server_version_num ≥ 140000`, and free

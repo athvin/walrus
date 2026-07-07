@@ -36,24 +36,44 @@ pub struct InternalTables {
     pub heartbeat_oid: Option<u32>,
     /// Column index of `walrus.heartbeat.beat_seq`, learned from its `Relation` message.
     heartbeat_beat_seq_col: Option<usize>,
-    // pub ddl_audit_oid: Option<u32>,   // filled in PR 2.33
+    /// `walrus.ddl_audit`'s OID — its INSERTs are the sink's DDL signal (PR 2.33), consumed for control
+    /// and NEVER materialised as a `<table>`/`<table>_raw` file.
+    pub ddl_audit_oid: Option<u32>,
+    /// The `ddl_audit` relation shape (its INSERTs are never cached), so [`crate::ddl::DdlEvent`] can
+    /// parse a decoded tuple by column name.
+    ddl_audit_rel: Option<common::PgRelation>,
 }
 
 impl InternalTables {
-    /// Is this relation OID one of walrus's own control tables (never staged as user data)?
+    /// Is this relation OID one of walrus's own control tables (never staged as user data)? Both
+    /// `walrus.heartbeat` and `walrus.ddl_audit` are consumed specially, never materialised.
     pub fn is_internal(&self, rel_oid: u32) -> bool {
-        self.heartbeat_oid == Some(rel_oid)
+        self.heartbeat_oid == Some(rel_oid) || self.ddl_audit_oid == Some(rel_oid)
+    }
+
+    /// Whether this OID is the DDL-audit table (its INSERTs drive [`crate::ddl::DdlConsumer`]).
+    pub fn is_ddl_audit(&self, rel_oid: u32) -> bool {
+        self.ddl_audit_oid == Some(rel_oid)
     }
 
     /// Learn a walrus-internal table's OID + relevant column offsets from its `Relation` message.
-    /// The `walrus.heartbeat` change is never cached in the [`crate::relcache::RelationCache`] (it is
-    /// internal), so its `beat_seq` column index is captured here to read the round-trip seq later.
+    /// The internal-table changes are never cached in the [`crate::relcache::RelationCache`], so any
+    /// column offsets needed later (heartbeat `beat_seq`) are captured here.
     pub fn note_relation(&mut self, relation: &common::PgRelation) {
         if relation.schema == "walrus" && relation.name == "heartbeat" {
             self.heartbeat_oid = Some(relation.oid);
             self.heartbeat_beat_seq_col =
                 relation.columns.iter().position(|c| c.name == "beat_seq");
         }
+        if relation.schema == "walrus" && relation.name == "ddl_audit" {
+            self.ddl_audit_oid = Some(relation.oid);
+            self.ddl_audit_rel = Some(relation.clone());
+        }
+    }
+
+    /// The `ddl_audit` relation shape, once its `Relation` message has been seen.
+    pub fn ddl_audit_rel(&self) -> Option<&common::PgRelation> {
+        self.ddl_audit_rel.as_ref()
     }
 
     /// Extract the returned `beat_seq` from a decoded `walrus.heartbeat` new-tuple (text format).

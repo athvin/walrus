@@ -113,7 +113,6 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
         triggers,
         std::sync::Arc::new(pg_sink::batch::SystemClock),
         epoch,
-        SCHEMA_VERSION,
         cfg.instance.clone(),
         cfg.max_inflight_bytes,
     );
@@ -129,6 +128,9 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
     .await
     .context("connect heartbeat SQL connection")?;
 
+    // DDL capture (§3): consume walrus.ddl_audit INSERTs → ddl_manifest + per-table structural version.
+    let mut ddl = pg_sink::ddl::DdlConsumer::new(epoch);
+
     let result = consume::run_decode_loop(
         &mut stream,
         token.clone(),
@@ -137,6 +139,7 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
         &sink,
         &mut checkpoint,
         &mut demux,
+        &mut ddl,
         &mut heartbeat,
         &state,
         &ctx.control_pool,

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        INSERT INTO walrus.ddl_manifest\n            (epoch, source_schema, source_table, c_lsn, c_event, c_tag, schema_version)\n        VALUES ($1, $2, $3, $4, $5, $6, $7)\n        RETURNING id\n        ",
+  "query": "\n        INSERT INTO walrus.ddl_manifest\n            (epoch, source_schema, source_table, c_lsn, c_event, c_tag, schema_version, c_rel_oid, c_columns)\n        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)\n        RETURNING id\n        ",
   "describe": {
     "columns": [
       {
@@ -22,12 +22,14 @@
         },
         "Text",
         "Text",
-        "Int8"
+        "Int8",
+        "Oid",
+        "Jsonb"
       ]
     },
     "nullable": [
       false
     ]
   },
-  "hash": "5113d73616fd1363f788af80d580df50768f865350ee4e8008ba57b295007195"
+  "hash": "9752d60976fa4212f5945860798f2066243a6ad7c20a99c1ebc09862ce259f2f"
 }

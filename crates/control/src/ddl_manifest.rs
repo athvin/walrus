@@ -29,13 +29,21 @@ pub struct DdlRow {
     pub schema_version: i64,
 }
 
-/// Record a decoded schema-change event (sink, PR 2.33). Returns the assigned `id`.
-pub async fn insert_ddl(ex: impl PgExecutor<'_>, row: &DdlRow) -> Result<i64, ControlError> {
+/// Record a decoded schema-change event (sink, PR 2.33). `c_rel_oid` + `c_columns` are the structured
+/// schema-diff payload (the source's post-change column snapshot) the loader applies in PR 3.8/3.9 —
+/// schema-DIFF, not a replay of the DDL text. Returns the assigned `id`.
+pub async fn insert_ddl(
+    ex: impl PgExecutor<'_>,
+    row: &DdlRow,
+    c_rel_oid: Option<u32>,
+    c_columns: Option<&serde_json::Value>,
+) -> Result<i64, ControlError> {
+    let c_rel_oid = c_rel_oid.map(sqlx::postgres::types::Oid);
     let rec = sqlx::query!(
         r#"
         INSERT INTO walrus.ddl_manifest
-            (epoch, source_schema, source_table, c_lsn, c_event, c_tag, schema_version)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+            (epoch, source_schema, source_table, c_lsn, c_event, c_tag, schema_version, c_rel_oid, c_columns)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         RETURNING id
         "#,
         row.epoch,
@@ -45,6 +53,8 @@ pub async fn insert_ddl(ex: impl PgExecutor<'_>, row: &DdlRow) -> Result<i64, Co
         row.c_event,
         row.c_tag,
         row.schema_version,
+        c_rel_oid,
+        c_columns,
     )
     .fetch_one(ex)
     .await

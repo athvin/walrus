@@ -158,7 +158,9 @@ async fn ddl_row_round_trips_with_commit_lsn() {
     let mut tx = pool.begin().await.unwrap();
     let epoch = 800_003;
 
-    let id = insert_ddl(&mut *tx, &ddl(epoch, "0/500", 5)).await.unwrap();
+    let id = insert_ddl(&mut *tx, &ddl(epoch, "0/500", 5), None, None)
+        .await
+        .unwrap();
     assert!(id > 0);
 
     let pending = read_pending_ddl(
@@ -186,9 +188,15 @@ async fn read_pending_ddl_orders_by_c_lsn() {
     let epoch = 800_004;
 
     // Insert out of LSN order.
-    insert_ddl(&mut *tx, &ddl(epoch, "0/300", 3)).await.unwrap();
-    insert_ddl(&mut *tx, &ddl(epoch, "0/100", 1)).await.unwrap();
-    insert_ddl(&mut *tx, &ddl(epoch, "0/200", 2)).await.unwrap();
+    insert_ddl(&mut *tx, &ddl(epoch, "0/300", 3), None, None)
+        .await
+        .unwrap();
+    insert_ddl(&mut *tx, &ddl(epoch, "0/100", 1), None, None)
+        .await
+        .unwrap();
+    insert_ddl(&mut *tx, &ddl(epoch, "0/200", 2), None, None)
+        .await
+        .unwrap();
 
     let all = read_pending_ddl(&mut *tx, epoch, "public", "orders", "0/0".parse().unwrap())
         .await

@@ -104,7 +104,6 @@ async fn savepoint_rollback_ready_file_has_exactly_6000_rows() {
         },
         Arc::new(SystemClock),
         epoch,
-        1,
         "test".to_string(),
         u64::MAX,
     );

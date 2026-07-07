@@ -134,7 +134,6 @@ async fn large_txn_single_ready_file_only_after_stream_commit() {
         },
         Arc::new(SystemClock),
         epoch,
-        1,
         "test".to_string(),
         u64::MAX,
     );
@@ -288,7 +287,6 @@ async fn whole_txn_abort_writes_no_ready_row() {
         },
         Arc::new(SystemClock),
         epoch,
-        1,
         "test".to_string(),
         u64::MAX,
     );
