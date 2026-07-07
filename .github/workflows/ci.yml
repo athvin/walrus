@@ -164,6 +164,11 @@ jobs:
       - name: Durability checkpoint (compose)
         run: cargo test -p pg-sink --test durability -- --ignored --test-threads=1
 
+      # PR 2.27: idle heartbeat — an idle publication beats after idle_after, the beat_seq returns
+      # through the stream, confirmed_flush_lsn advances, and the beat is never staged to a manifest.
+      - name: Heartbeat liveness (compose)
+        run: cargo test -p pg-sink --test heartbeat_liveness -- --ignored --test-threads=1
+
       # PR 2.18/2.19: the sink pod-lifecycle shell against the live stack — full bootstrap (control +
       # S3 + source preflight) → /startup→/ready flip, SIGTERM exit 0, missing control DB → exit 11.
       - name: Sink pod-lifecycle smoke (health · SIGTERM · fail-fast exit code)

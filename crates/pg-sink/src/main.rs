@@ -137,6 +137,17 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
     );
     let mut checkpoint = pg_sink::checkpoint::DurabilityCheckpoint::new(resume.start_lsn());
 
+    // The idle heartbeat rides a SEPARATE ordinary SQL connection (distinct from replication); its
+    // beat writes the published `walrus.heartbeat`, whose round-trip through the stream advances the
+    // slot on an otherwise-idle publication (§1.9).
+    let mut heartbeat = pg_sink::heartbeat::Heartbeat::connect(
+        &cfg.source_db_url,
+        cfg.instance.clone(),
+        cfg.heartbeat_config(),
+    )
+    .await
+    .context("connect heartbeat SQL connection")?;
+
     let result = consume::run_decode_loop(
         &mut stream,
         token.clone(),
@@ -144,6 +155,8 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
         &mut router,
         &sink,
         &mut checkpoint,
+        &mut heartbeat,
+        &state,
         &ctx.control_pool,
         epoch,
         SCHEMA_VERSION,
