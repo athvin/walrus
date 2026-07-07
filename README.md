@@ -10,6 +10,21 @@ current-state mirror on a user-chosen cadence.
 > [`docs/architecture.md`](docs/architecture.md) — read and critique it before any code
 > lands.
 
+## Design docs
+
+- [`docs/architecture.md`](docs/architecture.md) — the master architecture sketch: sink, loader,
+  S3 hand-off, slot/WAL safety, snapshot bootstrap, the raw→mirror transform, K8s topology, and the
+  verification plan.
+- [`docs/walrus-pg-sink.md`](docs/walrus-pg-sink.md) — the **sink** deep-dive: Postgres → Arrow →
+  Parquet → DuckDB type conversion, DDL capture via event triggers, and the K8s pod lifecycle
+  (incl. graceful shutdown).
+- [`docs/walrus-loader.md`](docs/walrus-loader.md) — the **loader** deep-dive: the work-handoff
+  contract, commit-gating, the two-phase append→transform, the `insert → delete → insert` collapse,
+  and the loader's K8s lifecycle & scaling.
+- [`docs/proto-version.md`](docs/proto-version.md) — the empirical pgoutput companion:
+  `proto_version 2` + `streaming 'on'` proven byte-by-byte from a live Postgres 16, with a
+  reproducible Docker harness.
+
 ## Shape (see the design doc for detail)
 
 - **`walrus-pg-sink`** — *non-negotiable job: take work off the WAL and write it to storage,
