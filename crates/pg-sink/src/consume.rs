@@ -36,11 +36,12 @@ pub async fn run_decode_loop(
     sink: &crate::sink::ParquetSink,
     checkpoint: &mut crate::checkpoint::DurabilityCheckpoint,
     demux: &mut crate::stream_txn::StreamDemux,
+    ddl: &mut crate::ddl::DdlConsumer,
     heartbeat: &mut Heartbeat,
     health: &HealthState,
     pool: &sqlx::PgPool,
     epoch: i64,
-    schema_version: i64,
+    _schema_version: i64, // structural version now rides the DDL consumer / cached shape (PR 2.33)
 ) -> anyhow::Result<()> {
     let mut ctx = StreamCtx::default();
     let mut internal = InternalTables::default();
@@ -94,11 +95,42 @@ pub async fn run_decode_loop(
                             trace_message(&msg);
                             match &msg {
                                 Message::Relation { relation, .. } => {
-                                    // Learn walrus.heartbeat's OID + column layout BEFORE its change
+                                    // Learn walrus.heartbeat / walrus.ddl_audit OIDs BEFORE their change
                                     // arrives (Relation always precedes the change in the same txn).
                                     internal.note_relation(relation);
-                                    on_relation(cache, pool, epoch, relation.clone(), schema_version)
-                                        .await?;
+                                    // Register user tables at their CURRENT structural version (bumped by
+                                    // DDL capture, PR 2.33) so the new-shape file carries the new version.
+                                    let version = ddl.version_of(&relation.schema, &relation.name);
+                                    on_relation(cache, pool, epoch, relation.clone(), version).await?;
+                                }
+                                // The DDL signal: a walrus.ddl_audit INSERT. Write a ddl_manifest row,
+                                // bump the affected table's structural schema_version, and cut a fresh
+                                // file. NEVER materialised as user data.
+                                Message::Insert { relation_oid, new, .. }
+                                    if internal.is_ddl_audit(*relation_oid) =>
+                                {
+                                    if let Some(rel) = internal.ddl_audit_rel() {
+                                        let ev = crate::ddl::DdlEvent::from_tuple(rel, new)
+                                            .context("parse ddl_audit tuple")?;
+                                        let structural = ddl
+                                            .consume(pool, &ev)
+                                            .await
+                                            .context("consume ddl event")?;
+                                        if let Some(new_version) = structural {
+                                            // Cut the old-version file for that table, then flush it.
+                                            let sealed = router.cut_table(cache, &ev.source_schema, &ev.source_table)?;
+                                            flush_sealed(sealed, stream, sink, checkpoint, pool, epoch).await?;
+                                            tracing::info!(
+                                                source_table = %format_args!("{}.{}", ev.source_schema, ev.source_table),
+                                                c_tag = %ev.c_tag,
+                                                schema_version = new_version,
+                                                c_lsn = %ev.c_lsn,
+                                                "DDL: manifest + version bump + file cut"
+                                            );
+                                        } else {
+                                            tracing::info!(c_tag = %ev.c_tag, "DDL: metadata-only (recorded, no bump)");
+                                        }
+                                    }
                                 }
                                 // The heartbeat round-trip: record it, mark the txn, and NEVER stage it
                                 // to S3 / a manifest row — it is control-plane, not user data.
@@ -115,7 +147,7 @@ pub async fn run_decode_loop(
                                 Message::Commit { commit_lsn, .. } => {
                                     // First seal/flush any user batch this commit made eligible.
                                     flush_sealed(
-                                        router.route(cache, &msg, frame_lsn, schema_version)?,
+                                        router.route(cache, &msg, frame_lsn, _schema_version)?,
                                         stream, sink, checkpoint, pool, epoch,
                                     )
                                     .await?;
@@ -193,7 +225,7 @@ pub async fn run_decode_loop(
                                         last_activity = Instant::now();
                                     }
                                     flush_sealed(
-                                        router.route(cache, other, frame_lsn, schema_version)?,
+                                        router.route(cache, other, frame_lsn, _schema_version)?,
                                         stream, sink, checkpoint, pool, epoch,
                                     )
                                     .await?;
@@ -380,9 +412,11 @@ impl BatchRouter {
         values: &[TupleValue],
         frame_lsn: Lsn,
         xid: u32,
-        schema_version: i64,
+        _schema_version: i64, // the version now rides the cached shape (bumped by DDL capture, PR 2.33)
     ) -> anyhow::Result<()> {
-        let Some(cached) = cache.get(oid, schema_version) else {
+        // Always the LATEST cached shape for this OID — so a change after a DDL bump lands in a
+        // new-version file (the homogeneous-file rule; the batcher was cut on the bump).
+        let Some(cached) = cache.latest_for(oid) else {
             tracing::warn!(
                 relation_oid = oid,
                 "change for a relation with no cached shape yet; skipping"
@@ -406,7 +440,7 @@ impl BatchRouter {
             xid,
             epoch: self.epoch,
             batch_id: String::new(), // assigned by the batcher when the batch opens
-            schema_version,
+            schema_version: cached.schema_version,
             source_schema: cached.relation.schema.clone(),
             source_table: cached.relation.name.clone(),
             kind: Kind::Stream,
@@ -416,6 +450,27 @@ impl BatchRouter {
         };
         batcher.push(meta, values);
         Ok(())
+    }
+
+    /// Cut the current file for `schema.table` (PR 2.33): force-seal its batcher so the pre-DDL rows
+    /// flush at the old `schema_version`, and drop the batcher so the next change rebuilds it from the
+    /// new-version shape. Returns the sealed old-version batch, if any.
+    pub fn cut_table(
+        &mut self,
+        cache: &RelationCache,
+        schema: &str,
+        table: &str,
+    ) -> anyhow::Result<Vec<SealedBatch>> {
+        let Some(oid) = cache.oid_for(schema, table) else {
+            return Ok(Vec::new()); // never buffered this table yet — nothing to cut
+        };
+        let mut sealed = Vec::new();
+        if let Some(mut batcher) = self.batchers.remove(&oid) {
+            if let Some(batch) = batcher.drain_committed().context("cut table on DDL bump")? {
+                sealed.push(batch);
+            }
+        }
+        Ok(sealed)
     }
 
     fn commit(&mut self, commit_lsn: Lsn) -> anyhow::Result<Vec<SealedBatch>> {

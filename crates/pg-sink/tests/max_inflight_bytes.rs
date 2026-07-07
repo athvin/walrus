@@ -104,7 +104,6 @@ async fn large_txn_low_ceiling_spills_and_stays_bounded() {
         },
         Arc::new(SystemClock),
         epoch,
-        1,
         "test".to_string(),
         ceiling,
     );

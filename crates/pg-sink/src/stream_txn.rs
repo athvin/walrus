@@ -98,7 +98,6 @@ pub struct StreamDemux {
     triggers: BatchTriggers,
     clock: Arc<dyn Clock>,
     epoch: i64,
-    schema_version: i64,
     sink_instance: String,
     meter: InflightMeter,
     spill_count: u64,
@@ -109,7 +108,6 @@ impl StreamDemux {
         triggers: BatchTriggers,
         clock: Arc<dyn Clock>,
         epoch: i64,
-        schema_version: i64,
         sink_instance: String,
         max_inflight_bytes: u64,
     ) -> Self {
@@ -119,7 +117,6 @@ impl StreamDemux {
             triggers,
             clock,
             epoch,
-            schema_version,
             sink_instance,
             meter: InflightMeter::new(max_inflight_bytes),
             spill_count: 0,
@@ -218,11 +215,10 @@ impl StreamDemux {
                 self.meter.release((oid, sub_xid)); // stale accounting; nothing buffered
                 continue;
             };
-            let (triggers, clock, epoch, schema_version, instance) = (
+            let (triggers, clock, epoch, instance) = (
                 self.triggers,
                 self.clock.clone(),
                 self.epoch,
-                self.schema_version,
                 self.sink_instance.clone(),
             );
             let (begin, rows) = {
@@ -239,7 +235,7 @@ impl StreamDemux {
                 (txn.begin_lsn, take)
             };
             self.meter.release((oid, sub_xid));
-            let Some(cached) = cache.get(oid, schema_version) else {
+            let Some(cached) = cache.latest_for(oid) else {
                 continue; // shape not cached (shouldn't happen mid-stream) — nothing to spill
             };
             let mut batcher =
@@ -253,7 +249,7 @@ impl StreamDemux {
                     xid: c.sub_xid,
                     epoch,
                     batch_id: String::new(),
-                    schema_version,
+                    schema_version: cached.schema_version,
                     source_schema: cached.relation.schema.clone(),
                     source_table: cached.relation.name.clone(),
                     kind: Kind::Stream,
@@ -374,16 +370,15 @@ impl StreamDemux {
             out.push(w);
         }
         // Materialise the still-in-memory survivors.
-        let (triggers, clock, epoch, schema_version, instance) = (
+        let (triggers, clock, epoch, instance) = (
             self.triggers,
             self.clock.clone(),
             self.epoch,
-            self.schema_version,
             self.sink_instance.clone(),
         );
         let mut batchers: HashMap<u32, TableBatcher> = HashMap::new();
         for c in changes.iter().filter(|c| !aborted.contains(&c.sub_xid)) {
-            let Some(cached) = cache.get(c.oid, schema_version) else {
+            let Some(cached) = cache.latest_for(c.oid) else {
                 continue;
             };
             let meta = SinkMeta {
@@ -394,7 +389,7 @@ impl StreamDemux {
                 xid: c.sub_xid,
                 epoch,
                 batch_id: String::new(),
-                schema_version,
+                schema_version: cached.schema_version,
                 source_schema: cached.relation.schema.clone(),
                 source_table: cached.relation.name.clone(),
                 kind: Kind::Stream,
@@ -532,7 +527,6 @@ mod tests {
                 max_fill: Duration::from_secs(3600),
             },
             Arc::new(SystemClock),
-            1,
             1,
             "test".into(),
             ceiling,

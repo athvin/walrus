@@ -11,6 +11,7 @@ pub mod bootstrap;
 pub mod checkpoint;
 pub mod config;
 pub mod consume;
+pub mod ddl;
 pub mod health;
 pub mod heartbeat;
 pub mod manifest;

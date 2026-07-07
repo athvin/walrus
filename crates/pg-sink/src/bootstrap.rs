@@ -88,6 +88,7 @@ pub async fn run_shared(cfg: &SinkConfig, deadline: Instant) -> Result<Bootstrap
     let pf = SourcePreflight::new(&source_client, cfg);
     let server = pf.assert_server_prereqs().await?;
     pf.assert_publication_covers().await?;
+    pf.assert_ddl_capture().await?;
     let pk = pf.assert_tables_have_pk(cfg.pk_mode()).await?;
     tracing::info!(
         version_num = server.version_num,
