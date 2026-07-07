@@ -41,10 +41,10 @@ impl TransformSql {
         }
     }
 
-    /// Render the full rendered SQL (dedup `CREATE TEMP TABLE _batch` + `MERGE INTO`) for this table —
-    /// generated from the **key list**, so a composite PK expands to `PARTITION BY k1,k2` /
-    /// `ON t.k1=s.k1 AND t.k2=s.k2`, never hard-coded to one column.
-    pub fn render(&self) -> String {
+    /// Render the full rendered SQL (dedup `CREATE TEMP TABLE _batch` + `MERGE INTO`) for this table,
+    /// reading only the un-transformed tail (`commit_lsn > after_lsn`) — generated from the **key list**,
+    /// so a composite PK expands to `PARTITION BY k1,k2` / `ON t.k1=s.k1 AND t.k2=s.k2`.
+    pub fn render(&self, after_lsn: &common::Lsn) -> String {
         let q = |c: &str| format!("\"{c}\"");
         let pk_list = self.pk.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
         let pk_join = self
@@ -78,12 +78,17 @@ impl TransformSql {
             .replace("{set_cols}", &set_cols)
             .replace("{insert_cols}", &insert_cols)
             .replace("{insert_vals}", &insert_vals)
+            .replace("{after_lsn}", &after_lsn.to_string())
     }
 }
 
-/// Run the transform (dedup + MERGE) against an already-populated `<table>_raw`. Phase B (PR 3.4) calls
-/// this per cycle. Pure SQL — the `transformed_lsn` window filter is PR 3.5.
-pub fn apply_transform(conn: &duckdb::Connection, t: &TransformSql) -> Result<(), LoaderError> {
-    conn.execute_batch(&t.render())
+/// Run the transform (dedup + MERGE) against `<table>_raw`, reading only `commit_lsn > after_lsn`.
+/// Phase B (PR 3.4) calls this inside a DuckDB transaction.
+pub fn apply_transform(
+    conn: &duckdb::Connection,
+    t: &TransformSql,
+    after_lsn: &common::Lsn,
+) -> Result<(), LoaderError> {
+    conn.execute_batch(&t.render(after_lsn))
         .map_err(|e| LoaderError::Duck(format!("transform {}: {e}", t.table)))
 }

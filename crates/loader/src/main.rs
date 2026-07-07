@@ -76,10 +76,10 @@ async fn run(cfg: LoaderConfig) -> Result<(), LoaderError> {
         .unwrap_or(1);
     tracing::info!(
         tables = keys.len(),
-        "bootstrap complete; ready (no apply loop yet)"
+        "bootstrap complete; starting apply loops"
     );
 
-    // Keep the lease alive off the (future) apply thread until SIGTERM.
+    // Keep the lease alive off the apply thread until SIGTERM.
     let renewer = lease::spawn_renewer(
         pool.clone(),
         epoch,
@@ -89,7 +89,38 @@ async fn run(cfg: LoaderConfig) -> Result<(), LoaderError> {
         token.clone(),
     );
 
-    token.cancelled().await;
+    // One apply loop per owned table. DuckDB's `Connection` is `!Send`, so the loops run on a
+    // `LocalSet` (this thread), the whole parallelism model being one worker per `.duckdb` file.
+    let local = tokio::task::LocalSet::new();
+    let handles: Vec<_> = owned
+        .into_iter()
+        .map(|o| {
+            let ctx = loader::phase_a::TableCtx {
+                pool: pool.clone(),
+                epoch,
+                schema: o.schema.clone(),
+                table: o.table.clone(),
+                rel: o.relation,
+                db: o.db,
+                state: state.clone(),
+                max_files: cfg.max_files_per_cycle,
+                poll_interval: cfg.poll_interval,
+            };
+            local.spawn_local(loader::apply_loop::apply_loop(ctx, token.clone()))
+        })
+        .collect();
+    // Drive the loops until they all exit (each returns on the shutdown token).
+    local
+        .run_until(async {
+            for h in handles {
+                if let Ok(Err(e)) = h.await {
+                    tracing::error!(error = %e, "apply loop failed");
+                    token.cancel();
+                }
+            }
+        })
+        .await;
+
     tracing::info!("SIGTERM: releasing leases and draining");
     renewer.abort();
     lease::release_all(&pool, epoch, &keys, &cfg.instance).await;

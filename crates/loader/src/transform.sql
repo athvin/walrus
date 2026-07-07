@@ -9,7 +9,7 @@
 -- a superseded earlier insert can never resurrect a deleted key (the resurrection guard, §5.3).
 CREATE OR REPLACE TEMP TABLE _batch AS
 SELECT * FROM "{table}_raw"
-WHERE "_walrus_op" <> 't'
+WHERE "_walrus_op" <> 't' AND "_walrus_commit_lsn" > '{after_lsn}'
 QUALIFY row_number() OVER (
     PARTITION BY {pk_list}
     ORDER BY "_walrus_commit_lsn" DESC, "_walrus_lsn" DESC

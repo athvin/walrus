@@ -11,25 +11,34 @@
 
 use crate::duck::TableDb;
 use crate::error::LoaderError;
-use common::Lsn;
+use crate::health::LoaderState;
+use common::{Lsn, PgRelation};
+use std::sync::Arc;
+use std::time::Duration;
 
-/// Everything one Phase-A pass needs for one owned table.
-pub struct TableCtx<'a> {
-    pub pool: &'a sqlx::PgPool,
+/// Everything one owned table's apply worker needs — **owned** (one `TableDb`/DuckDB connection per
+/// table, never shared), so it can move into a `spawn_local`'d [`crate::apply_loop::apply_loop`].
+pub struct TableCtx {
+    pub pool: sqlx::PgPool,
     pub epoch: i64,
     pub schema: String,
     pub table: String,
-    pub db: &'a TableDb,
-    /// Files claimed per cycle (cadence lives in the PR 3.4 loop).
+    /// The table shape — the transform (Phase B) renders its SQL from this.
+    pub rel: PgRelation,
+    pub db: TableDb,
+    pub state: Arc<LoaderState>,
+    /// Files claimed per cycle.
     pub max_files: i64,
+    /// The apply-loop poll cadence.
+    pub poll_interval: Duration,
 }
 
 /// One Phase-A pass. Returns the max `lsn_end` appended, or `None` if the queue was empty.
-pub async fn run_phase_a(ctx: &TableCtx<'_>) -> Result<Option<Lsn>, LoaderError> {
+pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     // 1. Claim in (lsn_end, id) order — NEVER `lsn_end > raw_appended_lsn` (that skips equal-lsn_end
     //    snapshot files forever).
     let claimed =
-        control::claim_ready(ctx.pool, ctx.epoch, &ctx.schema, &ctx.table, ctx.max_files).await?;
+        control::claim_ready(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table, ctx.max_files).await?;
     if claimed.is_empty() {
         return Ok(None);
     }

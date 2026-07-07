@@ -215,6 +215,11 @@ jobs:
       - name: Loader Phase A (compose)
         run: cargo test -p loader --test phase_a -- --ignored --test-threads=1
 
+      # PR 3.4: Phase B — transform the un-transformed tail (commit_lsn > transformed_lsn) into the
+      # mirror; mirror == current source, transformed_lsn advances, re-run byte-identical.
+      - name: Loader Phase B (compose)
+        run: cargo test -p loader --test phase_b -- --ignored --test-threads=1
+
       - name: Tear down (remove volumes)
         if: always()
         run: docker compose -f deploy/docker/docker-compose.yml down -v
