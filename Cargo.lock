@@ -2352,6 +2352,7 @@ dependencies = [
  "bytes",
  "chrono",
  "flate2",
+ "futures",
  "half",
  "hashbrown 0.15.5",
  "lz4_flex",
@@ -2362,6 +2363,7 @@ dependencies = [
  "simdutf8",
  "snap",
  "thrift",
+ "tokio",
  "twox-hash 1.6.3",
  "zstd",
 ]
@@ -2426,6 +2428,7 @@ dependencies = [
  "humantime-serde",
  "jiff",
  "object_store",
+ "parquet",
  "pg-to-arrow",
  "serde",
  "serde_json",
@@ -2435,6 +2438,7 @@ dependencies = [
  "tokio-postgres",
  "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -4141,6 +4145,7 @@ version = "1.23.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf80a72845275afea99e7f2b434723d3bc7e38470fcd1c7ed39a599c73319a53"
 dependencies = [
+ "getrandom 0.4.3",
  "js-sys",
  "wasm-bindgen",
 ]
