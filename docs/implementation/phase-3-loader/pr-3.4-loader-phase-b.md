@@ -1,5 +1,7 @@
 # PR 3.4 — Phase B wiring + advance `transformed_lsn`, and the per-table apply loop
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/57
+
 > **Phase:** 3 — walrus-loader · **Crates touched:** `loader` · **Est. size:** M ·
 > **Depends on:** PR 3.3 · **Unlocks:** PR 3.5
 
@@ -102,21 +104,21 @@ async fn re_running_phase_b_is_idempotent() { todo!() }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] After Phase A + Phase B over seeded Parquet, `<table>` equals the **current** source state (one
+- [x] After Phase A + Phase B over seeded Parquet, `<table>` equals the **current** source state (one
       row per PK, current values) — the §3.3 collapse rule now runs on real appended rows.
-- [ ] `transformed_lsn` advances to `max(commit_lsn)` applied and **never** exceeds `raw_appended_lsn`
+- [x] `transformed_lsn` advances to `max(commit_lsn)` applied and **never** exceeds `raw_appended_lsn`
       (the control-plane `CHECK` holds).
-- [ ] Phase B reads only `commit_lsn > transformed_lsn` and **never** re-reads the manifest.
-- [ ] Re-running Phase B over the same tail leaves the mirror **byte-identical** (idempotent).
-- [ ] The apply loop stamps `last_poll_completed_at` **every** cycle, including a no-op poll, and exits
+- [x] Phase B reads only `commit_lsn > transformed_lsn` and **never** re-reads the manifest.
+- [x] Re-running Phase B over the same tail leaves the mirror **byte-identical** (idempotent).
+- [x] The apply loop stamps `last_poll_completed_at` **every** cycle, including a no-op poll, and exits
       cleanly on the shutdown token.
-- [ ] A crash simulated between Phase A and Phase B is absorbed by a plain Phase-B re-run (no manual step).
-- [ ] Docs/comments explain why Phase B is naturally idempotent (watermark + LWW dedup → same winners).
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p loader` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` then `cargo test -p loader --test phase_b -- --ignored`
+- [x] A crash simulated between Phase A and Phase B is absorbed by a plain Phase-B re-run (no manual step).
+- [x] Docs/comments explain why Phase B is naturally idempotent (watermark + LWW dedup → same winners).
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p loader` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` then `cargo test -p loader --test phase_b -- --ignored`
         asserting **`mirror_equals_current_source_after_transform`** and
         **`re_running_phase_b_is_idempotent`**.
 
