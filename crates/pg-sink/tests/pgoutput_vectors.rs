@@ -1,12 +1,10 @@
 //! Golden-vector fixtures for the pgoutput decoder — a faithful, byte-for-byte port of
 //! `docs/examples/proto-version/test_decode_pgoutput.py::VECTORS`.
 //!
-//! PR 2.1 only stands up the table + helpers and one `#[ignore]`d enumerating test; PRs 2.2–2.8
-//! turn the vectors on family-by-family, TDD-style. `decode`/`render` are scaffolding those later
-//! PRs invoke — unused until then, hence the crate-level allow.
-#![allow(dead_code)]
+//! PRs 2.2–2.8 turn the vectors on family-by-family, TDD-style. PR 2.2 lights up `begin`, `commit`,
+//! and the `parse_stream` framing.
 
-use pg_sink::pgoutput::{parse_message, Message, StreamCtx};
+use pg_sink::pgoutput::{parse_message, parse_stream, DecodeError, Message, Reader, StreamCtx};
 
 /// A ported row of `VECTORS`: bytes in, the golden render line out.
 pub struct Vector {
@@ -278,28 +276,147 @@ pub const VECTORS: &[Vector] = &[
     },
 ];
 
-/// Test-only convenience: hex → one `Message`. (Reader/parse signature finalised in PR 2.2.)
-pub fn decode(hex: &str, streaming: bool) -> Message {
+/// Find a vector by name.
+fn lookup(name: &str) -> &'static Vector {
+    VECTORS
+        .iter()
+        .find(|v| v.name == name)
+        .unwrap_or_else(|| panic!("no vector named {name}"))
+}
+
+/// Test-only convenience: hex → one complete `Message` (rejects trailing bytes).
+fn decode(hex: &str, streaming: bool) -> Message {
     let bytes = hex::decode(hex).expect("vector hex is valid");
     let mut ctx = StreamCtx {
         in_stream: streaming,
     };
-    parse_message(&bytes, &mut ctx)
+    let mut reader = Reader::new(&bytes);
+    parse_message(&mut reader, &mut ctx).expect("vector decodes")
 }
 
-/// Test-only renderer that reproduces `decode_pgoutput.py::render` line-for-line. Lives in the test
-/// crate, NOT the lib — production stamps time as RFC-3339 `Z` (PR 1.1); this helper must match
-/// Python's `+00:00`/`X/Y`-hex output to compare against `expected`. Filled in PR 2.2.
-pub fn render(_m: &Message) -> String {
-    todo!("PR 2.2 — implement alongside the first decoded messages")
+/// `X/Y` upper-hex LSN, matching `decode_pgoutput.py::lsn`.
+fn fmt_lsn(v: u64) -> String {
+    format!("{:X}/{:X}", v >> 32, v & 0xFFFF_FFFF)
+}
+
+/// µs-since-2000 → Python `datetime.isoformat()` (`YYYY-MM-DDThh:mm:ss[.ffffff]+00:00`). The test
+/// crate reproduces Python's rendering to diff against the golden line; production uses `SinkMeta`'s
+/// RFC-3339 `Z` stamp (PR 1.1). Formatted by hand (not jiff's `Display`, which trims trailing
+/// fractional zeros — `.914880` would render `.91488`).
+fn fmt_ts(micros_since_2000: i64) -> String {
+    const MICROS_1970_TO_2000: i64 = 946_684_800_000_000;
+    let ts = jiff::Timestamp::from_microsecond(micros_since_2000 + MICROS_1970_TO_2000)
+        .expect("timestamp in range");
+    let dt = ts.to_zoned(jiff::tz::TimeZone::UTC).datetime();
+    let micros = (dt.subsec_nanosecond() / 1000) as u32;
+    let base = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+        dt.year(),
+        dt.month(),
+        dt.day(),
+        dt.hour(),
+        dt.minute(),
+        dt.second()
+    );
+    if micros == 0 {
+        format!("{base}+00:00")
+    } else {
+        format!("{base}.{micros:06}+00:00")
+    }
+}
+
+/// Test-only renderer reproducing `decode_pgoutput.py::render` line-for-line.
+fn render(m: &Message) -> String {
+    match m {
+        Message::Begin {
+            final_lsn,
+            commit_ts,
+            xid,
+        } => format!(
+            "BEGIN         final_lsn={} commit_ts={} xid={}",
+            fmt_lsn(final_lsn.as_u64()),
+            fmt_ts(*commit_ts),
+            xid
+        ),
+        Message::Commit {
+            flags,
+            commit_lsn,
+            end_lsn,
+            commit_ts,
+        } => format!(
+            "COMMIT        flags={} commit_lsn={} end_lsn={} commit_ts={}",
+            flags,
+            fmt_lsn(commit_lsn.as_u64()),
+            fmt_lsn(end_lsn.as_u64()),
+            fmt_ts(*commit_ts)
+        ),
+        Message::Origin { commit_lsn, name } => format!(
+            "ORIGIN        commit_lsn={} name='{}'",
+            fmt_lsn(commit_lsn.as_u64()),
+            name
+        ),
+        _ => todo!("render arm added in a later PR"),
+    }
 }
 
 #[test]
-#[ignore = "turned on family-by-family in PRs 2.2–2.8"]
+fn begin_decodes() {
+    let v = lookup("begin");
+    assert_eq!(render(&decode(v.hex, v.streaming)), v.expected);
+}
+
+#[test]
+fn commit_decodes() {
+    let v = lookup("commit");
+    assert_eq!(render(&decode(v.hex, v.streaming)), v.expected);
+}
+
+#[test]
+fn parse_stream_skips_newline_separators() {
+    // begin \n commit \n → [Begin, Commit]; the 0x0a bytes are separators, not data.
+    let mut raw = hex::decode(lookup("begin").hex).unwrap();
+    raw.push(0x0a);
+    raw.extend_from_slice(&hex::decode(lookup("commit").hex).unwrap());
+    raw.push(0x0a);
+
+    let mut ctx = StreamCtx::default();
+    let msgs = parse_stream(&raw, &mut ctx).unwrap();
+    assert_eq!(msgs.len(), 2);
+    match &msgs[0] {
+        Message::Begin { xid, .. } => assert_eq!(*xid, 749),
+        other => panic!("expected Begin, got {other:?}"),
+    }
+    assert!(matches!(&msgs[1], Message::Commit { .. }));
+}
+
+#[test]
+fn unknown_type_byte_errors_not_panics() {
+    let bytes = b"Zxxxx";
+    let mut ctx = StreamCtx::default();
+    let mut reader = Reader::new(bytes);
+    assert!(matches!(
+        parse_message(&mut reader, &mut ctx),
+        Err(DecodeError::UnknownMessage { byte: b'Z' })
+    ));
+}
+
+#[test]
+fn parse_message_rejects_trailing_bytes() {
+    let mut bytes = hex::decode(lookup("begin").hex).unwrap();
+    bytes.push(0xff); // one stray byte past a complete Begin
+    let mut ctx = StreamCtx::default();
+    let mut reader = Reader::new(&bytes);
+    assert!(matches!(
+        parse_message(&mut reader, &mut ctx),
+        Err(DecodeError::TrailingBytes { unconsumed: 1 })
+    ));
+}
+
+#[test]
+#[ignore = "meta-check; the family tests validate the vectors from PR 2.2 on"]
 fn all_vectors_present_and_hex_decodable() {
     for v in VECTORS {
         assert!(hex::decode(v.hex).is_ok(), "vector {} has bad hex", v.name);
     }
-    // Assert the full count so a dropped/renamed vector fails loudly.
     assert_eq!(VECTORS.len(), 30, "expected the full ported VECTORS set");
 }
