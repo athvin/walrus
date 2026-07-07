@@ -184,6 +184,11 @@ jobs:
       - name: Streaming large txn (compose)
         run: cargo test -p pg-sink --test streaming_large_txn -- --ignored --test-threads=1
 
+      # PR 2.31: the flagship — a rolled-back savepoint inside a committing streamed txn (proto §9b)
+      # yields a ready file with EXACTLY 6000 rows; the rolled-back sub-xid's rows are never present.
+      - name: Sub-transaction exclusion (compose)
+        run: cargo test -p pg-sink --test subtransaction_exclusion -- --ignored --test-threads=1
+
       # PR 2.18/2.19: the sink pod-lifecycle shell against the live stack — full bootstrap (control +
       # S3 + source preflight) → /startup→/ready flip, SIGTERM exit 0, missing control DB → exit 11.
       - name: Sink pod-lifecycle smoke (health · SIGTERM · fail-fast exit code)

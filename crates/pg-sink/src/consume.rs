@@ -154,12 +154,14 @@ pub async fn run_decode_loop(
                                 | Message::Update { xid: Some(_), .. }
                                 | Message::Delete { xid: Some(_), .. }) => {
                                     last_activity = Instant::now();
-                                    demux.on_change(cache, m, sink, frame_lsn).await?;
+                                    demux.on_change(m, frame_lsn)?;
                                 }
                                 Message::StreamCommit { xid, commit_lsn, .. } => {
-                                    // Promote the speculative files to `ready` (lsn_end = commit_lsn),
-                                    // then advance the slot — clamped to any still-older open txn.
-                                    let objs = demux.on_stream_commit(*xid, *commit_lsn, sink).await?;
+                                    // Materialise the survivors (aborted sub-xids excluded) to `ready`
+                                    // (lsn_end = commit_lsn), then advance the slot — clamped to any
+                                    // still-older open txn.
+                                    let objs =
+                                        demux.on_stream_commit(*xid, *commit_lsn, cache, sink).await?;
                                     for obj in &objs {
                                         crate::manifest::record_ready(pool, epoch, obj)
                                             .await
@@ -180,7 +182,9 @@ pub async fn run_decode_loop(
                                     );
                                 }
                                 Message::StreamAbort { top_xid, sub_xid } => {
-                                    demux.on_stream_abort(*top_xid, *sub_xid, sink).await?;
+                                    // sub == top → whole-txn drop; sub != top → exclude the rolled-back
+                                    // savepoint's rows (proto §9b) while the top-level txn commits on.
+                                    demux.on_stream_abort(*top_xid, *sub_xid);
                                     checkpoint.set_open_txn_floor(demux.open_floor());
                                 }
                                 other => {

@@ -1,42 +1,87 @@
-//! Large-transaction streaming (§1.6). With `streaming='on'`, a transaction larger than
-//! `logical_decoding_work_mem` arrives **before its commit**, chopped into interleaved
-//! `Stream Start … Stream Stop` blocks that finish with `Stream Commit` or `Stream Abort`. This module
-//! makes the sink correct under that:
+//! Large-transaction streaming + sub-transaction exclusion (§1.6, proto §8/§9). With `streaming='on'`,
+//! a transaction larger than `logical_decoding_work_mem` arrives **before its commit**, chopped into
+//! interleaved `Stream Start … Stream Stop` blocks that finish with `Stream Commit` or `Stream Abort`.
+//! This module makes the sink correct under that:
 //!
 //! 1. **Demultiplex per top-level `xid`** — a [`StreamDemux`] of per-xid [`StreamedTxn`] buffers,
 //!    reassembling non-contiguous segments via the `Stream Start` first-segment flag.
-//! 2. **Stage speculatively** — an open txn's sub-batches are PUT to S3 (the PR 2.24 path) to bound
-//!    memory, **but with no manifest row**. *Freeing memory (the PUT) is NOT the same as advancing the
-//!    slot or making data visible (the `ready` manifest row).*
-//! 3. **Commit-gate visibility** — `on_stream_commit` promotes the speculative files to `ready`
-//!    (`lsn_end = commit_lsn`); nothing is visible before `Stream Commit`.
-//! 4. **Hold the slot** — [`StreamDemux::open_floor`] is the oldest open txn's begin LSN; the
+//! 2. **Commit-gate visibility** — a buffered txn's rows become a `ready` manifest file **only on
+//!    `Stream Commit`**; nothing is visible before it.
+//! 3. **Hold the slot** — [`StreamDemux::open_floor`] is the oldest open txn's begin LSN; the
 //!    checkpoint clamps `confirmed_flush_lsn` to it, so a crash always re-streams an incomplete txn.
-//! 5. **Discard aborts** — a whole-txn `Stream Abort {sub == top}` deletes the speculative S3 objects
-//!    and writes no `ready` row (a live walsender *does* stream rows for a txn that later aborts,
-//!    proto §9a — the abort frame is the only discard signal).
+//! 4. **Discard aborts** — a whole-txn `Stream Abort {sub == top}` drops the buffer entirely; a
+//!    **sub-transaction** abort `Stream Abort {sub != top}` (PR 2.31, the dangerous savepoint case,
+//!    proto §9b) drops **exactly** that sub-xid's rows while the top-level continues to commit.
 //!
-//! Rolled-back **subtransactions** (`Stream Abort {sub != top}`) are PR 2.31; the per-message *sub*-xid
-//! is preserved on each row here so 2.31 can exclude them.
+//! **top vs sub xid (proto §7).** `Stream Start` carries the **top-level** xid; every streamed change
+//! carries its **sub**-transaction xid (which equals the top for the main branch). The abort names the
+//! **sub**-xid — so each buffered row is tagged with its sub-xid and `survivors()` excludes exactly the
+//! aborted ones. Mixing them up silently keeps or drops the wrong rows: the *silent corruption* this
+//! module exists to prevent. A live walsender **does** stream a rolled-back savepoint's rows before the
+//! abort is known (unlike the SQL decoding functions), so the `Stream Abort` frame is the only signal.
+//!
+//! **Memory (PR 2.31 state).** Rows are buffered **in memory** until `Stream Commit` so an aborted
+//! sub-xid's rows can be excluded before anything is written. The `max_inflight_bytes`-triggered
+//! proactive spill — which must spill *per sub-xid* so an aborted sub-xid's already-spilled file can be
+//! dropped without contaminating survivors — is **PR 2.32**.
 
 use crate::batch::{BatchTriggers, Clock, TableBatcher};
 use crate::pgoutput::Message;
 use crate::relcache::RelationCache;
 use crate::sink::{ParquetSink, WrittenObject};
 use anyhow::Context;
-use common::{Kind, Lsn, Op, SinkMeta, UtcTimestamp};
+use common::{Kind, Lsn, Op, SinkMeta, TupleValue, UtcTimestamp};
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+/// One streamed change, tagged with **its** sub-transaction xid (proto §7).
+#[derive(Clone)]
+struct StreamedChange {
+    sub_xid: u32,
+    oid: u32,
+    op: Op,
+    values: Vec<TupleValue>,
+    lsn: Lsn,
+}
 
 /// Per top-level xid buffer for an in-progress streamed transaction.
 struct StreamedTxn {
     /// The floor `confirmed_flush` must not pass while this txn is open (its first-segment LSN).
     begin_lsn: Lsn,
-    /// Speculatively-staged S3 objects — no manifest row until `Stream Commit`.
-    staged: Vec<WrittenObject>,
-    /// Not-yet-spilled rows, per table oid.
-    batchers: HashMap<u32, TableBatcher>,
+    /// Buffered changes in commit order, each tagged with its sub-xid.
+    changes: Vec<StreamedChange>,
+    /// Sub-xids that rolled back (`Stream Abort {sub != top}`) — excluded from `survivors`.
+    aborted: HashSet<u32>,
+}
+
+impl StreamedTxn {
+    fn new(begin_lsn: Lsn) -> Self {
+        StreamedTxn {
+            begin_lsn,
+            changes: Vec::new(),
+            aborted: HashSet::new(),
+        }
+    }
+
+    /// Record a streamed change tagged with its sub-xid (may equal the top-level xid).
+    fn push_change(&mut self, change: StreamedChange) {
+        self.changes.push(change);
+    }
+
+    /// `Stream Abort {sub != top}`: mark this sub-xid's rows dead. The top-level txn continues toward
+    /// `Stream Commit`; the rows stay buffered but `survivors` skips them (freed at commit).
+    fn abort_subtxn(&mut self, sub_xid: u32) {
+        self.aborted.insert(sub_xid);
+    }
+
+    /// The rows to materialise on `Stream Commit`: every buffered change **except** those tagged with
+    /// an aborted sub-xid, in commit order.
+    fn survivors(&self) -> impl Iterator<Item = &StreamedChange> {
+        self.changes
+            .iter()
+            .filter(move |c| !self.aborted.contains(&c.sub_xid))
+    }
 }
 
 /// Demultiplexes interleaved streamed transactions and commit-gates their visibility. It is **DB-free**
@@ -75,11 +120,9 @@ impl StreamDemux {
     /// mark it the current block so subsequent changes route to it.
     pub fn on_stream_start(&mut self, top_xid: u32, _first_segment: bool, lsn: Lsn) {
         // `begin_lsn` is set on first sight and never moved (later segments keep the original floor).
-        self.open.entry(top_xid).or_insert_with(|| StreamedTxn {
-            begin_lsn: lsn,
-            staged: Vec::new(),
-            batchers: HashMap::new(),
-        });
+        self.open
+            .entry(top_xid)
+            .or_insert_with(|| StreamedTxn::new(lsn));
         self.current_top = Some(top_xid);
     }
 
@@ -89,14 +132,8 @@ impl StreamDemux {
     }
 
     /// A streamed `Insert`/`Update`/`Delete` inside the current block: buffer it against the current
-    /// top-level xid, speculatively PUT to S3 (no manifest) when a per-batch cap trips.
-    pub async fn on_change(
-        &mut self,
-        cache: &RelationCache,
-        msg: &Message,
-        sink: &ParquetSink,
-        lsn: Lsn,
-    ) -> anyhow::Result<()> {
+    /// top-level xid, tagged with the change's **sub**-xid. In-memory only (PR 2.31); no S3 write yet.
+    pub fn on_change(&mut self, msg: &Message, lsn: Lsn) -> anyhow::Result<()> {
         let top = self
             .current_top
             .context("streamed change arrived outside a Stream Start block")?;
@@ -105,44 +142,82 @@ impl StreamDemux {
                 relation_oid,
                 new,
                 xid,
-            } => (
-                *relation_oid,
-                Op::Insert,
-                new.as_slice(),
-                xid.unwrap_or(top),
-            ),
+            } => (*relation_oid, Op::Insert, new.clone(), xid.unwrap_or(top)),
             Message::Update {
                 relation_oid,
                 new,
                 xid,
                 ..
-            } => (
-                *relation_oid,
-                Op::Update,
-                new.as_slice(),
-                xid.unwrap_or(top),
-            ),
+            } => (*relation_oid, Op::Update, new.clone(), xid.unwrap_or(top)),
             Message::Delete {
                 relation_oid,
                 old,
                 xid,
                 ..
-            } => (
-                *relation_oid,
-                Op::Delete,
-                old.as_slice(),
-                xid.unwrap_or(top),
-            ),
+            } => (*relation_oid, Op::Delete, old.clone(), xid.unwrap_or(top)),
             _ => return Ok(()),
         };
-        let Some(cached) = cache.get(oid, self.schema_version) else {
-            tracing::warn!(
-                relation_oid = oid,
-                "streamed change for an un-cached relation; skipping"
+        let txn = self
+            .open
+            .get_mut(&top)
+            .context("no open buffer for the current stream block")?;
+        txn.push_change(StreamedChange {
+            sub_xid,
+            oid,
+            op,
+            values,
+            lsn,
+        });
+        Ok(())
+    }
+
+    /// `Stream Abort {top, sub}`. **sub == top** (whole-txn abort, PR 2.30): drop the buffer entirely —
+    /// no `ready` row is ever written. **sub != top** (rolled-back savepoint, PR 2.31): drop exactly
+    /// that sub-xid's rows; the top-level txn stays open and will still commit its survivors.
+    pub fn on_stream_abort(&mut self, top_xid: u32, sub_xid: u32) {
+        if top_xid == sub_xid {
+            if self.current_top == Some(top_xid) {
+                self.current_top = None;
+            }
+            if let Some(txn) = self.open.remove(&top_xid) {
+                tracing::info!(
+                    top_xid,
+                    rows = txn.changes.len(),
+                    "whole-txn abort: dropped buffer"
+                );
+            }
+            return;
+        }
+        if let Some(txn) = self.open.get_mut(&top_xid) {
+            txn.abort_subtxn(sub_xid);
+            tracing::info!(
+                top_xid,
+                sub_xid,
+                "sub-txn abort: rolled-back savepoint rows excluded"
             );
-            return Ok(());
+        }
+    }
+
+    /// `Stream Commit`: materialise the **survivors** (aborted sub-xids excluded) into `ready` files,
+    /// stamped with the real `commit_lsn`, and return them for the caller to `record_ready`. The output
+    /// is chunked by the per-batch caps. The buffer is dropped.
+    pub async fn on_stream_commit(
+        &mut self,
+        top_xid: u32,
+        commit_lsn: Lsn,
+        cache: &RelationCache,
+        sink: &ParquetSink,
+    ) -> anyhow::Result<Vec<WrittenObject>> {
+        if self.current_top == Some(top_xid) {
+            self.current_top = None;
+        }
+        let Some(txn) = self.open.remove(&top_xid) else {
+            tracing::warn!(
+                top_xid,
+                "Stream Commit for an unknown xid; nothing to materialise"
+            );
+            return Ok(Vec::new());
         };
-        // Copy field context out of `self` before borrowing `self.open` mutably (disjoint borrows).
         let (triggers, clock, epoch, schema_version, instance) = (
             self.triggers,
             self.clock.clone(),
@@ -150,110 +225,61 @@ impl StreamDemux {
             self.schema_version,
             self.sink_instance.clone(),
         );
-        let txn = self
-            .open
-            .get_mut(&top)
-            .context("no open buffer for the current stream block")?;
-        let meta = SinkMeta {
-            op,
-            lsn,
-            // The real commit LSN is unknown until Stream Commit; the manifest row (authoritative) gets
-            // it there. Per-row we stamp the txn's begin LSN as a lower-bound placeholder.
-            commit_lsn: txn.begin_lsn,
-            commit_ts: UtcTimestamp::now(),
-            xid: sub_xid, // the SUB-transaction xid — PR 2.31 needs it to exclude rolled-back subtxns
-            epoch,
-            batch_id: String::new(),
-            schema_version,
-            source_schema: cached.relation.schema.clone(),
-            source_table: cached.relation.name.clone(),
-            kind: Kind::Stream,
-            unchanged_toast: vec![],
-            sink_instance: instance,
-            sink_processed_at: UtcTimestamp::now(),
-        };
-        let batcher = match txn.batchers.entry(oid) {
-            Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(e) => e.insert(
-                TableBatcher::new(cached.clone(), triggers, clock)
-                    .context("open streamed batcher")?,
-            ),
-        };
-        batcher.push(meta, values);
-        // Promote at the begin LSN so the rows become sealable; a cap trip spills speculatively.
-        batcher
-            .on_commit(txn.begin_lsn)
-            .context("promote streamed rows")?;
-        if batcher.should_flush() {
-            let sealed = batcher.seal().context("seal speculative sub-batch")?;
-            let obj = sink.put(sealed).await.context("speculative PUT")?;
-            tracing::info!(top_xid = top, uri = %obj.s3_uri, "spilled speculative sub-batch (no manifest)");
-            txn.staged.push(obj);
+        let mut batchers: HashMap<u32, TableBatcher> = HashMap::new();
+        let mut out = Vec::new();
+        for c in txn.survivors() {
+            let Some(cached) = cache.get(c.oid, schema_version) else {
+                tracing::warn!(
+                    relation_oid = c.oid,
+                    "committed streamed change for an un-cached relation; skipping"
+                );
+                continue;
+            };
+            let meta = SinkMeta {
+                op: c.op,
+                lsn: c.lsn,
+                commit_lsn, // NOW known — the streamed rows carry the real commit LSN
+                commit_ts: UtcTimestamp::now(),
+                xid: c.sub_xid,
+                epoch,
+                batch_id: String::new(),
+                schema_version,
+                source_schema: cached.relation.schema.clone(),
+                source_table: cached.relation.name.clone(),
+                kind: Kind::Stream,
+                unchanged_toast: vec![],
+                sink_instance: instance.clone(),
+                sink_processed_at: UtcTimestamp::now(),
+            };
+            let batcher = match batchers.entry(c.oid) {
+                Entry::Occupied(e) => e.into_mut(),
+                Entry::Vacant(e) => e.insert(
+                    TableBatcher::new(cached.clone(), triggers, clock.clone())
+                        .context("open streamed materialise batcher")?,
+                ),
+            };
+            batcher.push(meta, &c.values);
+            batcher
+                .on_commit(commit_lsn)
+                .context("promote streamed survivors")?;
+            if batcher.should_flush() {
+                out.push(
+                    sink.put(batcher.seal()?)
+                        .await
+                        .context("materialise streamed sub-batch")?,
+                );
+            }
         }
-        Ok(())
-    }
-
-    /// `Stream Commit`: seal any remaining buffered rows, then return every staged object stamped with
-    /// the real `commit_lsn` so the caller writes the `ready` manifest rows. The buffer is dropped.
-    pub async fn on_stream_commit(
-        &mut self,
-        top_xid: u32,
-        commit_lsn: Lsn,
-        sink: &ParquetSink,
-    ) -> anyhow::Result<Vec<WrittenObject>> {
-        if self.current_top == Some(top_xid) {
-            self.current_top = None;
-        }
-        let Some(mut txn) = self.open.remove(&top_xid) else {
-            tracing::warn!(
-                top_xid,
-                "Stream Commit for an unknown xid; nothing to promote"
-            );
-            return Ok(Vec::new());
-        };
-        for batcher in txn.batchers.values_mut() {
+        for batcher in batchers.values_mut() {
             if batcher.committed_rows() > 0 {
-                let sealed = batcher.seal().context("seal final streamed sub-batch")?;
-                txn.staged
-                    .push(sink.put(sealed).await.context("final speculative PUT")?);
+                out.push(
+                    sink.put(batcher.seal()?)
+                        .await
+                        .context("materialise final streamed batch")?,
+                );
             }
         }
-        // Stamp the authoritative commit LSN — only NOW are these files visible.
-        for obj in &mut txn.staged {
-            obj.lsn_end = commit_lsn;
-        }
-        Ok(txn.staged)
-    }
-
-    /// `Stream Abort`: a **whole-txn** abort (`sub == top`) deletes the speculative S3 objects and drops
-    /// the buffer — no `ready` row is ever written. A sub-txn abort (`sub != top`) is PR 2.31.
-    pub async fn on_stream_abort(
-        &mut self,
-        top_xid: u32,
-        sub_xid: u32,
-        sink: &ParquetSink,
-    ) -> anyhow::Result<()> {
-        if top_xid != sub_xid {
-            return Ok(()); // rolled-back subtransaction inside a committing txn — PR 2.31
-        }
-        if self.current_top == Some(top_xid) {
-            self.current_top = None;
-        }
-        if let Some(txn) = self.open.remove(&top_xid) {
-            for obj in &txn.staged {
-                // Best-effort: the object has no manifest row, so a leaked file is harmless (GC'd
-                // later); what must never happen is a `ready` row pointing at a deleted object.
-                if let Err(e) = sink.delete(&obj.key).await {
-                    tracing::warn!(uri = %obj.s3_uri, error = %e, "abort: speculative delete failed");
-                }
-            }
-            tracing::info!(
-                top_xid,
-                staged = txn.staged.len(),
-                "whole-txn abort: discarded speculative files"
-            );
-        }
-        Ok(())
+        Ok(out)
     }
 
     /// The oldest open txn's begin LSN — `confirmed_flush` must never pass this (§1.6). `None` when no
@@ -263,10 +289,10 @@ impl StreamDemux {
     }
 
     #[cfg(test)]
-    fn buffered_rows(&self, top_xid: u32) -> u64 {
+    fn survivor_count(&self, top_xid: u32) -> usize {
         self.open
             .get(&top_xid)
-            .map(|t| t.batchers.values().map(TableBatcher::committed_rows).sum())
+            .map(|t| t.survivors().count())
             .unwrap_or(0)
     }
 }
@@ -285,8 +311,7 @@ pub fn is_streamed_change(msg: &Message) -> bool {
 mod tests {
     use super::*;
     use crate::batch::SystemClock;
-    use crate::sink::ParquetSink;
-    use common::{PgColumn, PgRelation, ReplicaIdentity, TupleValue};
+    use common::{PgColumn, PgRelation, ReplicaIdentity};
     use pg_to_arrow::oids;
     use std::time::Duration;
 
@@ -324,10 +349,10 @@ mod tests {
         }
     }
 
-    fn demux(max_rows: u64) -> StreamDemux {
+    fn demux() -> StreamDemux {
         StreamDemux::new(
             BatchTriggers {
-                max_rows,
+                max_rows: 100_000,
                 max_bytes: u64::MAX,
                 max_fill: Duration::from_secs(3600),
             },
@@ -338,46 +363,42 @@ mod tests {
         )
     }
 
-    fn mem_sink() -> (ParquetSink, Arc<dyn object_store::ObjectStore>) {
-        let store: Arc<dyn object_store::ObjectStore> =
-            Arc::new(object_store::memory::InMemory::new());
-        (ParquetSink::new(store.clone(), "walrus".into(), 1), store)
+    fn mem_sink() -> ParquetSink {
+        ParquetSink::new(
+            Arc::new(object_store::memory::InMemory::new()),
+            "walrus".into(),
+            1,
+        )
     }
 
-    #[tokio::test]
-    async fn demux_routes_interleaved_xids_to_their_buffers() {
-        let cache = cache();
-        let (sink, _store) = mem_sink();
-        let mut d = demux(u64::MAX); // never spills — rows stay buffered
-                                     // Interleave: open 100, one row; stop; open 200, two rows; stop; resume 100, one more row.
+    #[test]
+    fn demux_routes_interleaved_xids_to_their_buffers() {
+        let mut d = demux();
+        // Interleave: open 100 (one row); stop; open 200 (two rows); stop; resume 100 (one more).
         d.on_stream_start(100, true, "0/100".parse().unwrap());
-        d.on_change(&cache, &insert("1", 100), &sink, "0/101".parse().unwrap())
-            .await
+        d.on_change(&insert("1", 100), "0/101".parse().unwrap())
             .unwrap();
         d.on_stream_stop();
         d.on_stream_start(200, true, "0/200".parse().unwrap());
-        d.on_change(&cache, &insert("2", 200), &sink, "0/201".parse().unwrap())
-            .await
+        d.on_change(&insert("2", 200), "0/201".parse().unwrap())
             .unwrap();
-        d.on_change(&cache, &insert("3", 200), &sink, "0/202".parse().unwrap())
-            .await
+        d.on_change(&insert("3", 200), "0/202".parse().unwrap())
             .unwrap();
         d.on_stream_stop();
         d.on_stream_start(100, false, "0/300".parse().unwrap());
-        d.on_change(&cache, &insert("4", 100), &sink, "0/301".parse().unwrap())
-            .await
+        d.on_change(&insert("4", 100), "0/301".parse().unwrap())
             .unwrap();
         assert_eq!(
-            d.buffered_rows(100),
+            d.survivor_count(100),
             2,
             "xid 100 got its 2 interleaved rows"
         );
-        assert_eq!(d.buffered_rows(200), 2, "xid 200 got its 2 rows");
+        assert_eq!(d.survivor_count(200), 2, "xid 200 got its 2 rows");
     }
 
-    #[tokio::test]
-    async fn open_floor_is_oldest_open_txn_begin_lsn() {
-        let mut d = demux(u64::MAX);
+    #[test]
+    fn open_floor_is_oldest_open_txn_begin_lsn() {
+        let mut d = demux();
         assert_eq!(d.open_floor(), None, "no open txn → no floor");
         d.on_stream_start(100, true, "0/500".parse().unwrap());
         d.on_stream_start(200, true, "0/900".parse().unwrap());
@@ -389,23 +410,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_commit_stamps_commit_lsn_and_returns_files() {
+    async fn stream_commit_materialises_survivors_stamped_with_commit_lsn() {
         let cache = cache();
-        let (sink, _store) = mem_sink();
-        let mut d = demux(1); // spill every row → speculative files
+        let sink = mem_sink();
+        let mut d = demux();
         d.on_stream_start(100, true, "0/100".parse().unwrap());
-        d.on_change(&cache, &insert("1", 100), &sink, "0/101".parse().unwrap())
-            .await
+        d.on_change(&insert("1", 100), "0/101".parse().unwrap())
             .unwrap();
-        d.on_change(&cache, &insert("2", 100), &sink, "0/102".parse().unwrap())
-            .await
+        d.on_change(&insert("2", 100), "0/102".parse().unwrap())
             .unwrap();
         let commit: Lsn = "0/900".parse().unwrap();
-        let files = d.on_stream_commit(100, commit, &sink).await.unwrap();
-        assert!(
-            !files.is_empty(),
-            "commit returns the staged files to promote"
-        );
+        let files = d
+            .on_stream_commit(100, commit, &cache, &sink)
+            .await
+            .unwrap();
+        assert!(!files.is_empty(), "commit materialises the buffered rows");
+        assert_eq!(files.iter().map(|f| f.row_count).sum::<u64>(), 2);
         assert!(
             files.iter().all(|f| f.lsn_end == commit),
             "every file stamped with commit_lsn"
@@ -413,29 +433,109 @@ mod tests {
         assert_eq!(d.open_floor(), None, "the committed txn is no longer open");
     }
 
-    #[tokio::test]
-    async fn whole_txn_stream_abort_deletes_speculative_and_writes_no_ready() {
-        let cache = cache();
-        let (sink, store) = mem_sink();
-        let mut d = demux(1); // spill every row
+    #[test]
+    fn whole_txn_stream_abort_drops_the_buffer() {
+        let mut d = demux();
         d.on_stream_start(100, true, "0/100".parse().unwrap());
-        d.on_change(&cache, &insert("1", 100), &sink, "0/101".parse().unwrap())
-            .await
+        d.on_change(&insert("1", 100), "0/101".parse().unwrap())
             .unwrap();
-        d.on_change(&cache, &insert("2", 100), &sink, "0/102".parse().unwrap())
-            .await
-            .unwrap();
-        // Grab the staged keys before the abort, then assert they are gone after.
-        let keys: Vec<_> = d.open[&100].staged.iter().map(|o| o.key.clone()).collect();
-        assert!(!keys.is_empty(), "rows spilled speculatively");
-        d.on_stream_abort(100, 100, &sink).await.unwrap();
-        assert_eq!(d.open_floor(), None, "aborted txn dropped");
-        for k in keys {
-            use object_store::ObjectStore;
-            assert!(
-                store.head(&k).await.is_err(),
-                "speculative object deleted on whole-txn abort"
-            );
+        d.on_stream_abort(100, 100); // sub == top
+        assert_eq!(d.open_floor(), None, "whole-txn abort dropped the buffer");
+    }
+
+    // ---- PR 2.31: the flagship sub-transaction-exclusion assertions (proto §9b) ----
+
+    fn insert_id(id: i32, sub_xid: u32) -> Message {
+        Message::Insert {
+            xid: Some(sub_xid),
+            relation_oid: 42,
+            new: vec![
+                TupleValue::Text(id.to_string()),
+                TupleValue::Text("n".into()),
+            ],
         }
+    }
+
+    /// proto §9b: top=857 keeps 3000 (kept-A), savepoint=858 rolls back 2762, savepoint=859 keeps 3000
+    /// (kept-B). `Stream Abort {top=857, sub=858}` then `Stream Commit 857` → exactly 6000 survivors.
+    #[tokio::test]
+    async fn subtxn_abort_excludes_only_the_aborted_subxid() {
+        let cache = cache();
+        let sink = mem_sink();
+        let mut d = demux();
+        let begin: Lsn = "0/1000".parse().unwrap();
+        d.on_stream_start(857, true, begin);
+        for i in 0..3000 {
+            d.on_change(&insert_id(10_000 + i, 857), begin).unwrap(); // kept-A (top branch)
+        }
+        for i in 0..2762 {
+            d.on_change(&insert_id(20_000 + i, 858), begin).unwrap(); // rolled-back savepoint
+        }
+        d.on_stream_abort(857, 858); // sub != top → drop ONLY 858's rows; 857 stays open
+        for i in 0..3000 {
+            d.on_change(&insert_id(30_000 + i, 859), begin).unwrap(); // kept-B (new savepoint)
+        }
+        assert_eq!(
+            d.survivor_count(857),
+            6000,
+            "exactly 6000 survivors: 3000 kept-A + 3000 kept-B"
+        );
+
+        let commit: Lsn = "0/9000".parse().unwrap();
+        let files = d
+            .on_stream_commit(857, commit, &cache, &sink)
+            .await
+            .unwrap();
+        let rows: u64 = files.iter().map(|f| f.row_count).sum();
+        assert_eq!(
+            rows, 6000,
+            "the ready file has EXACTLY 6000 rows — never the 2762 rolled-back ones"
+        );
+    }
+
+    #[tokio::test]
+    async fn survivors_are_emitted_in_commit_order() {
+        // kept-A (id 1) buffered before the abort; kept-B (id 2) after — order preserved.
+        let mut d = demux();
+        let begin: Lsn = "0/1000".parse().unwrap();
+        d.on_stream_start(857, true, begin);
+        d.on_change(&insert_id(1, 857), begin).unwrap();
+        d.on_change(&insert_id(9, 858), begin).unwrap();
+        d.on_stream_abort(857, 858);
+        d.on_change(&insert_id(2, 859), begin).unwrap();
+        let ids: Vec<i32> = d.open[&857]
+            .survivors()
+            .map(|c| match &c.values[0] {
+                TupleValue::Text(s) => s.parse().unwrap(),
+                _ => -1,
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![1, 2],
+            "survivors keep commit order, aborted 9 excluded"
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_then_new_subxid_after_rollback_is_kept() {
+        let cache = cache();
+        let sink = mem_sink();
+        let mut d = demux();
+        let begin: Lsn = "0/1000".parse().unwrap();
+        d.on_stream_start(857, true, begin);
+        d.on_change(&insert_id(1, 858), begin).unwrap(); // to-be-aborted
+        d.on_stream_abort(857, 858);
+        d.on_change(&insert_id(2, 859), begin).unwrap(); // opened AFTER the rollback → kept
+        assert_eq!(d.survivor_count(857), 1);
+        let files = d
+            .on_stream_commit(857, "0/9000".parse().unwrap(), &cache, &sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            files.iter().map(|f| f.row_count).sum::<u64>(),
+            1,
+            "the post-rollback sub-xid is kept"
+        );
     }
 }
