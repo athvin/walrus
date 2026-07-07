@@ -1,5 +1,7 @@
 # PR 2.5 — `Update` and `Delete` (the `K`/`O` old image; NULL vs unchanged-TOAST)
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/25
+
 > **Phase:** 2 — walrus-pg-sink (2a: the hand-rolled decoder) · **Crates touched:** `pg-sink` ·
 > **Est. size:** M · **Depends on:** PR 2.4 · **Unlocks:** PR 2.6
 
@@ -144,19 +146,19 @@ fn null_and_unchanged_toast_are_distinct() {
 
 ## Definition of Done
 
-- [ ] All seven vectors above render to their exact golden lines.
-- [ ] `update_no_key_change` → `old_kind == None` **and** `old == None` (the byte after the OID was
+- [x] All seven vectors above render to their exact golden lines.
+- [x] `update_no_key_change` → `old_kind == None` **and** `old == None` (the byte after the OID was
       `'N'`, not `'K'`).
-- [ ] `update_pk_change` → `old_kind == Some(Key)`, first old column `Text("1")`, remaining old columns
+- [x] `update_pk_change` → `old_kind == Some(Key)`, first old column `Text("1")`, remaining old columns
       `Null` (DEFAULT ships key columns only).
-- [ ] `update_full_identity`/`delete_full_identity` → `old_kind == Full` with every column present.
-- [ ] `update_composite_pk_partial` → both key columns present in the old image even though only one key
+- [x] `update_full_identity`/`delete_full_identity` → `old_kind == Full` with every column present.
+- [x] `update_composite_pk_partial` → both key columns present in the old image even though only one key
       changed; the non-key column is `Null`.
-- [ ] `unchanged_toast_update` → a `Null` column and an `UnchangedToast` column that are **not equal**.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink` (workspace stays green)
+- [x] `unchanged_toast_update` → a `Null` column and an `UnchangedToast` column that are **not equal**.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink` (workspace stays green)
 
 ## Hints & gotchas
 
