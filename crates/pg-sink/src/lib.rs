@@ -11,6 +11,7 @@ pub mod bootstrap;
 pub mod config;
 pub mod consume;
 pub mod health;
+pub mod manifest;
 pub mod pgoutput;
 pub mod preflight;
 pub mod relcache;

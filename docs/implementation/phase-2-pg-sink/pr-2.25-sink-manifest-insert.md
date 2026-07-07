@@ -1,5 +1,7 @@
 # PR 2.25 — Manifest INSERT (`lsn_end` = commit LSN) — durability step (b)
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/45
+
 > **Phase:** 2 — walrus-pg-sink (2c — the sink binary) · **Crates touched:** `pg-sink` (bin+lib),
 > `control` · **Est. size:** S · **Depends on:** PR 2.24 · **Unlocks:** PR 2.26
 
@@ -112,19 +114,19 @@ pub async fn flush_batch(
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] After a durable PUT, exactly one `file_manifest` row is committed via `control` with
+- [x] After a durable PUT, exactly one `file_manifest` row is committed via `control` with
       `status='ready'`, `kind='stream'`, epoch + `schema_version` stamped.
-- [ ] `lsn_end` on the row equals the batch's **commit LSN** (proven against a batch whose commit LSN
+- [x] `lsn_end` on the row equals the batch's **commit LSN** (proven against a batch whose commit LSN
       differs from its max row LSN).
-- [ ] The manifest INSERT happens **strictly after** the PUT returns durable (ordering is enforced in
+- [x] The manifest INSERT happens **strictly after** the PUT returns durable (ordering is enforced in
       `flush_batch`, not incidental).
-- [ ] A crash *before* the manifest commit leaves no `ready` row → the batch re-streams (documented;
+- [x] A crash *before* the manifest commit leaves no `ready` row → the batch re-streams (documented;
       the loader's row-level `ON CONFLICT` covers a duplicate).
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` then `cargo test -p pg-sink --test manifest_insert`: object at key +
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` then `cargo test -p pg-sink --test manifest_insert`: object at key +
         `ready` manifest row both exist, and `lsn_end == commit LSN`.
 
 ## Hints & gotchas
