@@ -121,6 +121,11 @@ jobs:
       - name: Control integration tests (migrations schema/CHECK + file_manifest claim order)
         run: cargo test -p control --features integration
 
+      # The type-descriptor round-trip is #[ignore]-gated (it dev-deps pg-to-arrow); run it explicitly
+      # against the live control PG. Reuses the --features integration build from the step above.
+      - name: schema_registry TypeDescriptor round-trip (PR 2.17)
+        run: cargo test -p control --features integration -- --ignored schema_registry_roundtrips_a_type_descriptor
+
       - name: sqlx offline cache is up to date (cargo sqlx prepare --check)
         run: cargo sqlx prepare --check --workspace
 

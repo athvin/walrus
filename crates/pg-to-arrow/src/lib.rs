@@ -9,6 +9,7 @@
 //! (2.11), and the Tier-2/3 types (2.12+) follow.
 
 pub mod batch;
+pub mod descriptor;
 pub mod error;
 pub mod geometric;
 pub mod oids;

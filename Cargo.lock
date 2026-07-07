@@ -756,6 +756,7 @@ name = "control"
 version = "0.1.0"
 dependencies = [
  "common",
+ "pg-to-arrow",
  "serde_json",
  "sqlx",
  "thiserror",
