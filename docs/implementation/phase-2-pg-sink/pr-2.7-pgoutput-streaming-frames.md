@@ -1,5 +1,7 @@
 # PR 2.7 — v2 stream frames, the per-message xid, and sub-transaction abort (crown jewel)
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/27
+
 > **Phase:** 2 — walrus-pg-sink (2a: the hand-rolled decoder) · **Crates touched:** `pg-sink` ·
 > **Est. size:** M · **Depends on:** PR 2.6 · **Unlocks:** PR 2.8
 
@@ -139,20 +141,20 @@ fn parse_stream_preserves_streaming_context_across_messages() {
 
 ## Definition of Done
 
-- [ ] All six `stream_*` vectors render to their golden lines.
-- [ ] `stream_abort_subtransaction` → `top_xid=757, sub_xid=758, is_whole_txn_abort() == Some(false)`
+- [x] All six `stream_*` vectors render to their golden lines.
+- [x] `stream_abort_subtransaction` → `top_xid=757, sub_xid=758, is_whole_txn_abort() == Some(false)`
       (**the flagship**: a committing txn's rolled-back savepoint).
-- [ ] `stream_abort_whole_txn` → `top_xid == sub_xid == 866, is_whole_txn_abort() == Some(true)`.
-- [ ] `Stream Start` sets `ctx.in_stream`; the following `streamed_insert_carries_xid` decodes with
+- [x] `stream_abort_whole_txn` → `top_xid == sub_xid == 866, is_whole_txn_abort() == Some(true)`.
+- [x] `Stream Start` sets `ctx.in_stream`; the following `streamed_insert_carries_xid` decodes with
       `xid == Some(753)`; `Stream Stop` clears the context and a subsequent change has `xid == None`.
-- [ ] `parse_stream` threads the context across `0x0a` separators: `[StreamStart, Insert, StreamStop]`
+- [x] `parse_stream` threads the context across `0x0a` separators: `[StreamStart, Insert, StreamStop]`
       with the insert's `xid == Some(753)`.
-- [ ] `Stream Abort` reads exactly two `Int32`s (no trailing LSN/ts) — the remaining-bytes guard from 2.2
+- [x] `Stream Abort` reads exactly two `Int32`s (no trailing LSN/ts) — the remaining-bytes guard from 2.2
       confirms nothing is left over.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink` (workspace stays green)
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink` (workspace stays green)
 
 ## Hints & gotchas
 
