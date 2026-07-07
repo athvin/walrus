@@ -1,5 +1,7 @@
 # PR 2.32 — Enforce an aggregate `max_inflight_bytes` ceiling with spill + pause-poll
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/52
+
 > **Phase:** 2 — walrus-pg-sink · **Crates touched:** `pg-sink`, `common` · **Est. size:** M ·
 > **Depends on:** PR 2.31 · **Unlocks:** PR 2.33
 
@@ -121,23 +123,23 @@ async fn large_txn_low_ceiling_spills_and_stays_bounded() { todo!() }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] A large transaction under a deliberately **low** `max_inflight_bytes` increments the
+- [x] A large transaction under a deliberately **low** `max_inflight_bytes` increments the
       `spill_count` counter (speculative spill occurs), and aggregate in-flight bytes stay bounded.
-- [ ] The shed order is honoured: committed batches flush first; only open-txn buffers spill; pause-poll
+- [x] The shed order is honoured: committed batches flush first; only open-txn buffers spill; pause-poll
       is the last resort.
-- [ ] A speculative spill **frees memory but does not advance `confirmed_flush_lsn`** (still clamped at
+- [x] A speculative spill **frees memory but does not advance `confirmed_flush_lsn`** (still clamped at
       the open-txn floor from PR 2.30).
-- [ ] The pause-poll backstop pauses at the activate ratio and resumes only at the lower resume ratio
+- [x] The pause-poll backstop pauses at the activate ratio and resumes only at the lower resume ratio
       (no flapping) — unit-tested.
-- [ ] Config is bounds-validated: `max_inflight_bytes > 0`, `resume_ratio < activate_ratio < 1.0`;
+- [x] Config is bounds-validated: `max_inflight_bytes > 0`, `resume_ratio < activate_ratio < 1.0`;
       invalid → terminal.
-- [ ] Docs/comments state `logical_decoding_work_mem` does **not** bound *our* memory and the ceiling
+- [x] Docs/comments state `logical_decoding_work_mem` does **not** bound *our* memory and the ceiling
       must sit below the pod limit.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` then `cargo test -p pg-sink --test max_inflight_bytes -- --ignored`
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` then `cargo test -p pg-sink --test max_inflight_bytes -- --ignored`
         asserting **`large_txn_low_ceiling_spills_and_stays_bounded`**.
 
 ## Hints & gotchas
