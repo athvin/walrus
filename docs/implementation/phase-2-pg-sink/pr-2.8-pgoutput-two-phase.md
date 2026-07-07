@@ -1,5 +1,7 @@
 # PR 2.8 — Two-phase (v3) messages: parse without misalignment, and disambiguate `'K'`
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/28
+
 > **Phase:** 2 — walrus-pg-sink (2a: the hand-rolled decoder) · **Crates touched:** `pg-sink` ·
 > **Est. size:** S · **Depends on:** PR 2.7 · **Unlocks:** PR 2.9
 
@@ -118,20 +120,20 @@ fn all_vectors_render_to_golden() {
 
 ## Definition of Done
 
-- [ ] `begin_prepare`, `prepare`, `commit_prepared`, `rollback_prepared` all render to their golden lines.
-- [ ] Each two-phase vector decodes `xid == 100` and `gid == "gtx"` (proves the field order, esp.
+- [x] `begin_prepare`, `prepare`, `commit_prepared`, `rollback_prepared` all render to their golden lines.
+- [x] Each two-phase vector decodes `xid == 100` and `gid == "gtx"` (proves the field order, esp.
       `rollback_prepared`'s two-ts / two-end-LSN layout, is exact — no misalignment).
-- [ ] `'K'` disambiguation: `commit_prepared` → `Message::CommitPrepared`; the `'K'` in `update_pk_change`
+- [x] `'K'` disambiguation: `commit_prepared` → `Message::CommitPrepared`; the `'K'` in `update_pk_change`
       → `old_kind == Some(Key)` (both decode correctly, same byte, different position).
-- [ ] The previously-`#[ignore]`d enumerating test from PR 2.1 is **removed/replaced** by
+- [x] The previously-`#[ignore]`d enumerating test from PR 2.1 is **removed/replaced** by
       `all_vectors_render_to_golden`, which passes for **every** vector — the decoder now covers the full
       catalog (v1 + v2 streaming + v3 two-phase).
-- [ ] A truly unknown top-level byte still yields `DecodeError::UnknownMessage` (regression check that
+- [x] A truly unknown top-level byte still yields `DecodeError::UnknownMessage` (regression check that
       adding these arms didn't turn a stray byte into a silent success).
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink` (workspace stays green)
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink` (workspace stays green)
 
 ## Hints & gotchas
 
