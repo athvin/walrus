@@ -1,5 +1,7 @@
 # PR 0.1 — Scaffold the Cargo workspace and the first CI gate
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/9
+
 > **Phase:** 0 — Foundations & CI · **Crates touched:** `common` (new), workspace root ·
 > **Est. size:** M · **Depends on:** — (first PR) · **Unlocks:** PR 0.2
 
@@ -115,16 +117,16 @@ components = ["rustfmt", "clippy"]
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `cargo build --workspace` compiles the empty `common` crate.
-- [ ] `.gitignore` untracks `/target`, `.env`, and the committed
+- [x] `cargo build --workspace` compiles the empty `common` crate.
+- [x] `.gitignore` untracks `/target`, `.env`, and the committed
       `docs/examples/proto-version/__pycache__/` (run `git rm -r --cached` on the latter).
-- [ ] `LICENSE` exists (MIT) so the repo-root README's link resolves.
-- [ ] `rust-toolchain.toml` pins one explicit stable channel; local + CI report the same `rustc -V`.
-- [ ] CI runs on push/PR and is **red if any gate fails**.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test --workspace` (passes with zero tests)
+- [x] `LICENSE` exists (MIT) so the repo-root README's link resolves.
+- [x] `rust-toolchain.toml` pins one explicit stable channel; local + CI report the same `rustc -V`.
+- [x] CI runs on push/PR and is **red if any gate fails**.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test --workspace` (passes with zero tests)
 
 ## Hints & gotchas
 

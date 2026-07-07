@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/common"] # grows one crate at a time, following the DAG in docs/implementation/README.md
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+rust-version = "1.95" # keep in sync with rust-toolchain.toml; MSRV formalised in PR 4.7
+
+# Lint-as-policy, centralised so no member crate can silently opt out of `deny(warnings)`.
+# NOTE: these only take effect in a member once it declares `[lints] workspace = true`.
+[workspace.lints.rust]
+warnings = "deny"
+
+[workspace.lints.clippy]
+all = "deny"
+
+[workspace.dependencies]
+# Shared version pins land here as later PRs add deps (thiserror, serde, tracing, sqlx, arrow, …).
