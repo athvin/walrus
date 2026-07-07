@@ -8,7 +8,8 @@
 
 use anyhow::Context;
 use pg_sink::config::SinkConfig;
-use pg_sink::{bootstrap, health, shutdown};
+use pg_sink::replication::ReplicationStream;
+use pg_sink::{bootstrap, consume, health, shutdown, slot};
 use std::process::ExitCode;
 use tokio::time::Instant;
 
@@ -69,22 +70,46 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
     // Shared bootstrap steps 2–4. On failure, tear the health server down before propagating the
     // classified error (whose exit code `main` surfaces).
     let deadline = Instant::now() + cfg.startup_deadline;
-    if let Err(e) = bootstrap::run_shared(&cfg, deadline).await {
-        token.cancel();
-        let _ = server.await;
-        return Err(e.into());
-    }
+    let ctx = match bootstrap::run_shared(&cfg, deadline).await {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            token.cancel();
+            let _ = server.await;
+            return Err(e.into());
+        }
+    };
 
     state.mark_ready();
-    tracing::info!("bootstrap complete; ready — awaiting shutdown signal");
+    tracing::info!("bootstrap complete; ready");
 
-    // The replication loop will run here (PR 2.20+). For now, hold the pod open until SIGTERM.
-    token.cancelled().await;
+    // Establish the replication stream and run the decode loop until SIGTERM (PR 2.21). Slot
+    // management is over the preflight connection; the streaming is the hand-rolled connection.
+    let resume = slot::verify_or_create_slot(&ctx.source_client, &cfg.slot_name)
+        .await
+        .context("verify/create replication slot")?;
+    let mut stream = ReplicationStream::start(
+        &cfg.source_db_url,
+        &cfg.slot_name,
+        resume.start_lsn(),
+        &cfg.publication_name,
+    )
+    .await
+    .context("START_REPLICATION")?;
+    tracing::info!(
+        slot = %cfg.slot_name,
+        start_lsn = %resume.start_lsn(),
+        "streaming logical replication"
+    );
+
+    let result = consume::run_decode_loop(&mut stream, token.clone()).await;
+
+    // Whatever ended the loop (SIGTERM, stream end, or a decode error), drain the health server.
     state.mark_terminating();
-    tracing::info!("shutdown signal received; draining health server");
+    token.cancel();
+    tracing::info!("draining health server");
     server
         .await
         .context("health server task join")?
         .context("health server")?;
-    Ok(())
+    result
 }

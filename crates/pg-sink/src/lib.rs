@@ -8,6 +8,7 @@
 
 pub mod bootstrap;
 pub mod config;
+pub mod consume;
 pub mod health;
 pub mod pgoutput;
 pub mod preflight;
