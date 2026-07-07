@@ -1,5 +1,7 @@
 # PR 2.1 — Scaffold `pg-sink` (lib + bin) and port the golden-vector fixtures
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/21
+
 > **Phase:** 2 — walrus-pg-sink (2a: the hand-rolled decoder) · **Crates touched:** `pg-sink` (new) ·
 > **Est. size:** M · **Depends on:** PR 1.6 (phase-1 boundary; also needs `common` from PRs 0.2/0.3/1.2) ·
 > **Unlocks:** PR 2.2
@@ -182,18 +184,18 @@ fn all_vectors_present_and_hex_decodable() {
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `crates/pg-sink` is a workspace member building a `pg_sink` lib **and** a `walrus-pg-sink` bin.
-- [ ] `pg-sink/tests/pgoutput_vectors.rs` compiles and holds **every** entry of
+- [x] `crates/pg-sink` is a workspace member building a `pg_sink` lib **and** a `walrus-pg-sink` bin.
+- [x] `pg-sink/tests/pgoutput_vectors.rs` compiles and holds **every** entry of
       `test_decode_pgoutput.py::VECTORS` (same names, hex, streaming flag, expected line) — the
       enumerating test asserts the exact count.
-- [ ] `#[ignore]`d enumerating test passes when run explicitly
+- [x] `#[ignore]`d enumerating test passes when run explicitly
       (`cargo test -p pg-sink -- --ignored all_vectors_present_and_hex_decodable`): all hex decodes.
-- [ ] `parse_message`/`render` are compilable shapes (`unimplemented!()`/`todo!()`), never invoked by a
+- [x] `parse_message`/`render` are compilable shapes (`unimplemented!()`/`todo!()`), never invoked by a
       non-ignored test yet.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink` (and `cargo test --workspace` stays green)
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink` (and `cargo test --workspace` stays green)
 
 ## Hints & gotchas
 
