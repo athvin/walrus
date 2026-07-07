@@ -175,7 +175,7 @@ async fn large_txn_single_ready_file_only_after_stream_commit() {
                 m @ (Message::Insert { xid: Some(_), .. }
                 | Message::Update { xid: Some(_), .. }
                 | Message::Delete { xid: Some(_), .. }) => {
-                    demux.on_change(&cache, m, &sink, frame_lsn).await.unwrap();
+                    demux.on_change(m, frame_lsn).unwrap();
                     streamed_changes += 1;
                     // Mid-open-window: NOT committed yet — no ready rows, slot NOT advanced.
                     if !mid_checked && streamed_changes >= 1000 {
@@ -201,7 +201,10 @@ async fn large_txn_single_ready_file_only_after_stream_commit() {
                     commit_lsn: clsn,
                     ..
                 } => {
-                    let objs = demux.on_stream_commit(*xid, *clsn, &sink).await.unwrap();
+                    let objs = demux
+                        .on_stream_commit(*xid, *clsn, &cache, &sink)
+                        .await
+                        .unwrap();
                     for obj in &objs {
                         pg_sink::manifest::record_ready(&pool, epoch, obj)
                             .await
@@ -273,7 +276,7 @@ async fn whole_txn_abort_writes_no_ready_row() {
         ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
             .await
             .unwrap();
-    let sink = ParquetSink::new(minio(), "walrus".to_string(), epoch);
+    let _sink = ParquetSink::new(minio(), "walrus".to_string(), epoch);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     let mut demux = StreamDemux::new(
@@ -332,13 +335,10 @@ async fn whole_txn_abort_writes_no_ready_row() {
                 m @ (Message::Insert { xid: Some(_), .. }
                 | Message::Update { xid: Some(_), .. }
                 | Message::Delete { xid: Some(_), .. }) => {
-                    demux.on_change(&cache, m, &sink, frame_lsn).await.unwrap();
+                    demux.on_change(m, frame_lsn).unwrap();
                 }
                 Message::StreamAbort { top_xid, sub_xid } => {
-                    demux
-                        .on_stream_abort(*top_xid, *sub_xid, &sink)
-                        .await
-                        .unwrap();
+                    demux.on_stream_abort(*top_xid, *sub_xid);
                     saw_abort = true;
                 }
                 // The trailing small (non-streamed) commit ends the loop.
