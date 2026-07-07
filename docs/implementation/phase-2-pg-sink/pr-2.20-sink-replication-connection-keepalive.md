@@ -1,5 +1,7 @@
 # PR 2.20 — `START_REPLICATION` + standby keepalive feedback (the de-risking spike)
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/40
+
 > **Phase:** 2 — walrus-pg-sink (2c — the sink binary) · **Crates touched:** `pg-sink` (bin+lib), `common` ·
 > **Est. size:** L · **Depends on:** PR 2.19 · **Unlocks:** PR 2.21
 
@@ -132,19 +134,19 @@ pub struct StandbyStatus { pub write: Lsn, pub flush: Lsn, pub apply: Lsn, pub r
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] Slot presence is verified and `restart_lsn` / `confirmed_flush_lsn` are read (or the slot is
+- [x] Slot presence is verified and `restart_lsn` / `confirmed_flush_lsn` are read (or the slot is
       created capturing `consistent_point` + `snapshot_name`), establishing the `START_REPLICATION` LSN.
-- [ ] `START_REPLICATION` is issued with **`proto_version '2'`, `streaming 'on'`, `publication_names`**.
-- [ ] `'w'` and `'k'` frame headers parse correctly (LSNs are `common::Lsn`, big-endian).
-- [ ] Standby status updates go out on a sub-`wal_sender_timeout` interval **and** immediately on
+- [x] `START_REPLICATION` is issued with **`proto_version '2'`, `streaming 'on'`, `publication_names`**.
+- [x] `'w'` and `'k'` frame headers parse correctly (LSNs are `common::Lsn`, big-endian).
+- [x] Standby status updates go out on a sub-`wal_sender_timeout` interval **and** immediately on
       `reply_requested`, advancing only the **received/keepalive** LSN.
-- [ ] The spike outcome is recorded: `tokio-postgres` is sufficient, **or** the file notes the pivot to
+- [x] The spike outcome is recorded: `tokio-postgres` is sufficient, **or** the file notes the pivot to
       `pgwire-replication` and the seam (`ReplicationStream`) is unchanged for callers.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` then `cargo test -p pg-sink --test replication_spike`: a source
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` then `cargo test -p pg-sink --test replication_spike`: a source
         `INSERT` produces ≥ 1 `XLogData`, and the connection is still alive **after** `wal_sender_timeout`.
 
 ## Hints & gotchas
