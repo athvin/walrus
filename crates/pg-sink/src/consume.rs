@@ -31,6 +31,7 @@ pub async fn run_decode_loop(
     cache: &mut RelationCache,
     router: &mut BatchRouter,
     sink: &crate::sink::ParquetSink,
+    checkpoint: &mut crate::checkpoint::DurabilityCheckpoint,
     pool: &sqlx::PgPool,
     epoch: i64,
     schema_version: i64,
@@ -66,12 +67,17 @@ pub async fn run_decode_loop(
                                     for sealed in router.route(cache, other, frame_lsn, schema_version)? {
                                         // Durability steps (a) PUT then (b) commit the manifest row.
                                         let written = flush_batch(sink, pool, epoch, sealed).await?;
-                                        // TODO(PR 2.26): advance confirmed_flush_lsn to written.lsn_end.
+                                        // Step (c): ONLY now advance confirmed_flush and tell the server.
+                                        checkpoint.on_batch_durable(written.lsn_end);
+                                        checkpoint
+                                            .send(stream, false)
+                                            .await
+                                            .context("send durability standby status")?;
                                         tracing::info!(
                                             uri = %written.s3_uri,
-                                            rows = written.row_count,
                                             lsn_end = %written.lsn_end,
-                                            "durable: object + manifest ready row"
+                                            confirmed_flush = %checkpoint.confirmed_flush(),
+                                            "durable: object + manifest + slot advanced"
                                         );
                                     }
                                 }

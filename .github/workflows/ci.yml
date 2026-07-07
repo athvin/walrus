@@ -159,6 +159,11 @@ jobs:
       - name: Manifest insert (compose)
         run: cargo test -p pg-sink --test manifest_insert -- --ignored
 
+      # PR 2.26: durability checkpoint — confirmed_flush_lsn advances to a batch's lsn_end only after
+      # the S3 PUT + manifest commit; a crash before the standby update re-streams (at-least-once).
+      - name: Durability checkpoint (compose)
+        run: cargo test -p pg-sink --test durability -- --ignored --test-threads=1
+
       # PR 2.18/2.19: the sink pod-lifecycle shell against the live stack — full bootstrap (control +
       # S3 + source preflight) → /startup→/ready flip, SIGTERM exit 0, missing control DB → exit 11.
       - name: Sink pod-lifecycle smoke (health · SIGTERM · fail-fast exit code)
