@@ -4,6 +4,8 @@
 
 # PR 1.3 — Control-plane migrations + `sqlx::migrate!` runner
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/17
+
 > **Phase:** 1 — Shared core · **Crates touched:** `control`, `migrations/control` · **Est. size:** M ·
 > **Depends on:** PR 1.2, PR 0.6 · **Unlocks:** PR 1.4, PR 1.5, PR 1.6
 
@@ -149,16 +151,16 @@ async fn checkpoint_check_rejects_transformed_ahead_of_raw() { todo!() /* INSERT
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `0001_control_schema.sql` creates all five contract tables with the exact column names/types.
-- [ ] `file_manifest` has the **partial** claim index keyed `(epoch, source_schema, source_table, lsn_end, id) WHERE status='ready'`.
-- [ ] `loader_checkpoint` has the composite PK and the `CHECK (transformed_lsn <= raw_appended_lsn)`.
-- [ ] `run_migrations()` is idempotent (re-running is a no-op) and errors are terminal/transient-classified.
-- [ ] Comments note the watermarks are **commit-LSN valued** and the manifest is a **queue** (rows deleted).
-- [ ] `cargo sqlx prepare --check` passes; `.sqlx/` is committed and CI runs the offline check.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p control` (unit) and — with services — `docker compose up --wait` then
+- [x] `0001_control_schema.sql` creates all five contract tables with the exact column names/types.
+- [x] `file_manifest` has the **partial** claim index keyed `(epoch, source_schema, source_table, lsn_end, id) WHERE status='ready'`.
+- [x] `loader_checkpoint` has the composite PK and the `CHECK (transformed_lsn <= raw_appended_lsn)`.
+- [x] `run_migrations()` is idempotent (re-running is a no-op) and errors are terminal/transient-classified.
+- [x] Comments note the watermarks are **commit-LSN valued** and the manifest is a **queue** (rows deleted).
+- [x] `cargo sqlx prepare --check` passes; `.sqlx/` is committed and CI runs the offline check.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p control` (unit) and — with services — `docker compose up --wait` then
         `cargo test -p control --test migrations` proves the schema + the CHECK rejection.
 
 ## Hints & gotchas
