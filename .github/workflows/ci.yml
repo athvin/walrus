@@ -127,3 +127,21 @@ jobs:
       - name: Tear down (remove volumes)
         if: always()
         run: docker compose -f deploy/docker/docker-compose.yml down -v
+
+  conformance:
+    name: conformance (DuckDB read-back)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain (from rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustc --version
+
+      # Caches the bundled-DuckDB compile (a minutes-long C++ build) so only the first run pays it.
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Conformance tests (write Parquet -> DuckDB read_parquet -> assert typeof + value)
+        run: cargo test -p pg-to-arrow --features conformance
