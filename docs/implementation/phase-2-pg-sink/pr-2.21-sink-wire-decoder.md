@@ -1,5 +1,7 @@
 # PR 2.21 — Wire the pgoutput decoder to the live stream
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/41
+
 > **Phase:** 2 — walrus-pg-sink (2c — the sink binary) · **Crates touched:** `pg-sink` (bin+lib) ·
 > **Est. size:** M · **Depends on:** PR 2.20 · **Unlocks:** PR 2.22
 
@@ -95,18 +97,18 @@ async fn per_message_xid_present_only_within_stream() { todo!() }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] Live `XLogData` payloads are decoded by the **existing** `pgoutput::parse_message` (no forked
+- [x] Live `XLogData` payloads are decoded by the **existing** `pgoutput::parse_message` (no forked
       copy of the decoder).
-- [ ] `StreamingCtx` is updated on `Stream Start`/`Stop` so v2 framing decodes without misalignment.
-- [ ] Each decoded message logs via `tracing` with **structured fields** (`op`, `source_table`,
+- [x] `StreamingCtx` is updated on `Stream Start`/`Stop` so v2 framing decodes without misalignment.
+- [x] Each decoded message logs via `tracing` with **structured fields** (`op`, `source_table`,
       `commit_lsn`, `lsn`, `xid`) — no `println!`, no interpolation.
-- [ ] Keepalive replies still go out while the loop decodes (no regression from PR 2.20).
-- [ ] The loop exits cleanly on the `CancellationToken`.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` then `cargo test -p pg-sink --test live_decode`: an `INSERT INTO
+- [x] Keepalive replies still go out while the loop decodes (no regression from PR 2.20).
+- [x] The loop exits cleanly on the `CancellationToken`.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` then `cargo test -p pg-sink --test live_decode`: an `INSERT INTO
         orders` decodes to `Begin, Relation, Insert, Commit` in order.
 
 ## Hints & gotchas
