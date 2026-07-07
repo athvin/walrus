@@ -1,5 +1,7 @@
 # PR 2.22 — Relation cache + Arrow schema per `schema_version`
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/42
+
 > **Phase:** 2 — walrus-pg-sink (2c — the sink binary) · **Crates touched:** `pg-sink` (bin+lib),
 > `pg-to-arrow`, `control` · **Est. size:** M · **Depends on:** PR 2.21 · **Unlocks:** PR 2.23
 
@@ -125,20 +127,20 @@ pub async fn on_relation(
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] A `Relation` message builds a Tier-1 Arrow schema (incl. the `walrus_pg_sink_meta` `Utf8` column)
+- [x] A `Relation` message builds a Tier-1 Arrow schema (incl. the `walrus_pg_sink_meta` `Utf8` column)
       via `pg-to-arrow` and caches it under `(relation_oid, schema_version)`.
-- [ ] The first sighting of a relation **upserts** a `schema_registry` row (via `control`); a repeat at
+- [x] The first sighting of a relation **upserts** a `schema_registry` row (via `control`); a repeat at
       the same `schema_version` is idempotent (no duplicate/no error).
-- [ ] Bootstrap **hydrates** the cache from `schema_registry`, so a restart doesn't need a fresh
+- [x] Bootstrap **hydrates** the cache from `schema_registry`, so a restart doesn't need a fresh
       `Relation` to convert the first tuple.
-- [ ] `walrus.ddl_audit` and `walrus.heartbeat` are recognised as internal and **never** registered or
+- [x] `walrus.ddl_audit` and `walrus.heartbeat` are recognised as internal and **never** registered or
       schematised.
-- [ ] The cached `SchemaRef` for `orders` exactly matches the schema asserted in PR 2.9's unit test.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` then `cargo test -p pg-sink --test relation_cache`: first `Relation`
+- [x] The cached `SchemaRef` for `orders` exactly matches the schema asserted in PR 2.9's unit test.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` then `cargo test -p pg-sink --test relation_cache`: first `Relation`
         writes a registry row whose schema matches.
 
 ## Hints & gotchas
