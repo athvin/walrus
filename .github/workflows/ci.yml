@@ -169,6 +169,11 @@ jobs:
       - name: Heartbeat liveness (compose)
         run: cargo test -p pg-sink --test heartbeat_liveness -- --ignored --test-threads=1
 
+      # PR 2.28: graceful drain — SIGTERM flushes the in-flight committed batch + manifest, advances
+      # confirmed_flush via a final standby update, sends CopyDone, never drops the slot, and resumes.
+      - name: Graceful shutdown drain (compose)
+        run: cargo test -p pg-sink --test graceful_shutdown -- --ignored --test-threads=1
+
       # PR 2.18/2.19: the sink pod-lifecycle shell against the live stack — full bootstrap (control +
       # S3 + source preflight) → /startup→/ready flip, SIGTERM exit 0, missing control DB → exit 11.
       - name: Sink pod-lifecycle smoke (health · SIGTERM · fail-fast exit code)

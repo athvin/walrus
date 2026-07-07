@@ -1,5 +1,7 @@
 # PR 2.28 — Drain cleanly on SIGTERM and never drop the slot
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/48
+
 > **Phase:** 2 — walrus-pg-sink · **Crates touched:** `pg-sink` · **Est. size:** M ·
 > **Depends on:** PR 2.27 · **Unlocks:** PR 2.29
 
@@ -112,21 +114,21 @@ async fn sigterm_mid_stream_drains_commits_and_resumes() { todo!() }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] On `SIGTERM` the loop stops consuming, the in-flight **committed** batch is flushed to S3 and its
+- [x] On `SIGTERM` the loop stops consuming, the in-flight **committed** batch is flushed to S3 and its
       manifest row committed, a **final** standby update advances `confirmed_flush_lsn`, `CopyDone` is
       sent, and the process exits `0` — all within the grace window.
-- [ ] Open, uncommitted streamed-txn buffers are **dropped, not forced out** (no orphan speculative S3
+- [x] Open, uncommitted streamed-txn buffers are **dropped, not forced out** (no orphan speculative S3
       objects), and the final `confirmed_flush_lsn` is **never** past the open-txn floor.
-- [ ] `DROP_REPLICATION_SLOT` is **never** issued on a normal shutdown (grep-assert in the test).
-- [ ] A restarted sink **resumes** from `confirmed_flush_lsn`; any re-streamed changes are de-duplicated
+- [x] `DROP_REPLICATION_SLOT` is **never** issued on a normal shutdown (grep-assert in the test).
+- [x] A restarted sink **resumes** from `confirmed_flush_lsn`; any re-streamed changes are de-duplicated
       downstream (documented as at-least-once → effectively-once).
-- [ ] Docs/comments explain the preStop-then-SIGTERM sequence and the PID-1/exec-form requirement
+- [x] Docs/comments explain the preStop-then-SIGTERM sequence and the PID-1/exec-form requirement
       (implementation of the Dockerfile deferred to PR 4.8).
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` then `cargo test -p pg-sink --test graceful_shutdown -- --ignored`
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` then `cargo test -p pg-sink --test graceful_shutdown -- --ignored`
         asserting **`sigterm_mid_stream_drains_commits_and_resumes`**.
 
 ## Hints & gotchas
