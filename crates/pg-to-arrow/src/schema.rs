@@ -63,6 +63,10 @@ pub fn emit_fields(col: &PgColumn) -> Result<Vec<Field>, Error> {
             col.type_modifier,
         )]);
     }
+    // Geometric → one nested STRUCT/LIST-of-doubles field (§2.4, PR 2.14).
+    if let Some(field) = crate::geometric::geometric_field(&col.name, col.type_oid) {
+        return Ok(vec![field]);
+    }
     Err(Error::NotTier1 {
         oid: col.type_oid,
         typmod: col.type_modifier,
@@ -280,9 +284,23 @@ mod tests {
 
     #[test]
     fn still_unhandled_oid_errors() {
-        // point (600) is a geometric type, deferred to PR 2.14 — still NotTier1 here.
-        let err = emit_fields(&col("p", 600, -1)).unwrap_err();
-        assert!(matches!(err, Error::NotTier1 { oid: 600, .. }));
+        // uuid (2950) is a Tier-3 VARCHAR carrier, deferred to PR 2.15 — still NotTier1 here.
+        let err = emit_fields(&col("u", 2950, -1)).unwrap_err();
+        assert!(matches!(err, Error::NotTier1 { oid: 2950, .. }));
+    }
+
+    #[test]
+    fn geometric_point_emits_one_struct_field() {
+        let fields = emit_fields(&col("loc", oids::POINT, -1)).unwrap();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name(), "loc");
+        match fields[0].data_type() {
+            DataType::Struct(sf) => {
+                let names: Vec<&str> = sf.iter().map(|f| f.name().as_str()).collect();
+                assert_eq!(names, vec!["x", "y"]);
+            }
+            other => panic!("expected STRUCT(x,y), got {other:?}"),
+        }
     }
 
     #[test]

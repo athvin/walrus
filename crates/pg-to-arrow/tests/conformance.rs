@@ -359,3 +359,83 @@ fn multirange_empty_list_is_distinct_from_null() {
     let n = read_parquet_rows(&null, "SELECT (c IS NULL)::VARCHAR, 'x' FROM {p}");
     assert_eq!(n[0].0, "true", "NULL column = NULL list");
 }
+
+// ---- Tier-2 geometric (PR 2.14) -----------------------------------------------------------------
+// Every native geometric type → a nested STRUCT / LIST<STRUCT> of doubles. We read the nested fields
+// back through DuckDB (`c.x`, `c.p1.x`, `c.points`, `unnest(c)`) and compare numerically (avoiding
+// DOUBLE text formatting). `path.is_closed` is proven to distinguish an open from a closed path.
+
+#[test]
+fn geometric_point_reads_back_as_struct() {
+    let bytes = write_parquet_bytes(&one_col_batch(oids::POINT, -1, "(1,2)")).unwrap();
+    let rows = read_parquet_rows(
+        &bytes,
+        "SELECT (c.x = 1.0)::VARCHAR, (c.y = 2.0)::VARCHAR FROM {p}",
+    );
+    assert_eq!(rows[0], ("true".to_string(), "true".to_string()));
+}
+
+#[test]
+fn geometric_box_and_lseg_nest_two_points() {
+    let bx = write_parquet_bytes(&one_col_batch(oids::BOX, -1, "(2,3),(0,1)")).unwrap();
+    let b = read_parquet_rows(
+        &bx,
+        "SELECT (c.p1.x = 2.0)::VARCHAR, (c.p2.y = 1.0)::VARCHAR FROM {p}",
+    );
+    assert_eq!(b[0], ("true".to_string(), "true".to_string()));
+    let ls = write_parquet_bytes(&one_col_batch(oids::LSEG, -1, "[(0,0),(1,1)]")).unwrap();
+    let l = read_parquet_rows(
+        &ls,
+        "SELECT (c.p1.x = 0.0)::VARCHAR, (c.p2.x = 1.0)::VARCHAR FROM {p}",
+    );
+    assert_eq!(l[0], ("true".to_string(), "true".to_string()));
+}
+
+#[test]
+fn geometric_circle_carries_radius_and_line_three_coeffs() {
+    let ci = write_parquet_bytes(&one_col_batch(oids::CIRCLE, -1, "<(1,2),3>")).unwrap();
+    let c = read_parquet_rows(
+        &ci,
+        "SELECT (c.x = 1.0 AND c.y = 2.0)::VARCHAR, (c.r = 3.0)::VARCHAR FROM {p}",
+    );
+    assert_eq!(c[0], ("true".to_string(), "true".to_string()));
+    let li = write_parquet_bytes(&one_col_batch(oids::LINE, -1, "{1,2,3}")).unwrap();
+    let l = read_parquet_rows(
+        &li,
+        "SELECT (c.a = 1.0)::VARCHAR, (c.c = 3.0)::VARCHAR FROM {p}",
+    );
+    assert_eq!(l[0], ("true".to_string(), "true".to_string()));
+}
+
+#[test]
+fn geometric_polygon_reads_back_as_list_of_points() {
+    let bytes =
+        write_parquet_bytes(&one_col_batch(oids::POLYGON, -1, "((0,0),(1,0),(1,1))")).unwrap();
+    let count = read_parquet_rows(&bytes, "SELECT (len(c) = 3)::VARCHAR, 'x' FROM {p}");
+    assert_eq!(count[0].0, "true");
+    // Third vertex is (1,1).
+    let verts = read_parquet_rows(
+        &bytes,
+        "SELECT (u.x = 1.0 AND u.y = 1.0)::VARCHAR, 'x' FROM (SELECT unnest(c) AS u FROM {p})",
+    );
+    assert_eq!(verts.len(), 3);
+    assert_eq!(verts[2].0, "true");
+}
+
+#[test]
+fn geometric_path_open_vs_closed_reads_back_is_closed() {
+    // Same two points; the ONLY read-back difference is is_closed.
+    let open = write_parquet_bytes(&one_col_batch(oids::PATH, -1, "[(0,0),(1,1)]")).unwrap();
+    let o = read_parquet_rows(
+        &open,
+        "SELECT c.is_closed::VARCHAR, (len(c.points) = 2)::VARCHAR FROM {p}",
+    );
+    assert_eq!(o[0], ("false".to_string(), "true".to_string()));
+
+    let closed = write_parquet_bytes(&one_col_batch(oids::PATH, -1, "((0,0),(1,1))")).unwrap();
+    let c = read_parquet_rows(
+        &closed,
+        "SELECT c.is_closed::VARCHAR, (len(c.points) = 2)::VARCHAR FROM {p}",
+    );
+    assert_eq!(c[0], ("true".to_string(), "true".to_string()));
+}

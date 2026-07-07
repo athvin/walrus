@@ -1,5 +1,7 @@
 # PR 2.14 — Tier-2: geometric types → `STRUCT` / `LIST` of doubles
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/34
+
 > **Phase:** 2 — walrus-pg-sink (2b: pg-to-arrow) · **Crates touched:** `pg-to-arrow` · **Est. size:** M ·
 > **Depends on:** PR 2.13 · **Unlocks:** PR 2.15
 
@@ -84,15 +86,15 @@ mod tests {
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `emit_fields` returns the documented `STRUCT`/`LIST` shape for each of point/line/lseg/box/circle/path/polygon.
-- [ ] `path` always carries `is_closed`, and a test proves an open path (`[(…)]`) and closed path (`((…))`)
+- [x] `emit_fields` returns the documented `STRUCT`/`LIST` shape for each of point/line/lseg/box/circle/path/polygon.
+- [x] `path` always carries `is_closed`, and a test proves an open path (`[(…)]`) and closed path (`((…))`)
       differ only by that flag.
-- [ ] Nested builders round-trip: `box.p1.x`, `polygon[0].y`, `path.points[…]` read back correctly in DuckDB.
-- [ ] PostGIS types are *not* handled here (they map to `NotTier1`/unsupported, deferred by design).
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-to-arrow` and `cargo test -p pg-to-arrow --features conformance`
+- [x] Nested builders round-trip: `box.p1.x`, `polygon[0].y`, `path.points[…]` read back correctly in DuckDB.
+- [x] PostGIS types are *not* handled here (they map to `NotTier1`/unsupported, deferred by design).
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-to-arrow` and `cargo test -p pg-to-arrow --features conformance`
 
 ## Hints & gotchas
 
