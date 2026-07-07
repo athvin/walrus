@@ -228,7 +228,7 @@ Two deliberate structural notes:
 | ✅ | [3.4](./phase-3-loader/pr-3.4-loader-phase-b.md) | Phase B wiring + advance `transformed_lsn` | loader §4 |
 | ✅ | [3.5](./phase-3-loader/pr-3.5-loader-truncate.md) | TRUNCATE (tuple-boundary wipe) | loader §5.5 |
 | ✅ | [3.6](./phase-3-loader/pr-3.6-loader-unchanged-toast.md) | unchanged-TOAST resolution (raw back-scan) | loader §5.6 |
-| ☐ | [3.7](./phase-3-loader/pr-3.7-loader-max-applied-lsn-guard.md) | per-PK max-applied-commit-LSN guard | loader §7 |
+| ✅ | [3.7](./phase-3-loader/pr-3.7-loader-max-applied-lsn-guard.md) | per-PK max-applied-commit-LSN guard | loader §7 |
 | ☐ | [3.8](./phase-3-loader/pr-3.8-loader-ddl-additive.md) | DDL apply — additive (add/rename/widen/comment) | per-change-type table |
 | ☐ | [3.9](./phase-3-loader/pr-3.9-loader-ddl-destructive.md) | DDL apply — destructive (drop / lossy quarantine) | sink §3 / taxonomy |
 | ☐ | [3.10](./phase-3-loader/pr-3.10-loader-snapshot-stream-boundary.md) | snapshot/stream boundary via the transform | §1.7 / loader §7 |

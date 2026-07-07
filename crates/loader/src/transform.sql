@@ -1,5 +1,20 @@
--- The raw→mirror transform (loader §5–§6, architecture §21) — the single source of truth run by both
+-- The raw→mirror transform (loader §5–§7, architecture §21) — the single source of truth run by both
 -- the hermetic tests and Phase B. Rendered per table by `transform.rs`.
+--
+-- ⚠ EXTENDS architecture.md (Open Q8/Q13, loader §7): the per-PK max-applied-`(commit_lsn, lsn)` guard.
+-- The incremental MERGE would apply a window winner UNCONDITIONALLY — safe only if a winner's tuple is
+-- always ≥ the tuple that last shaped the mirror row it touches. Two faces break that:
+--   (A) the equal-`commit_lsn` SNAPSHOT STRADDLE — a snapshot row carries `commit_lsn = consistent_point`;
+--       a strict `> :transformed_lsn` window would exclude it forever once the watermark reaches that
+--       point. The relaxed `>=` low bound below re-examines it.
+--   (B) a stale DELETE / re-INSERT STRADDLING THE WATERMARK — an out-of-order winner that would resurrect
+--       a killed row or clobber a newer one.
+-- Hidden columns `_applied_commit_lsn` / `_applied_lsn` on the mirror record the tuple that last shaped
+-- each row; every mutating MERGE branch is gated on `(s.commit_lsn, s.lsn) > (t._applied_*)`, so a stale
+-- winner is a no-op regardless of watermark timing. The `>=` bound and the guard work TOGETHER: `>=`
+-- alone would re-apply already-applied rows every cycle; the guard makes those re-applications no-ops.
+-- The periodic full-rebuild (PR 3.11) remains the safety net regardless — this only makes the
+-- *incremental* path correct on its own.
 --
 -- Step 0 — TRUNCATE pre-step (§5.5). A `t` row carries no tuple/PK, so it can't be a MERGE branch:
 -- wipe the WHOLE mirror as of the latest truncate `(Ct, Lt)` in the tail (all rows, incl. earlier
@@ -13,10 +28,12 @@
 -- substitute the last NON-sentinel value for that PK from `<table>_raw` **at or before** the winner's
 -- tuple, falling back to the current mirror value LAST. A mirror-only lookup loses the value when the
 -- setter and the unchanged-TOAST update land in the SAME batch (mirror has no row for that PK yet).
+-- The low bound is `>= {after_lsn}` (break face A): a row AT the watermark is re-examined; the guard in
+-- Step 3 makes an already-applied one a no-op.
 CREATE OR REPLACE TEMP TABLE _batch AS
 WITH winners AS (
     SELECT * FROM "{table}_raw"
-    WHERE "_walrus_op" <> 't' AND "_walrus_commit_lsn" > '{after_lsn}'{truncate_bound}
+    WHERE "_walrus_op" <> 't' AND "_walrus_commit_lsn" >= '{after_lsn}'{truncate_bound}
     QUALIFY row_number() OVER (
         PARTITION BY {pk_list}
         ORDER BY "_walrus_commit_lsn" DESC, "_walrus_lsn" DESC
@@ -26,13 +43,16 @@ SELECT {resolved_select}
 FROM winners s
 LEFT JOIN "{table}" t ON {pk_join};
 
--- Step 3 — collapse into the mirror. Three branches encode the intra-batch PK-churn collapse rule:
---   MATCHED AND op='d'      → DELETE (the winner is a tombstone)
---   MATCHED                 → UPDATE (last-tuple-wins, incl. d→i)
---   NOT MATCHED AND op<>'d' → INSERT (new key; a phantom delete for an unseen key is a no-op)
+-- Step 3 — collapse into the mirror. Three branches encode the intra-batch PK-churn collapse rule,
+-- each MUTATING branch gated on the per-PK guard `(s.commit_lsn, s.lsn) > (t._applied_commit_lsn,
+-- t._applied_lsn)` so a stale straddle winner (break face B) is a no-op:
+--   MATCHED AND op='d' AND guard → DELETE (the winner is a newer tombstone)
+--   MATCHED           AND guard → UPDATE (last-tuple-wins, incl. d→i; also stamps `_applied_*`)
+--   NOT MATCHED AND op<>'d'     → INSERT (new key; a phantom delete for an unseen key is a no-op; the
+--                                 first event for a key is always newer than the low sentinel `_applied_*`)
 MERGE INTO "{table}" AS t
 USING _batch AS s
 ON {pk_join}
-WHEN MATCHED AND s."_walrus_op" = 'd' THEN DELETE
-WHEN MATCHED THEN UPDATE SET {set_cols}
+WHEN MATCHED AND s."_walrus_op" = 'd' AND {guard} THEN DELETE
+WHEN MATCHED AND {guard} THEN UPDATE SET {set_cols}
 WHEN NOT MATCHED AND s."_walrus_op" <> 'd' THEN INSERT ({insert_cols}) VALUES ({insert_vals});
