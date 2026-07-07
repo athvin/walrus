@@ -119,6 +119,39 @@ impl TransformSql {
             .map(|c| format!("s.{}", q(c)))
             .collect::<Vec<_>>()
             .join(", ");
+
+        // `_batch`'s SELECT list: PK columns pass through; each non-key column is unchanged-TOAST-
+        // resolved (a raw back-scan gated by the winner's `unchanged_toast` meta list — see §5.6); the
+        // `_walrus_op` rides along for the MERGE branches.
+        let r_pk_eq_s = self
+            .pk
+            .iter()
+            .map(|c| format!("r.{} = s.{}", q(c), q(c)))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let mut select_parts: Vec<String> = self.pk.iter().map(|c| format!("s.{}", q(c))).collect();
+        for c in &self.non_key {
+            let qc = q(c);
+            // Membership test on the JSON array text (`["big"]`) — the quotes disambiguate substrings.
+            let listed = |alias: &str| {
+                format!(
+                    "COALESCE(json_extract_string({alias}.\"walrus_pg_sink_meta\", '$.unchanged_toast'), '[]') LIKE '%\"{c}\"%'"
+                )
+            };
+            select_parts.push(format!(
+                "CASE WHEN {winner_listed} THEN COALESCE(( \
+                   SELECT r.{qc} FROM \"{table}_raw\" r \
+                   WHERE {r_pk_eq_s} AND NOT ({raw_listed}) \
+                     AND (r.\"_walrus_commit_lsn\", r.\"_walrus_lsn\") <= (s.\"_walrus_commit_lsn\", s.\"_walrus_lsn\") \
+                   ORDER BY r.\"_walrus_commit_lsn\" DESC, r.\"_walrus_lsn\" DESC LIMIT 1), t.{qc}) \
+                 ELSE s.{qc} END AS {qc}",
+                winner_listed = listed("s"),
+                raw_listed = listed("r"),
+                table = self.table,
+            ));
+        }
+        select_parts.push("s.\"_walrus_op\"".to_string());
+        let resolved_select = select_parts.join(", ");
         // The truncate wipe (whole mirror) + the tuple-boundary window filter — empty when no truncate.
         let (truncate_wipe, truncate_bound) = match (boundary.ct, boundary.lt) {
             (Some(ct), Some(lt)) => (
@@ -137,6 +170,7 @@ impl TransformSql {
             .replace("{after_lsn}", &after_lsn.to_string())
             .replace("{truncate_wipe}", &truncate_wipe)
             .replace("{truncate_bound}", &truncate_bound)
+            .replace("{resolved_select}", &resolved_select)
     }
 }
 

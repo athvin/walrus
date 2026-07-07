@@ -1,5 +1,7 @@
 # PR 3.6 — Unchanged-TOAST resolution: the raw back-scan
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/59
+
 > **Phase:** 3 — walrus-loader · **Crates touched:** `loader` · **Est. size:** M ·
 > **Depends on:** PR 3.5 · **Unlocks:** PR 3.7
 
@@ -91,21 +93,21 @@ impl TransformSql {
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] The §5.6 worked case — `INSERT big='X'` @100 then `UPDATE …, big=<sentinel>` @200 for the same
+- [x] The §5.6 worked case — `INSERT big='X'` @100 then `UPDATE …, big=<sentinel>` @200 for the same
       PK, mirror empty — ends with the mirror row holding **`big='X'`**, resolved by back-scanning
       `<table>_raw`, **not** `NULL`.
-- [ ] When raw has no non-sentinel value for the column, resolution falls back to the current `<table>`
+- [x] When raw has no non-sentinel value for the column, resolution falls back to the current `<table>`
       value (last resort), not `NULL`.
-- [ ] A real SQL `NULL` (`op` payload `'n'`) is **never** treated as unchanged-TOAST — it stays `NULL`.
-- [ ] Non-toast / non-listed columns pass through untouched (the substitution is per named column only).
-- [ ] The back-scan is set-based (no per-row Rust loop), reading only `<table>_raw` (+ `<table>` for the
+- [x] A real SQL `NULL` (`op` payload `'n'`) is **never** treated as unchanged-TOAST — it stays `NULL`.
+- [x] Non-toast / non-listed columns pass through untouched (the substitution is per named column only).
+- [x] The back-scan is set-based (no per-row Rust loop), reading only `<table>_raw` (+ `<table>` for the
       fallback).
-- [ ] Hermetic in-memory unit tests (no docker compose).
-- [ ] Docs/comments explain why a mirror-only lookup loses the value in the same-batch case.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p loader --test transform` (and `--workspace` stays green) asserting
+- [x] Hermetic in-memory unit tests (no docker compose).
+- [x] Docs/comments explain why a mirror-only lookup loses the value in the same-batch case.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p loader --test transform` (and `--workspace` stays green) asserting
         **`same_batch_unchanged_toast_carries_forward_the_prior_value`**.
 
 ## Hints & gotchas
