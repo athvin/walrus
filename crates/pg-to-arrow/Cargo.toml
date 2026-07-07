@@ -8,11 +8,23 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+# `conformance` pulls the bundled DuckDB (a minutes-long C++ compile) for the read-back tests.
+# Off by default so `cargo test`/`build` stay fast; the CI conformance job (and clippy
+# --all-features) is the only place it compiles.
+conformance = ["dep:duckdb"]
+
 [dependencies]
 common = { path = "../common" }
 arrow = { workspace = true }
+parquet = { workspace = true }
 thiserror = { workspace = true }
 serde_json = { workspace = true }
 # jiff parses canonical Postgres temporal text into micros/days; hex decodes bytea `\x…` text.
 jiff = { workspace = true }
 hex = { workspace = true }
+duckdb = { workspace = true, features = ["bundled"], optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+bytes = { workspace = true }

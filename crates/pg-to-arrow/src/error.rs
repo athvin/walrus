@@ -22,4 +22,6 @@ pub enum Error {
     Downcast { column: String },
     #[error("arrow error: {0}")]
     Arrow(#[from] arrow::error::ArrowError),
+    #[error("parquet error: {0}")]
+    Parquet(#[from] parquet::errors::ParquetError),
 }
