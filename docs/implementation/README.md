@@ -206,7 +206,7 @@ Two deliberate structural notes:
 | ✅ | [2.20](./phase-2-pg-sink/pr-2.20-sink-replication-connection-keepalive.md) | `START_REPLICATION` + keepalive feedback (the spike) | §1.2 / §1.9 |
 | ✅ | [2.21](./phase-2-pg-sink/pr-2.21-sink-wire-decoder.md) | wire the decoder to the live stream | proto §4 |
 | ✅ | [2.22](./phase-2-pg-sink/pr-2.22-sink-relation-cache.md) | relation cache + Arrow schema per `schema_version` | bootstrap 7 / §2.6 |
-| ☐ | [2.23](./phase-2-pg-sink/pr-2.23-sink-batching-cadence.md) | micro-batching + cadence flush triggers | §1.3 |
+| ✅ | [2.23](./phase-2-pg-sink/pr-2.23-sink-batching-cadence.md) | micro-batching + cadence flush triggers | §1.3 |
 | ☐ | [2.24](./phase-2-pg-sink/pr-2.24-sink-parquet-s3-put.md) | Arrow → Parquet → S3 PUT (object_store) | §1.4 |
 | ☐ | [2.25](./phase-2-pg-sink/pr-2.25-sink-manifest-insert.md) | manifest INSERT (`lsn_end` = commit LSN) | §1.5 |
 | ☐ | [2.26](./phase-2-pg-sink/pr-2.26-sink-durability-checkpoint.md) | advance `confirmed_flush_lsn` only after S3 + manifest | §1.5 invariant |
