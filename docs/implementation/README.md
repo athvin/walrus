@@ -211,7 +211,7 @@ Two deliberate structural notes:
 | ✅ | [2.25](./phase-2-pg-sink/pr-2.25-sink-manifest-insert.md) | manifest INSERT (`lsn_end` = commit LSN) | §1.5 |
 | ✅ | [2.26](./phase-2-pg-sink/pr-2.26-sink-durability-checkpoint.md) | advance `confirmed_flush_lsn` only after S3 + manifest | §1.5 invariant |
 | ✅ | [2.27](./phase-2-pg-sink/pr-2.27-sink-heartbeat-liveness.md) | idle heartbeat + round-trip liveness | §1.9 / sink §4.4 |
-| ☐ | [2.28](./phase-2-pg-sink/pr-2.28-sink-graceful-shutdown.md) | graceful SIGTERM drain (never drop the slot) | sink §4.5 |
+| ✅ | [2.28](./phase-2-pg-sink/pr-2.28-sink-graceful-shutdown.md) | graceful SIGTERM drain (never drop the slot) | sink §4.5 |
 | ☐ | [2.29](./phase-2-pg-sink/pr-2.29-sink-snapshot-backfill.md) | snapshot/backfill via exported snapshot | §1.7 |
 | ☐ | [2.30](./phase-2-pg-sink/pr-2.30-sink-streaming-large-txn.md) | streaming large-txn: demux + speculative staging + commit-gate | §1.6 / proto §8 |
 | ☐ | [2.31](./phase-2-pg-sink/pr-2.31-sink-subtransaction-exclusion.md) | rolled-back subtransaction exclusion (flagship) | proto §9b / §1.6 |
