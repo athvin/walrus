@@ -38,6 +38,7 @@ tokio = { workspace = true, features = [
     "time",
 ] }
 tokio-util = { workspace = true }
+tokio-postgres = { workspace = true, features = ["runtime"] }
 axum = { workspace = true }
 object_store = { workspace = true, features = ["aws"] }
 bytes = { workspace = true }

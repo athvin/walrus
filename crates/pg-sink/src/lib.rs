@@ -10,4 +10,5 @@ pub mod bootstrap;
 pub mod config;
 pub mod health;
 pub mod pgoutput;
+pub mod preflight;
 pub mod shutdown;

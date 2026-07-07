@@ -13,6 +13,7 @@
 //! the deadline, after which the last error is returned and `main` maps its distinct exit code.
 
 use crate::config::SinkConfig;
+use crate::preflight::{self, SourcePreflight};
 use common::config::ObjectStoreConfig;
 use common::Error;
 use object_store::path::Path;
@@ -22,11 +23,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 
-/// What the shared bootstrap hands the (future) replication loop: the control-plane pool and a live,
-/// canary-verified object store.
+/// What the shared bootstrap hands the (future) replication loop: the control-plane pool, a live
+/// canary-verified object store, and the preflighted source connection (PR 2.20 opens the actual
+/// streaming replication connection).
 pub struct BootstrapCtx {
     pub control_pool: PgPool,
     pub object_store: Arc<dyn ObjectStore>,
+    pub source_client: tokio_postgres::Client,
 }
 
 const CANARY_PAYLOAD: &[u8] = b"walrus bootstrap canary";
@@ -75,9 +78,28 @@ pub async fn run_shared(cfg: &SinkConfig, deadline: Instant) -> Result<Bootstrap
     .await?;
     tracing::info!("object-store canary (put/get/delete) passed");
 
+    // Step 6: source-side preflight. The connect is transient (server may be coming up); every
+    // assertion is terminal — a wrong wal_level / missing publication / keyless table can't self-heal.
+    let source_client = retry_transient(deadline, "source database", || {
+        let url = cfg.source_db_url.clone();
+        async move { preflight::connect_source(&url).await }
+    })
+    .await?;
+    let pf = SourcePreflight::new(&source_client, cfg);
+    let server = pf.assert_server_prereqs().await?;
+    pf.assert_publication_covers().await?;
+    let pk = pf.assert_tables_have_pk(cfg.pk_mode()).await?;
+    tracing::info!(
+        version_num = server.version_num,
+        ok_tables = pk.ok.len(),
+        quarantined = pk.quarantined.len(),
+        "source preflight passed"
+    );
+
     Ok(BootstrapCtx {
         control_pool,
         object_store,
+        source_client,
     })
 }
 
