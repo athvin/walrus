@@ -1,0 +1,95 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, epoch, source_schema, source_table, s3_uri, kind, row_count,\n               lsn_start AS \"lsn_start: Lsn\", lsn_end AS \"lsn_end: Lsn\", schema_version, status\n        FROM walrus.file_manifest\n        WHERE epoch = $1 AND source_schema = $2 AND source_table = $3 AND status = 'ready'\n        ORDER BY lsn_end, id\n        LIMIT $4\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "epoch",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "source_schema",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "source_table",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "s3_uri",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "kind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "row_count",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "lsn_start: Lsn",
+        "type_info": {
+          "Custom": {
+            "name": "pg_lsn",
+            "kind": "Simple"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "lsn_end: Lsn",
+        "type_info": {
+          "Custom": {
+            "name": "pg_lsn",
+            "kind": "Simple"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "schema_version",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 10,
+        "name": "status",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "46cb7f7cc2006265798c4c86e7a6794ac6b284b20e4d17055fc33734cb963378"
+}
