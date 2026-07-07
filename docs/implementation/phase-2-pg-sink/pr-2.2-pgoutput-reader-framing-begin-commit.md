@@ -1,5 +1,7 @@
 # PR 2.2 — Reader primitives, stream framing, and `Begin` / `Commit`
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/22
+
 > **Phase:** 2 — walrus-pg-sink (2a: the hand-rolled decoder) · **Crates touched:** `pg-sink` ·
 > **Est. size:** M · **Depends on:** PR 2.1 · **Unlocks:** PR 2.3
 
@@ -168,16 +170,16 @@ fn unknown_type_byte_errors_not_panics() {
 
 ## Definition of Done
 
-- [ ] `Reader` reads BE ints and null-terminated strings; every primitive returns `Err(UnexpectedEof)`
+- [x] `Reader` reads BE ints and null-terminated strings; every primitive returns `Err(UnexpectedEof)`
       (never panics) when the buffer is short.
-- [ ] `begin` and `commit` vectors render to their exact golden lines.
-- [ ] `parse_stream` splits `begin\ncommit\n` into `[Begin, Commit]` and `Begin.xid == 749`.
-- [ ] A message whose leading byte is unrecognised yields `DecodeError::UnknownMessage`, not a panic.
-- [ ] `parse_message` rejects a message with trailing unconsumed bytes (`TrailingBytes`).
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink` (workspace stays green)
+- [x] `begin` and `commit` vectors render to their exact golden lines.
+- [x] `parse_stream` splits `begin\ncommit\n` into `[Begin, Commit]` and `Begin.xid == 749`.
+- [x] A message whose leading byte is unrecognised yields `DecodeError::UnknownMessage`, not a panic.
+- [x] `parse_message` rejects a message with trailing unconsumed bytes (`TrailingBytes`).
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink` (workspace stays green)
 
 ## Hints & gotchas
 
