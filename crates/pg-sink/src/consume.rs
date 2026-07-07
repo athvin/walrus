@@ -154,7 +154,7 @@ pub async fn run_decode_loop(
                                 | Message::Update { xid: Some(_), .. }
                                 | Message::Delete { xid: Some(_), .. }) => {
                                     last_activity = Instant::now();
-                                    demux.on_change(m, frame_lsn)?;
+                                    demux.on_change(cache, m, sink, frame_lsn).await?;
                                 }
                                 Message::StreamCommit { xid, commit_lsn, .. } => {
                                     // Materialise the survivors (aborted sub-xids excluded) to `ready`
@@ -184,7 +184,7 @@ pub async fn run_decode_loop(
                                 Message::StreamAbort { top_xid, sub_xid } => {
                                     // sub == top → whole-txn drop; sub != top → exclude the rolled-back
                                     // savepoint's rows (proto §9b) while the top-level txn commits on.
-                                    demux.on_stream_abort(*top_xid, *sub_xid);
+                                    demux.on_stream_abort(*top_xid, *sub_xid, sink).await;
                                     checkpoint.set_open_txn_floor(demux.open_floor());
                                 }
                                 other => {

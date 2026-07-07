@@ -115,6 +115,7 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
         epoch,
         SCHEMA_VERSION,
         cfg.instance.clone(),
+        cfg.max_inflight_bytes,
     );
 
     // The idle heartbeat rides a SEPARATE ordinary SQL connection (distinct from replication); its
