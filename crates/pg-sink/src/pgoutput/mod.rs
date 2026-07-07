@@ -11,7 +11,7 @@ pub mod typmod;
 pub use error::DecodeError;
 pub use reader::Reader;
 
-use common::{Lsn, PgColumn, PgRelation, ReplicaIdentity};
+use common::{Lsn, PgColumn, PgRelation, ReplicaIdentity, TupleValue};
 
 /// Message types that carry a 4-byte per-message xid immediately after the tag — but ONLY inside a
 /// streamed block (proto §7): Relation, Type, Insert, Update, Delete, Truncate, Message.
@@ -59,6 +59,42 @@ pub enum Message {
         namespace: String,
         name: String,
     },
+    /// `'I'`: Int32 relation OID, `Byte1('N')`, then the new TupleData.
+    Insert {
+        xid: Option<u32>,
+        relation_oid: u32,
+        new: Vec<TupleValue>,
+    },
+}
+
+/// Decode a `TupleData`: `Int16` column-count, then per column a one-byte format tag —
+/// `'n'` → [`TupleValue::Null`], `'u'` → [`TupleValue::UnchangedToast`] (value **not** on the
+/// wire), `'t'` → [`TupleValue::Text`] (Int32 length + UTF-8 bytes), `'b'` →
+/// [`TupleValue::Binary`] (Int32 length + bytes). An unexpected tag means the cursor misaligned →
+/// [`DecodeError::BadTupleFormat`] (fail loud, never guess). Shared by Insert/Update/Delete.
+pub fn parse_tuple(reader: &mut Reader<'_>) -> Result<Vec<TupleValue>, DecodeError> {
+    let ncols = reader.int16()?;
+    let mut cols = Vec::with_capacity(ncols as usize);
+    for _ in 0..ncols {
+        let value = match reader.byte1()? {
+            b'n' => TupleValue::Null,
+            b'u' => TupleValue::UnchangedToast, // one byte total — no length, no value
+            b't' => {
+                let len = reader.int32()? as usize;
+                let bytes = reader.take(len)?;
+                // `t` is the value's *text* representation; interpreting it (numeric? enum label?)
+                // is the type layer's job (pg-to-arrow). Here we only require valid UTF-8.
+                TupleValue::Text(std::str::from_utf8(&bytes)?.to_string())
+            }
+            b'b' => {
+                let len = reader.int32()? as usize;
+                TupleValue::Binary(reader.take(len)?)
+            }
+            other => return Err(DecodeError::BadTupleFormat { byte: other }),
+        };
+        cols.push(value);
+    }
+    Ok(cols)
 }
 
 /// Parse one message off `reader` (advancing it), for use by [`parse_stream`]. Stream context is
@@ -128,6 +164,19 @@ fn parse_one(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Message, De
             namespace: reader.string()?,
             name: reader.string()?,
         }),
+        b'I' => {
+            let relation_oid = reader.int32()?;
+            // A fixed `'N'` marker precedes the new tuple; a mismatch is an upstream framing error.
+            let marker = reader.byte1()?;
+            if marker != b'N' {
+                return Err(DecodeError::BadTupleFormat { byte: marker });
+            }
+            Ok(Message::Insert {
+                xid,
+                relation_oid,
+                new: parse_tuple(reader)?,
+            })
+        }
         other => Err(DecodeError::UnknownMessage { byte: other }),
     }
 }
