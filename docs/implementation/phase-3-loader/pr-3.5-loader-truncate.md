@@ -1,5 +1,7 @@
 # PR 3.5 — TRUNCATE: a mirror wipe keyed on the `(commit_lsn, lsn)` tuple
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/58
+
 > **Phase:** 3 — walrus-loader · **Crates touched:** `loader` · **Est. size:** M ·
 > **Depends on:** PR 3.4 · **Unlocks:** PR 3.6
 
@@ -90,20 +92,20 @@ impl TransformSql {
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] A `TRUNCATE` followed by re-`INSERT`s in the tail → the mirror is emptied as of the truncate and
+- [x] A `TRUNCATE` followed by re-`INSERT`s in the tail → the mirror is emptied as of the truncate and
       holds **only** the post-truncate rows.
-- [ ] A **same-transaction** `TRUNCATE; INSERT …` (shared `commit_lsn`, distinct `lsn`) → the
+- [x] A **same-transaction** `TRUNCATE; INSERT …` (shared `commit_lsn`, distinct `lsn`) → the
       post-truncate inserts **survive** — the tuple boundary `(commit_lsn, lsn) > (Ct, Lt)` keeps them.
-- [ ] A counterfactual test demonstrates a **scalar** `commit_lsn > Ct` filter would drop those inserts
+- [x] A counterfactual test demonstrates a **scalar** `commit_lsn > Ct` filter would drop those inserts
       (proving why the tuple is required).
-- [ ] `transformed_lsn` advances past a truncate-only tail (a bare `TRUNCATE` never stalls the pipeline).
-- [ ] `<table>_raw` **retains** the `t` op as a logged row — raw is never truncated.
-- [ ] These are hermetic in-memory unit tests (no docker compose).
-- [ ] Docs/comments state the tuple-not-scalar invariant at the boundary.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p loader --test transform` (and `--workspace` stays green) asserting
+- [x] `transformed_lsn` advances past a truncate-only tail (a bare `TRUNCATE` never stalls the pipeline).
+- [x] `<table>_raw` **retains** the `t` op as a logged row — raw is never truncated.
+- [x] These are hermetic in-memory unit tests (no docker compose).
+- [x] Docs/comments state the tuple-not-scalar invariant at the boundary.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p loader --test transform` (and `--workspace` stays green) asserting
         **`same_commit_truncate_then_insert_survives_tuple_boundary`** and
         **`truncate_then_reinsert_keeps_only_post_truncate_rows`**.
 
