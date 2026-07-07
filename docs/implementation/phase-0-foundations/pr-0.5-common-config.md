@@ -1,5 +1,7 @@
 # PR 0.5 — Typed, bounds-validated shared config loading
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/13
+
 > **Phase:** 0 — Foundations & CI · **Crates touched:** `common` · **Est. size:** M ·
 > **Depends on:** PR 0.4 · **Unlocks:** PR 0.6
 
@@ -131,18 +133,18 @@ mod tests {
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `CommonConfig::load()` reads a file (when `WALRUS_CONFIG` is set) and overlays `WALRUS_`-prefixed
+- [x] `CommonConfig::load()` reads a file (when `WALRUS_CONFIG` is set) and overlays `WALRUS_`-prefixed
       env vars, deserialising into typed fields (durations via `humantime_serde`).
-- [ ] `validate()` rejects at least: empty `control_db_url`, empty `object_store.bucket`, and a
+- [x] `validate()` rejects at least: empty `control_db_url`, empty `object_store.bucket`, and a
       zero/absurd `startup_deadline` — each as `Error::Config(_)` (which is terminal, per PR 0.2).
-- [ ] The happy-path parse test uses `figment::Jail` (or equivalent) so env manipulation is hermetic.
-- [ ] Unknown/misspelled keys are rejected (`deny_unknown_fields`) so a typo'd ConfigMap key fails
+- [x] The happy-path parse test uses `figment::Jail` (or equivalent) so env manipulation is hermetic.
+- [x] Unknown/misspelled keys are rejected (`deny_unknown_fields`) so a typo'd ConfigMap key fails
       loud at boot, not silently as a default.
-- [ ] `load()` calls `validate()` — an invalid config can never escape as an `Ok`.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p common` (and `--workspace` stays green)
+- [x] `load()` calls `validate()` — an invalid config can never escape as an `Ok`.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p common` (and `--workspace` stays green)
 
 ## Hints & gotchas
 
