@@ -255,3 +255,107 @@ fn timetz_offset_sign_roundtrips() {
     );
     assert_eq!(w[0].1, "-28800");
 }
+
+// ---- Tier-2 range / multirange (PR 2.13) --------------------------------------------------------
+// range → 5 flat columns (c_lower/c_upper/c_lower_inc/c_upper_inc/c_empty); multirange → LIST<STRUCT>.
+// NULL, `empty`, and `unbounded` must read back as three distinct states.
+
+/// Build a one-column batch from a single `TupleValue` (for the whole-column NULL cases).
+fn one_col_value_batch(oid: u32, typmod: i32, value: TupleValue) -> arrow::array::RecordBatch {
+    let mut b = BatchBuilder::new(&one_col_rel(oid, typmod)).unwrap();
+    b.append_row(&[value], &meta()).unwrap();
+    b.finish().unwrap()
+}
+
+#[test]
+fn range_int4_bounds_inclusivity_and_types() {
+    let bytes = write_parquet_bytes(&one_col_batch(oids::INT4RANGE, -1, "[1,10)")).unwrap();
+    // Element columns are INTEGER; the flags are BOOLEAN.
+    let types = read_parquet_rows(&bytes, "SELECT typeof(c_lower), typeof(c_empty) FROM {p}");
+    assert_eq!(types[0], ("INTEGER".to_string(), "BOOLEAN".to_string()));
+    // Canonical half-open `[1,10)`: bounds 1/10, lower inclusive, upper exclusive, not empty.
+    let vals = read_parquet_rows(
+        &bytes,
+        "SELECT CAST(c_lower AS VARCHAR), CAST(c_upper AS VARCHAR) FROM {p}",
+    );
+    assert_eq!(vals[0], ("1".to_string(), "10".to_string()));
+    let flags = read_parquet_rows(
+        &bytes,
+        "SELECT (c_lower_inc AND NOT c_upper_inc AND NOT c_empty)::VARCHAR, 'x' FROM {p}",
+    );
+    assert_eq!(flags[0].0, "true");
+}
+
+#[test]
+fn range_empty_sets_empty_true_and_bounds_null() {
+    let bytes = write_parquet_bytes(&one_col_batch(oids::INT4RANGE, -1, "empty")).unwrap();
+    let rows = read_parquet_rows(
+        &bytes,
+        "SELECT c_empty::VARCHAR, (c_lower IS NULL AND c_upper IS NULL)::VARCHAR FROM {p}",
+    );
+    assert_eq!(rows[0], ("true".to_string(), "true".to_string()));
+}
+
+#[test]
+fn range_unbounded_lower_is_null_with_empty_false() {
+    // Distinct from `empty`: the lower bound is NULL but the range is present (`_empty=false`).
+    let bytes = write_parquet_bytes(&one_col_batch(oids::INT4RANGE, -1, "(,10)")).unwrap();
+    let rows = read_parquet_rows(
+        &bytes,
+        "SELECT (c_lower IS NULL)::VARCHAR, c_empty::VARCHAR FROM {p}",
+    );
+    assert_eq!(rows[0], ("true".to_string(), "false".to_string()));
+}
+
+#[test]
+fn range_whole_null_nulls_all_five_columns() {
+    let bytes =
+        write_parquet_bytes(&one_col_value_batch(oids::INT4RANGE, -1, TupleValue::Null)).unwrap();
+    let rows = read_parquet_rows(
+        &bytes,
+        "SELECT (c_lower IS NULL AND c_upper IS NULL AND c_lower_inc IS NULL \
+         AND c_upper_inc IS NULL AND c_empty IS NULL)::VARCHAR, 'x' FROM {p}",
+    );
+    assert_eq!(
+        rows[0].0, "true",
+        "whole-column NULL nulls all five siblings"
+    );
+}
+
+#[test]
+fn multirange_reads_back_as_list_of_structs() {
+    let bytes =
+        write_parquet_bytes(&one_col_batch(oids::INT4MULTIRANGE, -1, "{[1,4),[7,9)}")).unwrap();
+    // Two members, in order.
+    let count = read_parquet_rows(&bytes, "SELECT len(c)::VARCHAR, 'x' FROM {p}");
+    assert_eq!(count[0].0, "2");
+    let members = read_parquet_rows(
+        &bytes,
+        "SELECT CAST(m.lower AS VARCHAR), CAST(m.upper AS VARCHAR) FROM (SELECT unnest(c) AS m FROM {p})",
+    );
+    assert_eq!(members[0], ("1".to_string(), "4".to_string()));
+    assert_eq!(members[1], ("7".to_string(), "9".to_string()));
+}
+
+#[test]
+fn multirange_empty_list_is_distinct_from_null() {
+    let empty = write_parquet_bytes(&one_col_batch(oids::INT4MULTIRANGE, -1, "{}")).unwrap();
+    let e = read_parquet_rows(
+        &empty,
+        "SELECT (c IS NULL)::VARCHAR, len(c)::VARCHAR FROM {p}",
+    );
+    assert_eq!(
+        e[0],
+        ("false".to_string(), "0".to_string()),
+        "empty list ≠ NULL"
+    );
+
+    let null = write_parquet_bytes(&one_col_value_batch(
+        oids::INT4MULTIRANGE,
+        -1,
+        TupleValue::Null,
+    ))
+    .unwrap();
+    let n = read_parquet_rows(&null, "SELECT (c IS NULL)::VARCHAR, 'x' FROM {p}");
+    assert_eq!(n[0].0, "true", "NULL column = NULL list");
+}

@@ -12,6 +12,7 @@ pub mod batch;
 pub mod error;
 pub mod oids;
 pub mod parquet;
+pub mod range;
 pub mod schema;
 pub mod tier2;
 

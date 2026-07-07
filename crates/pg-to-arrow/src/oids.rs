@@ -19,5 +19,19 @@ pub const TIMESTAMPTZ: u32 = 1184;
 // Tier-2 decompositions (PR 2.12): each fans out to several sibling columns (§2.4).
 pub const INTERVAL: u32 = 1186;
 pub const TIMETZ: u32 = 1266;
+// Range families → 5 flat sibling columns (PR 2.13). OIDs are stable pg_catalog built-ins.
+pub const INT4RANGE: u32 = 3904;
+pub const NUMRANGE: u32 = 3906;
+pub const TSRANGE: u32 = 3908;
+pub const TSTZRANGE: u32 = 3910;
+pub const DATERANGE: u32 = 3912;
+pub const INT8RANGE: u32 = 3926;
+// Multirange families (PG14+) → LIST<STRUCT> (PR 2.13).
+pub const INT4MULTIRANGE: u32 = 4451;
+pub const NUMMULTIRANGE: u32 = 4532;
+pub const TSMULTIRANGE: u32 = 4533;
+pub const TSTZMULTIRANGE: u32 = 4534;
+pub const DATEMULTIRANGE: u32 = 4535;
+pub const INT8MULTIRANGE: u32 = 4536;
 pub const NUMERIC: u32 = 1700;
 pub const JSONB: u32 = 3802;

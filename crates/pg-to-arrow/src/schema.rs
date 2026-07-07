@@ -8,6 +8,7 @@
 
 use crate::error::Error;
 use crate::oids;
+use crate::range::RangeFamily;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use common::{PgColumn, PgRelation};
 
@@ -43,13 +44,29 @@ pub fn emit_fields(col: &PgColumn) -> Result<Vec<Field>, Error> {
         return Ok(vec![Field::new(col.name.clone(), dt, true)]);
     }
     match col.type_oid {
-        oids::INTERVAL => Ok(crate::tier2::interval_fields(&col.name)),
-        oids::TIMETZ => Ok(crate::tier2::timetz_fields(&col.name)),
-        _ => Err(Error::NotTier1 {
-            oid: col.type_oid,
-            typmod: col.type_modifier,
-        }),
+        oids::INTERVAL => return Ok(crate::tier2::interval_fields(&col.name)),
+        oids::TIMETZ => return Ok(crate::tier2::timetz_fields(&col.name)),
+        _ => {}
     }
+    // Range → 5 flat sibling columns; multirange → one LIST<STRUCT> (§2.4, PR 2.13).
+    if let Some(fam) = RangeFamily::from_range_oid(col.type_oid) {
+        return Ok(crate::tier2::range_fields(
+            &col.name,
+            fam,
+            col.type_modifier,
+        ));
+    }
+    if let Some(fam) = RangeFamily::from_multirange_oid(col.type_oid) {
+        return Ok(vec![crate::tier2::multirange_field(
+            &col.name,
+            fam,
+            col.type_modifier,
+        )]);
+    }
+    Err(Error::NotTier1 {
+        oid: col.type_oid,
+        typmod: col.type_modifier,
+    })
 }
 
 /// Arrow `DataType` for a Tier-1 OID+typmod, or `None` if the type is not (yet) Tier-1.
@@ -263,9 +280,46 @@ mod tests {
 
     #[test]
     fn still_unhandled_oid_errors() {
-        // int4range (3904) is Tier-2 range, deferred to PR 2.13 — still NotTier1 here.
-        let err = emit_fields(&col("r", 3904, -1)).unwrap_err();
-        assert!(matches!(err, Error::NotTier1 { oid: 3904, .. }));
+        // point (600) is a geometric type, deferred to PR 2.14 — still NotTier1 here.
+        let err = emit_fields(&col("p", 600, -1)).unwrap_err();
+        assert!(matches!(err, Error::NotTier1 { oid: 600, .. }));
+    }
+
+    #[test]
+    fn int4range_emits_five_flat_columns() {
+        let fields = emit_fields(&col("span", oids::INT4RANGE, -1)).unwrap();
+        let shape: Vec<(&str, &DataType)> = fields
+            .iter()
+            .map(|f| (f.name().as_str(), f.data_type()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("span_lower", &DataType::Int32),
+                ("span_upper", &DataType::Int32),
+                ("span_lower_inc", &DataType::Boolean),
+                ("span_upper_inc", &DataType::Boolean),
+                ("span_empty", &DataType::Boolean),
+            ]
+        );
+    }
+
+    #[test]
+    fn int4multirange_emits_one_list_of_struct() {
+        let fields = emit_fields(&col("spans", oids::INT4MULTIRANGE, -1)).unwrap();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name(), "spans");
+        match fields[0].data_type() {
+            DataType::List(item) => match item.data_type() {
+                DataType::Struct(sf) => {
+                    let names: Vec<&str> = sf.iter().map(|f| f.name().as_str()).collect();
+                    assert_eq!(names, vec!["lower", "upper", "lower_inc", "upper_inc"]);
+                    assert_eq!(sf[0].data_type(), &DataType::Int32);
+                }
+                other => panic!("expected LIST<STRUCT>, item was {other:?}"),
+            },
+            other => panic!("expected LIST, got {other:?}"),
+        }
     }
 
     #[test]
