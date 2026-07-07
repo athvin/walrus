@@ -47,3 +47,40 @@ jobs:
 
       - name: cargo test --workspace
         run: cargo test --workspace
+
+  compose:
+    name: compose (source-pg · control-pg · minio)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `up --wait` is the deterministic gate: it blocks until all three services are healthy and
+      # the createbucket one-shot has completed. GitHub's ubuntu runners ship Docker + Compose v2.
+      - name: Boot the dev stack (up --wait)
+        run: docker compose -f deploy/docker/docker-compose.yml up --wait
+
+      - name: Show service state
+        if: always()
+        run: docker compose -f deploy/docker/docker-compose.yml ps -a
+
+      - name: Smoke — services reachable, seeded, and bucket present
+        run: |
+          set -euo pipefail
+          C="docker compose -f deploy/docker/docker-compose.yml"
+          # Both Postgres instances accept connections (checked inside the containers).
+          $C exec -T source-pg pg_isready -U postgres -d walrus
+          $C exec -T control-pg pg_isready -U postgres -d walrus_control
+          # MinIO health on the published port.
+          curl -sf http://localhost:9000/minio/health/live
+          # Source PG came up with wal_level=logical.
+          wal_level=$($C exec -T source-pg psql -U postgres -d walrus -tAc "SHOW wal_level")
+          echo "wal_level=$wal_level"; test "$wal_level" = "logical"
+          # Publication covers >= 3 tables (orders / customers / items).
+          count=$($C exec -T source-pg psql -U postgres -d walrus -tAc "SELECT count(*) FROM pg_publication_tables")
+          echo "pg_publication_tables=$count"; test "$count" -ge 3
+          # The walrus bucket exists (createbucket sidecar created it and is healthy).
+          $C exec -T createbucket mc ls local/walrus
+
+      - name: Tear down (remove volumes)
+        if: always()
+        run: docker compose -f deploy/docker/docker-compose.yml down -v

@@ -1,5 +1,7 @@
 # PR 0.6 — Dev harness: docker-compose (source PG + control PG + MinIO) + `justfile`
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/14
+
 > **Phase:** 0 — Foundations & CI · **Crates touched:** none (infra: `deploy/docker/`, root `justfile`)
 > · **Est. size:** M · **Depends on:** PR 0.5 · **Unlocks:** PR 1.3 (first integration test), phase 1
 
@@ -150,21 +152,21 @@ AWS_SECRET_ACCESS_KEY=minioadmin
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `just up` (i.e. `docker compose … up --wait`) exits 0 only after **all three** services report
+- [x] `just up` (i.e. `docker compose … up --wait`) exits 0 only after **all three** services report
       healthy; `just down` removes containers *and* volumes (`-v`).
-- [ ] `just smoke` passes: both Postgres ports accept connections and MinIO `/health/live` returns 200.
-- [ ] The source PG comes up with `wal_level=logical` and is **seeded** with `orders` / `customers`
+- [x] `just smoke` passes: both Postgres ports accept connections and MinIO `/health/live` returns 200.
+- [x] The source PG comes up with `wal_level=logical` and is **seeded** with `orders` / `customers`
       (composite PK) / `items` (REPLICA IDENTITY FULL) / the `mood` enum + `CREATE PUBLICATION`
       (verify e.g. `SELECT count(*) FROM pg_publication_tables` ≥ 3).
-- [ ] The MinIO `walrus` bucket exists after `up --wait` (the `createbucket` one-shot completed).
-- [ ] `.env.example` keys map 1:1 onto `CommonConfig` (PR 0.5) so `cp .env.example .env` yields a
+- [x] The MinIO `walrus` bucket exists after `up --wait` (the `createbucket` one-shot completed).
+- [x] `.env.example` keys map 1:1 onto `CommonConfig` (PR 0.5) so `cp .env.example .env` yields a
       loadable config.
-- [ ] CI's new `compose` job runs `up --wait` → smoke → `down -v` and is red if any step fails.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test --workspace`
-  - [ ] `docker compose -f deploy/docker/docker-compose.yml up --wait` then `just smoke`
+- [x] CI's new `compose` job runs `up --wait` → smoke → `down -v` and is red if any step fails.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test --workspace`
+  - [x] `docker compose -f deploy/docker/docker-compose.yml up --wait` then `just smoke`
 
 ## Hints & gotchas
 
