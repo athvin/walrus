@@ -1,5 +1,7 @@
 # PR 2.17 — Build the per-column `TypeDescriptor` and persist it to `schema_registry`
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/37
+
 > **Phase:** 2 — walrus-pg-sink (2b: pg-to-arrow) · **Crates touched:** `pg-to-arrow`, `common`, `control` (test) ·
 > **Est. size:** M · **Depends on:** PR 2.16, PR 1.6 (`schema_registry` model) · **Unlocks:** PR 2.18
 
@@ -102,19 +104,19 @@ async fn schema_registry_roundtrips_a_type_descriptor() {
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `describe_column` returns a `TypeDescriptor` matching §2.6 for representative columns: `interval`
+- [x] `describe_column` returns a `TypeDescriptor` matching §2.6 for representative columns: `interval`
       (tier 2, three `emit[]`, a `recombine`), `enum` (tier 3, `meta.enum_labels` = ordered set), `char(n)`
       (tier 1, `meta.char_length = n`).
-- [ ] `tier_of` / `emit_of` agree with `schema::emit_fields` for **every** OID the crate supports (a test
+- [x] `tier_of` / `emit_of` agree with `schema::emit_fields` for **every** OID the crate supports (a test
       cross-checks the two dispatches so they can't drift).
-- [ ] `TypeDescriptor` serializes to / deserializes from the §2.6 JSON shape (round-trip equal).
-- [ ] Compose test writes a descriptor into `schema_registry` (keyed by `schema_version`) via `control` and
+- [x] `TypeDescriptor` serializes to / deserializes from the §2.6 JSON shape (round-trip equal).
+- [x] Compose test writes a descriptor into `schema_registry` (keyed by `schema_version`) via `control` and
       reads back an equal descriptor; `control/tests` dev-depends on `pg-to-arrow` with **no DAG cycle**.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-to-arrow` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` then `cargo test -p control -- --ignored schema_registry_roundtrips_a_type_descriptor`
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-to-arrow` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` then `cargo test -p control -- --ignored schema_registry_roundtrips_a_type_descriptor`
 
 ## Hints & gotchas
 
