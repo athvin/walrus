@@ -1,0 +1,49 @@
+name: CI
+
+# Every push and PR runs the four baseline gates. This is the machine-checked definition of
+# "green" that every later PR in the roadmap inherits (docs/implementation/README.md → "CI grows
+# with the phases"). New gates (compose, sqlx offline, conformance, cargo-deny, kubeconform) switch
+# on in later phases as the code that needs them lands.
+on:
+  push:
+  pull_request:
+
+# One in-flight run per ref; a new push cancels the previous run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gates:
+    name: fmt · clippy · build · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the channel + rustfmt/clippy components; install it explicitly so
+      # the version is logged and the cache key below is computed against the pinned rustc. (rustup
+      # 1.28+ no longer auto-installs the toolchain-file toolchain on first proxy use.)
+      - name: Install pinned Rust toolchain (from rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+
+      # Cheapest gate first: fail fast on formatting before spending time on clippy/build/test.
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: cargo build --workspace
+        run: cargo build --workspace
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
