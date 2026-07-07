@@ -1,5 +1,7 @@
 # PR 0.3 — Add the `Lsn` newtype (parse, zero-padded Display, numeric `Ord`)
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/11
+
 > **Phase:** 0 — Foundations & CI · **Crates touched:** `common` · **Est. size:** S ·
 > **Depends on:** PR 0.2 · **Unlocks:** PR 0.4
 
@@ -136,16 +138,16 @@ mod tests {
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `"0/199BAC8".parse::<Lsn>()` and `format!("{lsn}")` **round-trip** (parse ∘ display == identity).
-- [ ] `Display` always emits exactly 16 uppercase hex digits, zero-padded (`00000000019A2B3C`).
-- [ ] `FromStr` accepts both `X/Y` and bare 16-hex; rejects non-hex, empty, and > 16 significant hex.
-- [ ] serde emits/consumes the **padded string**, not a JSON number (assert on the JSON text).
-- [ ] **Property held:** for a vector of `Lsn`s, sorting by `Display` string == sorting by `as_u64()`.
-- [ ] `Ord` is numeric (it derives from the inner `u64`); `Lsn::ZERO < any nonzero`.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p common` (and `--workspace` stays green)
+- [x] `"0/199BAC8".parse::<Lsn>()` and `format!("{lsn}")` **round-trip** (parse ∘ display == identity).
+- [x] `Display` always emits exactly 16 uppercase hex digits, zero-padded (`00000000019A2B3C`).
+- [x] `FromStr` accepts both `X/Y` and bare 16-hex; rejects non-hex, empty, and > 16 significant hex.
+- [x] serde emits/consumes the **padded string**, not a JSON number (assert on the JSON text).
+- [x] **Property held:** for a vector of `Lsn`s, sorting by `Display` string == sorting by `as_u64()`.
+- [x] `Ord` is numeric (it derives from the inner `u64`); `Lsn::ZERO < any nonzero`.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p common` (and `--workspace` stays green)
 
 ## Hints & gotchas
 

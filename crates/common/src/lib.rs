@@ -2,5 +2,7 @@
 //! `SinkMeta`, and the neutral Postgres shape types. Populated PR by PR (0.2 →).
 
 pub mod error;
+pub mod lsn;
 
 pub use error::{Error, ExitCode, Result};
+pub use lsn::Lsn;
