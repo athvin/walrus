@@ -1,5 +1,7 @@
 # PR 0.2 — `common` error taxonomy, terminal/transient split, and `ExitCode`
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/10
+
 > **Phase:** 0 — Foundations & CI · **Crates touched:** `common` · **Est. size:** M ·
 > **Depends on:** PR 0.1 · **Unlocks:** PR 0.3
 
@@ -151,17 +153,17 @@ mod tests {
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `is_terminal()` returns `true` for `Config`, `Preflight`, `KeylessTable`, `LeaseContended`,
+- [x] `is_terminal()` returns `true` for `Config`, `Preflight`, `KeylessTable`, `LeaseContended`,
       `Internal`; `false` for `ControlDb`, `ObjectStore`.
-- [ ] `exit_code()` maps every terminal variant to a **distinct** non-zero `ExitCode`; only
+- [x] `exit_code()` maps every terminal variant to a **distinct** non-zero `ExitCode`; only
       `ExitCode::Success` is `0`.
-- [ ] `Display` for each variant names the precondition **and** the observed value (actionable log).
-- [ ] `From<ExitCode> for std::process::ExitCode` exists (the seam bins use in `main`).
-- [ ] Doc comment records the invariant "classification is a method, never string-matching".
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p common` (and `--workspace` stays green)
+- [x] `Display` for each variant names the precondition **and** the observed value (actionable log).
+- [x] `From<ExitCode> for std::process::ExitCode` exists (the seam bins use in `main`).
+- [x] Doc comment records the invariant "classification is a method, never string-matching".
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p common` (and `--workspace` stays green)
 
 ## Hints & gotchas
 
