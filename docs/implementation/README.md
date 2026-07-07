@@ -222,7 +222,7 @@ Two deliberate structural notes:
 
 | ✅ | PR | Delivers | Design |
 |---|---|---|---|
-| ☐ | [3.1](./phase-3-loader/pr-3.1-loader-skeleton-bootstrap-lease.md) | bin skeleton: bootstrap (lease, DuckDB open, checkpoints) + health | loader §8.1–§8.2 |
+| ✅ | [3.1](./phase-3-loader/pr-3.1-loader-skeleton-bootstrap-lease.md) | bin skeleton: bootstrap (lease, DuckDB open, checkpoints) + health | loader §8.1–§8.2 |
 | ☐ | [3.2](./phase-3-loader/pr-3.2-loader-phase-a-append.md) | Phase A: claim + append verbatim to `<table>_raw` + watermark/delete | loader §3–§4 |
 | ☐ | [3.3](./phase-3-loader/pr-3.3-loader-transform-template.md) | transform SQL template + pure in-memory tests (crown jewel) | loader §5.2–§6 |
 | ☐ | [3.4](./phase-3-loader/pr-3.4-loader-phase-b.md) | Phase B wiring + advance `transformed_lsn` | loader §4 |
