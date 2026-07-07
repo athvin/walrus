@@ -14,6 +14,7 @@ pub mod consume;
 pub mod health;
 pub mod heartbeat;
 pub mod manifest;
+pub mod memory;
 pub mod pgoutput;
 pub mod preflight;
 pub mod relcache;

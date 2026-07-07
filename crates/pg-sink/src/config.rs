@@ -51,8 +51,14 @@ pub struct SinkConfig {
     pub max_rows: u64,
     /// Byte-size flush threshold.
     pub max_bytes: u64,
-    /// Back-pressure ceiling on un-acked in-flight bytes.
+    /// Back-pressure ceiling on aggregate in-flight buffered bytes (§1.3) — process-wide, distinct from
+    /// the per-batch `max_bytes`. Must sit **below** the pod memory limit so a graceful spill beats a
+    /// cgroup OOM-kill; `logical_decoding_work_mem` does NOT bound this.
     pub max_inflight_bytes: u64,
+    /// Pause-poll backstop **activate** ratio of `max_inflight_bytes` (high band).
+    pub backpressure_activate_ratio: f64,
+    /// Pause-poll backstop **resume** ratio (low band) — must be `< activate` so intake doesn't flap.
+    pub backpressure_resume_ratio: f64,
     /// Bootstrap retry budget: transient deps are retried until this elapses, then terminal.
     #[serde(with = "humantime_serde")]
     pub startup_deadline: Duration,
@@ -84,6 +90,8 @@ impl Default for SinkConfig {
             max_rows: 100_000,
             max_bytes: 128 * 1024 * 1024,
             max_inflight_bytes: 512 * 1024 * 1024,
+            backpressure_activate_ratio: 0.85,
+            backpressure_resume_ratio: 0.75,
             startup_deadline: Duration::from_secs(60),
             health_addr: SocketAddr::from(([0, 0, 0, 0], 8080)),
             manage_publication: false,
@@ -139,6 +147,14 @@ impl SinkConfig {
             .map_err(|e| ConfigError::Load(e.to_string()))?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// The validated backpressure hysteresis gate (PR 2.32).
+    pub fn backpressure(&self) -> crate::memory::Backpressure {
+        crate::memory::Backpressure::new(
+            self.backpressure_activate_ratio,
+            self.backpressure_resume_ratio,
+        )
     }
 
     /// The validated idle-heartbeat settings (PR 2.27).
@@ -197,6 +213,19 @@ impl SinkConfig {
                 detail: format!(
                     "must be ≥ max_bytes ({}) so at least one full batch can be in flight",
                     self.max_bytes
+                ),
+            });
+        }
+        // Hysteresis band: 0 < resume < activate < 1.0 so the backstop never flaps.
+        if !(0.0 < self.backpressure_resume_ratio
+            && self.backpressure_resume_ratio < self.backpressure_activate_ratio
+            && self.backpressure_activate_ratio < 1.0)
+        {
+            return Err(ConfigError::OutOfBounds {
+                field: "backpressure_activate_ratio",
+                detail: format!(
+                    "require 0 < resume ({}) < activate ({}) < 1.0",
+                    self.backpressure_resume_ratio, self.backpressure_activate_ratio
                 ),
             });
         }
@@ -307,6 +336,20 @@ mod tests {
             cfg.validate().unwrap_err(),
             ConfigError::OutOfBounds {
                 field: "heartbeat_idle_after",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn backpressure_ratios_must_form_a_hysteresis_band() {
+        let mut cfg = valid();
+        cfg.backpressure_resume_ratio = 0.9; // resume >= activate → invalid
+        cfg.backpressure_activate_ratio = 0.85;
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ConfigError::OutOfBounds {
+                field: "backpressure_activate_ratio",
                 ..
             }
         ));

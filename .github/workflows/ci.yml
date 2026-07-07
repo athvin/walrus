@@ -189,6 +189,11 @@ jobs:
       - name: Sub-transaction exclusion (compose)
         run: cargo test -p pg-sink --test subtransaction_exclusion -- --ignored --test-threads=1
 
+      # PR 2.32: aggregate max_inflight_bytes — a large open txn under a low ceiling spills
+      # speculatively (spill_count increments), memory stays bounded, and the slot is never advanced.
+      - name: Max inflight bytes (compose)
+        run: cargo test -p pg-sink --test max_inflight_bytes -- --ignored --test-threads=1
+
       # PR 2.18/2.19: the sink pod-lifecycle shell against the live stack — full bootstrap (control +
       # S3 + source preflight) → /startup→/ready flip, SIGTERM exit 0, missing control DB → exit 11.
       - name: Sink pod-lifecycle smoke (health · SIGTERM · fail-fast exit code)

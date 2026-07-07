@@ -215,7 +215,7 @@ Two deliberate structural notes:
 | ✅ | [2.29](./phase-2-pg-sink/pr-2.29-sink-snapshot-backfill.md) | snapshot/backfill via exported snapshot | §1.7 |
 | ✅ | [2.30](./phase-2-pg-sink/pr-2.30-sink-streaming-large-txn.md) | streaming large-txn: demux + speculative staging + commit-gate | §1.6 / proto §8 |
 | ✅ | [2.31](./phase-2-pg-sink/pr-2.31-sink-subtransaction-exclusion.md) | rolled-back subtransaction exclusion (flagship) | proto §9b / §1.6 |
-| ☐ | [2.32](./phase-2-pg-sink/pr-2.32-sink-max-inflight-bytes.md) | aggregate `max_inflight_bytes` ceiling + spill | §1.3 |
+| ✅ | [2.32](./phase-2-pg-sink/pr-2.32-sink-max-inflight-bytes.md) | aggregate `max_inflight_bytes` ceiling + spill | §1.3 |
 | ☐ | [2.33](./phase-2-pg-sink/pr-2.33-sink-ddl-capture.md) | DDL capture consumption (ddl_audit → ddl_manifest + version bump) | sink §3 |
 
 ### Phase 3 — walrus-loader  ·  [`phase-3-loader/`](./phase-3-loader/)
