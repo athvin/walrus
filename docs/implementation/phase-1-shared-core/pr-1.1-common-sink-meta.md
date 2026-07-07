@@ -4,6 +4,8 @@
 
 # PR 1.1 — Add the `SinkMeta` provenance model
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/15
+
 > **Phase:** 1 — Shared core · **Crates touched:** `common` · **Est. size:** M ·
 > **Depends on:** PR 0.5 · **Unlocks:** PR 1.2
 
@@ -144,16 +146,16 @@ mod tests {
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `SinkMeta` has every field from architecture.md §1.4 with the exact JSON keys.
-- [ ] `Op` serializes to `"i" | "u" | "d" | "t"`; `Kind` to `"snapshot" | "stream"`.
-- [ ] `commit_ts` and `sink_processed_at` serialize as RFC-3339 with a **`Z`** suffix; a non-UTC input is rejected.
-- [ ] `lsn` and `commit_lsn` serialize as zero-padded 16-hex strings (reuse `Lsn` from PR 0.3).
-- [ ] A round-trip test deserializes the §1.4 example block and re-serializes to equal JSON.
-- [ ] Docs/comments explain that these keys are a cross-service wire contract.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p common` (and `--workspace` stays green)
+- [x] `SinkMeta` has every field from architecture.md §1.4 with the exact JSON keys.
+- [x] `Op` serializes to `"i" | "u" | "d" | "t"`; `Kind` to `"snapshot" | "stream"`.
+- [x] `commit_ts` and `sink_processed_at` serialize as RFC-3339 with a **`Z`** suffix; a non-UTC input is rejected.
+- [x] `lsn` and `commit_lsn` serialize as zero-padded 16-hex strings (reuse `Lsn` from PR 0.3).
+- [x] A round-trip test deserializes the §1.4 example block and re-serializes to equal JSON.
+- [x] Docs/comments explain that these keys are a cross-service wire contract.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p common` (and `--workspace` stays green)
 
 ## Hints & gotchas
 

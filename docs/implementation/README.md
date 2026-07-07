@@ -161,7 +161,7 @@ Two deliberate structural notes:
 
 | ✅ | PR | Delivers | Design |
 |---|---|---|---|
-| ☐ | [1.1](./phase-1-shared-core/pr-1.1-common-sink-meta.md) | `SinkMeta` provenance model (UTC `Z`) | §1.4 |
+| ✅ | [1.1](./phase-1-shared-core/pr-1.1-common-sink-meta.md) | `SinkMeta` provenance model (UTC `Z`) | §1.4 |
 | ☐ | [1.2](./phase-1-shared-core/pr-1.2-common-pg-shape-types.md) | `PgRelation` / `PgColumn` / `TupleValue` / `TypeDescriptor` | §2.6 / proto §4 |
 | ☐ | [1.3](./phase-1-shared-core/pr-1.3-control-migrations.md) | control-plane migrations + `sqlx::migrate!` runner | Coordination contract |
 | ☐ | [1.4](./phase-1-shared-core/pr-1.4-control-file-manifest.md) | `file_manifest` claim/insert/delete (`ORDER BY lsn_end, id`) | loader §2 |
