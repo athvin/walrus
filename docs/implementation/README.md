@@ -202,7 +202,7 @@ Two deliberate structural notes:
 | ✅ | PR | Delivers | Design |
 |---|---|---|---|
 | ✅ | [2.18](./phase-2-pg-sink/pr-2.18-sink-skeleton-health-shutdown.md) | bin skeleton: bootstrap scaffold, health endpoints, SIGTERM | sink §4.2–§4.3 |
-| ☐ | [2.19](./phase-2-pg-sink/pr-2.19-sink-source-preflight.md) | source preflight (`wal_level`, headroom, publication) | §1.1 |
+| ✅ | [2.19](./phase-2-pg-sink/pr-2.19-sink-source-preflight.md) | source preflight (`wal_level`, headroom, publication) | §1.1 |
 | ☐ | [2.20](./phase-2-pg-sink/pr-2.20-sink-replication-connection-keepalive.md) | `START_REPLICATION` + keepalive feedback (the spike) | §1.2 / §1.9 |
 | ☐ | [2.21](./phase-2-pg-sink/pr-2.21-sink-wire-decoder.md) | wire the decoder to the live stream | proto §4 |
 | ☐ | [2.22](./phase-2-pg-sink/pr-2.22-sink-relation-cache.md) | relation cache + Arrow schema per `schema_version` | bootstrap 7 / §2.6 |

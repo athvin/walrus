@@ -1,5 +1,7 @@
 # PR 2.19 — Source-side preflight (`wal_level`, headroom, publication, PK)
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/39
+
 > **Phase:** 2 — walrus-pg-sink (2c — the sink binary) · **Crates touched:** `pg-sink` (bin+lib), `common` ·
 > **Est. size:** M · **Depends on:** PR 2.18 · **Unlocks:** PR 2.20
 
@@ -129,19 +131,19 @@ INSERT INTO walrus.heartbeat (id, ts) VALUES (1, now()) ON CONFLICT DO NOTHING;
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] Preflight opens a **replication-capable** connection and runs catalog queries over it.
-- [ ] A correctly-configured source (wal_level=logical, PG≥14, headroom, `walrus_pub` covering tables +
+- [x] Preflight opens a **replication-capable** connection and runs catalog queries over it.
+- [x] A correctly-configured source (wal_level=logical, PG≥14, headroom, `walrus_pub` covering tables +
       `ddl_audit` + `heartbeat`, every user table PK'd) **passes** with no error.
-- [ ] `wal_level != logical`, PG < 14, no slot/wal-sender headroom, a publication gap, or a keyless
+- [x] `wal_level != logical`, PG < 14, no slot/wal-sender headroom, a publication gap, or a keyless
       table (strict) each produce the **matching `PreflightError`** and a distinct terminal `ExitCode`.
-- [ ] `lenient` mode **quarantines + alerts + continues** on a keyless table (surfaced in `PkReport`).
-- [ ] `migrations/source/0001_publication.sql` is idempotent (re-runnable) and creates/seeds
+- [x] `lenient` mode **quarantines + alerts + continues** on a keyless table (surfaced in `PkReport`).
+- [x] `migrations/source/0001_publication.sql` is idempotent (re-runnable) and creates/seeds
       `walrus.heartbeat`.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` then `cargo test -p pg-sink --test preflight`: good source passes,
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` then `cargo test -p pg-sink --test preflight`: good source passes,
         a source booted with `wal_level=replica` yields the terminal exit.
 
 ## Hints & gotchas
