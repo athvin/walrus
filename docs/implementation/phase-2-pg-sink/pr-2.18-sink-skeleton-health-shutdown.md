@@ -1,5 +1,7 @@
 # PR 2.18 — Sink binary skeleton: bootstrap scaffold, health endpoints, SIGTERM
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/38
+
 > **Phase:** 2 — walrus-pg-sink (2c — the sink binary) · **Crates touched:** `pg-sink` (bin+lib), `common` ·
 > **Est. size:** M · **Depends on:** PR 2.17 · **Unlocks:** PR 2.19
 
@@ -158,20 +160,20 @@ async fn run(cfg: crate::config::SinkConfig) -> anyhow::Result<()> {
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `pg-sink` builds as **bin + lib**; `pg-sink/tests/` still imports the `pgoutput` module.
-- [ ] Invalid config (missing field / out-of-bounds threshold) → **terminal**, mapped to a distinct
+- [x] `pg-sink` builds as **bin + lib**; `pg-sink/tests/` still imports the `pgoutput` module.
+- [x] Invalid config (missing field / out-of-bounds threshold) → **terminal**, mapped to a distinct
       non-zero `common::ExitCode`; a *missing control DB* is treated as **transient** until the
       `startup_deadline`, then terminal.
-- [ ] `/startup` returns non-200 during bootstrap and 200 after; `/ready` 200 only once `mark_ready`
+- [x] `/startup` returns non-200 during bootstrap and 200 after; `/ready` 200 only once `mark_ready`
       was called; `/healthz` reflects liveness (not lag).
-- [ ] SIGTERM (and SIGINT) trip the `CancellationToken`; `axum` server returns via
+- [x] SIGTERM (and SIGINT) trip the `CancellationToken`; `axum` server returns via
       `with_graceful_shutdown` and the process exits 0.
-- [ ] Docs/comments state the transient-vs-terminal rule and why liveness ≠ readiness.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` then a compose smoke: process boots, `/startup`→`/ready` flips,
+- [x] Docs/comments state the transient-vs-terminal rule and why liveness ≠ readiness.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` then a compose smoke: process boots, `/startup`→`/ready` flips,
         and a *missing* control DB yields the mapped non-zero exit.
 
 ## Hints & gotchas

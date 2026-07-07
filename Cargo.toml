@@ -39,3 +39,7 @@ parquet = "=54.3.1"
 duckdb = "=1.10504.0"
 uuid = "1"
 tempfile = "3"
+# Sink binary (PR 2.18): health endpoints, cancellation, object-store canary.
+axum = "0.7"
+tokio-util = "0.7"
+object_store = "0.11"
