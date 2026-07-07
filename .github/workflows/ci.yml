@@ -204,6 +204,12 @@ jobs:
       - name: Sink pod-lifecycle smoke (health · SIGTERM · fail-fast exit code)
         run: bash scripts/sink-smoke.sh
 
+      # PR 3.1: loader bootstrap — acquires the ownership lease, opens <table>.duckdb with both
+      # <table> and <table>_raw, loads watermarks; a live-lease 2nd instance exits terminal; a stale
+      # lock behind an expired lease is reclaimed.
+      - name: Loader bootstrap (compose)
+        run: cargo test -p loader --test bootstrap -- --ignored --test-threads=1
+
       - name: Tear down (remove volumes)
         if: always()
         run: docker compose -f deploy/docker/docker-compose.yml down -v

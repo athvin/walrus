@@ -11,6 +11,7 @@ pub mod ddl_manifest;
 pub mod manifest;
 pub mod replication_state;
 pub mod schema_registry;
+pub mod table_ownership;
 
 pub use checkpoint::{
     advance_raw_appended, advance_transformed, ensure_checkpoint, read_checkpoint, Checkpoint,
@@ -24,3 +25,4 @@ pub use replication_state::{insert_epoch, read_current_epoch, ReplicationState};
 pub use schema_registry::{
     read_all_latest_registry, read_latest_version, read_registry, upsert_registry, RegistryRow,
 };
+pub use table_ownership::{acquire_lease, release_lease, renew_lease, Lease};
