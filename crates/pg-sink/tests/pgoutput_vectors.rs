@@ -528,7 +528,73 @@ fn render(m: &Message) -> String {
             };
             format!("STREAM ABORT  top_xid={top_xid} sub_xid={sub_xid}  <- {kind}")
         }
-        _ => todo!("render arm added in a later PR"),
+        Message::BeginPrepare {
+            prepare_lsn,
+            end_lsn,
+            prepare_ts,
+            xid,
+            gid,
+        } => format!(
+            "BEGIN PREPARE prepare_lsn={} end_lsn={} ts={} xid={xid} gid='{gid}'",
+            fmt_lsn(prepare_lsn.as_u64()),
+            fmt_lsn(end_lsn.as_u64()),
+            fmt_ts(*prepare_ts)
+        ),
+        Message::Prepare {
+            prepare_lsn,
+            end_lsn,
+            prepare_ts,
+            xid,
+            gid,
+            ..
+        } => format!(
+            "PREPARE       prepare_lsn={} end_lsn={} ts={} xid={xid} gid='{gid}'",
+            fmt_lsn(prepare_lsn.as_u64()),
+            fmt_lsn(end_lsn.as_u64()),
+            fmt_ts(*prepare_ts)
+        ),
+        Message::CommitPrepared {
+            commit_lsn,
+            end_lsn,
+            commit_ts,
+            xid,
+            gid,
+            ..
+        } => format!(
+            "COMMIT PREP   commit_lsn={} end_lsn={} ts={} xid={xid} gid='{gid}'",
+            fmt_lsn(commit_lsn.as_u64()),
+            fmt_lsn(end_lsn.as_u64()),
+            fmt_ts(*commit_ts)
+        ),
+        Message::RollbackPrepared {
+            end_lsn,
+            rollback_end_lsn,
+            prepare_ts,
+            rollback_ts,
+            xid,
+            gid,
+            ..
+        } => format!(
+            "ROLLBACK PREP end_lsn={} rollback_lsn={} prepare_ts={} rollback_ts={} xid={xid} gid='{gid}'",
+            fmt_lsn(end_lsn.as_u64()),
+            fmt_lsn(rollback_end_lsn.as_u64()),
+            fmt_ts(*prepare_ts),
+            fmt_ts(*rollback_ts)
+        ),
+        Message::StreamPrepare {
+            prepare_lsn,
+            end_lsn,
+            prepare_ts,
+            xid,
+            gid,
+            ..
+        } => format!(
+            "STREAM PREPARE prepare_lsn={} end_lsn={} ts={} xid={xid} gid='{gid}'",
+            fmt_lsn(prepare_lsn.as_u64()),
+            fmt_lsn(end_lsn.as_u64()),
+            fmt_ts(*prepare_ts)
+        ),
+        _ => unreachable!("every current Message variant is rendered"),
     }
 }
 
@@ -995,10 +1061,74 @@ fn parse_stream_preserves_streaming_context_across_messages() {
 }
 
 #[test]
-#[ignore = "meta-check; the family tests validate the vectors from PR 2.2 on"]
-fn all_vectors_present_and_hex_decodable() {
-    for v in VECTORS {
-        assert!(hex::decode(v.hex).is_ok(), "vector {} has bad hex", v.name);
+fn two_phase_vectors_render() {
+    for name in [
+        "begin_prepare",
+        "prepare",
+        "commit_prepared",
+        "rollback_prepared",
+    ] {
+        let v = lookup(name);
+        assert_eq!(render(&decode(v.hex, v.streaming)), v.expected, "{name}");
     }
+}
+
+#[test]
+fn two_phase_messages_carry_gid_and_xid() {
+    // Proves each field order (esp. rollback_prepared's two-ts/two-end-LSN layout) is exact.
+    for name in [
+        "begin_prepare",
+        "prepare",
+        "commit_prepared",
+        "rollback_prepared",
+    ] {
+        let (xid, gid) = match decode(lookup(name).hex, false) {
+            Message::BeginPrepare { xid, gid, .. }
+            | Message::Prepare { xid, gid, .. }
+            | Message::CommitPrepared { xid, gid, .. }
+            | Message::RollbackPrepared { xid, gid, .. } => (xid, gid),
+            other => panic!("{name}: expected a two-phase message, got {other:?}"),
+        };
+        assert_eq!(xid, 100, "{name} xid");
+        assert_eq!(gid, "gtx", "{name} gid");
+    }
+}
+
+#[test]
+fn commit_prepared_k_disambiguated_from_update_key_marker() {
+    // Top-level 'K' is Commit Prepared...
+    assert!(matches!(
+        decode(lookup("commit_prepared").hex, false),
+        Message::CommitPrepared { .. }
+    ));
+    // ...while the 'K' inside an Update is the old-KEY marker. Same byte, different position.
+    match decode(lookup("update_pk_change").hex, false) {
+        Message::Update { old_kind, .. } => assert_eq!(old_kind, Some(OldTupleKind::Key)),
+        other => panic!("expected Update, got {other:?}"),
+    }
+}
+
+#[test]
+fn unknown_top_level_byte_still_errors() {
+    // Adding the two-phase arms must not turn a truly unknown byte into a silent success.
+    let mut ctx = StreamCtx::default();
+    assert!(matches!(
+        parse_message(&mut Reader::new(b"Zxxxx"), &mut ctx),
+        Err(DecodeError::UnknownMessage { byte: b'Z' })
+    ));
+}
+
+/// The decoder now covers the full catalog (v1 + v2 streaming + v3 two-phase): EVERY ported vector
+/// round-trips to its golden line.
+#[test]
+fn all_vectors_render_to_golden() {
     assert_eq!(VECTORS.len(), 30, "expected the full ported VECTORS set");
+    for v in VECTORS {
+        assert_eq!(
+            render(&decode(v.hex, v.streaming)),
+            v.expected,
+            "{}",
+            v.name
+        );
+    }
 }

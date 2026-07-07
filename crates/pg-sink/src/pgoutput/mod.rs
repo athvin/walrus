@@ -126,6 +126,58 @@ pub enum Message {
     /// fields (those exist only under `streaming 'parallel'`, v4, which walrus never enables).
     /// `sub != top` is a rolled-back savepoint inside a *committing* transaction (§9b).
     StreamAbort { top_xid: u32, sub_xid: u32 },
+
+    // ---- two-phase (v3) frames. walrus runs at v2 and never enables `two_phase`, so it NEVER sees
+    // these in production — but the decoder must still parse them without misaligning the cursor, so
+    // a stray byte fails loudly *at that byte* rather than silently corrupting the stream. There is
+    // no runtime handling for these anywhere; the decoder is simply complete. ----
+    /// `'b'`: Int64 prepare LSN, Int64 end LSN, Int64 prepare ts, Int32 xid, String gid.
+    BeginPrepare {
+        prepare_lsn: Lsn,
+        end_lsn: Lsn,
+        prepare_ts: i64,
+        xid: u32,
+        gid: String,
+    },
+    /// `'P'`: Int8 flags, then prepare LSN, end LSN, prepare ts, xid, gid.
+    Prepare {
+        flags: u8,
+        prepare_lsn: Lsn,
+        end_lsn: Lsn,
+        prepare_ts: i64,
+        xid: u32,
+        gid: String,
+    },
+    /// `'K'`: Int8 flags, commit LSN, end LSN, commit ts, xid, gid. **Top-level message** — NOT the
+    /// old-KEY submessage marker (that `'K'` is read only inside the Update/Delete arms; same byte,
+    /// different parser position, no collision).
+    CommitPrepared {
+        flags: u8,
+        commit_lsn: Lsn,
+        end_lsn: Lsn,
+        commit_ts: i64,
+        xid: u32,
+        gid: String,
+    },
+    /// `'r'`: Int8 flags, end LSN, rollback end LSN, prepare ts, rollback ts, xid, gid.
+    RollbackPrepared {
+        flags: u8,
+        end_lsn: Lsn,
+        rollback_end_lsn: Lsn,
+        prepare_ts: i64,
+        rollback_ts: i64,
+        xid: u32,
+        gid: String,
+    },
+    /// `'p'`: the streamed variant of Prepare (same fields as `'P'`).
+    StreamPrepare {
+        flags: u8,
+        prepare_lsn: Lsn,
+        end_lsn: Lsn,
+        prepare_ts: i64,
+        xid: u32,
+        gid: String,
+    },
 }
 
 impl Message {
@@ -351,6 +403,48 @@ fn parse_one(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Message, De
         b'A' => Ok(Message::StreamAbort {
             top_xid: reader.int32()?,
             sub_xid: reader.int32()?,
+        }),
+        // Two-phase (v3). Field orders differ per message — cross-checked against the reference
+        // decoder. `'K'` here is Commit Prepared (top-level), distinct from the old-KEY marker.
+        b'b' => Ok(Message::BeginPrepare {
+            prepare_lsn: reader.lsn()?,
+            end_lsn: reader.lsn()?,
+            prepare_ts: reader.int64()?,
+            xid: reader.int32()?,
+            gid: reader.string()?,
+        }),
+        b'P' => Ok(Message::Prepare {
+            flags: reader.byte1()?,
+            prepare_lsn: reader.lsn()?,
+            end_lsn: reader.lsn()?,
+            prepare_ts: reader.int64()?,
+            xid: reader.int32()?,
+            gid: reader.string()?,
+        }),
+        b'K' => Ok(Message::CommitPrepared {
+            flags: reader.byte1()?,
+            commit_lsn: reader.lsn()?,
+            end_lsn: reader.lsn()?,
+            commit_ts: reader.int64()?,
+            xid: reader.int32()?,
+            gid: reader.string()?,
+        }),
+        b'r' => Ok(Message::RollbackPrepared {
+            flags: reader.byte1()?,
+            end_lsn: reader.lsn()?,
+            rollback_end_lsn: reader.lsn()?,
+            prepare_ts: reader.int64()?,
+            rollback_ts: reader.int64()?,
+            xid: reader.int32()?,
+            gid: reader.string()?,
+        }),
+        b'p' => Ok(Message::StreamPrepare {
+            flags: reader.byte1()?,
+            prepare_lsn: reader.lsn()?,
+            end_lsn: reader.lsn()?,
+            prepare_ts: reader.int64()?,
+            xid: reader.int32()?,
+            gid: reader.string()?,
         }),
         other => Err(DecodeError::UnknownMessage { byte: other }),
     }
