@@ -64,15 +64,14 @@ pub async fn run_decode_loop(
                                 }
                                 other => {
                                     for sealed in router.route(cache, other, frame_lsn, schema_version)? {
-                                        // Durability step (a): PUT to S3 before anything downstream.
-                                        let written = sink.put(sealed).await.context("PUT parquet object to S3")?;
-                                        // TODO(PR 2.25): manifest `ready` INSERT keyed on this object;
-                                        // TODO(PR 2.26): advance confirmed_flush_lsn once durable.
+                                        // Durability steps (a) PUT then (b) commit the manifest row.
+                                        let written = flush_batch(sink, pool, epoch, sealed).await?;
+                                        // TODO(PR 2.26): advance confirmed_flush_lsn to written.lsn_end.
                                         tracing::info!(
                                             uri = %written.s3_uri,
                                             rows = written.row_count,
                                             lsn_end = %written.lsn_end,
-                                            "wrote parquet object"
+                                            "durable: object + manifest ready row"
                                         );
                                     }
                                 }
@@ -83,6 +82,28 @@ pub async fn run_decode_loop(
             }
         }
     }
+}
+
+/// Flush a sealed batch durably: **(a)** PUT the Parquet object to S3, **then (b)** commit the
+/// `file_manifest` `ready` row — never the other way round (§1.5). Step (c) — advancing the slot to
+/// `obj.lsn_end` — is PR 2.26. A crash between (a) and (b) is safe: the batch re-streams (no `ready`
+/// row was committed), at-least-once.
+pub async fn flush_batch(
+    sink: &crate::sink::ParquetSink,
+    ex: impl sqlx::PgExecutor<'_>,
+    epoch: i64,
+    batch: crate::batch::SealedBatch,
+) -> anyhow::Result<crate::sink::WrittenObject> {
+    // (a) durable in S3.
+    let obj = sink
+        .put(batch)
+        .await
+        .context("PUT parquet object to S3 (durability a)")?;
+    // (b) committed in the control DB.
+    crate::manifest::record_ready(ex, epoch, &obj)
+        .await
+        .context("commit manifest ready row (durability b)")?;
+    Ok(obj)
 }
 
 /// Routes decoded changes into per-table [`TableBatcher`]s and seals at commit boundaries. Owns the

@@ -24,11 +24,23 @@ pub enum FileKind {
     Snapshot,
 }
 
+impl FileKind {
+    /// The `file_manifest.kind` string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FileKind::Stream => "stream",
+            FileKind::Snapshot => "snapshot",
+        }
+    }
+}
+
 /// The result of a durable S3 PUT — everything PR 2.25 needs for the manifest row.
 #[derive(Debug, Clone)]
 pub struct WrittenObject {
     pub s3_uri: String,
     pub key: Path,
+    pub source_schema: String,
+    pub source_table: String,
     pub lsn_start: Lsn,
     pub lsn_end: Lsn,
     pub row_count: u64,
@@ -87,6 +99,8 @@ impl ParquetSink {
         Ok(WrittenObject {
             s3_uri: format!("s3://{}/{}", self.bucket, key),
             key,
+            source_schema: batch.schema,
+            source_table: batch.table,
             lsn_start: batch.lsn_start,
             lsn_end: batch.lsn_end,
             row_count: batch.row_count,

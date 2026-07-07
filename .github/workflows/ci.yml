@@ -155,6 +155,10 @@ jobs:
       - name: Parquet S3 PUT (compose)
         run: cargo test -p pg-sink --test parquet_put -- --ignored
 
+      # PR 2.25: manifest INSERT — object + ready row both exist; lsn_end == commit LSN.
+      - name: Manifest insert (compose)
+        run: cargo test -p pg-sink --test manifest_insert -- --ignored
+
       # PR 2.18/2.19: the sink pod-lifecycle shell against the live stack — full bootstrap (control +
       # S3 + source preflight) → /startup→/ready flip, SIGTERM exit 0, missing control DB → exit 11.
       - name: Sink pod-lifecycle smoke (health · SIGTERM · fail-fast exit code)
