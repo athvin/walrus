@@ -1,5 +1,7 @@
 # PR 0.4 — `init_tracing()` and the structured-field convention
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/12
+
 > **Phase:** 0 — Foundations & CI · **Crates touched:** `common` · **Est. size:** S ·
 > **Depends on:** PR 0.3 · **Unlocks:** PR 0.5
 
@@ -113,17 +115,17 @@ mod tests {
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `init_tracing(&TelemetryConfig::default())` returns `Ok(())` and installs a subscriber without
+- [x] `init_tracing(&TelemetryConfig::default())` returns `Ok(())` and installs a subscriber without
       panicking.
-- [ ] A **second** `init_tracing` call is a handled outcome (e.g. logs at `debug` and returns `Ok`),
+- [x] A **second** `init_tracing` call is a handled outcome (e.g. logs at `debug` and returns `Ok`),
       never a panic — global-subscriber double-install is expected under test.
-- [ ] `cfg.filter` (or `RUST_LOG`, or the default) drives the level; `cfg.json` selects JSON vs pretty.
-- [ ] The `fields` constants exist and are referenced from a doc comment as the required spelling.
-- [ ] No `println!`/`eprintln!` anywhere in `common`.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p common` (and `--workspace` stays green)
+- [x] `cfg.filter` (or `RUST_LOG`, or the default) drives the level; `cfg.json` selects JSON vs pretty.
+- [x] The `fields` constants exist and are referenced from a doc comment as the required spelling.
+- [x] No `println!`/`eprintln!` anywhere in `common`.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p common` (and `--workspace` stays green)
 
 ## Hints & gotchas
 
