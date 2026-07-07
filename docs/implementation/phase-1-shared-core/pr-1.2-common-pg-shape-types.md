@@ -4,6 +4,8 @@
 
 # PR 1.2 — Add the Postgres shape types (the decoupling seam)
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/16
+
 > **Phase:** 1 — Shared core · **Crates touched:** `common` · **Est. size:** M ·
 > **Depends on:** PR 1.1 · **Unlocks:** PR 1.6, PR 2.3, PR 2.9
 
@@ -182,16 +184,16 @@ mod tests {
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `ReplicaIdentity::from_wire` maps `d/n/f/i` correctly and errors on anything else.
-- [ ] `PgColumn::numeric_precision_scale()` decodes the §4 example (`atttypmod 655366 → (10, 2)`).
-- [ ] `PgRelation::key_columns()` returns key columns **in relation order** (composite-PK safe).
-- [ ] `TupleValue` keeps `Null` and `UnchangedToast` as distinct variants; `Binary` uses `bytes::Bytes`.
-- [ ] `TypeDescriptor` serde-round-trips the §2.6 interval example (keys, `tier` as `2`, nested `meta`).
-- [ ] Docs/comments state that these types are the seam: decoder produces, pg-to-arrow/control/loader consume.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p common` (and `--workspace` stays green)
+- [x] `ReplicaIdentity::from_wire` maps `d/n/f/i` correctly and errors on anything else.
+- [x] `PgColumn::numeric_precision_scale()` decodes the §4 example (`atttypmod 655366 → (10, 2)`).
+- [x] `PgRelation::key_columns()` returns key columns **in relation order** (composite-PK safe).
+- [x] `TupleValue` keeps `Null` and `UnchangedToast` as distinct variants; `Binary` uses `bytes::Bytes`.
+- [x] `TypeDescriptor` serde-round-trips the §2.6 interval example (keys, `tier` as `2`, nested `meta`).
+- [x] Docs/comments state that these types are the seam: decoder produces, pg-to-arrow/control/loader consume.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p common` (and `--workspace` stays green)
 
 ## Hints & gotchas
 
