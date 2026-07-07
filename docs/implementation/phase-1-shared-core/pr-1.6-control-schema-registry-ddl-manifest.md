@@ -4,6 +4,8 @@
 
 # PR 1.6 — `schema_registry` + `ddl_manifest` models
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/20
+
 > **Phase:** 1 — Shared core · **Crates touched:** `control` · **Est. size:** M ·
 > **Depends on:** PR 1.3, PR 1.2 · **Unlocks:** PR 2.17, PR 2.22, PR 2.33, PR 3.8
 
@@ -176,18 +178,18 @@ async fn read_pending_ddl_orders_by_c_lsn() { todo!() }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `schema_registry` stores/loads `Vec<TypeDescriptor>` (from `common`) as `jsonb`, keyed by
+- [x] `schema_registry` stores/loads `Vec<TypeDescriptor>` (from `common`) as `jsonb`, keyed by
       `(epoch, schema, table, schema_version)`; a re-write of the same version is idempotent.
-- [ ] `read_registry(version)` round-trips a descriptor set **byte-for-byte equal** to what was written.
-- [ ] `read_latest_version` returns the max `schema_version` for a table (or `None`).
-- [ ] `ddl_manifest` rows carry `c_lsn` (commit LSN) and `read_pending_ddl(after_lsn)` returns rows in
+- [x] `read_registry(version)` round-trips a descriptor set **byte-for-byte equal** to what was written.
+- [x] `read_latest_version` returns the max `schema_version` for a table (or `None`).
+- [x] `ddl_manifest` rows carry `c_lsn` (commit LSN) and `read_pending_ddl(after_lsn)` returns rows in
       `c_lsn` order.
-- [ ] Comments state these tables are **history — never pruned** (contrast with the manifest queue).
-- [ ] `.sqlx/` regenerated; `cargo sqlx prepare --check` passes.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p control` and — with services — `docker compose up --wait` then
+- [x] Comments state these tables are **history — never pruned** (contrast with the manifest queue).
+- [x] `.sqlx/` regenerated; `cargo sqlx prepare --check` passes.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p control` and — with services — `docker compose up --wait` then
         `cargo test -p control --test registry_ddl` (descriptor + ddl round-trip passes).
 
 ## Hints & gotchas
