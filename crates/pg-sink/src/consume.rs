@@ -20,13 +20,17 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 /// Drive the stream: decode each `XLogData`, register each `Relation` (cache + schema_registry), route
-/// I/U/D into per-table batchers (sealing at commit boundaries), keep keepalives answered (inside
-/// `ReplicationStream`), and exit cleanly on cancel or stream end.
+/// I/U/D into per-table batchers (sealing at commit boundaries), PUT sealed batches to S3, keep
+/// keepalives answered (inside `ReplicationStream`), and exit cleanly on cancel or stream end.
+// The loop driver wires together the full pipeline (cache, router, sink, control pool); its arity is
+// intrinsic, not a code smell.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_decode_loop(
     stream: &mut ReplicationStream,
     token: CancellationToken,
     cache: &mut RelationCache,
     router: &mut BatchRouter,
+    sink: &crate::sink::ParquetSink,
     pool: &sqlx::PgPool,
     epoch: i64,
     schema_version: i64,
@@ -60,12 +64,15 @@ pub async fn run_decode_loop(
                                 }
                                 other => {
                                     for sealed in router.route(cache, other, frame_lsn, schema_version)? {
-                                        // TODO(PR 2.24): Parquet-encode + S3 PUT; PR 2.25: manifest INSERT.
+                                        // Durability step (a): PUT to S3 before anything downstream.
+                                        let written = sink.put(sealed).await.context("PUT parquet object to S3")?;
+                                        // TODO(PR 2.25): manifest `ready` INSERT keyed on this object;
+                                        // TODO(PR 2.26): advance confirmed_flush_lsn once durable.
                                         tracing::info!(
-                                            source_table = %format_args!("{}.{}", sealed.schema, sealed.table),
-                                            rows = sealed.row_count,
-                                            lsn_end = %sealed.lsn_end,
-                                            "sealed batch (write is PR 2.24)"
+                                            uri = %written.s3_uri,
+                                            rows = written.row_count,
+                                            lsn_end = %written.lsn_end,
+                                            "wrote parquet object"
                                         );
                                     }
                                 }

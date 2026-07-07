@@ -32,6 +32,9 @@ serde_json = { workspace = true }
 # Relation cache (PR 2.22): decoded PgRelation → Arrow schema + TypeDescriptors.
 pg-to-arrow = { path = "../pg-to-arrow" }
 arrow = { workspace = true }
+# Parquet encode → S3 (PR 2.24): AsyncArrowWriter streams into an object_store multipart writer.
+parquet = { workspace = true, features = ["async"] }
+uuid = { workspace = true, features = ["v4"] }
 figment = { workspace = true, features = ["env", "toml", "yaml"] }
 humantime-serde = { workspace = true }
 tokio = { workspace = true, features = [

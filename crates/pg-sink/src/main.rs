@@ -130,12 +130,18 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
         epoch,
         cfg.instance.clone(),
     );
+    let sink = pg_sink::sink::ParquetSink::new(
+        ctx.object_store.clone(),
+        cfg.object_store.bucket.clone(),
+        epoch,
+    );
 
     let result = consume::run_decode_loop(
         &mut stream,
         token.clone(),
         &mut cache,
         &mut router,
+        &sink,
         &ctx.control_pool,
         epoch,
         SCHEMA_VERSION,

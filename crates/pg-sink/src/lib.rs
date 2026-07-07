@@ -16,4 +16,5 @@ pub mod preflight;
 pub mod relcache;
 pub mod replication;
 pub mod shutdown;
+pub mod sink;
 pub mod slot;
