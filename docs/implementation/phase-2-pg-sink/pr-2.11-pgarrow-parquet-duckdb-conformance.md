@@ -1,5 +1,7 @@
 # PR 2.11 — Parquet write + DuckDB read-back conformance harness (Tier-1)
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/31
+
 > **Phase:** 2 — walrus-pg-sink (2b: pg-to-arrow) · **Crates touched:** `pg-to-arrow` · **Est. size:** L ·
 > **Depends on:** PR 2.10 · **Unlocks:** PR 2.12 (and every Tier-2/3 PR reuses this harness)
 
@@ -97,19 +99,19 @@ fn read_parquet_rows(bytes: &[u8], sql: &str) -> Vec<(String, String)> { todo!()
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `write_parquet_bytes` produces a valid Parquet file arrow-rs can read back to an equal `RecordBatch`.
-- [ ] Under `--features conformance`, each Tier-1 type write→`read_parquet`→asserts **`typeof(col)`** *and* the value.
-- [ ] `timestamptz` reads back as DuckDB `TIMESTAMP WITH TIME ZONE` and `timestamp` as `TIMESTAMP` (the
+- [x] `write_parquet_bytes` produces a valid Parquet file arrow-rs can read back to an equal `RecordBatch`.
+- [x] Under `--features conformance`, each Tier-1 type write→`read_parquet`→asserts **`typeof(col)`** *and* the value.
+- [x] `timestamptz` reads back as DuckDB `TIMESTAMP WITH TIME ZONE` and `timestamp` as `TIMESTAMP` (the
       `isAdjustedToUTC` distinction), both at microsecond resolution.
-- [ ] `numeric(10,2)` reads back as DuckDB `DECIMAL(10,2)` with the exact value; `bytea` reads back as `BLOB`.
-- [ ] Default build (`cargo test -p pg-to-arrow`) does **not** compile `duckdb`; the conformance tests only
+- [x] `numeric(10,2)` reads back as DuckDB `DECIMAL(10,2)` with the exact value; `bytea` reads back as `BLOB`.
+- [x] Default build (`cargo test -p pg-to-arrow`) does **not** compile `duckdb`; the conformance tests only
       run under the feature.
-- [ ] CI gains a `conformance` job that builds bundled DuckDB with a cache and runs the feature tests green.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-to-arrow`
-  - [ ] `cargo test -p pg-to-arrow --features conformance` (the write→read_parquet→typeof assertions)
+- [x] CI gains a `conformance` job that builds bundled DuckDB with a cache and runs the feature tests green.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-to-arrow`
+  - [x] `cargo test -p pg-to-arrow --features conformance` (the write→read_parquet→typeof assertions)
 
 ## Hints & gotchas
 
