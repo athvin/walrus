@@ -4,6 +4,8 @@
 
 # PR 1.4 — `file_manifest` models: insert-ready, claim-in-commit-order, delete-claimed
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/18
+
 > **Phase:** 1 — Shared core · **Crates touched:** `control` · **Est. size:** M ·
 > **Depends on:** PR 1.3 · **Unlocks:** PR 2.25, PR 3.2
 
@@ -143,17 +145,17 @@ async fn mark_failed_removes_row_from_ready_claims() { todo!() }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `claim_ready` emits `WHERE status='ready' … ORDER BY lsn_end, id LIMIT $n` and is proven to
+- [x] `claim_ready` emits `WHERE status='ready' … ORDER BY lsn_end, id LIMIT $n` and is proven to
       order two equal-`lsn_end` files by ascending `id`.
-- [ ] There is **no** `lsn_end > raw_appended_lsn` predicate anywhere in the claim path (comment says why).
-- [ ] `insert_ready` writes `status='ready'` with `lsn_end` set to the commit LSN and returns the `id`.
-- [ ] `delete_claimed(&ids)` retires exactly those rows via `= ANY($1)`; `mark_failed` dead-letters one.
-- [ ] Compose test: seed manifest rows, claim in order (incl. tiebreak), then delete — all green.
-- [ ] `.sqlx/` regenerated; `cargo sqlx prepare --check` passes.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p control` and — with services — `docker compose up --wait` then
+- [x] There is **no** `lsn_end > raw_appended_lsn` predicate anywhere in the claim path (comment says why).
+- [x] `insert_ready` writes `status='ready'` with `lsn_end` set to the commit LSN and returns the `id`.
+- [x] `delete_claimed(&ids)` retires exactly those rows via `= ANY($1)`; `mark_failed` dead-letters one.
+- [x] Compose test: seed manifest rows, claim in order (incl. tiebreak), then delete — all green.
+- [x] `.sqlx/` regenerated; `cargo sqlx prepare --check` passes.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p control` and — with services — `docker compose up --wait` then
         `cargo test -p control --test manifest` (the named claim-order assertion passes).
 
 ## Hints & gotchas
