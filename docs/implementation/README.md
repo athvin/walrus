@@ -179,7 +179,7 @@ Two deliberate structural notes:
 | ✅ | [2.3](./phase-2-pg-sink/pr-2.3-pgoutput-relation-type.md) | Relation + Type (typmod → `numeric(p,s)`) | proto §4 / sink §2.3 |
 | ✅ | [2.4](./phase-2-pg-sink/pr-2.4-pgoutput-tuple-insert.md) | TupleData (`n`/`u`/`t`/`b`) + Insert | proto §4–§5 |
 | ✅ | [2.5](./phase-2-pg-sink/pr-2.5-pgoutput-update-delete.md) | Update + Delete (K/O old-image; NULL vs TOAST) | proto §4 / §6 |
-| ☐ | [2.6](./phase-2-pg-sink/pr-2.6-pgoutput-truncate-message.md) | Truncate + logical Message | proto §4 |
+| ✅ | [2.6](./phase-2-pg-sink/pr-2.6-pgoutput-truncate-message.md) | Truncate + logical Message | proto §4 |
 | ☐ | [2.7](./phase-2-pg-sink/pr-2.7-pgoutput-streaming-frames.md) | v2 Stream frames + per-msg xid + subtxn-abort | proto §7–§10 |
 | ☐ | [2.8](./phase-2-pg-sink/pr-2.8-pgoutput-two-phase.md) | v3 two-phase parse-without-misalign + `K` disambiguation | proto §12 |
 

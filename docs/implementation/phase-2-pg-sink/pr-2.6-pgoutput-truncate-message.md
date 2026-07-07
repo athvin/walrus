@@ -1,5 +1,7 @@
 # PR 2.6 — `Truncate` and the logical `Message`
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/26
+
 > **Phase:** 2 — walrus-pg-sink (2a: the hand-rolled decoder) · **Crates touched:** `pg-sink` ·
 > **Est. size:** S · **Depends on:** PR 2.5 · **Unlocks:** PR 2.7
 
@@ -118,17 +120,17 @@ fn message_transactional_flag() {
 
 ## Definition of Done
 
-- [ ] `truncate_plain`, `truncate_cascade_restart`, `message_non_transactional`, `message_transactional`
+- [x] `truncate_plain`, `truncate_cascade_restart`, `message_non_transactional`, `message_transactional`
       all render to their golden lines.
-- [ ] `truncate_plain` → `(cascade, restart_identity) == (false, false)`, `relations == [16651]`;
+- [x] `truncate_plain` → `(cascade, restart_identity) == (false, false)`, `relations == [16651]`;
       `truncate_cascade_restart` → `(true, true)`, `relations == [16665]`.
-- [ ] `message_non_transactional.transactional == false`; `message_transactional.transactional == true`.
-- [ ] Message `content` is preserved as raw bytes (e.g. `b"hb-non"`, `b"hb-txn"`), not utf-8-lossily
+- [x] `message_non_transactional.transactional == false`; `message_transactional.transactional == true`.
+- [x] Message `content` is preserved as raw bytes (e.g. `b"hb-non"`, `b"hb-txn"`), not utf-8-lossily
       decoded in the decoder.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink` (workspace stays green)
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink` (workspace stays green)
 
 ## Hints & gotchas
 
