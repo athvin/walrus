@@ -1,5 +1,7 @@
 # PR 2.23 — Micro-batching + cadence flush triggers
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/43
+
 > **Phase:** 2 — walrus-pg-sink (2c — the sink binary) · **Crates touched:** `pg-sink` (bin+lib),
 > `pg-to-arrow` · **Est. size:** M · **Depends on:** PR 2.22 · **Unlocks:** PR 2.24
 
@@ -131,19 +133,19 @@ mod tests {
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] Rows buffer against the **open** txn and become flush-eligible only at `Commit`; `seal()` on an
+- [x] Rows buffer against the **open** txn and become flush-eligible only at `Commit`; `seal()` on an
       open txn returns `BatchError::OpenTransaction`.
-- [ ] `should_flush` trips on **each** of `max_rows`, `max_bytes`, and `max_fill` — proven by three
+- [x] `should_flush` trips on **each** of `max_rows`, `max_bytes`, and `max_fill` — proven by three
       unit tests, the last using a **fake clock** (no real sleep).
-- [ ] A sealed batch's `lsn_end` is the **commit LSN** of its last transaction, not the max row LSN
+- [x] A sealed batch's `lsn_end` is the **commit LSN** of its last transaction, not the max row LSN
       (a dedicated test builds a batch where those differ).
-- [ ] Each buffered row carries a populated `walrus_pg_sink_meta` (`op`, `commit_lsn`, `lsn`, `xid`,
+- [x] Each buffered row carries a populated `walrus_pg_sink_meta` (`op`, `commit_lsn`, `lsn`, `xid`,
       `kind`, table/schema, `schema_version`).
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink` (unit fake-clock tests; `--workspace` stays green)
-  - [ ] `docker compose up --wait` then a compose check: a stream of inserts forms and seals ≥ 1 batch.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink` (unit fake-clock tests; `--workspace` stays green)
+  - [x] `docker compose up --wait` then a compose check: a stream of inserts forms and seals ≥ 1 batch.
 
 ## Hints & gotchas
 

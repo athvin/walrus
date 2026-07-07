@@ -8,18 +8,25 @@
 //! loop, since a v2 sub-xid prefix appears *only inside* a stream. Small txns still arrive whole at
 //! commit (no stream frames), and `StreamCtx` handles both shapes with no special-casing here.
 
+use crate::batch::{BatchTriggers, Clock, SealedBatch, TableBatcher};
 use crate::pgoutput::{self, Message, Reader, StreamCtx};
 use crate::relcache::{is_internal_table, RelationCache};
 use crate::replication::{ReplicationMessage, ReplicationStream};
 use anyhow::Context;
+use common::{Kind, Lsn, Op, SinkMeta, TupleValue, UtcTimestamp};
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-/// Drive the stream: decode each `XLogData`, register each `Relation` (cache + schema_registry), keep
-/// keepalives answered (inside `ReplicationStream`), and exit cleanly on cancel or stream end.
+/// Drive the stream: decode each `XLogData`, register each `Relation` (cache + schema_registry), route
+/// I/U/D into per-table batchers (sealing at commit boundaries), keep keepalives answered (inside
+/// `ReplicationStream`), and exit cleanly on cancel or stream end.
 pub async fn run_decode_loop(
     stream: &mut ReplicationStream,
     token: CancellationToken,
     cache: &mut RelationCache,
+    router: &mut BatchRouter,
     pool: &sqlx::PgPool,
     epoch: i64,
     schema_version: i64,
@@ -38,17 +45,198 @@ pub async fn run_decode_loop(
                         return Ok(());
                     }
                     Some(frame) => {
+                        // The change's LSN is the XLogData frame's start (pgoutput change messages
+                        // carry no per-change LSN of their own).
+                        let frame_lsn = match &frame {
+                            ReplicationMessage::XLogData { wal_start, .. } => *wal_start,
+                            ReplicationMessage::Keepalive { .. } => Lsn::ZERO,
+                        };
                         if let Some(msg) = on_frame(&mut ctx, frame)? {
                             trace_message(&msg);
-                            if let Message::Relation { relation, .. } = &msg {
-                                on_relation(cache, pool, epoch, relation.clone(), schema_version)
-                                    .await?;
+                            match &msg {
+                                Message::Relation { relation, .. } => {
+                                    on_relation(cache, pool, epoch, relation.clone(), schema_version)
+                                        .await?;
+                                }
+                                other => {
+                                    for sealed in router.route(cache, other, frame_lsn, schema_version)? {
+                                        // TODO(PR 2.24): Parquet-encode + S3 PUT; PR 2.25: manifest INSERT.
+                                        tracing::info!(
+                                            source_table = %format_args!("{}.{}", sealed.schema, sealed.table),
+                                            rows = sealed.row_count,
+                                            lsn_end = %sealed.lsn_end,
+                                            "sealed batch (write is PR 2.24)"
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
         }
+    }
+}
+
+/// Routes decoded changes into per-table [`TableBatcher`]s and seals at commit boundaries. Owns the
+/// per-table batchers + the sink context stamped into each row's `walrus_pg_sink_meta`.
+pub struct BatchRouter {
+    batchers: HashMap<u32, TableBatcher>,
+    triggers: BatchTriggers,
+    clock: Arc<dyn Clock>,
+    epoch: i64,
+    sink_instance: String,
+    /// The current transaction's top-level xid (from `Begin`), used when a change carries no xid
+    /// (non-streamed txns).
+    txn_xid: u32,
+}
+
+impl BatchRouter {
+    pub fn new(
+        triggers: BatchTriggers,
+        clock: Arc<dyn Clock>,
+        epoch: i64,
+        sink_instance: String,
+    ) -> Self {
+        BatchRouter {
+            batchers: HashMap::new(),
+            triggers,
+            clock,
+            epoch,
+            sink_instance,
+            txn_xid: 0,
+        }
+    }
+
+    /// Route one decoded message. `Begin` sets the txn context; `I/U/D` buffer against the open txn;
+    /// `Commit` promotes them and returns any batches that a trigger sealed. Streamed large txns
+    /// (`Stream*`) and `Truncate`/`Message` are deferred (PR 2.30 / 2.27 / 2.33).
+    pub fn route(
+        &mut self,
+        cache: &RelationCache,
+        msg: &Message,
+        frame_lsn: Lsn,
+        schema_version: i64,
+    ) -> anyhow::Result<Vec<SealedBatch>> {
+        match msg {
+            Message::Begin { xid, .. } => {
+                self.txn_xid = *xid;
+                Ok(Vec::new())
+            }
+            Message::Insert {
+                relation_oid,
+                new,
+                xid,
+            } => {
+                self.push(
+                    cache,
+                    *relation_oid,
+                    Op::Insert,
+                    new,
+                    frame_lsn,
+                    xid.unwrap_or(self.txn_xid),
+                    schema_version,
+                )?;
+                Ok(Vec::new())
+            }
+            Message::Update {
+                relation_oid,
+                new,
+                xid,
+                ..
+            } => {
+                self.push(
+                    cache,
+                    *relation_oid,
+                    Op::Update,
+                    new,
+                    frame_lsn,
+                    xid.unwrap_or(self.txn_xid),
+                    schema_version,
+                )?;
+                Ok(Vec::new())
+            }
+            Message::Delete {
+                relation_oid,
+                old,
+                xid,
+                ..
+            } => {
+                // The old-key tuple is full-width (non-key columns as NULL under DEFAULT identity).
+                self.push(
+                    cache,
+                    *relation_oid,
+                    Op::Delete,
+                    old,
+                    frame_lsn,
+                    xid.unwrap_or(self.txn_xid),
+                    schema_version,
+                )?;
+                Ok(Vec::new())
+            }
+            Message::Commit { commit_lsn, .. } => self.commit(*commit_lsn),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push(
+        &mut self,
+        cache: &RelationCache,
+        oid: u32,
+        op: Op,
+        values: &[TupleValue],
+        frame_lsn: Lsn,
+        xid: u32,
+        schema_version: i64,
+    ) -> anyhow::Result<()> {
+        let Some(cached) = cache.get(oid, schema_version) else {
+            tracing::warn!(
+                relation_oid = oid,
+                "change for a relation with no cached shape yet; skipping"
+            );
+            return Ok(());
+        };
+        let triggers = self.triggers;
+        let clock = self.clock.clone();
+        let batcher = match self.batchers.entry(oid) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => e.insert(
+                TableBatcher::new(cached.clone(), triggers, clock)
+                    .context("create table batcher")?,
+            ),
+        };
+        let meta = SinkMeta {
+            op,
+            lsn: frame_lsn,
+            commit_lsn: Lsn::ZERO, // patched at the batcher's on_commit
+            commit_ts: UtcTimestamp::now(), // TODO: source commit_ts (Begin) needs a from-micros ctor
+            xid,
+            epoch: self.epoch,
+            batch_id: String::new(), // assigned by the batcher when the batch opens
+            schema_version,
+            source_schema: cached.relation.schema.clone(),
+            source_table: cached.relation.name.clone(),
+            kind: Kind::Stream,
+            unchanged_toast: vec![],
+            sink_instance: self.sink_instance.clone(),
+            sink_processed_at: UtcTimestamp::now(),
+        };
+        batcher.push(meta, values);
+        Ok(())
+    }
+
+    fn commit(&mut self, commit_lsn: Lsn) -> anyhow::Result<Vec<SealedBatch>> {
+        let mut sealed = Vec::new();
+        for batcher in self.batchers.values_mut() {
+            batcher
+                .on_commit(commit_lsn)
+                .context("promote committed rows")?;
+            if batcher.should_flush() {
+                sealed.push(batcher.seal().context("seal batch")?);
+            }
+        }
+        Ok(sealed)
     }
 }
 

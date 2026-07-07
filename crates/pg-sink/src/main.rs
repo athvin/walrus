@@ -119,10 +119,23 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
         "streaming logical replication"
     );
 
+    let triggers = pg_sink::batch::BatchTriggers {
+        max_fill: cfg.max_fill,
+        max_rows: cfg.max_rows,
+        max_bytes: cfg.max_bytes,
+    };
+    let mut router = consume::BatchRouter::new(
+        triggers,
+        std::sync::Arc::new(pg_sink::batch::SystemClock),
+        epoch,
+        cfg.instance.clone(),
+    );
+
     let result = consume::run_decode_loop(
         &mut stream,
         token.clone(),
         &mut cache,
+        &mut router,
         &ctx.control_pool,
         epoch,
         SCHEMA_VERSION,
