@@ -87,6 +87,24 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
     let resume = slot::verify_or_create_slot(&ctx.source_client, &cfg.slot_name)
         .await
         .context("verify/create replication slot")?;
+
+    // Epoch: the generation that namespaces control-plane state (§1.8). Resume the current one, or
+    // establish the first. Schema-version bumps arrive with DDL capture (PR 2.33); until then, 1.
+    let epoch = current_or_new_epoch(&ctx.control_pool, &cfg.slot_name, resume.start_lsn()).await?;
+    const SCHEMA_VERSION: i64 = 1;
+
+    // Shared bootstrap step 7: hydrate the relation cache from schema_registry so a restart resumes.
+    let mut cache = pg_sink::relcache::RelationCache::default();
+    let rows = control::read_all_latest_registry(&ctx.control_pool, epoch)
+        .await
+        .context("read schema_registry for hydration")?;
+    cache.hydrate(rows).context("hydrate relation cache")?;
+    tracing::info!(
+        epoch,
+        cached_relations = cache.len(),
+        "relation cache hydrated"
+    );
+
     let mut stream = ReplicationStream::start(
         &cfg.source_db_url,
         &cfg.slot_name,
@@ -101,7 +119,15 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
         "streaming logical replication"
     );
 
-    let result = consume::run_decode_loop(&mut stream, token.clone()).await;
+    let result = consume::run_decode_loop(
+        &mut stream,
+        token.clone(),
+        &mut cache,
+        &ctx.control_pool,
+        epoch,
+        SCHEMA_VERSION,
+    )
+    .await;
 
     // Whatever ended the loop (SIGTERM, stream end, or a decode error), drain the health server.
     state.mark_terminating();
@@ -112,4 +138,30 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
         .context("health server task join")?
         .context("health server")?;
     result
+}
+
+/// Resume the current epoch generation (§1.8), or establish the first one for this slot. Epoch bump /
+/// total-restart is PR 4.6.
+async fn current_or_new_epoch(
+    pool: &sqlx::PgPool,
+    slot_name: &str,
+    created_lsn: common::Lsn,
+) -> anyhow::Result<i64> {
+    if let Some(state) = control::read_current_epoch(pool)
+        .await
+        .context("read current epoch")?
+    {
+        return Ok(state.epoch);
+    }
+    let state = control::ReplicationState {
+        epoch: 1,
+        slot_name: slot_name.to_string(),
+        created_lsn,
+        status: "streaming".to_string(),
+    };
+    control::insert_epoch(pool, &state)
+        .await
+        .context("insert first epoch")?;
+    tracing::info!(epoch = 1, "established first epoch");
+    Ok(1)
 }

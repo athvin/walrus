@@ -143,6 +143,10 @@ jobs:
       - name: Live decode (compose)
         run: cargo test -p pg-sink --test live_decode -- --ignored
 
+      # PR 2.22: relation cache → schema_registry round-trip (first Relation writes a row; hydrate).
+      - name: Relation cache (compose)
+        run: cargo test -p pg-sink --test relation_cache -- --ignored
+
       # PR 2.18/2.19: the sink pod-lifecycle shell against the live stack — full bootstrap (control +
       # S3 + source preflight) → /startup→/ready flip, SIGTERM exit 0, missing control DB → exit 11.
       - name: Sink pod-lifecycle smoke (health · SIGTERM · fail-fast exit code)

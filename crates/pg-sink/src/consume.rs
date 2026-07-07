@@ -9,15 +9,20 @@
 //! commit (no stream frames), and `StreamCtx` handles both shapes with no special-casing here.
 
 use crate::pgoutput::{self, Message, Reader, StreamCtx};
+use crate::relcache::{is_internal_table, RelationCache};
 use crate::replication::{ReplicationMessage, ReplicationStream};
 use anyhow::Context;
 use tokio_util::sync::CancellationToken;
 
-/// Drive the stream: decode each `XLogData`, keep keepalives answered (inside `ReplicationStream`),
-/// and exit cleanly on cancel or stream end.
+/// Drive the stream: decode each `XLogData`, register each `Relation` (cache + schema_registry), keep
+/// keepalives answered (inside `ReplicationStream`), and exit cleanly on cancel or stream end.
 pub async fn run_decode_loop(
     stream: &mut ReplicationStream,
     token: CancellationToken,
+    cache: &mut RelationCache,
+    pool: &sqlx::PgPool,
+    epoch: i64,
+    schema_version: i64,
 ) -> anyhow::Result<()> {
     let mut ctx = StreamCtx::default();
     loop {
@@ -35,12 +40,52 @@ pub async fn run_decode_loop(
                     Some(frame) => {
                         if let Some(msg) = on_frame(&mut ctx, frame)? {
                             trace_message(&msg);
+                            if let Message::Relation { relation, .. } = &msg {
+                                on_relation(cache, pool, epoch, relation.clone(), schema_version)
+                                    .await?;
+                            }
                         }
                     }
                 }
             }
         }
     }
+}
+
+/// On a `Relation` message: build the Arrow schema + descriptors, cache them under
+/// `(oid, schema_version)`, and **persist** the `schema_registry` row (idempotent on
+/// `(epoch, schema, table, version)`). Internal walrus tables are never registered. The persist is a
+/// control-DB write, so this is `async`; the order is build → cache → persist.
+pub async fn on_relation(
+    cache: &mut RelationCache,
+    ex: impl sqlx::PgExecutor<'_>,
+    epoch: i64,
+    relation: common::PgRelation,
+    schema_version: i64,
+) -> anyhow::Result<()> {
+    if is_internal_table(&relation.schema, &relation.name) {
+        return Ok(());
+    }
+    let cached = cache
+        .upsert_from_relation(relation, schema_version)
+        .context("build Arrow schema for relation")?;
+    let row = control::RegistryRow {
+        epoch,
+        source_schema: cached.relation.schema.clone(),
+        source_table: cached.relation.name.clone(),
+        schema_version,
+        descriptors: cached.descriptors.clone(),
+        columns: serde_json::to_value(&cached.relation).context("serialize relation snapshot")?,
+    };
+    control::upsert_registry(ex, &row)
+        .await
+        .context("upsert schema_registry")?;
+    tracing::info!(
+        source_table = %format_args!("{}.{}", cached.relation.schema, cached.relation.name),
+        schema_version,
+        "registered relation"
+    );
+    Ok(())
 }
 
 /// Route one live frame. A keepalive is a no-op here (its feedback is sent inside the stream); an

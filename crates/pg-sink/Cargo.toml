@@ -28,6 +28,10 @@ sqlx = { workspace = true, features = [
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+# Relation cache (PR 2.22): decoded PgRelation → Arrow schema + TypeDescriptors.
+pg-to-arrow = { path = "../pg-to-arrow" }
+arrow = { workspace = true }
 figment = { workspace = true, features = ["env", "toml", "yaml"] }
 humantime-serde = { workspace = true }
 tokio = { workspace = true, features = [

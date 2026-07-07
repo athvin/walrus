@@ -21,4 +21,6 @@ pub use manifest::{
     claim_ready, delete_claimed, insert_ready, mark_failed, ManifestRow, NewManifestFile,
 };
 pub use replication_state::{insert_epoch, read_current_epoch, ReplicationState};
-pub use schema_registry::{read_latest_version, read_registry, upsert_registry, RegistryRow};
+pub use schema_registry::{
+    read_all_latest_registry, read_latest_version, read_registry, upsert_registry, RegistryRow,
+};
