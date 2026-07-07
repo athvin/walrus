@@ -439,3 +439,46 @@ fn geometric_path_open_vs_closed_reads_back_is_closed() {
     );
     assert_eq!(c[0], ("true".to_string(), "true".to_string()));
 }
+
+// ---- Tier-3 canonical-text carriers (PR 2.15) ---------------------------------------------------
+// No lossless structural target → one VARCHAR column carrying the canonical text verbatim.
+
+#[test]
+fn unconstrained_numeric_is_varchar_verbatim() {
+    let (t, v) = typeof_and_value(oids::NUMERIC, -1, "3.14159");
+    assert_eq!(t, "VARCHAR");
+    assert_eq!(v, "3.14159");
+}
+
+#[test]
+fn numeric_over_38_digits_survives_exactly_as_varchar() {
+    // 42 significant digits — well past DuckDB's DECIMAL precision-38 ceiling. As VARCHAR it is exact;
+    // a Decimal128/Decimal256 path would hit DuckDB's Parquet reader downcasting p>38 to DOUBLE and
+    // lose digits. Carried as unconstrained numeric (typmod -1).
+    let big = "1234567890123456789012345678901234567890.12";
+    let (t, v) = typeof_and_value(oids::NUMERIC, -1, big);
+    assert_eq!(t, "VARCHAR");
+    assert_eq!(v, big, "the exact 40+ digit string must survive");
+}
+
+#[test]
+fn system_types_carry_canonical_varchar() {
+    for (oid, text) in [
+        (oids::BIT, "101"),
+        (oids::VARBIT, "1011"),
+        (oids::INET, "192.168.0.1/24"),
+        (oids::CIDR, "10.0.0.0/8"),
+        (oids::MACADDR, "08:00:2b:01:02:03"),
+        (oids::MACADDR8, "08:00:2b:01:02:03:04:05"),
+        (oids::TSVECTOR, "'cat':1 'sat':2"),
+        (oids::TSQUERY, "'cat' & 'sat'"),
+        (oids::PG_LSN, "16/B374D848"),
+        (oids::XID, "1234"),
+        (oids::XID8, "1234567890"),
+        (oids::XML, "<a>1</a>"),
+    ] {
+        let (t, v) = typeof_and_value(oid, -1, text);
+        assert_eq!(t, "VARCHAR", "oid {oid} should read back as VARCHAR");
+        assert_eq!(v, text, "oid {oid} value must be verbatim");
+    }
+}

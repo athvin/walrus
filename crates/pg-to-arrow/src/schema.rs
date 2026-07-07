@@ -43,6 +43,10 @@ pub fn emit_fields(col: &PgColumn) -> Result<Vec<Field>, Error> {
     if let Some(dt) = tier1_data_type(col.type_oid, col.type_modifier) {
         return Ok(vec![Field::new(col.name.clone(), dt, true)]);
     }
+    // Tier-3 canonical-text carriers → one Utf8 field (incl. unconstrained / p>38 numeric, §2.5, PR 2.15).
+    if crate::tier3::is_tier3_text(col.type_oid, col.type_modifier) {
+        return Ok(vec![crate::tier3::tier3_field(&col.name)]);
+    }
     match col.type_oid {
         oids::INTERVAL => return Ok(crate::tier2::interval_fields(&col.name)),
         oids::TIMETZ => return Ok(crate::tier2::timetz_fields(&col.name)),
@@ -203,6 +207,20 @@ mod tests {
         assert_eq!(numeric_precision_scale(-1), None);
         // unconstrained numeric is a Tier-3 VARCHAR carrier (PR 2.15), not Tier-1.
         assert_eq!(tier1_data_type(oids::NUMERIC, -1), None);
+    }
+
+    #[test]
+    fn unconstrained_and_over_38_numeric_emit_one_utf8_field() {
+        // The Tier-3 numeric branch (PR 2.15): a single Utf8 carrier, not Decimal128.
+        for typmod in [-1, ((40 << 16) | 10) + 4] {
+            let fields = emit_fields(&col("amount", oids::NUMERIC, typmod)).unwrap();
+            assert_eq!(fields.len(), 1);
+            assert_eq!(fields[0].name(), "amount");
+            assert_eq!(fields[0].data_type(), &DataType::Utf8);
+        }
+        // But numeric(10,2) still stays Tier-1 Decimal128 (no regression).
+        let d = emit_fields(&col("amount", oids::NUMERIC, 655366)).unwrap();
+        assert_eq!(d[0].data_type(), &DataType::Decimal128(10, 2));
     }
 
     #[test]

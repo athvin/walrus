@@ -16,6 +16,7 @@ pub mod parquet;
 pub mod range;
 pub mod schema;
 pub mod tier2;
+pub mod tier3;
 
 pub use batch::BatchBuilder;
 pub use error::Error;
