@@ -25,6 +25,14 @@ pub struct StreamCtx {
     pub in_stream: bool,
 }
 
+/// The old-image submessage tag: `'K'` = key columns only (DEFAULT identity), `'O'` = the whole old
+/// row (FULL identity).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OldTupleKind {
+    Key,
+    Full,
+}
+
 /// One decoded pgoutput message. Variants are added family-by-family in PRs 2.2–2.8:
 /// 2.3 Relation/Type; 2.4 Insert; 2.5 Update/Delete; 2.6 Truncate/Message; 2.7 Stream*;
 /// 2.8 the two-phase family.
@@ -65,6 +73,33 @@ pub enum Message {
         relation_oid: u32,
         new: Vec<TupleValue>,
     },
+    /// `'U'`: rel OID, then EITHER a (`'K'`|`'O'`) old tuple + `'N'`, OR straight to `'N'` (no old
+    /// image — a non-key UPDATE under DEFAULT identity), then the new tuple.
+    Update {
+        xid: Option<u32>,
+        relation_oid: u32,
+        old_kind: Option<OldTupleKind>,
+        old: Option<Vec<TupleValue>>,
+        new: Vec<TupleValue>,
+    },
+    /// `'D'`: rel OID, then a (`'K'`|`'O'`) old tuple (always present — how the loader locates the
+    /// row to remove).
+    Delete {
+        xid: Option<u32>,
+        relation_oid: u32,
+        old_kind: OldTupleKind,
+        old: Vec<TupleValue>,
+    },
+}
+
+/// Consume the fixed `'N'` marker that precedes a new tuple; a mismatch is an upstream framing
+/// error (a misaligned parse).
+fn expect_n(reader: &mut Reader<'_>) -> Result<(), DecodeError> {
+    let b = reader.byte1()?;
+    if b != b'N' {
+        return Err(DecodeError::BadTupleFormat { byte: b });
+    }
+    Ok(())
 }
 
 /// Decode a `TupleData`: `Int16` column-count, then per column a one-byte format tag —
@@ -175,6 +210,46 @@ fn parse_one(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Message, De
                 xid,
                 relation_oid,
                 new: parse_tuple(reader)?,
+            })
+        }
+        b'U' => {
+            let relation_oid = reader.int32()?;
+            // Branch on the byte AFTER the OID: 'K'/'O' → an old image (then a 'N' before the new
+            // tuple); 'N' → no old image, and the 'N' we just read IS the new-tuple marker.
+            let (old_kind, old) = match reader.byte1()? {
+                b'K' => {
+                    let old = parse_tuple(reader)?;
+                    expect_n(reader)?;
+                    (Some(OldTupleKind::Key), Some(old))
+                }
+                b'O' => {
+                    let old = parse_tuple(reader)?;
+                    expect_n(reader)?;
+                    (Some(OldTupleKind::Full), Some(old))
+                }
+                b'N' => (None, None),
+                other => return Err(DecodeError::BadTupleFormat { byte: other }),
+            };
+            Ok(Message::Update {
+                xid,
+                relation_oid,
+                old_kind,
+                old,
+                new: parse_tuple(reader)?,
+            })
+        }
+        b'D' => {
+            let relation_oid = reader.int32()?;
+            let old_kind = match reader.byte1()? {
+                b'K' => OldTupleKind::Key,
+                b'O' => OldTupleKind::Full,
+                other => return Err(DecodeError::BadTupleFormat { byte: other }),
+            };
+            Ok(Message::Delete {
+                xid,
+                relation_oid,
+                old_kind,
+                old: parse_tuple(reader)?,
             })
         }
         other => Err(DecodeError::UnknownMessage { byte: other }),
