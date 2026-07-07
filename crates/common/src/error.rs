@@ -31,6 +31,12 @@ pub enum Error {
     #[error("object store unavailable: {0}")]
     ObjectStore(String),
 
+    /// Source Postgres could not be reached (a replication-capable connect failed for a reason that
+    /// retrying might fix — the server is still coming up). May be transient. A *privilege* or
+    /// server-config mismatch is a terminal [`Error::Preflight`] instead.
+    #[error("source database unavailable: {0}")]
+    SourceDb(String),
+
     /// Source-server prerequisite mismatch (`wal_level`, version, slot/wal_sender headroom,
     /// missing publication/slot). Terminal.
     #[error("source preflight failed: {0}")]
@@ -64,7 +70,7 @@ impl Error {
             | Error::LeaseContended(_)
             | Error::Internal(_) => true,
             // Dependencies that may simply be "still coming up" during a rollout.
-            Error::ControlDb(_) | Error::ObjectStore(_) => false,
+            Error::ControlDb(_) | Error::ObjectStore(_) | Error::SourceDb(_) => false,
         }
     }
 
@@ -80,6 +86,7 @@ impl Error {
             Error::Config(_) => ExitCode::Config,
             Error::ControlDb(_) => ExitCode::ControlDb,
             Error::ObjectStore(_) => ExitCode::ObjectStore,
+            Error::SourceDb(_) => ExitCode::SourceDb,
             Error::Preflight(_) => ExitCode::Preflight,
             Error::KeylessTable { .. } => ExitCode::KeylessTable,
             Error::LeaseContended(_) => ExitCode::LeaseContended,
@@ -101,6 +108,7 @@ pub enum ExitCode {
     Preflight = 13,
     KeylessTable = 14,
     LeaseContended = 15,
+    SourceDb = 16,
     Internal = 70,
 }
 
@@ -121,6 +129,7 @@ mod tests {
             (Error::Config("bad bound".into()), true),
             (Error::ControlDb("connection refused".into()), false),
             (Error::ObjectStore("503 from MinIO".into()), false),
+            (Error::SourceDb("connection refused".into()), false),
             (Error::Preflight("wal_level=replica".into()), true),
             (
                 Error::KeylessTable {

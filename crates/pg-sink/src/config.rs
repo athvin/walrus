@@ -47,6 +47,12 @@ pub struct SinkConfig {
     pub startup_deadline: Duration,
     /// Where the K8s health endpoints bind.
     pub health_addr: SocketAddr,
+    /// If true, the sink creates/alters `publication_name` to cover the required tables; else a gap
+    /// is terminal (the operator owns the source setup — PR 2.19 `migrations/source`).
+    pub manage_publication: bool,
+    /// `true` (default) = **strict** keys: a published user table with no usable replica identity is
+    /// terminal. `false` = **lenient**: quarantine + alert + continue (surfaced in the `PkReport`).
+    pub strict_keys: bool,
 }
 
 impl Default for SinkConfig {
@@ -65,6 +71,8 @@ impl Default for SinkConfig {
             max_inflight_bytes: 512 * 1024 * 1024,
             startup_deadline: Duration::from_secs(60),
             health_addr: SocketAddr::from(([0, 0, 0, 0], 8080)),
+            manage_publication: false,
+            strict_keys: true,
         }
     }
 }
@@ -116,6 +124,15 @@ impl SinkConfig {
             .map_err(|e| ConfigError::Load(e.to_string()))?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// The keyless-table policy for the source preflight (§1.1, PR 2.19).
+    pub fn pk_mode(&self) -> crate::preflight::PkMode {
+        if self.strict_keys {
+            crate::preflight::PkMode::Strict
+        } else {
+            crate::preflight::PkMode::Lenient
+        }
     }
 
     /// Bounds-check every field. Pure and offline — no sockets. Any violation is terminal.
