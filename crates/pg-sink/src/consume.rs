@@ -9,6 +9,8 @@
 //! commit (no stream frames), and `StreamCtx` handles both shapes with no special-casing here.
 
 use crate::batch::{BatchTriggers, Clock, SealedBatch, TableBatcher};
+use crate::health::HealthState;
+use crate::heartbeat::{Heartbeat, InternalTables};
 use crate::pgoutput::{self, Message, Reader, StreamCtx};
 use crate::relcache::{is_internal_table, RelationCache};
 use crate::replication::{ReplicationMessage, ReplicationStream};
@@ -17,6 +19,7 @@ use common::{Kind, Lsn, Op, SinkMeta, TupleValue, UtcTimestamp};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 /// Drive the stream: decode each `XLogData`, register each `Relation` (cache + schema_registry), route
@@ -32,16 +35,39 @@ pub async fn run_decode_loop(
     router: &mut BatchRouter,
     sink: &crate::sink::ParquetSink,
     checkpoint: &mut crate::checkpoint::DurabilityCheckpoint,
+    heartbeat: &mut Heartbeat,
+    health: &HealthState,
     pool: &sqlx::PgPool,
     epoch: i64,
     schema_version: i64,
 ) -> anyhow::Result<()> {
     let mut ctx = StreamCtx::default();
+    let mut internal = InternalTables::default();
+    // Idle windows are monotonic (`tokio::time::Instant`); `last_activity` moves on every user change,
+    // never on keepalives or the heartbeat's own round-trip.
+    let mut last_activity = Instant::now();
+    // Whether the transaction currently decoding carries the heartbeat change (its Commit lets the
+    // checkpoint advance on an idle publication).
+    let mut txn_has_heartbeat = false;
+    // Check idleness at the beat cadence; the first (immediate) tick is a no-op (just-started).
+    let mut beat_check = tokio::time::interval(heartbeat.idle_after());
+    beat_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = token.cancelled() => {
                 tracing::info!("decode loop cancelled");
                 return Ok(());
+            }
+            _ = beat_check.tick() => {
+                // The beat fires over a SEPARATE SQL connection only when idle on both clocks; a
+                // failure is logged and surfaced as `degraded`, never fatal (liveness never self-harms).
+                let now = Instant::now();
+                match heartbeat.maybe_beat(now, last_activity).await {
+                    Ok(Some(seq)) => tracing::info!(beat_seq = seq, "fired idle heartbeat"),
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(error = %e, "heartbeat beat failed"),
+                }
+                health.set_degraded(heartbeat.degraded(now));
             }
             frame = stream.next() => {
                 match frame.context("read replication frame")? {
@@ -60,26 +86,64 @@ pub async fn run_decode_loop(
                             trace_message(&msg);
                             match &msg {
                                 Message::Relation { relation, .. } => {
+                                    // Learn walrus.heartbeat's OID + column layout BEFORE its change
+                                    // arrives (Relation always precedes the change in the same txn).
+                                    internal.note_relation(relation);
                                     on_relation(cache, pool, epoch, relation.clone(), schema_version)
                                         .await?;
                                 }
-                                other => {
-                                    for sealed in router.route(cache, other, frame_lsn, schema_version)? {
-                                        // Durability steps (a) PUT then (b) commit the manifest row.
-                                        let written = flush_batch(sink, pool, epoch, sealed).await?;
-                                        // Step (c): ONLY now advance confirmed_flush and tell the server.
-                                        checkpoint.on_batch_durable(written.lsn_end);
-                                        checkpoint
-                                            .send(stream, false)
-                                            .await
-                                            .context("send durability standby status")?;
-                                        tracing::info!(
-                                            uri = %written.s3_uri,
-                                            lsn_end = %written.lsn_end,
-                                            confirmed_flush = %checkpoint.confirmed_flush(),
-                                            "durable: object + manifest + slot advanced"
-                                        );
+                                // The heartbeat round-trip: record it, mark the txn, and NEVER stage it
+                                // to S3 / a manifest row — it is control-plane, not user data.
+                                Message::Insert { relation_oid, new, .. }
+                                | Message::Update { relation_oid, new, .. }
+                                    if internal.is_internal(*relation_oid) =>
+                                {
+                                    if let Some(seq) = internal.beat_seq_of(new) {
+                                        heartbeat.observe_return(seq, Instant::now());
+                                        tracing::info!(beat_seq = seq, "heartbeat round-trip observed");
                                     }
+                                    txn_has_heartbeat = true;
+                                }
+                                Message::Commit { commit_lsn, .. } => {
+                                    // First seal/flush any user batch this commit made eligible.
+                                    flush_sealed(
+                                        router.route(cache, &msg, frame_lsn, schema_version)?,
+                                        stream, sink, checkpoint, pool, epoch,
+                                    )
+                                    .await?;
+                                    // Then, for an idle heartbeat-only txn, advance to its commit LSN —
+                                    // but never past un-durable user data (a floor the flush above just
+                                    // cleared if it was eligible).
+                                    if std::mem::take(&mut txn_has_heartbeat) {
+                                        if let Some(floor) = router.undurable_floor() {
+                                            tracing::warn!(
+                                                floor = %floor,
+                                                "heartbeat: un-durable buffered data precedes the beat; holding confirmed_flush"
+                                            );
+                                        } else {
+                                            checkpoint.on_batch_durable(*commit_lsn);
+                                            checkpoint
+                                                .send(stream, false)
+                                                .await
+                                                .context("send heartbeat standby status")?;
+                                            tracing::info!(
+                                                confirmed_flush = %checkpoint.confirmed_flush(),
+                                                "idle heartbeat advanced confirmed_flush"
+                                            );
+                                        }
+                                        health.set_degraded(heartbeat.degraded(Instant::now()));
+                                    }
+                                }
+                                other => {
+                                    // A user change is activity — it suppresses the idle beat.
+                                    if matches!(other, Message::Insert { .. } | Message::Update { .. } | Message::Delete { .. }) {
+                                        last_activity = Instant::now();
+                                    }
+                                    flush_sealed(
+                                        router.route(cache, other, frame_lsn, schema_version)?,
+                                        stream, sink, checkpoint, pool, epoch,
+                                    )
+                                    .await?;
                                 }
                             }
                         }
@@ -88,6 +152,35 @@ pub async fn run_decode_loop(
             }
         }
     }
+}
+
+/// PUT each sealed batch, commit its manifest row, then advance the durability checkpoint to its
+/// `lsn_end` and tell the server — the strict (a) PUT → (b) manifest → (c) slot ordering of §1.5.
+async fn flush_sealed(
+    sealed: Vec<SealedBatch>,
+    stream: &mut ReplicationStream,
+    sink: &crate::sink::ParquetSink,
+    checkpoint: &mut crate::checkpoint::DurabilityCheckpoint,
+    pool: &sqlx::PgPool,
+    epoch: i64,
+) -> anyhow::Result<()> {
+    for batch in sealed {
+        // Durability steps (a) PUT then (b) commit the manifest row.
+        let written = flush_batch(sink, pool, epoch, batch).await?;
+        // Step (c): ONLY now advance confirmed_flush and tell the server.
+        checkpoint.on_batch_durable(written.lsn_end);
+        checkpoint
+            .send(stream, false)
+            .await
+            .context("send durability standby status")?;
+        tracing::info!(
+            uri = %written.s3_uri,
+            lsn_end = %written.lsn_end,
+            confirmed_flush = %checkpoint.confirmed_flush(),
+            "durable: object + manifest + slot advanced"
+        );
+    }
+    Ok(())
 }
 
 /// Flush a sealed batch durably: **(a)** PUT the Parquet object to S3, **then (b)** commit the
@@ -271,6 +364,15 @@ impl BatchRouter {
             }
         }
         Ok(sealed)
+    }
+
+    /// The earliest commit LSN of any committed-but-unsealed row across all tables, or `None` if
+    /// nothing is buffered. An idle heartbeat must not advance `confirmed_flush` past this (PR 2.27).
+    pub fn undurable_floor(&self) -> Option<Lsn> {
+        self.batchers
+            .values()
+            .filter_map(TableBatcher::undurable_floor)
+            .min()
     }
 }
 

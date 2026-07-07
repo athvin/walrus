@@ -9,7 +9,8 @@
 //!   after an outage has high lag *by definition*, and a lag-based liveness probe would kill it
 //!   exactly when it is doing its job. High lag feeds `degraded` on readiness/health, never a kill.
 
-use axum::{extract::State, http::StatusCode, routing::get, Router};
+use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
+use serde::Serialize;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -94,12 +95,29 @@ async fn startup(State(state): State<Arc<HealthState>>) -> StatusCode {
     }
 }
 
-async fn ready(State(state): State<Arc<HealthState>>) -> StatusCode {
-    if state.is_ready() {
+/// The `/ready` JSON body. `degraded` (stale heartbeat round-trip / high lag) is **reported, not
+/// gating** — the status code follows `is_ready()` alone, so a degraded-but-catching-up sink stays in
+/// rotation. Never gate readiness on `degraded` (§4.3).
+#[derive(Debug, Serialize)]
+struct ReadyBody {
+    ready: bool,
+    degraded: bool,
+}
+
+async fn ready(State(state): State<Arc<HealthState>>) -> (StatusCode, Json<ReadyBody>) {
+    let ready = state.is_ready();
+    let code = if ready {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
-    }
+    };
+    (
+        code,
+        Json(ReadyBody {
+            ready,
+            degraded: state.is_degraded(),
+        }),
+    )
 }
 
 async fn healthz(State(state): State<Arc<HealthState>>) -> StatusCode {

@@ -36,6 +36,12 @@ pub struct SinkConfig {
     /// Batch cadence — flush a file at least this often (see PR 2.23 / §1.3).
     #[serde(with = "humantime_serde")]
     pub max_fill: Duration,
+    /// Fire an idle heartbeat only after the published tables have been idle this long (PR 2.27 / §1.9).
+    #[serde(with = "humantime_serde")]
+    pub heartbeat_idle_after: Duration,
+    /// A beat un-returned after this long marks the sink `degraded` (observability, never a kill).
+    #[serde(with = "humantime_serde")]
+    pub heartbeat_roundtrip_deadline: Duration,
     /// Row-count flush threshold.
     pub max_rows: u64,
     /// Byte-size flush threshold.
@@ -66,6 +72,8 @@ impl Default for SinkConfig {
             slot_name: String::new(),
             publication_name: String::new(),
             max_fill: Duration::from_secs(5),
+            heartbeat_idle_after: Duration::from_secs(10),
+            heartbeat_roundtrip_deadline: Duration::from_secs(30),
             max_rows: 100_000,
             max_bytes: 128 * 1024 * 1024,
             max_inflight_bytes: 512 * 1024 * 1024,
@@ -126,6 +134,14 @@ impl SinkConfig {
         Ok(cfg)
     }
 
+    /// The validated idle-heartbeat settings (PR 2.27).
+    pub fn heartbeat_config(&self) -> crate::heartbeat::HeartbeatConfig {
+        crate::heartbeat::HeartbeatConfig {
+            idle_after: self.heartbeat_idle_after,
+            roundtrip_deadline: self.heartbeat_roundtrip_deadline,
+        }
+    }
+
     /// The keyless-table policy for the source preflight (§1.1, PR 2.19).
     pub fn pk_mode(&self) -> crate::preflight::PkMode {
         if self.strict_keys {
@@ -151,6 +167,20 @@ impl SinkConfig {
         }
         duration_bound("max_fill", self.max_fill)?;
         duration_bound("startup_deadline", self.startup_deadline)?;
+        duration_bound("heartbeat_idle_after", self.heartbeat_idle_after)?;
+        duration_bound(
+            "heartbeat_roundtrip_deadline",
+            self.heartbeat_roundtrip_deadline,
+        )?;
+        if self.heartbeat_idle_after >= self.heartbeat_roundtrip_deadline {
+            return Err(ConfigError::OutOfBounds {
+                field: "heartbeat_idle_after",
+                detail: format!(
+                    "must be < heartbeat_roundtrip_deadline ({:?}) — a beat needs time to return",
+                    self.heartbeat_roundtrip_deadline
+                ),
+            });
+        }
         positive("max_rows", self.max_rows)?;
         positive("max_bytes", self.max_bytes)?;
         positive("max_inflight_bytes", self.max_inflight_bytes)?;
@@ -256,6 +286,20 @@ mod tests {
             cfg.validate().unwrap_err(),
             ConfigError::OutOfBounds {
                 field: "max_inflight_bytes",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn heartbeat_idle_after_must_be_below_roundtrip_deadline() {
+        let mut cfg = valid();
+        cfg.heartbeat_idle_after = Duration::from_secs(30);
+        cfg.heartbeat_roundtrip_deadline = Duration::from_secs(30);
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ConfigError::OutOfBounds {
+                field: "heartbeat_idle_after",
                 ..
             }
         ));

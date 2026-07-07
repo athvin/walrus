@@ -176,6 +176,16 @@ impl TableBatcher {
     pub fn committed_rows(&self) -> u64 {
         self.committed_rows
     }
+
+    /// The commit LSN of the earliest committed-but-unsealed row, or `None` if nothing is buffered.
+    /// The durability floor an idle heartbeat must not advance `confirmed_flush` past (PR 2.27): those
+    /// rows are not yet in S3, so a slot advance beyond them would lose them on crash. Open-txn
+    /// (uncommitted) rows do **not** count — their future commit LSN re-streams regardless.
+    pub fn undurable_floor(&self) -> Option<Lsn> {
+        (self.committed_rows > 0)
+            .then_some(self.first_commit_lsn)
+            .flatten()
+    }
 }
 
 /// A rough running byte estimate of the buffered Arrow size (not the compressed Parquet size, which

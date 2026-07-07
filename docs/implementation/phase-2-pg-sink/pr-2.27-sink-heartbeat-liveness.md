@@ -1,5 +1,7 @@
 # PR 2.27 — Fire an idle heartbeat and track round-trip liveness
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/47
+
 > **Phase:** 2 — walrus-pg-sink · **Crates touched:** `pg-sink`, `common` · **Est. size:** M ·
 > **Depends on:** PR 2.26 · **Unlocks:** PR 2.28
 
@@ -136,19 +138,19 @@ async fn idle_publication_beats_and_advances_confirmed_flush() { todo!() }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] With the published user tables **idle**, a beat fires only **after** `heartbeat_idle_after`, its
+- [x] With the published user tables **idle**, a beat fires only **after** `heartbeat_idle_after`, its
       `beat_seq` **returns** through the stream, and `confirmed_flush_lsn` advances as a result.
-- [ ] Under active user-table writes the beat is **suppressed** (no `walrus.heartbeat` UPDATE issued).
-- [ ] The `walrus.heartbeat` change is **never** staged to S3 nor written to a manifest row.
-- [ ] A stale round-trip during a legitimate catch-up sets `/ready`'s `degraded` field **without**
+- [x] Under active user-table writes the beat is **suppressed** (no `walrus.heartbeat` UPDATE issued).
+- [x] The `walrus.heartbeat` change is **never** staged to S3 nor written to a manifest row.
+- [x] A stale round-trip during a legitimate catch-up sets `/ready`'s `degraded` field **without**
       taking the pod out of readiness (no hard gate) and **without** any liveness kill.
-- [ ] Docs/comments explain: separate SQL connection, why the table must be in `walrus_pub`, and the
+- [x] Docs/comments explain: separate SQL connection, why the table must be in `walrus_pub`, and the
       keepalive-vs-heartbeat-vs-durability three-LSN distinction.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` then `cargo test -p pg-sink --test heartbeat_liveness -- --ignored`
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` then `cargo test -p pg-sink --test heartbeat_liveness -- --ignored`
         asserting **`idle_publication_beats_and_advances_confirmed_flush`**.
 
 ## Hints & gotchas

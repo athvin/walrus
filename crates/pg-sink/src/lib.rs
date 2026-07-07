@@ -12,6 +12,7 @@ pub mod checkpoint;
 pub mod config;
 pub mod consume;
 pub mod health;
+pub mod heartbeat;
 pub mod manifest;
 pub mod pgoutput;
 pub mod preflight;
