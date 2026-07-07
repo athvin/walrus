@@ -157,6 +157,17 @@ impl ReplicationStream {
         self.last_received
     }
 
+    /// Advance the durable (`flush`/`apply`) baseline the periodic keepalive reports — set by the
+    /// durability checkpoint (PR 2.26) only after S3 + manifest are durable. Never regresses.
+    pub fn set_durable(&mut self, lsn: Lsn) {
+        self.durable = self.durable.max(lsn);
+    }
+
+    /// The current durable (`confirmed_flush`) baseline.
+    pub fn durable(&self) -> Lsn {
+        self.durable
+    }
+
     // ---- internals --------------------------------------------------------------------------
 
     async fn handle_copy_data(

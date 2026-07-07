@@ -135,6 +135,7 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
         cfg.object_store.bucket.clone(),
         epoch,
     );
+    let mut checkpoint = pg_sink::checkpoint::DurabilityCheckpoint::new(resume.start_lsn());
 
     let result = consume::run_decode_loop(
         &mut stream,
@@ -142,6 +143,7 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
         &mut cache,
         &mut router,
         &sink,
+        &mut checkpoint,
         &ctx.control_pool,
         epoch,
         SCHEMA_VERSION,
