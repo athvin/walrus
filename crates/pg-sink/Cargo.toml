@@ -27,3 +27,5 @@ tracing = { workspace = true }
 hex = { workspace = true }
 # Test-only: the golden-vector renderer converts µs-since-2000 timestamps to Python's isoformat.
 jiff = { workspace = true }
+# Test-only: name the seam types (ReplicaIdentity, …) the decoder produces when asserting on them.
+common = { path = "../common" }

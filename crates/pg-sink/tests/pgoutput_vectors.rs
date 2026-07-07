@@ -4,6 +4,7 @@
 //! PRs 2.2–2.8 turn the vectors on family-by-family, TDD-style. PR 2.2 lights up `begin`, `commit`,
 //! and the `parse_stream` framing.
 
+use common::ReplicaIdentity;
 use pg_sink::pgoutput::{parse_message, parse_stream, DecodeError, Message, Reader, StreamCtx};
 
 /// A ported row of `VECTORS`: bytes in, the golden render line out.
@@ -355,6 +356,48 @@ fn render(m: &Message) -> String {
             fmt_lsn(commit_lsn.as_u64()),
             name
         ),
+        Message::Relation { xid, relation } => {
+            let pre = match xid {
+                Some(x) => format!("xid={x} "),
+                None => String::new(),
+            };
+            let replident = match relation.replica_identity {
+                ReplicaIdentity::Default => 'd',
+                ReplicaIdentity::Nothing => 'n',
+                ReplicaIdentity::Full => 'f',
+                ReplicaIdentity::Index => 'i',
+            };
+            let cols = relation
+                .columns
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{}{}(oid={},mod={})",
+                        if c.is_key { "KEY " } else { "" },
+                        c.name,
+                        c.type_oid,
+                        c.type_modifier
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "RELATION      {pre}oid={} {}.{} replident='{replident}' cols=[{cols}]",
+                relation.oid, relation.schema, relation.name
+            )
+        }
+        Message::Type {
+            xid,
+            oid,
+            namespace,
+            name,
+        } => {
+            let pre = match xid {
+                Some(x) => format!("xid={x} "),
+                None => String::new(),
+            };
+            format!("TYPE          {pre}oid={oid} {namespace}.{name}")
+        }
         _ => todo!("render arm added in a later PR"),
     }
 }
@@ -410,6 +453,69 @@ fn parse_message_rejects_trailing_bytes() {
         parse_message(&mut reader, &mut ctx),
         Err(DecodeError::TrailingBytes { unconsumed: 1 })
     ));
+}
+
+#[test]
+fn relation_and_type_vectors_render() {
+    for name in [
+        "type_enum",
+        "relation_orders",
+        "relation_composite_pk",
+        "relation_full_identity_all_keys",
+        "relation_after_add_column",
+    ] {
+        let v = lookup(name);
+        assert_eq!(render(&decode(v.hex, v.streaming)), v.expected, "{name}");
+    }
+}
+
+#[test]
+fn numeric_typmod_encodes_precision_scale() {
+    use pg_sink::pgoutput::typmod::{atttypmod, numeric_precision_scale};
+    assert_eq!(atttypmod(0xFFFF_FFFF), -1);
+    assert_eq!(numeric_precision_scale(655366), Some((10, 2)));
+    assert_eq!(numeric_precision_scale(-1), None);
+
+    // orders.amount is numeric(10,2): type_oid 1700, atttypmod 655366.
+    match decode(lookup("relation_orders").hex, false) {
+        Message::Relation { relation, .. } => {
+            let amount = relation
+                .columns
+                .iter()
+                .find(|c| c.name == "amount")
+                .unwrap();
+            assert_eq!(amount.type_oid, 1700);
+            assert_eq!(amount.type_modifier, 655366);
+            assert_eq!(numeric_precision_scale(amount.type_modifier), Some((10, 2)));
+        }
+        other => panic!("expected Relation, got {other:?}"),
+    }
+}
+
+#[test]
+fn relation_marks_only_key_columns() {
+    match decode(lookup("relation_orders").hex, false) {
+        Message::Relation { relation, xid } => {
+            assert_eq!(xid, None, "a non-streamed Relation has no xid prefix");
+            assert_eq!(relation.key_columns(), vec!["id"]);
+            assert_eq!(relation.replica_identity, ReplicaIdentity::Default);
+        }
+        other => panic!("expected Relation, got {other:?}"),
+    }
+}
+
+#[test]
+fn full_identity_flags_every_column_key() {
+    match decode(lookup("relation_full_identity_all_keys").hex, false) {
+        Message::Relation { relation, .. } => {
+            assert_eq!(relation.replica_identity, ReplicaIdentity::Full);
+            assert!(
+                relation.columns.iter().all(|c| c.is_key),
+                "REPLICA IDENTITY FULL flags every column as key"
+            );
+        }
+        other => panic!("expected Relation, got {other:?}"),
+    }
 }
 
 #[test]

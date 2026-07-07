@@ -176,7 +176,7 @@ Two deliberate structural notes:
 |---|---|---|---|
 | ✅ | [2.1](./phase-2-pg-sink/pr-2.1-pgoutput-scaffold-golden-vectors.md) | `pg-sink` lib+bin; port `test_decode_pgoutput.py::VECTORS` to Rust fixtures | proto §14 |
 | ✅ | [2.2](./phase-2-pg-sink/pr-2.2-pgoutput-reader-framing-begin-commit.md) | Reader primitives, framing, Begin/Commit | proto §4 / §7 |
-| ☐ | [2.3](./phase-2-pg-sink/pr-2.3-pgoutput-relation-type.md) | Relation + Type (typmod → `numeric(p,s)`) | proto §4 / sink §2.3 |
+| ✅ | [2.3](./phase-2-pg-sink/pr-2.3-pgoutput-relation-type.md) | Relation + Type (typmod → `numeric(p,s)`) | proto §4 / sink §2.3 |
 | ☐ | [2.4](./phase-2-pg-sink/pr-2.4-pgoutput-tuple-insert.md) | TupleData (`n`/`u`/`t`/`b`) + Insert | proto §4–§5 |
 | ☐ | [2.5](./phase-2-pg-sink/pr-2.5-pgoutput-update-delete.md) | Update + Delete (K/O old-image; NULL vs TOAST) | proto §4 / §6 |
 | ☐ | [2.6](./phase-2-pg-sink/pr-2.6-pgoutput-truncate-message.md) | Truncate + logical Message | proto §4 |

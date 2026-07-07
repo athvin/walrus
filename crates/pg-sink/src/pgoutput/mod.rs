@@ -6,11 +6,16 @@
 
 pub mod error;
 pub mod reader;
+pub mod typmod;
 
 pub use error::DecodeError;
 pub use reader::Reader;
 
-use common::Lsn;
+use common::{Lsn, PgColumn, PgRelation, ReplicaIdentity};
+
+/// Message types that carry a 4-byte per-message xid immediately after the tag — but ONLY inside a
+/// streamed block (proto §7): Relation, Type, Insert, Update, Delete, Truncate, Message.
+const XID_PREFIXED: &[u8] = b"RYIUDTM";
 
 /// Whether we are inside a Stream Start..Stop block. The per-message xid prefix (proto §7) exists
 /// **only** while this is true; Stream Start/Stop toggle it (from PR 2.7). It is threaded through
@@ -41,13 +46,34 @@ pub enum Message {
     },
     /// `'O'`: Int64 commit LSN, String origin name.
     Origin { commit_lsn: Lsn, name: String },
+    /// `'R'`: the table shape (OID, namespace, name, replica identity, columns). `xid` is `Some`
+    /// only inside a streamed block.
+    Relation {
+        xid: Option<u32>,
+        relation: PgRelation,
+    },
+    /// `'Y'`: a non-builtin type announcement (e.g. our `mood` enum).
+    Type {
+        xid: Option<u32>,
+        oid: u32,
+        namespace: String,
+        name: String,
+    },
 }
 
 /// Parse one message off `reader` (advancing it), for use by [`parse_stream`]. Stream context is
 /// consulted from PR 2.3 onward (the xid prefix); Begin/Commit/Origin are never xid-prefixed —
 /// they *are* the transaction frame.
-fn parse_one(reader: &mut Reader<'_>, _ctx: &mut StreamCtx) -> Result<Message, DecodeError> {
+fn parse_one(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Message, DecodeError> {
     let tag = reader.byte1()?;
+    // The per-message (sub-transaction) xid prefix exists only while streaming (proto §7/§9b). The
+    // same bytes therefore parse differently in vs. out of a stream. Begin/Commit/Origin are the
+    // txn frame itself and are never prefixed.
+    let xid = if XID_PREFIXED.contains(&tag) && ctx.in_stream {
+        Some(reader.int32()?)
+    } else {
+        None
+    };
     match tag {
         b'B' => Ok(Message::Begin {
             final_lsn: reader.lsn()?,
@@ -62,6 +88,44 @@ fn parse_one(reader: &mut Reader<'_>, _ctx: &mut StreamCtx) -> Result<Message, D
         }),
         b'O' => Ok(Message::Origin {
             commit_lsn: reader.lsn()?,
+            name: reader.string()?,
+        }),
+        b'R' => {
+            let oid = reader.int32()?;
+            let schema = reader.string()?;
+            let name = reader.string()?;
+            let ident_byte = reader.byte1()?;
+            let replica_identity = ReplicaIdentity::from_wire(ident_byte)
+                .map_err(|_| DecodeError::BadReplicaIdentity { byte: ident_byte })?;
+            let ncols = reader.int16()?;
+            let mut columns = Vec::with_capacity(ncols as usize);
+            for _ in 0..ncols {
+                let flags = reader.byte1()?;
+                let col_name = reader.string()?;
+                let type_oid = reader.int32()?;
+                let type_modifier = typmod::atttypmod(reader.int32()?);
+                columns.push(PgColumn {
+                    name: col_name,
+                    type_oid,
+                    type_modifier,
+                    is_key: flags & 1 != 0,
+                });
+            }
+            Ok(Message::Relation {
+                xid,
+                relation: PgRelation {
+                    oid,
+                    schema,
+                    name,
+                    replica_identity,
+                    columns,
+                },
+            })
+        }
+        b'Y' => Ok(Message::Type {
+            xid,
+            oid: reader.int32()?,
+            namespace: reader.string()?,
             name: reader.string()?,
         }),
         other => Err(DecodeError::UnknownMessage { byte: other }),
