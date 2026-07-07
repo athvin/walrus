@@ -3,6 +3,8 @@
 
 pub mod error;
 pub mod lsn;
+pub mod telemetry;
 
 pub use error::{Error, ExitCode, Result};
 pub use lsn::Lsn;
+pub use telemetry::{init_tracing, TelemetryConfig};

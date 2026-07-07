@@ -11,6 +11,8 @@ workspace = true # inherit deny(warnings) + clippy::all from the workspace root
 [dependencies]
 thiserror = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 
 [dev-dependencies]
 serde_json = { workspace = true }

@@ -153,7 +153,7 @@ Two deliberate structural notes:
 | ✅ | [0.1](./phase-0-foundations/pr-0.1-workspace-skeleton-and-ci.md) | Cargo workspace, `rust-toolchain.toml`, `.gitignore`, MIT `LICENSE`, first CI gate | workspace layout |
 | ✅ | [0.2](./phase-0-foundations/pr-0.2-common-errors-exit-codes.md) | `common` error taxonomy + terminal/transient + `ExitCode` | fail-fast preflight |
 | ✅ | [0.3](./phase-0-foundations/pr-0.3-common-lsn-newtype.md) | `Lsn` newtype (parse, zero-padded Display, numeric `Ord`) | §1.4 / coordination |
-| ☐ | [0.4](./phase-0-foundations/pr-0.4-common-telemetry.md) | `init_tracing()` + structured-field convention | Observability |
+| ✅ | [0.4](./phase-0-foundations/pr-0.4-common-telemetry.md) | `init_tracing()` + structured-field convention | Observability |
 | ☐ | [0.5](./phase-0-foundations/pr-0.5-common-config.md) | typed, validated config loading | K8s config/cadence |
 | ☐ | [0.6](./phase-0-foundations/pr-0.6-dev-harness-compose.md) | docker-compose (source PG + control PG + MinIO) + `justfile` | Verification harness |
 
