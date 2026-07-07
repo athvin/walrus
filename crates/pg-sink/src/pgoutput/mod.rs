@@ -11,6 +11,7 @@ pub mod typmod;
 pub use error::DecodeError;
 pub use reader::Reader;
 
+use bytes::Bytes;
 use common::{Lsn, PgColumn, PgRelation, ReplicaIdentity, TupleValue};
 
 /// Message types that carry a 4-byte per-message xid immediately after the tag — but ONLY inside a
@@ -89,6 +90,24 @@ pub enum Message {
         relation_oid: u32,
         old_kind: OldTupleKind,
         old: Vec<TupleValue>,
+    },
+    /// `'T'`: Int32 rel-count, Int8 option bits (`1`=CASCADE, `2`=RESTART IDENTITY), then the rel
+    /// OIDs. Carries **no tuple / no PK** — handled as a separate wipe step downstream (loader §5.5).
+    Truncate {
+        xid: Option<u32>,
+        cascade: bool,
+        restart_identity: bool,
+        relations: Vec<u32>,
+    },
+    /// `'M'`: Int8 flags (bit 1 = transactional), Int64 message LSN, String prefix, Int32 content
+    /// length + content bytes. A non-transactional message is emitted immediately, even ahead of
+    /// its transaction's Begin (used for the idle heartbeat).
+    Message {
+        xid: Option<u32>,
+        transactional: bool,
+        lsn: Lsn,
+        prefix: String,
+        content: Bytes,
     },
 }
 
@@ -250,6 +269,34 @@ fn parse_one(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Message, De
                 relation_oid,
                 old_kind,
                 old: parse_tuple(reader)?,
+            })
+        }
+        b'T' => {
+            let nrel = reader.int32()? as usize;
+            let opt = reader.byte1()?;
+            // Fixed-count array: the count IS the length; no per-element framing, no tuple.
+            let relations = (0..nrel)
+                .map(|_| reader.int32())
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Message::Truncate {
+                xid,
+                cascade: opt & 1 != 0,
+                restart_identity: opt & 2 != 0,
+                relations,
+            })
+        }
+        b'M' => {
+            let flags = reader.byte1()?;
+            let lsn = reader.lsn()?;
+            let prefix = reader.string()?;
+            let len = reader.int32()? as usize;
+            let content = reader.take(len)?;
+            Ok(Message::Message {
+                xid,
+                transactional: flags & 1 != 0,
+                lsn,
+                prefix,
+                content,
             })
         }
         other => Err(DecodeError::UnknownMessage { byte: other }),

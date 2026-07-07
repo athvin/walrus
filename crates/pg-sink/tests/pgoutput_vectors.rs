@@ -450,6 +450,57 @@ fn render(m: &Message) -> String {
                 render_tuple(old)
             )
         }
+        Message::Truncate {
+            xid,
+            cascade,
+            restart_identity,
+            relations,
+        } => {
+            let pre = match xid {
+                Some(x) => format!("xid={x} "),
+                None => String::new(),
+            };
+            let mut opts: Vec<&str> = Vec::new();
+            if *cascade {
+                opts.push("CASCADE");
+            }
+            if *restart_identity {
+                opts.push("RESTART IDENTITY");
+            }
+            let opts_str = if opts.is_empty() {
+                "none".to_string()
+            } else {
+                opts.join("|")
+            };
+            let rels = relations
+                .iter()
+                .map(|r| r.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("TRUNCATE      {pre}opts={opts_str} rels=[{rels}]")
+        }
+        Message::Message {
+            xid,
+            transactional,
+            lsn,
+            prefix,
+            content,
+        } => {
+            let pre = match xid {
+                Some(x) => format!("xid={x} "),
+                None => String::new(),
+            };
+            let kind = if *transactional {
+                "transactional"
+            } else {
+                "non-transactional"
+            };
+            format!(
+                "MESSAGE       {pre}{kind} lsn={} prefix='{prefix}' content={}",
+                fmt_lsn(lsn.as_u64()),
+                fmt_bytes(content)
+            )
+        }
         _ => todo!("render arm added in a later PR"),
     }
 }
@@ -460,6 +511,25 @@ fn old_kind_char(k: OldTupleKind) -> char {
         OldTupleKind::Key => 'K',
         OldTupleKind::Full => 'O',
     }
+}
+
+/// Bytes as a Python-style byte-string literal (`b'hb-non'`), escaping the non-printables Python
+/// escapes, to diff against the golden line.
+fn fmt_bytes(b: &[u8]) -> String {
+    let mut s = String::from("b'");
+    for &byte in b {
+        match byte {
+            b'\\' => s.push_str("\\\\"),
+            b'\'' => s.push_str("\\'"),
+            b'\n' => s.push_str("\\n"),
+            b'\r' => s.push_str("\\r"),
+            b'\t' => s.push_str("\\t"),
+            0x20..=0x7e => s.push(byte as char),
+            _ => s.push_str(&format!("\\x{byte:02x}")),
+        }
+    }
+    s.push('\'');
+    s
 }
 
 /// Render a tuple like `decode_pgoutput.py::render_tuple`.
@@ -739,6 +809,74 @@ fn null_and_unchanged_toast_are_distinct() {
             assert_ne!(new[2], new[4]);
         }
         other => panic!("expected Update, got {other:?}"),
+    }
+}
+
+#[test]
+fn truncate_and_message_vectors_render() {
+    for name in [
+        "truncate_plain",
+        "truncate_cascade_restart",
+        "message_non_transactional",
+        "message_transactional",
+    ] {
+        let v = lookup(name);
+        assert_eq!(render(&decode(v.hex, v.streaming)), v.expected, "{name}");
+    }
+}
+
+#[test]
+fn truncate_option_bits() {
+    match decode(lookup("truncate_plain").hex, false) {
+        Message::Truncate {
+            cascade,
+            restart_identity,
+            relations,
+            ..
+        } => {
+            assert_eq!((cascade, restart_identity), (false, false));
+            assert_eq!(relations, vec![16651]);
+        }
+        other => panic!("expected Truncate, got {other:?}"),
+    }
+    match decode(lookup("truncate_cascade_restart").hex, false) {
+        Message::Truncate {
+            cascade,
+            restart_identity,
+            relations,
+            ..
+        } => {
+            assert_eq!((cascade, restart_identity), (true, true));
+            assert_eq!(relations, vec![16665]);
+        }
+        other => panic!("expected Truncate, got {other:?}"),
+    }
+}
+
+#[test]
+fn message_transactional_flag() {
+    match decode(lookup("message_non_transactional").hex, false) {
+        Message::Message {
+            transactional,
+            content,
+            ..
+        } => {
+            assert!(!transactional);
+            // content preserved as raw bytes, not utf-8-lossily decoded.
+            assert_eq!(content.as_ref(), b"hb-non".as_slice());
+        }
+        other => panic!("expected Message, got {other:?}"),
+    }
+    match decode(lookup("message_transactional").hex, false) {
+        Message::Message {
+            transactional,
+            content,
+            ..
+        } => {
+            assert!(transactional);
+            assert_eq!(content.as_ref(), b"hb-txn".as_slice());
+        }
+        other => panic!("expected Message, got {other:?}"),
     }
 }
 
