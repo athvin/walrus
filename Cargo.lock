@@ -974,6 +974,7 @@ dependencies = [
  "bytes",
  "common",
  "hex",
+ "jiff",
  "thiserror",
  "tokio",
  "tracing",

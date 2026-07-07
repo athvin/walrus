@@ -25,3 +25,5 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 hex = { workspace = true }
+# Test-only: the golden-vector renderer converts µs-since-2000 timestamps to Python's isoformat.
+jiff = { workspace = true }
