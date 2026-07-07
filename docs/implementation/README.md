@@ -165,7 +165,7 @@ Two deliberate structural notes:
 | ✅ | [1.2](./phase-1-shared-core/pr-1.2-common-pg-shape-types.md) | `PgRelation` / `PgColumn` / `TupleValue` / `TypeDescriptor` | §2.6 / proto §4 |
 | ✅ | [1.3](./phase-1-shared-core/pr-1.3-control-migrations.md) | control-plane migrations + `sqlx::migrate!` runner | Coordination contract |
 | ✅ | [1.4](./phase-1-shared-core/pr-1.4-control-file-manifest.md) | `file_manifest` claim/insert/delete (`ORDER BY lsn_end, id`) | loader §2 |
-| ☐ | [1.5](./phase-1-shared-core/pr-1.5-control-checkpoint-replication-state.md) | two-watermark checkpoint + epoch, CHECK-guarded | loader §4 |
+| ✅ | [1.5](./phase-1-shared-core/pr-1.5-control-checkpoint-replication-state.md) | two-watermark checkpoint + epoch, CHECK-guarded | loader §4 |
 | ☐ | [1.6](./phase-1-shared-core/pr-1.6-control-schema-registry-ddl-manifest.md) | `schema_registry` + `ddl_manifest` models | §2.6 / DDL capture |
 
 ### Phase 2 — walrus-pg-sink  ·  [`phase-2-pg-sink/`](./phase-2-pg-sink/)

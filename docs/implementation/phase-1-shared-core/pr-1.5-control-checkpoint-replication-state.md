@@ -4,6 +4,8 @@
 
 # PR 1.5 — Two-watermark checkpoint + epoch (`loader_checkpoint`, `replication_state`)
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/19
+
 > **Phase:** 1 — Shared core · **Crates touched:** `control` · **Est. size:** M ·
 > **Depends on:** PR 1.3 · **Unlocks:** PR 3.1, PR 3.2, PR 3.4
 
@@ -144,18 +146,18 @@ async fn read_current_epoch_returns_highest_generation() { todo!() }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `ensure_checkpoint` creates a `(0/0, 0/0)` row idempotently; `read_checkpoint` returns it.
-- [ ] `advance_raw_appended` and `advance_transformed` are **separate** UPSERTs, each accepting a caller
+- [x] `ensure_checkpoint` creates a `(0/0, 0/0)` row idempotently; `read_checkpoint` returns it.
+- [x] `advance_raw_appended` and `advance_transformed` are **separate** UPSERTs, each accepting a caller
       executor (so Phase A can share a txn with the manifest delete in PR 3.2).
-- [ ] A compose test proves the DB **CHECK rejects** `transformed_lsn > raw_appended_lsn`, surfaced as a
+- [x] A compose test proves the DB **CHECK rejects** `transformed_lsn > raw_appended_lsn`, surfaced as a
       typed terminal `ControlError` (not a panic / raw sqlx error leaking).
-- [ ] `read_current_epoch` returns the highest-epoch `replication_state`; `insert_epoch` inserts one.
-- [ ] Comments state both watermarks are **commit-LSN valued** and advance **independently**.
-- [ ] `.sqlx/` regenerated; `cargo sqlx prepare --check` passes.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p control` and — with services — `docker compose up --wait` then
+- [x] `read_current_epoch` returns the highest-epoch `replication_state`; `insert_epoch` inserts one.
+- [x] Comments state both watermarks are **commit-LSN valued** and advance **independently**.
+- [x] `.sqlx/` regenerated; `cargo sqlx prepare --check` passes.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p control` and — with services — `docker compose up --wait` then
         `cargo test -p control --test checkpoint` (the CHECK-rejection assertion passes).
 
 ## Hints & gotchas
