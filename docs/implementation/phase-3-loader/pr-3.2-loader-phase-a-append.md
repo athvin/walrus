@@ -1,5 +1,7 @@
 # PR 3.2 — Phase A: claim `ready` files → append verbatim to `<table>_raw` → watermark + delete
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/55
+
 > **Phase:** 3 — walrus-loader · **Crates touched:** `loader`, `control` · **Est. size:** M ·
 > **Depends on:** PR 3.1 · **Unlocks:** PR 3.3
 
@@ -122,23 +124,23 @@ async fn re_running_the_same_file_appends_zero_rows() { todo!() }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] Seeded `ready` files (reuse a sink Parquet fixture) land in `<table>_raw` **verbatim**:
+- [x] Seeded `ready` files (reuse a sink Parquet fixture) land in `<table>_raw` **verbatim**:
       `walrus_pg_sink_meta` intact **and** `op`/`commit_lsn`/`lsn`/`sink_processed_at` promoted to typed
       columns.
-- [ ] Files are claimed and appended in **`(lsn_end, id)`** order; the claim filter is **not**
+- [x] Files are claimed and appended in **`(lsn_end, id)`** order; the claim filter is **not**
       `lsn_end > raw_appended_lsn`.
-- [ ] After the append commits, **one** control-DB txn advances `raw_appended_lsn = max(lsn_end)` **and**
+- [x] After the append commits, **one** control-DB txn advances `raw_appended_lsn = max(lsn_end)` **and**
       deletes exactly the claimed manifest ids.
-- [ ] Re-running the same file (crash-window replay) appends **zero** new rows (`ON CONFLICT DO NOTHING`
+- [x] Re-running the same file (crash-window replay) appends **zero** new rows (`ON CONFLICT DO NOTHING`
       on the enforced composite PK).
-- [ ] `<table>` (the mirror) is **untouched** — Phase A never writes it.
-- [ ] Docs/comments explain the two-guard idempotency (queue delete + row-level PK) and why the
+- [x] `<table>` (the mirror) is **untouched** — Phase A never writes it.
+- [x] Docs/comments explain the two-guard idempotency (queue delete + row-level PK) and why the
       watermark can't cover the append-commit-to-queue-delete window.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p loader` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` then `cargo test -p loader --test phase_a -- --ignored`
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p loader` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` then `cargo test -p loader --test phase_a -- --ignored`
         asserting **`re_running_the_same_file_appends_zero_rows`** and
         **`advances_raw_watermark_and_deletes_the_claimed_manifest_rows`**.
 
