@@ -16,5 +16,7 @@ warnings = "deny"
 all = "deny"
 
 [workspace.dependencies]
-# Shared version pins land here as later PRs add deps (serde, tracing, sqlx, arrow, …).
+# Shared version pins land here as later PRs add deps (tracing, sqlx, arrow, …).
 thiserror = "2"
+serde = "1"
+serde_json = "1"
