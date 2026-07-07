@@ -82,60 +82,32 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
     state.mark_ready();
     tracing::info!("bootstrap complete; ready");
 
-    // Establish the replication stream and run the decode loop until SIGTERM (PR 2.21). Slot
-    // management is over the preflight connection; the streaming is the hand-rolled connection.
-    let resume = slot::verify_or_create_slot(&ctx.source_client, &cfg.slot_name)
-        .await
-        .context("verify/create replication slot")?;
-
-    // Epoch: the generation that namespaces control-plane state (§1.8). Resume the current one, or
-    // establish the first. Schema-version bumps arrive with DDL capture (PR 2.33); until then, 1.
-    let epoch = current_or_new_epoch(&ctx.control_pool, &cfg.slot_name, resume.start_lsn()).await?;
     const SCHEMA_VERSION: i64 = 1;
-
-    // Shared bootstrap step 7: hydrate the relation cache from schema_registry so a restart resumes.
-    let mut cache = pg_sink::relcache::RelationCache::default();
-    let rows = control::read_all_latest_registry(&ctx.control_pool, epoch)
-        .await
-        .context("read schema_registry for hydration")?;
-    cache.hydrate(rows).context("hydrate relation cache")?;
-    tracing::info!(
-        epoch,
-        cached_relations = cache.len(),
-        "relation cache hydrated"
-    );
-
-    let mut stream = ReplicationStream::start(
-        &cfg.source_db_url,
-        &cfg.slot_name,
-        resume.start_lsn(),
-        &cfg.publication_name,
-    )
-    .await
-    .context("START_REPLICATION")?;
-    tracing::info!(
-        slot = %cfg.slot_name,
-        start_lsn = %resume.start_lsn(),
-        "streaming logical replication"
-    );
-
     let triggers = pg_sink::batch::BatchTriggers {
         max_fill: cfg.max_fill,
         max_rows: cfg.max_rows,
         max_bytes: cfg.max_bytes,
     };
+    let mut cache = pg_sink::relcache::RelationCache::default();
+
+    // Bootstrap decision (§1.7 / §1.8): a **pre-existing slot** means resume from `confirmed_flush_lsn`
+    // (hydrate the cache from schema_registry). **No slot** means first bootstrap: create it with an
+    // exported snapshot, backfill every published user table, then stream from `consistent_point`.
+    let Bootstrapped {
+        mut stream,
+        epoch,
+        start_lsn,
+        sink,
+    } = establish_stream(&cfg, &ctx, &mut cache, triggers, SCHEMA_VERSION).await?;
+    tracing::info!(slot = %cfg.slot_name, start_lsn = %start_lsn, epoch, "streaming logical replication");
+
     let mut router = consume::BatchRouter::new(
         triggers,
         std::sync::Arc::new(pg_sink::batch::SystemClock),
         epoch,
         cfg.instance.clone(),
     );
-    let sink = pg_sink::sink::ParquetSink::new(
-        ctx.object_store.clone(),
-        cfg.object_store.bucket.clone(),
-        epoch,
-    );
-    let mut checkpoint = pg_sink::checkpoint::DurabilityCheckpoint::new(resume.start_lsn());
+    let mut checkpoint = pg_sink::checkpoint::DurabilityCheckpoint::new(start_lsn);
 
     // The idle heartbeat rides a SEPARATE ordinary SQL connection (distinct from replication); its
     // beat writes the published `walrus.heartbeat`, whose round-trip through the stream advances the
@@ -172,6 +144,125 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
         .context("health server task join")?
         .context("health server")?;
     result
+}
+
+/// The established streaming state after the bootstrap decision.
+struct Bootstrapped {
+    stream: ReplicationStream,
+    epoch: i64,
+    start_lsn: common::Lsn,
+    sink: pg_sink::sink::ParquetSink,
+}
+
+/// Resume a pre-existing slot, or first-bootstrap with an exported snapshot + backfill (§1.7 / §1.8).
+/// The sink is epoch-namespaced, so it is built here once the epoch is known.
+async fn establish_stream(
+    cfg: &SinkConfig,
+    ctx: &bootstrap::BootstrapCtx,
+    cache: &mut pg_sink::relcache::RelationCache,
+    triggers: pg_sink::batch::BatchTriggers,
+    schema_version: i64,
+) -> anyhow::Result<Bootstrapped> {
+    let make_sink = |epoch| {
+        pg_sink::sink::ParquetSink::new(
+            ctx.object_store.clone(),
+            cfg.object_store.bucket.clone(),
+            epoch,
+        )
+    };
+
+    if let Some(info) = slot::read_slot(&ctx.source_client, &cfg.slot_name)
+        .await
+        .context("read replication slot")?
+    {
+        // Resume: stream from confirmed_flush_lsn; hydrate the relation cache from schema_registry.
+        let epoch =
+            current_or_new_epoch(&ctx.control_pool, &cfg.slot_name, info.confirmed_flush_lsn)
+                .await?;
+        let rows = control::read_all_latest_registry(&ctx.control_pool, epoch)
+            .await
+            .context("read schema_registry for hydration")?;
+        cache.hydrate(rows).context("hydrate relation cache")?;
+        tracing::info!(
+            epoch,
+            cached_relations = cache.len(),
+            "relation cache hydrated (resume)"
+        );
+        let stream = ReplicationStream::start(
+            &cfg.source_db_url,
+            &cfg.slot_name,
+            info.confirmed_flush_lsn,
+            &cfg.publication_name,
+        )
+        .await
+        .context("START_REPLICATION (resume)")?;
+        return Ok(Bootstrapped {
+            stream,
+            epoch,
+            start_lsn: info.confirmed_flush_lsn,
+            sink: make_sink(epoch),
+        });
+    }
+
+    // First bootstrap: create the slot with an exported snapshot and backfill before streaming.
+    let mut snap = pg_sink::snapshot::SnapshotConn::connect(&cfg.source_db_url)
+        .await
+        .context("open snapshot replication connection")?;
+    let snapshot = snap
+        .create_slot_with_snapshot(&cfg.slot_name)
+        .await
+        .context("CREATE_REPLICATION_SLOT with exported snapshot")?;
+    let epoch =
+        current_or_new_epoch(&ctx.control_pool, &cfg.slot_name, snapshot.consistent_point).await?;
+    let sink = make_sink(epoch);
+
+    // Backfill every published user table under the exported snapshot, registering each shape so the
+    // subsequent streaming decode (and the loader) have it. Internal walrus tables are excluded.
+    let tables =
+        pg_sink::snapshot::published_user_tables(&ctx.source_client, &cfg.publication_name)
+            .await
+            .context("list published user tables")?;
+    let mut backfill = pg_sink::snapshot::Backfill::connect(
+        &cfg.source_db_url,
+        epoch,
+        cfg.instance.clone(),
+        triggers,
+        cfg.backfill_statement_timeout,
+    )
+    .await
+    .context("open backfill connection")?;
+    let mut total = 0u64;
+    for (schema, table) in &tables {
+        let rel = pg_sink::snapshot::describe_source_relation(&ctx.source_client, schema, table)
+            .await
+            .with_context(|| format!("describe {schema}.{table} for backfill"))?;
+        consume::on_relation(cache, &ctx.control_pool, epoch, rel.clone(), schema_version)
+            .await
+            .context("register backfilled relation")?;
+        total += backfill
+            .copy_table(&rel, &snapshot, &sink, &ctx.control_pool, schema_version)
+            .await
+            .with_context(|| format!("backfill {schema}.{table}"))?;
+    }
+    tracing::info!(
+        epoch,
+        tables = tables.len(),
+        rows = total,
+        consistent_point = %snapshot.consistent_point,
+        "backfill complete; handing off to streaming"
+    );
+
+    // Hand off: START_REPLICATION from consistent_point on the (now snapshot-done) connection.
+    let stream = snap
+        .into_stream(&cfg.slot_name, &cfg.publication_name)
+        .await
+        .context("hand off snapshot → streaming")?;
+    Ok(Bootstrapped {
+        stream,
+        epoch,
+        start_lsn: snapshot.consistent_point,
+        sink,
+    })
 }
 
 /// Resume the current epoch generation (§1.8), or establish the first one for this slot. Epoch bump /

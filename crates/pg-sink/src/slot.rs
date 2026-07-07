@@ -49,6 +49,38 @@ fn parse_lsn(s: &str) -> anyhow::Result<Lsn> {
         .map_err(|e| anyhow::anyhow!("could not parse LSN {s:?}: {e:?}"))
 }
 
+/// Read a slot's resume position **without** creating it — `None` if it does not exist. The bootstrap
+/// (PR 2.29) uses this to decide between resuming (`Some`) and a first-time snapshot+backfill (`None`).
+pub async fn read_slot(
+    client: &tokio_postgres::Client,
+    slot: &str,
+) -> anyhow::Result<Option<SlotInfo>> {
+    let rows = client
+        .query(
+            "SELECT restart_lsn::text, confirmed_flush_lsn::text
+             FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        )
+        .await?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let restart: Option<String> = row.get(0);
+    let confirmed: Option<String> = row.get(1);
+    Ok(Some(SlotInfo {
+        restart_lsn: restart
+            .as_deref()
+            .map(parse_lsn)
+            .transpose()?
+            .unwrap_or(Lsn::ZERO),
+        confirmed_flush_lsn: confirmed
+            .as_deref()
+            .map(parse_lsn)
+            .transpose()?
+            .unwrap_or(Lsn::ZERO),
+    }))
+}
+
 /// Verify the slot (reading `restart_lsn` / `confirmed_flush_lsn`), or create it via SQL.
 pub async fn verify_or_create_slot(
     client: &tokio_postgres::Client,

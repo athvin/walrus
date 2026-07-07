@@ -200,9 +200,21 @@ pub async fn flush_batch(
     epoch: i64,
     batch: crate::batch::SealedBatch,
 ) -> anyhow::Result<crate::sink::WrittenObject> {
+    flush_batch_kind(sink, ex, epoch, batch, crate::sink::FileKind::Stream).await
+}
+
+/// As [`flush_batch`], stamping the object + manifest `kind` — the backfill (PR 2.29) flushes with
+/// [`crate::sink::FileKind::Snapshot`].
+pub async fn flush_batch_kind(
+    sink: &crate::sink::ParquetSink,
+    ex: impl sqlx::PgExecutor<'_>,
+    epoch: i64,
+    batch: crate::batch::SealedBatch,
+    kind: crate::sink::FileKind,
+) -> anyhow::Result<crate::sink::WrittenObject> {
     // (a) durable in S3.
     let obj = sink
-        .put(batch)
+        .put_with_kind(batch, kind)
         .await
         .context("PUT parquet object to S3 (durability a)")?;
     // (b) committed in the control DB.

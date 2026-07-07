@@ -75,7 +75,18 @@ impl ParquetSink {
 
     /// Encode `batch` to Parquet (MICROS temporals + Snappy, inherited from the Arrow schema and the
     /// walrus writer properties) and stream it to S3 via multipart. Returns **only once durable**.
+    /// Streamed WAL rows; the backfill (PR 2.29) uses [`Self::put_with_kind`].
     pub async fn put(&self, batch: SealedBatch) -> Result<WrittenObject, SinkError> {
+        self.put_with_kind(batch, FileKind::Stream).await
+    }
+
+    /// As [`Self::put`], stamping the object's provenance (`stream` vs `snapshot`) — the manifest row's
+    /// `kind` (PR 2.25). Snapshot files all share `lsn_end = consistent_point`, `id`-disambiguated.
+    pub async fn put_with_kind(
+        &self,
+        batch: SealedBatch,
+        kind: FileKind,
+    ) -> Result<WrittenObject, SinkError> {
         let uuid = uuid::Uuid::new_v4().to_string();
         let key = self.object_key(&batch.schema, &batch.table, batch.lsn_end, &uuid);
 
@@ -105,7 +116,7 @@ impl ParquetSink {
             lsn_end: batch.lsn_end,
             row_count: batch.row_count,
             schema_version: batch.schema_version,
-            kind: FileKind::Stream,
+            kind,
         })
     }
 }
