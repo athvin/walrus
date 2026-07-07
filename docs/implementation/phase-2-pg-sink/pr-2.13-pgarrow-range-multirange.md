@@ -1,5 +1,7 @@
 # PR 2.13 — Tier-2: `range` (5 flat columns) + `multirange` (`LIST<STRUCT>`)
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/33
+
 > **Phase:** 2 — walrus-pg-sink (2b: pg-to-arrow) · **Crates touched:** `pg-to-arrow` · **Est. size:** L ·
 > **Depends on:** PR 2.12 · **Unlocks:** PR 2.14
 
@@ -102,18 +104,18 @@ mod tests {
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `emit_fields` returns the 5 correctly-typed range columns (element type per family) and a single
+- [x] `emit_fields` returns the 5 correctly-typed range columns (element type per family) and a single
       `LIST(STRUCT(...))` field for multiranges.
-- [ ] Encoding proven distinct: whole-column NULL → all five NULL; `empty` → `_empty=true` + both bounds NULL;
+- [x] Encoding proven distinct: whole-column NULL → all five NULL; `empty` → `_empty=true` + both bounds NULL;
       unbounded-lower → `_lower` NULL with `_empty=false`.
-- [ ] `int4range`/`int8range`/`daterange` canonicalize to `[)` and still emit all five flags uniformly;
+- [x] `int4range`/`int8range`/`daterange` canonicalize to `[)` and still emit all five flags uniformly;
       continuous `numrange`/`tsrange`/`tstzrange` preserve arbitrary inclusivity.
-- [ ] `multirange` round-trips member count/order; empty multirange = empty list ≠ NULL list.
-- [ ] Conformance: read_parquet reproduces bounds, inclusivity, and `_empty` for each case.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-to-arrow` and `cargo test -p pg-to-arrow --features conformance`
+- [x] `multirange` round-trips member count/order; empty multirange = empty list ≠ NULL list.
+- [x] Conformance: read_parquet reproduces bounds, inclusivity, and `_empty` for each case.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-to-arrow` and `cargo test -p pg-to-arrow --features conformance`
 
 ## Hints & gotchas
 

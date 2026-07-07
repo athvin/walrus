@@ -191,7 +191,7 @@ Two deliberate structural notes:
 | ✅ | [2.10](./phase-2-pg-sink/pr-2.10-pgarrow-tier1-recordbatch.md) | Tier-1 `TupleValue` → Arrow builders → RecordBatch | sink §2 / §2.7 |
 | ✅ | [2.11](./phase-2-pg-sink/pr-2.11-pgarrow-parquet-duckdb-conformance.md) | Parquet write + DuckDB read-back conformance harness | sink §2.1 / §2.8 |
 | ✅ | [2.12](./phase-2-pg-sink/pr-2.12-pgarrow-interval-timetz.md) | Tier-2 `interval` (3 cols) + `timetz` (2 cols) | sink §2.4 |
-| ☐ | [2.13](./phase-2-pg-sink/pr-2.13-pgarrow-range-multirange.md) | Tier-2 `range` (5 cols) + `multirange` | sink §2.4 |
+| ✅ | [2.13](./phase-2-pg-sink/pr-2.13-pgarrow-range-multirange.md) | Tier-2 `range` (5 cols) + `multirange` | sink §2.4 |
 | ☐ | [2.14](./phase-2-pg-sink/pr-2.14-pgarrow-geometric.md) | Tier-2 geometric types → STRUCT/LIST of doubles | sink §2.4 |
 | ☐ | [2.15](./phase-2-pg-sink/pr-2.15-pgarrow-tier3-text-carriers.md) | Tier-3 canonical-text carriers (numeric>38, bit, inet, …) | sink §2.5 |
 | ☐ | [2.16](./phase-2-pg-sink/pr-2.16-pgarrow-uuid-enum.md) | `uuid` (arrow.uuid) + `enum` (VARCHAR + labels) | sink §2.4 / §2.5 |
