@@ -1,5 +1,7 @@
 # PR 2.12 — Tier-2: `interval` (3 columns) + `timetz` (2 columns)
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/32
+
 > **Phase:** 2 — walrus-pg-sink (2b: pg-to-arrow) · **Crates touched:** `pg-to-arrow` · **Est. size:** M ·
 > **Depends on:** PR 2.11 · **Unlocks:** PR 2.13
 
@@ -94,18 +96,18 @@ mod tests {
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `emit_fields` returns 3 fields for `interval` and 2 for `timetz`, named `<c>_months/_days/_micros` and
+- [x] `emit_fields` returns 3 fields for `interval` and 2 for `timetz`, named `<c>_months/_days/_micros` and
       `<c>_micros/_offset_seconds`; Tier-1 columns still return exactly one field (no regression to PR 2.9 tests).
-- [ ] `BatchBuilder` appends an `interval` value to all three builders and a `timetz` value to both; a source
+- [x] `BatchBuilder` appends an `interval` value to all three builders and a `timetz` value to both; a source
       `NULL` sets all sibling columns null in the same row.
-- [ ] `parse_interval` keeps `'1 mon'`, `'30 days'`, `'720 hours'` as *distinct* `(1,0,0)`/`(0,30,0)`/`(0,0,…)`.
-- [ ] Conformance: interval rebuilds to the right DuckDB `INTERVAL` (`to_months+to_days+to_microseconds`), and
+- [x] `parse_interval` keeps `'1 mon'`, `'30 days'`, `'720 hours'` as *distinct* `(1,0,0)`/`(0,30,0)`/`(0,0,…)`.
+- [x] Conformance: interval rebuilds to the right DuckDB `INTERVAL` (`to_months+to_days+to_microseconds`), and
       `timetz` offset sign round-trips (the test *pins* the convention).
-- [ ] A comment on the interval column records the never-a-join-key caveat.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-to-arrow` and `cargo test -p pg-to-arrow --features conformance`
+- [x] A comment on the interval column records the never-a-join-key caveat.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-to-arrow` and `cargo test -p pg-to-arrow --features conformance`
 
 ## Hints & gotchas
 

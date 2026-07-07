@@ -160,3 +160,98 @@ fn json_is_verbatim() {
     assert_eq!(t, "VARCHAR");
     assert_eq!(v, "{\"a\": 1}");
 }
+
+// ---- Tier-2 fan-out (PR 2.12) -------------------------------------------------------------------
+// One source column becomes several: interval → c_months/c_days/c_micros, timetz → c_micros/
+// c_offset_seconds. We assert the sibling column *types* and that DuckDB rebuilds them back into the
+// intended `INTERVAL` (via `to_months + to_days + to_microseconds`, §2.4) / pinned timetz offset.
+
+/// A one-column ("c") relation of a given Tier-2 type.
+fn one_col_rel(oid: u32, typmod: i32) -> PgRelation {
+    PgRelation {
+        oid: 1,
+        schema: "public".to_string(),
+        name: "t".to_string(),
+        replica_identity: ReplicaIdentity::Default,
+        columns: vec![PgColumn {
+            name: "c".to_string(),
+            type_oid: oid,
+            type_modifier: typmod,
+            is_key: false,
+        }],
+    }
+}
+
+#[test]
+fn interval_three_columns_rebuild_to_duckdb_interval() {
+    // '1 mon 2 days 03:04:05' → c_months=1, c_days=2, c_micros=11_045_000_000.
+    let bytes =
+        write_parquet_bytes(&one_col_batch(oids::INTERVAL, -1, "1 mon 2 days 03:04:05")).unwrap();
+
+    // Sibling column types: months/days are INTEGER, micros is BIGINT.
+    let types = read_parquet_rows(&bytes, "SELECT typeof(c_months), typeof(c_micros) FROM {p}");
+    assert_eq!(types[0].0, "INTEGER");
+    assert_eq!(types[0].1, "BIGINT");
+    let days_ty = read_parquet_rows(&bytes, "SELECT typeof(c_days), 'x' FROM {p}");
+    assert_eq!(days_ty[0].0, "INTEGER");
+
+    // The loader's rebuild recovers a genuine DuckDB INTERVAL.
+    let rebuild = "to_months(c_months) + to_days(c_days) + to_microseconds(c_micros)";
+    let rows = read_parquet_rows(
+        &bytes,
+        &format!("SELECT typeof({rebuild}), CAST({rebuild} AS VARCHAR) FROM {{p}}"),
+    );
+    assert_eq!(rows[0].0, "INTERVAL");
+    let v = &rows[0].1;
+    assert!(
+        v.contains("1 month") && v.contains("2 days") && v.contains("03:04:05"),
+        "rebuilt interval was {v}"
+    );
+}
+
+#[test]
+fn interval_null_sets_all_three_columns_null() {
+    let rel = one_col_rel(oids::INTERVAL, -1);
+    let mut b = BatchBuilder::new(&rel).unwrap();
+    b.append_row(&[TupleValue::Null], &meta()).unwrap();
+    let bytes = write_parquet_bytes(&b.finish().unwrap()).unwrap();
+    let rows = read_parquet_rows(
+        &bytes,
+        "SELECT 'x', (c_months IS NULL AND c_days IS NULL AND c_micros IS NULL)::VARCHAR FROM {p}",
+    );
+    assert_eq!(
+        rows[0].1, "true",
+        "a NULL interval nulls all three siblings"
+    );
+}
+
+#[test]
+fn timetz_offset_sign_roundtrips() {
+    // Sign convention pinned here: '+05:30' (east of UTC) stores offset_seconds = +19800.
+    let bytes = write_parquet_bytes(&one_col_batch(oids::TIMETZ, -1, "12:34:56+05:30")).unwrap();
+
+    let types = read_parquet_rows(
+        &bytes,
+        "SELECT typeof(c_micros), typeof(c_offset_seconds) FROM {p}",
+    );
+    assert_eq!(types[0].0, "BIGINT");
+    assert_eq!(types[0].1, "INTEGER");
+
+    let vals = read_parquet_rows(
+        &bytes,
+        "SELECT CAST(c_micros AS VARCHAR), CAST(c_offset_seconds AS VARCHAR) FROM {p}",
+    );
+    assert_eq!(
+        vals[0].0,
+        ((12i64 * 3600 + 34 * 60 + 56) * 1_000_000).to_string()
+    );
+    assert_eq!(vals[0].1, "19800");
+
+    // A west-of-UTC offset stores the negative — the sign is not dropped the way DMS does.
+    let west = write_parquet_bytes(&one_col_batch(oids::TIMETZ, -1, "12:34:56-08")).unwrap();
+    let w = read_parquet_rows(
+        &west,
+        "SELECT 'x', CAST(c_offset_seconds AS VARCHAR) FROM {p}",
+    );
+    assert_eq!(w[0].1, "-28800");
+}

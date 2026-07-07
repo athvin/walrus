@@ -22,22 +22,30 @@ pub fn build_schema(rel: &PgRelation) -> Result<Schema, Error> {
             relation: format!("{}.{}", rel.schema, rel.name),
         });
     }
+    // One source column may fan out to several fields (Tier-2, PR 2.12), so we `extend` rather than
+    // `push` — the seam that interval/timetz and every remaining type PR (2.13–2.16) plug into.
     let mut fields: Vec<Field> = Vec::with_capacity(rel.columns.len() + 1);
     for col in &rel.columns {
-        fields.push(tier1_field(col)?);
+        fields.extend(emit_fields(col)?);
     }
     // Provenance rides in one JSON-text column, always present → non-nullable.
     fields.push(Field::new(SINK_META_COLUMN, DataType::Utf8, false));
     Ok(Schema::new(fields))
 }
 
-/// One source column → one Arrow `Field`. **Data fields stay `nullable(true)`**: delete old-images
-/// and unchanged-TOAST placeholders arrive partial, so even a PK column can be absent on the wire;
-/// the mirror's PK-not-null is enforced downstream in the loader, not here.
-pub fn tier1_field(col: &PgColumn) -> Result<Field, Error> {
-    match tier1_data_type(col.type_oid, col.type_modifier) {
-        Some(dt) => Ok(Field::new(col.name.clone(), dt, true)),
-        None => Err(Error::NotTier1 {
+/// One source column → the Arrow field(s) the sink emits for it. **Tier-1** maps 1:1 (one field);
+/// **Tier-2** (`interval`, `timetz`, …) decomposes into several sibling fields the loader recombines
+/// (§2.4). **Data fields stay `nullable(true)`**: delete old-images and unchanged-TOAST placeholders
+/// arrive partial, so even a PK column can be absent on the wire; the mirror's PK-not-null is enforced
+/// downstream in the loader, not here.
+pub fn emit_fields(col: &PgColumn) -> Result<Vec<Field>, Error> {
+    if let Some(dt) = tier1_data_type(col.type_oid, col.type_modifier) {
+        return Ok(vec![Field::new(col.name.clone(), dt, true)]);
+    }
+    match col.type_oid {
+        oids::INTERVAL => Ok(crate::tier2::interval_fields(&col.name)),
+        oids::TIMETZ => Ok(crate::tier2::timetz_fields(&col.name)),
+        _ => Err(Error::NotTier1 {
             oid: col.type_oid,
             typmod: col.type_modifier,
         }),
@@ -187,10 +195,77 @@ mod tests {
     }
 
     #[test]
-    fn non_tier1_oid_errors() {
-        // interval (1186) is Tier-2 (PR 2.12), not Tier-1.
-        let err = tier1_field(&col("dur", 1186, -1)).unwrap_err();
-        assert!(matches!(err, Error::NotTier1 { oid: 1186, .. }));
+    fn tier1_column_still_emits_exactly_one_field() {
+        // No regression from PR 2.9: a native type expands to a single field named after the column.
+        let fields = emit_fields(&col("note", oids::TEXT, -1)).unwrap();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name(), "note");
+        assert_eq!(fields[0].data_type(), &DataType::Utf8);
+    }
+
+    #[test]
+    fn interval_emits_three_signed_int_fields() {
+        let fields = emit_fields(&col("dur", oids::INTERVAL, -1)).unwrap();
+        let shape: Vec<(&str, &DataType)> = fields
+            .iter()
+            .map(|f| (f.name().as_str(), f.data_type()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("dur_months", &DataType::Int32),
+                ("dur_days", &DataType::Int32),
+                ("dur_micros", &DataType::Int64),
+            ]
+        );
+        assert!(fields.iter().all(|f| f.is_nullable()));
+    }
+
+    #[test]
+    fn timetz_emits_micros_and_offset_fields() {
+        let fields = emit_fields(&col("t", oids::TIMETZ, -1)).unwrap();
+        let shape: Vec<(&str, &DataType)> = fields
+            .iter()
+            .map(|f| (f.name().as_str(), f.data_type()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("t_micros", &DataType::Int64),
+                ("t_offset_seconds", &DataType::Int32),
+            ]
+        );
+    }
+
+    #[test]
+    fn interval_fields_expand_within_the_relation_schema() {
+        // A Tier-2 column widens the flat schema: 1 int col + interval(3) + meta = 5 fields.
+        let rel = PgRelation {
+            oid: 2,
+            schema: "public".to_string(),
+            name: "spans".to_string(),
+            replica_identity: ReplicaIdentity::Default,
+            columns: vec![col("id", oids::INT4, -1), col("dur", oids::INTERVAL, -1)],
+        };
+        let schema = build_schema(&rel).unwrap();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "id",
+                "dur_months",
+                "dur_days",
+                "dur_micros",
+                SINK_META_COLUMN
+            ]
+        );
+    }
+
+    #[test]
+    fn still_unhandled_oid_errors() {
+        // int4range (3904) is Tier-2 range, deferred to PR 2.13 — still NotTier1 here.
+        let err = emit_fields(&col("r", 3904, -1)).unwrap_err();
+        assert!(matches!(err, Error::NotTier1 { oid: 3904, .. }));
     }
 
     #[test]

@@ -13,8 +13,10 @@ pub mod error;
 pub mod oids;
 pub mod parquet;
 pub mod schema;
+pub mod tier2;
 
 pub use batch::BatchBuilder;
 pub use error::Error;
 pub use parquet::{default_writer_properties, write_parquet, write_parquet_bytes};
-pub use schema::{build_schema, tier1_data_type, tier1_field, SINK_META_COLUMN};
+pub use schema::{build_schema, emit_fields, tier1_data_type, SINK_META_COLUMN};
+pub use tier2::{parse_interval, parse_timetz};
