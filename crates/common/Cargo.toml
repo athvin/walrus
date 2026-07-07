@@ -15,6 +15,9 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 figment = { workspace = true, features = ["env", "toml", "yaml"] }
 humantime-serde = { workspace = true }
+# jiff over `time`: jiff::Timestamp is inherently a UTC instant and Displays as RFC-3339 with a
+# `Z` suffix, so UtcTimestamp cannot accidentally emit a local/offset datetime.
+jiff = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
