@@ -134,6 +134,11 @@ jobs:
       - name: Source preflight (compose)
         run: cargo test -p pg-sink --test preflight -- --ignored
 
+      # PR 2.20: the START_REPLICATION transport spike — a source write yields an XLogData frame, and
+      # standby-status keepalive feedback keeps the connection alive past wal_sender_timeout (5s).
+      - name: Replication spike (compose)
+        run: cargo test -p pg-sink --test replication_spike -- --ignored
+
       # PR 2.18/2.19: the sink pod-lifecycle shell against the live stack — full bootstrap (control +
       # S3 + source preflight) → /startup→/ready flip, SIGTERM exit 0, missing control DB → exit 11.
       - name: Sink pod-lifecycle smoke (health · SIGTERM · fail-fast exit code)

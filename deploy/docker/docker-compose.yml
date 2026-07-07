@@ -14,6 +14,10 @@ services:
     environment:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: walrus
+      # Dev-harness auth: `trust` so the sink's hand-rolled replication client (PR 2.20) does a
+      # no-SCRAM startup handshake. Password-based clients (preflight/control) still connect — trust
+      # ignores the credential. Never use `trust` outside the harness.
+      POSTGRES_HOST_AUTH_METHOD: trust
     ports:
       - "5432:5432"
     command:
@@ -24,6 +28,10 @@ services:
       - max_replication_slots=10
       - -c
       - max_wal_senders=10
+      - -c
+      # Short walsender timeout so the "survives past wal_sender_timeout" spike test (PR 2.20) is
+      # fast; the sink's standby-status feedback interval must stay well under this.
+      - wal_sender_timeout=5s
       - -c
       - logical_decoding_work_mem=64kB # tiny → streaming trips on small txns (Phase 2 tests)
     volumes:
