@@ -71,6 +71,13 @@ pub fn emit_fields(col: &PgColumn) -> Result<Vec<Field>, Error> {
     if let Some(field) = crate::geometric::geometric_field(&col.name, col.type_oid) {
         return Ok(vec![field]);
     }
+    // uuid → native FixedSizeBinary(16)+arrow.uuid; enum (non-builtin OID) → Utf8 (§2.4/§2.5, PR 2.16).
+    if col.type_oid == oids::UUID {
+        return Ok(vec![crate::uuid_enum::uuid_field(&col.name)]);
+    }
+    if crate::uuid_enum::is_enum_oid(col.type_oid) {
+        return Ok(vec![crate::uuid_enum::enum_field(&col.name)]);
+    }
     Err(Error::NotTier1 {
         oid: col.type_oid,
         typmod: col.type_modifier,
@@ -302,9 +309,26 @@ mod tests {
 
     #[test]
     fn still_unhandled_oid_errors() {
-        // uuid (2950) is a Tier-3 VARCHAR carrier, deferred to PR 2.15 — still NotTier1 here.
-        let err = emit_fields(&col("u", 2950, -1)).unwrap_err();
-        assert!(matches!(err, Error::NotTier1 { oid: 2950, .. }));
+        // money (790) is a builtin with no mapping yet — still NotTier1 (and not caught by the
+        // non-builtin enum rule, since 790 < FIRST_NORMAL_OID).
+        let err = emit_fields(&col("m", 790, -1)).unwrap_err();
+        assert!(matches!(err, Error::NotTier1 { oid: 790, .. }));
+    }
+
+    #[test]
+    fn uuid_emits_fixed_size_binary_with_extension_and_enum_is_utf8() {
+        let u = emit_fields(&col("id", oids::UUID, -1)).unwrap();
+        assert_eq!(u.len(), 1);
+        assert_eq!(u[0].data_type(), &DataType::FixedSizeBinary(16));
+        assert_eq!(
+            u[0].metadata()
+                .get("ARROW:extension:name")
+                .map(String::as_str),
+            Some("arrow.uuid")
+        );
+        // A non-builtin OID is treated as enum → Utf8 (interim, PR 2.22 resolves via catalog).
+        let e = emit_fields(&col("status", 16400, -1)).unwrap();
+        assert_eq!(e[0].data_type(), &DataType::Utf8);
     }
 
     #[test]

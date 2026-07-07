@@ -17,6 +17,7 @@ pub mod range;
 pub mod schema;
 pub mod tier2;
 pub mod tier3;
+pub mod uuid_enum;
 
 pub use batch::BatchBuilder;
 pub use error::Error;

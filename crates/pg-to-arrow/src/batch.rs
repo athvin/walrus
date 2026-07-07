@@ -14,9 +14,9 @@ use crate::range::RangeFamily;
 use crate::schema::{build_schema, tier1_data_type, SINK_META_COLUMN};
 use arrow::array::{
     make_builder, ArrayBuilder, ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder,
-    Decimal128Builder, Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder,
-    ListBuilder, RecordBatch, StringBuilder, StructBuilder, Time64MicrosecondBuilder,
-    TimestampMicrosecondBuilder,
+    Decimal128Builder, FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder,
+    Int32Builder, Int64Builder, ListBuilder, RecordBatch, StringBuilder, StructBuilder,
+    Time64MicrosecondBuilder, TimestampMicrosecondBuilder,
 };
 use arrow::datatypes::{DataType, Field, FieldRef, SchemaRef, TimeUnit};
 use common::{PgColumn, PgRelation, SinkMeta, TupleValue};
@@ -43,6 +43,10 @@ fn emit_kind(col: &PgColumn) -> Result<Emit, Error> {
     }
     // Tier-3 carriers are a single Utf8 column → the same Scalar/append_value path (PR 2.15).
     if crate::tier3::is_tier3_text(col.type_oid, col.type_modifier) {
+        return Ok(Emit::Scalar);
+    }
+    // uuid (FixedSizeBinary) and enum (Utf8) are both single columns → Scalar/append_value (PR 2.16).
+    if col.type_oid == oids::UUID || crate::uuid_enum::is_enum_oid(col.type_oid) {
         return Ok(Emit::Scalar);
     }
     match col.type_oid {
@@ -178,6 +182,11 @@ fn column_builder(field: &Field) -> Result<Box<dyn ArrayBuilder>, Error> {
         DataType::Timestamp(TimeUnit::Microsecond, tz) => {
             Box::new(TimestampMicrosecondBuilder::new().with_timezone_opt(tz.clone()))
         }
+        // uuid: FixedSizeBinary(16). The `arrow.uuid` extension lives on the schema Field (not the
+        // builder); it rides through `write_parquet`'s `batch.schema()` into the Parquet UUID type.
+        DataType::FixedSizeBinary(width) => {
+            Box::new(FixedSizeBinaryBuilder::with_capacity(0, *width))
+        }
         // Multirange: LIST<STRUCT>. Build the struct's child builders via `column_builder` too, so a
         // Decimal/Timestamp member bound keeps its precision/scale/tz (`make_builder` would drop them
         // and the finished array would mismatch the schema). ListBuilder's default item field is
@@ -301,8 +310,18 @@ fn append_value(
                 }
             }
         }
-        // `append_value` only runs for `Emit::Scalar` (Tier-1) columns; Tier-2 fan-out has its own
-        // `append_interval`/`append_timetz`. So no other Arrow type reaches this arm.
+        // uuid: parse canonical text → 16 bytes, append as fixed-width binary (PR 2.16).
+        DataType::FixedSizeBinary(_) => {
+            let b = downcast!(builder, FixedSizeBinaryBuilder, col);
+            if is_null {
+                b.append_null();
+            } else {
+                let bytes = crate::uuid_enum::parse_uuid_bytes(text(value, col, dt)?)?;
+                b.append_value(bytes)?;
+            }
+        }
+        // `append_value` runs for `Emit::Scalar` (Tier-1 + Tier-3 Utf8 + uuid) columns; the Tier-2
+        // fan-out shapes have their own `append_*`. So no other Arrow type reaches this arm.
         _ => {
             return Err(Error::Downcast {
                 column: col.to_string(),
