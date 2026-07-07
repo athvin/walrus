@@ -8,53 +8,102 @@
 //! move in lockstep — every `append_row` pushes exactly one slot to every column.
 
 use crate::error::Error;
-use crate::schema::{build_schema, SINK_META_COLUMN};
+use crate::oids;
+use crate::schema::{build_schema, tier1_data_type, SINK_META_COLUMN};
 use arrow::array::{
     make_builder, ArrayBuilder, ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder,
     Decimal128Builder, Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder,
     RecordBatch, StringBuilder, Time64MicrosecondBuilder, TimestampMicrosecondBuilder,
 };
 use arrow::datatypes::{DataType, Field, SchemaRef, TimeUnit};
-use common::{PgRelation, SinkMeta, TupleValue};
+use common::{PgColumn, PgRelation, SinkMeta, TupleValue};
 use std::sync::Arc;
+
+/// How one source column's `TupleValue` fans out onto the flat builder list. Tier-1 consumes one
+/// builder (the existing `append_value` path); Tier-2 spreads a single value across several sibling
+/// builders (PR 2.12). Ordering here MUST match `emit_fields` / `build_schema` (§2.4, PR 2.17's
+/// descriptor `emit[]` lists the same suffixes in the same order).
+enum Emit {
+    Scalar,   // 1 builder
+    Interval, // 3 builders: _months(i32), _days(i32), _micros(i64)
+    Timetz,   // 2 builders: _micros(i64), _offset_seconds(i32)
+}
+
+/// The number of flat builders (emitted Arrow fields) this source column consumes.
+fn emit_kind(col: &PgColumn) -> Result<Emit, Error> {
+    if tier1_data_type(col.type_oid, col.type_modifier).is_some() {
+        return Ok(Emit::Scalar);
+    }
+    match col.type_oid {
+        oids::INTERVAL => Ok(Emit::Interval),
+        oids::TIMETZ => Ok(Emit::Timetz),
+        _ => Err(Error::NotTier1 {
+            oid: col.type_oid,
+            typmod: col.type_modifier,
+        }),
+    }
+}
 
 /// Accumulates decoded rows for ONE relation into a single Arrow `RecordBatch`.
 pub struct BatchBuilder {
     schema: SchemaRef,
-    builders: Vec<Box<dyn ArrayBuilder>>, // one per source (Tier-1) column, in order
+    builders: Vec<Box<dyn ArrayBuilder>>, // one per EMITTED field, flat, in schema order
+    plan: Vec<Emit>,                      // one per SOURCE column: how its value fans out
     meta: StringBuilder,                  // the trailing walrus_pg_sink_meta column
     rows: usize,
 }
 
 impl BatchBuilder {
-    /// Build empty typed builders from the relation's Tier-1 Arrow schema (PR 2.9).
+    /// Build empty typed builders from the relation's Arrow schema (PR 2.9; Tier-2 fan-out, PR 2.12).
     pub fn new(rel: &PgRelation) -> Result<Self, Error> {
         let schema = Arc::new(build_schema(rel)?);
-        let mut builders = Vec::with_capacity(rel.columns.len());
-        // All fields except the trailing meta column.
-        for field in schema.fields().iter().take(rel.columns.len()) {
+        // One flat builder per data field (every field except the trailing meta column).
+        let data_field_count = schema.fields().len() - 1;
+        let mut builders = Vec::with_capacity(data_field_count);
+        for field in schema.fields().iter().take(data_field_count) {
             builders.push(column_builder(field)?);
+        }
+        // One routing entry per source column; its widths sum to `data_field_count`.
+        let mut plan = Vec::with_capacity(rel.columns.len());
+        for col in &rel.columns {
+            plan.push(emit_kind(col)?);
         }
         Ok(BatchBuilder {
             schema,
             builders,
+            plan,
             meta: StringBuilder::new(),
             rows: 0,
         })
     }
 
-    /// Append one decoded tuple + its provenance. `values.len()` must equal the source column count.
+    /// Append one decoded tuple + its provenance. `values.len()` must equal the source column count
+    /// (one `TupleValue` per source column — Tier-2 values fan out to several builders internally).
     pub fn append_row(&mut self, values: &[TupleValue], meta: &SinkMeta) -> Result<(), Error> {
-        if values.len() != self.builders.len() {
+        if values.len() != self.plan.len() {
             return Err(Error::RowLenMismatch {
-                expected: self.builders.len(),
+                expected: self.plan.len(),
                 got: values.len(),
             });
         }
         // Clone the Fields (Arc) so we can read the field types while mutably borrowing `builders`.
         let fields = self.schema.fields().clone();
-        for (i, (builder, value)) in self.builders.iter_mut().zip(values).enumerate() {
-            append_value(builder.as_mut(), &fields[i], value)?;
+        let mut bi = 0; // flat builder index; advances by each column's emit width
+        for (emit, value) in self.plan.iter().zip(values) {
+            match emit {
+                Emit::Scalar => {
+                    append_value(self.builders[bi].as_mut(), &fields[bi], value)?;
+                    bi += 1;
+                }
+                Emit::Interval => {
+                    append_interval(&mut self.builders[bi..bi + 3], fields[bi].name(), value)?;
+                    bi += 3;
+                }
+                Emit::Timetz => {
+                    append_timetz(&mut self.builders[bi..bi + 2], fields[bi].name(), value)?;
+                    bi += 2;
+                }
+            }
         }
         let json = serde_json::to_string(meta).map_err(|e| Error::ValueParse {
             column: SINK_META_COLUMN.to_string(),
@@ -192,12 +241,74 @@ fn append_value(
                 }
             }
         }
-        // The schema is Tier-1 by construction (PR 2.9), so no other type reaches here.
+        // `append_value` only runs for `Emit::Scalar` (Tier-1) columns; Tier-2 fan-out has its own
+        // `append_interval`/`append_timetz`. So no other Arrow type reaches this arm.
         _ => {
             return Err(Error::Downcast {
                 column: col.to_string(),
             })
         }
+    }
+    Ok(())
+}
+
+/// Fan a single `interval` value across its three sibling builders (`_months` i32, `_days` i32,
+/// `_micros` i64). NULL / unchanged-TOAST sets all three null in lockstep — the one shared logical
+/// NULL that keeps a real zero interval `(0,0,0)` distinguishable from absence (§2.4).
+fn append_interval(
+    builders: &mut [Box<dyn ArrayBuilder>],
+    col: &str,
+    value: &TupleValue,
+) -> Result<(), Error> {
+    let parts = match value {
+        TupleValue::Null | TupleValue::UnchangedToast => None,
+        _ => Some(crate::tier2::parse_interval(text(
+            value,
+            col,
+            &DataType::Int64,
+        )?)?),
+    };
+    let months = downcast!(builders[0], Int32Builder, col);
+    match parts {
+        Some((m, _, _)) => months.append_value(m),
+        None => months.append_null(),
+    }
+    let days = downcast!(builders[1], Int32Builder, col);
+    match parts {
+        Some((_, d, _)) => days.append_value(d),
+        None => days.append_null(),
+    }
+    let micros = downcast!(builders[2], Int64Builder, col);
+    match parts {
+        Some((_, _, us)) => micros.append_value(us),
+        None => micros.append_null(),
+    }
+    Ok(())
+}
+
+/// Fan a single `timetz` value across `_micros` (i64) and `_offset_seconds` (i32); NULL sets both.
+fn append_timetz(
+    builders: &mut [Box<dyn ArrayBuilder>],
+    col: &str,
+    value: &TupleValue,
+) -> Result<(), Error> {
+    let parts = match value {
+        TupleValue::Null | TupleValue::UnchangedToast => None,
+        _ => Some(crate::tier2::parse_timetz(text(
+            value,
+            col,
+            &DataType::Int64,
+        )?)?),
+    };
+    let micros = downcast!(builders[0], Int64Builder, col);
+    match parts {
+        Some((us, _)) => micros.append_value(us),
+        None => micros.append_null(),
+    }
+    let offset = downcast!(builders[1], Int32Builder, col);
+    match parts {
+        Some((_, off)) => offset.append_value(off),
+        None => offset.append_null(),
     }
     Ok(())
 }
@@ -378,7 +489,10 @@ fn parse_timestamptz_micros(s: &str, col: &str) -> Result<i64, Error> {
 mod tests {
     use super::*;
     use crate::oids;
-    use arrow::array::{Array, AsArray, Decimal128Array, StringArray, TimestampMicrosecondArray};
+    use arrow::array::{
+        Array, AsArray, Decimal128Array, Int32Array, Int64Array, StringArray,
+        TimestampMicrosecondArray,
+    };
     use common::{Kind, Op, PgColumn, PgRelation, ReplicaIdentity, SinkMeta, UtcTimestamp};
 
     fn col(name: &str, oid: u32, typmod: i32) -> PgColumn {
@@ -569,5 +683,99 @@ mod tests {
         assert_eq!(parse_decimal("19.99", 2, "amount").unwrap(), 1999);
         assert_eq!(parse_decimal("-0.05", 2, "amount").unwrap(), -5);
         assert_eq!(parse_decimal("7", 2, "amount").unwrap(), 700);
+    }
+
+    /// A one-column relation of `oid` (used for the Tier-2 fan-out tests).
+    fn one_col_rel(name: &str, oid: u32, typmod: i32) -> PgRelation {
+        PgRelation {
+            oid: 3,
+            schema: "public".to_string(),
+            name: "t".to_string(),
+            replica_identity: ReplicaIdentity::Default,
+            columns: vec![col(name, oid, typmod)],
+        }
+    }
+
+    #[test]
+    fn interval_fans_out_to_three_builders() {
+        let rel = one_col_rel("dur", oids::INTERVAL, -1);
+        let mut b = BatchBuilder::new(&rel).unwrap();
+        b.append_row(
+            &[TupleValue::Text("1 mon 2 days 03:04:05".to_string())],
+            &meta(vec![]),
+        )
+        .unwrap();
+        let batch = b.finish().unwrap();
+        assert_eq!(batch.num_columns(), 4); // months + days + micros + meta
+        let months = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let days = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let micros = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(months.value(0), 1);
+        assert_eq!(days.value(0), 2);
+        assert_eq!(micros.value(0), (3 * 3600 + 4 * 60 + 5) * 1_000_000);
+    }
+
+    #[test]
+    fn timetz_fans_out_to_two_builders() {
+        let rel = one_col_rel("t", oids::TIMETZ, -1);
+        let mut b = BatchBuilder::new(&rel).unwrap();
+        b.append_row(
+            &[TupleValue::Text("12:34:56+05:30".to_string())],
+            &meta(vec![]),
+        )
+        .unwrap();
+        let batch = b.finish().unwrap();
+        assert_eq!(batch.num_columns(), 3); // micros + offset + meta
+        let micros = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let offset = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(micros.value(0), (12 * 3600 + 34 * 60 + 56) * 1_000_000);
+        assert_eq!(offset.value(0), 19_800);
+    }
+
+    #[test]
+    fn interval_null_maps_all_three_columns_null() {
+        let rel = one_col_rel("dur", oids::INTERVAL, -1);
+        let mut b = BatchBuilder::new(&rel).unwrap();
+        b.append_row(&[TupleValue::Null], &meta(vec![])).unwrap();
+        let batch = b.finish().unwrap();
+        let months = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let days = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let micros = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert!(
+            months.is_null(0) && days.is_null(0) && micros.is_null(0),
+            "all three interval siblings share one logical NULL"
+        );
     }
 }

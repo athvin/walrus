@@ -16,5 +16,8 @@ pub const DATE: u32 = 1082;
 pub const TIME: u32 = 1083;
 pub const TIMESTAMP: u32 = 1114;
 pub const TIMESTAMPTZ: u32 = 1184;
+// Tier-2 decompositions (PR 2.12): each fans out to several sibling columns (§2.4).
+pub const INTERVAL: u32 = 1186;
+pub const TIMETZ: u32 = 1266;
 pub const NUMERIC: u32 = 1700;
 pub const JSONB: u32 = 3802;
