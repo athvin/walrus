@@ -232,7 +232,7 @@ Two deliberate structural notes:
 | ✅ | [3.8](./phase-3-loader/pr-3.8-loader-ddl-additive.md) | DDL apply — additive (add/rename/widen/comment) | per-change-type table |
 | ✅ | [3.9](./phase-3-loader/pr-3.9-loader-ddl-destructive.md) | DDL apply — destructive (drop / lossy quarantine) | sink §3 / taxonomy |
 | ✅ | [3.10](./phase-3-loader/pr-3.10-loader-snapshot-stream-boundary.md) | snapshot/stream boundary via the transform | §1.7 / loader §7 |
-| ☐ | [3.11](./phase-3-loader/pr-3.11-loader-full-rebuild-compaction.md) | periodic full-rebuild / compaction + retention prune | loader §5.7 / §9.4 |
+| ✅ | [3.11](./phase-3-loader/pr-3.11-loader-full-rebuild-compaction.md) | periodic full-rebuild / compaction + retention prune | loader §5.7 / §9.4 |
 | ☐ | [3.12](./phase-3-loader/pr-3.12-loader-graceful-shutdown.md) | graceful SIGTERM drain + full-rebuild abort | loader §8.5 |
 
 ### Phase 4 — End-to-end, ops & resilience  ·  [`phase-4-end-to-end/`](./phase-4-end-to-end/)

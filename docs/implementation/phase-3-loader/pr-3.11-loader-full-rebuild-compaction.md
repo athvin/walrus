@@ -1,5 +1,7 @@
 # PR 3.11 — Periodic full-rebuild / compaction + retention prune
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/64
+
 > **Phase:** 3 — walrus-loader · **Crates touched:** `loader` · **Est. size:** L ·
 > **Depends on:** PR 3.10 · **Unlocks:** PR 3.12
 
@@ -95,22 +97,22 @@ async fn rebuild_reclaims_space_and_prune_keeps_mirror_correct() { todo!() }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] The full-rebuild produces a mirror **identical** to the incremental transform over the same
+- [x] The full-rebuild produces a mirror **identical** to the incremental transform over the same
       history (same rows, same values, `op='d'` winners dropped).
-- [ ] A raw value pruned below the retention floor **survives** because the rebuild unions the current
+- [x] A raw value pruned below the retention floor **survives** because the rebuild unions the current
       mirror as an LSN-floor baseline (nothing lost, incl. resolved unchanged-TOAST values).
-- [ ] The rebuild is **atomic** (`CREATE OR REPLACE … AS SELECT`; readers see the old table until
+- [x] The rebuild is **atomic** (`CREATE OR REPLACE … AS SELECT`; readers see the old table until
       commit) and reclaims space where ordinary `DELETE`/`CHECKPOINT` would not.
-- [ ] Compaction and retention are **distinct** cadence knobs from the poll interval, per-table
+- [x] Compaction and retention are **distinct** cadence knobs from the poll interval, per-table
       overridable; the rebuild runs on the **same worker thread**, serialized after an apply cycle.
-- [ ] A leftover cancellation hook exists for PR 3.12 to abort an in-flight rebuild.
-- [ ] Docs/comments state the DuckDB storage truth (`DELETE` tombstones; `VACUUM FULL` unimplemented;
+- [x] A leftover cancellation hook exists for PR 3.12 to abort an in-flight rebuild.
+- [x] Docs/comments state the DuckDB storage truth (`DELETE` tombstones; `VACUUM FULL` unimplemented;
       reclamation rides the rebuild).
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p loader` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` then `cargo test -p loader --test compaction -- --ignored`
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p loader` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` then `cargo test -p loader --test compaction -- --ignored`
         asserting **`rebuild_reclaims_space_and_prune_keeps_mirror_correct`**.
 
 ## Hints & gotchas
