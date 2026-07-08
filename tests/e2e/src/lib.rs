@@ -25,6 +25,8 @@ pub struct Harness {
     source: sqlx::PgPool,
     control: sqlx::PgPool,
     duckdb_dir: PathBuf,
+    /// The sink's captured stdout+stderr (its `tracing` log) — scraped for spill events (PR 4.3).
+    sink_log: PathBuf,
     /// The epoch the sink established (always 1 after the clean reset).
     pub epoch: i64,
 }
@@ -90,8 +92,9 @@ impl Harness {
         let duckdb_dir = std::env::temp_dir().join(format!("walrus-e2e-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&duckdb_dir);
         std::fs::create_dir_all(&duckdb_dir)?;
+        let sink_log = duckdb_dir.join("sink.log");
 
-        let sink = spawn_sink(&bins)?;
+        let sink = spawn_sink(&bins, &sink_log)?;
         wait_ready("http://127.0.0.1:8130", Duration::from_secs(45))
             .await
             .context("sink /ready")?;
@@ -106,16 +109,69 @@ impl Harness {
             source,
             control,
             duckdb_dir,
+            sink_log,
             epoch: 1,
         })
     }
 
-    /// Run SQL on the SOURCE database; returns rows affected.
+    /// The source Postgres pool — for tests that need multiple concurrent sessions (overlapping txns).
+    pub fn source_pool(&self) -> &sqlx::PgPool {
+        &self.source
+    }
+
+    /// How many speculative spills the sink has logged so far (PR 4.3) — the observable proof that the
+    /// `max_inflight_bytes` ceiling fired and open-txn memory stayed bounded (a real `in_flight_bytes`
+    /// metric endpoint lands in PR 4.10).
+    pub fn sink_spill_count(&self) -> usize {
+        std::fs::read_to_string(&self.sink_log)
+            .map(|s| s.matches("spilled open-txn buffer").count())
+            .unwrap_or(0)
+    }
+
+    /// Poll [`Harness::sink_spill_count`] until it reaches `min`, or the deadline elapses. Call this while
+    /// the producing txn is STILL OPEN: holding the txn open is what lets the walsender read past
+    /// `logical_decoding_work_mem` and stream it (a fast `BEGIN;…;COMMIT` can commit before it is decoded,
+    /// so it decodes as a complete, non-streamed txn and never spills). Deterministic, not a fixed sleep.
+    pub async fn await_spill(&self, min: usize, deadline: std::time::Duration) -> Result<usize> {
+        let start = tokio::time::Instant::now();
+        loop {
+            let n = self.sink_spill_count();
+            if n >= min {
+                return Ok(n);
+            }
+            if start.elapsed() > deadline {
+                anyhow::bail!("sink spilled {n} < {min} within {deadline:?}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+
+    /// The WAL bytes the replication slot is retaining (`restart_lsn` .. current) — bounded once a txn
+    /// commits and is consumed.
+    pub async fn slot_retained_bytes(&self) -> Result<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0)::bigint \
+             FROM pg_replication_slots WHERE slot_name = $1",
+        )
+        .bind(SLOT)
+        .fetch_optional(&self.source)
+        .await?
+        .unwrap_or(0))
+    }
+
+    /// Run a SINGLE SQL statement on the SOURCE database; returns rows affected.
     pub async fn source_exec(&self, sql: &str) -> Result<u64> {
         Ok(sqlx::query(sql)
             .execute(&self.source)
             .await?
             .rows_affected())
+    }
+
+    /// Run a MULTI-statement SQL batch on the SOURCE (simple query protocol) — e.g. `BEGIN; …; COMMIT`
+    /// with savepoints, which the extended protocol of [`Harness::source_exec`] rejects.
+    pub async fn source_batch(&self, sql: &str) -> Result<()> {
+        sqlx::raw_sql(sql).execute(&self.source).await?;
+        Ok(())
     }
 
     /// List S3 object keys under `<epoch>/<schema>/<table>/`.
@@ -258,8 +314,14 @@ async fn build_bins(_target: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn spawn_sink(bins: &std::path::Path) -> Result<Child> {
+fn spawn_sink(bins: &std::path::Path, log: &std::path::Path) -> Result<Child> {
+    // The sink's `tracing` fmt layer writes to STDOUT (its spill/durability events live there); config
+    // errors + panics go to STDERR. Capture BOTH into `sink.log` (two handles onto one file) so
+    // [`Harness::sink_spill_count`] can scrape the spill events AND a startup failure is still visible.
+    let stdout = std::fs::File::create(log).context("create sink log")?;
+    let stderr = stdout.try_clone().context("clone sink log handle")?;
     Command::new(bins.join("walrus-pg-sink"))
+        .stdout(std::process::Stdio::from(stdout))
         .env("WALRUS_SOURCE_DB_URL", SOURCE_URL)
         .env("WALRUS_CONTROL_DB_URL", CONTROL_URL)
         .env("WALRUS_OBJECT_STORE__BUCKET", BUCKET)
@@ -270,14 +332,18 @@ fn spawn_sink(bins: &std::path::Path) -> Result<Child> {
         .env("WALRUS_PUBLICATION_NAME", "walrus_pub")
         .env("WALRUS_MANAGE_PUBLICATION", "false")
         .env("WALRUS_MAX_FILL", "1s")
-        .env("WALRUS_MAX_ROWS", "1000")
-        .env("WALRUS_MAX_BYTES", "1000000")
-        .env("WALRUS_MAX_INFLIGHT_BYTES", "2000000")
+        .env("WALRUS_MAX_ROWS", "100000")
+        // A LOW aggregate ceiling (64 KiB) so a few thousand rows in one open txn spill (PR 4.3) —
+        // bounding memory — instead of buffering the whole txn. `max_bytes` (per-batch) must stay ≤ the
+        // ceiling (the sink validates `max_inflight_bytes >= max_bytes`).
+        .env("WALRUS_MAX_BYTES", "32768")
+        .env("WALRUS_MAX_INFLIGHT_BYTES", "65536")
         .env("WALRUS_HEARTBEAT_IDLE_AFTER", "1s")
         .env("WALRUS_STARTUP_DEADLINE", "30s")
         .env("WALRUS_HEALTH_ADDR", "127.0.0.1:8130")
         .env("AWS_ACCESS_KEY_ID", "minioadmin")
         .env("AWS_SECRET_ACCESS_KEY", "minioadmin")
+        .stderr(std::process::Stdio::from(stderr))
         .kill_on_drop(true)
         .spawn()
         .context("spawn walrus-pg-sink")
