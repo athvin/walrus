@@ -8,8 +8,7 @@
 use crate::error::LoaderError;
 use crate::phase_a::{run_phase_a, TableCtx};
 use crate::phase_b::run_phase_b;
-use crate::transform::TransformSql;
-use common::{Lsn, PgRelation};
+use common::Lsn;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -59,7 +58,7 @@ fn drain(ctx: &TableCtx) -> Result<(), LoaderError> {
 async fn compact(ctx: &TableCtx, shutdown: &CancellationToken) -> Result<(), LoaderError> {
     let cp = control::read_checkpoint(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table).await?;
     let transformed = cp.map(|c| c.transformed_lsn).unwrap_or(Lsn::ZERO);
-    let t = TransformSql::from_relation(&current_relation(ctx).await?);
+    let t = crate::phase_b::current_transform(ctx).await?;
 
     // The rebuild is abortable: a SIGTERM mid-rewrite interrupts it, rolls back, and returns Ok (PR 3.12).
     crate::compaction::full_rebuild_abortable(ctx.db.conn(), &t, shutdown).await?;
@@ -77,23 +76,4 @@ async fn compact(ctx: &TableCtx, shutdown: &CancellationToken) -> Result<(), Loa
         "compaction: mirror rebuilt (reclaimed), raw pruned below the retention floor"
     );
     Ok(())
-}
-
-/// The mirror's CURRENT reconciled shape — registry at the DuckDB `schema_version` (PR 3.8), falling back
-/// to the bootstrap relation when there is no registry row. Keeps the rebuild's columns matching the
-/// tables after any DDL, exactly as Phase B does.
-async fn current_relation(ctx: &TableCtx) -> Result<PgRelation, LoaderError> {
-    match control::read_registry(
-        &ctx.pool,
-        ctx.epoch,
-        &ctx.schema,
-        &ctx.table,
-        ctx.db.schema_version()?,
-    )
-    .await?
-    {
-        Some(r) => serde_json::from_value(r.columns)
-            .map_err(|e| LoaderError::Internal(format!("decode registry columns: {e}"))),
-        None => Ok(ctx.rel.clone()),
-    }
 }

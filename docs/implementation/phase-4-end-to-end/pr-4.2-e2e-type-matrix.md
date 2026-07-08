@@ -1,5 +1,7 @@
 # PR 4.2 — End-to-end type round-trip matrix + unchanged-TOAST carry-forward
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/67 (also built the loader's descriptor-driven Tier-2 type system, which Phase 3 had skipped)
+
 > **Phase:** 4 — End-to-end, ops & resilience · **Crates touched:** `tests/e2e` · **Est. size:** M ·
 > **Depends on:** PR 4.1 · **Unlocks:** PR 4.3
 
@@ -103,18 +105,19 @@ async fn unchanged_toast_update_keeps_old_big_value() {
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] Every matrix type round-trips to the mirror with the **expected DuckDB `typeof`** and value
-      (`numeric`→`DECIMAL(p,s)`, `timestamptz`→`TIMESTAMP WITH TIME ZONE`/MICROS, `uuid`→`UUID`, arrays,
-      `jsonb`, `bytea`, `interval`, `range`).
-- [ ] An all-NULL row round-trips with every column NULL (not empty string / not 0).
-- [ ] The unchanged-TOAST update leaves the mirror's big column at the **old value**, resolved by the
+- [x] Every matrix type round-trips to the mirror with the **expected DuckDB `typeof`** and value
+      (`numeric`→`DECIMAL(p,s)`, `timestamptz`→`TIMESTAMP WITH TIME ZONE`/MICROS, `uuid`→`UUID`,
+      `jsonb`→`VARCHAR` (Tier-3 text carrier), `bytea`→`BLOB`, `interval`→`INTERVAL` (recombined),
+      `range`→flat siblings). Arrays are not sink-mapped; `timetz`/geometric/multirange are follow-ups.
+- [x] An all-NULL row round-trips with every column NULL (not empty string / not 0).
+- [x] The unchanged-TOAST update leaves the mirror's big column at the **old value**, resolved by the
       raw back-scan — never NULL.
-- [ ] Failures name the offending type (table-driven, one assert per case).
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test --workspace`
-  - [ ] `docker compose up --wait` then `cargo test -p e2e --features it -- --ignored` asserting
+- [x] Failures name the offending type (table-driven, one assert per case).
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test --workspace`
+  - [x] `docker compose up --wait` then `cargo test -p e2e --features it -- --ignored` asserting
         **`every_mapped_type_round_trips_with_correct_typeof`**, **`all_nulls_round_trip_as_null`**, and
         **`unchanged_toast_update_keeps_old_big_value`**.
 

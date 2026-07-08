@@ -65,14 +65,25 @@ impl Harness {
         .execute(&source)
         .await
         .context("source 0002")?;
+        // The wide fidelity table (PR 4.2) — one column per mapped type family + a TOAST-able `big`. It
+        // must exist BEFORE the sink bootstraps so the sink registers it and the loader owns it.
+        sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS public.types_matrix ( \
+                 id  int PRIMARY KEY, n numeric(10,4), j jsonb, u uuid, ts timestamptz, \
+                 b bytea, iv interval, rng int4range, big text, s text); \
+             ALTER TABLE public.types_matrix ALTER COLUMN big SET STORAGE EXTENDED;",
+        )
+        .execute(&source)
+        .await
+        .context("create types_matrix")?;
         sqlx::raw_sql(&format!(
-            "TRUNCATE public.orders; \
+            "TRUNCATE public.orders; TRUNCATE public.types_matrix; \
              SELECT pg_drop_replication_slot('{SLOT}') \
                 FROM pg_replication_slots WHERE slot_name = '{SLOT}';"
         ))
         .execute(&source)
         .await
-        .context("reset source orders + slot")?;
+        .context("reset source tables + slot")?;
 
         let bins = target_dir();
         build_bins(&bins).await?;
