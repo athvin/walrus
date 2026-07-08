@@ -21,13 +21,19 @@ pub async fn run_phase_b(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
         })?;
     let after = cp.transformed_lsn;
 
-    // The max commit LSN in the un-transformed tail (16-hex text sorts as the LSN, so `max` = latest).
-    // `max()` returns one row (NULL when the tail is empty).
+    // The max commit LSN in the tail we (re)transform, bounded `>= transformed_lsn` (16-hex text sorts as
+    // the LSN, so `max` = latest). The `>=` is load-bearing for the snapshot/stream boundary (PR 3.10,
+    // closing PR 3.7 break-face A end-to-end): equal-`lsn_end` snapshot files carry `commit_lsn =
+    // consistent_point`, and if a later loader batch appends one *after* `transformed_lsn` already reached
+    // that point, a strict `>` scan would skip it forever. Re-including the boundary re-applies rows the
+    // mirror already has — the per-PK `_applied_*` guard makes those a no-op, so the mirror stays exact
+    // (`max()` is NULL only when `<table>_raw` is empty). A source that sits idle at the boundary re-scans
+    // that one commit's rows each poll; normal streaming advances `transformed_lsn` past it immediately.
     let conn = ctx.db.conn();
     let max_hex: Option<String> = conn
         .query_row(
             &format!(
-                "SELECT max(\"_walrus_commit_lsn\") FROM \"{}_raw\" WHERE \"_walrus_commit_lsn\" > ?",
+                "SELECT max(\"_walrus_commit_lsn\") FROM \"{}_raw\" WHERE \"_walrus_commit_lsn\" >= ?",
                 ctx.table
             ),
             [after.to_string()],
@@ -35,7 +41,7 @@ pub async fn run_phase_b(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
         )
         .map_err(|e| LoaderError::Duck(format!("scan un-transformed tail: {e}")))?;
     let Some(max_hex) = max_hex else {
-        return Ok(None); // nothing new since transformed_lsn
+        return Ok(None); // <table>_raw is empty — nothing to transform yet
     };
     let max_lsn: Lsn = max_hex
         .parse()
@@ -69,14 +75,9 @@ pub async fn run_phase_b(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
         .map_err(|e| LoaderError::Duck(format!("commit transform txn: {e}")))?;
 
     // Advance the watermark AFTER the DuckDB commit. The CHECK (transformed_lsn <= raw_appended_lsn)
-    // holds because Phase A ran first this cycle.
-    //
-    // The equal-`commit_lsn` snapshot straddle (§7 break face A) is handled INSIDE the transform: its
-    // window low bound is `>= after` (re-examines a row AT the watermark) and every mutating MERGE branch
-    // is gated on the per-PK `_applied_*` guard, so re-applying a boundary row is a no-op. The strict `>`
-    // max-scan above still gates WHETHER we run (no idle re-scan of the equal-`commit_lsn` snapshot bulk);
-    // proving the full equal-`lsn_end` split-batch boundary end-to-end is PR 3.10. The full-rebuild (PR
-    // 3.11) is the safety net regardless.
+    // holds because Phase A ran first this cycle. `max_lsn` can equal the prior `transformed_lsn` (a
+    // boundary re-transform advances it to the same value — a no-op) — that is the snapshot/stream
+    // boundary being held closed (PR 3.10). The full-rebuild (PR 3.11) is the safety net regardless.
     control::advance_transformed(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table, max_lsn).await?;
     tracing::info!(
         table = %format_args!("{}.{}", ctx.schema, ctx.table),

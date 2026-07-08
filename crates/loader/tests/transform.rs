@@ -695,3 +695,42 @@ fn columns_of(conn: &Connection, name: &str) -> Vec<String> {
     let rows = stmt.query_map([name], |r| r.get::<_, String>(0)).unwrap();
     rows.map(|r| r.unwrap()).collect()
 }
+
+// ---- PR 3.10: the snapshot/stream boundary through the transform. Snapshot rows are just more raw
+// rows the window ranks by `(commit_lsn, lsn)` — no bespoke backfill mode. ----
+
+/// A snapshot row (`commit_lsn = consistent_point`) plus a LATER overlapping stream change on the same
+/// PK → the stream value wins by tuple, zero loss / zero dupes.
+#[test]
+fn overlapping_stream_change_outranks_the_snapshot_row() {
+    let c = db();
+    seed(
+        &c,
+        &[
+            (1, 'i', 100, 1, "snap"), // snapshot: commit_lsn = consistent_point (100)
+            (1, 'u', 200, 5, "streamed"), // overlapping stream: commit_lsn > consistent_point
+        ],
+    );
+    transform(&c);
+    assert_eq!(
+        status_of(&c, 1).as_deref(),
+        Some("streamed"),
+        "the stream change (commit_lsn > consistent_point) out-ranks the snapshot row"
+    );
+    assert_eq!(mirror_count(&c), 1, "zero dupes across the boundary");
+}
+
+/// A snapshot-ONLY key whose `commit_lsn` equals `transformed_lsn` (the consistent_point boundary) is
+/// still applied — the `>=` window + PR 3.7 guard (break face A) never let the watermark skip it.
+#[test]
+fn no_stream_key_snapshot_row_at_boundary_is_applied() {
+    let c = db();
+    let after: common::Lsn = "0/64".parse().unwrap(); // consistent_point == transformed_lsn == 100
+    seed(&c, &[(2, 'i', 100, 3, "only-snap")]);
+    apply_transform(&c, &TransformSql::from_relation(&orders_rel()), &after).unwrap();
+    assert_eq!(
+        status_of(&c, 2).as_deref(),
+        Some("only-snap"),
+        "a no-stream snapshot key AT the boundary is applied, not dropped by the watermark"
+    );
+}

@@ -243,9 +243,15 @@ jobs:
         run: cargo test -p loader --test ddl_additive -- --ignored --test-threads=1
 
       # PR 3.9: destructive DDL apply — a lossy int4→int2 cast on a populated mirror overflows and
-      # quarantines the table (/ready degrades). Runs LAST among loader tests (highest seeded epoch).
+      # quarantines the table (/ready degrades).
       - name: Loader DDL destructive (compose)
         run: cargo test -p loader --test ddl_destructive -- --ignored --test-threads=1
+
+      # PR 3.10: snapshot/stream boundary — an overlapping stream change out-ranks the snapshot row, and
+      # equal-lsn_end snapshot files split across batches all land (the `>=` bound + PR 3.7 guard). Uses
+      # its own explicit epochs (constructs TableCtx directly), so it is order-independent vs bootstrap.
+      - name: Loader snapshot boundary (compose)
+        run: cargo test -p loader --test snapshot_boundary -- --ignored --test-threads=1
 
       - name: Tear down (remove volumes)
         if: always()
