@@ -128,6 +128,62 @@ async fn connection_survives_past_wal_sender_timeout() {
 }
 
 #[tokio::test]
+#[ignore = "requires docker compose up --wait (source PG, wal_sender_timeout=5s)"]
+async fn keepalive_survives_a_no_read_flush_window() {
+    // The keepalive-vs-durability contract (§1.9): while the decode loop is busy in a slow/stalled S3
+    // flush it is NOT reading frames, yet the walsender still severs us after `wal_sender_timeout` (5s)
+    // unless feedback keeps flowing. `flush_batch_keepalive` pumps `send_received_feedback` on the
+    // feedback cadence for exactly this reason. Reproduce it at the transport level: stop reading for
+    // > 5s while pumping keepalive, then prove the connection is still live (a fresh write streams
+    // through). Before the fix this exercised nothing — the pump lived inside `next()`, so not reading
+    // meant no feedback and a `terminating walsender` reconnect.
+    let slot = "walrus_spike_flush_keepalive";
+    let _guard = SOURCE_LOCK.lock().await;
+    let admin = admin().await;
+    let start = fresh_slot(&admin, slot).await;
+    let mut stream = ReplicationStream::start(&source_url(), slot, start, "walrus_pub")
+        .await
+        .unwrap();
+
+    // Simulate an 8s flush: never call next(); pump keepalive on the feedback cadence instead.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(stream.feedback_budget()).await;
+        stream
+            .send_received_feedback(false)
+            .await
+            .expect("keepalive during the simulated flush");
+    }
+
+    // Prove liveness: a fresh published write must still stream through (the walsender did not sever).
+    admin
+        .execute(
+            "UPDATE walrus.heartbeat SET beat_seq = beat_seq + 1, ts = now() WHERE id = 1",
+            &[],
+        )
+        .await
+        .unwrap();
+    let alive = tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            match stream.next().await.expect("frame") {
+                Some(ReplicationMessage::XLogData { data, .. }) if !data.is_empty() => break true,
+                Some(_) => continue, // buffered keepalive — keep reading
+                None => break false,
+            }
+        }
+    })
+    .await
+    .expect("stream still live after an 8s no-read flush window");
+    assert!(
+        alive,
+        "keepalive kept the walsender connected through the flush window"
+    );
+
+    drop(stream);
+    drop_slot(&admin, slot).await;
+}
+
+#[tokio::test]
 #[ignore = "requires docker compose up --wait (source PG)"]
 async fn reply_requested_keepalive_is_answered_immediately() {
     let slot = "walrus_spike_reply";

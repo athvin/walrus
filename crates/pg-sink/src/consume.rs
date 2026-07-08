@@ -19,7 +19,7 @@ use common::{Kind, Lsn, Op, SinkMeta, TupleValue, UtcTimestamp};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::time::Instant;
+use tokio::time::{sleep, Instant};
 use tokio_util::sync::CancellationToken;
 
 /// Drive the stream: decode each `XLogData`, register each `Relation` (cache + schema_registry), route
@@ -265,8 +265,10 @@ async fn flush_sealed(
     epoch: i64,
 ) -> anyhow::Result<()> {
     for batch in sealed {
-        // Durability steps (a) PUT then (b) commit the manifest row.
-        let written = flush_batch(sink, pool, epoch, batch).await?;
+        // Durability steps (a) PUT then (b) commit the manifest row — pumping unconditional keepalive
+        // throughout so a slow or stalled S3 flush can't starve the walsender past `wal_sender_timeout`
+        // (§1.9). The flush touches the object store + control DB, never the replication socket.
+        let written = flush_batch_keepalive(stream, sink, pool, epoch, batch).await?;
         // Step (c): ONLY now advance confirmed_flush and tell the server.
         checkpoint.on_batch_durable(written.lsn_end);
         checkpoint
@@ -281,6 +283,36 @@ async fn flush_sealed(
         );
     }
     Ok(())
+}
+
+/// Await the durable flush ([`flush_batch`]: S3 PUT + manifest commit) while pumping **unconditional**
+/// keepalive feedback on the stream every feedback interval — so a slow or stalled S3 PUT can't starve
+/// the walsender past `wal_sender_timeout` (§1.9). The flush future touches the object store and control
+/// DB, never the replication socket, so the keepalive rides concurrently; and `tokio::select!` runs the
+/// *chosen* branch's body to completion (the flush future is parked, never dropped, while a keepalive
+/// sends), so a feedback frame is never cancelled mid-write. `confirmed_flush` is untouched here — it
+/// advances only after this returns (the caller's `on_batch_durable`), so the pumped feedback carries
+/// the pre-flush durable baseline (received advances as `write`, `flush`/`apply` hold — the two-LSN rule).
+async fn flush_batch_keepalive(
+    stream: &mut ReplicationStream,
+    sink: &crate::sink::ParquetSink,
+    ex: &sqlx::PgPool,
+    epoch: i64,
+    batch: SealedBatch,
+) -> anyhow::Result<crate::sink::WrittenObject> {
+    let flush = flush_batch(sink, ex, epoch, batch);
+    tokio::pin!(flush);
+    loop {
+        let budget = stream.feedback_budget();
+        tokio::select! {
+            biased;
+            written = &mut flush => return written,
+            _ = sleep(budget) => stream
+                .send_received_feedback(false)
+                .await
+                .context("keepalive during a stalled flush")?,
+        }
+    }
 }
 
 /// Flush a sealed batch durably: **(a)** PUT the Parquet object to S3, **then (b)** commit the

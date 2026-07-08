@@ -175,6 +175,14 @@ impl ReplicationStream {
         self.feedback_deadline = Instant::now() + interval;
     }
 
+    /// Time remaining until the next unconditional feedback is due. The flush path (PR 2.26) races this
+    /// against a slow S3 PUT so keepalive keeps flowing while the read loop is busy — a stalled flush
+    /// must never starve the walsender past `wal_sender_timeout` (§1.9). Saturates to zero when overdue.
+    pub fn feedback_budget(&self) -> Duration {
+        self.feedback_deadline
+            .saturating_duration_since(Instant::now())
+    }
+
     /// Read one frame. Sends unconditional feedback whenever the interval elapses (so an idle stream
     /// stays alive), and answers a `reply_requested` keepalive immediately. `None` on stream end.
     pub async fn next(&mut self) -> anyhow::Result<Option<ReplicationMessage>> {
@@ -296,7 +304,10 @@ impl ReplicationStream {
     }
 
     /// Feedback carrying the received LSN as `write`; `flush`/`apply` stay at the durable baseline.
-    async fn send_received_feedback(&mut self, reply_requested: bool) -> anyhow::Result<()> {
+    /// Public so the flush path can pump keepalive while a slow S3 PUT blocks the read loop — the PUT
+    /// touches the object store, not this socket, so feedback rides concurrently (§1.9: keepalive is
+    /// unconditional, never gated on durability). Resets the feedback deadline on each send.
+    pub async fn send_received_feedback(&mut self, reply_requested: bool) -> anyhow::Result<()> {
         self.send_standby_status(StandbyStatus {
             write: self.last_received,
             flush: self.durable,
