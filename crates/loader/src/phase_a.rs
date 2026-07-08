@@ -44,10 +44,26 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     }
 
     // 2. Append each file verbatim to <table>_raw (DuckDB auto-commits each statement). Idempotent.
+    //    Files are claimed in (lsn_end, id) = commit order, and the sink cuts a fresh homogeneous file at
+    //    every structural change, so schema_version is monotonic across `claimed`. Before appending a
+    //    file at a NEWER version, reconcile both tables UP TO it (PR 3.8) — so `<table>_raw` always has
+    //    exactly the file's columns and the verbatim `SELECT *` append lines up; already-appended older
+    //    rows read NULL for the freshly-added column (additive superset).
     let mut max_lsn = Lsn::ZERO;
     let mut ids = Vec::with_capacity(claimed.len());
     let mut appended = 0u64;
     for f in &claimed {
+        if f.schema_version > ctx.db.schema_version()? {
+            crate::ddl::reconcile_to_version(
+                &ctx.db,
+                &ctx.pool,
+                ctx.epoch,
+                &ctx.schema,
+                &ctx.table,
+                f.schema_version,
+            )
+            .await?;
+        }
         appended += ctx.db.append_parquet(&ctx.table, &f.s3_uri)?;
         max_lsn = max_lsn.max(f.lsn_end);
         ids.push(f.id);

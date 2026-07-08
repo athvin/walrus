@@ -220,6 +220,12 @@ jobs:
       - name: Loader Phase B (compose)
         run: cargo test -p loader --test phase_b -- --ignored --test-threads=1
 
+      # PR 3.8: additive/lossless DDL apply — both DuckDB tables evolve at the correct LSN relative to
+      # data (ADD COLUMN across a schema_version boundary). Runs LAST among loader tests: it seeds a
+      # higher epoch and read_current_epoch is MAX, so it must not precede the epoch-sensitive bootstrap.
+      - name: Loader DDL additive (compose)
+        run: cargo test -p loader --test ddl_additive -- --ignored --test-threads=1
+
       - name: Tear down (remove volumes)
         if: always()
         run: docker compose -f deploy/docker/docker-compose.yml down -v

@@ -1,5 +1,7 @@
 # PR 3.8 — DDL apply: additive changes (ADD COLUMN · RENAME · lossless widen · COMMENT)
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/61
+
 > **Phase:** 3 — walrus-loader · **Crates touched:** `loader`, `control` · **Est. size:** M ·
 > **Depends on:** PR 3.7 · **Unlocks:** PR 3.9
 
@@ -100,23 +102,23 @@ async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() { todo!() }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `ADD COLUMN` → `<table>` gets the column; `<table>_raw` gets it **nullable**; pre-change rows read
+- [x] `ADD COLUMN` → `<table>` gets the column; `<table>_raw` gets it **nullable**; pre-change rows read
       NULL/default; post-change files align.
-- [ ] `RENAME COLUMN` / `RENAME TABLE` → both tables renamed, resolved by **`attnum`/position**, never
+- [x] `RENAME COLUMN` / `RENAME TABLE` → both tables renamed, resolved by **`attnum`/position**, never
       as a drop+add.
-- [ ] A **lossless/widening** `ALTER COLUMN TYPE` → in-place cast on both tables; `pg-to-arrow` maps the
+- [x] A **lossless/widening** `ALTER COLUMN TYPE` → in-place cast on both tables; `pg-to-arrow` maps the
       new type going forward.
-- [ ] `COMMENT ON` → mirrored onto `<table>` only (not `<table>_raw`); it does **not** cut a
+- [x] `COMMENT ON` → mirrored onto `<table>` only (not `<table>_raw`); it does **not** cut a
       `schema_version` boundary or gate data.
-- [ ] Pending DDL is applied **before** transforming any file at the new `schema_version` (no file
+- [x] Pending DDL is applied **before** transforming any file at the new `schema_version` (no file
       straddles a boundary) — at both bootstrap and steady-state Phase B.
-- [ ] Derivation is `new − old` schema-diff — **no `c_ddl_text` parsing**.
-- [ ] Docs/comments explain the homogeneous-file rule and the structural-vs-metadata split.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p loader` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` then `cargo test -p loader --test ddl_additive -- --ignored`
+- [x] Derivation is `new − old` schema-diff — **no `c_ddl_text` parsing**.
+- [x] Docs/comments explain the homogeneous-file rule and the structural-vs-metadata split.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p loader` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` then `cargo test -p loader --test ddl_additive -- --ignored`
         asserting **`both_tables_evolve_at_the_correct_lsn_relative_to_data`**.
 
 ## Hints & gotchas

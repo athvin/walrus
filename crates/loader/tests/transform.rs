@@ -662,7 +662,7 @@ fn guard_applies_newer_and_rejects_stale_by_tuple() {
 #[test]
 fn applied_columns_are_hidden_from_user_projections() {
     let db = TableDb::open(std::path::Path::new(":memory:")).unwrap();
-    db.ensure_tables(&orders_rel()).unwrap();
+    db.ensure_tables(&orders_rel(), 1).unwrap();
     let conn = db.conn();
 
     let mirror_cols = columns_of(conn, "orders");

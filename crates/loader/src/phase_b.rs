@@ -41,8 +41,24 @@ pub async fn run_phase_b(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
         .parse()
         .map_err(|e| LoaderError::Internal(format!("parse max commit_lsn {max_hex:?}: {e:?}")))?;
 
-    // The transform runs atomically: dedup TEMP + three-branch MERGE in one DuckDB txn.
-    let t = TransformSql::from_relation(&ctx.rel);
+    // The transform must reference exactly the columns the reconciled tables now have — i.e. the shape at
+    // the DuckDB tables' CURRENT reconciled `schema_version` (Phase A advanced it, PR 3.8), NOT the stale
+    // bootstrap shape. Read that version's relation from `schema_registry`; fall back to `ctx.rel` when no
+    // registry row exists (a single-version deployment / hermetic setup).
+    let rel = match control::read_registry(
+        &ctx.pool,
+        ctx.epoch,
+        &ctx.schema,
+        &ctx.table,
+        ctx.db.schema_version()?,
+    )
+    .await?
+    {
+        Some(r) => serde_json::from_value(r.columns)
+            .map_err(|e| LoaderError::Internal(format!("decode registry columns: {e}")))?,
+        None => ctx.rel.clone(),
+    };
+    let t = TransformSql::from_relation(&rel);
     conn.execute_batch("BEGIN TRANSACTION;")
         .map_err(|e| LoaderError::Duck(format!("begin transform txn: {e}")))?;
     if let Err(e) = apply_transform(conn, &t, &after) {

@@ -6,6 +6,7 @@
 pub mod apply_loop;
 pub mod bootstrap;
 pub mod config;
+pub mod ddl;
 pub mod duck;
 pub mod error;
 pub mod health;

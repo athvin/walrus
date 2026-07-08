@@ -57,6 +57,7 @@ pub async fn bootstrap(
     let registry = control::read_all_latest_registry(pool, epoch).await?;
     let mut owned = Vec::new();
     for row in registry {
+        let version = row.schema_version;
         let rel: PgRelation = serde_json::from_value(row.columns)
             .map_err(|e| LoaderError::Internal(format!("decode registry columns: {e}")))?;
 
@@ -71,10 +72,15 @@ pub async fn bootstrap(
         )
         .await?;
 
-        // (2) SECOND FENCE: open the .duckdb read-write (takes the file lock) + ensure both tables.
+        // (2) SECOND FENCE: open the .duckdb read-write (takes the file lock) + ensure both tables, then
+        // (4) reconcile a RESUMED .duckdb (its persisted `_walrus_meta` version < the registered latest)
+        // UP TO that version — applying any additive DDL it missed before it processes more data (PR 3.8).
+        // For a FRESH file this is a no-op (created at the latest shape, watermark already there); the
+        // steady-state per-file forward reconcile lives in Phase A.
         let path = Path::new(&cfg.duckdb_dir).join(format!("{}.duckdb", rel.name));
         let db = TableDb::open(&path)?;
-        db.ensure_tables(&rel)?;
+        db.ensure_tables(&rel, version)?;
+        crate::ddl::reconcile_to_version(&db, pool, epoch, &rel.schema, &rel.name, version).await?;
 
         // (3) Load both watermarks (the fence is already held) and assert the DB-enforced invariant.
         control::ensure_checkpoint(pool, epoch, &rel.schema, &rel.name).await?;
