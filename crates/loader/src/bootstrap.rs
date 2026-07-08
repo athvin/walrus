@@ -79,7 +79,12 @@ pub async fn bootstrap(
         // steady-state per-file forward reconcile lives in Phase A.
         let path = Path::new(&cfg.duckdb_dir).join(format!("{}.duckdb", rel.name));
         let db = TableDb::open(&path)?;
-        db.ensure_tables(&rel, version)?;
+        // Build the DuckDB shape from the registry descriptors (Tier-2 emit/recombine, PR 4.2); with no
+        // descriptors this is the plain scalar shape.
+        db.ensure_tables_planned(
+            &crate::plan::TablePlan::from_registry(&rel, &row.descriptors),
+            version,
+        )?;
         crate::ddl::reconcile_to_version(&db, pool, epoch, &rel.schema, &rel.name, version).await?;
 
         // (3) Load both watermarks (the fence is already held) and assert the DB-enforced invariant.

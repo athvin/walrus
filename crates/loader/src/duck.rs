@@ -4,6 +4,7 @@
 //! proves the lease is reclaimable *before* calling [`TableDb::open`].
 
 use crate::error::LoaderError;
+use crate::plan::TablePlan;
 use common::PgRelation;
 use std::path::Path;
 
@@ -27,17 +28,34 @@ impl TableDb {
     /// The seed is `ON CONFLICT DO NOTHING`, so an EXISTING `.duckdb` keeps its persisted, already-
     /// reconciled version across restarts — the additive DDL applier ([`crate::ddl`]) advances it.
     pub fn ensure_tables(&self, rel: &PgRelation, schema_version: i64) -> Result<(), LoaderError> {
-        let cols: Vec<String> = rel
-            .columns
+        self.ensure_tables_planned(&crate::plan::TablePlan::tier1(rel), schema_version)
+    }
+
+    /// As [`TableDb::ensure_tables`], but from a full [`TablePlan`] — the mirror carries the recombined
+    /// target types and `<table>_raw` the verbatim emit columns (Tier-2 decomposition, PR 4.2). The
+    /// Tier-1 plan produces exactly the scalar shape `ensure_tables` always built.
+    pub fn ensure_tables_planned(
+        &self,
+        plan: &TablePlan,
+        schema_version: i64,
+    ) -> Result<(), LoaderError> {
+        let cols: Vec<String> = plan
+            .mirror_cols
             .iter()
-            .map(|c| format!("\"{}\" {}", c.name, duck_type(c.type_oid)))
+            .map(|c| format!("\"{}\" {}", c.name, c.duckdb_type))
             .collect();
-        let keys: Vec<String> = rel
-            .columns
+        let keys: Vec<String> = plan
+            .mirror_cols
             .iter()
             .filter(|c| c.is_key)
             .map(|c| format!("\"{}\"", c.name))
             .collect();
+        let raw_cols: Vec<String> = plan
+            .raw_cols
+            .iter()
+            .map(|c| format!("\"{}\" {}", c.name, c.duckdb_type))
+            .collect();
+        let table = &plan.table;
 
         // The mirror: current row per key, plus two HIDDEN guard columns (§7, ⚠ extends architecture.md)
         // recording the `(commit_lsn, lsn)` tuple that last shaped each row — the per-PK max-applied guard
@@ -45,10 +63,9 @@ impl TableDb {
         // gains them via `ALTER … IF NOT EXISTS`, which back-fills existing rows with that sentinel (a
         // too-low seed just means the first real event wins — which is correct).
         let mut mirror = format!(
-            "CREATE TABLE IF NOT EXISTS \"{}\" ({}, \
+            "CREATE TABLE IF NOT EXISTS \"{table}\" ({}, \
              \"_applied_commit_lsn\" VARCHAR DEFAULT '0000000000000000', \
              \"_applied_lsn\" VARCHAR DEFAULT '0000000000000000'",
-            rel.name,
             cols.join(", ")
         );
         if !keys.is_empty() {
@@ -57,14 +74,13 @@ impl TableDb {
         mirror.push(')');
         // Idempotent back-fill for a mirror created before PR 3.7 (compose resume).
         let applied_cols = format!(
-            "ALTER TABLE \"{t}\" ADD COLUMN IF NOT EXISTS \"_applied_commit_lsn\" VARCHAR DEFAULT '0000000000000000'; \
-             ALTER TABLE \"{t}\" ADD COLUMN IF NOT EXISTS \"_applied_lsn\" VARCHAR DEFAULT '0000000000000000';",
-            t = rel.name
+            "ALTER TABLE \"{table}\" ADD COLUMN IF NOT EXISTS \"_applied_commit_lsn\" VARCHAR DEFAULT '0000000000000000'; \
+             ALTER TABLE \"{table}\" ADD COLUMN IF NOT EXISTS \"_applied_lsn\" VARCHAR DEFAULT '0000000000000000';"
         );
         // The user-facing projection: the mirror WITHOUT the internal guard columns (DoD §7 "hidden from
         // user projections"). Users read `<table>_current`; `_applied_*` never leak. Recreated by the DDL
         // applier after any structural change (a `SELECT *` view binds its columns at creation time).
-        let user_view = user_view_sql(&rel.name);
+        let user_view = user_view_sql(table);
         // The per-table DDL-reconcile watermark (PR 3.8). Seeded once; the applier advances it.
         let meta = format!(
             "CREATE TABLE IF NOT EXISTS \"_walrus_meta\" (k VARCHAR PRIMARY KEY, v BIGINT); \
@@ -72,20 +88,19 @@ impl TableDb {
              ON CONFLICT (k) DO NOTHING;"
         );
 
-        // The CDC log: every change verbatim, with the intact `walrus_pg_sink_meta` JSON plus four
-        // columns PROMOTED out of it (op / commit_lsn / lsn / sink_processed_at) as sortable 16-hex /
-        // RFC-3339 text. **Composite PK = source key + sink_processed_at + lsn** — the load-bearing
-        // idempotency fence (a ms-resolution `sink_processed_at` collision is broken by the always-
-        // distinct `lsn`): `ON CONFLICT DO NOTHING` makes a crash-window replay a no-op.
+        // The CDC log: every change verbatim (the emit columns), with the intact `walrus_pg_sink_meta`
+        // JSON plus four columns PROMOTED out of it (op / commit_lsn / lsn / sink_processed_at) as sortable
+        // 16-hex / RFC-3339 text. **Composite PK = source key + sink_processed_at + lsn** — the load-bearing
+        // idempotency fence (a ms-resolution `sink_processed_at` collision is broken by the always-distinct
+        // `lsn`): `ON CONFLICT DO NOTHING` makes a crash-window replay a no-op.
         let mut raw_pk = keys.clone();
         raw_pk.push("\"_walrus_sink_processed_at\"".into());
         raw_pk.push("\"_walrus_lsn\"".into());
         let raw = format!(
-            "CREATE TABLE IF NOT EXISTS \"{}_raw\" ({}, \"walrus_pg_sink_meta\" VARCHAR, \
+            "CREATE TABLE IF NOT EXISTS \"{table}_raw\" ({}, \"walrus_pg_sink_meta\" VARCHAR, \
              \"_walrus_op\" VARCHAR, \"_walrus_commit_lsn\" VARCHAR, \"_walrus_lsn\" VARCHAR, \
              \"_walrus_sink_processed_at\" VARCHAR, PRIMARY KEY ({}))",
-            rel.name,
-            cols.join(", "),
+            raw_cols.join(", "),
             raw_pk.join(", ")
         );
 
@@ -93,7 +108,7 @@ impl TableDb {
             .execute_batch(&format!(
                 "{mirror}; {applied_cols} {raw}; {user_view} {meta}"
             ))
-            .map_err(|e| LoaderError::Duck(format!("ensure tables for {}: {e}", rel.name)))?;
+            .map_err(|e| LoaderError::Duck(format!("ensure tables for {table}: {e}")))?;
         Ok(())
     }
 

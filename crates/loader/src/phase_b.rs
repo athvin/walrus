@@ -9,8 +9,27 @@
 
 use crate::error::LoaderError;
 use crate::phase_a::TableCtx;
+use crate::plan::TablePlan;
 use crate::transform::{apply_transform, TransformSql};
-use common::Lsn;
+use common::{Lsn, PgRelation};
+
+/// Build the transform for a table at its CURRENT reconciled `schema_version` (PR 3.8): read the registry
+/// (columns + type descriptors) into a [`TablePlan`] (Tier-2 emit/recombine, PR 4.2); fall back to the
+/// bootstrap relation's scalar shape when there is no registry row (single-version / hermetic setups).
+pub async fn current_transform(ctx: &TableCtx) -> Result<TransformSql, LoaderError> {
+    let ver = ctx.db.schema_version()?;
+    match control::read_registry(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table, ver).await? {
+        Some(r) => {
+            let rel: PgRelation = serde_json::from_value(r.columns)
+                .map_err(|e| LoaderError::Internal(format!("decode registry columns: {e}")))?;
+            Ok(TransformSql::from_plan(&TablePlan::from_registry(
+                &rel,
+                &r.descriptors,
+            )))
+        }
+        None => Ok(TransformSql::from_relation(&ctx.rel)),
+    }
+}
 
 /// One Phase-B pass. Returns the max `commit_lsn` applied, or `None` if the tail was empty.
 pub async fn run_phase_b(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
@@ -49,22 +68,8 @@ pub async fn run_phase_b(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
 
     // The transform must reference exactly the columns the reconciled tables now have — i.e. the shape at
     // the DuckDB tables' CURRENT reconciled `schema_version` (Phase A advanced it, PR 3.8), NOT the stale
-    // bootstrap shape. Read that version's relation from `schema_registry`; fall back to `ctx.rel` when no
-    // registry row exists (a single-version deployment / hermetic setup).
-    let rel = match control::read_registry(
-        &ctx.pool,
-        ctx.epoch,
-        &ctx.schema,
-        &ctx.table,
-        ctx.db.schema_version()?,
-    )
-    .await?
-    {
-        Some(r) => serde_json::from_value(r.columns)
-            .map_err(|e| LoaderError::Internal(format!("decode registry columns: {e}")))?,
-        None => ctx.rel.clone(),
-    };
-    let t = TransformSql::from_relation(&rel);
+    // bootstrap shape (and, PR 4.2, with the Tier-2 emit/recombine from the descriptors).
+    let t = current_transform(ctx).await?;
     conn.execute_batch("BEGIN TRANSACTION;")
         .map_err(|e| LoaderError::Duck(format!("begin transform txn: {e}")))?;
     if let Err(e) = apply_transform(conn, &t, &after) {
