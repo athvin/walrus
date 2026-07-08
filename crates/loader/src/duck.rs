@@ -135,7 +135,19 @@ impl TableDb {
     /// Phase A (PR 3.2): append one Parquet file **verbatim** into `<table>_raw`, promoting
     /// `op`/`commit_lsn`/`lsn`/`sink_processed_at` out of `walrus_pg_sink_meta`. `ON CONFLICT DO NOTHING`
     /// on the composite PK makes a replay idempotent. Returns rows appended. **Never touches the mirror.**
-    pub fn append_parquet(&self, table: &str, s3_uri: &str) -> Result<u64, LoaderError> {
+    ///
+    /// `commit_lsn_override` (PR 4.3 fix): for a **speculative-spill** file (manifest `kind = 'spill'`)
+    /// the per-row `commit_lsn` in the Parquet is a *placeholder* — the file was written before its txn's
+    /// commit LSN was known. A spill file is one whole transaction, so its authoritative `commit_lsn` is
+    /// the file's `lsn_end` (stamped on the manifest at `Stream Commit`); passing `Some(lsn_end)` here
+    /// stamps every appended row with it, so a concurrently-committed neighbour txn is never dropped by
+    /// the transform's commit-LSN window (architecture.md §1.6). `None` keeps the verbatim per-row value.
+    pub fn append_parquet(
+        &self,
+        table: &str,
+        s3_uri: &str,
+        commit_lsn_override: Option<&str>,
+    ) -> Result<u64, LoaderError> {
         let uri = s3_uri.replace('\'', "''");
         // Map the file's columns into `<table>_raw` **by name**, not by position (PR 3.8). After an
         // `ADD COLUMN`, DuckDB appends the new column at the physical END of `<table>_raw` (after the
@@ -148,13 +160,17 @@ impl TableDb {
             .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(", ");
+        let commit_lsn_expr = match commit_lsn_override {
+            Some(lsn) => format!("'{}'", lsn.replace('\'', "''")),
+            None => "json_extract_string(walrus_pg_sink_meta, '$.commit_lsn')".to_string(),
+        };
         let sql = format!(
             "INSERT INTO \"{table}_raw\" \
                  ({quoted}, \"_walrus_op\", \"_walrus_commit_lsn\", \"_walrus_lsn\", \
                   \"_walrus_sink_processed_at\") \
              SELECT {quoted}, \
                  json_extract_string(walrus_pg_sink_meta, '$.op'), \
-                 json_extract_string(walrus_pg_sink_meta, '$.commit_lsn'), \
+                 {commit_lsn_expr}, \
                  json_extract_string(walrus_pg_sink_meta, '$.lsn'), \
                  json_extract_string(walrus_pg_sink_meta, '$.sink_processed_at') \
              FROM read_parquet('{uri}') ON CONFLICT DO NOTHING"
@@ -247,5 +263,99 @@ pub(crate) fn duck_type(oid: u32) -> &'static str {
         114 | 3802 => "JSON",               // json / jsonb
         17 => "BLOB",                       // bytea
         _ => "VARCHAR",                     // text, varchar, enums, and everything else
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::{PgColumn, PgRelation, ReplicaIdentity};
+
+    fn orders() -> PgRelation {
+        let col = |name: &str, oid: u32, is_key: bool| PgColumn {
+            name: name.into(),
+            type_oid: oid,
+            type_modifier: -1,
+            is_key,
+        };
+        PgRelation {
+            oid: 42,
+            schema: "public".into(),
+            name: "orders".into(),
+            replica_identity: ReplicaIdentity::Default,
+            columns: vec![col("id", 23, true), col("status", 25, false)],
+        }
+    }
+
+    /// Write a local `(id, status, walrus_pg_sink_meta)` Parquet whose rows carry `commit_lsn = placeholder`
+    /// — mimicking a speculative spill written before its txn's commit LSN was known.
+    fn write_local_fixture(dir: &Path, name: &str, ids: (i64, i64), placeholder: &str) -> String {
+        let path = dir.join(name);
+        let uri = path.to_string_lossy().replace('\'', "''");
+        let w = duckdb::Connection::open_in_memory().unwrap();
+        let meta = |lsn: &str| {
+            format!(
+                "{{\"op\":\"Insert\",\"commit_lsn\":\"{placeholder}\",\"lsn\":\"{lsn}\",\
+                  \"sink_processed_at\":\"2026-07-08T12:00:0{lsn}Z\"}}"
+            )
+        };
+        w.execute_batch(&format!(
+            "CREATE TABLE fixture (id BIGINT, status VARCHAR, walrus_pg_sink_meta VARCHAR); \
+             INSERT INTO fixture VALUES \
+               ({}, 'a', '{}'), ({}, 'b', '{}'); \
+             COPY fixture TO '{uri}' (FORMAT PARQUET);",
+            ids.0,
+            meta("1"),
+            ids.1,
+            meta("2"),
+        ))
+        .unwrap();
+        uri
+    }
+
+    fn commit_lsns(db: &TableDb, ids: (i64, i64)) -> Vec<String> {
+        let mut stmt = db
+            .conn
+            .prepare("SELECT \"_walrus_commit_lsn\" FROM orders_raw WHERE id IN (?, ?) ORDER BY id")
+            .unwrap();
+        stmt.query_map([ids.0, ids.1], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// PR 4.3 fix: a `spill` file's per-row `commit_lsn` placeholder is overridden by the file's `lsn_end`
+    /// (the real commit LSN), while a non-spill file appends the per-row value verbatim.
+    #[test]
+    fn spill_override_stamps_lsn_end_but_verbatim_otherwise() {
+        let dir = std::env::temp_dir().join("walrus-loader-spill-override");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = TableDb::open(&dir.join("orders.duckdb")).unwrap();
+        db.ensure_tables(&orders(), 1).unwrap();
+        // Local Parquet + JSON extraction need the json extension (no S3 here → configure_s3 is not called).
+        db.conn.execute_batch("INSTALL json; LOAD json;").unwrap();
+
+        // A spill file: rows carry the placeholder `0000000000000064`, but the file committed at `…00C8`.
+        let placeholder = "0000000000000064";
+        let lsn_end = "00000000000000C8";
+        let spill = write_local_fixture(&dir, "spill.parquet", (1, 2), placeholder);
+        let n = db.append_parquet("orders", &spill, Some(lsn_end)).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(
+            commit_lsns(&db, (1, 2)),
+            vec![lsn_end, lsn_end],
+            "a spill file's rows are stamped with the file's lsn_end, not the placeholder"
+        );
+
+        // A non-spill (verbatim) file: the per-row placeholder is preserved.
+        let batch = write_local_fixture(&dir, "batch.parquet", (3, 4), placeholder);
+        let n = db.append_parquet("orders", &batch, None).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(
+            commit_lsns(&db, (3, 4)),
+            vec![placeholder, placeholder],
+            "a non-spill file keeps its verbatim per-row commit_lsn"
+        );
     }
 }

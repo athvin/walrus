@@ -26,7 +26,7 @@ use crate::batch::{BatchTriggers, Clock, TableBatcher};
 use crate::memory::InflightMeter;
 use crate::pgoutput::Message;
 use crate::relcache::RelationCache;
-use crate::sink::{ParquetSink, WrittenObject};
+use crate::sink::{FileKind, ParquetSink, WrittenObject};
 use anyhow::Context;
 use common::{Kind, Lsn, Op, SinkMeta, TupleValue, UtcTimestamp};
 use std::collections::hash_map::Entry;
@@ -263,8 +263,11 @@ impl StreamDemux {
             if batcher.committed_rows() == 0 {
                 continue;
             }
+            // Tag as `Spill`: these rows carry a placeholder `commit_lsn` (`begin`) because the real commit
+            // LSN is not yet known. `on_stream_commit` corrects the manifest `lsn_end` to the commit LSN;
+            // the loader then reads `lsn_end` as the authoritative per-row `commit_lsn` for a `spill` file.
             let written = sink
-                .put(batcher.seal()?)
+                .put_with_kind(batcher.seal()?, FileKind::Spill)
                 .await
                 .context("speculative spill PUT")?;
             self.spill_count += 1;
@@ -670,14 +673,26 @@ mod tests {
                 .await
                 .unwrap(); // kept
         }
+        let commit: Lsn = "0/9000".parse().unwrap();
         let files = d
-            .on_stream_commit(857, "0/9000".parse().unwrap(), &cache, &sink)
+            .on_stream_commit(857, commit, &cache, &sink)
             .await
             .unwrap();
         assert_eq!(
             files.iter().map(|f| f.row_count).sum::<u64>(),
             400,
             "even with spilling, the aborted sub-xid (200 rows) is excluded → 400 survivors"
+        );
+        // PR 4.3 fix: promoted spills are tagged `Spill` (their per-row commit_lsn is a placeholder, so the
+        // loader must stamp `lsn_end`), and EVERY returned file — spill or survivor — carries the real
+        // commit LSN as `lsn_end`.
+        assert!(
+            files.iter().any(|f| f.kind == FileKind::Spill),
+            "at least one promoted spill is tagged FileKind::Spill"
+        );
+        assert!(
+            files.iter().all(|f| f.lsn_end == commit),
+            "every file carries the real commit LSN in lsn_end"
         );
     }
 }

@@ -17,11 +17,17 @@ use object_store::ObjectStore;
 use parquet::arrow::AsyncArrowWriter;
 use std::sync::Arc;
 
-/// Whether the object holds streamed WAL rows or backfill snapshot rows (PR 2.29).
+/// Whether the object holds streamed WAL rows, backfill snapshot rows (PR 2.29), or a **speculative
+/// open-txn spill** (PR 4.3 fix). A `Spill` file is a *single* streamed transaction's rows written
+/// before its commit LSN is known, so its rows carry a placeholder `commit_lsn`; the real commit LSN is
+/// the file's `lsn_end`, stamped onto the manifest at `Stream Commit`. The loader therefore treats
+/// `lsn_end` — not the per-row placeholder — as the authoritative `commit_lsn` for a `Spill` file, which
+/// keeps commit-order correct (architecture.md §1.6). A multi-txn `Stream` batch keeps its per-row LSNs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {
     Stream,
     Snapshot,
+    Spill,
 }
 
 impl FileKind {
@@ -30,6 +36,7 @@ impl FileKind {
         match self {
             FileKind::Stream => "stream",
             FileKind::Snapshot => "snapshot",
+            FileKind::Spill => "spill",
         }
     }
 }

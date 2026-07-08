@@ -81,7 +81,14 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
                 return Err(e);
             }
         }
-        appended += ctx.db.append_parquet(&ctx.table, &f.s3_uri)?;
+        // A `spill` file is one streamed txn written before its commit LSN was known, so its per-row
+        // `commit_lsn` is a placeholder; `lsn_end` (corrected on `Stream Commit`) is the real commit LSN
+        // for every row. Stamp it so the transform's commit-LSN window can't drop a neighbour txn that
+        // committed inside the spill's placeholder range (architecture.md §1.6). Other kinds append verbatim.
+        let commit_lsn_override = (f.kind == "spill").then(|| f.lsn_end.to_string());
+        appended += ctx
+            .db
+            .append_parquet(&ctx.table, &f.s3_uri, commit_lsn_override.as_deref())?;
         max_lsn = max_lsn.max(f.lsn_end);
         ids.push(f.id);
     }

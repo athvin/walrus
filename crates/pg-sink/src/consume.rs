@@ -189,6 +189,21 @@ pub async fn run_decode_loop(
                                     demux.on_change(cache, m, sink, frame_lsn).await?;
                                 }
                                 Message::StreamCommit { xid, commit_lsn, .. } => {
+                                    // Commit-order fence (architecture.md §1.6): any regular (non-streamed)
+                                    // txn that committed WHILE this large txn was streaming is still buffered
+                                    // in the router — small batches flush on the `max_fill` cadence, not per
+                                    // commit — and its commit LSN is LOWER than this one. Flush those `ready`
+                                    // rows FIRST so the manifest stays in commit-LSN order. Otherwise this
+                                    // txn's file (higher `lsn_end`) becomes `ready` first, the loader
+                                    // transforms + advances `transformed_lsn` past it, and the late,
+                                    // lower-LSN regular file is then permanently skipped by the `>= ` window.
+                                    // (The slot stays clamped to this still-open txn's floor until its
+                                    // `on_batch_durable` below, so draining early never advances past it.)
+                                    flush_sealed(
+                                        router.drain_committed()?,
+                                        stream, sink, checkpoint, pool, epoch,
+                                    )
+                                    .await?;
                                     // Materialise the survivors (aborted sub-xids excluded) to `ready`
                                     // (lsn_end = commit_lsn), then advance the slot — clamped to any
                                     // still-older open txn.
