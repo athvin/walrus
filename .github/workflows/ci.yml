@@ -23,6 +23,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The bundled DuckDB compiles from source into large artifacts; the cold-build path here (both the
+      # dev-profile `build` and the test-profile `test`) can exhaust the runner's ~14 GB and fail with
+      # "No space left on device". Reclaim the preinstalled toolchains we don't use for headroom.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift || true
+          df -h /
+
       # rust-toolchain.toml pins the channel + rustfmt/clippy components; install it explicitly so
       # the version is logged and the cache key below is computed against the pinned rustc. (rustup
       # 1.28+ no longer auto-installs the toolchain-file toolchain on first proxy use.)
@@ -95,6 +104,13 @@ jobs:
       DATABASE_URL: postgres://postgres:postgres@localhost:5433/walrus_control
     steps:
       - uses: actions/checkout@v4
+
+      # Same disk-headroom reclaim as the gates job — this job also cold-builds the bundled DuckDB.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift || true
+          df -h /
 
       - name: Install pinned Rust toolchain (from rust-toolchain.toml)
         run: |
