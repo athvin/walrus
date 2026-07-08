@@ -31,6 +31,10 @@ pub struct TableCtx {
     pub max_files: i64,
     /// The apply-loop poll cadence.
     pub poll_interval: Duration,
+    /// The compaction cadence — full-rebuild + prune, on this worker thread after an apply cycle (PR 3.11).
+    pub compaction_interval: Duration,
+    /// Raw retention as an LSN-byte lag behind `transformed_lsn` (the prune floor).
+    pub retention_lsn_lag: u64,
 }
 
 /// One Phase-A pass. Returns the max `lsn_end` appended, or `None` if the queue was empty.

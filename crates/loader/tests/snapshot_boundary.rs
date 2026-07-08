@@ -155,6 +155,8 @@ async fn setup(epoch: i64, max_files: i64) -> (TableCtx, std::path::PathBuf) {
         state: LoaderState::new(),
         max_files,
         poll_interval: Duration::from_secs(5),
+        compaction_interval: Duration::from_secs(3600),
+        retention_lsn_lag: 16 << 20,
     };
     (ctx, dir)
 }
