@@ -1,5 +1,7 @@
 # PR 3.9 — DDL apply: destructive changes (DROP COLUMN · lossy type → quarantine · DROP TABLE)
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/62
+
 > **Phase:** 3 — walrus-loader · **Crates touched:** `loader`, `control` · **Est. size:** M ·
 > **Depends on:** PR 3.8 · **Unlocks:** PR 3.10
 
@@ -93,21 +95,21 @@ async fn drop_table_retires_both_tables_and_the_file() { todo!() }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `DROP COLUMN` → the column is **physically dropped** from `<table>` but **retained nullable** in
+- [x] `DROP COLUMN` → the column is **physically dropped** from `<table>` but **retained nullable** in
       `<table>_raw`; post-drop files fill it NULL.
-- [ ] A **lossy/incompatible** `ALTER COLUMN TYPE` → the mirror cast is attempted; on failure the table
+- [x] A **lossy/incompatible** `ALTER COLUMN TYPE` → the mirror cast is attempted; on failure the table
       is **quarantined + an alert fires + processing stops** (terminal, accepted v1 outcome); `<table>_raw`
       is **widened to `VARCHAR`** and existing rows are **never re-cast**.
-- [ ] `DROP TABLE` → both `<table>` and `<table>_raw` are retired and the file dropped.
-- [ ] Quarantine surfaces on `/ready` (degraded) and a metric/log, and does not silently continue.
-- [ ] Destructive DDL is applied **before** crossing its LSN (same version-gating as PR 3.8).
-- [ ] Raw never destructively drops or casts history — only additive widening.
-- [ ] Docs/comments state that single-table reload out of quarantine is out of scope in v1.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p loader` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` then `cargo test -p loader --test ddl_destructive -- --ignored`
+- [x] `DROP TABLE` → both `<table>` and `<table>_raw` are retired and the file dropped.
+- [x] Quarantine surfaces on `/ready` (degraded) and a metric/log, and does not silently continue.
+- [x] Destructive DDL is applied **before** crossing its LSN (same version-gating as PR 3.8).
+- [x] Raw never destructively drops or casts history — only additive widening.
+- [x] Docs/comments state that single-table reload out of quarantine is out of scope in v1.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p loader` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` then `cargo test -p loader --test ddl_destructive -- --ignored`
         asserting **`lossy_cast_failure_quarantines_the_table_and_alerts`**.
 
 ## Hints & gotchas
