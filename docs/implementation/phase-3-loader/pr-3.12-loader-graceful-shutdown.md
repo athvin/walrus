@@ -1,5 +1,7 @@
 # PR 3.12 — Graceful SIGTERM drain + full-rebuild abort
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/65
+
 > **Phase:** 3 — walrus-loader · **Crates touched:** `loader` · **Est. size:** M ·
 > **Depends on:** PR 3.11 · **Unlocks:** PR 4.1 (phase boundary)
 
@@ -104,23 +106,23 @@ async fn a_replacement_loader_resumes_from_the_two_watermarks() { todo!() }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] On `SIGTERM` mid-apply, the worker stops claiming, **finishes** the in-flight Phase A (with the
+- [x] On `SIGTERM` mid-apply, the worker stops claiming, **finishes** the in-flight Phase A (with the
       atomic `raw_appended_lsn` advance + manifest delete) and Phase B (`transformed_lsn`), then exits 0
       within grace — **both watermarks committed**.
-- [ ] The ownership **lease is released** and the DuckDB file is `CHECKPOINT`ed + closed cleanly — **no
+- [x] The ownership **lease is released** and the DuckDB file is `CHECKPOINT`ed + closed cleanly — **no
       stale lock** for the next bootstrap.
-- [ ] An in-flight **full-rebuild is aborted** (rolled back) on `SIGTERM`, not waited on — it re-runs
+- [x] An in-flight **full-rebuild is aborted** (rolled back) on `SIGTERM`, not waited on — it re-runs
       next cycle.
-- [ ] A **replacement** loader started afterward **resumes** from the two watermarks with no data loss
+- [x] A **replacement** loader started afterward **resumes** from the two watermarks with no data loss
       and no duplicate application.
-- [ ] The loader never touches the replication slot.
-- [ ] Docs/comments state the PID-1/exec-form requirement (deferred wiring → PR 4.8) and the grace-sizing
+- [x] The loader never touches the replication slot.
+- [x] Docs/comments state the PID-1/exec-form requirement (deferred wiring → PR 4.8) and the grace-sizing
       rule (measured incremental worst case; exclude the full-rebuild; skip `preStop`).
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p loader` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` then `cargo test -p loader --test shutdown -- --ignored`
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p loader` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` then `cargo test -p loader --test shutdown -- --ignored`
         asserting **`sigterm_mid_apply_commits_both_watermarks_and_releases_lease`** and
         **`in_flight_full_rebuild_is_aborted_on_sigterm`**.
 

@@ -22,24 +22,37 @@ pub async fn apply_loop(ctx: TableCtx, shutdown: CancellationToken) -> Result<()
     let mut last_compaction = Instant::now();
     loop {
         tokio::select! {
-            _ = shutdown.cancelled() => {
-                tracing::info!(table = %format_args!("{}.{}", ctx.schema, ctx.table), "apply loop stopping");
-                return Ok(());
-            }
+            _ = shutdown.cancelled() => return drain(&ctx),
             _ = tick.tick() => {}
         }
-        // A crash between the two phases is absorbed by the next cycle's plain re-run (both idempotent).
+        // Drain step 2+3: `run_phase_a`/`run_phase_b` are never interrupted mid-flight, so the in-flight
+        // cycle FINISHES atomically (append + the control-DB `raw_appended_lsn`+DELETE txn, then the
+        // transform + `transformed_lsn`) even if SIGTERM arrives now — no new crash window. A crash
+        // BETWEEN the two phases is absorbed by the next cycle's plain re-run (both idempotent).
         run_phase_a(&ctx).await?;
         run_phase_b(&ctx).await?;
         ctx.state.stamp_poll();
 
-        // Compaction on its own cadence, serialized AFTER the apply cycle on this same worker thread —
-        // it needs the exclusive writer and ~2× transient space, so it can never contend with the writer.
-        if last_compaction.elapsed() >= ctx.compaction_interval {
+        // Compaction on its own cadence, serialized AFTER the apply cycle on this same worker thread — it
+        // needs the exclusive writer and ~2× transient space, so it can never contend with the writer. Do
+        // NOT start a new rebuild once draining (an already-running one is aborted inside `compact`).
+        if !shutdown.is_cancelled() && last_compaction.elapsed() >= ctx.compaction_interval {
             compact(&ctx, &shutdown).await?;
             last_compaction = Instant::now();
         }
     }
+}
+
+/// Drain one worker on SIGTERM: the in-flight cycle already finished (both watermarks committed), so just
+/// `CHECKPOINT` the WAL into the main file and return — dropping `ctx` closes the file, releasing the
+/// lock cleanly (no stale lock for the next bootstrap). The lease is released by `main` after all workers
+/// drain (after their watermarks commit). PR 3.12.
+fn drain(ctx: &TableCtx) -> Result<(), LoaderError> {
+    if let Err(e) = ctx.db.conn().execute_batch("CHECKPOINT;") {
+        tracing::warn!(table = %format_args!("{}.{}", ctx.schema, ctx.table), error = %e, "drain CHECKPOINT failed");
+    }
+    tracing::info!(table = %format_args!("{}.{}", ctx.schema, ctx.table), "apply loop drained (watermarks committed, file checkpointed)");
+    Ok(())
 }
 
 /// One compaction pass: full-rebuild (self-heal + reclaim) then prune raw below the retention floor.
@@ -48,7 +61,11 @@ async fn compact(ctx: &TableCtx, shutdown: &CancellationToken) -> Result<(), Loa
     let transformed = cp.map(|c| c.transformed_lsn).unwrap_or(Lsn::ZERO);
     let t = TransformSql::from_relation(&current_relation(ctx).await?);
 
-    crate::compaction::full_rebuild(ctx.db.conn(), &t, shutdown)?;
+    // The rebuild is abortable: a SIGTERM mid-rewrite interrupts it, rolls back, and returns Ok (PR 3.12).
+    crate::compaction::full_rebuild_abortable(ctx.db.conn(), &t, shutdown).await?;
+    if shutdown.is_cancelled() {
+        return Ok(()); // draining — skip the prune, the rebuild was aborted; both re-run next start
+    }
     // Prune only below `transformed_lsn - retention_lsn_lag` (always behind transformed_lsn) — the rebuild
     // just captured every current value into the mirror baseline, so pruned raw can lose nothing.
     let floor = crate::compaction::retention_floor(transformed, ctx.retention_lsn_lag);
