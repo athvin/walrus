@@ -50,6 +50,11 @@ pub enum Error {
     #[error("table ownership lease contended: {0}")]
     LeaseContended(String),
 
+    /// A lossy/incompatible schema change could not be applied without destroying data — the table is
+    /// quarantined and processing stops (an accepted, alerting v1 outcome). Terminal.
+    #[error("table quarantined: {0}")]
+    Quarantine(String),
+
     /// Anything not otherwise classified. Terminal.
     #[error("internal error: {0}")]
     Internal(String),
@@ -68,6 +73,7 @@ impl Error {
             | Error::Preflight(_)
             | Error::KeylessTable { .. }
             | Error::LeaseContended(_)
+            | Error::Quarantine(_)
             | Error::Internal(_) => true,
             // Dependencies that may simply be "still coming up" during a rollout.
             Error::ControlDb(_) | Error::ObjectStore(_) | Error::SourceDb(_) => false,
@@ -90,6 +96,7 @@ impl Error {
             Error::Preflight(_) => ExitCode::Preflight,
             Error::KeylessTable { .. } => ExitCode::KeylessTable,
             Error::LeaseContended(_) => ExitCode::LeaseContended,
+            Error::Quarantine(_) => ExitCode::Quarantine,
             Error::Internal(_) => ExitCode::Internal,
         }
     }
@@ -109,6 +116,7 @@ pub enum ExitCode {
     KeylessTable = 14,
     LeaseContended = 15,
     SourceDb = 16,
+    Quarantine = 17,
     Internal = 70,
 }
 
@@ -138,6 +146,10 @@ mod tests {
                 true,
             ),
             (Error::LeaseContended("held by loader-0".into()), true),
+            (
+                Error::Quarantine("lossy cast on public.orders.n".into()),
+                true,
+            ),
             (Error::Internal("unreachable".into()), true),
         ]
     }

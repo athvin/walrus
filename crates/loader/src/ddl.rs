@@ -10,11 +10,13 @@
 //! source shape; `<table>_raw` is an **additive superset** (columns only ever added / widened / renamed —
 //! never dropped here), so old verbatim rows stay valid (a new column reads NULL for them).
 //!
-//! This PR handles the **additive / lossless** classes only: `ADD COLUMN`, `RENAME COLUMN` /
-//! `RENAME TABLE`, a lossless/widening `ALTER COLUMN TYPE`, and `COMMENT` (metadata — mirror only, and
-//! it does **not** cut a `schema_version` boundary). **Destructive** DDL (`DROP COLUMN`, lossy
-//! `ALTER TYPE`, `DROP TABLE`) is deferred to PR 3.9 — a lossy/narrowing change here is an explicit
-//! error with a `→ PR 3.9` marker, never a silent wrong cast.
+//! **Additive / lossless** (PR 3.8): `ADD COLUMN`, `RENAME COLUMN` / `RENAME TABLE`, a lossless/widening
+//! `ALTER COLUMN TYPE`, and `COMMENT` (metadata — mirror only, does **not** cut a `schema_version`
+//! boundary). **Destructive** (PR 3.9), where mirror and raw diverge most: `DROP COLUMN` (physical on
+//! the mirror, retained-nullable on raw), a **lossy** `ALTER COLUMN TYPE` (attempt the in-place mirror
+//! cast → on failure **quarantine + alert + stop**, an accepted terminal v1 outcome; raw is widened to
+//! `VARCHAR`, never re-cast), and `DROP TABLE` (retire both tables + file). Raw is an additive superset:
+//! it only ever adds / widens — it never destructively drops or re-casts history.
 
 use crate::duck::{duck_type, user_view_sql, TableDb};
 use crate::error::LoaderError;
@@ -58,6 +60,18 @@ pub enum AdditiveChange {
     },
 }
 
+/// One destructive change (PR 3.9) — where mirror and raw **diverge**: the mirror follows the exact
+/// current shape (physical drop / in-place cast), the raw log preserves history (retain / widen-only).
+pub enum DestructiveChange {
+    /// `DROP COLUMN` — physically dropped from `<table>`; **retained nullable** in `<table>_raw`.
+    DropColumn { name: String },
+    /// A lossy/incompatible `ALTER COLUMN TYPE` — attempt the in-place mirror cast (→ quarantine on
+    /// failure); widen `<table>_raw` to `VARCHAR` (never re-cast historical values).
+    LossyType { name: String, new: PgColumn },
+    /// `DROP TABLE` — retire both DuckDB tables (the `.duckdb` file is retired by the caller).
+    DropTable { name: String },
+}
+
 /// Whether the two columns map to the SAME DuckDB type (the only thing an `ALTER COLUMN TYPE` would
 /// change) — a typmod-only tweak (e.g. `varchar(10)→varchar(20)`, both DuckDB `VARCHAR`) is a no-op.
 fn same_duck_type(a: &PgColumn, b: &PgColumn) -> bool {
@@ -74,35 +88,54 @@ fn is_lossless_widen(old: &PgColumn, new: &PgColumn) -> bool {
     )
 }
 
-/// Diff `old → new` by POSITION (attnum): rename (same position, changed name), widen (same position,
-/// changed DuckDB type), append (trailing new columns), and a table rename. Order is
-/// rename-before-widen so a combined rename+widen at one position lands correctly.
-///
-/// A **destructive** shape (fewer columns) or a **lossy** type change is an error with a `→ PR 3.9`
-/// marker — this PR never silently applies a narrowing cast.
-pub fn diff_additive(
-    old: &SchemaVersion,
-    new: &SchemaVersion,
-) -> Result<Vec<AdditiveChange>, LoaderError> {
-    let mut changes = Vec::new();
+/// The full classification of one version step: additive/lossless changes plus destructive ones
+/// (PR 3.9). The sink cuts one file per structural change, so a step usually yields a single change.
+#[derive(Default)]
+pub struct SchemaDiff {
+    pub additive: Vec<AdditiveChange>,
+    pub destructive: Vec<DestructiveChange>,
+}
+
+/// Diff `old → new` by POSITION (attnum), classifying each change as additive or **destructive**
+/// (PR 3.9). The homogeneous-file rule means one DDL per version, so a length change is unambiguous:
+/// a drop shrinks the column count (never a rename, which keeps it), and an empty new column set is a
+/// `DROP TABLE`. A type change is a lossless widen (additive) or a lossy/narrowing one (destructive).
+pub fn diff(old: &SchemaVersion, new: &SchemaVersion) -> Result<SchemaDiff, LoaderError> {
+    let mut d = SchemaDiff::default();
+
+    // DROP TABLE: the registered version carries no columns (the sink's `sql_drop` sentinel).
+    if new.relation.columns.is_empty() && !old.relation.columns.is_empty() {
+        d.destructive.push(DestructiveChange::DropTable {
+            name: old.relation.name.clone(),
+        });
+        return Ok(d);
+    }
+
     if old.relation.name != new.relation.name {
-        changes.push(AdditiveChange::RenameTable {
+        d.additive.push(AdditiveChange::RenameTable {
             from: old.relation.name.clone(),
             to: new.relation.name.clone(),
         });
     }
+
     let (oc, nc) = (&old.relation.columns, &new.relation.columns);
     if nc.len() < oc.len() {
-        return Err(LoaderError::Internal(format!(
-            "destructive column removal ({}→{} cols) on {} → PR 3.9",
-            oc.len(),
-            nc.len(),
-            new.relation.name
-        )));
+        // DROP COLUMN(s): a length decrease is a drop (a rename keeps the count). Identify the dropped
+        // columns by name-set difference — the surviving columns keep their names.
+        let kept: std::collections::HashSet<&str> = nc.iter().map(|c| c.name.as_str()).collect();
+        for o in oc.iter().filter(|o| !kept.contains(o.name.as_str())) {
+            d.destructive.push(DestructiveChange::DropColumn {
+                name: o.name.clone(),
+            });
+        }
+        return Ok(d);
     }
+
+    // len(new) >= len(old): position-matched rename / type-change over the common prefix, then any
+    // trailing appended columns are ADDs.
     for (i, (o, n)) in oc.iter().zip(nc.iter()).enumerate() {
         if o.name != n.name {
-            changes.push(AdditiveChange::RenameColumn {
+            d.additive.push(AdditiveChange::RenameColumn {
                 position: i,
                 from: o.name.clone(),
                 to: n.name.clone(),
@@ -110,24 +143,39 @@ pub fn diff_additive(
         }
         if !same_duck_type(o, n) {
             if is_lossless_widen(o, n) {
-                changes.push(AdditiveChange::WidenColumn {
+                d.additive.push(AdditiveChange::WidenColumn {
                     position: i,
                     name: n.name.clone(),
                     new: n.clone(),
                 });
             } else {
-                // TODO(3.9): lossy/narrowing cast → quarantine (never a silent lossy in-place cast).
-                return Err(LoaderError::Internal(format!(
-                    "lossy type change on {} (oid {}→{}) → PR 3.9",
-                    n.name, o.type_oid, n.type_oid
-                )));
+                d.destructive.push(DestructiveChange::LossyType {
+                    name: n.name.clone(),
+                    new: n.clone(),
+                });
             }
         }
     }
     for n in &nc[oc.len()..] {
-        changes.push(AdditiveChange::AddColumn(n.clone()));
+        d.additive.push(AdditiveChange::AddColumn(n.clone()));
     }
-    Ok(changes)
+    Ok(d)
+}
+
+/// The additive-only view of [`diff`] — errors if the step is destructive (use [`diff`] +
+/// [`apply_destructive`] for those, PR 3.9). Kept so the additive path stays a total function.
+pub fn diff_additive(
+    old: &SchemaVersion,
+    new: &SchemaVersion,
+) -> Result<Vec<AdditiveChange>, LoaderError> {
+    let d = diff(old, new)?;
+    if !d.destructive.is_empty() {
+        return Err(LoaderError::Internal(format!(
+            "destructive change on {} — not an additive diff (PR 3.9)",
+            new.relation.name
+        )));
+    }
+    Ok(d.additive)
 }
 
 /// Apply the derived changes to the DuckDB tables per the taxonomy: mirror = exact shape, `<table>_raw`
@@ -205,6 +253,74 @@ pub fn apply_additive(
         .map_err(|e| LoaderError::Duck(format!("apply additive DDL to {table}: {e}")))
 }
 
+/// Apply destructive changes (PR 3.9) — the mirror-vs-raw asymmetry is the whole point: the mirror
+/// takes the exact current shape (physical drop / in-place cast), the raw log preserves history
+/// (retain / widen-to-VARCHAR, **never** a re-cast that could fail on stored values). A lossy cast that
+/// fails on the mirror returns [`LoaderError::Quarantine`] — a terminal, alerting v1 outcome (single-
+/// table reload out of quarantine is **out of scope in v1**). `DROP TABLE` retires both DuckDB tables
+/// idempotently (`IF EXISTS`); the `.duckdb` file is retired separately by [`retire_file`].
+pub fn apply_destructive(
+    conn: &duckdb::Connection,
+    table: &str,
+    changes: &[DestructiveChange],
+) -> Result<(), LoaderError> {
+    for ch in changes {
+        match ch {
+            DestructiveChange::DropColumn { name } => {
+                // Mirror: physical drop. Raw: RETAIN the column (already nullable) — verbatim history; a
+                // post-drop file simply NULL-fills it (name-explicit append). Recreate the view.
+                let sql = format!(
+                    "ALTER TABLE \"{table}\" DROP COLUMN IF EXISTS \"{name}\"; {}",
+                    user_view_sql(table)
+                );
+                conn.execute_batch(&sql).map_err(|e| {
+                    LoaderError::Duck(format!("drop column {name} on {table}: {e}"))
+                })?;
+            }
+            DestructiveChange::LossyType { name, new } => {
+                let ty = duck_type(new.type_oid);
+                // Raw FIRST: widen to VARCHAR so rows of BOTH schema_versions coexist in one column;
+                // never issue a CAST that could fail on historical values. Idempotent (already VARCHAR).
+                conn.execute_batch(&format!(
+                    "ALTER TABLE \"{table}_raw\" ALTER COLUMN \"{name}\" TYPE VARCHAR;"
+                ))
+                .map_err(|e| LoaderError::Duck(format!("widen raw {name} on {table}: {e}")))?;
+                // Mirror: attempt the in-place cast. DuckDB validates before applying, so a failure
+                // leaves the mirror unchanged → QUARANTINE (loud, terminal). Never silent data loss.
+                if let Err(e) = conn.execute_batch(&format!(
+                    "ALTER TABLE \"{table}\" ALTER COLUMN \"{name}\" TYPE {ty};"
+                )) {
+                    return Err(LoaderError::Quarantine {
+                        table: table.to_string(),
+                        reason: format!("lossy ALTER COLUMN {name} TYPE {ty} failed: {e}"),
+                    });
+                }
+            }
+            DestructiveChange::DropTable { name } => {
+                conn.execute_batch(&format!(
+                    "DROP VIEW IF EXISTS \"{name}_current\"; \
+                     DROP TABLE IF EXISTS \"{name}\"; DROP TABLE IF EXISTS \"{name}_raw\";"
+                ))
+                .map_err(|e| LoaderError::Duck(format!("drop table {name}: {e}")))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Retire a dropped table's `.duckdb` file (call after its owning connection is closed). Idempotent —
+/// a missing file (a crash mid-retire re-run) is success.
+pub fn retire_file(path: &std::path::Path) -> Result<(), LoaderError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(LoaderError::Internal(format!(
+            "retire {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
 /// Bring both DuckDB tables up to `target` by applying each version step's additive diff, advancing the
 /// `_walrus_meta` watermark after each — **before** any file at that version is appended/transformed.
 /// Idempotent: the watermark is persisted in the `.duckdb`, so a re-run resumes from where it left off.
@@ -225,8 +341,11 @@ pub async fn reconcile_to_version(
             load_version(pool, epoch, schema, table, cur).await?,
             load_version(pool, epoch, schema, table, next).await?,
         ) {
-            let changes = diff_additive(&old, &new)?;
-            apply_additive(db.conn(), table, &changes)?;
+            let d = diff(&old, &new)?;
+            apply_additive(db.conn(), table, &d.additive)?;
+            // Destructive changes (PR 3.9) apply after additive ones; a lossy cast failure short-circuits
+            // with `Quarantine` and the watermark is NOT advanced (re-run re-quarantines idempotently).
+            apply_destructive(db.conn(), table, &d.destructive)?;
         }
         db.set_schema_version(next)?;
         cur = next;

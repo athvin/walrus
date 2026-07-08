@@ -23,6 +23,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The bundled DuckDB compiles from source into large artifacts; the cold-build path here (both the
+      # dev-profile `build` and the test-profile `test`) can exhaust the runner's ~14 GB and fail with
+      # "No space left on device". Reclaim the preinstalled toolchains we don't use for headroom.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift || true
+          df -h /
+
       # rust-toolchain.toml pins the channel + rustfmt/clippy components; install it explicitly so
       # the version is logged and the cache key below is computed against the pinned rustc. (rustup
       # 1.28+ no longer auto-installs the toolchain-file toolchain on first proxy use.)
@@ -95,6 +104,13 @@ jobs:
       DATABASE_URL: postgres://postgres:postgres@localhost:5433/walrus_control
     steps:
       - uses: actions/checkout@v4
+
+      # Same disk-headroom reclaim as the gates job — this job also cold-builds the bundled DuckDB.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift || true
+          df -h /
 
       - name: Install pinned Rust toolchain (from rust-toolchain.toml)
         run: |
@@ -221,10 +237,15 @@ jobs:
         run: cargo test -p loader --test phase_b -- --ignored --test-threads=1
 
       # PR 3.8: additive/lossless DDL apply — both DuckDB tables evolve at the correct LSN relative to
-      # data (ADD COLUMN across a schema_version boundary). Runs LAST among loader tests: it seeds a
-      # higher epoch and read_current_epoch is MAX, so it must not precede the epoch-sensitive bootstrap.
+      # data (ADD COLUMN across a schema_version boundary). Runs after the epoch-sensitive bootstrap
+      # (read_current_epoch is MAX and this seeds a higher epoch).
       - name: Loader DDL additive (compose)
         run: cargo test -p loader --test ddl_additive -- --ignored --test-threads=1
+
+      # PR 3.9: destructive DDL apply — a lossy int4→int2 cast on a populated mirror overflows and
+      # quarantines the table (/ready degrades). Runs LAST among loader tests (highest seeded epoch).
+      - name: Loader DDL destructive (compose)
+        run: cargo test -p loader --test ddl_destructive -- --ignored --test-threads=1
 
       - name: Tear down (remove volumes)
         if: always()
