@@ -54,7 +54,7 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     let mut appended = 0u64;
     for f in &claimed {
         if f.schema_version > ctx.db.schema_version()? {
-            crate::ddl::reconcile_to_version(
+            if let Err(e) = crate::ddl::reconcile_to_version(
                 &ctx.db,
                 &ctx.pool,
                 ctx.epoch,
@@ -62,7 +62,20 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
                 &ctx.table,
                 f.schema_version,
             )
-            .await?;
+            .await
+            {
+                // A lossy DDL cast that fails is a QUARANTINE (PR 3.9): latch the state so `/ready`
+                // degrades, fire a loud error-level alert, and stop — never a silent continue.
+                if matches!(e, LoaderError::Quarantine { .. }) {
+                    ctx.state.quarantine();
+                    tracing::error!(
+                        table = %format_args!("{}.{}", ctx.schema, ctx.table),
+                        error = %e,
+                        "QUARANTINE: lossy schema change could not be applied — /ready degraded, processing stopped"
+                    );
+                }
+                return Err(e);
+            }
         }
         appended += ctx.db.append_parquet(&ctx.table, &f.s3_uri)?;
         max_lsn = max_lsn.max(f.lsn_end);

@@ -221,10 +221,15 @@ jobs:
         run: cargo test -p loader --test phase_b -- --ignored --test-threads=1
 
       # PR 3.8: additive/lossless DDL apply — both DuckDB tables evolve at the correct LSN relative to
-      # data (ADD COLUMN across a schema_version boundary). Runs LAST among loader tests: it seeds a
-      # higher epoch and read_current_epoch is MAX, so it must not precede the epoch-sensitive bootstrap.
+      # data (ADD COLUMN across a schema_version boundary). Runs after the epoch-sensitive bootstrap
+      # (read_current_epoch is MAX and this seeds a higher epoch).
       - name: Loader DDL additive (compose)
         run: cargo test -p loader --test ddl_additive -- --ignored --test-threads=1
+
+      # PR 3.9: destructive DDL apply — a lossy int4→int2 cast on a populated mirror overflows and
+      # quarantines the table (/ready degrades). Runs LAST among loader tests (highest seeded epoch).
+      - name: Loader DDL destructive (compose)
+        run: cargo test -p loader --test ddl_destructive -- --ignored --test-threads=1
 
       - name: Tear down (remove volumes)
         if: always()

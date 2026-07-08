@@ -21,6 +21,10 @@ pub enum LoaderError {
     /// enforces `CHECK (transformed_lsn <= raw_appended_lsn)`), so this is terminal.
     #[error("corrupt checkpoint for {table}: transformed_lsn > raw_appended_lsn")]
     CorruptCheckpoint { table: String },
+    /// A lossy/incompatible `ALTER COLUMN TYPE` failed the in-place mirror cast (PR 3.9). The table is
+    /// quarantined and processing STOPS — an accepted, alerting v1 outcome (never silent data loss).
+    #[error("table {table} quarantined: {reason}")]
+    Quarantine { table: String, reason: String },
     #[error("{0}")]
     Internal(String),
 }
@@ -38,6 +42,9 @@ impl LoaderError {
             }
             LoaderError::CorruptCheckpoint { table } => {
                 common::Error::Internal(format!("corrupt checkpoint for {table}"))
+            }
+            LoaderError::Quarantine { table, reason } => {
+                common::Error::Quarantine(format!("{table}: {reason}"))
             }
             LoaderError::Internal(m) => common::Error::Internal(m.clone()),
         }
