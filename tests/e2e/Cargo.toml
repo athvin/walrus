@@ -1,0 +1,27 @@
+[package]
+name = "e2e"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# The end-to-end integration crate: it depends on nothing in the walrus DAG's *libraries* for its
+# assertions, but drives both binaries (`walrus-pg-sink`, `walrus-loader`) as black boxes over the
+# compose stack. All tests are `#[ignore]` and gated behind `--features it`, so `cargo build/test
+# --workspace` (no `it`) compiles the crate with zero active tests and never needs docker.
+[features]
+it = []
+
+[lints]
+workspace = true
+
+[dependencies]
+common = { path = "../../crates/common", features = ["sqlx"] }
+control = { path = "../../crates/control" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", "time", "net"] }
+sqlx = { workspace = true, features = ["runtime-tokio", "tls-rustls", "postgres"] }
+duckdb = { workspace = true, features = ["bundled"] }
+object_store = { workspace = true, features = ["aws"] }
+anyhow = { workspace = true }
+serde_json = { workspace = true }

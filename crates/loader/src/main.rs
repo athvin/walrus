@@ -87,6 +87,13 @@ async fn run(cfg: LoaderConfig) -> Result<(), LoaderError> {
         token.clone(),
     );
 
+    // Configure DuckDB's httpfs on every owned file so `read_parquet('s3://…')` (Phase A) has the
+    // staging-bucket credentials — the binary's equivalent of what the compose tests set up by hand.
+    let s3 = duck_s3_access(&cfg);
+    for o in &owned {
+        o.db.configure_s3(&s3)?;
+    }
+
     // One apply loop per owned table. DuckDB's `Connection` is `!Send`, so the loops run on a
     // `LocalSet` (this thread), the whole parallelism model being one worker per `.duckdb` file.
     let local = tokio::task::LocalSet::new();
@@ -132,7 +139,9 @@ async fn run(cfg: LoaderConfig) -> Result<(), LoaderError> {
 }
 
 fn build_store(cfg: &LoaderConfig) -> Result<Arc<dyn ObjectStore>, LoaderError> {
-    let mut b = AmazonS3Builder::new()
+    // `from_env` so the AWS credential env (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`) is honoured —
+    // `new()` alone falls back to the EC2 IMDS credential chain, which hangs/fails off-EC2 (e.g. MinIO).
+    let mut b = AmazonS3Builder::from_env()
         .with_bucket_name(&cfg.object_store.bucket)
         .with_region(&cfg.object_store.region);
     if let Some(endpoint) = &cfg.object_store.endpoint {
@@ -142,4 +151,22 @@ fn build_store(cfg: &LoaderConfig) -> Result<Arc<dyn ObjectStore>, LoaderError> 
         .build()
         .map_err(|e| LoaderError::ObjectStore(format!("build S3 client: {e}")))?;
     Ok(Arc::new(store))
+}
+
+/// DuckDB httpfs credentials for `read_parquet('s3://…')`, from the object-store config + the AWS env
+/// (the same `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` the `object_store` client reads). DuckDB wants a
+/// scheme-less `host:port` endpoint; the scheme selects TLS.
+fn duck_s3_access(cfg: &LoaderConfig) -> loader::duck::S3Access {
+    let raw = cfg.object_store.endpoint.as_deref().unwrap_or_default();
+    let (use_ssl, endpoint) = match raw.strip_prefix("https://") {
+        Some(host) => (true, host),
+        None => (false, raw.strip_prefix("http://").unwrap_or(raw)),
+    };
+    loader::duck::S3Access {
+        endpoint: endpoint.to_string(),
+        region: cfg.object_store.region.clone(),
+        access_key_id: std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_default(),
+        secret_access_key: std::env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_default(),
+        use_ssl,
+    }
 }
