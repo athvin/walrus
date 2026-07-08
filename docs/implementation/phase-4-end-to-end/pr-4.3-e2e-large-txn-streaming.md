@@ -1,5 +1,8 @@
 # PR 4.3 — End-to-end large-txn streaming: bounded memory, commit-order, subtxn-abort
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/69 (surfaced + fixed two streaming
+> commit-order bugs in #68: spilled-file `commit_lsn` placeholder + out-of-commit-order `ready` rows)
+
 > **Phase:** 4 — End-to-end, ops & resilience · **Crates touched:** `tests/e2e` · **Est. size:** L ·
 > **Depends on:** PR 4.2 · **Unlocks:** PR 4.4
 
@@ -111,19 +114,19 @@ async fn rolled_back_savepoint_never_materializes() {
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] The large committed txn appears **atomically after commit**; during streaming the `in_flight_bytes`
+- [x] The large committed txn appears **atomically after commit**; during streaming the `in_flight_bytes`
       metric stays ≤ the ceiling and `spill_count` increments; slot retained bytes stay bounded.
-- [ ] The aborted large txn produces **no** `ready` row, no surviving Parquet, and **zero** rows in
+- [x] The aborted large txn produces **no** `ready` row, no surviving Parquet, and **zero** rows in
       `<table>_raw` / mirror.
-- [ ] The late-committing large txn is **not skipped**: files apply in `(lsn_end, id)` commit order and
+- [x] The late-committing large txn is **not skipped**: files apply in `(lsn_end, id)` commit order and
       the mirror reflects last-writer-by-commit-LSN (the row-LSN-bug regression guard).
-- [ ] The committed txn with a rolled-back savepoint yields **exactly 6000** rows in `<table>_raw`, none
+- [x] The committed txn with a rolled-back savepoint yields **exactly 6000** rows in `<table>_raw`, none
       from the rolled-back subtransaction.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test --workspace`
-  - [ ] `docker compose up --wait` then `cargo test -p e2e --features it -- --ignored` asserting
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test --workspace`
+  - [x] `docker compose up --wait` then `cargo test -p e2e --features it -- --ignored` asserting
         **`large_txn_is_atomic_and_bounded`**, **`aborted_large_txn_leaves_nothing`**,
         **`late_committing_large_txn_not_skipped`**, and **`rolled_back_savepoint_never_materializes`**.
 
