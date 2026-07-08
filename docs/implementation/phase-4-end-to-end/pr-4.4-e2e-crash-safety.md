@@ -1,5 +1,7 @@
 # PR 4.4 — End-to-end crash safety: effectively-once via checkpoint replay
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/70
+
 > **Phase:** 4 — End-to-end, ops & resilience · **Crates touched:** `tests/e2e` · **Est. size:** M ·
 > **Depends on:** PR 4.3 · **Unlocks:** PR 4.5
 
@@ -100,17 +102,17 @@ impl Harness {
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] A sink `SIGKILL`ed **mid-batch** (between S3 PUT and standby update) restarts, re-streams from
+- [x] A sink `SIGKILL`ed **mid-batch** (between S3 PUT and standby update) restarts, re-streams from
       `confirmed_flush_lsn`, and the mirror converges to the source with **no loss and no dupes**.
-- [ ] A loader `SIGKILL`ed **mid-MERGE** restarts with both watermarks consistent and the mirror equal to
+- [x] A loader `SIGKILL`ed **mid-MERGE** restarts with both watermarks consistent and the mirror equal to
       the source — no half-applied MERGE, no double-apply, no resurrected deletes.
-- [ ] The result is **effectively-once**: the final mirror is identical to a run with no crash.
-- [ ] The kills are `SIGKILL` (ungraceful), distinct from the SIGTERM drains in PRs 2.28 / 3.12.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test --workspace`
-  - [ ] `docker compose up --wait` then `cargo test -p e2e --features it -- --ignored` asserting
+- [x] The result is **effectively-once**: the final mirror is identical to a run with no crash.
+- [x] The kills are `SIGKILL` (ungraceful), distinct from the SIGTERM drains in PRs 2.28 / 3.12.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test --workspace`
+  - [x] `docker compose up --wait` then `cargo test -p e2e --features it -- --ignored` asserting
         **`sink_killed_mid_batch_loses_nothing`** and **`loader_killed_mid_merge_is_idempotent`**.
 
 ## Hints & gotchas
