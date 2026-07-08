@@ -1,5 +1,7 @@
 # PR 4.1 — Wire both services end-to-end: the thin vertical slice
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/66
+
 > **Phase:** 4 — End-to-end, ops & resilience · **Crates touched:** `tests/e2e` (new) · **Est. size:** M ·
 > **Depends on:** PR 3.12 · **Unlocks:** PR 4.2
 
@@ -114,19 +116,19 @@ async fn insert_update_delete_reaches_mirror() {
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `tests/e2e` is a workspace member with an `it` feature; `cargo build --workspace` (no `it`) still
+- [x] `tests/e2e` is a workspace member with an `it` feature; `cargo build --workspace` (no `it`) still
       builds it with zero tests active.
-- [ ] `Harness::start` spawns both bins against compose, waits on `/ready`, and stops them on `Drop`.
-- [ ] After `INSERT`/`UPDATE`/`DELETE` on `orders`: at least one Parquet object exists under
+- [x] `Harness::start` spawns both bins against compose, waits on `/ready`, and stops them on `Drop`.
+- [x] After `INSERT`/`UPDATE`/`DELETE` on `orders`: at least one Parquet object exists under
       `<epoch>/public/orders/`, `orders_raw` holds the three CDC rows **verbatim** (meta JSON present;
       `op`/`commit_lsn`/`lsn`/`sink_processed_at` promoted), and the `orders` mirror equals the current
       source (the row is absent after the `DELETE`).
-- [ ] The test waits on `transformed_lsn`, never a fixed `sleep`.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test --workspace` (the e2e test is `#[ignore]` without services)
-  - [ ] `docker compose up --wait` then
+- [x] The test waits on `transformed_lsn`, never a fixed `sleep`.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test --workspace` (the e2e test is `#[ignore]` without services)
+  - [x] `docker compose up --wait` then
         `cargo test -p e2e --features it -- --ignored` asserting **`insert_update_delete_reaches_mirror`**.
 
 ## Hints & gotchas
