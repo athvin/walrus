@@ -1,5 +1,7 @@
 # PR 3.10 — Snapshot/stream boundary through the transform
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/63
+
 > **Phase:** 3 — walrus-loader · **Crates touched:** `loader` · **Est. size:** M ·
 > **Depends on:** PR 3.9 · **Unlocks:** PR 3.11
 
@@ -86,22 +88,22 @@ async fn equal_lsn_end_snapshot_files_split_across_batches_all_applied() { todo!
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] A snapshot load followed by an **overlapping** stream change on the same PK → the mirror ends at
+- [x] A snapshot load followed by an **overlapping** stream change on the same PK → the mirror ends at
       the **stream** value (`commit_lsn > consistent_point` out-ranks the snapshot row by tuple).
-- [ ] **Equal-`lsn_end`** snapshot files split across multiple loader batches are **all** applied —
+- [x] **Equal-`lsn_end`** snapshot files split across multiple loader batches are **all** applied —
       none skipped by the watermark (the claim uses `(lsn_end, id)` + queue-delete, and the PR 3.7 `>=`
       bound + guard handle the boundary key).
-- [ ] A no-stream key whose snapshot row carries `commit_lsn == transformed_lsn` still lands in the
+- [x] A no-stream key whose snapshot row carries `commit_lsn == transformed_lsn` still lands in the
       mirror (break face A stays closed).
-- [ ] Snapshot files flow through the **same** Phase A / Phase B path as stream files — no special mode.
-- [ ] Zero loss and zero dupes across the snapshot/stream boundary.
-- [ ] Docs/comments explain why `lsn_end`-only watermark filtering would drop equal-`lsn_end` snapshot
+- [x] Snapshot files flow through the **same** Phase A / Phase B path as stream files — no special mode.
+- [x] Zero loss and zero dupes across the snapshot/stream boundary.
+- [x] Docs/comments explain why `lsn_end`-only watermark filtering would drop equal-`lsn_end` snapshot
       files.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p loader` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` then `cargo test -p loader --test snapshot_boundary -- --ignored`
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p loader` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` then `cargo test -p loader --test snapshot_boundary -- --ignored`
         asserting **`snapshot_then_overlapping_stream_yields_stream_value`** and
         **`equal_lsn_end_snapshot_files_split_across_batches_all_applied`**.
 
