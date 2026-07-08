@@ -14,4 +14,5 @@ pub mod health;
 pub mod lease;
 pub mod phase_a;
 pub mod phase_b;
+pub mod shutdown;
 pub mod transform;

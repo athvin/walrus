@@ -258,6 +258,11 @@ jobs:
       - name: Loader compaction reclaim (real file)
         run: cargo test -p loader --test compaction -- --ignored --test-threads=1
 
+      # PR 3.12: graceful SIGTERM drain — both watermarks commit + lease released + no stale lock; an
+      # in-flight full-rebuild is aborted (rolled back); a replacement resumes from the two watermarks.
+      - name: Loader graceful shutdown (compose)
+        run: cargo test -p loader --test shutdown -- --ignored --test-threads=1
+
       - name: Tear down (remove volumes)
         if: always()
         run: docker compose -f deploy/docker/docker-compose.yml down -v

@@ -3,7 +3,6 @@
 //! exit code at `main`). Everything below returns [`LoaderError`], whose distinct exit code `main`
 //! surfaces so a broken deploy is greppable in `kubectl logs`.
 
-use anyhow::Context;
 use loader::bootstrap;
 use loader::config::LoaderConfig;
 use loader::error::LoaderError;
@@ -13,7 +12,6 @@ use object_store::aws::AmazonS3Builder;
 use object_store::ObjectStore;
 use std::process::ExitCode;
 use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
 
 fn main() -> ExitCode {
     let cfg = match LoaderConfig::load() {
@@ -47,7 +45,7 @@ fn main() -> ExitCode {
 }
 
 async fn run(cfg: LoaderConfig) -> Result<(), LoaderError> {
-    let token = install_signal_handlers();
+    let token = loader::shutdown::install_signal_handlers();
     let state = LoaderState::new();
 
     // Bind health *before* bootstrap so `/startup` answers 503 while the lease + DuckDB open proceed.
@@ -144,22 +142,4 @@ fn build_store(cfg: &LoaderConfig) -> Result<Arc<dyn ObjectStore>, LoaderError> 
         .build()
         .map_err(|e| LoaderError::ObjectStore(format!("build S3 client: {e}")))?;
     Ok(Arc::new(store))
-}
-
-/// SIGTERM/SIGINT → cancel one shared token.
-fn install_signal_handlers() -> CancellationToken {
-    use tokio::signal::unix::{signal, SignalKind};
-    let token = CancellationToken::new();
-    let child = token.clone();
-    tokio::spawn(async move {
-        let mut term = signal(SignalKind::terminate()).context("SIGTERM").unwrap();
-        let mut int = signal(SignalKind::interrupt()).context("SIGINT").unwrap();
-        tokio::select! {
-            _ = term.recv() => tracing::info!("SIGTERM received"),
-            _ = int.recv() => tracing::info!("SIGINT received"),
-            _ = child.cancelled() => {}
-        }
-        child.cancel();
-    });
-    token
 }
