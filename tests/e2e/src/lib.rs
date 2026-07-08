@@ -27,6 +27,8 @@ pub struct Harness {
     duckdb_dir: PathBuf,
     /// The sink's captured stdout+stderr (its `tracing` log) — scraped for spill events (PR 4.3).
     sink_log: PathBuf,
+    /// The `target/<profile>/` dir the binaries live in — kept so a crashed child can be respawned (PR 4.4).
+    bins: PathBuf,
     /// The epoch the sink established (always 1 after the clean reset).
     pub epoch: i64,
 }
@@ -110,6 +112,7 @@ impl Harness {
             control,
             duckdb_dir,
             sink_log,
+            bins,
             epoch: 1,
         })
     }
@@ -117,6 +120,11 @@ impl Harness {
     /// The source Postgres pool — for tests that need multiple concurrent sessions (overlapping txns).
     pub fn source_pool(&self) -> &sqlx::PgPool {
         &self.source
+    }
+
+    /// The control Postgres pool — for tests that read checkpoints / the manifest directly (PR 4.4).
+    pub fn control_pool(&self) -> &sqlx::PgPool {
+        &self.control
     }
 
     /// How many speculative spills the sink has logged so far (PR 4.3) — the observable proof that the
@@ -249,6 +257,134 @@ impl Harness {
         let _ = self.loader.start_kill();
         let _ = self.loader.wait().await;
         Ok(())
+    }
+
+    /// **SIGKILL** the sink (PR 4.4) — the *ungraceful* crash path, NOT the SIGTERM graceful drain of PR
+    /// 2.28. `tokio::process::Child::start_kill` sends `SIGKILL` (signal 9); `wait` reaps the zombie so the
+    /// process is gone (and its walsender connection torn down) before we respawn.
+    pub async fn kill_sink(&mut self) -> Result<()> {
+        self.sink.start_kill().context("SIGKILL sink")?;
+        let _ = self.sink.wait().await;
+        Ok(())
+    }
+
+    /// Respawn the sink fresh and block until `/ready`. After a `SIGKILL` the source still marks the
+    /// replication slot **active** until it notices the dropped connection, and the sink's resume path
+    /// issues `START_REPLICATION` with no retry — so wait for the slot to go inactive first (what a real
+    /// orchestrator's backoff-restart achieves), then spawn. Resume is from `confirmed_flush_lsn`.
+    pub async fn restart_sink(&mut self) -> Result<()> {
+        self.await_slot_inactive(Duration::from_secs(30)).await?;
+        self.sink = spawn_sink(&self.bins, &self.sink_log)?;
+        wait_ready("http://127.0.0.1:8130", Duration::from_secs(45))
+            .await
+            .context("sink /ready after restart")
+    }
+
+    /// **SIGKILL** the loader (PR 4.4) — ungraceful, distinct from the SIGTERM drain of PR 3.12. Process
+    /// death releases the DuckDB file lock (the OS closes the fd) and leaves the lease row in place.
+    pub async fn kill_loader(&mut self) -> Result<()> {
+        self.loader.start_kill().context("SIGKILL loader")?;
+        let _ = self.loader.wait().await;
+        Ok(())
+    }
+
+    /// Respawn the loader fresh and block until `/ready`. It reuses `WALRUS_INSTANCE=e2e-loader`, so
+    /// `acquire_lease` sees the lease as **already ours** and reclaims it immediately (no TTL wait); the
+    /// DuckDB lock was freed on `SIGKILL`. Resume is from the two persisted watermarks.
+    pub async fn restart_loader(&mut self) -> Result<()> {
+        self.loader = spawn_loader(&self.bins, &self.duckdb_dir)?;
+        wait_ready("http://127.0.0.1:8131", Duration::from_secs(45))
+            .await
+            .context("loader /ready after restart")
+    }
+
+    /// Poll the source until the replication slot is `active = false` (the dead walsender cleaned up), so a
+    /// fresh sink can `START_REPLICATION` without hitting "replication slot is active".
+    pub async fn await_slot_inactive(&self, deadline: Duration) -> Result<()> {
+        let start = Instant::now();
+        loop {
+            let active: Option<bool> =
+                sqlx::query_scalar("SELECT active FROM pg_replication_slots WHERE slot_name = $1")
+                    .bind(SLOT)
+                    .fetch_optional(&self.source)
+                    .await?;
+            if active != Some(true) {
+                return Ok(());
+            }
+            if start.elapsed() > deadline {
+                anyhow::bail!("replication slot {SLOT} still active within {deadline:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Poll `loader_checkpoint.raw_appended_lsn` for `table` until it passes `target` — i.e. Phase A has
+    /// appended the batch to `<table>_raw`, even if Phase B has not yet MERGEd it (the mid-MERGE window,
+    /// where `transformed_lsn < raw_appended_lsn`). PR 4.4 uses this to crash the loader *after append,
+    /// before/ during merge*.
+    pub async fn await_raw_appended_past(
+        &self,
+        table: &str,
+        target: common::Lsn,
+        deadline: Duration,
+    ) -> Result<()> {
+        let start = Instant::now();
+        loop {
+            if let Some(cp) =
+                control::read_checkpoint(&self.control, self.epoch, "public", table).await?
+            {
+                if cp.raw_appended_lsn > target {
+                    return Ok(());
+                }
+            }
+            if start.elapsed() > deadline {
+                anyhow::bail!(
+                    "raw_appended_lsn for {table} never passed {target} within {deadline:?}"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Assert the loader's DuckDB mirror `<table>_current` equals the current source `public.<table>`
+    /// **row-by-row** (id + status), the effectively-once convergence check. Call after [`stop_loader`]
+    /// (DuckDB is single-writer, so the mirror is read only once the loader has exited).
+    pub async fn assert_mirror_equals_source(&self, table: &str) -> Result<()> {
+        let src: Vec<(i32, Option<String>)> = sqlx::query_as(&format!(
+            "SELECT id, status FROM public.{table} ORDER BY id"
+        ))
+        .fetch_all(&self.source)
+        .await
+        .context("read source rows")?;
+        let mirror = self.duckdb_pairs(
+            table,
+            &format!("SELECT id, status FROM {table}_current ORDER BY id"),
+        )?;
+        anyhow::ensure!(
+            src.len() == mirror.len(),
+            "row count mismatch: source has {} rows, mirror has {}",
+            src.len(),
+            mirror.len()
+        );
+        for (s, m) in src.iter().zip(mirror.iter()) {
+            anyhow::ensure!(s == m, "mirror row {m:?} != source row {s:?}");
+        }
+        Ok(())
+    }
+
+    /// Read `(id, status)` pairs from the loader's read-only `.duckdb` file. Call after [`stop_loader`].
+    fn duckdb_pairs(&self, table: &str, sql: &str) -> Result<Vec<(i32, Option<String>)>> {
+        let path = self.duckdb_dir.join(format!("{table}.duckdb"));
+        let conn = duckdb::Connection::open_with_flags(
+            &path,
+            duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?,
+        )
+        .with_context(|| format!("open {}", path.display()))?;
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, i32>(0)?, r.get::<_, Option<String>>(1)?))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// Open the loader's per-table `.duckdb` file read-only and collect the first column of each row as a
