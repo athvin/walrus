@@ -23,10 +23,18 @@ pub struct LoaderConfig {
     /// The ownership-lease TTL; renewed well under it.
     #[serde(with = "humantime_serde")]
     pub lease_ttl: Duration,
-    /// The apply-loop poll cadence (incremental Phase A + Phase B). Distinct from the compaction /
-    /// retention knobs (PR 3.11), which are not wired here.
+    /// The apply-loop poll cadence (incremental Phase A + Phase B).
     #[serde(with = "humantime_serde")]
     pub poll_interval: Duration,
+    /// The compaction cadence (PR 3.11) — the per-table full-rebuild + retention prune. **Distinct** from
+    /// `poll_interval`, slower, and run on the SAME worker thread serialized after an apply cycle (it
+    /// holds the exclusive writer and needs ~2× transient space, so size it for low-traffic windows).
+    #[serde(with = "humantime_serde")]
+    pub compaction_interval: Duration,
+    /// Raw retention as an LSN-byte lag behind `transformed_lsn`: compaction prunes `<table>_raw` below
+    /// `transformed_lsn - retention_lsn_lag`. The rebuild's mirror baseline makes even an aggressive
+    /// prune lossless (a pruned value survives as the current mirror row).
+    pub retention_lsn_lag: u64,
     /// Manifest files claimed per Phase-A cycle.
     pub max_files_per_cycle: i64,
     /// Bootstrap retry budget for transient deps.
@@ -46,6 +54,8 @@ impl Default for LoaderConfig {
             duckdb_dir: String::new(),
             lease_ttl: Duration::from_secs(30),
             poll_interval: Duration::from_secs(5),
+            compaction_interval: Duration::from_secs(3600),
+            retention_lsn_lag: 16 << 20, // 16 MiB of WAL retained behind transformed_lsn
             max_files_per_cycle: 32,
             startup_deadline: Duration::from_secs(60),
             health_addr: SocketAddr::from(([0, 0, 0, 0], 8080)),

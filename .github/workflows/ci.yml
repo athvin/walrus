@@ -253,6 +253,11 @@ jobs:
       - name: Loader snapshot boundary (compose)
         run: cargo test -p loader --test snapshot_boundary -- --ignored --test-threads=1
 
+      # PR 3.11: full-rebuild reclaims blocks a DELETE only tombstones (needs a real .duckdb file, not the
+      # compose services); the hermetic rebuild==incremental / pruned-value-survives cases run in gates.
+      - name: Loader compaction reclaim (real file)
+        run: cargo test -p loader --test compaction -- --ignored --test-threads=1
+
       - name: Tear down (remove volumes)
         if: always()
         run: docker compose -f deploy/docker/docker-compose.yml down -v

@@ -105,6 +105,8 @@ async fn run(cfg: LoaderConfig) -> Result<(), LoaderError> {
                 state: state.clone(),
                 max_files: cfg.max_files_per_cycle,
                 poll_interval: cfg.poll_interval,
+                compaction_interval: cfg.compaction_interval,
+                retention_lsn_lag: cfg.retention_lsn_lag,
             };
             local.spawn_local(loader::apply_loop::apply_loop(ctx, token.clone()))
         })

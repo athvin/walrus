@@ -333,6 +333,8 @@ async fn lossy_cast_failure_quarantines_the_table_and_alerts() {
         state: state.clone(),
         max_files: 100,
         poll_interval: Duration::from_secs(5),
+        compaction_interval: Duration::from_secs(3600),
+        retention_lsn_lag: 16 << 20,
     };
 
     // Process v1 fully so the mirror holds n=99999 BEFORE the lossy DDL reconcile runs.
