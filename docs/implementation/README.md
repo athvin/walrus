@@ -240,7 +240,7 @@ Two deliberate structural notes:
 | ✅ | PR | Delivers | Design |
 |---|---|---|---|
 | ✅ | [4.1](./phase-4-end-to-end/pr-4.1-e2e-thin-slice.md) | e2e thin slice: INSERT/UPDATE/DELETE → mirror | Verification harness |
-| ☐ | [4.2](./phase-4-end-to-end/pr-4.2-e2e-type-matrix.md) | e2e type round-trip matrix + unchanged-TOAST | Verification "Types" |
+| ✅ | [4.2](./phase-4-end-to-end/pr-4.2-e2e-type-matrix.md) | e2e type round-trip matrix + unchanged-TOAST | Verification "Types" |
 | ☐ | [4.3](./phase-4-end-to-end/pr-4.3-e2e-large-txn-streaming.md) | e2e large-txn + commit-order + subtxn-abort | Verification (large-txn) |
 | ☐ | [4.4](./phase-4-end-to-end/pr-4.4-e2e-crash-safety.md) | e2e crash safety (effectively-once) | Verification "Crash safety" |
 | ☐ | [4.5](./phase-4-end-to-end/pr-4.5-e2e-wal-runaway-heartbeat.md) | e2e WAL-runaway + heartbeat + keepalive-vs-durability | Verification (chaos) |
