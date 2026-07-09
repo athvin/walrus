@@ -1,5 +1,7 @@
 # PR 4.7 — Supply-chain CI: `cargo-deny` + a documented MSRV
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/74
+
 > **Phase:** 4 — End-to-end, ops & resilience · **Crates touched:** workspace root (CI + `deny.toml`) ·
 > **Est. size:** S · **Depends on:** PR 4.6 · **Unlocks:** PR 4.8
 
@@ -95,19 +97,19 @@ allow-git = [ /* any pinned git dep, e.g. a patched arrow/pgwire fork, with a co
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `cargo deny check advisories licenses bans sources` passes locally on the current tree.
-- [ ] The `licenses` allow-list covers **every** crate in the tree (no `unlicensed`/unknown), and each
+- [x] `cargo deny check advisories licenses bans sources` passes locally on the current tree.
+- [x] The `licenses` allow-list covers **every** crate in the tree (no `unlicensed`/unknown), and each
       entry is a real SPDX id — no blanket `allow-osi-fsf-free = "both"` shortcut.
-- [ ] The `sources` check denies unknown registries/git; any git dep is explicitly allow-listed with a
+- [x] The `sources` check denies unknown registries/git; any git dep is explicitly allow-listed with a
       justifying comment.
-- [ ] The workspace declares a `rust-version` (MSRV) matching `rust-toolchain.toml`; CI builds on the MSRV
+- [x] The workspace declares a `rust-version` (MSRV) matching `rust-toolchain.toml`; CI builds on the MSRV
       and the value is recorded in `../README.md`.
-- [ ] The `supply-chain` CI job is wired in and green.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test --workspace`
-  - [ ] `cargo deny check` (new gate, must be green)
+- [x] The `supply-chain` CI job is wired in and green.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test --workspace`
+  - [x] `cargo deny check` (new gate, must be green)
 
 ## Hints & gotchas
 
