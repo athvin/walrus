@@ -5,7 +5,7 @@ members = ["crates/common", "crates/control", "crates/loader", "crates/pg-sink",
 [workspace.package]
 edition = "2021"
 license = "MIT"
-rust-version = "1.95" # keep in sync with rust-toolchain.toml; MSRV formalised in PR 4.7
+rust-version = "1.95" # MSRV — keep in sync with rust-toolchain.toml; CI `msrv` job fails on drift (PR 4.7)
 
 # Lint-as-policy, centralised so no member crate can silently opt out of `deny(warnings)`.
 # NOTE: these only take effect in a member once it declares `[lints] workspace = true`.

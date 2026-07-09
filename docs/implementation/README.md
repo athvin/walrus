@@ -264,7 +264,7 @@ that needs them lands:
 | 0.6 | compose job: `docker compose up --wait` → smoke → `down` |
 | 1.3 | integration job vs compose (control PG); `sqlx` offline (`cargo sqlx prepare --check`) |
 | 2.11 | DuckDB-bundled **conformance** job (feature-gated; registry/sccache cache) |
-| 4.7 | `cargo-deny` (licenses / advisories / bans / sources) |
+| 4.7 | `cargo-deny` (licenses / advisories / bans / sources); MSRV **1.95** guard (declared `rust-version` == pinned toolchain) |
 | 4.8–4.9 | image build; `kubeconform` / kind manifest validation |
 | 4.1+ | full `tests/e2e` job (feature `it`) |
 
