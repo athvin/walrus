@@ -1,0 +1,38 @@
+# deploy/k8s/base — kustomize base for the walrus data plane (PR 4.9).
+#
+# Topology the design mandates (architecture.md#kubernetes-deployment):
+#   * walrus-pg-sink   — StatefulSet replicas=1  (exactly one consumer of the single lifelong slot)
+#   * walrus-loader    — StatefulSet replicas=1  + RWO PVC (one owner of every .duckdb file)
+# Both are Guaranteed QoS (requests == limits), drained on SIGTERM (grace 90s, NO preStop), and never
+# scaled horizontally (file/slot ownership is exclusive; sharding is the deferred goal in PR 4.11).
+#
+# secrets.example.yaml is deliberately NOT a resource here — it is a template the operator copies to a
+# real `walrus-secrets` Secret (or lets IRSA/Workload Identity provide). CI validates it standalone.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - serviceaccount.yaml
+  - configmap.yaml
+  - pg-sink-statefulset.yaml
+  - loader-statefulset.yaml
+  - pdb.yaml
+  - slot-init-job.yaml
+
+# The slot-init Job applies the SOURCE migrations verbatim from the repo — single source of truth, so
+# the cluster bootstrap can never drift from what the sink's preflight asserts. Rendering therefore
+# needs `--load-restrictor LoadRestrictionsNone` (the files live outside base/); scripts/k8s-validate.sh
+# and the CI `manifests` job both pass it.
+configMapGenerator:
+  - name: walrus-slot-init-sql
+    files:
+      - 0001_publication.sql=../../../migrations/source/0001_publication.sql
+      - 0002_ddl_triggers.sql=../../../migrations/source/0002_ddl_triggers.sql
+
+generatorOptions:
+  disableNameSuffixHash: true # stable name so slot-init-job.yaml can reference it directly
+
+labels:
+  - includeSelectors: false # never touch immutable StatefulSet/Job selectors
+    pairs:
+      app.kubernetes.io/part-of: walrus

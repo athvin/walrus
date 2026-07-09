@@ -1,0 +1,116 @@
+# walrus-loader: ONE owner of every .duckdb file. Single-writer is assembled from replicas=1 + the RWO
+# PVC + an ownership lease + DuckDB's file lock. Like the sink it scales VERTICALLY only — bumping
+# replicas would contend for the same exclusive files (per-replica-PVC sharding is deferred to PR 4.11).
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: walrus-loader
+  labels:
+    app.kubernetes.io/name: walrus-loader
+spec:
+  clusterIP: None
+  selector:
+    app: walrus-loader
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: walrus-loader
+  labels:
+    app.kubernetes.io/name: walrus-loader
+spec:
+  replicas: 1 # one owner of all .duckdb files — never raise this
+  serviceName: walrus-loader
+  selector:
+    matchLabels:
+      app: walrus-loader
+  template:
+    metadata:
+      labels:
+        app: walrus-loader
+        app.kubernetes.io/name: walrus-loader
+    spec:
+      serviceAccountName: walrus
+      # Drain (finish Phase-A append + Phase-B transform, commit both watermarks, release lease + DuckDB
+      # lock) fits the 60–120s window. No preStop, for the same reason as the sink.
+      terminationGracePeriodSeconds: 90
+      # The loader cannot bootstrap until the sink has established an epoch + registered tables (it exits
+      # otherwise). Wait for the epoch row so the loader doesn't CrashLoopBackOff ahead of the sink.
+      initContainers:
+        - name: wait-epoch
+          image: postgres:16-alpine
+          command:
+            - sh
+            - -c
+            - 'until psql "$WALRUS_CONTROL_DB_URL" -tAc "select 1 from walrus.replication_state limit 1" 2>/dev/null | grep -q 1; do echo "waiting for sink to establish an epoch..."; sleep 2; done'
+          env:
+            - name: WALRUS_CONTROL_DB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: walrus-secrets
+                  key: WALRUS_CONTROL_DB_URL
+      containers:
+        - name: loader
+          image: walrus-loader:latest # overridden per-environment via a kustomize overlay `images:` tag
+          ports:
+            - name: http
+              containerPort: 8080
+          resources: # Guaranteed QoS; memory headroom for DuckDB's working set above the buffered set
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+          envFrom:
+            - configMapRef:
+                name: walrus-loader-config
+          env:
+            - name: WALRUS_INSTANCE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: WALRUS_CONTROL_DB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: walrus-secrets
+                  key: WALRUS_CONTROL_DB_URL
+          volumeMounts:
+            - name: duckdb
+              mountPath: /var/lib/walrus # == WALRUS_DUCKDB_DIR in walrus-loader-config
+          startupProbe: # gates the slow lease-acquire + DuckDB open; suppresses readiness/liveness meanwhile
+            httpGet:
+              path: /startup
+              port: http
+            periodSeconds: 5
+            failureThreshold: 120
+            timeoutSeconds: 3
+          readinessProbe: # bootstrap done + no quarantined table; a legitimately-behind loader stays ready
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 3
+          livenessProbe: # progress-only: the apply loop stamped last_poll — an idle-but-healthy loader stays live
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 3
+  # RWO PVC for the .duckdb files. ReadWriteOnce because DuckDB is single-writer; the volume follows the
+  # one loader pod. 20Gi is a starting point — grow per source-table footprint.
+  volumeClaimTemplates:
+    - metadata:
+        name: duckdb
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi

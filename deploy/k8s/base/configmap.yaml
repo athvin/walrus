@@ -1,0 +1,69 @@
+# Non-secret tuning knobs, one ConfigMap per service. They are SEPARATE because both configs are
+# #[serde(deny_unknown_fields)]: a WALRUS_* key a binary doesn't recognise makes figment reject the
+# whole config at startup. So the sink ConfigMap holds only sink keys, the loader's only loader keys;
+# shared keys (object_store, telemetry, health, startup_deadline) are recognised by both and duplicated.
+# Identity/credentials are NOT here — DB URLs come from the Secret (secretKeyRef), WALRUS_INSTANCE from
+# the pod name (fieldRef), S3 from IRSA/Workload Identity. Durations are humantime strings ("5s").
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: walrus-sink-config
+  labels:
+    app.kubernetes.io/name: walrus-pg-sink
+data:
+  # --- batching / cadence: how often and how large a Parquet batch is cut ---
+  WALRUS_MAX_FILL: "5s"               # flush at least this often (wall-clock cadence)
+  WALRUS_MAX_ROWS: "100000"           # row-count flush threshold
+  WALRUS_MAX_BYTES: "134217728"       # 128 MiB per-batch size threshold
+  # Aggregate, process-wide in-memory ceiling across all per-(table,xid) Arrow builders. MUST stay well
+  # BELOW the container memory limit (2Gi below) so a cgroup OOM-kill can never beat the graceful
+  # spill-to-S3. 512 MiB inflight under a 2Gi limit leaves ample headroom for Arrow + Parquet buffers.
+  WALRUS_MAX_INFLIGHT_BYTES: "536870912" # 512 MiB
+  WALRUS_BACKPRESSURE_ACTIVATE_RATIO: "0.85" # pause polling above this fraction of the ceiling
+  WALRUS_BACKPRESSURE_RESUME_RATIO: "0.75"   # resume below this (hysteresis; must be < activate)
+  # --- heartbeat: keeps the slot advancing on an idle publication (feeds READINESS, never liveness) ---
+  WALRUS_HEARTBEAT_IDLE_AFTER: "10s"          # beat only after the publication is idle this long
+  WALRUS_HEARTBEAT_ROUNDTRIP_DEADLINE: "30s"  # un-returned beat past this marks the sink degraded
+  WALRUS_BACKFILL_STATEMENT_TIMEOUT: "0s"     # 0 = no timeout on the initial snapshot COPY
+  # --- bootstrap / publication ownership ---
+  WALRUS_STARTUP_DEADLINE: "60s"     # retry budget for transient deps before bootstrap gives up
+  WALRUS_MANAGE_PUBLICATION: "false" # operator owns the publication (slot-init Job applies 0001); sink asserts, never creates
+  WALRUS_STRICT_KEYS: "true"         # a published table without a usable replica identity is terminal
+  # --- object store (bucket is required; region defaults; endpoint omitted = real AWS) ---
+  WALRUS_OBJECT_STORE__BUCKET: "walrus"
+  WALRUS_OBJECT_STORE__REGION: "us-east-1"
+  # WALRUS_OBJECT_STORE__ENDPOINT: "http://minio:9000"  # set only for MinIO/localstack
+  # --- replication identity (deployment-level constants; not secrets) ---
+  WALRUS_SLOT_NAME: "walrus_slot"
+  WALRUS_PUBLICATION_NAME: "walrus_pub"
+  # --- health server bind (probes hit these paths on :8080) ---
+  WALRUS_HEALTH_ADDR: "0.0.0.0:8080"
+  WALRUS_TELEMETRY__JSON: "true"     # structured JSON logs for cluster log pipelines
+  WALRUS_TELEMETRY__FILTER: "info"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: walrus-loader-config
+  labels:
+    app.kubernetes.io/name: walrus-loader
+data:
+  # --- apply cadence ---
+  WALRUS_POLL_INTERVAL: "5s"           # Phase-A append + Phase-B transform poll cadence
+  WALRUS_COMPACTION_INTERVAL: "3600s"  # slower per-table full-rebuild + raw-retention prune (1h)
+  WALRUS_RETENTION_LSN_LAG: "16777216" # keep 16 MiB of <table>_raw history behind transformed_lsn
+  WALRUS_MAX_FILES_PER_CYCLE: "32"     # manifest files claimed per Phase-A cycle
+  WALRUS_LEASE_TTL: "30s"              # table-ownership lease TTL (renewed well under it)
+  # --- storage: the RWO PVC is mounted here; one .duckdb file per source table ---
+  WALRUS_DUCKDB_DIR: "/var/lib/walrus"
+  # --- bootstrap ---
+  WALRUS_STARTUP_DEADLINE: "60s"
+  # --- object store (same bucket the sink writes; loader reads via DuckDB httpfs) ---
+  WALRUS_OBJECT_STORE__BUCKET: "walrus"
+  WALRUS_OBJECT_STORE__REGION: "us-east-1"
+  # WALRUS_OBJECT_STORE__ENDPOINT: "http://minio:9000"
+  # --- health server bind ---
+  WALRUS_HEALTH_ADDR: "0.0.0.0:8080"
+  WALRUS_TELEMETRY__JSON: "true"
+  WALRUS_TELEMETRY__FILTER: "info"
