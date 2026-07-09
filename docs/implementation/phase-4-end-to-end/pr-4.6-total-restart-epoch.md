@@ -1,5 +1,7 @@
 # PR 4.6 — Total-restart: epoch bump on slot loss, and never on a transient disconnect
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/73
+
 > **Phase:** 4 — End-to-end, ops & resilience · **Crates touched:** `pg-sink`, `loader`, `control`,
 > `tests/e2e` · **Est. size:** L · **Depends on:** PR 4.5 · **Unlocks:** PR 4.7
 
@@ -132,20 +134,20 @@ async fn transient_disconnect_does_not_trigger_total_restart() {
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] On a **successful** connection with the slot **absent** or `wal_status='lost'`, the sink bumps
+- [x] On a **successful** connection with the slot **absent** or `wal_status='lost'`, the sink bumps
       `replication_state.epoch`, creates a new slot with a fresh exported snapshot, and retires old-epoch
       state (loud alert).
-- [ ] A **transient disconnect** (connection failed) routes to the bootstrap backoff retry and leaves the
+- [x] A **transient disconnect** (connection failed) routes to the bootstrap backoff retry and leaves the
       epoch **unchanged** — no re-snapshot, resume from `confirmed_flush_lsn`.
-- [ ] Loaders detect the new epoch and rebuild **every** `.duckdb` file (both `<table>` and `<table>_raw`),
+- [x] Loaders detect the new epoch and rebuild **every** `.duckdb` file (both `<table>` and `<table>_raw`),
       **resetting both watermarks**; the mirror converges to the source under the new epoch.
-- [ ] The new epoch namespaces the S3 prefix, manifest rows, and checkpoints; old-epoch S3 is left to its
+- [x] The new epoch namespaces the S3 prefix, manifest rows, and checkpoints; old-epoch S3 is left to its
       lifecycle TTL.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink -p loader -p control` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` then `cargo test -p e2e --features it -- --ignored` asserting
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink -p loader -p control` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` then `cargo test -p e2e --features it -- --ignored` asserting
         **`dropping_the_slot_triggers_epoch_bump_and_full_rebuild`** and
         **`transient_disconnect_does_not_trigger_total_restart`**.
 

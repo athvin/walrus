@@ -79,12 +79,18 @@ pub async fn bootstrap(
         // steady-state per-file forward reconcile lives in Phase A.
         let path = Path::new(&cfg.duckdb_dir).join(format!("{}.duckdb", rel.name));
         let db = TableDb::open(&path)?;
+        // Total-restart rebuild (§1.8): if this `.duckdb` was built for a retired generation (its
+        // `_walrus_meta['epoch']` < the control epoch), wipe its mirror + raw so the fresh new-epoch
+        // snapshot rebuilds it. A no-op for a fresh file or a same-epoch resume. Both watermarks reset for
+        // free — the new epoch's `loader_checkpoint` (loaded below) is a fresh `0/0`.
+        crate::epoch::rebuild_for_new_epoch(&db, &rel.name, epoch)?;
         // Build the DuckDB shape from the registry descriptors (Tier-2 emit/recombine, PR 4.2); with no
-        // descriptors this is the plain scalar shape.
+        // descriptors this is the plain scalar shape. Then stamp the generation this file is now built for.
         db.ensure_tables_planned(
             &crate::plan::TablePlan::from_registry(&rel, &row.descriptors),
             version,
         )?;
+        db.set_built_epoch(epoch)?;
         crate::ddl::reconcile_to_version(&db, pool, epoch, &rel.schema, &rel.name, version).await?;
 
         // (3) Load both watermarks (the fence is already held) and assert the DB-enforced invariant.

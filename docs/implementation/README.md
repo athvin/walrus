@@ -244,7 +244,7 @@ Two deliberate structural notes:
 | ✅ | [4.3](./phase-4-end-to-end/pr-4.3-e2e-large-txn-streaming.md) | e2e large-txn + commit-order + subtxn-abort | Verification (large-txn) |
 | ✅ | [4.4](./phase-4-end-to-end/pr-4.4-e2e-crash-safety.md) | e2e crash safety (effectively-once) | Verification "Crash safety" |
 | ✅ | [4.5](./phase-4-end-to-end/pr-4.5-e2e-wal-runaway-heartbeat.md) | e2e WAL-runaway + heartbeat + keepalive-vs-durability | Verification (chaos) |
-| ☐ | [4.6](./phase-4-end-to-end/pr-4.6-total-restart-epoch.md) | total-restart / epoch bump on slot loss | §1.8 |
+| ✅ | [4.6](./phase-4-end-to-end/pr-4.6-total-restart-epoch.md) | total-restart / epoch bump on slot loss | §1.8 |
 | ☐ | [4.7](./phase-4-end-to-end/pr-4.7-ci-cargo-deny.md) | supply-chain CI: `cargo-deny` + MSRV | CI-grows |
 | ☐ | [4.8](./phase-4-end-to-end/pr-4.8-dockerfiles.md) | multi-stage Dockerfiles (PID-1 SIGTERM) | sink §4.5 |
 | ☐ | [4.9](./phase-4-end-to-end/pr-4.9-kubernetes-manifests.md) | Kubernetes manifests (StatefulSets, PVC, probes, PDB) | K8s deployment |

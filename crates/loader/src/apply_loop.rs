@@ -19,10 +19,31 @@ pub async fn apply_loop(ctx: TableCtx, shutdown: CancellationToken) -> Result<()
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Track the last compaction so the (slower) rebuild cadence is independent of the poll interval.
     let mut last_compaction = Instant::now();
+    // The generation baseline for the total-restart guard: the highest epoch present as of loop start.
+    // In production this equals `ctx.epoch` (bootstrap read the MAX), so the guard fires on ANY later
+    // bump; using the observed MAX (not `ctx.epoch`) means a shared test control-plane carrying unrelated
+    // higher epochs doesn't trip it — only a genuine bump *while this loader runs* does.
+    let baseline_epoch = control::read_current_epoch(&ctx.pool)
+        .await?
+        .map(|s| s.epoch)
+        .unwrap_or(ctx.epoch)
+        .max(ctx.epoch);
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => return drain(&ctx),
             _ = tick.tick() => {}
+        }
+        // Total-restart guard (§1.8): if the control plane opened a newer generation than the one we
+        // started on, this loader is now running a RETIRED epoch. Exit loudly (→ `main` cancels the token
+        // and the process restarts) so bootstrap wipes + rebuilds every `.duckdb` under the new epoch —
+        // never rebuild in place mid-run.
+        if let Some(state) = control::read_current_epoch(&ctx.pool).await? {
+            if state.epoch > baseline_epoch {
+                return Err(LoaderError::EpochBumped {
+                    from: ctx.epoch,
+                    to: state.epoch,
+                });
+            }
         }
         // Drain step 2+3: `run_phase_a`/`run_phase_b` are never interrupted mid-flight, so the in-flight
         // cycle FINISHES atomically (append + the control-DB `raw_appended_lsn`+DELETE txn, then the

@@ -21,7 +21,7 @@ pub use ddl_manifest::{insert_ddl, read_pending_ddl, DdlRow};
 pub use manifest::{
     claim_ready, delete_claimed, insert_ready, mark_failed, ManifestRow, NewManifestFile,
 };
-pub use replication_state::{insert_epoch, read_current_epoch, ReplicationState};
+pub use replication_state::{bump_epoch, insert_epoch, read_current_epoch, ReplicationState};
 pub use schema_registry::{
     read_all_latest_registry, read_latest_version, read_registry, upsert_registry, RegistryRow,
 };

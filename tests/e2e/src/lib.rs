@@ -563,6 +563,71 @@ impl Harness {
     pub fn sink_running(&mut self) -> bool {
         matches!(self.sink.try_wait(), Ok(None))
     }
+
+    // ---- PR 4.6: total-restart (epoch bump on slot loss) ----------------------------------------
+
+    /// The current (highest) epoch in `replication_state`, or 1 if none yet — bumps on a total-restart.
+    pub async fn current_epoch(&self) -> Result<i64> {
+        Ok(control::read_current_epoch(&self.control)
+            .await?
+            .map(|s| s.epoch)
+            .unwrap_or(1))
+    }
+
+    /// Re-read the current epoch into `self.epoch` after a total-restart, so the epoch-namespaced reads
+    /// (`s3_list`, `await_transformed_past`, …) target the NEW generation.
+    pub async fn refresh_epoch(&mut self) -> Result<i64> {
+        self.epoch = self.current_epoch().await?;
+        Ok(self.epoch)
+    }
+
+    /// Poll `current_epoch` until it exceeds `from`, or the deadline elapses (a total-restart bumped it).
+    pub async fn await_epoch_past(&self, from: i64, deadline: Duration) -> Result<i64> {
+        let start = Instant::now();
+        loop {
+            let e = self.current_epoch().await?;
+            if e > from {
+                return Ok(e);
+            }
+            if start.elapsed() > deadline {
+                anyhow::bail!("epoch never advanced past {from} within {deadline:?} (still {e})");
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// DROP the source replication slot — the total-restart trigger: its WAL history is gone, so on
+    /// restart the sink classifies the slot `Absent` and bumps the epoch. A slot cannot be dropped while a
+    /// walsender is attached, so terminate any attached one and wait for inactivity first.
+    pub async fn drop_slot(&self) -> Result<()> {
+        sqlx::raw_sql(&format!(
+            "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots \
+             WHERE slot_name = '{SLOT}' AND active_pid IS NOT NULL;"
+        ))
+        .execute(&self.source)
+        .await?;
+        self.await_slot_inactive(Duration::from_secs(30)).await?;
+        sqlx::raw_sql(&format!(
+            "SELECT pg_drop_replication_slot('{SLOT}') \
+             FROM pg_replication_slots WHERE slot_name = '{SLOT}';"
+        ))
+        .execute(&self.source)
+        .await?;
+        Ok(())
+    }
+
+    /// Terminate the sink's walsender backend WITHOUT dropping the slot — a transient disconnect (a
+    /// network blip). The slot survives, so a restart must RESUME from `confirmed_flush` and NOT bump the
+    /// epoch (the false-positive guard, §1.8).
+    pub async fn terminate_walsender(&self) -> Result<()> {
+        sqlx::raw_sql(&format!(
+            "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots \
+             WHERE slot_name = '{SLOT}' AND active_pid IS NOT NULL;"
+        ))
+        .execute(&self.source)
+        .await?;
+        Ok(())
+    }
 }
 
 impl Drop for Harness {
