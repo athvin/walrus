@@ -1,5 +1,7 @@
 # PR 4.9 — Kubernetes manifests: StatefulSets, PVC, probes, PDB
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/76
+
 > **Phase:** 4 — End-to-end, ops & resilience · **Crates touched:** `deploy/k8s` (+ CI) · **Est. size:** L ·
 > **Depends on:** PR 4.8 · **Unlocks:** PR 4.10
 
@@ -117,21 +119,21 @@ spec:
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] Each service is a `StatefulSet` `replicas=1` with Guaranteed QoS (requests == limits); the loader has
+- [x] Each service is a `StatefulSet` `replicas=1` with Guaranteed QoS (requests == limits); the loader has
       a RWO `volumeClaimTemplates` PVC for its `.duckdb` files.
-- [ ] All three probes are wired to the real endpoints with the correct semantics: startup gates bootstrap
+- [x] All three probes are wired to the real endpoints with the correct semantics: startup gates bootstrap
       (and suppresses liveness/readiness during catch-up), readiness holds work, liveness is
       **progress/deadlock only** — **no probe references slot lag**.
-- [ ] The PDB is `maxUnavailable: 1` (or absent) — **never** `minAvailable: 1` (verified: `kubectl drain`
+- [x] The PDB is `maxUnavailable: 1` (or absent) — **never** `minAvailable: 1` (verified: `kubectl drain`
       is not blocked).
-- [ ] `terminationGracePeriodSeconds` is 60–120s and there is **no** `preStop` hook.
-- [ ] The `ConfigMap` exposes every cadence + heartbeat knob; creds come from Secrets/IRSA, never inline
+- [x] `terminationGracePeriodSeconds` is 60–120s and there is **no** `preStop` hook.
+- [x] The `ConfigMap` exposes every cadence + heartbeat knob; creds come from Secrets/IRSA, never inline
       static keys.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test --workspace`
-  - [ ] `kubeconform` validates all manifests (and, if used, a `kind` apply + `/ready` smoke passes).
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test --workspace`
+  - [x] `kubeconform` validates all manifests (and, if used, a `kind` apply + `/ready` smoke passes).
 
 ## Hints & gotchas
 
