@@ -367,3 +367,26 @@ jobs:
       - name: Tear down
         if: always()
         run: docker compose -f deploy/docker/docker-compose.yml down -v || true
+
+  # PR 4.9: Kubernetes manifests. Render the kustomize base (LoadRestrictionsNone — the slot-init
+  # ConfigMap is generated from the real migrations/source/*.sql outside base/) and schema-validate every
+  # resource with kubeconform in strict mode against a pinned API version. Fast, no cluster required.
+  manifests:
+    name: manifests (kustomize + kubeconform)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kustomize + kubeconform (pinned)
+        run: |
+          KUSTOMIZE_VERSION=v5.4.3
+          KUBECONFORM_VERSION=v0.6.7
+          curl -sSfL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin kustomize
+          curl -sSfL "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin kubeconform
+          kustomize version
+          kubeconform -v
+
+      - name: Validate manifests (kustomize render → kubeconform strict)
+        run: bash scripts/k8s-validate.sh

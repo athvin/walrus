@@ -1,0 +1,73 @@
+# One-shot bootstrap of the SOURCE database. Run once before (or alongside) the sink.
+#
+# What it does — the deployment-independent source-side setup the sink cannot self-apply while running
+# with WALRUS_MANAGE_PUBLICATION=false:
+#   1. migrations/source/0001_publication.sql — the walrus.heartbeat + walrus.ddl_audit tables.
+#   2. migrations/source/0002_ddl_triggers.sql — walrus.ddl_audit columns + the ddl_command_end / sql_drop
+#      event triggers (a missing trigger is a terminal preflight failure).
+#   3. Ensures the publication exists — idempotently, as FOR ALL TABLES (the simplest functional default,
+#      matching the dev harness). Edit to a table-list publication
+#      (CREATE PUBLICATION <name> FOR TABLE <your user tables>) if you don't want every table replicated.
+# The SQL in 1–2 is the repo's real migrations, mounted from the `walrus-slot-init-sql` ConfigMap that
+# kustomize generates from those files — single source of truth, so the cluster can't drift from what the
+# sink's preflight asserts.
+#
+# What it does NOT do: create the replication slot, write the epoch, or run control-plane migrations — the
+# sink does all of that itself on startup (CREATE_REPLICATION_SLOT with an exported snapshot, then
+# bump_epoch into walrus.replication_state).
+#
+# The role in WALRUS_SOURCE_DB_URL must own the tables and be able to CREATE EVENT TRIGGER / CREATE
+# PUBLICATION (superuser or suitably granted).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: walrus-slot-init
+  labels:
+    app.kubernetes.io/name: walrus-slot-init
+spec:
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        app: walrus-slot-init
+        app.kubernetes.io/name: walrus-slot-init
+    spec:
+      serviceAccountName: walrus
+      restartPolicy: OnFailure
+      containers:
+        - name: slot-init
+          image: postgres:16-alpine
+          command:
+            - sh
+            - -euc
+            - |
+              echo "applying source migrations (walrus tables + DDL triggers)"
+              psql "$WALRUS_SOURCE_DB_URL" -v ON_ERROR_STOP=1 -f /sql/0001_publication.sql
+              psql "$WALRUS_SOURCE_DB_URL" -v ON_ERROR_STOP=1 -f /sql/0002_ddl_triggers.sql
+              if psql "$WALRUS_SOURCE_DB_URL" -tAc "select 1 from pg_publication where pubname = '$WALRUS_PUBLICATION_NAME'" | grep -q 1; then
+                echo "publication $WALRUS_PUBLICATION_NAME already exists — leaving it as-is"
+              else
+                echo "creating publication $WALRUS_PUBLICATION_NAME FOR ALL TABLES (edit for a table-list publication)"
+                psql "$WALRUS_SOURCE_DB_URL" -v ON_ERROR_STOP=1 -c "CREATE PUBLICATION \"$WALRUS_PUBLICATION_NAME\" FOR ALL TABLES"
+              fi
+              echo "slot-init: source publication + walrus tables + DDL triggers applied"
+          env:
+            - name: WALRUS_SOURCE_DB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: walrus-secrets
+                  key: WALRUS_SOURCE_DB_URL
+            # Same publication name the sink asserts — single source of truth in walrus-sink-config.
+            - name: WALRUS_PUBLICATION_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: walrus-sink-config
+                  key: WALRUS_PUBLICATION_NAME
+          volumeMounts:
+            - name: sql
+              mountPath: /sql
+              readOnly: true
+      volumes:
+        - name: sql
+          configMap:
+            name: walrus-slot-init-sql
