@@ -6,6 +6,7 @@
 //! probes, and [`shutdown`] fans one `CancellationToken` out of SIGTERM/SIGINT. The thin
 //! `walrus-pg-sink` binary (`src/main.rs`) wires them together; the replication loop fills in later.
 
+pub mod backfill;
 pub mod batch;
 pub mod bootstrap;
 pub mod checkpoint;

@@ -249,7 +249,12 @@ Two deliberate structural notes:
 | ✅ | [4.8](./phase-4-end-to-end/pr-4.8-dockerfiles.md) | multi-stage Dockerfiles (PID-1 SIGTERM) | sink §4.5 |
 | ✅ | [4.9](./phase-4-end-to-end/pr-4.9-kubernetes-manifests.md) | Kubernetes manifests (StatefulSets, PVC, probes, PDB) | K8s deployment |
 | ✅ | [4.10](./phase-4-end-to-end/pr-4.10-observability-metrics.md) | Prometheus metrics + dashboard + alerts | Observability |
-| ☐ | [4.11](./phase-4-end-to-end/pr-4.11-deferred-goal-scaffolding.md) | deferred-goal scaffolding (CTID snapshot, sharding hooks) | Deferred goals |
+| ✅ | [4.11](./phase-4-end-to-end/pr-4.11-deferred-goal-scaffolding.md) | deferred-goal scaffolding (CTID snapshot, sharding hooks) | Deferred goals |
+
+> **🏁 Curriculum complete.** All phases (0 → 4) are done: the Postgres → DuckDB CDC pipeline is built,
+> wired end-to-end, containerised, deployed to Kubernetes, observable, and its three deferred goals are
+> documented with marked seams. The [deferred goals](../deferred-goals.md) are the only forward work,
+> left as clearly-labelled extension points — not v1 scope.
 
 ---
 

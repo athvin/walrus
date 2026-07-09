@@ -13,6 +13,7 @@ pub mod epoch;
 pub mod error;
 pub mod health;
 pub mod lease;
+pub mod ownership;
 pub mod phase_a;
 pub mod phase_b;
 pub mod plan;
