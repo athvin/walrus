@@ -64,6 +64,7 @@ epoch, or ownership machinery — only concurrent `COPY` under the snapshot alre
 
 ---
 
-*Curriculum complete — this is the roadmap finish line
-([docs/implementation/README.md](./implementation/README.md)). The seams above are marked, not
+*v1 curriculum complete (phases 0–4) — these goals are the feature-work finish line
+([docs/implementation/README.md](./implementation/README.md); phase 5 there is post-v1 hardening —
+benchmarks, hot-path cleanup, CI speed — not new features). The seams above are marked, not
 implemented; each changes no v1 runtime behaviour.*
