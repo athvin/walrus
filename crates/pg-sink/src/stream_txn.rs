@@ -271,6 +271,7 @@ impl StreamDemux {
                 .await
                 .context("speculative spill PUT")?;
             self.spill_count += 1;
+            common::metrics::inc_spill(); // memory-ceiling speculative spill (PR 4.10)
             tracing::info!(
                 top_xid = top,
                 sub_xid,
@@ -293,6 +294,7 @@ impl StreamDemux {
     /// speculative files; the top-level txn stays open and commits its survivors.
     pub async fn on_stream_abort(&mut self, top_xid: u32, sub_xid: u32, sink: &ParquetSink) {
         if top_xid == sub_xid {
+            common::metrics::inc_aborted_txn(); // whole-txn abort (PR 4.10)
             if self.current_top == Some(top_xid) {
                 self.current_top = None;
             }

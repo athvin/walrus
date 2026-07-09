@@ -9,7 +9,10 @@
 //!   after an outage has high lag *by definition*, and a lag-based liveness probe would kill it
 //!   exactly when it is doing its job. High lag feeds `degraded` on readiness/health, never a kill.
 
-use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
+use axum::{
+    extract::State, http::header, http::StatusCode, response::IntoResponse, routing::get, Json,
+    Router,
+};
 use serde::Serialize;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -129,12 +132,22 @@ async fn healthz(State(state): State<Arc<HealthState>>) -> StatusCode {
     }
 }
 
-/// The probe router, with the shared state injected.
+/// The Prometheus text exposition (PR 4.10). No state — it reads the process-wide recorder, so it
+/// lives happily on the same router as the state-backed probes.
+async fn metrics() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        common::metrics::render(),
+    )
+}
+
+/// The probe + metrics router, with the shared state injected.
 pub fn router(state: Arc<HealthState>) -> Router {
     Router::new()
         .route("/startup", get(startup))
         .route("/ready", get(ready))
         .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics))
         .with_state(state)
 }
 

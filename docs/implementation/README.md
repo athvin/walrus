@@ -248,7 +248,7 @@ Two deliberate structural notes:
 | ✅ | [4.7](./phase-4-end-to-end/pr-4.7-ci-cargo-deny.md) | supply-chain CI: `cargo-deny` + MSRV | CI-grows |
 | ✅ | [4.8](./phase-4-end-to-end/pr-4.8-dockerfiles.md) | multi-stage Dockerfiles (PID-1 SIGTERM) | sink §4.5 |
 | ✅ | [4.9](./phase-4-end-to-end/pr-4.9-kubernetes-manifests.md) | Kubernetes manifests (StatefulSets, PVC, probes, PDB) | K8s deployment |
-| ☐ | [4.10](./phase-4-end-to-end/pr-4.10-observability-metrics.md) | Prometheus metrics + dashboard + alerts | Observability |
+| ✅ | [4.10](./phase-4-end-to-end/pr-4.10-observability-metrics.md) | Prometheus metrics + dashboard + alerts | Observability |
 | ☐ | [4.11](./phase-4-end-to-end/pr-4.11-deferred-goal-scaffolding.md) | deferred-goal scaffolding (CTID snapshot, sharding hooks) | Deferred goals |
 
 ---

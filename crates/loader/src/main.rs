@@ -47,6 +47,8 @@ fn main() -> ExitCode {
 async fn run(cfg: LoaderConfig) -> Result<(), LoaderError> {
     let token = loader::shutdown::install_signal_handlers();
     let state = LoaderState::new();
+    // Install the Prometheus recorder before anything can serve /metrics or emit a series (PR 4.10).
+    common::metrics::init();
 
     // Bind health *before* bootstrap so `/startup` answers 503 while the lease + DuckDB open proceed.
     let listener = tokio::net::TcpListener::bind(cfg.health_addr)
@@ -68,6 +70,11 @@ async fn run(cfg: LoaderConfig) -> Result<(), LoaderError> {
     };
     state.mark_ready();
     let keys: Vec<(String, String)> = owned.iter().map(|t| t.key()).collect();
+    // Zero-init every per-table loader series so /metrics lists the owned tables from the first scrape,
+    // before any apply cycle has moved a needle (PR 4.10).
+    for (schema, table) in &keys {
+        common::metrics::init_table_series(&format!("{schema}.{table}"));
+    }
     let epoch = control::read_current_epoch(&pool)
         .await?
         .map(|s| s.epoch)

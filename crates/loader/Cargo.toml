@@ -32,3 +32,7 @@ tokio-util = { workspace = true }
 axum = { workspace = true }
 object_store = { workspace = true, features = ["aws"] }
 tracing = { workspace = true }
+
+[dev-dependencies]
+# Raw-HTTP scrape test (metrics_scrape.rs) reads the /metrics body via AsyncReadExt/AsyncWriteExt.
+tokio = { workspace = true, features = ["io-util"] }

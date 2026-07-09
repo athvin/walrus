@@ -75,6 +75,12 @@ pub async fn classify_slot(client: &tokio_postgres::Client, slot: &str) -> SlotS
         return SlotStatus::Absent;
     };
     let wal_status: Option<String> = row.get(0);
+    // Expose the categorical slot health as a gauge (PR 4.10) from this existing read — no extra query.
+    common::metrics::set_wal_status(match wal_status.as_deref() {
+        Some("lost") => 2,
+        Some("unreserved") => 1,
+        _ => 0, // reserved / extended
+    });
     if wal_status.as_deref() == Some("lost") {
         return SlotStatus::Invalidated;
     }

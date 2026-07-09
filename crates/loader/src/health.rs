@@ -8,7 +8,9 @@
 //! - `/healthz` — liveness = *progress*, read from an in-memory `last_poll_completed_at` stamped every
 //!   cycle (even a no-op). It reflects **no** lag metric — an idle-but-healthy loader must stay live.
 
-use axum::{extract::State, http::StatusCode, routing::get, Router};
+use axum::{
+    extract::State, http::header, http::StatusCode, response::IntoResponse, routing::get, Router,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -84,11 +86,20 @@ fn ok_or_unavailable(ok: bool) -> StatusCode {
     }
 }
 
+/// The Prometheus text exposition (PR 4.10) — stateless; reads the process-wide recorder.
+async fn metrics() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        common::metrics::render(),
+    )
+}
+
 pub fn router(state: Arc<LoaderState>) -> Router {
     Router::new()
         .route("/startup", get(startup))
         .route("/ready", get(ready))
         .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics))
         .with_state(state)
 }
 
