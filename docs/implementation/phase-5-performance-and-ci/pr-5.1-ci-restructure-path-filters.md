@@ -1,5 +1,7 @@
 # PR 5.1 — CI restructure: drop the redundant build, skip heavy jobs on docs-only changes
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/81
+
 > **Phase:** 5 — Performance & CI · **Crates touched:** none (`.github/workflows/ci.yml` only) ·
 > **Est. size:** S · **Depends on:** PR 4.11 · **Unlocks:** PR 5.2
 
@@ -115,18 +117,18 @@ runs:
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `gates` runs exactly `fmt --check` → `clippy --all-targets --all-features -D warnings` →
+- [x] `gates` runs exactly `fmt --check` → `clippy --all-targets --all-features -D warnings` →
       `test --workspace`; the standalone `cargo build --workspace` step is gone.
-- [ ] A **docs-only** commit (e.g. touching only this file) runs `changes` + the cheap jobs and
+- [x] A **docs-only** commit (e.g. touching only this file) runs `changes` + the cheap jobs and
       skips `gates`/`integration`/`conformance`/`images`/`compose` — and the PR is still mergeable
       (skipped gated jobs report as passing, not pending).
-- [ ] A **code** commit runs everything, exactly as before.
-- [ ] The free-disk-space block exists once, as a composite action, used by all three heavy jobs.
-- [ ] The PR description records before/after wall-times for `gates` on a warm cache (evidence the
+- [x] A **code** commit runs everything, exactly as before.
+- [x] The free-disk-space block exists once, as a composite action, used by all three heavy jobs.
+- [x] The PR description records before/after wall-times for `gates` on a warm cache (evidence the
       dropped step actually saved time).
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check` / `clippy` / `test --workspace` (unchanged — this PR is CI-only)
-  - [ ] the full workflow green on the PR itself
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check` / `clippy` / `test --workspace` (unchanged — this PR is CI-only)
+  - [x] the full workflow green on the PR itself
 
 ## Hints & gotchas
 
