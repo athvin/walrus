@@ -284,3 +284,49 @@ jobs:
 
       - name: Conformance tests (write Parquet -> DuckDB read_parquet -> assert typeof + value)
         run: cargo test -p pg-to-arrow --features conformance
+
+  # PR 4.7: supply-chain gate. `cargo deny check` runs all four families (advisories / licenses /
+  # bans / sources) against Cargo.lock — no crate compilation, so this job is fast and needs no
+  # DuckDB build. cargo-deny is pinned to an exact version (matching the one deny.toml was authored
+  # against) so a new release can't silently change the gate; new RUSTSEC advisories still surface,
+  # which is the point of the advisories check.
+  supply-chain:
+    name: supply-chain (cargo-deny · advisories · licenses · bans · sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-deny (pinned)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.19.9
+
+      - name: cargo deny check
+        run: cargo deny check
+
+  # PR 4.7: MSRV drift guard. walrus pins one exact stable in rust-toolchain.toml and every job above
+  # builds + tests on it, so CI already builds on the MSRV — this job's role is to fail fast if the
+  # declared MSRV (Cargo.toml [workspace.package].rust-version) and the pinned toolchain channel ever
+  # diverge, turning a toolchain drift into an explicit CI failure instead of a mystery build break.
+  # Cheap: string comparison only, no toolchain install or compile.
+  msrv:
+    name: MSRV (declared rust-version == pinned toolchain)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Declared MSRV matches the pinned toolchain
+        run: |
+          set -euo pipefail
+          declared=$(sed -nE 's/^[[:space:]]*rust-version[[:space:]]*=[[:space:]]*"([0-9]+\.[0-9]+)".*/\1/p' Cargo.toml | head -1)
+          pinned=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([0-9]+\.[0-9]+).*/\1/p' rust-toolchain.toml | head -1)
+          echo "declared MSRV  (Cargo.toml)          = ${declared:-<none>}"
+          echo "pinned channel (rust-toolchain.toml) = ${pinned:-<none>}"
+          if [ -z "$declared" ] || [ -z "$pinned" ]; then
+            echo "::error::could not parse the MSRV / toolchain version"; exit 1
+          fi
+          if [ "$declared" != "$pinned" ]; then
+            echo "::error::MSRV drift — Cargo.toml rust-version ($declared) != rust-toolchain.toml channel ($pinned); keep them in sync."
+            exit 1
+          fi
+          echo "ok: the gates/integration/conformance jobs build on this exact toolchain, i.e. on the MSRV ($declared)."

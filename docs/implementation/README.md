@@ -245,7 +245,7 @@ Two deliberate structural notes:
 | ✅ | [4.4](./phase-4-end-to-end/pr-4.4-e2e-crash-safety.md) | e2e crash safety (effectively-once) | Verification "Crash safety" |
 | ✅ | [4.5](./phase-4-end-to-end/pr-4.5-e2e-wal-runaway-heartbeat.md) | e2e WAL-runaway + heartbeat + keepalive-vs-durability | Verification (chaos) |
 | ✅ | [4.6](./phase-4-end-to-end/pr-4.6-total-restart-epoch.md) | total-restart / epoch bump on slot loss | §1.8 |
-| ☐ | [4.7](./phase-4-end-to-end/pr-4.7-ci-cargo-deny.md) | supply-chain CI: `cargo-deny` + MSRV | CI-grows |
+| ✅ | [4.7](./phase-4-end-to-end/pr-4.7-ci-cargo-deny.md) | supply-chain CI: `cargo-deny` + MSRV | CI-grows |
 | ☐ | [4.8](./phase-4-end-to-end/pr-4.8-dockerfiles.md) | multi-stage Dockerfiles (PID-1 SIGTERM) | sink §4.5 |
 | ☐ | [4.9](./phase-4-end-to-end/pr-4.9-kubernetes-manifests.md) | Kubernetes manifests (StatefulSets, PVC, probes, PDB) | K8s deployment |
 | ☐ | [4.10](./phase-4-end-to-end/pr-4.10-observability-metrics.md) | Prometheus metrics + dashboard + alerts | Observability |
@@ -264,7 +264,7 @@ that needs them lands:
 | 0.6 | compose job: `docker compose up --wait` → smoke → `down` |
 | 1.3 | integration job vs compose (control PG); `sqlx` offline (`cargo sqlx prepare --check`) |
 | 2.11 | DuckDB-bundled **conformance** job (feature-gated; registry/sccache cache) |
-| 4.7 | `cargo-deny` (licenses / advisories / bans / sources) |
+| 4.7 | `cargo-deny` (licenses / advisories / bans / sources); MSRV **1.95** guard (declared `rust-version` == pinned toolchain) |
 | 4.8–4.9 | image build; `kubeconform` / kind manifest validation |
 | 4.1+ | full `tests/e2e` job (feature `it`) |
 
