@@ -85,7 +85,6 @@ jobs:
       - uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Cache cargo registry + target
-        if: false   # TEMP(proof): disable Swatinem so target is empty; sccache must serve DuckDB. Reverted next commit.
         uses: Swatinem/rust-cache@v2
 
       # Cheapest gate first: fail fast on formatting before spending time on clippy/test. There is no
@@ -173,7 +172,6 @@ jobs:
       - uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Cache cargo registry + target
-        if: false   # TEMP(proof): disable Swatinem so target is empty; sccache must serve DuckDB. Reverted next commit.
         uses: Swatinem/rust-cache@v2
 
       - name: Install sqlx-cli
@@ -352,7 +350,6 @@ jobs:
       # sccache caches the individual DuckDB C++ objects; Swatinem still caches the registry + the
       # finished target dir so a fully-warm run rebuilds nothing (the two layers are complements).
       - name: Cache cargo registry + target
-        if: false   # TEMP(proof): disable Swatinem so target is empty; sccache must serve DuckDB. Reverted next commit.
         uses: Swatinem/rust-cache@v2
 
       - name: Conformance tests (write Parquet -> DuckDB read_parquet -> assert typeof + value)
