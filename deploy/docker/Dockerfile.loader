@@ -20,7 +20,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
 ENV SQLX_OFFLINE=true
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p loader --bin walrus-loader
+# BuildKit cache mounts (PR 5.3): the cargo registry + the target dir persist across builds (via
+# buildkit-cache-dance in CI), so a source-only change recompiles just the workspace crates — the
+# dependencies and the bundled-DuckDB C++ stay warm. A cache mount's contents never enter the image
+# layer, so the release binary is copied OUT of the mount into /out for the runtime stage to COPY.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p loader --bin walrus-loader \
+ && mkdir -p /out && cp target/release/walrus-loader /out/walrus-loader
 
 # --- runtime ---------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
@@ -28,7 +35,7 @@ FROM debian:bookworm-slim AS runtime
 # download), and libstdc++6 (the bundled DuckDB's C++ runtime — the classic "missing shared lib").
 RUN apt-get update && apt-get install -y --no-install-recommends tini ca-certificates libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /src/target/release/walrus-loader /usr/local/bin/walrus-loader
+COPY --from=builder /out/walrus-loader /usr/local/bin/walrus-loader
 # The default `.duckdb` working dir (an RWO PVC mount in production — PR 4.9); created so a bare
 # `docker run` with WALRUS_DUCKDB_DIR=/var/lib/walrus has somewhere to write.
 RUN mkdir -p /var/lib/walrus
