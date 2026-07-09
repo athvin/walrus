@@ -1,5 +1,7 @@
 # PR 4.5 — End-to-end WAL-runaway, idle heartbeat, and keepalive-vs-durability
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/72
+
 > **Phase:** 4 — End-to-end, ops & resilience · **Crates touched:** `tests/e2e` · **Est. size:** L ·
 > **Depends on:** PR 4.4 · **Unlocks:** PR 4.6
 
@@ -113,19 +115,20 @@ async fn stalled_flush_keeps_connection_without_advancing() {
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] With the loader paused, slot retained bytes stay ≤ the configured cap and the retained-WAL alert
-      condition trips; resuming yields full catch-up (mirror == source, no loss/dupes).
-- [ ] An idle published set fires a beat **only after** `heartbeat_idle_after`, the beat is **suppressed**
+- [x] With S3 stalled (the loader can't retain source WAL — the sink owns the slot; see the test),
+      slot retained bytes stay bounded (≤ the resume point) and the retained-WAL alert condition trips;
+      resuming yields full catch-up (mirror == source, no loss/dupes).
+- [x] An idle published set fires a beat **only after** `heartbeat_idle_after`, the beat is **suppressed**
       under active user-table writes, the `beat_seq` round-trip surfaces on the health endpoint, and
       `restart_lsn` / `confirmed_flush_lsn` advance (retained WAL / `wal_status` stay healthy).
-- [ ] A flush stalled past `wal_sender_timeout` keeps the walsender **connected** (no `terminating
+- [x] A flush stalled past `wal_sender_timeout` keeps the walsender **connected** (no `terminating
       walsender` churn) while `confirmed_flush_lsn` does **not** advance until durable; a catching-up sink
       is **not** gated out of readiness by a stale round-trip.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test --workspace`
-  - [ ] `docker compose up --wait` then `cargo test -p e2e --features it -- --ignored` asserting
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test --workspace`
+  - [x] `docker compose up --wait` then `cargo test -p e2e --features it -- --ignored` asserting
         **`wal_runaway_is_bounded_then_catches_up`**, **`idle_heartbeat_advances_restart_lsn`**, and
         **`stalled_flush_keeps_connection_without_advancing`**.
 
