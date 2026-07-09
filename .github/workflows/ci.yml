@@ -55,6 +55,17 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    # sccache caches at compiler-invocation granularity (rustc crate outputs + the DuckDB C++ .o
+    # files) in the GHA backend, so identical compilations hit across jobs, profiles, and Cargo.lock
+    # changes — unlike Swatinem's target-dir cache, which any dep bump invalidates. CC/CXX route the
+    # cc-crate's DuckDB C++ build through sccache (the expensive payload); CARGO_INCREMENTAL=0
+    # because sccache refuses to cache incremental rustc. (PR 5.2)
+    env:
+      RUSTC_WRAPPER: sccache
+      CC: sccache cc
+      CXX: sccache c++
+      SCCACHE_GHA_ENABLED: "true"
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
 
@@ -70,6 +81,9 @@ jobs:
           rustc --version
           cargo --version
 
+      # Starts the sccache server and points it at the GHA cache backend (SCCACHE_GHA_ENABLED). Pinned.
+      - uses: mozilla-actions/sccache-action@v0.0.10
+
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
 
@@ -84,6 +98,10 @@ jobs:
 
       - name: cargo test --workspace
         run: cargo test --workspace
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
 
   compose:
     name: compose (source-pg · control-pg · minio)
@@ -134,6 +152,12 @@ jobs:
       # integration test; DATABASE_URL is what `sqlx prepare` connects to.
       WALRUS_CONTROL_DB_URL: postgres://postgres:postgres@localhost:5433/walrus_control
       DATABASE_URL: postgres://postgres:postgres@localhost:5433/walrus_control
+      # sccache: cache rustc + the DuckDB C++ objects across jobs/profiles/Cargo.lock (PR 5.2).
+      RUSTC_WRAPPER: sccache
+      CC: sccache cc
+      CXX: sccache c++
+      SCCACHE_GHA_ENABLED: "true"
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
 
@@ -144,6 +168,8 @@ jobs:
         run: |
           rustup toolchain install
           rustc --version
+
+      - uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
@@ -291,6 +317,10 @@ jobs:
       - name: Loader graceful shutdown (compose)
         run: cargo test -p loader --test shutdown -- --ignored --test-threads=1
 
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
+
       - name: Tear down (remove volumes)
         if: always()
         run: docker compose -f deploy/docker/docker-compose.yml down -v
@@ -300,6 +330,13 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    env:
+      # sccache: cache rustc + the DuckDB C++ objects across jobs/profiles/Cargo.lock (PR 5.2).
+      RUSTC_WRAPPER: sccache
+      CC: sccache cc
+      CXX: sccache c++
+      SCCACHE_GHA_ENABLED: "true"
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
 
@@ -308,12 +345,19 @@ jobs:
           rustup toolchain install
           rustc --version
 
-      # Caches the bundled-DuckDB compile (a minutes-long C++ build) so only the first run pays it.
+      - uses: mozilla-actions/sccache-action@v0.0.10
+
+      # sccache caches the individual DuckDB C++ objects; Swatinem still caches the registry + the
+      # finished target dir so a fully-warm run rebuilds nothing (the two layers are complements).
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
 
       - name: Conformance tests (write Parquet -> DuckDB read_parquet -> assert typeof + value)
         run: cargo test -p pg-to-arrow --features conformance
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
 
   # PR 4.7: supply-chain gate. `cargo deny check` runs all four families (advisories / licenses /
   # bans / sources) against Cargo.lock — no crate compilation, so this job is fast and needs no

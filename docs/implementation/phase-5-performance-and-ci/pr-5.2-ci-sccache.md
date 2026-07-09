@@ -1,5 +1,7 @@
 # PR 5.2 — sccache: stop recompiling DuckDB's C++ on every cache miss
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/83
+
 > **Phase:** 5 — Performance & CI · **Crates touched:** none (`.github/workflows/ci.yml` only) ·
 > **Est. size:** S–M · **Depends on:** PR 5.1 · **Unlocks:** PR 5.3
 
@@ -87,17 +89,18 @@ docs/implementation/README.md        # modify — CI-grows table row for 5.2
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] All three compiling jobs run under sccache with the env above, and print
+- [x] All three compiling jobs run under sccache with the env above, and print
       `sccache --show-stats` at the end of every run.
-- [ ] **The proof run:** with a warm sccache but a perturbed `Cargo.lock` (Swatinem's worst case),
-      each compiling job's compile phase drops from ~15–20 min to low single-digit minutes, and the
-      stats show a high C/C++ hit rate (the DuckDB objects). Before/after numbers in the PR
-      description.
-- [ ] A fully-warm run is not slower than before (sccache overhead on 100% Swatinem hits is noise).
-- [ ] The sccache action tag is pinned (not `@main`).
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check` / `clippy` / `test --workspace` (unchanged — CI-only PR)
-  - [ ] the full workflow green on the PR itself
+- [x] **The proof run:** with a warm sccache but a cold target, the DuckDB C++ compile is served by
+      sccache — conformance dropped **675s → 232s** with an **80% C/C++ hit rate** (258/321 objects).
+      Note: a *perturbed `Cargo.lock`* turned out **not** to be Swatinem's worst case (its restore-key
+      fallback keeps the target warm → 0 C/C++ requests), so the proof used a genuinely cold target
+      (Swatinem disabled) instead. Before/after numbers + the full nuance are in the PR description.
+- [x] A fully-warm run is not slower than before (sccache overhead on 100% Swatinem hits is noise).
+- [x] The sccache action tag is pinned (not `@main`). — `@v0.0.10`
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check` / `clippy` / `test --workspace` (unchanged — CI-only PR)
+  - [x] the full workflow green on the PR itself
 
 ## Hints & gotchas
 
