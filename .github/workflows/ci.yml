@@ -330,3 +330,40 @@ jobs:
             exit 1
           fi
           echo "ok: the gates/integration/conformance jobs build on this exact toolchain, i.e. on the MSRV ($declared)."
+
+  # PR 4.8: container images. Build both multi-stage Dockerfiles, then run the PID-1 SIGTERM smoke
+  # (scripts/image-smoke.sh): boot compose, drive the sink to `streaming` and the loader to its apply
+  # loops, SIGTERM each, and assert a graceful exit 0 (not 137/SIGKILL). The loader image cold-builds
+  # the bundled DuckDB C++, so this job is slow like the other DuckDB jobs.
+  images:
+    name: images (build + PID-1 SIGTERM smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Both images (esp. the loader's bundled-DuckDB build) are large; reclaim runner disk headroom.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift || true
+          df -h /
+
+      - name: Build walrus-pg-sink image
+        run: docker build -f deploy/docker/Dockerfile.pg-sink -t walrus-pg-sink:ci .
+
+      - name: Build walrus-loader image (bundled DuckDB — slow cold build)
+        run: docker build -f deploy/docker/Dockerfile.loader -t walrus-loader:ci .
+
+      - name: PID-1 SIGTERM smoke (both images handle SIGTERM → exit 0, not SIGKILL)
+        run: bash scripts/image-smoke.sh
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          docker ps -a
+          docker logs walrus-sink-smoke 2>&1 | tail -60 || true
+          docker logs walrus-loader-smoke 2>&1 | tail -60 || true
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f deploy/docker/docker-compose.yml down -v || true

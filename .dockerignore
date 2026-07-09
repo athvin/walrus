@@ -1,0 +1,14 @@
+# .dockerignore — trim the build context for deploy/docker/Dockerfile.* (PR 4.8).
+#
+# The release build needs Cargo.toml, Cargo.lock, crates/, tests/ (workspace members),
+# migrations/ (sqlx::migrate! embeds migrations/control at compile time) and .sqlx/ (the offline
+# query cache). Everything below is excluded so the context stays small and layer-cacheable — most
+# importantly target/, which is many gigabytes of build artifacts.
+target/
+**/target/
+.git/
+.gitignore
+.github/
+.claude/
+docs/
+*.md
