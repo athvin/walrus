@@ -223,6 +223,64 @@ impl TableDb {
             .map_err(|e| LoaderError::Duck(format!("set schema_version: {e}")))?;
         Ok(())
     }
+
+    /// The **epoch (generation)** this `.duckdb` was last built for (`_walrus_meta['epoch']`), or `None`
+    /// if never stamped (a brand-new file — no `_walrus_meta` yet — or a pre-4.6 file). A value below the
+    /// control-plane epoch means the mirror + raw hold a **retired generation** (total-restart, §1.8) and
+    /// must be wiped before the new-epoch snapshot reloads.
+    pub fn built_epoch(&self) -> Result<Option<i64>, LoaderError> {
+        // A brand-new file has no `_walrus_meta` yet — probe first so this never errors on it.
+        let has_meta: i64 = self
+            .conn
+            .query_row(
+                "SELECT count(*) FROM information_schema.tables WHERE table_name = '_walrus_meta'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| LoaderError::Duck(format!("probe _walrus_meta: {e}")))?;
+        if has_meta == 0 {
+            return Ok(None);
+        }
+        // `max(v)` yields one row with NULL (→ `None`) when the 'epoch' key is absent (pre-4.6 file).
+        let v: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT max(v) FROM \"_walrus_meta\" WHERE k = 'epoch'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| LoaderError::Duck(format!("read built epoch: {e}")))?;
+        Ok(v)
+    }
+
+    /// Stamp the generation this `.duckdb` is now built for (`_walrus_meta['epoch']`). Upserts, so it both
+    /// records a fresh file's epoch and re-stamps a rebuilt file's new epoch.
+    pub fn set_built_epoch(&self, epoch: i64) -> Result<(), LoaderError> {
+        self.conn
+            .execute(
+                "INSERT INTO \"_walrus_meta\" (k, v) VALUES ('epoch', ?) \
+                 ON CONFLICT (k) DO UPDATE SET v = excluded.v",
+                duckdb::params![epoch],
+            )
+            .map_err(|e| LoaderError::Duck(format!("set built epoch: {e}")))?;
+        Ok(())
+    }
+
+    /// Wipe a retired generation from this `.duckdb` (total-restart, §1.8): drop the user view, the mirror,
+    /// the CDC log, and `_walrus_meta`. The caller then re-runs `ensure_tables*` to recreate them empty, so
+    /// the fresh new-epoch snapshot re-appends into `<table>_raw` and the transform re-derives `<table>`
+    /// from scratch (both watermarks reset — the new epoch's `loader_checkpoint` is a fresh `0/0`).
+    pub fn wipe_generation(&self, table: &str) -> Result<(), LoaderError> {
+        self.conn
+            .execute_batch(&format!(
+                "DROP VIEW IF EXISTS \"{table}_current\"; \
+                 DROP TABLE IF EXISTS \"{table}\"; \
+                 DROP TABLE IF EXISTS \"{table}_raw\"; \
+                 DROP TABLE IF EXISTS \"_walrus_meta\";"
+            ))
+            .map_err(|e| LoaderError::Duck(format!("wipe generation for {table}: {e}")))?;
+        Ok(())
+    }
 }
 
 /// The user-facing `<table>_current` view: the mirror minus the hidden `_applied_*` guard columns

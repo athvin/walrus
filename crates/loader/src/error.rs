@@ -25,6 +25,11 @@ pub enum LoaderError {
     /// quarantined and processing STOPS — an accepted, alerting v1 outcome (never silent data loss).
     #[error("table {table} quarantined: {reason}")]
     Quarantine { table: String, reason: String },
+    /// The control plane opened a NEW generation (§1.8 total-restart) while this loader was running the
+    /// old one. Exit **loudly** so the orchestrator restarts us into a rebuild under the new epoch —
+    /// never rebuild a running generation in place.
+    #[error("epoch bumped {from} → {to}: control-plane opened a new generation (total-restart) — restarting to rebuild")]
+    EpochBumped { from: i64, to: i64 },
     #[error("{0}")]
     Internal(String),
 }
@@ -45,6 +50,9 @@ impl LoaderError {
             }
             LoaderError::Quarantine { table, reason } => {
                 common::Error::Quarantine(format!("{table}: {reason}"))
+            }
+            LoaderError::EpochBumped { from, to } => {
+                common::Error::Internal(format!("epoch bumped {from} → {to} (total-restart)"))
             }
             LoaderError::Internal(m) => common::Error::Internal(m.clone()),
         }

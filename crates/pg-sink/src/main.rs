@@ -9,7 +9,7 @@
 use anyhow::Context;
 use pg_sink::config::SinkConfig;
 use pg_sink::replication::ReplicationStream;
-use pg_sink::{bootstrap, consume, health, shutdown, slot};
+use pg_sink::{bootstrap, consume, health, shutdown};
 use std::process::ExitCode;
 use tokio::time::Instant;
 
@@ -184,40 +184,55 @@ async fn establish_stream(
         )
     };
 
-    if let Some(info) = slot::read_slot(&ctx.source_client, &cfg.slot_name)
-        .await
-        .context("read replication slot")?
-    {
-        // Resume: stream from confirmed_flush_lsn; hydrate the relation cache from schema_registry.
-        let epoch =
-            current_or_new_epoch(&ctx.control_pool, &cfg.slot_name, info.confirmed_flush_lsn)
-                .await?;
-        let rows = control::read_all_latest_registry(&ctx.control_pool, epoch)
+    // Classify the slot on the (already-connected) source before deciding: resume a healthy slot, or —
+    // only when the catalog authoritatively says the slot is gone — open a fresh one. A connection
+    // hiccup (`Unreachable`) is NOT slot loss: exit so the orchestrator's backoff-restart reconnects,
+    // never a total-restart (§1.8, the false-positive guard).
+    let status = pg_sink::epoch::classify_slot(&ctx.source_client, &cfg.slot_name).await;
+    match pg_sink::epoch::decide(&status) {
+        pg_sink::epoch::SlotAction::Retry => {
+            anyhow::bail!(
+                "could not classify replication slot {} (source connection lost mid-bootstrap) — \
+                 exiting to retry via backoff; this is NOT slot loss and does NOT bump the epoch",
+                cfg.slot_name
+            );
+        }
+        pg_sink::epoch::SlotAction::Resume { confirmed_flush } => {
+            // Resume: stream from confirmed_flush_lsn; hydrate the relation cache from schema_registry.
+            let epoch =
+                current_or_new_epoch(&ctx.control_pool, &cfg.slot_name, confirmed_flush).await?;
+            let rows = control::read_all_latest_registry(&ctx.control_pool, epoch)
+                .await
+                .context("read schema_registry for hydration")?;
+            cache.hydrate(rows).context("hydrate relation cache")?;
+            tracing::info!(
+                epoch,
+                cached_relations = cache.len(),
+                "relation cache hydrated (resume)"
+            );
+            let stream = ReplicationStream::start(
+                &cfg.source_db_url,
+                &cfg.slot_name,
+                confirmed_flush,
+                &cfg.publication_name,
+            )
             .await
-            .context("read schema_registry for hydration")?;
-        cache.hydrate(rows).context("hydrate relation cache")?;
-        tracing::info!(
-            epoch,
-            cached_relations = cache.len(),
-            "relation cache hydrated (resume)"
-        );
-        let stream = ReplicationStream::start(
-            &cfg.source_db_url,
-            &cfg.slot_name,
-            info.confirmed_flush_lsn,
-            &cfg.publication_name,
-        )
-        .await
-        .context("START_REPLICATION (resume)")?;
-        return Ok(Bootstrapped {
-            stream,
-            epoch,
-            start_lsn: info.confirmed_flush_lsn,
-            sink: make_sink(epoch),
-        });
+            .context("START_REPLICATION (resume)")?;
+            return Ok(Bootstrapped {
+                stream,
+                epoch,
+                start_lsn: confirmed_flush,
+                sink: make_sink(epoch),
+            });
+        }
+        pg_sink::epoch::SlotAction::FreshSlot => { /* fall through to fresh-slot + backfill below */
+        }
     }
 
-    // First bootstrap: create the slot with an exported snapshot and backfill before streaming.
+    // Fresh slot: create it with an exported snapshot and backfill before streaming. This is the FIRST
+    // bootstrap when no prior epoch exists, or a TOTAL-RESTART (§1.8) when the slot was lost/absent while
+    // a generation was running — `bump_epoch` yields `1` on an empty table and `MAX+1` otherwise, so a
+    // single path serves both; we distinguish them only to alert loudly on the disaster case.
     let mut snap = pg_sink::snapshot::SnapshotConn::connect(&cfg.source_db_url)
         .await
         .context("open snapshot replication connection")?;
@@ -225,8 +240,28 @@ async fn establish_stream(
         .create_slot_with_snapshot(&cfg.slot_name)
         .await
         .context("CREATE_REPLICATION_SLOT with exported snapshot")?;
-    let epoch =
-        current_or_new_epoch(&ctx.control_pool, &cfg.slot_name, snapshot.consistent_point).await?;
+    let prior = control::read_current_epoch(&ctx.control_pool)
+        .await
+        .context("read prior epoch")?;
+    let epoch = control::bump_epoch(
+        &ctx.control_pool,
+        &cfg.slot_name,
+        snapshot.consistent_point,
+        "streaming",
+    )
+    .await
+    .context("open new epoch")?;
+    match &prior {
+        Some(p) => tracing::error!(
+            old_epoch = p.epoch,
+            new_epoch = epoch,
+            slot = %cfg.slot_name,
+            slot_status = ?status,
+            "TOTAL-RESTART: the replication slot was lost/absent — bumping the epoch and re-snapshotting \
+             ALL tables under the new generation; old-epoch S3 is left to its lifecycle TTL"
+        ),
+        None => tracing::info!(epoch, "first bootstrap: created slot + established epoch"),
+    }
     let sink = make_sink(epoch);
 
     // Backfill every published user table under the exported snapshot, registering each shape so the

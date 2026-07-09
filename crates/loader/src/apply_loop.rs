@@ -24,6 +24,17 @@ pub async fn apply_loop(ctx: TableCtx, shutdown: CancellationToken) -> Result<()
             _ = shutdown.cancelled() => return drain(&ctx),
             _ = tick.tick() => {}
         }
+        // Total-restart guard (§1.8): if the control plane opened a newer generation, this loader is
+        // running a RETIRED epoch. Exit loudly (→ `main` cancels the token and the process restarts) so
+        // bootstrap wipes + rebuilds every `.duckdb` under the new epoch — never rebuild in place mid-run.
+        if let Some(state) = control::read_current_epoch(&ctx.pool).await? {
+            if state.epoch > ctx.epoch {
+                return Err(LoaderError::EpochBumped {
+                    from: ctx.epoch,
+                    to: state.epoch,
+                });
+            }
+        }
         // Drain step 2+3: `run_phase_a`/`run_phase_b` are never interrupted mid-flight, so the in-flight
         // cycle FINISHES atomically (append + the control-DB `raw_appended_lsn`+DELETE txn, then the
         // transform + `transformed_lsn`) even if SIGTERM arrives now — no new crash window. A crash
