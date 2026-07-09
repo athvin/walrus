@@ -1,0 +1,36 @@
+# syntax=docker/dockerfile:1
+#
+# Multi-stage image for the `walrus-loader` binary (PR 4.8). Near-identical to Dockerfile.pg-sink —
+# the only real differences are the build target and two DuckDB-driven needs:
+#   * builder installs a full C++ toolchain (build-essential) because `duckdb`'s `bundled` feature
+#     compiles DuckDB's vendored C++ from source;
+#   * runtime installs libstdc++6, which that bundled DuckDB dynamically links.
+#
+# builder  — compile the release binary against the pinned MSRV toolchain (1.95.0). sqlx OFFLINE.
+# runtime  — slim Debian running the binary under `tini` as PID 1 so SIGTERM reaches the process and
+#            the graceful lease-release / drain runs (loader §8; walrus-pg-sink §4.5 PID-1 rationale).
+
+# --- builder ---------------------------------------------------------------
+FROM rust:1.95.0-slim-bookworm AS builder
+# build-essential (gcc/g++/make) for DuckDB's bundled C++ compile + the vendored C deps; pkg-config
+# for their build scripts.
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+# sqlx's query! macros read the committed `.sqlx/` cache instead of connecting to a DB at build time.
+ENV SQLX_OFFLINE=true
+WORKDIR /src
+COPY . .
+RUN cargo build --release -p loader --bin walrus-loader
+
+# --- runtime ---------------------------------------------------------------
+FROM debian:bookworm-slim AS runtime
+# tini (PID-1 init that forwards SIGTERM), ca-certificates (S3/TLS + DuckDB httpfs extension
+# download), and libstdc++6 (the bundled DuckDB's C++ runtime — the classic "missing shared lib").
+RUN apt-get update && apt-get install -y --no-install-recommends tini ca-certificates libstdc++6 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /src/target/release/walrus-loader /usr/local/bin/walrus-loader
+# The default `.duckdb` working dir (an RWO PVC mount in production — PR 4.9); created so a bare
+# `docker run` with WALRUS_DUCKDB_DIR=/var/lib/walrus has somewhere to write.
+RUN mkdir -p /var/lib/walrus
+# EXEC FORM under tini → walrus-loader is tini's direct child and receives SIGTERM directly.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/walrus-loader"]

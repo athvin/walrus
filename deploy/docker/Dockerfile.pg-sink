@@ -1,0 +1,33 @@
+# syntax=docker/dockerfile:1
+#
+# Multi-stage image for the `walrus-pg-sink` binary (PR 4.8).
+#
+# builder  — compile the release binary against the pinned MSRV toolchain (1.95.0, matching
+#            rust-toolchain.toml so rustup never re-downloads). sqlx runs OFFLINE against the
+#            committed `.sqlx/` cache, so no database is needed at build time.
+# runtime  — a slim Debian whose ONLY job is to run the binary under `tini` as PID 1. The exec-form
+#            entrypoint is load-bearing: a shell entrypoint would swallow SIGTERM and Kubernetes would
+#            SIGKILL the pod mid-drain (walrus-pg-sink §4.5). Under tini the binary is a direct child
+#            and receives SIGTERM itself, so its graceful-drain handler actually runs.
+
+# --- builder ---------------------------------------------------------------
+FROM rust:1.95.0-slim-bookworm AS builder
+# A C/C++ toolchain for the vendored C deps (ring, zstd-sys, …); pkg-config for their build scripts.
+RUN apt-get update && apt-get install -y --no-install-recommends g++ pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+# sqlx's query! macros read the committed `.sqlx/` cache instead of connecting to a DB at build time.
+ENV SQLX_OFFLINE=true
+WORKDIR /src
+COPY . .
+RUN cargo build --release -p pg-sink --bin walrus-pg-sink
+
+# --- runtime ---------------------------------------------------------------
+FROM debian:bookworm-slim AS runtime
+# tini: a real init that forwards SIGTERM to its child and reaps zombies. ca-certificates: the CA
+# bundle the S3/TLS client needs. No build toolchain lands here — the image stays slim.
+RUN apt-get update && apt-get install -y --no-install-recommends tini ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /src/target/release/walrus-pg-sink /usr/local/bin/walrus-pg-sink
+# EXEC FORM under tini → walrus-pg-sink is tini's direct child (effectively PID 1) and receives
+# SIGTERM directly, never a shell in between. This is the whole reason this Dockerfile exists.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/walrus-pg-sink"]
