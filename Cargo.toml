@@ -47,3 +47,7 @@ object_store = "0.11"
 tokio-postgres = "0.7"
 # Hand-rolled replication wire protocol (PR 2.20): big-endian LSNs / clocks in CopyBoth frames.
 byteorder = "1"
+# Observability (PR 4.10): a metrics facade + a Prometheus recorder. default-features off — we render
+# the text exposition through the existing axum health server, not the crate's own hyper listener.
+metrics = "0.23"
+metrics-exporter-prometheus = { version = "0.15", default-features = false }

@@ -1,0 +1,66 @@
+# Prometheus alerting rules for walrus (PR 4.10).
+#
+# These page on the four things the design says actually warrant a human: slot growth, slot
+# `wal_status`, heartbeat staleness, and a loader backlog that will not drain. They deliberately do
+# **NOT** alert on replication / raw-append / transform lag being *high* — a pod catching up after an
+# outage has high lag by design, the same reason liveness is never tied to lag. We alert on backlog
+# that keeps *growing*, not on absolute lag.
+#
+# Thresholds are conservative starting points; tune per deployment. `severity: page` is the routing
+# hook for your Alertmanager.
+groups:
+  - name: walrus-slot
+    rules:
+      # Slot growth: the slot is pinning too much WAL on the source. Page well before
+      # max_slot_wal_keep_size so an operator can act before the slot is force-invalidated (§1.9).
+      - alert: WalrusSlotRetainedWalHigh
+        expr: walrus_sink_slot_retained_wal_bytes > 1073741824 # 1 GiB
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "walrus replication slot is retaining a lot of WAL"
+          description: "Slot has retained {{ $value | humanize1024 }}B of WAL for 10m — the consumer is behind or stalled; act before max_slot_wal_keep_size invalidates the slot."
+
+      # wal_status categorical: 0 reserved · 1 unreserved · 2 lost. Anything ≥ 1 means the slot is at
+      # (or past) the retention cap — imminent or actual data-loss risk on the slot.
+      - alert: WalrusSlotWalStatusDegraded
+        expr: walrus_sink_wal_status >= 1
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: "walrus slot wal_status is unreserved or lost"
+          description: "wal_status gauge = {{ $value }} (1 unreserved, 2 lost). A lost slot forces a total restart (epoch bump); an unreserved slot is one step away."
+
+  - name: walrus-heartbeat
+    rules:
+      # Heartbeat staleness: the idle-heartbeat round-trip has not returned through the stream within
+      # the deadline — the stream may be stalled or the slot silently not advancing (§1.9). This is the
+      # readiness `degraded` signal surfaced as a page, never a livenessProbe kill.
+      - alert: WalrusHeartbeatStale
+        expr: walrus_sink_heartbeat_roundtrip_age_seconds > 60
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "walrus heartbeat round-trip is stale"
+          description: "Last heartbeat round-trip is {{ $value | humanizeDuration }} old (> wal_sender_timeout). The slot may not be advancing."
+
+  - name: walrus-loader
+    rules:
+      # Loader backlog that does NOT drain: files have been 'ready' and unprocessed, and the queue is
+      # not shrinking, for 15m. This is "growth that doesn't drain", NOT absolute lag — a legitimately
+      # catching-up loader (files draining, deriv < 0) must not page.
+      - alert: WalrusLoaderBacklogNotDraining
+        expr: (walrus_loader_files_ready > 0) and (deriv(walrus_loader_files_ready[15m]) >= 0)
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: "walrus loader backlog is not draining"
+          description: "Table {{ $labels.table }} has had ready files unprocessed and non-decreasing for 15m — the apply loop is stuck, not merely behind."
+
+# Intentionally absent: no alert references walrus_loader_transform_lag_bytes,
+# walrus_loader_raw_append_lag_bytes, or walrus_sink_replication_lag_bytes as an absolute threshold —
+# those are dashboard signals only. High lag after an outage is healthy catch-up.

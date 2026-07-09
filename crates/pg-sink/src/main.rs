@@ -57,6 +57,8 @@ fn main() -> ExitCode {
 async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
     let token = shutdown::install_signal_handlers();
     let state = health::HealthState::new();
+    // Install the Prometheus recorder before anything can serve /metrics or emit a series (PR 4.10).
+    common::metrics::init();
 
     // Bind health *after* config validated (no half-open port on a config crash) but *before* the
     // dependency checks, so `/startup` answers 503 while control PG / S3 come up, then flips to 200.

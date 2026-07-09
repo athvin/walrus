@@ -24,6 +24,10 @@ humantime-serde = { workspace = true }
 # `Z` suffix, so UtcTimestamp cannot accidentally emit a local/offset datetime.
 jiff = { workspace = true }
 bytes = { workspace = true }
+# Observability (PR 4.10): the `metrics` facade (call-site macros are no-ops until a recorder is
+# installed) + the Prometheus recorder whose handle renders the /metrics text exposition.
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 sqlx = { workspace = true, optional = true, features = [
     "runtime-tokio",
     "postgres",

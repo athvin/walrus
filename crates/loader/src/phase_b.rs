@@ -39,6 +39,14 @@ pub async fn run_phase_b(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
             LoaderError::Internal(format!("no checkpoint for {}.{}", ctx.schema, ctx.table))
         })?;
     let after = cp.transformed_lsn;
+    // Phase-B transform lag = raw_appended_lsn − transformed_lsn (PR 4.10); pure math from the checkpoint
+    // just read, no extra query. Labelled per table (bounded cardinality).
+    common::metrics::set_transform_lag(
+        &format!("{}.{}", ctx.schema, ctx.table),
+        cp.raw_appended_lsn
+            .as_u64()
+            .saturating_sub(cp.transformed_lsn.as_u64()),
+    );
 
     // The max commit LSN in the tail we (re)transform, bounded `>= transformed_lsn` (16-hex text sorts as
     // the LSN, so `max` = latest). The `>=` is load-bearing for the snapshot/stream boundary (PR 3.10,

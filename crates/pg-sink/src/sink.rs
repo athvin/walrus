@@ -103,6 +103,9 @@ impl ParquetSink {
     ) -> Result<WrittenObject, SinkError> {
         let uuid = uuid::Uuid::new_v4().to_string();
         let key = self.object_key(&batch.schema, &batch.table, batch.lsn_end, &uuid);
+        // Flush-latency + throughput instrumentation (PR 4.10); no-op until a recorder is installed.
+        let flush_start = std::time::Instant::now();
+        let rows = batch.record_batch.num_rows() as u64;
 
         // Multipart streaming writer — no local temp file, no whole-batch buffering.
         let buf_writer = BufWriter::new(self.store.clone(), key.clone());
@@ -120,6 +123,7 @@ impl ParquetSink {
             .close()
             .await
             .map_err(|e| SinkError::Encode(e.to_string()))?;
+        common::metrics::record_batch_flush(flush_start.elapsed().as_secs_f64(), rows);
 
         Ok(WrittenObject {
             s3_uri: format!("s3://{}/{}", self.bucket, key),
