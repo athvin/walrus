@@ -16,7 +16,8 @@ The **design is already finished** and lives one directory up:
   reproducible Docker harness and a Python decoder + golden vectors under
   [`../examples/proto-version/`](../examples/proto-version/).
 
-This curriculum turns that design into **68 PRs across 5 phases**. Each PR is a self-contained task
+This curriculum turns that design into **77 PRs across 6 phases** (phases 0–4 build v1; phase 5
+hardens it — benchmarking, hot-path cleanup, and a much faster CI). Each PR is a self-contained task
 file with an explicit *Definition of Done*. You write the code; the task tells you what "done and
 green" means.
 
@@ -144,7 +145,7 @@ Two deliberate structural notes:
 
 ## The roadmap
 
-68 PRs. Tick each box as you merge. Every DoD is traceable to a design section (right column).
+77 PRs. Tick each box as you merge. Every DoD is traceable to a design section (right column).
 
 ### Phase 0 — Foundations & CI  ·  [`phase-0-foundations/`](./phase-0-foundations/)
 
@@ -251,10 +252,31 @@ Two deliberate structural notes:
 | ✅ | [4.10](./phase-4-end-to-end/pr-4.10-observability-metrics.md) | Prometheus metrics + dashboard + alerts | Observability |
 | ✅ | [4.11](./phase-4-end-to-end/pr-4.11-deferred-goal-scaffolding.md) | deferred-goal scaffolding (CTID snapshot, sharding hooks) | Deferred goals |
 
-> **🏁 Curriculum complete.** All phases (0 → 4) are done: the Postgres → DuckDB CDC pipeline is built,
-> wired end-to-end, containerised, deployed to Kubernetes, observable, and its three deferred goals are
-> documented with marked seams. The [deferred goals](../deferred-goals.md) are the only forward work,
-> left as clearly-labelled extension points — not v1 scope.
+> **🏁 v1 complete.** Phases 0 → 4 are done: the Postgres → DuckDB CDC pipeline is built, wired
+> end-to-end, containerised, deployed to Kubernetes, observable, and its three deferred goals are
+> documented with marked seams. The [deferred goals](../deferred-goals.md) remain future feature work;
+> **Phase 5 below is the post-v1 hardening pass** — measure it, clean up the proven hot paths, and make
+> CI fast.
+
+### Phase 5 — Performance & CI  ·  [`phase-5-performance-and-ci/`](./phase-5-performance-and-ci/)
+
+Post-v1 hardening: make CI fast (the bundled-DuckDB C++ build currently compiles up to four times per
+cold run), build the benchmark instruments the design's performance claims have never been tested
+against, then fix **only the measured** hot-path bottlenecks — every optimization lands with a
+before/after delta recorded in `docs/benchmarks.md`. Closes with a dependency/debt sweep (the DuckDB
+1.4.x LTS EOL clock is 2026-09-16).
+
+| ✅ | PR | Delivers | Design |
+|---|---|---|---|
+| ⬜ | [5.1](./phase-5-performance-and-ci/pr-5.1-ci-restructure-path-filters.md) | CI restructure: drop redundant build, docs-only path filtering | CI-grows |
+| ⬜ | [5.2](./phase-5-performance-and-ci/pr-5.2-ci-sccache.md) | sccache: cache DuckDB's C++ objects across jobs/profiles | CI-grows |
+| ⬜ | [5.3](./phase-5-performance-and-ci/pr-5.3-docker-build-cache.md) | Docker builds: BuildKit cache mounts + GHA layer cache | CI-grows |
+| ⬜ | [5.4](./phase-5-performance-and-ci/pr-5.4-bench-sink-decode-arrow.md) | criterion benches: pgoutput decode + Arrow batch build; `docs/benchmarks.md` | proto §4–§8 / sink §2 |
+| ⬜ | [5.5](./phase-5-performance-and-ci/pr-5.5-bench-loader-transform.md) | criterion benches: transform scaling, TOAST back-scan, Phase-A append | loader §5–§6, §9.2 |
+| ⬜ | [5.6](./phase-5-performance-and-ci/pr-5.6-e2e-throughput-harness.md) | e2e throughput harness + `raw_append_lag_bytes` metric + bottleneck ranking | Observability / loader §9.3 |
+| ⬜ | [5.7](./phase-5-performance-and-ci/pr-5.7-sink-hot-path.md) | sink hot-path fixes (meta-JSON amortization, clone removal, release profile) — measured only | §1.4 / benchmarks |
+| ⬜ | [5.8](./phase-5-performance-and-ci/pr-5.8-loader-hot-path.md) | loader hot-path fixes (DESCRIBE cache, TOAST back-scan rewrite) — measured only | loader §5.6 / sink §3.5 |
+| ⬜ | [5.9](./phase-5-performance-and-ci/pr-5.9-dependency-debt-sweep.md) | debt sweep: commit_ts TODO, object_store advisories, DuckDB next-LTS bump | Open Q4(b) / proto §4 |
 
 ---
 
@@ -272,6 +294,10 @@ that needs them lands:
 | 4.7 | `cargo-deny` (licenses / advisories / bans / sources); MSRV **1.95** guard (declared `rust-version` == pinned toolchain) |
 | 4.8–4.9 | image build; `kubeconform` / kind manifest validation |
 | 4.1+ | full `tests/e2e` job (feature `it`) |
+| 5.1 | docs-only changes skip the compile-heavy jobs; redundant `build --workspace` step removed |
+| 5.2 | sccache (Rust + bundled-DuckDB C++ object cache, GHA backend) in every compiling job |
+| 5.3 | image builds via buildx with BuildKit cache mounts + `type=gha` layer cache |
+| 5.4+ | bench targets compile-checked by `clippy --all-targets` (benches run locally, never a CI gate) |
 
 ---
 
