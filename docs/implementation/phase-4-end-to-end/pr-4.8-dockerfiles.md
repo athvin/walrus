@@ -1,5 +1,7 @@
 # PR 4.8 — Multi-stage Dockerfiles with PID-1 SIGTERM for both binaries
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/75
+
 > **Phase:** 4 — End-to-end, ops & resilience · **Crates touched:** `deploy/docker` (+ CI) ·
 > **Est. size:** M · **Depends on:** PR 4.7 · **Unlocks:** PR 4.9
 
@@ -97,18 +99,18 @@ ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/pg-sink"]
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] Both images build in CI from the multi-stage Dockerfiles; the runtime image is slim (no build
+- [x] Both images build in CI from the multi-stage Dockerfiles; the runtime image is slim (no build
       toolchain) and includes CA certs.
-- [ ] The `ENTRYPOINT` is **exec form** under `tini`; a `docker run` + `SIGTERM` (via `docker stop`) makes
+- [x] The `ENTRYPOINT` is **exec form** under `tini`; a `docker run` + `SIGTERM` (via `docker stop`) makes
       each process **handle the signal and exit 0** within the grace window — it is **not** `SIGKILL`ed.
-- [ ] `.dockerignore` excludes `target/`, `.git`, and docs so the build context is small and layer-cached.
-- [ ] The `duckdb`-bundled binary (loader) runs in the runtime image (correct libc, no missing shared
+- [x] `.dockerignore` excludes `target/`, `.git`, and docs so the build context is small and layer-cached.
+- [x] The `duckdb`-bundled binary (loader) runs in the runtime image (correct libc, no missing shared
       lib).
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test --workspace`
-  - [ ] `docker build -f deploy/docker/Dockerfile.pg-sink .` and `…Dockerfile.loader .` succeed, then the
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test --workspace`
+  - [x] `docker build -f deploy/docker/Dockerfile.pg-sink .` and `…Dockerfile.loader .` succeed, then the
         `docker run` **SIGTERM-reaches-PID-1** smoke exits 0.
 
 ## Hints & gotchas
