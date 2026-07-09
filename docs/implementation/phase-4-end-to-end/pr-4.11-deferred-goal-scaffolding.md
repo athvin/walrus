@@ -1,5 +1,7 @@
 # PR 4.11 — Deferred-goal scaffolding: CTID-range snapshot & loader-sharding hooks
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/78
+
 > **Phase:** 4 — End-to-end, ops & resilience · **Crates touched:** `pg-sink`, `loader`, `control` (docs +
 > inert hooks) · **Est. size:** S · **Depends on:** PR 4.10 · **Unlocks:** — (finish line)
 
@@ -100,22 +102,22 @@ struct TableAssignment {
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `docs/deferred-goals.md` documents all three deferred goals (single-table reload, loader sharding,
+- [x] `docs/deferred-goals.md` documents all three deferred goals (single-table reload, loader sharding,
       CTID-range backfill) with their likely shape and the **exact seam** each extends, cross-linked to the
       design sections.
-- [ ] The CTID-range and loader-sharding seams exist as clearly-marked, **inert** extension points
+- [x] The CTID-range and loader-sharding seams exist as clearly-marked, **inert** extension points
       (`#[allow(dead_code)]` / feature-gated / `unimplemented!` with a pointer) — they change **no** default
       runtime behaviour.
-- [ ] The PR 3.1 `fencing_token` is confirmed present, carried, and unused for routing today (single active
+- [x] The PR 3.1 `fencing_token` is confirmed present, carried, and unused for routing today (single active
       loader); the placeholder documents its future use.
-- [ ] The README roadmap marks PR 4.11 complete and notes the curriculum is finished.
-- [ ] **No regressions:** the full workspace and the e2e suite stay green.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings` (inert seams must not trip dead-code /
+- [x] The README roadmap marks PR 4.11 complete and notes the curriculum is finished.
+- [x] **No regressions:** the full workspace and the e2e suite stay green.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings` (inert seams must not trip dead-code /
         unused lints — annotate them)
-  - [ ] `cargo test --workspace`
-  - [ ] `docker compose up --wait` then `cargo test -p e2e --features it -- --ignored` still passes end to
+  - [x] `cargo test --workspace`
+  - [x] `docker compose up --wait` then `cargo test -p e2e --features it -- --ignored` still passes end to
         end (no behaviour changed).
 
 ## Hints & gotchas
