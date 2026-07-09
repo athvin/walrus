@@ -1,5 +1,7 @@
 # PR 4.10 — Observability: Prometheus metrics, dashboard, and alerts
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/77
+
 > **Phase:** 4 — End-to-end, ops & resilience · **Crates touched:** `common`, `pg-sink`, `loader`
 > (+ `deploy/`) · **Est. size:** M · **Depends on:** PR 4.9 · **Unlocks:** PR 4.11
 
@@ -115,19 +117,19 @@ async fn metrics_endpoint_exposes_all_sink_series() {
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] Both binaries expose `/metrics` in Prometheus text exposition, registering **every** series listed in
+- [x] Both binaries expose `/metrics` in Prometheus text exposition, registering **every** series listed in
       `architecture.md#observability` (lag, retained WAL, `wal_status`, heartbeat round-trip age, `beat_seq`
       gap, feedback age, batch/Parquet throughput, in-flight bytes, spill/pause counts, files-ready/table,
       raw-append lag, transform lag, aborted-txn, failed-file).
-- [ ] Metric names are stable constants shared by the call sites and the scrape test; per-table series are
+- [x] Metric names are stable constants shared by the call sites and the scrape test; per-table series are
       labelled by table (bounded cardinality — never per-row).
-- [ ] A committed Grafana `dashboard.json` and Prometheus `alerts.yaml` cover slot growth, `wal_status`,
+- [x] A committed Grafana `dashboard.json` and Prometheus `alerts.yaml` cover slot growth, `wal_status`,
       heartbeat staleness, and loader backlog — and **no** alert pages on catch-up lag.
-- [ ] This PR adds no pipeline behaviour — it only exposes existing signals.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test --workspace` including the scrape tests
+- [x] This PR adds no pipeline behaviour — it only exposes existing signals.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test --workspace` including the scrape tests
         **`metrics_endpoint_exposes_all_sink_series`** and the loader equivalent.
 
 ## Hints & gotchas
