@@ -15,6 +15,9 @@ const CONTROL_URL: &str = "postgres://postgres:postgres@localhost:5433/walrus_co
 const S3_ENDPOINT: &str = "http://localhost:9000";
 const BUCKET: &str = "walrus";
 const SLOT: &str = "walrus_e2e_slot";
+/// The MinIO container name (`<compose project>-<service>-1`) — `docker pause`d to stall the sink's S3
+/// durability in the WAL-runaway / keepalive chaos tests (PR 4.5).
+const MINIO: &str = "walrus-minio-1";
 
 /// A running walrus stack: the compose services (assumed up) plus a live `pg-sink` and `loader` spawned
 /// as child processes. `Drop` kills both — a leaked sink holds the replication slot and blocks the next
@@ -410,6 +413,156 @@ impl Harness {
         )?;
         Ok(conn.query_row(sql, [], |r| r.get(0))?)
     }
+
+    // ---- PR 4.5: slot-liveness chaos (S3 stall, slot status, heartbeat, health) ----------------
+
+    /// Stall the sink's durability by pausing MinIO (`docker pause`) — every S3 PUT then hangs, so the
+    /// sink cannot finish a durable flush: `confirmed_flush_lsn` freezes and the slot's `restart_lsn`
+    /// is pinned, so retained WAL grows (the WAL-runaway). Pausing the **loader** would NOT do this —
+    /// it doesn't own the slot; the sink advances `confirmed_flush` on its OWN S3 durability (§1.5/§1.9),
+    /// so stalling S3 is the only thing that retains source WAL. The keepalive fix (PR #71) keeps the
+    /// walsender connected throughout.
+    pub async fn stall_s3(&self) -> Result<()> {
+        docker(&["pause", MINIO]).await
+    }
+
+    /// Resume S3 (`docker unpause` MinIO) — the stalled PUT completes and the sink drains the backlog.
+    pub async fn unstall_s3(&self) -> Result<()> {
+        docker(&["unpause", MINIO]).await
+    }
+
+    /// The slot's `confirmed_flush_lsn` — the durable, slot-advancing LSN (moves only after S3 + manifest
+    /// durability, or an idle heartbeat commit; never on a stalled flush).
+    pub async fn slot_confirmed_flush(&self) -> Result<common::Lsn> {
+        let s: Option<String> = sqlx::query_scalar(
+            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
+        )
+        .bind(SLOT)
+        .fetch_optional(&self.source)
+        .await?;
+        s.context("replication slot not found")?
+            .parse()
+            .map_err(|e| anyhow::anyhow!("parse confirmed_flush_lsn: {e:?}"))
+    }
+
+    /// The slot's `restart_lsn` — the oldest WAL the slot still needs. Follows `confirmed_flush` once a
+    /// beat or durable flush advances the latter; a stuck `restart_lsn` is what retained WAL measures.
+    pub async fn slot_restart_lsn(&self) -> Result<common::Lsn> {
+        let s: Option<String> = sqlx::query_scalar(
+            "SELECT restart_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
+        )
+        .bind(SLOT)
+        .fetch_optional(&self.source)
+        .await?;
+        s.context("replication slot not found")?
+            .parse()
+            .map_err(|e| anyhow::anyhow!("parse restart_lsn: {e:?}"))
+    }
+
+    /// Whether a walsender is attached to the slot (`active = true`) — proof the connection is live. A
+    /// severed walsender (e.g. `wal_sender_timeout` with no keepalive) flips this to `false`.
+    pub async fn slot_active(&self) -> Result<bool> {
+        let active: Option<bool> =
+            sqlx::query_scalar("SELECT active FROM pg_replication_slots WHERE slot_name = $1")
+                .bind(SLOT)
+                .fetch_optional(&self.source)
+                .await?;
+        Ok(active == Some(true))
+    }
+
+    /// Poll `slot_retained_bytes` until it exceeds `threshold` (the retained-WAL alert condition trips),
+    /// or the deadline elapses. Watermark-based, not a fixed sleep.
+    pub async fn await_retained_bytes_over(
+        &self,
+        threshold: i64,
+        deadline: Duration,
+    ) -> Result<i64> {
+        let start = Instant::now();
+        loop {
+            let n = self.slot_retained_bytes().await?;
+            if n > threshold {
+                return Ok(n);
+            }
+            if start.elapsed() > deadline {
+                anyhow::bail!("retained WAL {n} never exceeded {threshold} within {deadline:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Poll the slot's `confirmed_flush_lsn` until it passes `target`, or the deadline elapses.
+    pub async fn await_confirmed_flush_past(
+        &self,
+        target: common::Lsn,
+        deadline: Duration,
+    ) -> Result<common::Lsn> {
+        let start = Instant::now();
+        loop {
+            let cf = self.slot_confirmed_flush().await?;
+            if cf > target {
+                return Ok(cf);
+            }
+            if start.elapsed() > deadline {
+                anyhow::bail!("confirmed_flush {cf} never passed {target} within {deadline:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// How many times the sink logged `needle` (log-scrape, like [`Harness::sink_spill_count`]).
+    fn grep_sink_log(&self, needle: &str) -> usize {
+        std::fs::read_to_string(&self.sink_log)
+            .map(|s| s.matches(needle).count())
+            .unwrap_or(0)
+    }
+
+    /// How many idle heartbeats the sink has FIRED (idle publication → wrote `walrus.heartbeat`).
+    pub fn heartbeat_beats(&self) -> usize {
+        self.grep_sink_log("fired idle heartbeat")
+    }
+
+    /// How many heartbeat round-trips the sink has OBSERVED (a `beat_seq` returned through the stream —
+    /// the slot-consume liveness signal that feeds the `/ready` `degraded` field).
+    pub fn heartbeat_roundtrips(&self) -> usize {
+        self.grep_sink_log("heartbeat round-trip observed")
+    }
+
+    /// Whether the sink log contains `needle` — e.g. a reconnect/sever error the keepalive path must
+    /// prevent (`"source closed the replication connection"`).
+    pub fn sink_log_contains(&self, needle: &str) -> bool {
+        self.grep_sink_log(needle) > 0
+    }
+
+    /// Poll [`Harness::heartbeat_roundtrips`] until it reaches `min`, or the deadline elapses.
+    pub async fn await_heartbeat_roundtrip(&self, min: usize, deadline: Duration) -> Result<usize> {
+        let start = Instant::now();
+        loop {
+            let n = self.heartbeat_roundtrips();
+            if n >= min {
+                return Ok(n);
+            }
+            if start.elapsed() > deadline {
+                anyhow::bail!("heartbeat round-trips {n} < {min} within {deadline:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// GET the sink's `/ready`, returning `(ready, degraded)`. Per `walrus-pg-sink.md` §4.3, `degraded`
+    /// is a FIELD, never a readiness gate — a catching-up sink is `degraded` yet still `ready` (HTTP 200).
+    /// `ready` is the HTTP-200 status (equals the body's `ready`); `degraded` is the body's field.
+    pub async fn sink_ready(&self) -> Result<(bool, bool)> {
+        let (ok, body) = http_get("http://127.0.0.1:8130/ready").await?;
+        let v: serde_json::Value =
+            serde_json::from_str(body.trim()).context("parse /ready JSON body")?;
+        Ok((ok, v["degraded"].as_bool().unwrap_or(false)))
+    }
+
+    /// Whether the sink child is still running (has not exited) — proof the walsender did not sever it
+    /// (a severed replication connection makes the sink's `next()` error and the process exit).
+    pub fn sink_running(&mut self) -> bool {
+        matches!(self.sink.try_wait(), Ok(None))
+    }
 }
 
 impl Drop for Harness {
@@ -417,6 +570,14 @@ impl Drop for Harness {
         // Best-effort kill both bins — a leaked sink pins the slot and blocks the next bootstrap.
         let _ = self.sink.start_kill();
         let _ = self.loader.start_kill();
+        // Undo an S3 stall a panicking test may have left in place, or the next run's sink bootstrap
+        // hangs on a paused MinIO.
+        // Quiet: `unpause` errors harmlessly when the container is not paused (the common case).
+        let _ = std::process::Command::new("docker")
+            .args(["unpause", MINIO])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
         let _ = std::fs::remove_dir_all(&self.duckdb_dir);
     }
 }
@@ -543,4 +704,47 @@ async fn http_get_ok(url: &str) -> bool {
     }
     String::from_utf8_lossy(&buf).starts_with("HTTP/1.0 200")
         || String::from_utf8_lossy(&buf).starts_with("HTTP/1.1 200")
+}
+
+/// A dependency-free HTTP GET returning `(status_is_200, body)` — used to read the `/ready` JSON body
+/// (`{ready, degraded}`), which [`http_get_ok`] discards.
+async fn http_get(url: &str) -> Result<(bool, String)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let rest = url.trim_start_matches("http://");
+    let (authority, path) = rest
+        .split_once('/')
+        .map(|(a, p)| (a, format!("/{p}")))
+        .unwrap_or((rest, "/".into()));
+    let mut stream = tokio::net::TcpStream::connect(authority)
+        .await
+        .context("connect for GET")?;
+    let req = format!("GET {path} HTTP/1.0\r\nHost: {authority}\r\n\r\n");
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .context("write GET")?;
+    let mut buf = Vec::new();
+    stream
+        .read_to_end(&mut buf)
+        .await
+        .context("read GET response")?;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let ok = text.starts_with("HTTP/1.0 200") || text.starts_with("HTTP/1.1 200");
+    // The body follows the blank line after the headers.
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default();
+    Ok((ok, body))
+}
+
+/// Run a `docker` subcommand (e.g. `pause`/`unpause` the MinIO container) and require success.
+async fn docker(args: &[&str]) -> Result<()> {
+    let status = Command::new("docker")
+        .args(args)
+        .status()
+        .await
+        .with_context(|| format!("run `docker {}`", args.join(" ")))?;
+    anyhow::ensure!(status.success(), "`docker {}` failed", args.join(" "));
+    Ok(())
 }
