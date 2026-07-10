@@ -249,4 +249,37 @@ the bottleneck (`raw_append`+`transform` lag in the MBs, sink `inflight` 0). The
 is real but invisible at the system level **because the sink was never the limiter** — which is exactly
 why candidate 3 (sink clone removal) was deferred to focus PR 5.8 on the loader.
 
-[criterion.rs]: https://bheisler.github.io/criterion.rs/book/
+### PR 5.8 — loader hot path
+
+**1. Per-`schema_version` DESCRIBE cache (landed).** `append_parquet` used to run a
+`DESCRIBE SELECT * FROM read_parquet(...)` against **every** claimed file to map its columns by name
+(PR 5.5: a fixed **~10 ms/file**, ~10 % of a narrow append). By the sink's homogeneous-file rule
+(walrus-pg-sink §3.5) every file at a `schema_version` has the same columns, so `TableDb` now caches
+the column list keyed on `schema_version` (a `RefCell<HashMap<i64, Arc<Vec<String>>>>`, never
+invalidated — a DDL bump is a new key). A Phase-A cycle claiming **N same-version files runs one
+`DESCRIBE`, not N** (asserted by `duck::tests::spill_override_…`: two v1 files → one cached entry).
+
+Delta: the ~10 ms introspection is now paid **once per (table, schema_version)** instead of per file —
+`(N−1) × ~10 ms` saved per cycle (at the default `max_files=100`, up to ~1 s/cycle). The single-cold-file
+`append_parquet` bench is unchanged (the first file still DESCRIBEs; the win is the repeats). No
+behavioural change: the same column list, just computed once.
+
+**2. TOAST back-scan rewrite (declined — measured).** PR 5.5 measured the back-scan delta at **≈0
+(within noise)** on the 100k-row / 30 %-sentinel bench: DuckDB **decorrelates** the per-column
+correlated subquery into a single `LEFT_DELIM_JOIN` (EXPLAIN ANALYZE in the PR 5.5 section), so it is
+already set-based. Rewriting it to a hand-rolled windowed `last_value(… IGNORE NULLS)` carry-forward
+would add SQL complexity and a `NULL`-vs-sentinel trap (walrus-pg-sink §2.7) for **no measured gain**.
+**Not taken** — the honest null result the phase asks for.
+
+**3. Window-rescan audit (O(tail) confirmed).** The transform's `>= after_lsn` tail scan: PR 5.5's
+scaling grid shows throughput **rising** with N (342 K → 2.11 M rows/s at K=1) — i.e. O(new events)
+with amortising fixed overhead, no superlinear term, cost tracking the distinct-PK winner count (the
+window `HASH_GROUP_BY`, per EXPLAIN ANALYZE). Bounded in practice by the retention prune (PR 3.11). No
+pathology found; the `>=` bound is **unchanged** (load-bearing for the snapshot straddle, PR 3.10).
+
+**System-level (PR 5.6 `mixed` re-run):** sink 6 081 rows/s (unchanged), loader lag peak 1.97 MB —
+**within run-to-run variance** of the 5.6 baseline (1.72 MB). The DESCRIBE cache removes a genuine
+per-cycle cost, but the loader's throughput is gated by `read_parquet` ingest + the transform window
+(PR 5.5's dominant costs), so the introspection saving doesn't visibly shift end-to-end lag; correctness
+is unchanged (mirror transforms, lags drain to 0). The next loader throughput lever is the ingest/
+transform path, not per-file introspection — noted for future work beyond Phase 5's measured-cleanup scope.

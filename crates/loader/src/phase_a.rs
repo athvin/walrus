@@ -100,9 +100,12 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
         // for every row. Stamp it so the transform's commit-LSN window can't drop a neighbour txn that
         // committed inside the spill's placeholder range (architecture.md §1.6). Other kinds append verbatim.
         let commit_lsn_override = (f.kind == "spill").then(|| f.lsn_end.to_string());
-        appended += ctx
-            .db
-            .append_parquet(&ctx.table, &f.s3_uri, commit_lsn_override.as_deref())?;
+        appended += ctx.db.append_parquet(
+            &ctx.table,
+            &f.s3_uri,
+            f.schema_version,
+            commit_lsn_override.as_deref(),
+        )?;
         max_lsn = max_lsn.max(f.lsn_end);
         ids.push(f.id);
     }
