@@ -177,5 +177,3 @@ fn duck_s3_access(cfg: &LoaderConfig) -> loader::duck::S3Access {
         use_ssl,
     }
 }
-
-// PR 5.3 chef proof: a source-only change (this comment) — reverted in the next commit.
