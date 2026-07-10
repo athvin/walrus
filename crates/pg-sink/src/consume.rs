@@ -188,7 +188,12 @@ pub async fn run_decode_loop(
                                     last_activity = Instant::now();
                                     demux.on_change(cache, m, sink, frame_lsn).await?;
                                 }
-                                Message::StreamCommit { xid, commit_lsn, .. } => {
+                                Message::StreamCommit {
+                                    xid,
+                                    commit_lsn,
+                                    commit_ts,
+                                    ..
+                                } => {
                                     // Commit-order fence (architecture.md §1.6): any regular (non-streamed)
                                     // txn that committed WHILE this large txn was streaming is still buffered
                                     // in the router — small batches flush on the `max_fill` cadence, not per
@@ -207,8 +212,15 @@ pub async fn run_decode_loop(
                                     // Materialise the survivors (aborted sub-xids excluded) to `ready`
                                     // (lsn_end = commit_lsn), then advance the slot — clamped to any
                                     // still-older open txn.
-                                    let objs =
-                                        demux.on_stream_commit(*xid, *commit_lsn, cache, sink).await?;
+                                    let objs = demux
+                                        .on_stream_commit(
+                                            *xid,
+                                            *commit_lsn,
+                                            UtcTimestamp::from_pg_micros(*commit_ts)?,
+                                            cache,
+                                            sink,
+                                        )
+                                        .await?;
                                     for obj in &objs {
                                         crate::manifest::record_ready(pool, epoch, obj)
                                             .await
@@ -445,11 +457,17 @@ impl BatchRouter {
                 )?;
                 Ok(Vec::new())
             }
-            Message::Commit { commit_lsn, .. } => self.commit(*commit_lsn),
+            Message::Commit {
+                commit_lsn,
+                commit_ts,
+                ..
+            } => self.commit(*commit_lsn, UtcTimestamp::from_pg_micros(*commit_ts)?),
             _ => Ok(Vec::new()),
         }
     }
 
+    // Each parameter is one provenance field the per-row `SinkMeta` must carry (oid, op, values, lsn,
+    // xid, schema_version) — the arity mirrors the CDC contract, not an extractable clump.
     #[allow(clippy::too_many_arguments)]
     fn push(
         &mut self,
@@ -483,7 +501,7 @@ impl BatchRouter {
             op,
             lsn: frame_lsn,
             commit_lsn: Lsn::ZERO, // patched at the batcher's on_commit
-            commit_ts: UtcTimestamp::now(), // TODO: source commit_ts (Begin) needs a from-micros ctor
+            commit_ts: UtcTimestamp::now(), // placeholder — patched at on_commit from Commit's ts (PR 5.9)
             xid,
             epoch: self.epoch,
             batch_id: String::new(), // assigned by the batcher when the batch opens
@@ -520,11 +538,15 @@ impl BatchRouter {
         Ok(sealed)
     }
 
-    fn commit(&mut self, commit_lsn: Lsn) -> anyhow::Result<Vec<SealedBatch>> {
+    fn commit(
+        &mut self,
+        commit_lsn: Lsn,
+        commit_ts: UtcTimestamp,
+    ) -> anyhow::Result<Vec<SealedBatch>> {
         let mut sealed = Vec::new();
         for batcher in self.batchers.values_mut() {
             batcher
-                .on_commit(commit_lsn)
+                .on_commit(commit_lsn, commit_ts)
                 .context("promote committed rows")?;
             if batcher.should_flush() {
                 sealed.push(batcher.seal().context("seal batch")?);

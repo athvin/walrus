@@ -157,10 +157,19 @@ async fn savepoint_rollback_ready_file_has_exactly_6000_rows() {
                     demux.on_stream_abort(*top_xid, *sub_xid, &sink).await;
                 }
                 Message::StreamCommit {
-                    xid, commit_lsn, ..
+                    xid,
+                    commit_lsn,
+                    commit_ts,
+                    ..
                 } => {
                     let objs = demux
-                        .on_stream_commit(*xid, *commit_lsn, &cache, &sink)
+                        .on_stream_commit(
+                            *xid,
+                            *commit_lsn,
+                            common::UtcTimestamp::from_pg_micros(*commit_ts).unwrap(),
+                            &cache,
+                            &sink,
+                        )
                         .await
                         .unwrap();
                     for obj in &objs {

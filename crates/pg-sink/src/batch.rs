@@ -11,7 +11,7 @@
 
 use crate::relcache::CachedRelation;
 use arrow::record_batch::RecordBatch;
-use common::{Lsn, SinkMeta, TupleValue};
+use common::{Lsn, SinkMeta, TupleValue, UtcTimestamp};
 use pg_to_arrow::BatchBuilder;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -112,9 +112,15 @@ impl TableBatcher {
         !self.pending.is_empty()
     }
 
-    /// Promote the open txn's rows to the committed builder at `commit_lsn`; they are now
-    /// flush-eligible. A commit with no rows for this table is a no-op.
-    pub fn on_commit(&mut self, commit_lsn: Lsn) -> Result<(), BatchError> {
+    /// Promote the open txn's rows to the committed builder at `(commit_lsn, commit_ts)`; they are now
+    /// flush-eligible. `commit_lsn` and `commit_ts` are known only at Commit, so per-row metas were
+    /// pushed with placeholders and get the real transaction values stamped here (PR 5.9). A commit
+    /// with no rows for this table is a no-op.
+    pub fn on_commit(
+        &mut self,
+        commit_lsn: Lsn,
+        commit_ts: UtcTimestamp,
+    ) -> Result<(), BatchError> {
         if self.pending.is_empty() {
             return Ok(());
         }
@@ -125,6 +131,7 @@ impl TableBatcher {
         self.last_commit_lsn = commit_lsn;
         for (mut meta, values) in std::mem::take(&mut self.pending) {
             meta.commit_lsn = commit_lsn;
+            meta.commit_ts = commit_ts;
             meta.batch_id = self.batch_id.clone();
             self.builder.append_row(&values, &meta)?;
             self.committed_rows += 1;
@@ -329,7 +336,8 @@ mod tests {
         b.push(meta("0/10"), &row("1"));
         b.push(meta("0/20"), &row("2"));
         assert!(!b.should_flush(), "open txn is never flush-eligible");
-        b.on_commit("0/30".parse().unwrap()).unwrap();
+        b.on_commit("0/30".parse().unwrap(), UtcTimestamp::now())
+            .unwrap();
         assert!(b.should_flush(), "2 committed rows hit max_rows=2");
         let sealed = b.seal().unwrap();
         assert_eq!(sealed.row_count, 2);
@@ -346,7 +354,8 @@ mod tests {
         .unwrap();
         // One row (~96 overhead + a few value bytes) exceeds the tiny 50-byte ceiling.
         b.push(meta("0/10"), &row("1"));
-        b.on_commit("0/30".parse().unwrap()).unwrap();
+        b.on_commit("0/30".parse().unwrap(), UtcTimestamp::now())
+            .unwrap();
         assert!(b.should_flush(), "committed bytes exceed max_bytes=50");
     }
 
@@ -360,7 +369,8 @@ mod tests {
         )
         .unwrap();
         b.push(meta("0/10"), &row("1"));
-        b.on_commit("0/30".parse().unwrap()).unwrap();
+        b.on_commit("0/30".parse().unwrap(), UtcTimestamp::now())
+            .unwrap();
         assert!(!b.should_flush(), "no wall time has elapsed yet");
         clock.advance(Duration::from_millis(150));
         assert!(b.should_flush(), "max_fill tripped via the fake clock");
@@ -388,7 +398,8 @@ mod tests {
         .unwrap();
         // A committed txn (flush-eligible, but under all thresholds) plus an OPEN speculative txn.
         b.push(meta("0/10"), &row("1"));
-        b.on_commit("0/20".parse().unwrap()).unwrap();
+        b.on_commit("0/20".parse().unwrap(), UtcTimestamp::now())
+            .unwrap();
         b.push(meta("0/30"), &row("2")); // open, uncommitted
         assert!(b.has_open_txn());
         let sealed = b
@@ -431,7 +442,8 @@ mod tests {
         // Row LSNs are HIGHER than the commit LSN — lsn_end must still be the commit LSN.
         b.push(meta("0/500"), &row("1"));
         b.push(meta("0/600"), &row("2"));
-        b.on_commit("0/100".parse().unwrap()).unwrap();
+        b.on_commit("0/100".parse().unwrap(), UtcTimestamp::now())
+            .unwrap();
         let sealed = b.seal().unwrap();
         assert_eq!(
             sealed.lsn_end,

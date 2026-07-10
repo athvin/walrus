@@ -182,8 +182,10 @@ impl Backfill {
             );
             // Snapshot rows have no per-row commit boundary: promote them all at the shared
             // consistent_point so the loader's (commit_lsn, lsn) dedup lets any later stream change win.
+            // They also have no real commit *time* (pre-existing data), so commit_ts is the
+            // snapshot-capture instant — provenance only, never an ordering key (PR 5.9).
             batcher
-                .on_commit(snap.consistent_point)
+                .on_commit(snap.consistent_point, UtcTimestamp::now())
                 .context("promote snapshot rows")?;
             copied += 1;
             if batcher.should_flush() {
@@ -457,7 +459,7 @@ mod tests {
             meta.clone(),
             &[TupleValue::Text("1".into()), TupleValue::Text("new".into())],
         );
-        b.on_commit(cp).unwrap();
+        b.on_commit(cp, UtcTimestamp::now()).unwrap();
         let sealed = b.seal().unwrap();
         assert_eq!(sealed.lsn_end, cp, "committed at the consistent_point");
     }
@@ -500,7 +502,7 @@ mod tests {
                 meta(cp),
                 &[TupleValue::Text("1".into()), TupleValue::Text("x".into())],
             );
-            b.on_commit(cp).unwrap();
+            b.on_commit(cp, UtcTimestamp::now()).unwrap();
             lsn_ends.push(b.seal().unwrap().lsn_end);
         }
         assert_eq!(

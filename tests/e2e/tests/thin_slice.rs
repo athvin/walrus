@@ -18,6 +18,13 @@ async fn insert_update_delete_reaches_mirror() {
     // earlier empty snapshot) can cross it.
     let before = h.source_wal_lsn().await.unwrap();
 
+    // Bracket the three commits by the SOURCE clock (Unix-epoch seconds): every txn's real commit time
+    // lands in [ts_lo, ts_hi], so the `commit_ts` stamped into each row's meta must too (PR 5.9).
+    let ts_lo: f64 = sqlx::query_scalar("SELECT extract(epoch FROM clock_timestamp())::float8")
+        .fetch_one(h.source_pool())
+        .await
+        .unwrap();
+
     // Drive the source: create → change → remove the same PK.
     h.source_exec("INSERT INTO public.orders (id, status) VALUES (1, 'created')")
         .await
@@ -26,6 +33,11 @@ async fn insert_update_delete_reaches_mirror() {
         .await
         .unwrap();
     h.source_exec("DELETE FROM public.orders WHERE id = 1")
+        .await
+        .unwrap();
+
+    let ts_hi: f64 = sqlx::query_scalar("SELECT extract(epoch FROM clock_timestamp())::float8")
+        .fetch_one(h.source_pool())
         .await
         .unwrap();
 
@@ -77,6 +89,26 @@ async fn insert_update_delete_reaches_mirror() {
     assert_eq!(
         promoted, 3,
         "op/commit_lsn/lsn/sink_processed_at promoted on all rows"
+    );
+
+    // The provenance `commit_ts` is the real transaction commit time (proto §4 µs-since-Y2K, converted
+    // by `UtcTimestamp::from_pg_micros`), not a decode-time placeholder: every row's parsed `commit_ts`
+    // falls inside the source-clock bracket, ±1 s for sub-second rounding / minor skew (PR 5.9).
+    let commit_ts_in_window = h
+        .duckdb_scalar(
+            "orders",
+            &format!(
+                "SELECT count(*) FROM orders_raw WHERE id = 1 \
+                 AND epoch(CAST(json_extract_string(walrus_pg_sink_meta, '$.commit_ts') AS TIMESTAMPTZ)) \
+                     BETWEEN {lo} AND {hi}",
+                lo = ts_lo - 1.0,
+                hi = ts_hi + 1.0,
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        commit_ts_in_window, 3,
+        "commit_ts on every row is the real commit time, within [{ts_lo}, {ts_hi}] ±1s"
     );
 
     // (c) The `orders` mirror equals the current source — the row is gone after the DELETE.
