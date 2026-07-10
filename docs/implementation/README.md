@@ -270,7 +270,7 @@ before/after delta recorded in `docs/benchmarks.md`. Closes with a dependency/de
 |---|---|---|---|
 | ✅ | [5.1](./phase-5-performance-and-ci/pr-5.1-ci-restructure-path-filters.md) | CI restructure: drop redundant build, docs-only path filtering | CI-grows |
 | ✅ | [5.2](./phase-5-performance-and-ci/pr-5.2-ci-sccache.md) | sccache: cache DuckDB's C++ objects across jobs/profiles | CI-grows |
-| ☐ | [5.3](./phase-5-performance-and-ci/pr-5.3-docker-build-cache.md) | Docker builds: BuildKit cache mounts + GHA layer cache | CI-grows |
+| ✅ | [5.3](./phase-5-performance-and-ci/pr-5.3-docker-build-cache.md) | Docker builds: cargo-chef + GHA layer cache | CI-grows |
 | ☐ | [5.4](./phase-5-performance-and-ci/pr-5.4-bench-sink-decode-arrow.md) | criterion benches: pgoutput decode + Arrow batch build; `docs/benchmarks.md` | proto §4–§8 / sink §2 |
 | ☐ | [5.5](./phase-5-performance-and-ci/pr-5.5-bench-loader-transform.md) | criterion benches: transform scaling, TOAST back-scan, Phase-A append | loader §5–§6, §9.2 |
 | ☐ | [5.6](./phase-5-performance-and-ci/pr-5.6-e2e-throughput-harness.md) | e2e throughput harness + `raw_append_lag_bytes` metric + bottleneck ranking | Observability / loader §9.3 |

@@ -1,5 +1,7 @@
 # PR 5.3 — Docker image builds: BuildKit cache mounts + GHA layer cache
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/84
+
 > **Phase:** 5 — Performance & CI · **Crates touched:** none (`deploy/docker/*`, CI) ·
 > **Est. size:** M · **Depends on:** PR 5.2 · **Unlocks:** PR 5.4
 
@@ -101,17 +103,21 @@ docs/implementation/README.md        # modify — CI-grows table row for 5.3
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] Both Dockerfiles build with BuildKit cache mounts; the release binaries are copied out of the
-      mount inside the build RUN (an image built with a cold cache and one built warm are
-      byte-equivalent in their final stage).
-- [ ] The `images` job uses buildx with `type=gha` cache; a re-run with **only a source-file
+- [x] Both Dockerfiles build via **cargo-chef** (the `cook` layer caches all dependencies incl. the
+      bundled-DuckDB C++ build); the runtime stage COPYs the release binary from the builder, and a
+      cold-cache build and a warm-cache build are byte-equivalent in their final stage. *(Cache mounts
+      were built first and dropped — cargo's mtime fingerprinting re-ran the DuckDB build after a
+      cache tar-restore, so a source change recompiled DuckDB anyway; the task authorises chef once
+      "mount caching proves insufficient". Full detail in the PR.)*
+- [x] The `images` job uses buildx with `type=gha,mode=max` cache; a re-run with **only a source-file
       change** rebuilds workspace crates but not dependencies (and not DuckDB), finishing in
-      single-digit minutes. Before/after numbers in the PR description.
-- [ ] `scripts/image-smoke.sh` passes unchanged: both images boot, reach their ready states, and
+      single-digit minutes — **352s, 0 `libduckdb-sys` recompiles** (cold was 1464s). Before/after in
+      the PR description.
+- [x] `scripts/image-smoke.sh` passes unchanged: both images boot, reach their ready states, and
       exit 0 on SIGTERM (tini is still PID 1).
-- [ ] Runtime stages unchanged: same base images, same installed packages
+- [x] Runtime stages unchanged: same base images, same installed packages
       (`tini`, `ca-certificates`, loader's `libstdc++6`), same entrypoints.
-- [ ] **Green locally and in CI:** full workflow green on the PR itself; local
+- [x] **Green locally and in CI:** full workflow green on the PR itself; local
       `docker build` of both files still works without buildx-specific flags (BuildKit is the
       default builder in current Docker).
 

@@ -420,11 +420,35 @@ jobs:
       # Both images (esp. the loader's bundled-DuckDB build) are large; reclaim runner disk headroom.
       - uses: ./.github/actions/free-disk-space
 
-      - name: Build walrus-pg-sink image
-        run: docker build -f deploy/docker/Dockerfile.pg-sink -t walrus-pg-sink:ci .
+      # PR 5.3: build via buildx with the GHA layer cache. The Dockerfiles use cargo-chef, whose `cook`
+      # layer (all deps incl. the bundled-DuckDB C++ build) is keyed on the workspace Cargo manifests,
+      # so a source-only change is a layer-cache hit and DuckDB is not recompiled. `mode=max` is
+      # essential — it caches the intermediate builder/cook layers, not just the final runtime stage.
+      # (Cache MOUNTS were tried first and dropped: cargo's mtime fingerprinting re-runs the DuckDB
+      # build script after a cache tar-restore, so the C++ build repeated regardless — chef sidesteps
+      # that by using the content-hashed Docker layer cache.)
+      - uses: docker/setup-buildx-action@v3
+        id: buildx
 
-      - name: Build walrus-loader image (bundled DuckDB — slow cold build)
-        run: docker build -f deploy/docker/Dockerfile.loader -t walrus-loader:ci .
+      - name: Build walrus-pg-sink image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.pg-sink
+          tags: walrus-pg-sink:ci
+          load: true
+          cache-from: type=gha,scope=pg-sink
+          cache-to: type=gha,scope=pg-sink,mode=max
+
+      - name: Build walrus-loader image (bundled DuckDB — chef-cooked deps cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.loader
+          tags: walrus-loader:ci
+          load: true
+          cache-from: type=gha,scope=loader
+          cache-to: type=gha,scope=loader,mode=max
 
       - name: PID-1 SIGTERM smoke (both images handle SIGTERM → exit 0, not SIGKILL)
         run: bash scripts/image-smoke.sh
