@@ -36,3 +36,17 @@ tracing = { workspace = true }
 [dev-dependencies]
 # Raw-HTTP scrape test (metrics_scrape.rs) reads the /metrics body via AsyncReadExt/AsyncWriteExt.
 tokio = { workspace = true, features = ["io-util"] }
+# Micro-benches (PR 5.5): transform scaling / TOAST back-scan / Phase-A append against in-memory DuckDB.
+criterion = { workspace = true }
+# The append bench generates a local Parquet fixture with the sink's own writer (Arrow → Parquet).
+pg-to-arrow = { path = "../pg-to-arrow" }
+tempfile = { workspace = true }
+
+# `harness = false` hands the bench binary to criterion_main! instead of the libtest bench harness.
+[[bench]]
+name = "transform"
+harness = false
+
+[[bench]]
+name = "append"
+harness = false
