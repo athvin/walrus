@@ -160,10 +160,19 @@ async fn large_txn_low_ceiling_spills_and_stays_bounded() {
                     }
                 }
                 Message::StreamCommit {
-                    xid, commit_lsn, ..
+                    xid,
+                    commit_lsn,
+                    commit_ts,
+                    ..
                 } => {
                     let objs = demux
-                        .on_stream_commit(*xid, *commit_lsn, &cache, &sink)
+                        .on_stream_commit(
+                            *xid,
+                            *commit_lsn,
+                            common::UtcTimestamp::from_pg_micros(*commit_ts).unwrap(),
+                            &cache,
+                            &sink,
+                        )
                         .await
                         .unwrap();
                     for obj in &objs {

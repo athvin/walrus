@@ -245,6 +245,10 @@ impl StreamDemux {
                     op: c.op,
                     lsn: c.lsn,
                     commit_lsn: begin, // placeholder until commit stamps the real one on the manifest
+                    // Best-effort: the real commit_ts arrives only at Stream Commit, but this spill file
+                    // is already durable in S3 by then (like commit_lsn, which the loader overrides via
+                    // the manifest lsn_end; commit_ts has no such override) — so spilled rows carry the
+                    // spill-time instant, always within the transaction's lifetime (PR 5.9).
                     commit_ts: UtcTimestamp::now(),
                     xid: c.sub_xid,
                     epoch,
@@ -259,7 +263,10 @@ impl StreamDemux {
                 };
                 batcher.push(meta, &c.values);
             }
-            batcher.on_commit(begin).context("promote spill rows")?;
+            // The spill-time instant stands in for commit_ts here (see the meta comment above).
+            batcher
+                .on_commit(begin, UtcTimestamp::now())
+                .context("promote spill rows")?;
             if batcher.committed_rows() == 0 {
                 continue;
             }
@@ -343,6 +350,7 @@ impl StreamDemux {
         &mut self,
         top_xid: u32,
         commit_lsn: Lsn,
+        commit_ts: UtcTimestamp,
         cache: &RelationCache,
         sink: &ParquetSink,
     ) -> anyhow::Result<Vec<WrittenObject>> {
@@ -390,7 +398,7 @@ impl StreamDemux {
                 op: c.op,
                 lsn: c.lsn,
                 commit_lsn,
-                commit_ts: UtcTimestamp::now(),
+                commit_ts, // the real Stream-Commit timestamp (also re-stamped by on_commit below)
                 xid: c.sub_xid,
                 epoch,
                 batch_id: String::new(),
@@ -411,7 +419,7 @@ impl StreamDemux {
             };
             batcher.push(meta, &c.values);
             batcher
-                .on_commit(commit_lsn)
+                .on_commit(commit_lsn, commit_ts)
                 .context("promote streamed survivors")?;
             if batcher.should_flush() {
                 out.push(
@@ -593,7 +601,7 @@ mod tests {
             .unwrap();
         let commit: Lsn = "0/900".parse().unwrap();
         let files = d
-            .on_stream_commit(100, commit, &cache, &sink)
+            .on_stream_commit(100, commit, UtcTimestamp::now(), &cache, &sink)
             .await
             .unwrap();
         assert_eq!(files.iter().map(|f| f.row_count).sum::<u64>(), 2);
@@ -638,7 +646,13 @@ mod tests {
         }
         assert_eq!(d.survivor_count(857), 6000);
         let files = d
-            .on_stream_commit(857, "0/9000".parse().unwrap(), &cache, &sink)
+            .on_stream_commit(
+                857,
+                "0/9000".parse().unwrap(),
+                UtcTimestamp::now(),
+                &cache,
+                &sink,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -677,7 +691,7 @@ mod tests {
         }
         let commit: Lsn = "0/9000".parse().unwrap();
         let files = d
-            .on_stream_commit(857, commit, &cache, &sink)
+            .on_stream_commit(857, commit, UtcTimestamp::now(), &cache, &sink)
             .await
             .unwrap();
         assert_eq!(

@@ -17,11 +17,14 @@ ignore = [
   "RUSTSEC-2024-0436",
   # quick-xml <0.41 DoS pair — quadratic duplicate-attribute scan (0194) and unbounded
   # namespace-declaration allocation (0195). Both are fixed in quick-xml >=0.41, but quick-xml is
-  # reachable only through `object_store 0.11.2`, which caps it at 0.37; bumping past that needs an
-  # object_store upgrade, out of scope for this config-only PR. In walrus, quick-xml parses only the
-  # S3 XML API responses from our own trusted object store (in-cluster MinIO), never attacker-
-  # controlled input, so the memory-exhaustion surface does not apply. Drop both once object_store is
-  # bumped to a release carrying quick-xml >=0.41.
+  # reachable only transitively through `object_store`, and NO published object_store release yet
+  # caps it at >=0.41. PR 5.9 evaluated the upgrade path empirically: object_store 0.11.2 → 0.37,
+  # 0.12.5 → 0.38, 0.13.2 → 0.39 (each still <0.41, so `cargo deny` re-fires both advisories), and
+  # 0.12/0.13 also drift the ObjectStore `put`/`get`/`delete` API. We therefore stay on 0.11.2 — a
+  # partial bump neither clears the advisory nor pays for its migration. In walrus, quick-xml parses
+  # only the S3 XML API responses from our own trusted object store (in-cluster MinIO), never
+  # attacker-controlled input, so the memory-exhaustion surface does not apply. Drop both once an
+  # object_store release carries quick-xml >=0.41.
   "RUSTSEC-2026-0194",
   "RUSTSEC-2026-0195",
 ]

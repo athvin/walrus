@@ -276,7 +276,7 @@ before/after delta recorded in `docs/benchmarks.md`. Closes with a dependency/de
 | ✅ | [5.6](./phase-5-performance-and-ci/pr-5.6-e2e-throughput-harness.md) | e2e throughput harness + `raw_append_lag_bytes` metric + bottleneck ranking | Observability / loader §9.3 |
 | ✅ | [5.7](./phase-5-performance-and-ci/pr-5.7-sink-hot-path.md) | sink hot-path fixes (meta-JSON amortization, clone removal, release profile) — measured only | §1.4 / benchmarks |
 | ✅ | [5.8](./phase-5-performance-and-ci/pr-5.8-loader-hot-path.md) | loader hot-path fixes (DESCRIBE cache, TOAST back-scan rewrite) — measured only | loader §5.6 / sink §3.5 |
-| ☐ | [5.9](./phase-5-performance-and-ci/pr-5.9-dependency-debt-sweep.md) | debt sweep: commit_ts TODO, object_store advisories, DuckDB next-LTS bump | Open Q4(b) / proto §4 |
+| ✅ | [5.9](./phase-5-performance-and-ci/pr-5.9-dependency-debt-sweep.md) | debt sweep: commit_ts TODO, object_store advisories, DuckDB next-LTS bump | Open Q4(b) / proto §4 |
 
 ---
 

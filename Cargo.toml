@@ -36,6 +36,9 @@ hex = "0.4"
 # parquet, and duckdb is pinned alongside for a stable read-back. §2.4 uuid.
 arrow = "=54.3.1"
 parquet = "=54.3.1"
+# `1.10504.0` encodes DuckDB engine v1.5.4 (duckdb-rs scheme since v1.5.0: minor=(N/100)%100,
+# patch=N%100). Latest published duckdb-rs, already past the 1.4.x LTS — see the LTS evaluation in
+# docs/implementation/notes/duckdb-lts-bump.md (PR 5.9).
 duckdb = "=1.10504.0"
 uuid = "1"
 tempfile = "3"

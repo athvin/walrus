@@ -63,6 +63,26 @@ impl UtcTimestamp {
             .map_err(|e| Error::Internal(format!("invalid RFC-3339 timestamp {s:?}: {e}")))?;
         Ok(UtcTimestamp(ts))
     }
+
+    /// Build from a pgoutput wire timestamp: **microseconds since 2000-01-01T00:00:00Z** (proto §4) —
+    /// the Postgres epoch, NOT the Unix epoch. Offsets by the fixed 946_684_800 s (2000-01-01 −
+    /// 1970-01-01; Unix time has no leap seconds) and defers to jiff's range check, so a corrupt or
+    /// overflowing frame is a decode error — **never a panic** (PR 5.9; retires the `commit_ts` TODO).
+    pub fn from_pg_micros(pg_micros: i64) -> Result<Self> {
+        // 2000-01-01T00:00:00Z expressed as microseconds since the Unix epoch.
+        const PG_EPOCH_OFFSET_MICROS: i64 = 946_684_800_000_000;
+        let unix_micros = pg_micros
+            .checked_add(PG_EPOCH_OFFSET_MICROS)
+            .ok_or_else(|| {
+                Error::Internal(format!("pgoutput commit_ts overflow: {pg_micros} µs"))
+            })?;
+        let ts = jiff::Timestamp::from_microsecond(unix_micros).map_err(|e| {
+            Error::Internal(format!(
+                "pgoutput commit_ts {pg_micros} µs out of range: {e}"
+            ))
+        })?;
+        Ok(UtcTimestamp(ts))
+    }
 }
 
 impl Serialize for UtcTimestamp {
@@ -326,5 +346,38 @@ mod tests {
                 meta.unchanged_toast
             );
         }
+    }
+
+    #[test]
+    fn pg_epoch_zero_is_y2k() {
+        // pgoutput µs=0 is the Postgres epoch, 2000-01-01T00:00:00Z — NOT the Unix epoch.
+        let ts = UtcTimestamp::from_pg_micros(0).unwrap();
+        assert_eq!(
+            serde_json::to_string(&ts).unwrap(),
+            "\"2000-01-01T00:00:00Z\""
+        );
+    }
+
+    #[test]
+    fn negative_micros_pre_y2k() {
+        // One second before the Postgres epoch.
+        let ts = UtcTimestamp::from_pg_micros(-1_000_000).unwrap();
+        assert_eq!(
+            serde_json::to_string(&ts).unwrap(),
+            "\"1999-12-31T23:59:59Z\""
+        );
+    }
+
+    #[test]
+    fn round_trips_a_known_commit_ts() {
+        // The µs the sink would receive for a real commit time, reconstructed back to the same instant.
+        let want = UtcTimestamp::parse_rfc3339("2026-07-04T12:00:00.123Z").unwrap();
+        let pg_micros = want.0.as_microsecond() - 946_684_800_000_000;
+        assert_eq!(UtcTimestamp::from_pg_micros(pg_micros).unwrap(), want);
+    }
+
+    #[test]
+    fn overflow_is_an_error_not_a_panic() {
+        assert!(UtcTimestamp::from_pg_micros(i64::MAX).is_err());
     }
 }

@@ -199,10 +199,17 @@ async fn large_txn_single_ready_file_only_after_stream_commit() {
                 Message::StreamCommit {
                     xid,
                     commit_lsn: clsn,
+                    commit_ts,
                     ..
                 } => {
                     let objs = demux
-                        .on_stream_commit(*xid, *clsn, &cache, &sink)
+                        .on_stream_commit(
+                            *xid,
+                            *clsn,
+                            common::UtcTimestamp::from_pg_micros(*commit_ts).unwrap(),
+                            &cache,
+                            &sink,
+                        )
                         .await
                         .unwrap();
                     for obj in &objs {
