@@ -1,5 +1,7 @@
 # PR 5.9 — Dependency & debt sweep: commit_ts, object_store advisories, the DuckDB LTS clock
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/90
+
 > **Phase:** 5 — Performance & CI · **Crates touched:** `common`, `pg-sink`, workspace root,
 > `deny.toml` · **Est. size:** M · **Depends on:** PR 5.8 · **Unlocks:** — (phase close)
 
@@ -101,22 +103,25 @@ mod tests {
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `SinkMeta.commit_ts` is the transaction's real commit timestamp (UTC, `Z`) on both the
+- [x] `SinkMeta.commit_ts` is the transaction's real commit timestamp (UTC, `Z`) on both the
       normal and streamed paths; the `consume.rs` TODO is gone; an integration assertion covers it.
-- [ ] `cargo deny check` is green with **both** `quick-xml` ignores removed (the advisories list
-      shrinks; nothing new is ignored to compensate).
-- [ ] All S3-touching integration tests (parquet_put, manifest_insert, durability, spill) pass on
-      the bumped `object_store` against MinIO.
-- [ ] The DuckDB bump either **landed** (conformance + full workspace + compose suites green, pin
-      comments updated) or is **documented** in `notes/duckdb-lts-bump.md` with the exact blocker
-      and the EOL date — one of the two, explicitly.
-- [ ] Every surviving `#[allow(...)]` in touched files has a current justification comment.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test --workspace`
-  - [ ] `cargo deny check`
-  - [ ] compose integration + conformance jobs green
+- [ ] ⚠️ `cargo deny check` green with **both** `quick-xml` ignores removed — **NOT achievable**:
+      no published `object_store` ships quick-xml ≥0.41 (0.11.2→0.37, 0.12.5→0.38, 0.13.2→0.39,
+      each still fires RUSTSEC-2026-0194/0195). Stayed on 0.11.2; `cargo deny check` **is** green
+      with the (evidence-updated) ignores present, nothing new ignored to compensate. See the PR.
+- [ ] ⚠️ S3-touching integration tests on the **bumped** `object_store` — **moot**: no viable bump
+      (see above), so `object_store` is unchanged at 0.11.2. `parquet_put`, `manifest_insert`,
+      `durability`, and the streamed/spill tests all pass on 0.11.2 against MinIO.
+- [x] The DuckDB bump is **documented** in `notes/duckdb-lts-bump.md`: the pin already bundles engine
+      v1.5.4 (latest published duckdb-rs, past the 1.4.x LTS / 2026-09-16 EOL); conformance green —
+      there is no newer release to land, so the "documented" branch applies explicitly.
+- [x] Every surviving `#[allow(...)]` in touched files has a current justification comment.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test --workspace`
+  - [x] `cargo deny check` (green with the justified `quick-xml` ignores retained)
+  - [x] compose integration + conformance jobs green
 
 ## Hints & gotchas
 
