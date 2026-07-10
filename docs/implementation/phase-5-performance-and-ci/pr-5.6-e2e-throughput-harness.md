@@ -1,5 +1,7 @@
 # PR 5.6 — End-to-end throughput harness + the missing lag metric
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/87
+
 > **Phase:** 5 — Performance & CI · **Crates touched:** `loader`, `common` (one metric), `scripts/`,
 > `justfile` · **Est. size:** M–L · **Depends on:** PR 5.5 · **Unlocks:** PR 5.7
 
@@ -109,20 +111,21 @@ metrics::gauge!("walrus_loader_raw_append_lag_bytes", "table" => plan.table.clon
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `walrus_loader_raw_append_lag_bytes{table}` is computed every Phase-A poll, is 0 on an empty
-      queue, and appears in the loader `/metrics` scrape test.
-- [ ] `just bench-e2e mixed` runs unattended on a laptop with docker: boots the stack, applies
+- [x] `walrus_loader_raw_append_lag_bytes{table}` is computed every Phase-A poll, is 0 on an empty
+      queue (pure unit test), and appears in the loader `/metrics` scrape test (via `LOADER_ALL`).
+- [x] `just bench-e2e mixed` runs unattended on a laptop with docker: boots the stack, applies
       load, drains, prints the summary, tears down — exit 0.
-- [ ] All three scenarios work; `large_txn` demonstrably streams (sink logs Stream frames /
-      `walrus_sink_spill_total` moves if the inflight ceiling is set low for the run).
-- [ ] `docs/benchmarks.md` gains one recorded run per scenario (rows/s per stage, latency, lag
-      curves) and a written **bottleneck ranking** naming what saturates first with evidence.
-- [ ] The harness uses release binaries (a debug-build measurement is a bug, not a baseline).
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test --workspace`
-  - [ ] `docker compose up --wait` + the amended loader metrics-scrape integration test
+- [x] All three scenarios work; `large_txn` demonstrably streams (`walrus_sink_spill_total` 0→5
+      under the 4 MB inflight ceiling).
+- [x] `docs/benchmarks.md` gains one recorded run per scenario (rows/s per stage, latency, lag
+      curves) and a written **bottleneck ranking** (the loader saturates first; evidence in the table).
+- [x] The harness uses release binaries (`cargo build --release` then the release binaries).
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test --workspace`
+  - [x] `docker compose up --wait` + the loader metrics-scrape test + the `phase_a` compose test
+        (exercises the new queries) + `sqlx prepare --check`
 
 ## Hints & gotchas
 
