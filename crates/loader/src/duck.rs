@@ -6,11 +6,21 @@
 use crate::error::LoaderError;
 use crate::plan::TablePlan;
 use common::PgRelation;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 /// Owns one table's `.duckdb` connection (mirror `<table>` + CDC log `<table>_raw`).
 pub struct TableDb {
     conn: duckdb::Connection,
+    /// Parquet column lists by `schema_version` (PR 5.8). A version's file shape is immutable — the
+    /// sink's homogeneous-file rule (walrus-pg-sink §3.5) cuts a fresh file at every DDL bump, so all
+    /// files at one version share their columns and a DDL bump is a *new* key. So this cache never
+    /// invalidates, and a Phase-A cycle claiming N same-version files runs one `DESCRIBE`, not N.
+    /// `RefCell` for interior mutability: `TableDb` is used single-threaded (DuckDB `Connection` is
+    /// `!Send`, one per apply worker on a `LocalSet`).
+    parquet_cols: RefCell<HashMap<i64, Arc<Vec<String>>>>,
 }
 
 impl TableDb {
@@ -19,7 +29,10 @@ impl TableDb {
     pub fn open(path: &Path) -> Result<Self, LoaderError> {
         let conn = duckdb::Connection::open(path)
             .map_err(|e| LoaderError::Duck(format!("open {}: {e}", path.display())))?;
-        Ok(TableDb { conn })
+        Ok(TableDb {
+            conn,
+            parquet_cols: RefCell::new(HashMap::new()),
+        })
     }
 
     /// `CREATE TABLE IF NOT EXISTS` for BOTH the mirror `<table>` and the CDC log `<table>_raw`
@@ -146,6 +159,7 @@ impl TableDb {
         &self,
         table: &str,
         s3_uri: &str,
+        schema_version: i64,
         commit_lsn_override: Option<&str>,
     ) -> Result<u64, LoaderError> {
         let uri = s3_uri.replace('\'', "''");
@@ -154,7 +168,8 @@ impl TableDb {
         // promoted columns), while the homogeneous file carries it in source order — a positional
         // `SELECT *` would then shift the promoted extracts by one. An explicit column list also lets an
         // OLDER-version file (fewer columns) NULL-fill the columns a later version added.
-        let file_cols = self.parquet_columns(&uri)?;
+        // The list is cached per `schema_version` (PR 5.8) — introspected once, not per file.
+        let file_cols = self.columns_for(&uri, schema_version)?;
         let quoted = file_cols
             .iter()
             .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
@@ -180,6 +195,25 @@ impl TableDb {
             .execute(&sql, [])
             .map_err(|e| LoaderError::Duck(format!("append {s3_uri} → {table}_raw: {e}")))?;
         Ok(n as u64)
+    }
+
+    /// The Parquet column list for `schema_version`, introspecting `uri` **once** per version and
+    /// caching it (PR 5.8; sound by the homogeneous-file rule — see [`TableDb::parquet_cols`]).
+    fn columns_for(&self, uri: &str, schema_version: i64) -> Result<Arc<Vec<String>>, LoaderError> {
+        if let Some(cols) = self.parquet_cols.borrow().get(&schema_version) {
+            return Ok(Arc::clone(cols));
+        }
+        let cols = Arc::new(self.parquet_columns(uri)?);
+        self.parquet_cols
+            .borrow_mut()
+            .insert(schema_version, Arc::clone(&cols));
+        Ok(cols)
+    }
+
+    /// Number of distinct `schema_version`s whose column list is cached — test probe for PR 5.8.
+    #[cfg(test)]
+    pub fn cached_schema_versions(&self) -> usize {
+        self.parquet_cols.borrow().len()
     }
 
     /// The column names of a staged Parquet file, in file order (source columns + `walrus_pg_sink_meta`).
@@ -398,7 +432,9 @@ mod tests {
         let placeholder = "0000000000000064";
         let lsn_end = "00000000000000C8";
         let spill = write_local_fixture(&dir, "spill.parquet", (1, 2), placeholder);
-        let n = db.append_parquet("orders", &spill, Some(lsn_end)).unwrap();
+        let n = db
+            .append_parquet("orders", &spill, 1, Some(lsn_end))
+            .unwrap();
         assert_eq!(n, 2);
         assert_eq!(
             commit_lsns(&db, (1, 2)),
@@ -408,12 +444,19 @@ mod tests {
 
         // A non-spill (verbatim) file: the per-row placeholder is preserved.
         let batch = write_local_fixture(&dir, "batch.parquet", (3, 4), placeholder);
-        let n = db.append_parquet("orders", &batch, None).unwrap();
+        let n = db.append_parquet("orders", &batch, 1, None).unwrap();
         assert_eq!(n, 2);
         assert_eq!(
             commit_lsns(&db, (3, 4)),
             vec![placeholder, placeholder],
             "a non-spill file keeps its verbatim per-row commit_lsn"
+        );
+
+        // PR 5.8: both files are schema_version 1 → the column list is DESCRIBEd once, cached, reused.
+        assert_eq!(
+            db.cached_schema_versions(),
+            1,
+            "two v1 files → one cached introspection, not per-file"
         );
     }
 }

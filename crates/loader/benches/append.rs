@@ -120,7 +120,7 @@ fn bench_append(c: &mut Criterion) {
                     db.ensure_tables(rel, 1).unwrap();
                     db
                 },
-                |db| black_box(db.append_parquet("orders", &uri, None).unwrap()),
+                |db| black_box(db.append_parquet("orders", &uri, 1, None).unwrap()),
                 BatchSize::PerIteration,
             );
         });
