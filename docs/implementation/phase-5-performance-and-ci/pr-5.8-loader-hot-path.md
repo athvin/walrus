@@ -1,5 +1,7 @@
 # PR 5.8 — Loader hot-path cleanup: DESCRIBE cache + TOAST back-scan, if the numbers say so
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/89
+
 > **Phase:** 5 — Performance & CI · **Crates touched:** `loader` · **Est. size:** M ·
 > **Depends on:** PR 5.7 · **Unlocks:** PR 5.9
 
@@ -106,21 +108,19 @@ impl TableDb {
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `append_parquet` introspects each `(table, schema_version)` **once**; a Phase-A cycle
-      claiming N same-version files runs exactly one introspection (asserted by a test, e.g.
-      counting via a probe or verifying the cache is populated after the first file).
-- [ ] If the back-scan rewrite landed: the full existing TOAST test matrix passes unchanged
-      (same-batch INSERT→update, pruned-value-via-mirror fallback, multi-column sentinels), plus at
-      least one new equivalence case seeded to distinguish the old and new SQL if they diverged.
-- [ ] If the rewrite was declined: `docs/benchmarks.md` records the measured share and the
-      decision.
-- [ ] The window-rescan audit conclusion is written down (O(tail) confirmed or a finding filed).
-- [ ] Before/after deltas for everything landed, in `docs/benchmarks.md` §History.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test --workspace` (the hermetic transform suite is the main oracle)
-  - [ ] compose integration: loader Phase A/B tests + the e2e unchanged-TOAST test
+- [x] `append_parquet` introspects each `(table, schema_version)` **once** — asserted in
+      `duck::tests::spill_override_…` (two v1 files → `cached_schema_versions() == 1`).
+- [x] Back-scan rewrite **declined** — n/a (no rewrite landed; the existing TOAST test matrix is
+      untouched and still green).
+- [x] The rewrite was declined: `docs/benchmarks.md` records the measured share (≈0, decorrelated)
+      and the decision.
+- [x] The window-rescan audit conclusion is written down (O(tail) confirmed from the 5.5 grid).
+- [x] Before/after deltas for everything landed, in `docs/benchmarks.md` §History.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test --workspace` (the hermetic transform suite is the main oracle)
+  - [x] compose integration: loader Phase A/B tests + the e2e unchanged-TOAST test (CI green)
 
 ## Hints & gotchas
 
