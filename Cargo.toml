@@ -55,3 +55,11 @@ metrics-exporter-prometheus = { version = "0.15", default-features = false }
 # the stdout stats, not the HTML plots, and a lean dev-dep tree (this phase is about *cutting* build
 # cost). `cargo_bench_support` is what makes `harness = false` + `criterion_main!` run under `cargo bench`.
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+# Release-artifact tuning (PR 5.7). Thin LTO inlines across crate boundaries — a real win on the
+# dispatch-heavy hot paths (Arrow `append_value` downcasts, the decoder match arms) for ~10-20 % extra
+# link time, measured on the PR 5.4 suite. `codegen-units` is left at the default: cgu=1 buys only a
+# few percent more for ~2× the release build — a bad trade for a project whose Phase-5 north star is
+# *cutting* CI/Docker build time (PRs 5.1-5.3), and the bench inherits `release` so the numbers count.
+[profile.release]
+lto = "thin"

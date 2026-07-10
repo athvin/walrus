@@ -116,6 +116,81 @@ pub struct SinkMeta {
     pub sink_processed_at: UtcTimestamp,
 }
 
+// --- amortized serialization (PR 5.7) -------------------------------------------------------------
+//
+// The meta column dominates `append_row` (PR 5.4: `serde_json::to_string(SinkMeta)` ≈ 576 ns/row,
+// ~91 % of the narrow-row cost). Within one sealed Parquet file the *batch-constant* fields never
+// change, so the batcher serializes them ONCE and, per row, serializes only the varying fields —
+// splicing the two into `{const,row}`. Byte-equivalence with `to_string(SinkMeta)` is guaranteed by
+// construction: these borrow structs carry the identical field names and types (no serde attributes
+// on `SinkMeta`), so each field serializes exactly as before; only the key ORDER shifts, and the
+// loader parses by key (`$.op`, …), never by position. Proven by `amortized_meta_matches_full`.
+
+/// The batch-constant subset of [`SinkMeta`] — the same for every row of one sealed file.
+#[derive(Serialize)]
+struct MetaConst<'a> {
+    epoch: i64,
+    batch_id: &'a str,
+    schema_version: i64,
+    source_schema: &'a str,
+    source_table: &'a str,
+    kind: &'a Kind,
+    sink_instance: &'a str,
+}
+
+/// The per-row subset of [`SinkMeta`].
+#[derive(Serialize)]
+struct MetaRow<'a> {
+    op: &'a Op,
+    lsn: &'a Lsn,
+    commit_lsn: &'a Lsn,
+    commit_ts: &'a UtcTimestamp,
+    xid: u32,
+    unchanged_toast: &'a [String],
+    sink_processed_at: &'a UtcTimestamp,
+}
+
+/// The inner of a serialized JSON object (`{…}`) with the braces removed. Both fragments are
+/// non-empty structs, so the output is always `{…}` and this never underflows.
+fn object_inner(s: &str) -> &str {
+    s.get(1..s.len().saturating_sub(1)).unwrap_or("")
+}
+
+impl SinkMeta {
+    /// The batch-constant fields as a brace-less JSON fragment (e.g. `"epoch":7,"batch_id":"…",…`),
+    /// serialized once per sealed batch and cached by the batcher.
+    pub fn const_json_inner(&self) -> std::result::Result<String, serde_json::Error> {
+        let s = serde_json::to_string(&MetaConst {
+            epoch: self.epoch,
+            batch_id: &self.batch_id,
+            schema_version: self.schema_version,
+            source_schema: &self.source_schema,
+            source_table: &self.source_table,
+            kind: &self.kind,
+            sink_instance: &self.sink_instance,
+        })?;
+        Ok(object_inner(&s).to_string())
+    }
+
+    /// Append the per-row fields (brace-less) to `buf`; the batcher wraps `{const,row}` around them.
+    pub fn write_row_json_inner(
+        &self,
+        buf: &mut String,
+    ) -> std::result::Result<(), serde_json::Error> {
+        let s = serde_json::to_string(&MetaRow {
+            op: &self.op,
+            lsn: &self.lsn,
+            commit_lsn: &self.commit_lsn,
+            commit_ts: &self.commit_ts,
+            xid: self.xid,
+            unchanged_toast: &self.unchanged_toast,
+            sink_processed_at: &self.sink_processed_at,
+        })?;
+        buf.push_str(object_inner(&s));
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,5 +299,32 @@ mod tests {
         assert_eq!(meta.batch_id, "3f2a0000-0000-0000-0000-000000000001");
         assert_eq!(meta.schema_version, 12);
         assert_eq!(meta.sink_instance, "walrus-pg-sink-0");
+    }
+
+    #[test]
+    fn amortized_meta_matches_full() {
+        // The amortized `{const,row}` splice (PR 5.7) must be byte-equivalent (key order aside) to
+        // `serde_json::to_string(SinkMeta)` — with AND without unchanged-TOAST columns.
+        let base: SinkMeta = serde_json::from_str(DOCS_EXAMPLE).unwrap();
+        for toast in [vec!["blob_col".to_string()], Vec::new()] {
+            let meta = SinkMeta {
+                unchanged_toast: toast,
+                ..base.clone()
+            };
+            let mut buf = String::from("{");
+            buf.push_str(&meta.const_json_inner().unwrap());
+            buf.push(',');
+            meta.write_row_json_inner(&mut buf).unwrap();
+            buf.push('}');
+
+            let amortized: serde_json::Value = serde_json::from_str(&buf).unwrap();
+            let full: serde_json::Value =
+                serde_json::from_str(&serde_json::to_string(&meta).unwrap()).unwrap();
+            assert_eq!(
+                amortized, full,
+                "amortized meta ≠ full for unchanged_toast={:?}",
+                meta.unchanged_toast
+            );
+        }
     }
 }
