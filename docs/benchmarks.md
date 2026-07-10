@@ -94,6 +94,79 @@ batch-constant). That 576 ns is **~91 % of `append_row/narrow_int4` (634 ns), ~7
 and ~58 % of `wide30`.** Amortising the batch-constant part of the meta JSON is the single biggest
 sink hot-path win available — PR 5.7's primary target.
 
+## Baselines (PR 5.5) — the loader
+
+All against an **in-memory DuckDB** with `SET threads = 4` (pinned), seeded via one
+`INSERT … SELECT range(N)` per iteration (individual inserts would dwarf the measured transform).
+`sample_size = 10` for the multi-hundred-ms benches. The transform benches run the **production**
+SQL (`loader::transform::apply_transform` over `TransformSql`) — one source of truth with the tests.
+`crates/loader/benches/transform.rs`, `append.rs`.
+
+### Transform scaling (N events over N/K PKs, K events/PK)
+
+| N | K=1 (median · rows/s) | K=10 (median · rows/s) |
+|---:|---|---|
+| 10 000 | 29.3 ms · 342 K | 25.1 ms · 399 K |
+| 100 000 | 98.9 ms · 1.01 M | 57.4 ms · 1.74 M |
+| 1 000 000 | 473.9 ms · 2.11 M | 249.8 ms · 4.00 M |
+
+**Reading it.** Two clean signals: (1) **throughput rises with N** (342 K → 1.01 M → 2.11 M rows/s at
+K=1) as fixed per-cycle overhead amortises — the transform is **O(new events)** as designed
+(`docs/walrus-loader.md` §6.3); no superlinear term appears. (2) **K=10 is ~2× faster than K=1 at the
+same N** (250 ms vs 474 ms at 1M) — because the window collapses 10 events → 1 winner per PK, so cost
+tracks the **distinct-PK winner count** (the MERGE side), not the raw event count. Churny tables
+(high K) are cheaper per event, not costlier.
+
+### Unchanged-TOAST back-scan (isolated) — 100k rows, 50k PKs, K=2
+
+| variant | median |
+|---|---:|
+| no TOAST sentinels | 138.5 ms |
+| sentinels on 3 cols, 30 % of winners | 135.1 ms |
+| **back-scan delta** | **≈ 0 (within noise)** |
+
+**The back-scan is not a bottleneck.** Same rows/PKs/LSNs; only the winner's `unchanged_toast` meta
+varies. The delta is within the confidence intervals. `EXPLAIN ANALYZE` (below) shows why: DuckDB
+**decorrelates** the per-column correlated subquery into a single `LEFT_DELIM_JOIN`, not a per-row
+loop. **Go/no-go for PR 5.8: do NOT rewrite the back-scan** — DuckDB already handles it; confirm with
+`EXPLAIN ANALYZE` before touching it.
+
+### Mirror-size sensitivity (100k-row tail)
+
+| mirror | median |
+|---|---:|
+| empty | 100.3 ms |
+| 1 000 000 rows pre-seeded | 106.0 ms |
+
+Only **~6 % slower** merging into a 1M-row mirror — the `MERGE` join is PK-index-bounded, not a full
+scan. Mirror size is not a hot-path concern.
+
+### Phase-A append (`append_parquet` from a local file — no MinIO) — 50k rows
+
+| bench | median | rows/s |
+|---|---:|---:|
+| `append_parquet/narrow` (3 cols) | 103.1 ms | 485 K |
+| `append_parquet/wide` (30 cols) | 174.8 ms | 286 K |
+| `parquet_describe/narrow` (per-file DESCRIBE) | 9.94 ms | — |
+| `parquet_describe/wide` | 10.19 ms | — |
+
+The per-file `DESCRIBE` introspection is a **fixed ~10 ms/file** (independent of width) — **~10 % of a
+narrow-file append**, and paid once per manifest file regardless of row count. Caching the DESCRIBE
+per `(table, schema_version)` is a candidate PR 5.8 win where files are small/many.
+
+### `EXPLAIN ANALYZE` — the 1M-row transform (K=1), which operators dominate
+
+The production SQL is two statements. Rendered + profiled (single run; profiling inflates absolute
+time — read the **shape**, not the total):
+
+- **Step 1+2 — dedup + TOAST-resolve + mirror LEFT JOIN → `_batch`** (the heavy step):
+  `WINDOW` (row_number over 1M raw) → `HASH_GROUP_BY` → `LEFT_DELIM_JOIN` (the **decorrelated** TOAST
+  back-scan) → `HASH_JOIN` (LEFT, mirror). The window/group-by + delim-join dominate.
+- **Step 3 — `MERGE_INTO`** (`HASH_JOIN` of `_batch` to the mirror on the PK): ~1/7 the time of Step 1+2.
+
+Takeaway: the **window dedup** is the transform's cost centre, not the TOAST back-scan (decorrelated)
+nor the MERGE (index-joined). PR 5.8 should target the window/scan, if anything.
+
 ## History
 
 Before/after deltas from PR 5.7 (sink) and PR 5.8 (loader) land here, each citing the baseline row it
