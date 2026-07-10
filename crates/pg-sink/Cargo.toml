@@ -58,3 +58,10 @@ hex = { workspace = true }
 jiff = { workspace = true }
 # Test-only: name the seam types (ReplicaIdentity, …) the decoder produces when asserting on them.
 common = { path = "../common" }
+# Micro-benches (PR 5.4): pgoutput decode throughput over synthetic frames.
+criterion = { workspace = true }
+
+# `harness = false` hands the bench binary to criterion_main! instead of the libtest bench harness.
+[[bench]]
+name = "decode"
+harness = false

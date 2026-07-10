@@ -1,5 +1,7 @@
 # PR 5.4 — Criterion micro-benches: pgoutput decode + Arrow batch building
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/85
+
 > **Phase:** 5 — Performance & CI · **Crates touched:** `pg-sink`, `pg-to-arrow`, workspace root ·
 > **Est. size:** M · **Depends on:** PR 5.3 · **Unlocks:** PR 5.5
 
@@ -121,19 +123,19 @@ harness = false
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `cargo bench -p pg-sink -p pg-to-arrow` runs to completion locally with stable numbers
+- [x] `cargo bench -p pg-sink -p pg-to-arrow` runs to completion locally with stable numbers
       (criterion's own variance estimates, not gut feel).
-- [ ] Decode benches cover: narrow, wide, text-heavy, and a streamed variant; Arrow benches cover:
+- [x] Decode benches cover: narrow, wide, text-heavy, and a streamed variant; Arrow benches cover:
       the same Tier-1 shapes, a Tier-2 fan-out shape, and the isolated meta-JSON pair.
-- [ ] The meta-JSON pair reads as a direct subtraction (identical benches except the serialization),
-      and the baseline quantifies its share of `append_row` time.
-- [ ] `docs/benchmarks.md` exists with methodology + the full baseline table, units in rows/s.
-- [ ] No production code changed (benches + manifests + docs only).
-- [ ] `just bench` works.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings` (bench targets compile-checked)
-  - [ ] `cargo test --workspace`
+- [x] The meta-JSON pair reads as a direct subtraction (identical benches except the serialization),
+      and the baseline quantifies its share of `append_row` time (≈576 ns/row = 58–91 %).
+- [x] `docs/benchmarks.md` exists with methodology + the full baseline table, units in rows/s.
+- [x] No production code changed (benches + manifests + docs only).
+- [x] `just bench` works.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings` (bench targets compile-checked)
+  - [x] `cargo test --workspace`
 
 ## Hints & gotchas
 

@@ -29,6 +29,12 @@ test:
 it:
     cargo test --workspace --features it
 
+# Criterion micro-benches (sink decode + Arrow batch building — PR 5.4). Run on a quiet machine;
+# results print to stdout. Never a CI gate (shared runners are too noisy) — CI only compile-checks
+# the bench targets via `clippy --all-targets`. Baselines live in docs/benchmarks.md.
+bench:
+    cargo bench -p pg-sink -p pg-to-arrow
+
 # Connectivity smoke: both Postgres instances ready + MinIO health + the walrus bucket exists.
 # Postgres checks run inside the containers (the host needs no postgres-client); MinIO health is
 # hit on the published port.
