@@ -39,6 +39,20 @@ pub struct TableCtx {
 
 /// One Phase-A pass. Returns the max `lsn_end` appended, or `None` if the queue was empty.
 pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
+    // Observability (PR 5.6): set the Phase-A backlog gauge every poll (0 when caught up) —
+    // `max(lsn_end over ready files) − raw_appended_lsn`. Both operands are cheap indexed control-DB
+    // reads; doing this before the claim means idle polls report a truthful 0.
+    let max_ready =
+        control::max_ready_lsn_end(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table).await?;
+    let raw_appended = control::read_checkpoint(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table)
+        .await?
+        .map(|cp| cp.raw_appended_lsn)
+        .unwrap_or(Lsn::ZERO);
+    common::metrics::set_raw_append_lag(
+        &format!("{}.{}", ctx.schema, ctx.table),
+        raw_append_lag_bytes(max_ready, raw_appended),
+    );
+
     // 1. Claim in (lsn_end, id) order — NEVER `lsn_end > raw_appended_lsn` (that skips equal-lsn_end
     //    snapshot files forever).
     let claimed =
@@ -114,4 +128,39 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
         "Phase A: appended to <table>_raw, watermark advanced, queue drained"
     );
     Ok(Some(max_lsn))
+}
+
+/// The raw-append backlog in LSN-bytes: how far the newest ready file's commit LSN leads the Phase-A
+/// frontier. An empty queue (`None`) is 0; a frontier already at/after the head saturates to 0 and
+/// never underflows. This is the value of `walrus_loader_raw_append_lag_bytes` (PR 5.6).
+fn raw_append_lag_bytes(max_ready_lsn_end: Option<Lsn>, raw_appended: Lsn) -> u64 {
+    max_ready_lsn_end.map_or(0, |head| {
+        head.as_u64().saturating_sub(raw_appended.as_u64())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::raw_append_lag_bytes;
+    use common::Lsn;
+
+    #[test]
+    fn empty_queue_is_zero_lag() {
+        assert_eq!(raw_append_lag_bytes(None, Lsn::new(100)), 0);
+    }
+
+    #[test]
+    fn lag_is_head_minus_frontier() {
+        assert_eq!(
+            raw_append_lag_bytes(Some(Lsn::new(500)), Lsn::new(200)),
+            300
+        );
+        assert_eq!(raw_append_lag_bytes(Some(Lsn::new(200)), Lsn::new(200)), 0);
+    }
+
+    #[test]
+    fn frontier_ahead_of_queue_saturates_to_zero() {
+        // A just-advanced frontier can momentarily lead a stale MAX read — never underflow.
+        assert_eq!(raw_append_lag_bytes(Some(Lsn::new(100)), Lsn::new(300)), 0);
+    }
 }

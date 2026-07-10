@@ -19,7 +19,8 @@ pub use checkpoint::{
 pub use db::{connect, run_migrations, ControlError};
 pub use ddl_manifest::{insert_ddl, read_pending_ddl, DdlRow};
 pub use manifest::{
-    claim_ready, delete_claimed, insert_ready, mark_failed, ManifestRow, NewManifestFile,
+    claim_ready, delete_claimed, insert_ready, mark_failed, max_ready_lsn_end, ManifestRow,
+    NewManifestFile,
 };
 pub use replication_state::{bump_epoch, insert_epoch, read_current_epoch, ReplicationState};
 pub use schema_registry::{
