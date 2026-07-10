@@ -1,5 +1,7 @@
 # PR 5.7 — Sink hot-path cleanup: proven bottlenecks only, with before/after numbers
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/88
+
 > **Phase:** 5 — Performance & CI · **Crates touched:** `pg-sink`, `pg-to-arrow`, `common`,
 > workspace root · **Est. size:** M · **Depends on:** PR 5.6 · **Unlocks:** PR 5.8
 
@@ -101,19 +103,21 @@ fn append_meta(&mut self, meta: &SinkMeta) { todo!() }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] Each landed change has a criterion before/after delta in `docs/benchmarks.md`; each skipped
-      candidate has a one-line "measured X%, not taken" note. No unmeasured "optimizations".
-- [ ] A unit test proves new meta JSON ≡ old meta JSON (parse both, compare `serde_json::Value`,
-      for metas with and without `unchanged_toast`).
-- [ ] The golden-vector suite, `pg-sink` integration tests, and the e2e provenance/type-matrix
-      tests pass unchanged — zero behavioural drift.
-- [ ] `[profile.release]` documented in-line: why thin LTO, what cgu setting won, with the numbers.
-- [ ] One 5.6 `mixed` re-run recorded — the micro-wins visible (or honestly not) at system level.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test --workspace`
-  - [ ] compose integration suite green (the sink tests exercise the changed paths live)
+- [x] Each landed change has a criterion before/after delta in `docs/benchmarks.md`; the skipped
+      candidate (clone removal) has a measured-context "not taken" note. No unmeasured "optimizations".
+- [x] A unit test proves new meta JSON ≡ old meta JSON (`amortized_meta_matches_full`: parse both,
+      compare `serde_json::Value`, with and without `unchanged_toast`).
+- [x] The golden-vector suite, `pg-sink` integration tests, and the e2e provenance/type-matrix
+      tests pass unchanged — zero behavioural drift (byte-compatible meta; CI integration+e2e green).
+- [x] `[profile.release]` documented in-line: thin LTO (within-noise on micro-benches, kept for
+      cross-crate inlining), cgu left default (build-time trade), with the numbers.
+- [x] One 5.6 `mixed` re-run recorded — the micro-win is honestly **invisible** at system level (the
+      loader, not the sink, is the limiter).
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test --workspace`
+  - [x] compose integration suite green (the sink tests exercise the changed paths live)
 
 ## Hints & gotchas
 
