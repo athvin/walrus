@@ -274,7 +274,7 @@ before/after delta recorded in `docs/benchmarks.md`. Closes with a dependency/de
 | ✅ | [5.4](./phase-5-performance-and-ci/pr-5.4-bench-sink-decode-arrow.md) | criterion benches: pgoutput decode + Arrow batch build; `docs/benchmarks.md` | proto §4–§8 / sink §2 |
 | ✅ | [5.5](./phase-5-performance-and-ci/pr-5.5-bench-loader-transform.md) | criterion benches: transform scaling, TOAST back-scan, Phase-A append | loader §5–§6, §9.2 |
 | ✅ | [5.6](./phase-5-performance-and-ci/pr-5.6-e2e-throughput-harness.md) | e2e throughput harness + `raw_append_lag_bytes` metric + bottleneck ranking | Observability / loader §9.3 |
-| ☐ | [5.7](./phase-5-performance-and-ci/pr-5.7-sink-hot-path.md) | sink hot-path fixes (meta-JSON amortization, clone removal, release profile) — measured only | §1.4 / benchmarks |
+| ✅ | [5.7](./phase-5-performance-and-ci/pr-5.7-sink-hot-path.md) | sink hot-path fixes (meta-JSON amortization, clone removal, release profile) — measured only | §1.4 / benchmarks |
 | ☐ | [5.8](./phase-5-performance-and-ci/pr-5.8-loader-hot-path.md) | loader hot-path fixes (DESCRIBE cache, TOAST back-scan rewrite) — measured only | loader §5.6 / sink §3.5 |
 | ☐ | [5.9](./phase-5-performance-and-ci/pr-5.9-dependency-debt-sweep.md) | debt sweep: commit_ts TODO, object_store advisories, DuckDB next-LTS bump | Open Q4(b) / proto §4 |
 

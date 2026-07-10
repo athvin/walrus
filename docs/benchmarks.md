@@ -208,6 +208,45 @@ taking. Net: **5.8 for throughput, 5.7 for a low-risk per-row win.**
 Before/after deltas from PR 5.7 (sink) and PR 5.8 (loader) land here, each citing the baseline row it
 improves and the commit that made the change.
 
-_(none yet — PR 5.4 establishes the baseline)_
+### PR 5.7 — sink hot path
+
+**1. Meta-JSON amortization (landed).** `BatchBuilder` now serializes the batch-constant `SinkMeta`
+fields once per sealed file and, per row, serializes only the varying fields, splicing `{const,row}`
+into a reused buffer. Byte-equivalent to `serde_json::to_string(meta)` (key order aside; proven by
+`common::sink_meta::amortized_meta_matches_full`). Measured on the PR 5.4 `append_row` suite (median
+ns/row, same reference machine):
+
+| shape | before (5.4) | after (5.7) | Δ |
+|---|---:|---:|---:|
+| `narrow_int4` | 634 | 460 | **−27.5 %** |
+| `wide30` | 1 001 | 814 | −18.7 % |
+| `text_heavy` | 800 | 616 | −23.0 % |
+| `tier2_fanout` | 1 052 | 837 | −20.4 % |
+
+The win is largest on narrow rows (where meta JSON was ~91 % of `append_row`); it removes ~half the
+~576 ns/row meta cost (the batch-constant half, now cached). `finish` and the decoder benches are
+untouched (within noise).
+
+**2. `[profile.release] lto = "thin"` (landed, honest null on micro-benches).** Isolated on the
+`append_row` suite the delta is **within noise** (−0.8 % to +1 %, mixed sign) — single-crate
+micro-benches don't exercise the cross-crate inlining thin LTO buys. Kept as standard release-artifact
+hygiene (the pg-sink/loader binaries span crates: decode → batch → arrow → parquet); `codegen-units`
+left at default (cgu=1's few-% gain doubles the release build, wrong for a phase whose goal is *cutting*
+build time).
+
+**3. Ownership-taking `push` / clone removal (measured-context defer).** `TableBatcher::push` still
+`to_vec()`s the decoded values, and `on_commit` clones `batch_id` per row. Taking ownership cascades
+into the sink's core decode loop (`route` borrows `&Message`; owning it restructures the loop + both
+call sites + `stream_txn.rs`), and `batch_id → Arc<str>` ripples through every `SinkMeta` construction
+site. **Deferred**: PR 5.6's e2e ranking shows the **sink is not the system bottleneck** (the loader
+is; sink `inflight` stays 0 at 6–7 k rows/s), and the meta-amortization already removed the dominant
+per-row sink cost — so this ordering-sensitive refactor is low-leverage. Recorded here rather than
+taken, per the phase's "measure, don't guess" rule.
+
+**System-level (PR 5.6 `mixed` re-run):** end-to-end throughput is **unchanged** — sink 6 081 rows/s,
+flush 8.0 ms (vs the 5.6 baseline's 6 250 rows/s, 8.2 ms; within run-to-run variance), the loader still
+the bottleneck (`raw_append`+`transform` lag in the MBs, sink `inflight` 0). The `append_row` micro-win
+is real but invisible at the system level **because the sink was never the limiter** — which is exactly
+why candidate 3 (sink clone removal) was deferred to focus PR 5.8 on the loader.
 
 [criterion.rs]: https://bheisler.github.io/criterion.rs/book/

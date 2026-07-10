@@ -76,6 +76,10 @@ pub struct BatchBuilder {
     plan: Vec<Emit>,                      // one per SOURCE column: how its value fans out
     meta: StringBuilder,                  // the trailing walrus_pg_sink_meta column
     rows: usize,
+    /// The batch-constant meta JSON fragment, serialized once from the first row (PR 5.7).
+    meta_const: Option<String>,
+    /// Reused scratch for assembling each row's `{const,row}` meta JSON (avoids a per-row alloc).
+    meta_buf: String,
 }
 
 impl BatchBuilder {
@@ -99,6 +103,8 @@ impl BatchBuilder {
             plan,
             meta: StringBuilder::new(),
             rows: 0,
+            meta_const: None,
+            meta_buf: String::new(),
         })
     }
 
@@ -142,13 +148,32 @@ impl BatchBuilder {
                 }
             }
         }
-        let json = serde_json::to_string(meta).map_err(|e| Error::ValueParse {
+        self.append_meta(meta)?;
+        self.rows += 1;
+        Ok(())
+    }
+
+    /// Append the row's `walrus_pg_sink_meta` JSON, amortizing the batch-constant fields (PR 5.7):
+    /// serialize them once (from the first row), then per row splice `{const,row}` into a reused
+    /// buffer. Byte-equivalent to `serde_json::to_string(meta)` (key order aside) — see
+    /// `common::sink_meta`'s `amortized_meta_matches_full` test.
+    fn append_meta(&mut self, meta: &SinkMeta) -> Result<(), Error> {
+        let meta_err = |e: serde_json::Error| Error::ValueParse {
             column: SINK_META_COLUMN.to_string(),
             value: e.to_string(),
             data_type: "json".to_string(),
-        })?;
-        self.meta.append_value(json);
-        self.rows += 1;
+        };
+        if self.meta_const.is_none() {
+            self.meta_const = Some(meta.const_json_inner().map_err(meta_err)?);
+        }
+        self.meta_buf.clear();
+        self.meta_buf.push('{');
+        self.meta_buf.push_str(self.meta_const.as_deref().unwrap());
+        self.meta_buf.push(',');
+        meta.write_row_json_inner(&mut self.meta_buf)
+            .map_err(meta_err)?;
+        self.meta_buf.push('}');
+        self.meta.append_value(&self.meta_buf);
         Ok(())
     }
 
@@ -1043,7 +1068,12 @@ mod tests {
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
-        assert_eq!(meta_col.value(0), serde_json::to_string(&m).unwrap());
+        // Order-independent: the amortized serialization (PR 5.7) splices batch-constant + per-row
+        // fragments, so the key ORDER may differ from `to_string(SinkMeta)`; the loader parses by key.
+        let got: serde_json::Value = serde_json::from_str(meta_col.value(0)).unwrap();
+        let want: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(got, want);
     }
 
     #[test]
