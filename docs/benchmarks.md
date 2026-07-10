@@ -167,6 +167,42 @@ time — read the **shape**, not the total):
 Takeaway: the **window dedup** is the transform's cost centre, not the TOAST back-scan (decorrelated)
 nor the MERGE (index-joined). PR 5.8 should target the window/scan, if anything.
 
+## End-to-end throughput (PR 5.6) — the system
+
+Where the micro-benches rank suspects inside one process, this measures the whole pipeline on the
+real compose stack (source PG → sink → S3, S3 → loader → mirror), reading the Prometheus metrics as
+probes. Reproduce with `just bench-e2e <scenario>` (local-only; **never a CI job** — numbers are
+hardware-relative). Release binaries; sink knobs `MAX_FILL=2s MAX_ROWS=5000 MAX_BYTES=2MB
+MAX_INFLIGHT=4MB`, loader `POLL_INTERVAL=1s`; reference machine as above.
+
+| scenario | source load | sink rows/s | sink flush (mean) | sink inflight / spill | loader lag peak | first to saturate |
+|---|---|---:|---:|---:|---:|---|
+| `mixed` (i/u/d, 4 clients, 30 s) | 16.8 k tps | 6 250 | 8.2 ms | 0 / 0 | **1.72 MB** | **loader** |
+| `wide_text` (~1 KB notes) | 8.3 k tps | 6 886 | 4.9 ms | 0 / 0 | **11.4 MB** | **loader** |
+| `large_txn` (one 200k-row txn) | 1 txn | 22 222 | 30.4 ms | — / **5** | 0 | sink streams; loader keeps up |
+
+**Bottleneck ranking (what saturates first, with evidence).**
+
+1. **The loader is the system bottleneck under sustained row-at-a-time load.** In `mixed` and
+   `wide_text` the sink never backs up — `walrus_sink_inflight_bytes` stays 0 and `spill_total` = 0 —
+   while the loader's `raw_append_lag_bytes` **and** `transform_lag_bytes` climb into the MBs. The
+   backlog is *transient*, not runaway: both drain to 0 within a few seconds of load stopping. So the
+   loader's per-cycle throughput trails the sink's, but the pipeline is stable.
+2. **Wide rows amplify the loader backlog ~6.6×** (`wide_text` 11.4 MB vs `mixed` 1.72 MB peak lag) —
+   larger per-row payloads hit the loader's per-row transform + append harder, exactly the ops the
+   micro-benches (PR 5.4 `append_row`, PR 5.5 transform) flagged. The sink absorbs the wider rows with
+   *more, smaller* flushes (141 vs 45; mean latency actually drops to 4.9 ms).
+3. **The bulk path is loader-friendly and streams cleanly on the sink.** The 200k-row `large_txn`
+   moves at 22 k rows/s with the loader never lagging (one file → per-file overhead amortised — cf. the
+   PR 5.5 finding that transform cost tracks winner count, not raw rows), and `walrus_sink_spill_total`
+   moves 0 → 5, confirming the txn is decoded **streamed** (reorder buffer spills at
+   `logical_decoding_work_mem=64kB`, past the 4 MB inflight ceiling).
+
+**Where PRs 5.7/5.8 should spend effort:** the loader (PR 5.8) has the higher system-level leverage —
+it saturates first under steady load. The sink (PR 5.7) is not the throughput limiter here, but its
+per-row meta-JSON cost (PR 5.4: ~576 ns/row, batch-constant) is cheap, high-confidence, and worth
+taking. Net: **5.8 for throughput, 5.7 for a low-risk per-row win.**
+
 ## History
 
 Before/after deltas from PR 5.7 (sink) and PR 5.8 (loader) land here, each citing the baseline row it

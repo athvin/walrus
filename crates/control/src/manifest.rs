@@ -102,6 +102,31 @@ pub async fn claim_ready(
     .map_err(ControlError::Connect)
 }
 
+/// The newest `ready` file's commit LSN for a table — the head of the Phase-A backlog — or `None`
+/// when the queue is empty. Powers the `walrus_loader_raw_append_lag_bytes` gauge (PR 5.6): the lag
+/// is this minus `raw_appended_lsn`. `MAX` over an empty set is SQL `NULL` → `None`.
+pub async fn max_ready_lsn_end(
+    executor: impl PgExecutor<'_>,
+    epoch: i64,
+    source_schema: &str,
+    source_table: &str,
+) -> Result<Option<Lsn>, ControlError> {
+    let row = sqlx::query!(
+        r#"
+        SELECT MAX(lsn_end) AS "max_lsn_end: Lsn"
+        FROM walrus.file_manifest
+        WHERE epoch = $1 AND source_schema = $2 AND source_table = $3 AND status = 'ready'
+        "#,
+        epoch,
+        source_schema,
+        source_table,
+    )
+    .fetch_one(executor)
+    .await
+    .map_err(ControlError::Connect)?;
+    Ok(row.max_lsn_end)
+}
+
 /// Retire claimed rows — the queue's "done" is a `DELETE`, not a status flip. Returns the count.
 pub async fn delete_claimed(
     executor: impl PgExecutor<'_>,

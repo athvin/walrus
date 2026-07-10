@@ -35,6 +35,12 @@ it:
 bench:
     cargo bench -p pg-sink -p pg-to-arrow
 
+# End-to-end throughput harness (PR 5.6): boots the compose stack, runs the release sink + loader
+# against it, applies a load scenario, drains, and prints a per-stage summary + bottleneck ranking.
+# LOCAL-ONLY (never a CI job — numbers are hardware-relative). Scenario: mixed | wide_text | large_txn.
+bench-e2e scenario="mixed":
+    bash scripts/bench-e2e.sh {{scenario}}
+
 # Connectivity smoke: both Postgres instances ready + MinIO health + the walrus bucket exists.
 # Postgres checks run inside the containers (the host needs no postgres-client); MinIO health is
 # hit on the published port.
