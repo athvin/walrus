@@ -1,5 +1,7 @@
 # PR 5.5 — Criterion benches: the loader transform + Phase-A append
 
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/86
+
 > **Phase:** 5 — Performance & CI · **Crates touched:** `loader` · **Est. size:** M ·
 > **Depends on:** PR 5.4 · **Unlocks:** PR 5.6
 
@@ -107,19 +109,19 @@ criterion_main!(benches);
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] Transform benches run the **production** SQL template (via `TransformSql`), not a copy — one
+- [x] Transform benches run the **production** SQL template (via `TransformSql`), not a copy — one
       source of truth, same as the unit tests.
-- [ ] Scaling table recorded for N × K grid; the write-up states whether cost is O(tail) as
-      designed (`docs/walrus-loader.md` §6.3) and flags any superlinear term.
-- [ ] The TOAST pair isolates the back-scan cost as a direct delta, and the number is in
-      `docs/benchmarks.md` (this is the go/no-go input for PR 5.8's rewrite).
-- [ ] The append benches separate `read_parquet` ingest from the DESCRIBE introspection line item.
-- [ ] `EXPLAIN ANALYZE` summary of the 1M transform committed alongside the numbers.
-- [ ] No production code changed.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test --workspace`
+- [x] Scaling table recorded for N × K grid; the write-up states cost is O(new events) as designed
+      (`docs/walrus-loader.md` §6.3), no superlinear term (throughput rises with N; K=10 ~2× K=1).
+- [x] The TOAST pair isolates the back-scan cost as a direct delta (≈0, within noise — DuckDB
+      decorrelates it), and the number is in `docs/benchmarks.md` (go/no-go for PR 5.8: don't rewrite).
+- [x] The append benches separate `read_parquet` ingest from the DESCRIBE introspection line item (~10 ms/file).
+- [x] `EXPLAIN ANALYZE` summary of the 1M transform committed alongside the numbers.
+- [x] No production code changed.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test --workspace`
 
 ## Hints & gotchas
 
