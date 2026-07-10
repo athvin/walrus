@@ -420,35 +420,15 @@ jobs:
       # Both images (esp. the loader's bundled-DuckDB build) are large; reclaim runner disk headroom.
       - uses: ./.github/actions/free-disk-space
 
-      # PR 5.3: build via buildx so the Dockerfiles' `--mount=type=cache` mounts work and image layers
-      # persist in the GHA cache (`type=gha`). Cache mounts are NOT part of the layer cache, so
-      # buildkit-cache-dance below persists the cargo registry + target dir separately — that is what
-      # lets a source-only change recompile just the workspace crates and skip the deps + DuckDB build.
+      # PR 5.3: build via buildx with the GHA layer cache. The Dockerfiles use cargo-chef, whose `cook`
+      # layer (all deps incl. the bundled-DuckDB C++ build) is keyed on the workspace Cargo manifests,
+      # so a source-only change is a layer-cache hit and DuckDB is not recompiled. `mode=max` is
+      # essential — it caches the intermediate builder/cook layers, not just the final runtime stage.
+      # (Cache MOUNTS were tried first and dropped: cargo's mtime fingerprinting re-runs the DuckDB
+      # build script after a cache tar-restore, so the C++ build repeated regardless — chef sidesteps
+      # that by using the content-hashed Docker layer cache.)
       - uses: docker/setup-buildx-action@v3
         id: buildx
-
-      - name: Restore the cargo cache-mount dir (registry + target)
-        uses: actions/cache@v4
-        id: docker-cargo-cache
-        with:
-          path: docker-cargo-cache
-          key: docker-cargo-mount-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            docker-cargo-mount-
-
-      # Injects the persisted registry + target into the builder's cache mounts before the builds, and
-      # extracts them back to docker-cargo-cache afterwards (post-step) for actions/cache to save.
-      - name: Inject cargo cache mounts into the builder
-        uses: reproducible-containers/buildkit-cache-dance@v3
-        with:
-          builder: ${{ steps.buildx.outputs.name }}
-          cache-dir: docker-cargo-cache
-          cache-map: |
-            {
-              "cargo-registry": "/usr/local/cargo/registry",
-              "cargo-target": "/src/target"
-            }
-          skip-extraction: ${{ steps.docker-cargo-cache.outputs.cache-hit }}
 
       - name: Build walrus-pg-sink image
         uses: docker/build-push-action@v6
@@ -460,7 +440,7 @@ jobs:
           cache-from: type=gha,scope=pg-sink
           cache-to: type=gha,scope=pg-sink,mode=max
 
-      - name: Build walrus-loader image (bundled DuckDB — cache-warmed)
+      - name: Build walrus-loader image (bundled DuckDB — chef-cooked deps cached)
         uses: docker/build-push-action@v6
         with:
           context: .

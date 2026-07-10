@@ -1,6 +1,9 @@
 # syntax=docker/dockerfile:1
 #
-# Multi-stage image for the `walrus-pg-sink` binary (PR 4.8).
+# Multi-stage image for the `walrus-pg-sink` binary (PR 4.8; cargo-chef caching added in PR 5.3).
+# cargo-chef splits the dependency build into a `cook` layer keyed only on the workspace's Cargo
+# manifests, so a source-only change reuses it from the GHA layer cache (`type=gha,mode=max`) and
+# recompiles just the workspace crates.
 #
 # builder  — compile the release binary against the pinned MSRV toolchain (1.95.0, matching
 #            rust-toolchain.toml so rustup never re-downloads). sqlx runs OFFLINE against the
@@ -10,23 +13,30 @@
 #            SIGKILL the pod mid-drain (walrus-pg-sink §4.5). Under tini the binary is a direct child
 #            and receives SIGTERM itself, so its graceful-drain handler actually runs.
 
+# --- chef ------------------------------------------------------------------
+# The pinned MSRV toolchain + cargo-chef, shared by the planner and builder stages.
+FROM rust:1.95.0-slim-bookworm AS chef
+RUN cargo install cargo-chef --locked
+WORKDIR /src
+
+# --- planner ---------------------------------------------------------------
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
 # --- builder ---------------------------------------------------------------
-FROM rust:1.95.0-slim-bookworm AS builder
+FROM chef AS builder
 # A C/C++ toolchain for the vendored C deps (ring, zstd-sys, …); pkg-config for their build scripts.
 RUN apt-get update && apt-get install -y --no-install-recommends g++ pkg-config \
     && rm -rf /var/lib/apt/lists/*
 # sqlx's query! macros read the committed `.sqlx/` cache instead of connecting to a DB at build time.
 ENV SQLX_OFFLINE=true
-WORKDIR /src
+# Cook only pg-sink's dependencies. Keyed on recipe.json → a source-only change is a layer-cache hit.
+COPY --from=planner /src/recipe.json recipe.json
+RUN cargo chef cook --release -p pg-sink --recipe-path recipe.json
+# Now the real sources; only the workspace crates recompile against the already-cooked deps.
 COPY . .
-# BuildKit cache mounts (PR 5.3): the cargo registry + the target dir persist across builds (via
-# buildkit-cache-dance in CI), so a source-only change recompiles just the workspace crates — the
-# dependencies stay warm. A cache mount's contents never enter the image layer, so the release
-# binary is copied OUT of the mount into /out for the runtime stage to COPY.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
-    cargo build --release -p pg-sink --bin walrus-pg-sink \
- && mkdir -p /out && cp target/release/walrus-pg-sink /out/walrus-pg-sink
+RUN cargo build --release -p pg-sink --bin walrus-pg-sink
 
 # --- runtime ---------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
@@ -34,7 +44,7 @@ FROM debian:bookworm-slim AS runtime
 # bundle the S3/TLS client needs. No build toolchain lands here — the image stays slim.
 RUN apt-get update && apt-get install -y --no-install-recommends tini ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /out/walrus-pg-sink /usr/local/bin/walrus-pg-sink
+COPY --from=builder /src/target/release/walrus-pg-sink /usr/local/bin/walrus-pg-sink
 # EXEC FORM under tini → walrus-pg-sink is tini's direct child (effectively PID 1) and receives
 # SIGTERM directly, never a shell in between. This is the whole reason this Dockerfile exists.
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/walrus-pg-sink"]
