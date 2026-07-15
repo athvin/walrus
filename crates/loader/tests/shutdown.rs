@@ -146,6 +146,7 @@ fn ctx_on(
         compaction_interval: compaction,
         retention_lsn_lag: 16 << 20,
         pause_logged: Default::default(),
+        resync_ids: Default::default(),
     }
 }
 

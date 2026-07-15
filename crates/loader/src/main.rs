@@ -120,6 +120,7 @@ async fn run(cfg: LoaderConfig) -> Result<(), LoaderError> {
                 compaction_interval: cfg.compaction_interval,
                 retention_lsn_lag: cfg.retention_lsn_lag,
                 pause_logged: Default::default(),
+                resync_ids: Default::default(),
             };
             local.spawn_local(loader::apply_loop::apply_loop(ctx, token.clone()))
         })
