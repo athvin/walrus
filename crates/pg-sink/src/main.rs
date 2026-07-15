@@ -137,6 +137,25 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
     // can subscribe while the decode loop resolves.
     let waiters = std::sync::Arc::new(pg_sink::reload_signal::WatermarkWaiters::default());
 
+    // The reload controller (PR 6.4): a side task off the decode path — own connections, polls
+    // table_reload on the heartbeat cadence, schedules exporters under max_concurrent_reloads.
+    let reload_controller = pg_sink::reload::ReloadController::spawn(
+        ctx.control_pool.clone(),
+        &cfg.source_db_url,
+        waiters.clone(),
+        pg_sink::reload::ReloadControllerConfig {
+            poll_interval: cfg.heartbeat_idle_after,
+            max_concurrent_reloads: cfg.max_concurrent_reloads as usize,
+            lease_ttl: cfg.reload_lease_ttl,
+            instance: cfg.instance.clone(),
+            publication_name: cfg.publication_name.clone(),
+            epoch,
+        },
+        token.clone(),
+    )
+    .await
+    .context("spawn reload controller")?;
+
     let result = consume::run_decode_loop(
         &mut stream,
         token.clone(),
@@ -155,9 +174,12 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
     )
     .await;
 
-    // Whatever ended the loop (SIGTERM, stream end, or a decode error), drain the health server.
+    // Whatever ended the loop (SIGTERM, stream end, or a decode error), drain the side tasks.
     state.mark_terminating();
     token.cancel();
+    reload_controller
+        .await
+        .context("reload controller task join")?;
     tracing::info!("draining health server");
     server
         .await

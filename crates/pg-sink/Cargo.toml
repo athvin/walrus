@@ -54,6 +54,8 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 hex = { workspace = true }
+# Test-only: tokio::time::pause via #[tokio::test(start_paused = true)] (the reload lease tests).
+tokio = { workspace = true, features = ["test-util"] }
 # Test-only: the golden-vector renderer converts µs-since-2000 timestamps to Python's isoformat.
 jiff = { workspace = true }
 # Test-only: name the seam types (ReplicaIdentity, …) the decoder produces when asserting on them.
