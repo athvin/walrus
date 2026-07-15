@@ -24,9 +24,11 @@ pub struct CachedRelation {
     pub schema_version: i64,
 }
 
-/// The two walrus-internal source tables: control-plane, never registered or schematised as user data.
+/// The three walrus-internal source tables: control-plane, never registered or schematised as user
+/// data. `reload_signal` (PR 6.3) is consumed for its echo — the chunk watermark — exactly as
+/// `ddl_audit` is consumed for DDL events: never batched, never a Parquet file, never a manifest row.
 pub fn is_internal_table(schema: &str, table: &str) -> bool {
-    schema == "walrus" && (table == "ddl_audit" || table == "heartbeat")
+    schema == "walrus" && (table == "ddl_audit" || table == "heartbeat" || table == "reload_signal")
 }
 
 #[derive(Debug, Default)]
@@ -214,7 +216,12 @@ mod tests {
     fn internal_tables_are_recognised() {
         assert!(is_internal_table("walrus", "heartbeat"));
         assert!(is_internal_table("walrus", "ddl_audit"));
+        assert!(is_internal_table("walrus", "reload_signal"));
         assert!(!is_internal_table("public", "orders"));
+        assert!(
+            !is_internal_table("public", "reload_signal"),
+            "schema-scoped"
+        );
         assert!(!is_internal_table("walrus", "something_else"));
     }
 }

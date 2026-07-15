@@ -41,6 +41,9 @@ pub mod names {
     pub const SINK_PAUSE_POLL_COUNT: &str = "walrus_sink_pause_poll_total";
     pub const SINK_ABORTED_TXN_COUNT: &str = "walrus_sink_aborted_txn_total";
     pub const SINK_FAILED_FILE_COUNT: &str = "walrus_sink_failed_file_total";
+    /// Reload echo cross-check failures (`embedded wal_insert_lsn >= commit LSN`, PR 6.3) — any
+    /// tick means the watermark model is wrong (page severity; PR 6.11 wires the alert).
+    pub const RELOAD_CROSSCHECK_VIOLATIONS: &str = "walrus_reload_crosscheck_violations_total";
 
     // --- loader (per-table; labelled by TABLE_LABEL = "schema.table") ---
     pub const LOADER_FILES_READY: &str = "walrus_loader_files_ready";
@@ -72,6 +75,7 @@ pub mod names {
         SINK_PAUSE_POLL_COUNT,
         SINK_ABORTED_TXN_COUNT,
         SINK_FAILED_FILE_COUNT,
+        RELOAD_CROSSCHECK_VIOLATIONS,
     ];
 
     /// Every per-table loader series, for per-table zero-init + the loader scrape test.
@@ -193,6 +197,11 @@ fn describe_all() {
         names::SINK_FAILED_FILE_COUNT,
         "files that failed to write / PUT"
     );
+    describe_counter!(
+        names::RELOAD_CROSSCHECK_VIOLATIONS,
+        "reload echo cross-check failures (embedded wal_insert_lsn >= commit LSN) — any tick means \
+         the watermark model is wrong"
+    );
 
     describe_gauge!(
         names::LOADER_FILES_READY,
@@ -249,6 +258,12 @@ fn zero_init_global() {
 /// Slot `wal_status` as the categorical gauge (0 reserved / 1 unreserved / 2 lost).
 pub fn set_wal_status(code: u8) {
     metrics::gauge!(names::SINK_WAL_STATUS).set(code as f64);
+}
+
+/// One reload echo cross-check violation (`embedded >= commit`, PR 6.3) — the watermark model is
+/// wrong; the alert on this counter is page severity (PR 6.11).
+pub fn record_reload_crosscheck_violation() {
+    metrics::counter!(names::RELOAD_CROSSCHECK_VIOLATIONS).increment(1);
 }
 
 /// One batch flush: its wall-clock latency and the row count written (Parquet throughput).

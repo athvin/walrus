@@ -275,6 +275,12 @@ jobs:
       - name: Reload signal (compose)
         run: cargo test -p pg-sink --test reload_signal -- --ignored --test-threads=1
 
+      # PR 6.3: echo routing — a manual reload_signal INSERT resolves a subscribed watermark waiter
+      # with the txn's COMMIT LSN (embedded < commit cross-check holds) and never reaches a
+      # batcher / Parquet file / manifest row.
+      - name: Reload echo (compose)
+        run: cargo test -p pg-sink --test reload_echo -- --ignored --test-threads=1
+
       # PR 2.18/2.19: the sink pod-lifecycle shell against the live stack — full bootstrap (control +
       # S3 + source preflight) → /startup→/ready flip, SIGTERM exit 0, missing control DB → exit 11.
       - name: Sink pod-lifecycle smoke (health · SIGTERM · fail-fast exit code)
