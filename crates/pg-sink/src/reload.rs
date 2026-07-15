@@ -175,7 +175,17 @@ async fn export_with_ddl_restarts(
         )
         .await?;
         match exporter.run().await? {
-            RunOutcome::Drained => return Ok(()),
+            RunOutcome::Drained { final_lsn } => {
+                // The sink's last act (PR 6.9 / H10): flip export_complete carrying H. The LOADER
+                // then flips `complete` once transformed_lsn >= H — the sink never writes `complete`.
+                control::reload::complete_export(&pool, req.reload_id, final_lsn).await?;
+                tracing::info!(
+                    reload_id = req.reload_id,
+                    final_lsn = %final_lsn,
+                    "reload export_complete (loader flips complete once transformed_lsn >= H)"
+                );
+                return Ok(());
+            }
             RunOutcome::SchemaChanged { new_version } => {
                 match handle_ddl_restart(&pool, &req, new_version, max_restarts).await? {
                     RestartDecision::Restarted(new_id) => {
@@ -249,6 +259,11 @@ impl ReloadController {
             cfg,
         };
         tokio::spawn(async move {
+            // Startup crash-recovery (PR 6.9): adopt + resume our own / orphaned exporting reloads
+            // ONCE, before the tick loop, unless we're already shutting down.
+            if !token.is_cancelled() {
+                controller.adopt_and_resume().await;
+            }
             let mut tick = tokio::time::interval(controller.cfg.poll_interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -292,6 +307,11 @@ impl ReloadController {
     /// blip) `release_claim`s it back to `requested` for the next tick — an infra failure must
     /// never be recorded as a terminal, operator-misleading preflight rejection.
     async fn tick(&self) -> anyhow::Result<()> {
+        // Surface genuinely stuck exports every tick (PR 6.9) — independent of free permits, and
+        // best-effort so a transient control-pg blip on this read never skips the claim below.
+        if let Err(e) = self.warn_stuck().await {
+            tracing::debug!(error = %e, "stuck-reload scan failed this tick");
+        }
         let free = self.semaphore.available_permits();
         if free == 0 {
             return Ok(());
@@ -365,86 +385,155 @@ impl ReloadController {
                     continue;
                 }
             };
-            let pool = self.pool.clone();
-            let holder = self.cfg.instance.clone();
-            let ttl = self.cfg.lease_ttl;
-            let max_restarts = self.cfg.reload_max_restarts;
-            let child = self.token.child_token();
-            let export_cfg = crate::reload_export::ChunkExportConfig {
-                chunk_rows: self.cfg.chunk_rows,
-                echo_timeout: self.cfg.echo_timeout,
-                instance: self.cfg.instance.clone(),
-                epoch: self.cfg.epoch,
-            };
-            let source_db_url = self.source_db_url.clone();
-            let waiters = self.waiters.clone();
-            let sink = self.sink.clone();
             tracing::info!(
                 reload_id = req.reload_id,
                 source_table = %format_args!("{}.{}", req.source_schema, req.source_table),
                 flavor = req.flavor.as_str(),
                 "reload claimed → exporting; exporter scheduled"
             );
-            tokio::spawn(async move {
-                let _permit = permit;
-                // The lease-renewal target: the export loop repoints this on every DDL-restart, so
-                // renewal follows the lease onto each successor row (PR 6.8).
-                let current_reload_id = Arc::new(AtomicI64::new(req.reload_id));
-                let renew_pool = pool.clone();
-                let renew_id = current_reload_id.clone();
-                // The chunk engine (PR 6.5) under DDL-restart (PR 6.8): dial the side connection,
-                // resume from the cursor, export until drained — restarting at the new schema if
-                // DDL bumps the version mid-export. Echo timeout fails the row inside; any other
-                // error leaves it `exporting` for lease-expiry + PR 6.9's adoption (infra errors
-                // are retried, never terminally mis-recorded).
-                let export = export_with_ddl_restarts(
-                    ExportDeps {
-                        source_db_url,
-                        pool,
-                        waiters,
-                        sink,
-                        export_cfg,
-                    },
-                    req,
-                    max_restarts,
-                    current_reload_id.clone(),
-                );
-                let end = lease_guarded_export(
-                    child,
-                    ttl / 3,
-                    move || {
-                        let pool = renew_pool.clone();
-                        let holder = holder.clone();
-                        let reload_id = renew_id.load(Ordering::SeqCst);
-                        async move {
-                            Ok(control::reload::renew_lease(
-                                &pool,
-                                reload_id,
-                                &holder,
-                                ttl.as_secs() as i64,
-                            )
-                            .await?)
-                        }
-                    },
-                    export,
-                )
-                .await;
-                let reload_id = current_reload_id.load(Ordering::SeqCst);
-                match &end {
-                    ExporterEnd::Cancelled => tracing::info!(
-                        reload_id,
-                        "exporter cancelled (shutdown); row left for startup-scan resume (PR 6.9)"
-                    ),
-                    ExporterEnd::LostLease => tracing::warn!(
-                        reload_id,
-                        "exporter lost its lease; stopping (another holder owns the row now)"
-                    ),
-                    ExporterEnd::Finished(res) => match res {
-                        Ok(()) => tracing::info!(reload_id, "export finished"),
-                        Err(e) => tracing::error!(reload_id, error = %e, "export failed"),
-                    },
+            self.spawn_exporter(req, permit);
+        }
+        Ok(())
+    }
+
+    /// Spawn the lease-guarded exporter for a claimed or adopted reload, holding `permit` inside the
+    /// task so the slot frees on exit. Shared by ordinary pickup ([`tick`]) and crash-recovery
+    /// ([`adopt_and_resume`]) — both hand it a row already `exporting` with a fresh lease.
+    fn spawn_exporter(&self, req: control::ReloadRow, permit: tokio::sync::OwnedSemaphorePermit) {
+        let pool = self.pool.clone();
+        let holder = self.cfg.instance.clone();
+        let ttl = self.cfg.lease_ttl;
+        let max_restarts = self.cfg.reload_max_restarts;
+        let child = self.token.child_token();
+        let export_cfg = crate::reload_export::ChunkExportConfig {
+            chunk_rows: self.cfg.chunk_rows,
+            echo_timeout: self.cfg.echo_timeout,
+            instance: self.cfg.instance.clone(),
+            epoch: self.cfg.epoch,
+        };
+        let source_db_url = self.source_db_url.clone();
+        let waiters = self.waiters.clone();
+        let sink = self.sink.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            // The lease-renewal target: the export loop repoints this on every DDL-restart, so
+            // renewal follows the lease onto each successor row (PR 6.8).
+            let current_reload_id = Arc::new(AtomicI64::new(req.reload_id));
+            let renew_pool = pool.clone();
+            let renew_id = current_reload_id.clone();
+            // The chunk engine (PR 6.5) under DDL-restart (PR 6.8): dial the side connection,
+            // resume from the cursor, export until drained — restarting at the new schema if DDL
+            // bumps the version mid-export, then flipping export_complete (PR 6.9). Echo timeout
+            // fails the row inside; any other error leaves it `exporting` for lease-expiry + PR
+            // 6.9's adoption (infra errors are retried, never terminally mis-recorded).
+            let export = export_with_ddl_restarts(
+                ExportDeps {
+                    source_db_url,
+                    pool,
+                    waiters,
+                    sink,
+                    export_cfg,
+                },
+                req,
+                max_restarts,
+                current_reload_id.clone(),
+            );
+            let end = lease_guarded_export(
+                child,
+                ttl / 3,
+                move || {
+                    let pool = renew_pool.clone();
+                    let holder = holder.clone();
+                    let reload_id = renew_id.load(Ordering::SeqCst);
+                    async move {
+                        Ok(control::reload::renew_lease(
+                            &pool,
+                            reload_id,
+                            &holder,
+                            ttl.as_secs() as i64,
+                        )
+                        .await?)
+                    }
+                },
+                export,
+            )
+            .await;
+            let reload_id = current_reload_id.load(Ordering::SeqCst);
+            match &end {
+                ExporterEnd::Cancelled => tracing::info!(
+                    reload_id,
+                    "exporter cancelled (shutdown); row left for startup-scan resume (PR 6.9)"
+                ),
+                ExporterEnd::LostLease => tracing::warn!(
+                    reload_id,
+                    "exporter lost its lease; stopping (another holder owns the row now)"
+                ),
+                ExporterEnd::Finished(res) => match res {
+                    Ok(()) => tracing::info!(reload_id, "export finished"),
+                    Err(e) => tracing::error!(reload_id, error = %e, "export failed"),
+                },
+            }
+        });
+    }
+
+    /// Startup crash-recovery (PR 6.9 / H7): adopt this sink's own / orphaned `exporting` reloads
+    /// (re-acquiring each lease in a race-safe guarded UPDATE) and resume them from the chunk cursor
+    /// — NOT from WAL redelivery, which is long gone. Runs ONCE before the tick loop: `adopt_resumable`'s
+    /// `lease_holder = me` clause is only safe before any exporter of ours is live (afterwards a live
+    /// row would be re-adopted into a duplicate). Bounded by the free permits, so it never oversubscribes.
+    async fn adopt_and_resume(&self) {
+        let free = self.semaphore.available_permits();
+        if free == 0 {
+            return;
+        }
+        let adopted = match control::reload::adopt_resumable(
+            &self.pool,
+            self.cfg.epoch,
+            &self.cfg.instance,
+            self.cfg.lease_ttl.as_secs() as i64,
+            free as i64,
+        )
+        .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(error = %e, "startup reload-adoption scan failed; requested reloads still pick up per tick");
+                return;
+            }
+        };
+        for req in adopted {
+            let permit = match self.semaphore.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::warn!(
+                        reload_id = req.reload_id,
+                        "no free permit to resume an adopted reload; leaving it (lease re-acquired)"
+                    );
+                    continue;
                 }
-            });
+            };
+            tracing::info!(
+                reload_id = req.reload_id,
+                source_table = %format_args!("{}.{}", req.source_schema, req.source_table),
+                status = req.status.as_str(),
+                cursor_chunk = req.chunk_no,
+                "adopting reload (crash recovery); resuming from the cursor"
+            );
+            self.spawn_exporter(req, permit);
+        }
+    }
+
+    /// Per-tick surfacing (PR 6.9): a genuinely stuck export — `exporting`, lease expired, nobody
+    /// renewing — warns each tick with its id and last holder. The alert rule is PR 6.11's.
+    async fn warn_stuck(&self) -> anyhow::Result<()> {
+        for (reload_id, holder) in
+            control::reload::stuck_exporting(&self.pool, self.cfg.epoch).await?
+        {
+            tracing::warn!(
+                reload_id,
+                lease_holder = ?holder,
+                "reload stuck: exporting with an expired, unadopted lease (no live exporter renewing it)"
+            );
         }
         Ok(())
     }

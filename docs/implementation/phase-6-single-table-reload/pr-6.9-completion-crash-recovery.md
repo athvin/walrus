@@ -1,6 +1,6 @@
 # PR 6.9 — completion & crash recovery: `export_complete`, `transformed_lsn ≥ H`, resume
 
-> **Status:** 📋 Planned
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/101
 
 > **Phase:** 6 — single-table reload · **Crates touched:** `pg-sink`, `loader`, `control` ·
 > **Est. size:** M · **Depends on:** PR 6.7 · **Unlocks:** PR 6.10
@@ -106,20 +106,20 @@ async fn complete_waits_for_transformed_lsn_to_reach_h() { todo!() }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] A drained export flips `export_complete` with `final_lsn = H =` the last chunk's watermark;
+- [x] A drained export flips `export_complete` with `final_lsn = H =` the last chunk's watermark;
       the exporter task exits and its concurrency permit frees.
-- [ ] The loader flips `complete` exactly when `transformed_lsn ≥ H` — asserted both ways
+- [x] The loader flips `complete` exactly when `transformed_lsn ≥ H` — asserted both ways
       (holds at `export_complete` while the loader is frozen; flips after it catches up).
-- [ ] SIGKILL mid-export + restart: the reload resumes from the cursor, re-exports nothing at or
+- [x] SIGKILL mid-export + restart: the reload resumes from the cursor, re-exports nothing at or
       before it, and completes — the kill test passes repeatedly (run it 3×; crash timing varies).
-- [ ] Startup adoption is race-safe (guarded UPDATE); a live foreign lease is never stolen.
-- [ ] An expired, unadopted lease warns per tick with the reload_id and holder.
-- [ ] The full status history lands in order; no state is skipped, none flips twice.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink -p loader -p control` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` then `cargo test -p pg-sink --test reload_recovery -- --ignored`
+- [x] Startup adoption is race-safe (guarded UPDATE); a live foreign lease is never stolen.
+- [x] An expired, unadopted lease warns per tick with the reload_id and holder.
+- [x] The full status history lands in order; no state is skipped, none flips twice.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink -p loader -p control` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` then `cargo test -p pg-sink --test reload_recovery -- --ignored`
         asserting both tests above.
 
 ## What completed looks like

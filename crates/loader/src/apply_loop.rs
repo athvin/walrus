@@ -51,6 +51,20 @@ pub async fn apply_loop(ctx: TableCtx, shutdown: CancellationToken) -> Result<()
         // BETWEEN the two phases is absorbed by the next cycle's plain re-run (both idempotent).
         run_phase_a(&ctx).await?;
         run_phase_b(&ctx).await?;
+        // Reload completion (PR 6.9 / H10): AFTER Phase B advanced `transformed_lsn`, flip any
+        // `export_complete` reload for this table to `complete` once the mirror has reached its `H`
+        // (`transformed_lsn >= final_lsn`). One guarded UPDATE joining the checkpoint we just wrote;
+        // a no-op on cycles with no such reload. The loader owns this flip, never the sink (H10).
+        let completed =
+            control::reload::complete_reached(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table)
+                .await?;
+        for reload_id in completed {
+            tracing::info!(
+                table = %format_args!("{}.{}", ctx.schema, ctx.table),
+                reload_id,
+                "reload complete: transformed_lsn reached H"
+            );
+        }
         ctx.state.stamp_poll();
 
         // Compaction on its own cadence, serialized AFTER the apply cycle on this same worker thread — it

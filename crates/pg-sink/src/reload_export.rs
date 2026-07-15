@@ -43,9 +43,11 @@ pub enum ChunkOutcome {
 /// How a whole [`ChunkExporter::run`] ended (PR 6.8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunOutcome {
-    /// The table drained at this attempt's frozen schema — the export is complete (PR 6.9 gives it
-    /// its `export_complete` ending).
-    Drained,
+    /// The table drained at this attempt's frozen schema — the export is done. `final_lsn` is `H`:
+    /// the drain probe's watermark, `>=` every chunk's `L_i` and `>= first_lsn` (LSNs are monotonic
+    /// in the stream). The controller flips `export_complete(H)` (PR 6.9); the loader then flips
+    /// `complete` once `transformed_lsn >= H`.
+    Drained { final_lsn: Lsn },
     /// DDL bumped the table's structural `schema_version` past the frozen one between chunks: this
     /// attempt is invalid and the controller must restart it at `new_version` (reload H9).
     SchemaChanged { new_version: i64 },
@@ -93,6 +95,9 @@ pub struct ChunkExporter {
     cursor: Option<serde_json::Value>,
     /// Chunk 1's `L_1` once frozen (mirrors `table_reload.first_lsn`).
     first_lsn: Option<Lsn>,
+    /// The most recent chunk probe's watermark — `H` on drain (PR 6.9). Set every
+    /// `export_next_chunk` right after the echo, so even an empty drain probe carries a valid `H`.
+    last_lsn: Option<Lsn>,
 }
 
 impl ChunkExporter {
@@ -188,6 +193,7 @@ impl ChunkExporter {
             chunk_no: req.chunk_no,
             cursor: req.cursor_pk.clone(),
             first_lsn: req.first_lsn,
+            last_lsn: None,
         })
     }
 
@@ -227,13 +233,18 @@ impl ChunkExporter {
                     );
                 }
                 ChunkOutcome::Drained { rows } => {
+                    // H = the last probe's watermark (always set: every probe echoes first).
+                    let final_lsn = self
+                        .last_lsn
+                        .expect("a chunk probe set the watermark before draining");
                     tracing::info!(
                         reload_id = self.reload_id,
                         chunk_no = self.chunk_no,
                         rows,
-                        "reload export drained (export_complete lands in PR 6.9)"
+                        final_lsn = %final_lsn,
+                        "reload export drained (controller flips export_complete)"
                     );
-                    return Ok(RunOutcome::Drained);
+                    return Ok(RunOutcome::Drained { final_lsn });
                 }
             }
         }
@@ -322,6 +333,9 @@ impl ChunkExporter {
         let chunk_no = self.chunk_no + 1;
         let echo = self.await_echo(chunk_no).await?;
         let watermark = echo.commit_lsn;
+        // Record the probe's watermark now — even an empty drain (no file, no cursor advance) then
+        // carries a valid `H` (>= first_lsn and every chunk `L_i`, LSNs being monotonic). PR 6.9.
+        self.last_lsn = Some(watermark);
 
         // The chunk read: one short autocommit statement, strictly after the echo was observed.
         let rows = self
