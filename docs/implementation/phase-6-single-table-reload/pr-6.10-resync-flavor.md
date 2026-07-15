@@ -1,6 +1,6 @@
 # PR 6.10 — the `resync` flavor: merge over the live mirror, no pause, no clear
 
-> **Status:** 📋 Planned
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/102
 
 > **Phase:** 6 — single-table reload · **Crates touched:** `pg-sink`, `loader` ·
 > **Est. size:** S · **Depends on:** PR 6.7 · **Unlocks:** PR 6.11
@@ -93,21 +93,21 @@ async fn resync_chunks_flow_through_raw() { todo!() }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `just reload table='public.orders' flavor='resync'` completes the full status walk with no
+- [x] `just reload table='public.orders' flavor='resync'` completes the full status walk with no
       pause, no `CREATE OR REPLACE`, no manifest purge, no meta-latch write.
-- [ ] Stale and missing mirror rows are repaired; the planted phantom row survives — asserted,
+- [x] Stale and missing mirror rows are repaired; the planted phantom row survives — asserted,
       because it is the documented contract.
-- [ ] Concurrent writes during the resync converge exactly as in 6.7's overlap tests (stream
+- [x] Concurrent writes during the resync converge exactly as in 6.7's overlap tests (stream
       beats chunk stamp).
-- [ ] A mid-resync DDL restarts the attempt through 6.8's path unchanged.
-- [ ] Chunk rows appear in `<table>_raw` (the uniform-path decision), and the design doc's §6
+- [x] A mid-resync DDL restarts the attempt through 6.8's path unchanged.
+- [x] Chunk rows appear in `<table>_raw` (the uniform-path decision), and the design doc's §6
       raw-semantics question is marked resolved with a pointer here.
-- [ ] The flavor decision guide exists where operators will find it.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink -p loader` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` then `cargo test -p loader --test reload_resync -- --ignored`
+- [x] The flavor decision guide exists where operators will find it.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink -p loader` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` then `cargo test -p loader --test reload_resync -- --ignored`
         asserting all three tests above.
 
 ## What completed looks like
