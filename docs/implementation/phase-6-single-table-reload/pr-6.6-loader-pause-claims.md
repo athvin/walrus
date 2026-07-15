@@ -1,6 +1,6 @@
 # PR 6.6 — pause the table's claims while a rebuild is in flight
 
-> **Status:** 📋 Planned
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/98
 
 > **Phase:** 6 — single-table reload · **Crates touched:** `control`, `loader` ·
 > **Est. size:** S · **Depends on:** PR 6.1 · **Unlocks:** PR 6.7
@@ -101,22 +101,22 @@ async fn resync_flavor_never_pauses() { todo!() }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] With a `reload`-flavor row in `requested` or `exporting`, `claim_ready` for that table
+- [x] With a `reload`-flavor row in `requested` or `exporting`, `claim_ready` for that table
       returns empty while its `ready` rows keep accumulating; a second table claims normally the
       whole time.
-- [ ] Flipping the reload to `export_complete` (and equally `complete`/`failed`) makes the next
+- [x] Flipping the reload to `export_complete` (and equally `complete`/`failed`) makes the next
       claim return the backlog in unchanged `(lsn_end, id)` order.
-- [ ] A `resync`-flavor row pauses nothing.
-- [ ] The table's checkpoint watermarks simply stop advancing during the pause — no rewind, no
+- [x] A `resync`-flavor row pauses nothing.
+- [x] The table's checkpoint watermarks simply stop advancing during the pause — no rewind, no
       CHECK violation, no special-casing in `checkpoint.rs`.
-- [ ] The loader logs the pause reason once per pause (not once per poll).
-- [ ] Docs/comments carry the why: claiming-then-rebuilding retires post-`W` events the rebuild
+- [x] The loader logs the pause reason once per pause (not once per poll).
+- [x] Docs/comments carry the why: claiming-then-rebuilding retires post-`W` events the rebuild
       can't replay.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p control -p loader` (and `--workspace` stays green); `cargo sqlx prepare --check`
-  - [ ] `docker compose up --wait` then the three `reload_pause` assertions above, `-- --ignored`
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p control -p loader` (and `--workspace` stays green); `cargo sqlx prepare --check`
+  - [x] `docker compose up --wait` then the three `reload_pause` assertions above, `-- --ignored`
 
 ## What completed looks like
 

@@ -84,6 +84,17 @@ pub async fn insert_ready(
 ///
 /// `ORDER BY lsn_end, id` — `id` breaks equal-`lsn_end` ties. There is deliberately **no**
 /// `lsn_end > raw_appended_lsn` predicate: that would skip the equal-`lsn_end` snapshot files.
+///
+/// **The pause predicate (PR 6.6, reload §2/H8):** while a `flavor='reload'` reload is
+/// `requested|exporting`, claiming would apply-and-RETIRE post-`W` stream files into the old
+/// mirror — and the rebuild would then clear that mirror with those events gone from the queue
+/// forever. Not claiming is a complete pause: rows accumulate `ready`, the frontier freezes at
+/// `W`, and the rebuild later replays the world in `(lsn_end, id)` order. The pause lives in the
+/// QUERY (one statement, no check-then-claim TOCTOU) and lifts at `export_complete` — the loader
+/// must claim again to reach the chunk files and trigger the rebuild (PR 6.7); pausing through
+/// `export_complete` would deadlock the reload. `resync` never pauses (H3). The `NOT EXISTS`
+/// probe is served by the `table_reload_one_live` partial index (its predicate
+/// `status NOT IN ('complete','failed')` covers `requested|exporting`).
 pub async fn claim_ready(
     executor: impl PgExecutor<'_>,
     epoch: i64,
@@ -94,12 +105,20 @@ pub async fn claim_ready(
     sqlx::query_as!(
         ManifestRow,
         r#"
-        SELECT id, epoch, source_schema, source_table, s3_uri, kind, row_count,
-               lsn_start AS "lsn_start: Lsn", lsn_end AS "lsn_end: Lsn", schema_version, status,
-               reload_id
-        FROM walrus.file_manifest
-        WHERE epoch = $1 AND source_schema = $2 AND source_table = $3 AND status = 'ready'
-        ORDER BY lsn_end, id
+        SELECT m.id, m.epoch, m.source_schema, m.source_table, m.s3_uri, m.kind, m.row_count,
+               m.lsn_start AS "lsn_start: Lsn", m.lsn_end AS "lsn_end: Lsn", m.schema_version,
+               m.status, m.reload_id
+        FROM walrus.file_manifest m
+        WHERE m.epoch = $1 AND m.source_schema = $2 AND m.source_table = $3 AND m.status = 'ready'
+          AND NOT EXISTS (
+              SELECT 1 FROM walrus.table_reload r
+              WHERE r.epoch = m.epoch
+                AND r.source_schema = m.source_schema
+                AND r.source_table = m.source_table
+                AND r.flavor = 'reload'
+                AND r.status IN ('requested', 'exporting')
+          )
+        ORDER BY m.lsn_end, m.id
         LIMIT $4
         "#,
         epoch,

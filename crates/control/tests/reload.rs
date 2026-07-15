@@ -404,7 +404,11 @@ async fn fail_purges_this_reloads_manifest_rows_only() {
         "stream rows never carry a reload_id"
     );
 
-    // …and the OTHER reload's chunk file is untouched.
+    // …and the OTHER reload's chunk file is untouched. (Its reload is still `exporting`, which
+    // since PR 6.6 pauses claim_ready for that table — flip it to export_complete first, which
+    // doubles as a pause-lift assertion.)
+    let h: Lsn = "0/500".parse().unwrap();
+    reload::complete_export(&mut *tx, r2, h).await.unwrap();
     let customers_left = claim_ready(&mut *tx, epoch, "public", "customers", 100)
         .await
         .unwrap();

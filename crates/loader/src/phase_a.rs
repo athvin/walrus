@@ -35,6 +35,28 @@ pub struct TableCtx {
     pub compaction_interval: Duration,
     /// Raw retention as an LSN-byte lag behind `transformed_lsn` (the prune floor).
     pub retention_lsn_lag: u64,
+    /// The reload_id whose claim pause was already logged (PR 6.6) — a paused table says *why* it
+    /// is idle once per pause, not once per poll. Per-table by construction (one `TableCtx` per
+    /// worker); interior mutability so `run_phase_a(&ctx)` keeps its shared-ref signature.
+    pub pause_logged: std::sync::Mutex<Option<i64>>,
+}
+
+/// The once-per-pause transition: `Some(reload_id)` exactly when a NEW pause begins (a different
+/// reload than last logged, or the first). A lifted pause (no live rebuild) clears the latch so
+/// the next reload logs again.
+pub fn pause_began(logged: &std::sync::Mutex<Option<i64>>, live: Option<i64>) -> Option<i64> {
+    let mut slot = logged.lock().unwrap();
+    match (*slot, live) {
+        (prev, Some(id)) if prev != Some(id) => {
+            *slot = Some(id);
+            Some(id)
+        }
+        (_, None) => {
+            *slot = None;
+            None
+        }
+        _ => None,
+    }
 }
 
 /// One Phase-A pass. Returns the max `lsn_end` appended, or `None` if the queue was empty.
@@ -58,8 +80,29 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     let claimed =
         control::claim_ready(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table, ctx.max_files).await?;
     if claimed.is_empty() {
+        // Distinguish IDLE from PAUSED (PR 6.6): a live rebuild-flavor reload withholds this
+        // table's claims (reload §2 — claiming would retire post-`W` files the rebuild must
+        // replay). Only probe when a backlog exists, and log the reason once per pause.
+        if max_ready.is_some() {
+            let live = control::reload::active_rebuilds(&ctx.pool, ctx.epoch)
+                .await?
+                .into_iter()
+                .find(|r| r.source_schema == ctx.schema && r.source_table == ctx.table)
+                .map(|r| r.reload_id);
+            if let Some(reload_id) = pause_began(&ctx.pause_logged, live) {
+                tracing::info!(
+                    table = %format_args!("{}.{}", ctx.schema, ctx.table),
+                    reload_id,
+                    reason = "rebuild-in-flight",
+                    "claims paused: ready rows accumulate (frontier frozen at W) until export_complete"
+                );
+            }
+        } else {
+            pause_began(&ctx.pause_logged, None); // caught up — clear the latch
+        }
         return Ok(None);
     }
+    pause_began(&ctx.pause_logged, None); // claiming again — any pause has lifted
 
     // 2. Append each file verbatim to <table>_raw (DuckDB auto-commits each statement). Idempotent.
     //    Files are claimed in (lsn_end, id) = commit order, and the sink cuts a fresh homogeneous file at
@@ -144,7 +187,7 @@ fn raw_append_lag_bytes(max_ready_lsn_end: Option<Lsn>, raw_appended: Lsn) -> u6
 
 #[cfg(test)]
 mod tests {
-    use super::raw_append_lag_bytes;
+    use super::{pause_began, raw_append_lag_bytes};
     use common::Lsn;
 
     #[test]
@@ -165,5 +208,31 @@ mod tests {
     fn frontier_ahead_of_queue_saturates_to_zero() {
         // A just-advanced frontier can momentarily lead a stale MAX read — never underflow.
         assert_eq!(raw_append_lag_bytes(Some(Lsn::new(100)), Lsn::new(300)), 0);
+    }
+
+    #[test]
+    fn pause_logs_once_per_pause_and_relatches_on_a_new_reload() {
+        let latch = std::sync::Mutex::new(None);
+        assert_eq!(pause_began(&latch, Some(7)), Some(7), "a new pause logs");
+        assert_eq!(
+            pause_began(&latch, Some(7)),
+            None,
+            "same pause: silent on later polls"
+        );
+        assert_eq!(
+            pause_began(&latch, None),
+            None,
+            "lifted: silent, latch cleared"
+        );
+        assert_eq!(
+            pause_began(&latch, Some(8)),
+            Some(8),
+            "the next reload logs again"
+        );
+        assert_eq!(
+            pause_began(&latch, Some(9)),
+            Some(9),
+            "a superseding reload (a PR 6.8 restart) logs without an intervening lift"
+        );
     }
 }

@@ -145,6 +145,7 @@ fn ctx_on(
         poll_interval: poll,
         compaction_interval: compaction,
         retention_lsn_lag: 16 << 20,
+        pause_logged: Default::default(),
     }
 }
 
