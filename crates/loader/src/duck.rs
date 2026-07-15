@@ -300,6 +300,66 @@ impl TableDb {
         Ok(())
     }
 
+    /// The highest `reload_id` this `.duckdb` has rebuilt for — the H8 idempotency latch (PR 6.7).
+    /// Absent ⇒ 0, so any real (bigserial ≥ 1) reload triggers. `max(v)` yields NULL (→ 0) when
+    /// the key is missing, mirroring [`TableDb::built_epoch`]'s probe-free read.
+    pub fn recorded_reload_id(&self) -> Result<i64, LoaderError> {
+        let v: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT max(v) FROM \"_walrus_meta\" WHERE k = 'reload_id'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| LoaderError::Duck(format!("read recorded reload_id: {e}")))?;
+        Ok(v.unwrap_or(0))
+    }
+
+    /// Latch the reload generation this `.duckdb` is now rebuilt for. With a monotonic bigserial
+    /// id, "latest wins" (H9) is this upsert plus a numeric compare at the trigger.
+    pub fn set_recorded_reload_id(&self, reload_id: i64) -> Result<(), LoaderError> {
+        self.conn
+            .execute(
+                "INSERT INTO \"_walrus_meta\" (k, v) VALUES ('reload_id', ?) \
+                 ON CONFLICT (k) DO UPDATE SET v = excluded.v",
+                duckdb::params![reload_id],
+            )
+            .map_err(|e| LoaderError::Duck(format!("set recorded reload_id: {e}")))?;
+        Ok(())
+    }
+
+    /// The reload rebuild (PR 6.7 / reload H8, §5 step 4): atomically replace BOTH tables at the
+    /// triggering file's `schema_version` — empty, at exactly the shape the attempt's chunks carry
+    /// — then let ordinary Phase A/B replay chunks + post-`W` stream files in `(lsn_end, id)`
+    /// order.
+    ///
+    /// **The raw-history decision (design §6, resolved here):** a rebuild DISCARDS the table's raw
+    /// CDC history in DuckDB by design. The pre-reload raw rows describe the world the clear is
+    /// replacing — replaying them against the rebuilt mirror would resurrect exactly the drift the
+    /// reload exists to kill — and the staged Parquet persists in S3 per its GC policy for
+    /// forensic replay. Acceptable for quarantine recovery, the feature's anchor use case.
+    ///
+    /// `_walrus_meta` survives (the epoch + reload_id latches live there); the schema_version
+    /// watermark is set to the FILE's version explicitly — `ensure_tables_planned`'s seed is
+    /// `ON CONFLICT DO NOTHING` and the pre-rebuild watermark may differ in either direction.
+    pub fn rebuild_for_reload(
+        &self,
+        plan: &TablePlan,
+        schema_version: i64,
+    ) -> Result<(), LoaderError> {
+        let table = &plan.table;
+        self.conn
+            .execute_batch(&format!(
+                "DROP VIEW IF EXISTS \"{table}_current\"; \
+                 DROP TABLE IF EXISTS \"{table}\"; \
+                 DROP TABLE IF EXISTS \"{table}_raw\";"
+            ))
+            .map_err(|e| LoaderError::Duck(format!("reload rebuild drop for {table}: {e}")))?;
+        self.ensure_tables_planned(plan, schema_version)?;
+        self.set_schema_version(schema_version)?;
+        Ok(())
+    }
+
     /// Wipe a retired generation from this `.duckdb` (total-restart, §1.8): drop the user view, the mirror,
     /// the CDC log, and `_walrus_meta`. The caller then re-runs `ensure_tables*` to recreate them empty, so
     /// the fresh new-epoch snapshot re-appends into `<table>_raw` and the transform re-derives `<table>`

@@ -1,6 +1,6 @@
 # PR 6.7 — the rebuild trigger: first `reload` file ⇒ `CREATE OR REPLACE`, latest-id wins
 
-> **Status:** 📋 Planned
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/99
 
 > **Phase:** 6 — single-table reload · **Crates touched:** `loader`, `control` ·
 > **Est. size:** L · **Depends on:** PR 6.5, PR 6.6 · **Unlocks:** PR 6.8
@@ -135,23 +135,23 @@ async fn rebuild_clears_the_lossy_cast_quarantine() { todo!() }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] End-to-end convergence: phantom row killed by the clear, rows updated mid-export end at the
+- [x] End-to-end convergence: phantom row killed by the clear, rows updated mid-export end at the
       stream's newer value (chunk stamp `L_i` loses dedup), rows deleted mid-export are absent,
       a delete for a row the rebuilt mirror never saw no-ops through the MERGE's
       `NOT MATCHED AND op='d'` branch.
-- [ ] The rebuild happens exactly once per reload_id (meta latch) — replaying the same chunk file
+- [x] The rebuild happens exactly once per reload_id (meta latch) — replaying the same chunk file
       after a crash does not re-clear the table.
-- [ ] Superseded pending rows (`lsn_end ≤ first_lsn`, non-reload kinds) are deleted at trigger
+- [x] Superseded pending rows (`lsn_end ≤ first_lsn`, non-reload kinds) are deleted at trigger
       time; stream files with `lsn_end > first_lsn` survive and apply **after** the chunks.
-- [ ] Stale-id files are retired unapplied; `resync`-flavor files never trigger a rebuild.
-- [ ] The quarantine marker clears; the table's watermarks resume from `W` forward — monotonic,
+- [x] Stale-id files are retired unapplied; `resync`-flavor files never trigger a rebuild.
+- [x] The quarantine marker clears; the table's watermarks resume from `W` forward — monotonic,
       no rewind (`checkpoint.rs` untouched).
-- [ ] The raw-history decision is written where raw semantics are documented.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p loader -p control` (and `--workspace` stays green); `cargo sqlx prepare --check`
-  - [ ] `docker compose up --wait` then `cargo test -p loader --test reload_rebuild -- --ignored`
+- [x] The raw-history decision is written where raw semantics are documented.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p loader -p control` (and `--workspace` stays green); `cargo sqlx prepare --check`
+  - [x] `docker compose up --wait` then `cargo test -p loader --test reload_rebuild -- --ignored`
         asserting all four tests above.
 
 ## What completed looks like

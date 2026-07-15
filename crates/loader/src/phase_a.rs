@@ -114,6 +114,19 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     let mut ids = Vec::with_capacity(claimed.len());
     let mut appended = 0u64;
     for f in &claimed {
+        // kind='reload' routing (PR 6.7, H8/H9): greater ⇒ rebuild-then-append; equal ⇒ plain
+        // append (chunks 2…n); less ⇒ a stale attempt's file — retire it unapplied (its id joins
+        // the end-of-batch delete, its lsn_end never advances the frontier, DuckDB is untouched).
+        if f.kind == "reload" && !route_reload_file(ctx, f).await? {
+            tracing::debug!(
+                table = %format_args!("{}.{}", ctx.schema, ctx.table),
+                manifest_id = f.id,
+                stale_reload_id = f.reload_id,
+                "stale reload file retired unapplied (latest-id wins)"
+            );
+            ids.push(f.id);
+            continue;
+        }
         if f.schema_version > ctx.db.schema_version()? {
             if let Err(e) = crate::ddl::reconcile_to_version(
                 &ctx.db,
@@ -174,6 +187,96 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
         "Phase A: appended to <table>_raw, watermark advanced, queue drained"
     );
     Ok(Some(max_lsn))
+}
+
+/// Route one claimed `kind='reload'` file (PR 6.7). Returns `true` to append it, `false` when it
+/// is a STALE attempt's file to retire unapplied.
+///
+/// The trigger's order of operations — rebuild DuckDB → clear quarantine → purge superseded
+/// manifest rows → set the meta latch → (caller) append — is crash-walked as follows: a crash
+/// anywhere BEFORE the latch re-runs the whole trigger on redo, and every step is idempotent
+/// (`CREATE OR REPLACE`-style drop+recreate, the flag clear, the purge). A crash AFTER the latch
+/// but before the append leaves the file still claimed/ready, and the redo takes the
+/// `equal ⇒ append` arm. Nothing needs a rewind: chunk stamps `L_i > W`, so the frozen frontier
+/// only ever moves forward (H8).
+async fn route_reload_file(ctx: &TableCtx, f: &control::ManifestRow) -> Result<bool, LoaderError> {
+    let file_reload_id = f.reload_id.ok_or_else(|| {
+        LoaderError::Internal(format!(
+            "manifest row {} is kind='reload' but carries no reload_id",
+            f.id
+        ))
+    })?;
+    let recorded = ctx.db.recorded_reload_id()?;
+    if file_reload_id < recorded {
+        return Ok(false); // a superseded attempt whose purge raced the claim (H9): retire
+    }
+    if file_reload_id == recorded {
+        return Ok(true); // chunks 2…n of the attempt already rebuilt for
+    }
+
+    // Greater: the first file of a NEW attempt — the rebuild trigger. The reload row carries the
+    // flavor and first_lsn the trigger needs.
+    let row = control::reload::get(&ctx.pool, file_reload_id)
+        .await?
+        .ok_or_else(|| {
+            LoaderError::Internal(format!(
+                "reload {file_reload_id} has chunk files but no table_reload row"
+            ))
+        })?;
+    if row.flavor == control::ReloadFlavor::Resync {
+        // resync merges over the LIVE mirror (H3): no clear, no purge, no latch. PR 6.10
+        // completes the flavor; here the branch must simply never rebuild for it.
+        return Ok(true);
+    }
+    let first_lsn = row.first_lsn.ok_or_else(|| {
+        LoaderError::Internal(format!(
+            "reload {file_reload_id} has chunk files but no first_lsn"
+        ))
+    })?;
+
+    // 1. Rebuild both tables, empty, at the FILE's schema_version (all of an attempt's chunks
+    //    share it by construction — PR 6.8 enforces that across DDL).
+    let plan = plan_at_version(ctx, f.schema_version).await?;
+    ctx.db.rebuild_for_reload(&plan, f.schema_version)?;
+    // 2. The quarantine latch (PR 3.9) clears: the rebuild replaced the data the lossy cast
+    //    could not be applied to — this is the per-table recovery path v1 never had.
+    ctx.state.clear_quarantine();
+    // 3. Purge superseded pending rows: every non-reload file at lsn_end <= first_lsn describes a
+    //    commit the chunks re-cover; applying them after the clear would only churn. Post-`W`
+    //    stream files (lsn_end > first_lsn) survive and apply AFTER the chunks in (lsn_end, id)
+    //    order — the interleave H8 promises.
+    let purged =
+        control::delete_superseded(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table, first_lsn)
+            .await?;
+    // 4. The latch: the rebuild happens exactly once per reload_id — a crash-redo of this same
+    //    file now takes the equal ⇒ append arm and cannot re-clear the table.
+    ctx.db.set_recorded_reload_id(file_reload_id)?;
+    tracing::info!(
+        table = %format_args!("{}.{}", ctx.schema, ctx.table),
+        reload_id = file_reload_id,
+        schema_version = f.schema_version,
+        first_lsn = %first_lsn,
+        purged,
+        "reload rebuild: tables replaced at the attempt's version; superseded rows purged; latch set"
+    );
+    Ok(true)
+}
+
+/// The registry shape at `version` as a [`crate::plan::TablePlan`] (the Tier-2 emit/recombine
+/// path, PR 4.2), falling back to the bootstrap relation's scalar shape for hermetic
+/// single-version setups — `phase_b::current_transform`'s exact precedent.
+async fn plan_at_version(
+    ctx: &TableCtx,
+    version: i64,
+) -> Result<crate::plan::TablePlan, LoaderError> {
+    match control::read_registry(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table, version).await? {
+        Some(r) => {
+            let rel: PgRelation = serde_json::from_value(r.columns)
+                .map_err(|e| LoaderError::Internal(format!("decode registry columns: {e}")))?;
+            Ok(crate::plan::TablePlan::from_registry(&rel, &r.descriptors))
+        }
+        None => Ok(crate::plan::TablePlan::tier1(&ctx.rel)),
+    }
 }
 
 /// The raw-append backlog in LSN-bytes: how far the newest ready file's commit LSN leads the Phase-A
