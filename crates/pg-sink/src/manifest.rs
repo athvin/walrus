@@ -35,6 +35,7 @@ fn to_ready_row(epoch: i64, obj: &WrittenObject) -> control::NewManifestFile {
         lsn_start: obj.lsn_start,
         lsn_end: obj.lsn_end,
         schema_version: obj.schema_version,
+        reload_id: None,
     }
 }
 

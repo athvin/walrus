@@ -130,6 +130,7 @@ async fn setup(epoch: i64) -> (TableCtx, std::path::PathBuf) {
             lsn_start: "0/64".parse().unwrap(),
             lsn_end: "0/64".parse().unwrap(),
             schema_version: 1,
+            reload_id: None,
         },
     )
     .await

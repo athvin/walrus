@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE walrus.table_reload\n        SET status = 'complete', updated_at = now()\n        WHERE reload_id = $1 AND status = 'export_complete'\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ed9ac1fddf34a7541bf1e57f686c1f174102b1934009bf56c1b0cfb3264907aa"
+}

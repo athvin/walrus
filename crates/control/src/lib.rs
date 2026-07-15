@@ -9,6 +9,7 @@ pub mod checkpoint;
 pub mod db;
 pub mod ddl_manifest;
 pub mod manifest;
+pub mod reload;
 pub mod replication_state;
 pub mod schema_registry;
 pub mod table_ownership;
@@ -22,6 +23,10 @@ pub use manifest::{
     claim_ready, delete_claimed, insert_ready, mark_failed, max_ready_lsn_end, ManifestRow,
     NewManifestFile,
 };
+// The reload transition functions stay module-qualified (`reload::request`, `reload::fail`, …):
+// several of their names (`renew_lease`, `complete`, `get`) would collide with or read vaguer
+// than the flat exports above. Only the types go flat.
+pub use reload::{ReloadFlavor, ReloadRow, ReloadStatus};
 pub use replication_state::{bump_epoch, insert_epoch, read_current_epoch, ReplicationState};
 pub use schema_registry::{
     read_all_latest_registry, read_latest_version, read_registry, upsert_registry, RegistryRow,

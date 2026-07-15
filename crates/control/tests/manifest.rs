@@ -36,6 +36,7 @@ fn file(epoch: i64, table: &str, lsn_end: &str) -> NewManifestFile {
         lsn_start: lsn,
         lsn_end: lsn,
         schema_version: 1,
+        reload_id: None,
     }
 }
 

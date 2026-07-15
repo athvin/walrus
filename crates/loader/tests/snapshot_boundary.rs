@@ -111,6 +111,7 @@ async fn insert_file(pool: &sqlx::PgPool, epoch: i64, uri: String, kind: &str, l
             lsn_start: lsn_end.parse().unwrap(),
             lsn_end: lsn_end.parse().unwrap(),
             schema_version: 1,
+            reload_id: None,
         },
     )
     .await

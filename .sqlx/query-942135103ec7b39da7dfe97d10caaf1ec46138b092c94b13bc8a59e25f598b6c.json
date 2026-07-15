@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE walrus.table_reload\n        SET status = 'export_complete', final_lsn = $2, updated_at = now()\n        WHERE reload_id = $1 AND status = 'exporting'\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        {
+          "Custom": {
+            "name": "pg_lsn",
+            "kind": "Simple"
+          }
+        }
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "942135103ec7b39da7dfe97d10caaf1ec46138b092c94b13bc8a59e25f598b6c"
+}

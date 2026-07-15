@@ -298,7 +298,7 @@ state — is the anchor use case and the phase-closing e2e.
 
 | ✅ | PR | Delivers | Design |
 |---|---|---|---|
-| ☐ | [6.1](./phase-6-single-table-reload/pr-6.1-control-table-reload-state-machine.md) | control-pg `table_reload` state machine + manifest `kind='reload'`/`reload_id` | reload §H4/H5/H10 |
+| ✅ | [6.1](./phase-6-single-table-reload/pr-6.1-control-table-reload-state-machine.md) | control-pg `table_reload` state machine + manifest `kind='reload'`/`reload_id` | reload §H4/H5/H10 |
 | ☐ | [6.2](./phase-6-single-table-reload/pr-6.2-source-reload-signal-table.md) | source `walrus.reload_signal` (insert-only, published) + preflight | reload §H1/H5/H11 |
 | ☐ | [6.3](./phase-6-single-table-reload/pr-6.3-sink-echo-routing-watermark.md) | echo routing + watermark waiter (`L_i` = decoded commit LSN) + race note | reload §H1/§6 |
 | ☐ | [6.4](./phase-6-single-table-reload/pr-6.4-sink-reload-controller.md) | reload controller: pickup, preflight, lease, `max_concurrent_reloads` | reload §H6/H7/H11 |
