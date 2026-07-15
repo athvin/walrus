@@ -19,7 +19,6 @@
 //! kept from double-exporting. Noted, deliberately not built (`replicas=1`).
 
 use crate::reload_signal::WatermarkWaiters;
-use control::reload::ReloadFlavor;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,8 +43,6 @@ pub enum PreflightRejection {
     NotPublished(String, String),
     #[error("table {0}.{1} has no primary key")]
     NoPrimaryKey(String, String),
-    #[error("flavor 'resync' lands in PR 6.10")]
-    ResyncNotYetImplemented,
 }
 
 /// Why a lease-guarded exporter ended (see [`lease_guarded_export`]).
@@ -575,11 +572,9 @@ impl ReloadController {
         source: &tokio_postgres::Client,
         req: &control::ReloadRow,
     ) -> Result<(), PreflightOutcome> {
-        if req.flavor == ReloadFlavor::Resync {
-            return Err(PreflightOutcome::Rejected(
-                PreflightRejection::ResyncNotYetImplemented,
-            ));
-        }
+        // Both flavors preflight identically (PR 6.10): in the publication + has a PK. `resync`
+        // needs no special guard — it merges chunks over the live mirror on the loader side, no
+        // pause and no rebuild; only the semantics differ, not the export.
         let published = source
             .query_one(
                 "SELECT EXISTS (SELECT 1 FROM pg_publication_tables
@@ -640,9 +635,6 @@ mod tests {
             PreflightRejection::NoPrimaryKey("public".into(), "keyless".into()).to_string(),
             "table public.keyless has no primary key"
         );
-        assert!(PreflightRejection::ResyncNotYetImplemented
-            .to_string()
-            .contains("PR 6.10"));
     }
 
     #[tokio::test(start_paused = true)]

@@ -177,6 +177,19 @@ for the quarantine case, where the mirror's shape itself is broken. The proposal
 Name both in the state machine; they share all machinery except the clear. Note the pause is needed
 **only** for rebuild — and "pause" costs nothing (H0 above: unclaimed manifest rows just wait).
 
+> **Which flavor? (the operator decision guide — PR 6.10)**
+> - **`resync`** — cheap drift repair. Merges chunks over the *live* mirror, so the table stays
+>   queryable throughout; no pause, no rebuild, raw history preserved. Repairs stale and missing
+>   rows but **tolerates phantoms** (a row that drifted into the mirror and no longer exists upstream
+>   is in no chunk and survives). Reach for it when you suspect the mirror has *fallen behind*.
+> - **`reload`** — the truth reset. Clears and rebuilds the mirror at the current schema, so it also
+>   removes phantoms and is the quarantine-recovery path (a failed lossy `ALTER … TYPE`, PR 3.9). It
+>   pauses the table's claims while exporting (queries see the pre-rebuild mirror until it swaps).
+>   Reach for it when the mirror's *shape or content* is wrong, not merely stale.
+>
+> Rule of thumb: `resync` when you'd tolerate a phantom to keep the table online; `reload` when only
+> a byte-for-byte match will do.
+
 ### H4 — One status row in the source DB, written by three services, is the wrong state store
 
 Layering problems, in increasing severity:
@@ -374,9 +387,12 @@ fan-out can later compose with the CTID-range machinery of
   DBLog) to primary sources; whether any production tool ships the *full-export-plus-overlap*
   design (Airbyte resync, PeerDB, Fivetran, AWS DMS reload-table) went unverified. If precedent
   exists it would argue the simpler shape is shippable; absence of evidence isn't absence.
-- **Raw history semantics after rebuild.** `CREATE OR REPLACE` of `<table>_raw` discards the
-  table's CDC history in DuckDB (S3 Parquet persists subject to GC). Acceptable for quarantine
-  recovery; decide whether `resync` flavor should ever touch raw at all.
+- **Raw history semantics after rebuild.** ✅ **Resolved (PR 6.7 + PR 6.10).** A `reload`'s
+  `CREATE OR REPLACE` of `<table>_raw` discards the table's CDC history in DuckDB (S3 Parquet
+  persists subject to GC) — acceptable for quarantine recovery. A `resync` takes the **uniform Phase
+  A path**: its chunk rows append into `<table>_raw` like any file, so raw history is preserved. One
+  path, no special-casing; see [PR 6.7](./implementation/phase-6-single-table-reload/pr-6.7-loader-rebuild-trigger.md)
+  and [PR 6.10](./implementation/phase-6-single-table-reload/pr-6.10-resync-flavor.md).
 - **Interaction with loader sharding** ([deferred goal §2](./deferred-goals.md#2-multi-pod-loader-table-sharding-horizontal-scale-out)):
   the rebuild trigger runs under the table's ownership lease, so it inherits the fencing story —
   confirm the reload lease and the ownership lease can't deadlock or interleave badly.

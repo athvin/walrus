@@ -136,6 +136,7 @@ async fn setup(epoch: i64) -> (TableCtx, std::path::PathBuf) {
         compaction_interval: Duration::from_secs(3600),
         retention_lsn_lag: 16 << 20,
         pause_logged: Default::default(),
+        resync_ids: Default::default(),
     };
     (ctx, dir)
 }

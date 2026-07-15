@@ -39,6 +39,11 @@ pub struct TableCtx {
     /// is idle once per pause, not once per poll. Per-table by construction (one `TableCtx` per
     /// worker); interior mutability so `run_phase_a(&ctx)` keeps its shared-ref signature.
     pub pause_logged: std::sync::Mutex<Option<i64>>,
+    /// reload_ids already identified as `resync` (PR 6.10). A resync never sets the meta latch, so
+    /// every one of its chunk files would otherwise re-enter `route_reload_file`'s "greater" arm and
+    /// re-fetch the reload row; caching the flavor here makes chunks 2…n a plain append with no
+    /// per-file lookup. Per-table interior mutability, like `pause_logged`.
+    pub resync_ids: std::sync::Mutex<std::collections::HashSet<i64>>,
 }
 
 /// The once-per-pause transition: `Some(reload_id)` exactly when a NEW pause begins (a different
@@ -206,6 +211,12 @@ async fn route_reload_file(ctx: &TableCtx, f: &control::ManifestRow) -> Result<b
             f.id
         ))
     })?;
+    // Fast path (PR 6.10): a resync we've already classified — plain append, no `recorded` read and
+    // no per-file reload-row fetch. A resync never latches, so without this cache every chunk would
+    // re-enter the "greater" arm below and re-fetch.
+    if ctx.resync_ids.lock().unwrap().contains(&file_reload_id) {
+        return Ok(true);
+    }
     let recorded = ctx.db.recorded_reload_id()?;
     if file_reload_id < recorded {
         return Ok(false); // a superseded attempt whose purge raced the claim (H9): retire
@@ -214,8 +225,9 @@ async fn route_reload_file(ctx: &TableCtx, f: &control::ManifestRow) -> Result<b
         return Ok(true); // chunks 2…n of the attempt already rebuilt for
     }
 
-    // Greater: the first file of a NEW attempt — the rebuild trigger. The reload row carries the
-    // flavor and first_lsn the trigger needs.
+    // Greater: the first file of a NEW attempt. The reload row carries the flavor: a `resync` merges
+    // over the LIVE mirror (H3) — no clear, no purge, no latch, and raw history preserved (chunks
+    // flow through Phase A like any file, PR 6.10); only a `reload` triggers the rebuild.
     let row = control::reload::get(&ctx.pool, file_reload_id)
         .await?
         .ok_or_else(|| {
@@ -224,8 +236,7 @@ async fn route_reload_file(ctx: &TableCtx, f: &control::ManifestRow) -> Result<b
             ))
         })?;
     if row.flavor == control::ReloadFlavor::Resync {
-        // resync merges over the LIVE mirror (H3): no clear, no purge, no latch. PR 6.10
-        // completes the flavor; here the branch must simply never rebuild for it.
+        ctx.resync_ids.lock().unwrap().insert(file_reload_id);
         return Ok(true);
     }
     let first_lsn = row.first_lsn.ok_or_else(|| {
