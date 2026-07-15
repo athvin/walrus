@@ -84,6 +84,38 @@ async fn await_status(pool: &sqlx::PgPool, reload_id: i64, want: ReloadStatus) {
     .unwrap_or_else(|_| panic!("reload {reload_id} never reached {want:?}"));
 }
 
+/// The exact SQL `just reload` runs (keep in sync with the justfile recipe): epoch comes from
+/// `MAX(epoch)` over `replication_state`, the table arg splits on the dot. Runs in a rolled-back
+/// transaction so the seeded epoch and the inserted request leave no trace.
+#[tokio::test]
+#[ignore = "requires docker compose up --wait (control PG)"]
+async fn just_reload_recipe_sql_selects_current_epoch_and_parses_table() {
+    let pool = control::connect(&control_url()).await.unwrap();
+    control::run_migrations(&pool).await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO walrus.replication_state (epoch, slot_name, created_lsn, status)
+         VALUES (640004, 'walrus_recipe_test', '0/0', 'streaming')",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    let (epoch, schema, table, flavor): (i64, String, String, String) = sqlx::query_as(
+        "INSERT INTO walrus.table_reload (epoch, source_schema, source_table, flavor) \
+         SELECT COALESCE(MAX(epoch), 1), split_part('public.orders', '.', 1), \
+                split_part('public.orders', '.', 2), 'reload' \
+         FROM walrus.replication_state \
+         RETURNING epoch, source_schema, source_table, flavor",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(epoch, 640_004, "the recipe targets the CURRENT (max) epoch");
+    assert_eq!((schema.as_str(), table.as_str()), ("public", "orders"));
+    assert_eq!(flavor, "reload");
+    tx.rollback().await.unwrap();
+}
+
 async fn lease_expiry_epoch(pool: &sqlx::PgPool, reload_id: i64) -> f64 {
     sqlx::query_scalar::<_, f64>(
         "SELECT extract(epoch FROM lease_expiry)::float8
@@ -112,9 +144,7 @@ async fn pickup_flips_to_exporting_with_a_live_advancing_lease() {
         Arc::new(WatermarkWaiters::default()),
         controller_cfg(epoch, 2),
         token.clone(),
-    )
-    .await
-    .unwrap();
+    );
 
     // `just reload table='public.orders'` — the same INSERT the recipe runs.
     let id = reload::request(&pool, epoch, "public", "orders", ReloadFlavor::Reload)
@@ -174,9 +204,7 @@ async fn preflight_failures_land_in_failed_with_reasons() {
         Arc::new(WatermarkWaiters::default()),
         controller_cfg(epoch, 2),
         token.clone(),
-    )
-    .await
-    .unwrap();
+    );
 
     // (a) Not in the publication (a table that doesn't exist is by definition unpublished).
     let ghost = reload::request(&pool, epoch, "public", "ghost_table", ReloadFlavor::Reload)
@@ -271,9 +299,7 @@ async fn cap_of_two_holds_and_the_stream_keeps_flowing() {
         Arc::new(WatermarkWaiters::default()),
         controller_cfg(epoch, 2),
         token.clone(),
-    )
-    .await
-    .unwrap();
+    );
 
     // Three valid requests, cap two: the third must WAIT (the stub exporters never finish, so a
     // permit never frees — `requested` is exactly where it stays).
@@ -307,6 +333,18 @@ async fn cap_of_two_holds_and_the_stream_keeps_flowing() {
         ReloadStatus::Requested,
         "the third waits for a permit"
     );
+
+    // Free a permit through the SHIPPED path: steal `a`'s lease, so its exporter's next renewal
+    // (≤ 2s) returns false → LostLease → its permit drops → the controller's next tick claims the
+    // third request. This drives lost-lease-cancels-the-exporter AND third-starts-when-a-permit-
+    // frees through the real controller, not a test copy. (Row `a` stays `exporting` under the
+    // thief — from here on 3 rows carry that status, but only 2 are ever OUR exporters.)
+    sqlx::query("UPDATE walrus.table_reload SET lease_holder = 'lease-thief' WHERE reload_id = $1")
+        .bind(a)
+        .execute(&pool)
+        .await
+        .unwrap();
+    await_status(&pool, c, ReloadStatus::Exporting).await;
 
     // The replication stream never paused while the controller worked: a user change written NOW
     // decodes promptly (the controller runs on its own connections, off the decode path).

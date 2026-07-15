@@ -309,6 +309,44 @@ async fn wrong_state_transition_changes_zero_rows() {
 }
 
 #[tokio::test]
+async fn release_claim_returns_the_row_to_the_queue() {
+    let pool = pool().await;
+    let mut tx = pool.begin().await.unwrap();
+    let epoch = 910_005;
+
+    let id = reload::request(&mut *tx, epoch, "public", "orders", ReloadFlavor::Reload)
+        .await
+        .unwrap();
+    reload::claim_requested(&mut *tx, epoch, "sink-a", 60, 10)
+        .await
+        .unwrap();
+
+    // A phantom can't release someone else's claim; releasing a `requested` row is a no-op too.
+    assert!(!reload::release_claim(&mut *tx, id, "sink-zombie")
+        .await
+        .unwrap());
+
+    // The claimant releases: back to `requested`, lease cleared, immediately re-claimable — the
+    // controller's un-claim path for infra failures between claim and exporter spawn (PR 6.4).
+    assert!(reload::release_claim(&mut *tx, id, "sink-a").await.unwrap());
+    let row = reload::get(&mut *tx, id).await.unwrap().unwrap();
+    assert_eq!(row.status, ReloadStatus::Requested);
+    assert_eq!(row.lease_holder, None);
+    assert!(!reload::release_claim(&mut *tx, id, "sink-a").await.unwrap());
+
+    let reclaimed = reload::claim_requested(&mut *tx, epoch, "sink-b", 60, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        reclaimed.iter().map(|r| r.reload_id).collect::<Vec<_>>(),
+        vec![id],
+        "a released claim is re-claimable"
+    );
+
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
 async fn fail_purges_this_reloads_manifest_rows_only() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();

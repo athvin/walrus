@@ -25,6 +25,16 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
+/// A preflight either genuinely REJECTS the request (typed, terminal, operator-facing) or fails
+/// for INFRA reasons (dead connection, timeout) — in which case the claim is released and retried
+/// next tick. Conflating the two would let an idle-connection kill terminally fail a valid
+/// request with a false "not in the publication" reason.
+#[derive(Debug)]
+pub enum PreflightOutcome {
+    Rejected(PreflightRejection),
+    Infra(anyhow::Error),
+}
+
 /// H11's fail-fast request validation: why a request never becomes an export. The reason lands in
 /// `table_reload.error` verbatim, so the operator reads it off the row.
 #[derive(Debug, thiserror::Error)]
@@ -98,11 +108,15 @@ pub struct ReloadControllerConfig {
     pub epoch: i64,
 }
 
-/// Sink-owned reload orchestration (H6). Never on the replication loop's path.
+/// Sink-owned reload orchestration (H6). Never on the replication loop's path — it holds a
+/// cloned handle of the control-pg pool and dials its OWN source connections; the only shared
+/// state is the waiter registry.
 pub struct ReloadController {
     pool: sqlx::PgPool,
-    /// Catalog preflight runs over this ordinary source SQL connection (the heartbeat shape).
-    source: tokio_postgres::Client,
+    /// Catalog preflight dials a FRESH ordinary source connection per non-empty tick: reloads are
+    /// rare operator events, and a held-forever idle client is exactly what proxies/failovers
+    /// silently kill — a dead connection must never masquerade as a preflight rejection.
+    source_db_url: String,
     #[allow(dead_code)] // handed to exporter tasks in PR 6.5 (subscribe-then-insert)
     waiters: Arc<WatermarkWaiters>,
     cfg: ReloadControllerConfig,
@@ -111,33 +125,24 @@ pub struct ReloadController {
 }
 
 impl ReloadController {
-    /// Connect the side SQL connection and spawn the controller task next to the heartbeat.
-    /// Failures inside the task are logged and retried next tick — the controller can degrade,
-    /// never take the sink down.
-    pub async fn spawn(
+    /// Spawn the controller task next to the heartbeat. Failures inside the task are logged and
+    /// retried next tick — the controller can degrade, never take the sink down.
+    pub fn spawn(
         pool: sqlx::PgPool,
         source_db_url: &str,
         waiters: Arc<WatermarkWaiters>,
         cfg: ReloadControllerConfig,
         token: CancellationToken,
-    ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-        let (source, connection) = tokio_postgres::connect(source_db_url, tokio_postgres::NoTls)
-            .await
-            .map_err(|e| anyhow::anyhow!("reload controller source connection: {e}"))?;
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                tracing::warn!(error = %e, "reload controller source connection closed");
-            }
-        });
+    ) -> tokio::task::JoinHandle<()> {
         let controller = ReloadController {
             pool,
-            source,
+            source_db_url: source_db_url.to_string(),
             waiters,
             semaphore: Arc::new(Semaphore::new(cfg.max_concurrent_reloads)),
             token: token.clone(),
             cfg,
         };
-        Ok(tokio::spawn(async move {
+        tokio::spawn(async move {
             let mut tick = tokio::time::interval(controller.cfg.poll_interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -149,23 +154,43 @@ impl ReloadController {
                         return;
                     }
                     _ = tick.tick() => {
-                        if let Err(e) = controller.tick().await {
-                            tracing::warn!(error = %e, "reload controller tick failed; retrying next tick");
+                        // The tick itself races the token too: a wedged claim/preflight must
+                        // never block `handle.await` in the shutdown path. A mid-claim drop can
+                        // leave rows `exporting` with a dying lease — expiry + PR 6.9's adoption
+                        // is the designed net for exactly that.
+                        tokio::select! {
+                            _ = token.cancelled() => {
+                                tracing::info!("reload controller cancelled mid-tick");
+                                return;
+                            }
+                            res = controller.tick() => {
+                                if let Err(e) = res {
+                                    tracing::warn!(error = %e, "reload controller tick failed; retrying next tick");
+                                }
+                            }
                         }
                     }
                 }
             }
-        }))
+        })
     }
 
     /// One tick: claim ≤ free-permit `requested` rows, preflight each, spawn exporters for the
     /// survivors. Claiming only what can run keeps queued requests in `requested`, where another
     /// (future) sink instance — or the next tick — can pick them up.
+    ///
+    /// Error discipline after the claim: **never `?` inside the per-row loop.** The claim already
+    /// flipped every row to `exporting`, so an early return would orphan the siblings — claimed,
+    /// leased, but with no exporter and no way back (`claim_requested` only sees `requested`).
+    /// A typed rejection `fail`s its row; an INFRA error (dead source connection, control-pg
+    /// blip) `release_claim`s it back to `requested` for the next tick — an infra failure must
+    /// never be recorded as a terminal, operator-misleading preflight rejection.
     async fn tick(&self) -> anyhow::Result<()> {
         let free = self.semaphore.available_permits();
         if free == 0 {
             return Ok(());
         }
+        // A single guarded UPDATE: if THIS errors, nothing was claimed — safe to propagate.
         let claimed = control::reload::claim_requested(
             &self.pool,
             self.cfg.epoch,
@@ -174,17 +199,54 @@ impl ReloadController {
             free as i64,
         )
         .await?;
-        for req in claimed {
-            if let Err(rejection) = self.preflight(&req).await {
+        if claimed.is_empty() {
+            return Ok(());
+        }
+        // Fresh preflight connection per non-empty tick (see the field doc). If the SOURCE is
+        // unreachable, no preflight can be trusted: release every claim and retry next tick.
+        let source = match crate::preflight::connect_source(&self.source_db_url).await {
+            Ok(c) => c,
+            Err(e) => {
                 tracing::warn!(
-                    reload_id = req.reload_id,
-                    source_table = %format_args!("{}.{}", req.source_schema, req.source_table),
-                    reason = %rejection,
-                    "reload request rejected at preflight"
+                    error = %e,
+                    claims = claimed.len(),
+                    "preflight source connection failed; releasing claims to retry next tick"
                 );
-                let mut conn = self.pool.acquire().await?;
-                control::reload::fail(&mut conn, req.reload_id, &rejection.to_string()).await?;
-                continue;
+                for req in &claimed {
+                    self.release_row(req).await;
+                }
+                return Ok(());
+            }
+        };
+        for req in claimed {
+            match self.preflight(&source, &req).await {
+                Ok(()) => {}
+                Err(PreflightOutcome::Rejected(rejection)) => {
+                    tracing::warn!(
+                        reload_id = req.reload_id,
+                        source_table = %format_args!("{}.{}", req.source_schema, req.source_table),
+                        reason = %rejection,
+                        "reload request rejected at preflight"
+                    );
+                    if let Err(e) = self.fail_row(req.reload_id, &rejection.to_string()).await {
+                        tracing::error!(
+                            reload_id = req.reload_id,
+                            error = %e,
+                            "could not record the rejection; releasing the claim instead"
+                        );
+                        self.release_row(&req).await;
+                    }
+                    continue;
+                }
+                Err(PreflightOutcome::Infra(e)) => {
+                    tracing::warn!(
+                        reload_id = req.reload_id,
+                        error = %e,
+                        "preflight infra error (NOT a rejection); releasing the claim to retry"
+                    );
+                    self.release_row(&req).await;
+                    continue;
+                }
             }
             // The permit is held INSIDE the spawned task — dropping it on task exit frees the slot.
             let permit = match self.semaphore.clone().try_acquire_owned() {
@@ -249,14 +311,49 @@ impl ReloadController {
         Ok(())
     }
 
-    /// H11, fail-fast: target in the publication, target has a PK, flavor implementable. Runs
-    /// BEFORE a single signal row or chunk is spent on a doomed reload.
-    async fn preflight(&self, req: &control::ReloadRow) -> Result<(), PreflightRejection> {
-        if req.flavor == ReloadFlavor::Resync {
-            return Err(PreflightRejection::ResyncNotYetImplemented);
+    /// Record a typed rejection on the row (its reason IS the operator UX).
+    async fn fail_row(&self, reload_id: i64, reason: &str) -> anyhow::Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        control::reload::fail(&mut conn, reload_id, reason).await?;
+        Ok(())
+    }
+
+    /// Un-claim a row after an infra failure: back to `requested` for the next tick. If even the
+    /// release fails, the row stays `exporting` with a dying lease — expiry + PR 6.9's adoption
+    /// is the recovery net, and the error log is the operator breadcrumb.
+    async fn release_row(&self, req: &control::ReloadRow) {
+        match control::reload::release_claim(&self.pool, req.reload_id, &self.cfg.instance).await {
+            Ok(true) => tracing::info!(
+                reload_id = req.reload_id,
+                "claim released → requested (retried next tick)"
+            ),
+            Ok(false) => tracing::warn!(
+                reload_id = req.reload_id,
+                "claim no longer ours to release; leaving it"
+            ),
+            Err(e) => tracing::error!(
+                reload_id = req.reload_id,
+                error = %e,
+                "release failed; row stays exporting — lease expiry + PR 6.9 adoption recover it"
+            ),
         }
-        let published = self
-            .source
+    }
+
+    /// H11, fail-fast: target in the publication, target has a PK, flavor implementable. Runs
+    /// BEFORE a single signal row or chunk is spent on a doomed reload. A catalog query error is
+    /// an [`PreflightOutcome::Infra`] failure, NEVER a rejection — a dead connection must not
+    /// terminally fail a valid request with a false reason.
+    async fn preflight(
+        &self,
+        source: &tokio_postgres::Client,
+        req: &control::ReloadRow,
+    ) -> Result<(), PreflightOutcome> {
+        if req.flavor == ReloadFlavor::Resync {
+            return Err(PreflightOutcome::Rejected(
+                PreflightRejection::ResyncNotYetImplemented,
+            ));
+        }
+        let published = source
             .query_one(
                 "SELECT EXISTS (SELECT 1 FROM pg_publication_tables
                                 WHERE pubname = $1 AND schemaname = $2 AND tablename = $3)",
@@ -268,15 +365,16 @@ impl ReloadController {
             )
             .await
             .map(|row| row.get::<_, bool>(0))
-            .unwrap_or(false);
+            .map_err(|e| PreflightOutcome::Infra(anyhow::anyhow!(e)))?;
         if !published {
-            return Err(PreflightRejection::NotPublished(
-                req.source_schema.clone(),
-                req.source_table.clone(),
+            return Err(PreflightOutcome::Rejected(
+                PreflightRejection::NotPublished(
+                    req.source_schema.clone(),
+                    req.source_table.clone(),
+                ),
             ));
         }
-        let has_pk = self
-            .source
+        let has_pk = source
             .query_one(
                 "SELECT EXISTS (SELECT 1 FROM pg_index i
                                 JOIN pg_class c ON c.oid = i.indrelid
@@ -286,11 +384,13 @@ impl ReloadController {
             )
             .await
             .map(|row| row.get::<_, bool>(0))
-            .unwrap_or(false);
+            .map_err(|e| PreflightOutcome::Infra(anyhow::anyhow!(e)))?;
         if !has_pk {
-            return Err(PreflightRejection::NoPrimaryKey(
-                req.source_schema.clone(),
-                req.source_table.clone(),
+            return Err(PreflightOutcome::Rejected(
+                PreflightRejection::NoPrimaryKey(
+                    req.source_schema.clone(),
+                    req.source_table.clone(),
+                ),
             ));
         }
         Ok(())

@@ -152,9 +152,7 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
             epoch,
         },
         token.clone(),
-    )
-    .await
-    .context("spawn reload controller")?;
+    );
 
     let result = consume::run_decode_loop(
         &mut stream,
