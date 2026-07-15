@@ -313,6 +313,7 @@ async fn lossy_cast_failure_quarantines_the_table_and_alerts() {
             lsn_start: "0/64".parse().unwrap(),
             lsn_end: "0/64".parse().unwrap(),
             schema_version: 1,
+            reload_id: None,
         },
     )
     .await
@@ -371,6 +372,7 @@ async fn lossy_cast_failure_quarantines_the_table_and_alerts() {
             lsn_start: "0/C8".parse().unwrap(),
             lsn_end: "0/C8".parse().unwrap(),
             schema_version: 2,
+            reload_id: None,
         },
     )
     .await

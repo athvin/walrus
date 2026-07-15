@@ -88,6 +88,7 @@ async fn seed_manifest(pool: &sqlx::PgPool, epoch: i64, uri: &str) {
             lsn_start: "0/64".parse().unwrap(),
             lsn_end: "0/64".parse().unwrap(),
             schema_version: 1,
+            reload_id: None,
         },
     )
     .await

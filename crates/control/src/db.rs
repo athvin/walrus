@@ -17,6 +17,21 @@ pub enum ControlError {
     /// it means a programming bug, never a transient condition.
     #[error("control-plane invariant violated (check constraint): {0}")]
     CheckViolation(String),
+
+    /// A reload was requested for a table that already has a live (non-terminal) one — the
+    /// `table_reload_one_live` partial unique index fired (PR 6.1). Terminal for THIS request:
+    /// retrying is pointless until the live reload reaches `complete`/`failed`.
+    #[error("a reload is already in progress for {schema}.{table}")]
+    ReloadInProgress { schema: String, table: String },
+
+    /// A reload transition's guarded UPDATE matched zero rows — the row was not in the expected
+    /// state (an illegal jump, a lost race, or a stale caller). Terminal: it means a bug or a
+    /// superseded actor, never a cold dependency.
+    #[error("illegal reload transition: reload {reload_id} is not in status {expected}")]
+    ReloadTransition {
+        reload_id: i64,
+        expected: &'static str,
+    },
 }
 
 impl ControlError {
@@ -24,7 +39,10 @@ impl ControlError {
     /// a cold dependency.
     pub fn is_terminal(&self) -> bool {
         match self {
-            ControlError::Migrate(_) | ControlError::CheckViolation(_) => true,
+            ControlError::Migrate(_)
+            | ControlError::CheckViolation(_)
+            | ControlError::ReloadInProgress { .. }
+            | ControlError::ReloadTransition { .. } => true,
             ControlError::Connect(_) => false,
         }
     }

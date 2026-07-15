@@ -13,6 +13,10 @@ use common::Lsn;
 use sqlx::PgExecutor;
 
 /// A `ready` file the loader can claim. The column set is exactly what the claim query reads.
+///
+/// `kind` is `'snapshot' | 'stream' | 'reload'` — reload chunk files (PR 6.1+) enter this same
+/// queue and sort into the same `(lsn_end, id)` order, carrying the `reload_id` the loader's
+/// rebuild trigger routes on (PR 6.7). Stream/snapshot rows never set `reload_id`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestRow {
     pub id: i64,
@@ -26,6 +30,8 @@ pub struct ManifestRow {
     pub lsn_end: Lsn,
     pub schema_version: i64,
     pub status: String,
+    /// `Some` only for `kind='reload'` chunk files; the purge/routing key.
+    pub reload_id: Option<i64>,
 }
 
 /// What the sink inserts after its Parquet is durable in S3 (PR 2.25).
@@ -40,6 +46,8 @@ pub struct NewManifestFile {
     pub lsn_start: Lsn,
     pub lsn_end: Lsn,
     pub schema_version: i64,
+    /// Set (with `kind='reload'`) only by the chunk export engine (PR 6.5); `None` otherwise.
+    pub reload_id: Option<i64>,
 }
 
 /// Insert a `status='ready'` row with `lsn_end` set to the commit LSN; returns the new `id`.
@@ -51,8 +59,8 @@ pub async fn insert_ready(
         r#"
         INSERT INTO walrus.file_manifest
             (epoch, source_schema, source_table, s3_uri, kind, row_count,
-             lsn_start, lsn_end, schema_version, status)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'ready')
+             lsn_start, lsn_end, schema_version, status, reload_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'ready', $10)
         RETURNING id
         "#,
         f.epoch,
@@ -64,6 +72,7 @@ pub async fn insert_ready(
         f.lsn_start as Lsn,
         f.lsn_end as Lsn,
         f.schema_version,
+        f.reload_id,
     )
     .fetch_one(executor)
     .await
@@ -86,7 +95,8 @@ pub async fn claim_ready(
         ManifestRow,
         r#"
         SELECT id, epoch, source_schema, source_table, s3_uri, kind, row_count,
-               lsn_start AS "lsn_start: Lsn", lsn_end AS "lsn_end: Lsn", schema_version, status
+               lsn_start AS "lsn_start: Lsn", lsn_end AS "lsn_end: Lsn", schema_version, status,
+               reload_id
         FROM walrus.file_manifest
         WHERE epoch = $1 AND source_schema = $2 AND source_table = $3 AND status = 'ready'
         ORDER BY lsn_end, id

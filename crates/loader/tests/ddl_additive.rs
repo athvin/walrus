@@ -459,6 +459,7 @@ async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
                 lsn_start: lsn.parse().unwrap(),
                 lsn_end: lsn.parse().unwrap(),
                 schema_version: ver,
+                reload_id: None,
             },
         )
         .await

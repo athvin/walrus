@@ -194,6 +194,7 @@ async fn sigterm_mid_apply_commits_both_watermarks_and_releases_lease() {
             lsn_start: "0/64".parse().unwrap(),
             lsn_end: "0/64".parse().unwrap(),
             schema_version: 1,
+            reload_id: None,
         },
     )
     .await
@@ -334,6 +335,7 @@ async fn a_replacement_loader_resumes_from_the_two_watermarks() {
             lsn_start: "0/64".parse().unwrap(),
             lsn_end: "0/64".parse().unwrap(),
             schema_version: 1,
+            reload_id: None,
         },
     )
     .await
@@ -361,6 +363,7 @@ async fn a_replacement_loader_resumes_from_the_two_watermarks() {
             lsn_start: "0/C8".parse().unwrap(),
             lsn_end: "0/C8".parse().unwrap(),
             schema_version: 1,
+            reload_id: None,
         },
     )
     .await

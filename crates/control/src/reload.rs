@@ -1,0 +1,449 @@
+//! `table_reload` models: the single-table-reload state machine (reload H4/H5/H10, PR 6.1).
+//!
+//! Control-pg owns the reload's brain; every transition below is a **guarded UPDATE** —
+//! `UPDATE … WHERE status = <expected>` — so a lost race or an illegal jump changes zero rows and
+//! surfaces as the typed [`ControlError::ReloadTransition`], never a silent double-claim. The
+//! status walk is `requested → exporting → export_complete → complete`, with `failed` terminal
+//! from the two middle states. There is deliberately **no** `superseded` status: a DDL restart
+//! (PR 6.8) is `fail()` with an explanatory reason plus a fresh successor row.
+//!
+//! `reload_id` is a **bigserial, not a UUID** (a recorded deviation from the design doc): "honor
+//! only the latest reload_id" (H9) becomes a numeric max, and the id fits the loader's
+//! `_walrus_meta` `v BIGINT` store verbatim. The duplicate-request guarantee a UUID key was for
+//! lives in the `table_reload_one_live` partial unique index instead — one non-terminal reload
+//! per `(epoch, schema, table)`, enforced by the database, mapped to the typed
+//! [`ControlError::ReloadInProgress`]. What a client-supplied UUID *would* have bought —
+//! caller-side idempotency keys — is not needed: "the same table, again" *is* the idempotency
+//! rule here.
+
+use crate::ControlError;
+use common::Lsn;
+use sqlx::{Connection, PgConnection, PgExecutor};
+
+/// `reload` rebuilds (clear + re-export — the quarantine-recovery flavor); `resync` merges chunks
+/// over the *live* mirror and tolerates phantoms (reload H3). Both flavors share every state and
+/// every transition in this module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[sqlx(rename_all = "lowercase")]
+pub enum ReloadFlavor {
+    Reload,
+    Resync,
+}
+
+impl ReloadFlavor {
+    /// The exact string the migration's CHECK constraint admits (second line of defense).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReloadFlavor::Reload => "reload",
+            ReloadFlavor::Resync => "resync",
+        }
+    }
+}
+
+impl std::str::FromStr for ReloadFlavor {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "reload" => Ok(ReloadFlavor::Reload),
+            "resync" => Ok(ReloadFlavor::Resync),
+            other => Err(format!("unknown reload flavor: {other}")),
+        }
+    }
+}
+
+/// `requested → exporting → export_complete → complete`; `failed` terminal from the middle. The
+/// SQL CHECK carries the same five values — belt and braces, like `loader_checkpoint`'s CHECK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[sqlx(rename_all = "snake_case")]
+pub enum ReloadStatus {
+    Requested,
+    Exporting,
+    ExportComplete,
+    Complete,
+    Failed,
+}
+
+impl ReloadStatus {
+    /// The exact string the migration's CHECK constraint admits.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReloadStatus::Requested => "requested",
+            ReloadStatus::Exporting => "exporting",
+            ReloadStatus::ExportComplete => "export_complete",
+            ReloadStatus::Complete => "complete",
+            ReloadStatus::Failed => "failed",
+        }
+    }
+}
+
+impl std::str::FromStr for ReloadStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "requested" => Ok(ReloadStatus::Requested),
+            "exporting" => Ok(ReloadStatus::Exporting),
+            "export_complete" => Ok(ReloadStatus::ExportComplete),
+            "complete" => Ok(ReloadStatus::Complete),
+            "failed" => Ok(ReloadStatus::Failed),
+            other => Err(format!("unknown reload status: {other}")),
+        }
+    }
+}
+
+/// One reload attempt. `lease_expiry`/timestamps stay out of the model — every time comparison
+/// happens in SQL (`now()`), like `table_ownership`, so the Rust side never holds a clock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReloadRow {
+    pub reload_id: i64,
+    pub epoch: i64,
+    pub source_schema: String,
+    pub source_table: String,
+    pub flavor: ReloadFlavor,
+    pub status: ReloadStatus,
+    /// Last COMPLETED chunk; 0 = none exported yet.
+    pub chunk_no: i64,
+    /// Last exported PK bound (a JSON array, so composite PKs need no special casing); `None` = start.
+    pub cursor_pk: Option<serde_json::Value>,
+    /// L₁ — the first chunk's echo watermark; frozen by the first `advance_cursor`, immutable after.
+    pub first_lsn: Option<Lsn>,
+    /// H — set at `export_complete`; the loader flips `complete` once `transformed_lsn >= H`.
+    pub final_lsn: Option<Lsn>,
+    /// The single schema version this attempt exports at; frozen alongside `first_lsn`.
+    pub schema_version: Option<i64>,
+    /// DDL restarts consumed so far (PR 6.8 caps it at `reload_max_restarts`).
+    pub restart_count: i32,
+    pub lease_holder: Option<String>,
+    pub error: Option<String>,
+}
+
+/// INSERT a reload request (`status='requested'`); returns the new `reload_id`.
+///
+/// A second request while the table has a live reload violates the `table_reload_one_live`
+/// partial unique index and maps to the typed [`ControlError::ReloadInProgress`] — matched by
+/// SQLSTATE + constraint *name*, never by message text. After `complete`/`failed` the row leaves
+/// the index and a new request succeeds.
+pub async fn request(
+    ex: impl PgExecutor<'_>,
+    epoch: i64,
+    source_schema: &str,
+    source_table: &str,
+    flavor: ReloadFlavor,
+) -> Result<i64, ControlError> {
+    let rec = sqlx::query!(
+        r#"
+        INSERT INTO walrus.table_reload (epoch, source_schema, source_table, flavor)
+        VALUES ($1, $2, $3, $4)
+        RETURNING reload_id
+        "#,
+        epoch,
+        source_schema,
+        source_table,
+        flavor.as_str(),
+    )
+    .fetch_one(ex)
+    .await
+    .map_err(|e| {
+        if let sqlx::Error::Database(db) = &e {
+            if db.code().as_deref() == Some("23505")
+                && db.constraint() == Some("table_reload_one_live")
+            {
+                return ControlError::ReloadInProgress {
+                    schema: source_schema.to_string(),
+                    table: source_table.to_string(),
+                };
+            }
+        }
+        ControlError::from_sqlx(e)
+    })?;
+    Ok(rec.reload_id)
+}
+
+/// Claim up to `limit` `requested` rows for this holder: set the lease, flip to `exporting`.
+///
+/// `FOR UPDATE SKIP LOCKED` under the guarded UPDATE makes concurrent claimers partition the
+/// queue instead of double-exporting; a fully-raced claimer just gets an empty `Vec`.
+pub async fn claim_requested(
+    ex: impl PgExecutor<'_>,
+    epoch: i64,
+    holder: &str,
+    lease_ttl_secs: i64,
+    limit: i64,
+) -> Result<Vec<ReloadRow>, ControlError> {
+    sqlx::query_as!(
+        ReloadRow,
+        r#"
+        UPDATE walrus.table_reload
+        SET status = 'exporting',
+            lease_holder = $2,
+            lease_expiry = now() + make_interval(secs => $3),
+            updated_at = now()
+        WHERE reload_id IN (
+            SELECT reload_id FROM walrus.table_reload
+            WHERE epoch = $1 AND status = 'requested'
+            ORDER BY reload_id
+            LIMIT $4
+            FOR UPDATE SKIP LOCKED
+        )
+        RETURNING reload_id, epoch, source_schema, source_table,
+                  flavor AS "flavor: ReloadFlavor", status AS "status: ReloadStatus",
+                  chunk_no, cursor_pk,
+                  first_lsn AS "first_lsn: Lsn", final_lsn AS "final_lsn: Lsn",
+                  schema_version, restart_count, lease_holder, error
+        "#,
+        epoch,
+        holder,
+        lease_ttl_secs as f64,
+        limit,
+    )
+    .fetch_all(ex)
+    .await
+    .map_err(ControlError::from_sqlx)
+}
+
+/// Renew this holder's lease on a live export. Affects zero rows — returning `false` — if we no
+/// longer hold it or the export left `exporting` (a phantom exporter must not renew).
+pub async fn renew_lease(
+    ex: impl PgExecutor<'_>,
+    reload_id: i64,
+    holder: &str,
+    lease_ttl_secs: i64,
+) -> Result<bool, ControlError> {
+    let done = sqlx::query!(
+        r#"
+        UPDATE walrus.table_reload
+        SET lease_expiry = now() + make_interval(secs => $3), updated_at = now()
+        WHERE reload_id = $1 AND lease_holder = $2 AND status = 'exporting'
+        "#,
+        reload_id,
+        holder,
+        lease_ttl_secs as f64,
+    )
+    .execute(ex)
+    .await
+    .map_err(ControlError::from_sqlx)?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// Record chunk `chunk_no` done: bump the cursor, store the new PK bound.
+///
+/// On the FIRST chunk this also freezes `first_lsn = L₁` and `schema_version` — the `COALESCE`
+/// keeps later chunks' values from ever overwriting them (frozen means frozen; PR 6.8 restarts
+/// with a *fresh* row rather than mutating these). The `chunk_no = $new - 1` guard makes the
+/// cursor strictly in-order: a duplicate or out-of-order advance changes zero rows and errors.
+pub async fn advance_cursor(
+    ex: impl PgExecutor<'_>,
+    reload_id: i64,
+    chunk_no: i64,
+    cursor_pk: &serde_json::Value,
+    chunk_lsn: Lsn,
+    schema_version: i64,
+) -> Result<(), ControlError> {
+    let done = sqlx::query!(
+        r#"
+        UPDATE walrus.table_reload
+        SET chunk_no = $2,
+            cursor_pk = $3,
+            first_lsn = COALESCE(first_lsn, $4),
+            schema_version = COALESCE(schema_version, $5),
+            updated_at = now()
+        WHERE reload_id = $1 AND status = 'exporting' AND chunk_no = $2::bigint - 1
+        "#,
+        reload_id,
+        chunk_no,
+        cursor_pk,
+        chunk_lsn as Lsn,
+        schema_version,
+    )
+    .execute(ex)
+    .await
+    .map_err(ControlError::from_sqlx)?;
+    if done.rows_affected() == 0 {
+        return Err(ControlError::ReloadTransition {
+            reload_id,
+            expected: "exporting (with the cursor at chunk_no - 1)",
+        });
+    }
+    Ok(())
+}
+
+/// `exporting → export_complete`, recording the final watermark `H`. The sink's last act; from
+/// here the LOADER finishes the walk (PR 6.9: `complete` once `transformed_lsn >= H`).
+pub async fn complete_export(
+    ex: impl PgExecutor<'_>,
+    reload_id: i64,
+    final_lsn: Lsn,
+) -> Result<(), ControlError> {
+    let done = sqlx::query!(
+        r#"
+        UPDATE walrus.table_reload
+        SET status = 'export_complete', final_lsn = $2, updated_at = now()
+        WHERE reload_id = $1 AND status = 'exporting'
+        "#,
+        reload_id,
+        final_lsn as Lsn,
+    )
+    .execute(ex)
+    .await
+    .map_err(ControlError::from_sqlx)?;
+    if done.rows_affected() == 0 {
+        return Err(ControlError::ReloadTransition {
+            reload_id,
+            expected: "exporting",
+        });
+    }
+    Ok(())
+}
+
+/// `export_complete → complete` — the loader calls this once `transformed_lsn >= final_lsn`
+/// (PR 6.9). Terminal: the row leaves the `table_reload_one_live` index and the table can be
+/// reloaded again.
+pub async fn complete(ex: impl PgExecutor<'_>, reload_id: i64) -> Result<(), ControlError> {
+    let done = sqlx::query!(
+        r#"
+        UPDATE walrus.table_reload
+        SET status = 'complete', updated_at = now()
+        WHERE reload_id = $1 AND status = 'export_complete'
+        "#,
+        reload_id,
+    )
+    .execute(ex)
+    .await
+    .map_err(ControlError::from_sqlx)?;
+    if done.rows_affected() == 0 {
+        return Err(ControlError::ReloadTransition {
+            reload_id,
+            expected: "export_complete",
+        });
+    }
+    Ok(())
+}
+
+/// `exporting | export_complete → failed`, and — in the SAME transaction — delete this reload's
+/// staged manifest rows. A failed reload must leave nothing for the loader to claim (H9), and
+/// coupling the purge to the flip means no crash window can separate them.
+///
+/// Takes a connection (not an executor) because this is two statements under one transaction;
+/// inside an outer transaction it nests as a savepoint, so callers like PR 6.8's
+/// fail-and-reissue can wrap it with the successor INSERT atomically. The purge needs no `kind`
+/// filter — only reload files carry a `reload_id` (that is the point of the nullable column).
+pub async fn fail(
+    conn: &mut PgConnection,
+    reload_id: i64,
+    reason: &str,
+) -> Result<(), ControlError> {
+    let mut tx = conn.begin().await.map_err(ControlError::from_sqlx)?;
+    let done = sqlx::query!(
+        r#"
+        UPDATE walrus.table_reload
+        SET status = 'failed', error = $2, updated_at = now()
+        WHERE reload_id = $1 AND status IN ('exporting', 'export_complete')
+        "#,
+        reload_id,
+        reason,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(ControlError::from_sqlx)?;
+    if done.rows_affected() == 0 {
+        // Dropping `tx` rolls the savepoint/transaction back.
+        return Err(ControlError::ReloadTransition {
+            reload_id,
+            expected: "exporting or export_complete",
+        });
+    }
+    sqlx::query!(
+        "DELETE FROM walrus.file_manifest WHERE reload_id = $1",
+        reload_id,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(ControlError::from_sqlx)?;
+    tx.commit().await.map_err(ControlError::from_sqlx)?;
+    Ok(())
+}
+
+/// Tables mid-rebuild — the loader-pause predicate's input (PR 6.6).
+///
+/// Deliberately `flavor = 'reload'` only (a `resync` never pauses anything — H3) and deliberately
+/// `requested | exporting` only: the pause MUST lift at `export_complete`, because the rebuild is
+/// *triggered by the loader claiming the chunk files* — pausing through `export_complete` would
+/// deadlock the reload forever (PR 6.6's gotcha, baked in here so no caller re-derives it).
+pub async fn active_rebuilds(
+    ex: impl PgExecutor<'_>,
+    epoch: i64,
+) -> Result<Vec<ReloadRow>, ControlError> {
+    sqlx::query_as!(
+        ReloadRow,
+        r#"
+        SELECT reload_id, epoch, source_schema, source_table,
+               flavor AS "flavor: ReloadFlavor", status AS "status: ReloadStatus",
+               chunk_no, cursor_pk,
+               first_lsn AS "first_lsn: Lsn", final_lsn AS "final_lsn: Lsn",
+               schema_version, restart_count, lease_holder, error
+        FROM walrus.table_reload
+        WHERE epoch = $1 AND flavor = 'reload' AND status IN ('requested', 'exporting')
+        ORDER BY reload_id
+        "#,
+        epoch,
+    )
+    .fetch_all(ex)
+    .await
+    .map_err(ControlError::from_sqlx)
+}
+
+/// Read one reload attempt, if it exists.
+pub async fn get(
+    ex: impl PgExecutor<'_>,
+    reload_id: i64,
+) -> Result<Option<ReloadRow>, ControlError> {
+    sqlx::query_as!(
+        ReloadRow,
+        r#"
+        SELECT reload_id, epoch, source_schema, source_table,
+               flavor AS "flavor: ReloadFlavor", status AS "status: ReloadStatus",
+               chunk_no, cursor_pk,
+               first_lsn AS "first_lsn: Lsn", final_lsn AS "final_lsn: Lsn",
+               schema_version, restart_count, lease_holder, error
+        FROM walrus.table_reload
+        WHERE reload_id = $1
+        "#,
+        reload_id,
+    )
+    .fetch_optional(ex)
+    .await
+    .map_err(ControlError::from_sqlx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn status_and_flavor_round_trip_their_sql_strings() {
+        // The strings are the contract with the migration's CHECK constraints AND with the
+        // sqlx::Type derive (`rename_all`) — a drift in any of the three is a bug this catches.
+        for status in [
+            ReloadStatus::Requested,
+            ReloadStatus::Exporting,
+            ReloadStatus::ExportComplete,
+            ReloadStatus::Complete,
+            ReloadStatus::Failed,
+        ] {
+            assert_eq!(ReloadStatus::from_str(status.as_str()), Ok(status));
+        }
+        assert_eq!(ReloadStatus::ExportComplete.as_str(), "export_complete");
+
+        for flavor in [ReloadFlavor::Reload, ReloadFlavor::Resync] {
+            assert_eq!(ReloadFlavor::from_str(flavor.as_str()), Ok(flavor));
+        }
+
+        assert!(
+            ReloadStatus::from_str("superseded").is_err(),
+            "five statuses, ever"
+        );
+        assert!(ReloadFlavor::from_str("rebuild").is_err());
+    }
+}
