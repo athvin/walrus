@@ -1,6 +1,6 @@
 # PR 6.3 — echo routing: consume `reload_signal`, resolve the watermark `L_i`
 
-> **Status:** 📋 Planned
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/95
 
 > **Phase:** 6 — single-table reload · **Crates touched:** `pg-sink` ·
 > **Est. size:** M · **Depends on:** PR 6.2 · **Unlocks:** PR 6.4
@@ -131,22 +131,22 @@ async fn signal_insert_resolves_waiter_and_never_reaches_parquet() { todo!() }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `is_internal_table("walrus", "reload_signal")` is true; a decoded signal insert never reaches
+- [x] `is_internal_table("walrus", "reload_signal")` is true; a decoded signal insert never reaches
       a `TableBatcher`, a Parquet file, or a manifest row (compose-asserted).
-- [ ] A subscribed waiter resolves with the signal transaction's **commit** LSN, not the Insert
+- [x] A subscribed waiter resolves with the signal transaction's **commit** LSN, not the Insert
       message's LSN — proven by a unit test with synthetic Insert + Commit frames.
-- [ ] Every resolve asserts `embedded_lsn < commit_lsn`; a synthetic violation increments the
+- [x] Every resolve asserts `embedded_lsn < commit_lsn`; a synthetic violation increments the
       counter and error-logs without panicking the consume loop.
-- [ ] Signals inside the consume path are acked like any consumed record — the slot's
+- [x] Signals inside the consume path are acked like any consumed record — the slot's
       `confirmed_flush` advances past them normally (no special retention).
-- [ ] `notes/commit-visibility-race.md` exists, is dated, states the assumption, the chosen bound,
+- [x] `notes/commit-visibility-race.md` exists, is dated, states the assumption, the chosen bound,
       and the revisit trigger; the read-only `pg_current_snapshot()` alternative is named.
-- [ ] Docs/comments explain subscribe-then-insert and buffer-at-Insert/resolve-at-Commit.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` then `cargo test -p pg-sink --test reload_echo -- --ignored`
+- [x] Docs/comments explain subscribe-then-insert and buffer-at-Insert/resolve-at-Commit.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` then `cargo test -p pg-sink --test reload_echo -- --ignored`
         asserting **`signal_insert_resolves_waiter_and_never_reaches_parquet`**.
 
 ## What completed looks like
