@@ -1,6 +1,6 @@
 # PR 6.8 — restart-on-DDL: every reload is single-schema by construction
 
-> **Status:** 📋 Planned
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/100
 
 > **Phase:** 6 — single-table reload · **Crates touched:** `pg-sink`, `control` ·
 > **Est. size:** M · **Depends on:** PR 6.5 · **Unlocks:** PR 6.9
@@ -126,23 +126,23 @@ async fn restart_cap_exhaustion_fails_loudly() { todo!() }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] An `ALTER TABLE` landing between chunks produces: old attempt `failed` with the superseded
+- [x] An `ALTER TABLE` landing between chunks produces: old attempt `failed` with the superseded
       reason, zero old chunk files left in the manifest, a successor attempt with
       `restart_count = 1` exporting from chunk zero at the new `schema_version` — and the reload
       then completes with the mirror in the new shape.
-- [ ] No moment exists (transactionally) with two non-terminal reloads for the table or with a
+- [x] No moment exists (transactionally) with two non-terminal reloads for the table or with a
       terminal attempt's chunk files still claimable.
-- [ ] Metadata-only DDL (e.g. `COMMENT ON`) does **not** restart — the check compares structural
+- [x] Metadata-only DDL (e.g. `COMMENT ON`) does **not** restart — the check compares structural
       versions only (PR 2.33's split).
-- [ ] Past `reload_max_restarts`, the reload fails with the cap in the error text and the
+- [x] Past `reload_max_restarts`, the reload fails with the cap in the error text and the
       cap-exhausted counter increments; no successor row appears.
-- [ ] `walrus_reload_restarts_total` counts each restart.
-- [ ] Docs/comments carry the H9 tradeoff and the revisit trigger.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink -p control` (and `--workspace` stays green); `cargo sqlx prepare --check`
-  - [ ] `docker compose up --wait` then `cargo test -p pg-sink --test reload_ddl -- --ignored`
+- [x] `walrus_reload_restarts_total` counts each restart.
+- [x] Docs/comments carry the H9 tradeoff and the revisit trigger.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink -p control` (and `--workspace` stays green); `cargo sqlx prepare --check`
+  - [x] `docker compose up --wait` then `cargo test -p pg-sink --test reload_ddl -- --ignored`
         asserting both tests above.
 
 ## What completed looks like

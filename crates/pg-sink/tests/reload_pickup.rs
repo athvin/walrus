@@ -68,6 +68,7 @@ fn controller_cfg(epoch: i64, cap: usize) -> ReloadControllerConfig {
         // exactly the observable-scheduling role PR 6.4's stub used to play. The echo/export
         // behaviour itself is reload_export.rs's suite.
         echo_timeout: Duration::from_secs(3600),
+        reload_max_restarts: 3,
     }
 }
 

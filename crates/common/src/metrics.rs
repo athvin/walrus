@@ -44,6 +44,15 @@ pub mod names {
     /// Reload echo cross-check failures (`embedded wal_insert_lsn >= commit LSN`, PR 6.3) — any
     /// tick means the watermark model is wrong (page severity; PR 6.11 wires the alert).
     pub const RELOAD_CROSSCHECK_VIOLATIONS: &str = "walrus_reload_crosscheck_violations_total";
+    /// DDL-restarts of a reload attempt (PR 6.8 / reload H9): a schema change past the reload's
+    /// first watermark invalidates the attempt and re-exports at the new schema. Steady churn here
+    /// on one table means a migration-heavy window racing a large reload (PR 6.11 wires the alert).
+    pub const RELOAD_RESTARTS_TOTAL: &str = "walrus_reload_restarts_total";
+    /// Reloads abandoned because they hit `reload_max_restarts` (PR 6.8): the export could not win
+    /// the race against DDL within the cap and is now `failed`. Any increment is operator-visible
+    /// waste — a page-worthy signal (PR 6.11).
+    pub const RELOAD_RESTART_CAP_EXHAUSTED_TOTAL: &str =
+        "walrus_reload_restart_cap_exhausted_total";
 
     // --- loader (per-table; labelled by TABLE_LABEL = "schema.table") ---
     pub const LOADER_FILES_READY: &str = "walrus_loader_files_ready";
@@ -76,6 +85,8 @@ pub mod names {
         SINK_ABORTED_TXN_COUNT,
         SINK_FAILED_FILE_COUNT,
         RELOAD_CROSSCHECK_VIOLATIONS,
+        RELOAD_RESTARTS_TOTAL,
+        RELOAD_RESTART_CAP_EXHAUSTED_TOTAL,
     ];
 
     /// Every per-table loader series, for per-table zero-init + the loader scrape test.
@@ -202,6 +213,14 @@ fn describe_all() {
         "reload echo cross-check failures (embedded wal_insert_lsn >= commit LSN) — any tick means \
          the watermark model is wrong"
     );
+    describe_counter!(
+        names::RELOAD_RESTARTS_TOTAL,
+        "reload attempts restarted because DDL bumped schema_version mid-export (PR 6.8)"
+    );
+    describe_counter!(
+        names::RELOAD_RESTART_CAP_EXHAUSTED_TOTAL,
+        "reloads failed after exhausting reload_max_restarts against mid-export DDL (PR 6.8)"
+    );
 
     describe_gauge!(
         names::LOADER_FILES_READY,
@@ -264,6 +283,16 @@ pub fn set_wal_status(code: u8) {
 /// wrong; the alert on this counter is page severity (PR 6.11).
 pub fn record_reload_crosscheck_violation() {
     metrics::counter!(names::RELOAD_CROSSCHECK_VIOLATIONS).increment(1);
+}
+
+/// One reload attempt re-issued because DDL bumped its table's `schema_version` mid-export (PR 6.8).
+pub fn record_reload_restart() {
+    metrics::counter!(names::RELOAD_RESTARTS_TOTAL).increment(1);
+}
+
+/// One reload abandoned at the restart cap (PR 6.8): visible waste, not silent corruption.
+pub fn record_reload_restart_cap_exhausted() {
+    metrics::counter!(names::RELOAD_RESTART_CAP_EXHAUSTED_TOTAL).increment(1);
 }
 
 /// One batch flush: its wall-clock latency and the row count written (Parquet throughput).

@@ -397,6 +397,78 @@ pub async fn fail(
     Ok(())
 }
 
+/// Would restarting an attempt with `restart_count` push it past `max_restarts` (PR 6.8)? The next
+/// attempt would carry `restart_count + 1`, so the cap is exceeded when that exceeds the max — a
+/// `max_restarts` of 0 fails the very first mid-export DDL. Pure so it unit-tests without a DB.
+pub fn restart_would_exceed_cap(restart_count: i32, max_restarts: i32) -> bool {
+    restart_count + 1 > max_restarts
+}
+
+/// H9 restart-on-DDL (PR 6.8): in ONE transaction, fail the old attempt — [`fail`]'s coupling
+/// purges its `kind='reload'` manifest rows, so no observer ever sees a terminal attempt with
+/// claimable chunk files — and, unless the restart cap is spent, INSERT its successor.
+///
+/// The successor is born `exporting`, carrying the old row's identity **and its lease** (an
+/// `INSERT … SELECT` copies `lease_holder`/`lease_expiry` verbatim, so the running exporter keeps
+/// ownership and no pickup round-trip is spent) with a FRESH cursor: `chunk_no` 0, `cursor_pk`
+/// NULL, and — the point of the whole exercise — `schema_version` NULL so chunk 1 re-freezes it at
+/// the NEW version. `restart_count` is `old + 1`. The `table_reload_one_live` partial unique index
+/// tolerates the successor only because the predecessor turns terminal in the SAME transaction.
+///
+/// Returns the successor `reload_id`, or `None` when `restart_count + 1 > max_restarts`: then the
+/// attempt is failed-only (the cap named in the reason) and no successor is written — visible
+/// waste, never silent mis-reconciliation (the design's H9 choice).
+pub async fn restart_for_ddl(
+    conn: &mut PgConnection,
+    old: &ReloadRow,
+    new_schema_version: i64,
+    max_restarts: i32,
+) -> Result<Option<i64>, ControlError> {
+    let next_restart = old.restart_count + 1;
+    let capped = restart_would_exceed_cap(old.restart_count, max_restarts);
+    let reason = if capped {
+        format!(
+            "superseded: ddl bumped schema_version to {new_schema_version}; \
+             restart cap {max_restarts} exhausted"
+        )
+    } else {
+        format!("superseded: ddl bumped schema_version to {new_schema_version}")
+    };
+
+    let mut tx = conn.begin().await.map_err(ControlError::from_sqlx)?;
+    // Reuse fail() (a savepoint inside this tx): one place owns "terminal ⇒ no claimable files".
+    // The Transaction auto-derefs to the PgConnection fail() wants; its inner begin() nests as a
+    // savepoint under this transaction.
+    fail(&mut tx, old.reload_id, &reason).await?;
+    if capped {
+        // Fail-only: the reload is abandoned, its chunk files already purged by fail().
+        tx.commit().await.map_err(ControlError::from_sqlx)?;
+        return Ok(None);
+    }
+    // The successor: copy identity + lease from the (now failed) predecessor, reset the cursor and
+    // schema_version, bump restart_count. Selecting only the carried columns leaves chunk_no/
+    // cursor_pk/first_lsn/final_lsn/schema_version/error at their table defaults (fresh start).
+    let rec = sqlx::query!(
+        r#"
+        INSERT INTO walrus.table_reload
+            (epoch, source_schema, source_table, flavor, status, restart_count,
+             lease_holder, lease_expiry)
+        SELECT epoch, source_schema, source_table, flavor, 'exporting', $2,
+               lease_holder, lease_expiry
+        FROM walrus.table_reload
+        WHERE reload_id = $1
+        RETURNING reload_id
+        "#,
+        old.reload_id,
+        next_restart,
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(ControlError::from_sqlx)?;
+    tx.commit().await.map_err(ControlError::from_sqlx)?;
+    Ok(Some(rec.reload_id))
+}
+
 /// Tables mid-rebuild — the loader-pause predicate's input (PR 6.6).
 ///
 /// Deliberately `flavor = 'reload'` only (a `resync` never pauses anything — H3) and deliberately
@@ -478,5 +550,23 @@ mod tests {
             "five statuses, ever"
         );
         assert!(ReloadFlavor::from_str("rebuild").is_err());
+    }
+
+    #[test]
+    fn restart_cap_counts_the_successor_not_the_predecessor() {
+        // The next attempt carries restart_count+1, so the cap is measured against THAT.
+        assert!(
+            restart_would_exceed_cap(0, 0),
+            "cap 0 fails the very first mid-export DDL"
+        );
+        assert!(!restart_would_exceed_cap(0, 3), "first restart is the 1st");
+        assert!(
+            !restart_would_exceed_cap(2, 3),
+            "the 3rd restart still fits"
+        );
+        assert!(
+            restart_would_exceed_cap(3, 3),
+            "the 4th would exceed a cap of 3"
+        );
     }
 }

@@ -20,6 +20,7 @@
 
 use crate::reload_signal::WatermarkWaiters;
 use control::reload::ReloadFlavor;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -95,6 +96,101 @@ where
     }
 }
 
+/// The outcome of a mid-export DDL restart (PR 6.8 / H9).
+#[derive(Debug)]
+pub enum RestartDecision {
+    /// A fresh successor at the new schema; keep exporting under this `reload_id`.
+    Restarted(i64),
+    /// `reload_max_restarts` is spent — the reload is now `failed`; stop.
+    Capped,
+}
+
+/// Run [`control::reload::restart_for_ddl`] and emit the matching metric (PR 6.8). Split from the
+/// export loop so a compose test drives this exact path — metric increment included — without
+/// standing up the whole controller.
+pub async fn handle_ddl_restart(
+    pool: &sqlx::PgPool,
+    old: &control::ReloadRow,
+    new_version: i64,
+    max_restarts: i32,
+) -> anyhow::Result<RestartDecision> {
+    let mut conn = pool.acquire().await?;
+    match control::reload::restart_for_ddl(&mut conn, old, new_version, max_restarts).await? {
+        Some(new_id) => {
+            common::metrics::record_reload_restart();
+            tracing::info!(
+                old_reload_id = old.reload_id,
+                new_reload_id = new_id,
+                new_version,
+                restart_count = old.restart_count + 1,
+                "reload restarted at the new schema (DDL landed between chunks)"
+            );
+            Ok(RestartDecision::Restarted(new_id))
+        }
+        None => {
+            common::metrics::record_reload_restart_cap_exhausted();
+            tracing::error!(
+                reload_id = old.reload_id,
+                new_version,
+                max_restarts,
+                "reload restart cap exhausted — attempt failed (visible waste, not silent corruption)"
+            );
+            Ok(RestartDecision::Capped)
+        }
+    }
+}
+
+/// The connections + config an exporter needs, bundled so the restart loop takes few args.
+struct ExportDeps {
+    source_db_url: String,
+    pool: sqlx::PgPool,
+    waiters: Arc<WatermarkWaiters>,
+    sink: crate::sink::ParquetSink,
+    export_cfg: crate::reload_export::ChunkExportConfig,
+}
+
+/// The exporter body under DDL-restart (PR 6.8 / H9): export until drained; on a mid-export
+/// structural bump, fail-and-reissue via [`handle_ddl_restart`] and resume from chunk zero at the
+/// new schema under the successor `reload_id` — or stop at the cap (the row is already `failed`).
+/// `current_reload_id` is shared with the lease-renewal closure: repointing it to the successor
+/// BEFORE the next await keeps renewal following the lease onto the new row (which
+/// `restart_for_ddl` carried the lease onto), so a renewal tick never fails against the terminal
+/// predecessor.
+async fn export_with_ddl_restarts(
+    deps: ExportDeps,
+    mut req: control::ReloadRow,
+    max_restarts: i32,
+    current_reload_id: Arc<AtomicI64>,
+) -> anyhow::Result<()> {
+    use crate::reload_export::{ChunkExporter, RunOutcome};
+    let pool = deps.pool;
+    loop {
+        let mut exporter = ChunkExporter::connect(
+            &deps.source_db_url,
+            pool.clone(),
+            deps.waiters.clone(),
+            deps.sink.clone(),
+            deps.export_cfg.clone(),
+            &req,
+        )
+        .await?;
+        match exporter.run().await? {
+            RunOutcome::Drained => return Ok(()),
+            RunOutcome::SchemaChanged { new_version } => {
+                match handle_ddl_restart(&pool, &req, new_version, max_restarts).await? {
+                    RestartDecision::Restarted(new_id) => {
+                        current_reload_id.store(new_id, Ordering::SeqCst);
+                        req = control::reload::get(&pool, new_id).await?.ok_or_else(|| {
+                            anyhow::anyhow!("successor reload {new_id} vanished after restart")
+                        })?;
+                    }
+                    RestartDecision::Capped => return Ok(()),
+                }
+            }
+        }
+    }
+}
+
 /// Everything the controller needs, cut from `SinkConfig` + bootstrap state.
 #[derive(Clone)]
 pub struct ReloadControllerConfig {
@@ -110,6 +206,8 @@ pub struct ReloadControllerConfig {
     pub chunk_rows: u64,
     /// How long a chunk waits for its watermark echo before failing loudly (PR 6.5 / H11).
     pub echo_timeout: Duration,
+    /// How many DDL-restarts a reload may consume before it fails (PR 6.8 / H9).
+    pub reload_max_restarts: i32,
 }
 
 /// Sink-owned reload orchestration (H6). Never on the replication loop's path — it holds a
@@ -270,6 +368,7 @@ impl ReloadController {
             let pool = self.pool.clone();
             let holder = self.cfg.instance.clone();
             let ttl = self.cfg.lease_ttl;
+            let max_restarts = self.cfg.reload_max_restarts;
             let child = self.token.child_token();
             let export_cfg = crate::reload_export::ChunkExportConfig {
                 chunk_rows: self.cfg.chunk_rows,
@@ -288,35 +387,35 @@ impl ReloadController {
             );
             tokio::spawn(async move {
                 let _permit = permit;
-                let reload_id = req.reload_id;
+                // The lease-renewal target: the export loop repoints this on every DDL-restart, so
+                // renewal follows the lease onto each successor row (PR 6.8).
+                let current_reload_id = Arc::new(AtomicI64::new(req.reload_id));
                 let renew_pool = pool.clone();
-                // The chunk engine (PR 6.5): dial the side connection, resume from the cursor,
-                // export until drained. Echo timeout fails the row inside; any other error leaves
-                // it `exporting` for lease-expiry + PR 6.9's adoption (infra errors are retried,
-                // never terminally mis-recorded).
-                let export = {
-                    let pool = pool.clone();
-                    let req = req.clone();
-                    async move {
-                        crate::reload_export::ChunkExporter::connect(
-                            &source_db_url,
-                            pool,
-                            waiters,
-                            sink,
-                            export_cfg,
-                            &req,
-                        )
-                        .await?
-                        .run()
-                        .await
-                    }
-                };
+                let renew_id = current_reload_id.clone();
+                // The chunk engine (PR 6.5) under DDL-restart (PR 6.8): dial the side connection,
+                // resume from the cursor, export until drained — restarting at the new schema if
+                // DDL bumps the version mid-export. Echo timeout fails the row inside; any other
+                // error leaves it `exporting` for lease-expiry + PR 6.9's adoption (infra errors
+                // are retried, never terminally mis-recorded).
+                let export = export_with_ddl_restarts(
+                    ExportDeps {
+                        source_db_url,
+                        pool,
+                        waiters,
+                        sink,
+                        export_cfg,
+                    },
+                    req,
+                    max_restarts,
+                    current_reload_id.clone(),
+                );
                 let end = lease_guarded_export(
                     child,
                     ttl / 3,
                     move || {
                         let pool = renew_pool.clone();
                         let holder = holder.clone();
+                        let reload_id = renew_id.load(Ordering::SeqCst);
                         async move {
                             Ok(control::reload::renew_lease(
                                 &pool,
@@ -330,6 +429,7 @@ impl ReloadController {
                     export,
                 )
                 .await;
+                let reload_id = current_reload_id.load(Ordering::SeqCst);
                 match &end {
                     ExporterEnd::Cancelled => tracing::info!(
                         reload_id,
