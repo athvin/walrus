@@ -16,10 +16,10 @@ The **design is already finished** and lives one directory up:
   reproducible Docker harness and a Python decoder + golden vectors under
   [`../examples/proto-version/`](../examples/proto-version/).
 
-This curriculum turns that design into **77 PRs across 6 phases** (phases 0–4 build v1; phase 5
-hardens it — benchmarking, hot-path cleanup, and a much faster CI). Each PR is a self-contained task
-file with an explicit *Definition of Done*. You write the code; the task tells you what "done and
-green" means.
+This curriculum turns that design into **89 PRs across 7 phases** (phases 0–4 build v1; phase 5
+hardens it — benchmarking, hot-path cleanup, and a much faster CI; phase 6 opens post-v1 feature
+work — single-table reload through the one slot). Each PR is a self-contained task file with an
+explicit *Definition of Done*. You write the code; the task tells you what "done and green" means.
 
 ---
 
@@ -145,7 +145,7 @@ Two deliberate structural notes:
 
 ## The roadmap
 
-77 PRs. Tick each box as you merge. Every DoD is traceable to a design section (right column).
+89 PRs. Tick each box as you merge. Every DoD is traceable to a design section (right column).
 
 ### Phase 0 — Foundations & CI  ·  [`phase-0-foundations/`](./phase-0-foundations/)
 
@@ -277,6 +277,39 @@ before/after delta recorded in `docs/benchmarks.md`. Closes with a dependency/de
 | ✅ | [5.7](./phase-5-performance-and-ci/pr-5.7-sink-hot-path.md) | sink hot-path fixes (meta-JSON amortization, clone removal, release profile) — measured only | §1.4 / benchmarks |
 | ✅ | [5.8](./phase-5-performance-and-ci/pr-5.8-loader-hot-path.md) | loader hot-path fixes (DESCRIBE cache, TOAST back-scan rewrite) — measured only | loader §5.6 / sink §3.5 |
 | ✅ | [5.9](./phase-5-performance-and-ci/pr-5.9-dependency-debt-sweep.md) | debt sweep: commit_ts TODO, object_store advisories, DuckDB next-LTS bump | Open Q4(b) / proto §4 |
+
+> **🚧 Feature work begins.** Phase 6 is the first post-v1 *feature* phase: it implements
+> [deferred goal §1](../deferred-goals.md#1-single-table-reload--re-sync-while-streaming) per the
+> decided design in [`single-table-reload.md`](../single-table-reload.md) — reload or re-sync N
+> tables through the **one lifelong slot**, no stream pause. Its task files carry two pattern
+> extensions, now in [`TEMPLATE.md`](./TEMPLATE.md): a **Status** line (`📋 Planned → ✅ Done`) and
+> a **What completed looks like** section (the observable demo, distinct from the DoD checklist).
+> "reload §Hn" in the Design column = a hole-section of that design doc.
+
+### Phase 6 — Single-table reload  ·  [`phase-6-single-table-reload/`](./phase-6-single-table-reload/)
+
+Chunked, watermark-stamped reloads in the Debezium/DBLog lineage: chunk-start watermarks flow
+in-band through `walrus.reload_signal` (echo-wait gives each chunk its low watermark `L_i`), chunk
+Parquet stamped `commit_lsn = lsn = L_i` sorts into the loader's existing `(lsn_end, id)` claim
+order, and Phase B's dedup algebra absorbs snapshot/stream overlap — no extra slots, no stream
+pause, no chunk buffer. Control-pg owns the state machine; restart-on-DDL keeps every attempt
+single-schema; **quarantine recovery after a lossy `ALTER COLUMN TYPE`** — v1's only terminal
+state — is the anchor use case and the phase-closing e2e.
+
+| ✅ | PR | Delivers | Design |
+|---|---|---|---|
+| 📋 | [6.1](./phase-6-single-table-reload/pr-6.1-control-table-reload-state-machine.md) | control-pg `table_reload` state machine + manifest `kind='reload'`/`reload_id` | reload §H4/H5/H10 |
+| 📋 | [6.2](./phase-6-single-table-reload/pr-6.2-source-reload-signal-table.md) | source `walrus.reload_signal` (insert-only, published) + preflight | reload §H1/H5/H11 |
+| 📋 | [6.3](./phase-6-single-table-reload/pr-6.3-sink-echo-routing-watermark.md) | echo routing + watermark waiter (`L_i` = decoded commit LSN) + race note | reload §H1/§6 |
+| 📋 | [6.4](./phase-6-single-table-reload/pr-6.4-sink-reload-controller.md) | reload controller: pickup, preflight, lease, `max_concurrent_reloads` | reload §H6/H7/H11 |
+| 📋 | [6.5](./phase-6-single-table-reload/pr-6.5-sink-chunk-export-engine.md) | chunk export engine: watermark → echo → stamped Parquet → manifest | reload §H1/H2/§5 |
+| 📋 | [6.6](./phase-6-single-table-reload/pr-6.6-loader-pause-claims.md) | loader pauses a rebuilding table's claims (frontier freezes at `W`) | reload §2/H8 |
+| 📋 | [6.7](./phase-6-single-table-reload/pr-6.7-loader-rebuild-trigger.md) | rebuild trigger: `CREATE OR REPLACE` on first reload file; latest-id wins | reload §H3/H8/H9 |
+| 📋 | [6.8](./phase-6-single-table-reload/pr-6.8-ddl-invalidation-restart.md) | restart-on-DDL: fresh reload_id, purge, retry cap | reload §H9 |
+| 📋 | [6.9](./phase-6-single-table-reload/pr-6.9-completion-crash-recovery.md) | completion (`transformed_lsn ≥ H`) + crash recovery from the chunk cursor | reload §H7/H10 |
+| 📋 | [6.10](./phase-6-single-table-reload/pr-6.10-resync-flavor.md) | `resync` flavor: merge over the live mirror; the phantom caveat | reload §H3 |
+| 📋 | [6.11](./phase-6-single-table-reload/pr-6.11-reload-observability.md) | reload metrics, alerts, runbook (stuck lease / restart cap / cross-check) | Observability |
+| 📋 | [6.12](./phase-6-single-table-reload/pr-6.12-e2e-quarantine-recovery.md) | e2e quarantine recovery + N-table scale on one slot; docs sweep | reload §2/§5 |
 
 ---
 
