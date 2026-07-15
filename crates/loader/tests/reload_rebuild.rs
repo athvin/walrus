@@ -160,10 +160,17 @@ async fn setup(epoch: i64) -> (TableCtx, std::path::PathBuf) {
     (ctx, dir)
 }
 
-/// Walk a reload through the REAL transitions to `export_complete` at `first_lsn = l1` — the
-/// state the loader sees once the sink's export drains (the pause is lifted, chunks claimable).
-async fn drained_reload(pool: &sqlx::PgPool, epoch: i64, l1: &str, h: &str) -> i64 {
-    let id = reload::request(pool, epoch, "public", "orders", ReloadFlavor::Reload)
+/// Walk a reload of `flavor` through the REAL transitions to `export_complete` at `first_lsn = l1`
+/// — the state the loader sees once the sink's export drains (for a rebuild-flavor reload the pause
+/// is lifted and chunks are claimable; a resync never paused anything).
+async fn drained_reload(
+    pool: &sqlx::PgPool,
+    epoch: i64,
+    l1: &str,
+    h: &str,
+    flavor: ReloadFlavor,
+) -> i64 {
+    let id = reload::request(pool, epoch, "public", "orders", flavor)
         .await
         .unwrap();
     reload::claim_requested(pool, epoch, "sink-t", 60, 10)
@@ -226,7 +233,7 @@ async fn rebuild_converges_mirror_to_source_and_kills_phantoms() {
 
     // The reload: chunks stamped L1 = 0/100 carry the source truth {1:'snap', 2:'b', 3:'c'};
     // a mid-export stream file at 0/200 updates 1 → 'newest' and deletes 2.
-    let reload_id = drained_reload(&ctx.pool, epoch, "0/100", "0/100").await;
+    let reload_id = drained_reload(&ctx.pool, epoch, "0/100", "0/100", ReloadFlavor::Reload).await;
     let chunk = write_rows(
         epoch,
         "chunk1",
@@ -314,7 +321,7 @@ async fn superseded_rows_are_purged_and_their_content_discarded() {
     );
     let pre_w_id = seed_file(&ctx.pool, epoch, &pre_w, "stream", "0/60", None).await;
 
-    let reload_id = drained_reload(&ctx.pool, epoch, "0/100", "0/100").await;
+    let reload_id = drained_reload(&ctx.pool, epoch, "0/100", "0/100", ReloadFlavor::Reload).await;
     let chunk = write_rows(
         epoch,
         "chunk1",
@@ -460,7 +467,7 @@ async fn rebuild_clears_the_lossy_cast_quarantine() {
     ctx.state.quarantine();
     assert!(!ctx.state.is_ready() || !ctx.state.is_started());
 
-    let reload_id = drained_reload(&ctx.pool, epoch, "0/100", "0/100").await;
+    let reload_id = drained_reload(&ctx.pool, epoch, "0/100", "0/100", ReloadFlavor::Reload).await;
     let chunk = write_rows(
         epoch,
         "chunk1",
@@ -476,6 +483,98 @@ async fn rebuild_clears_the_lossy_cast_quarantine() {
         "the rebuild is the quarantine's one exit"
     );
     assert_eq!(mirror_status(&ctx, 1).as_deref(), Some("recovered"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose up --wait (control PG + MinIO)"]
+async fn resync_flavor_never_rebuilds_and_merges_over_the_live_mirror() {
+    let _g = LOCK.lock().await;
+    let epoch = 670_006;
+    let (ctx, dir) = setup(epoch).await;
+
+    // A LIVE mirror the resync must NOT clear: ids 1,2 already streamed in. And — to prove the
+    // resync arm skips `clear_quarantine` (only a rebuild is that exit) — latch the quarantine.
+    let live = write_rows(
+        epoch,
+        "live",
+        &[
+            (1, "live", "i", "0000000000000050", "0000000000000050"),
+            (2, "keep", "i", "0000000000000050", "0000000000000051"),
+        ],
+    );
+    seed_file(&ctx.pool, epoch, &live, "stream", "0/50", None).await;
+    run_phase_a(&ctx).await.unwrap();
+    run_phase_b(&ctx).await.unwrap();
+    assert_eq!(mirror_count(&ctx), 2);
+    ctx.state.quarantine();
+
+    // A RESYNC reload (H3), drained to export_complete at first_lsn = 0/100. `active_rebuilds`
+    // excludes resync, so the loader never paused — the chunk is claimable straight away.
+    let reload_id = drained_reload(&ctx.pool, epoch, "0/100", "0/100", ReloadFlavor::Resync).await;
+
+    // A pre-`W` stream file (lsn_end <= first_lsn) that the REBUILD path would `delete_superseded`
+    // and discard with the old raw. Under resync it must survive and apply — proof the arm runs no
+    // purge. Claimed in the same batch, it sorts before the chunk in (lsn_end, id) order.
+    let pre_w = write_rows(
+        epoch,
+        "prew",
+        &[(
+            4,
+            "kept-no-purge",
+            "i",
+            "0000000000000060",
+            "0000000000000060",
+        )],
+    );
+    seed_file(&ctx.pool, epoch, &pre_w, "stream", "0/60", None).await;
+
+    // The resync chunk stamped L1 = 0/100: merges over the live mirror — updates id 1, adds id 3.
+    let chunk = write_rows(
+        epoch,
+        "chunk1",
+        &[
+            (1, "resynced", "i", "0000000000000100", "0000000000000100"),
+            (3, "new", "i", "0000000000000100", "0000000000000100"),
+        ],
+    );
+    seed_file(&ctx.pool, epoch, &chunk, "reload", "0/100", Some(reload_id)).await;
+
+    run_phase_a(&ctx).await.unwrap();
+    run_phase_b(&ctx).await.unwrap();
+
+    // Never rebuilt: the pre-existing live row survives (a rebuild would have dropped the whole
+    // mirror), the chunk merged over it, and the pre-`W` file's content was applied — not purged.
+    assert_eq!(
+        mirror_status(&ctx, 2).as_deref(),
+        Some("keep"),
+        "no rebuild — the untouched live row survives"
+    );
+    assert_eq!(
+        mirror_status(&ctx, 1).as_deref(),
+        Some("resynced"),
+        "the chunk merges over the live mirror"
+    );
+    assert_eq!(mirror_status(&ctx, 3).as_deref(), Some("new"));
+    assert_eq!(
+        mirror_status(&ctx, 4).as_deref(),
+        Some("kept-no-purge"),
+        "resync runs no delete_superseded — the pre-`W` content is NOT discarded"
+    );
+    assert_eq!(mirror_count(&ctx), 4);
+
+    // No latch (a stale-vs-latest comparison must never fire off a resync chunk — H9) and no
+    // quarantine exit (only a rebuild clears it).
+    assert_eq!(
+        ctx.db.recorded_reload_id().unwrap(),
+        0,
+        "resync never sets the reload_id latch"
+    );
+    assert!(
+        ctx.state.is_quarantined(),
+        "resync is not a quarantine exit — the latch still holds"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
