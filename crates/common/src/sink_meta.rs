@@ -27,12 +27,15 @@ pub enum Op {
     Truncate,
 }
 
-/// Where the row originated: an exported-snapshot backfill row vs a live WAL-stream row.
+/// Where the row originated: an exported-snapshot backfill row, a live WAL-stream row, or a
+/// single-table-reload chunk row (PR 6.5 — stamped `commit_lsn = lsn = L_i`, snapshot-op
+/// semantics so any overlapping stream event wins the loader's dedup).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     Snapshot,
     Stream,
+    Reload,
 }
 
 /// A UTC instant rendered as RFC-3339 with a `Z` suffix — walrus's only legal datetime form.

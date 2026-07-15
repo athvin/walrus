@@ -28,6 +28,9 @@ pub enum FileKind {
     Stream,
     Snapshot,
     Spill,
+    /// A single-table-reload chunk (PR 6.5): every row stamped `commit_lsn = lsn = L_i`, the
+    /// file's `lsn_end = L_i`, so chunks sort into the loader's `(lsn_end, id)` claim order.
+    Reload,
 }
 
 impl FileKind {
@@ -37,6 +40,7 @@ impl FileKind {
             FileKind::Stream => "stream",
             FileKind::Snapshot => "snapshot",
             FileKind::Spill => "spill",
+            FileKind::Reload => "reload",
         }
     }
 }
@@ -55,7 +59,9 @@ pub struct WrittenObject {
     pub kind: FileKind,
 }
 
-/// Encodes sealed batches to Parquet and PUTs them to S3, epoch-namespaced.
+/// Encodes sealed batches to Parquet and PUTs them to S3, epoch-namespaced. Cheap to clone (the
+/// store is an `Arc`) — reload exporters (PR 6.5) each carry their own handle.
+#[derive(Clone)]
 pub struct ParquetSink {
     store: Arc<dyn ObjectStore>,
     bucket: String,

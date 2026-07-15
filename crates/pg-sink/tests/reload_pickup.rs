@@ -14,6 +14,7 @@ use pg_sink::pgoutput::{Message, StreamCtx};
 use pg_sink::reload::{ReloadController, ReloadControllerConfig};
 use pg_sink::reload_signal::WatermarkWaiters;
 use pg_sink::replication::ReplicationStream;
+use pg_sink::sink::ParquetSink;
 use pg_sink::slot::verify_or_create_slot;
 use std::sync::Arc;
 use std::time::Duration;
@@ -62,6 +63,53 @@ fn controller_cfg(epoch: i64, cap: usize) -> ReloadControllerConfig {
         instance: "walrus-sink-test".to_string(),
         publication_name: "walrus_pub".to_string(),
         epoch,
+        chunk_rows: 1000,
+        // No decode loop resolves echoes in these tests, so exporters PARK on the echo await —
+        // exactly the observable-scheduling role PR 6.4's stub used to play. The echo/export
+        // behaviour itself is reload_export.rs's suite.
+        echo_timeout: Duration::from_secs(3600),
+    }
+}
+
+fn minio(epoch: i64) -> ParquetSink {
+    ParquetSink::new(
+        std::sync::Arc::new(
+            object_store::aws::AmazonS3Builder::new()
+                .with_bucket_name("walrus")
+                .with_region("us-east-1")
+                .with_endpoint("http://localhost:9000")
+                .with_access_key_id("minioadmin")
+                .with_secret_access_key("minioadmin")
+                .with_allow_http(true)
+                .build()
+                .unwrap(),
+        ),
+        "walrus".to_string(),
+        epoch,
+    )
+}
+
+/// The exporter reads the reload's schema_version from the registry — seed one per target table
+/// (in production the streaming sink registers every published table long before a reload).
+async fn seed_registry(
+    admin: &tokio_postgres::Client,
+    pool: &sqlx::PgPool,
+    epoch: i64,
+    tables: &[&str],
+) {
+    for table in tables {
+        let rel = pg_sink::snapshot::describe_source_relation(admin, "public", table)
+            .await
+            .unwrap();
+        let row = control::RegistryRow {
+            epoch,
+            source_schema: "public".to_string(),
+            source_table: table.to_string(),
+            schema_version: 1,
+            descriptors: pg_to_arrow::descriptor::describe_relation(&rel),
+            columns: serde_json::to_value(&rel).unwrap(),
+        };
+        control::upsert_registry(pool, &row).await.unwrap();
     }
 }
 
@@ -136,12 +184,14 @@ async fn pickup_flips_to_exporting_with_a_live_advancing_lease() {
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
     let pool = pool_for(epoch).await;
+    seed_registry(&admin, &pool, epoch, &["orders"]).await;
 
     let token = CancellationToken::new();
     let handle = ReloadController::spawn(
         pool.clone(),
         &source_url(),
         Arc::new(WatermarkWaiters::default()),
+        minio(epoch),
         controller_cfg(epoch, 2),
         token.clone(),
     );
@@ -161,13 +211,20 @@ async fn pickup_flips_to_exporting_with_a_live_advancing_lease() {
     let exp1 = lease_expiry_epoch(&pool, id).await;
     assert!(exp1 > now_epoch, "the lease is live");
 
-    // The stub exporter parks while its lease renews at TTL/3 (2s here): expiry must advance.
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    let exp2 = lease_expiry_epoch(&pool, id).await;
-    assert!(
-        exp2 > exp1,
-        "lease_expiry observably advances while the exporter runs ({exp1} → {exp2})"
-    );
+    // The exporter parks on its echo await while its lease renews at TTL/3 (2s here): expiry
+    // must advance. Poll rather than sleep-once — a loaded runner can delay a renewal tick.
+    let exp2 = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let e = lease_expiry_epoch(&pool, id).await;
+            if e > exp1 {
+                return e;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .expect("lease_expiry observably advances while the exporter runs");
+    assert!(exp2 > exp1);
 
     token.cancel();
     handle.await.unwrap();
@@ -202,6 +259,7 @@ async fn preflight_failures_land_in_failed_with_reasons() {
         pool.clone(),
         &source_url(),
         Arc::new(WatermarkWaiters::default()),
+        minio(epoch),
         controller_cfg(epoch, 2),
         token.clone(),
     );
@@ -277,6 +335,7 @@ async fn cap_of_two_holds_and_the_stream_keeps_flowing() {
         .await
         .unwrap();
     let pool = pool_for(epoch).await;
+    seed_registry(&admin, &pool, epoch, &["orders", "customers", "items"]).await;
 
     // A live stream BEFORE the controller starts — the no-stall probe.
     let _ = admin
@@ -297,6 +356,7 @@ async fn cap_of_two_holds_and_the_stream_keeps_flowing() {
         pool.clone(),
         &source_url(),
         Arc::new(WatermarkWaiters::default()),
+        minio(epoch),
         controller_cfg(epoch, 2),
         token.clone(),
     );
@@ -355,17 +415,28 @@ async fn cap_of_two_holds_and_the_stream_keeps_flowing() {
         )
         .await
         .unwrap();
+    // Match ONLY the customers insert by its relation OID — the exporters' own reload_signal
+    // inserts also decode as Inserts and must not satisfy the no-stall probe.
     let mut ctx = StreamCtx::default();
     tokio::time::timeout(Duration::from_secs(10), async {
+        let mut customers_oid: Option<u32> = None;
         loop {
             let frame = stream.next().await.unwrap().unwrap();
-            if let Some(Message::Insert { .. }) = on_frame(&mut ctx, frame).unwrap() {
-                return;
+            match on_frame(&mut ctx, frame).unwrap() {
+                Some(Message::Relation { relation, .. }) if relation.name == "customers" => {
+                    customers_oid = Some(relation.oid);
+                }
+                Some(Message::Insert { relation_oid, .. })
+                    if customers_oid == Some(relation_oid) =>
+                {
+                    return;
+                }
+                _ => {}
             }
         }
     })
     .await
-    .expect("a user insert decodes while the controller holds two exports");
+    .expect("the USER insert decodes while the controller holds two exports");
 
     token.cancel();
     handle.await.unwrap();

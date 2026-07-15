@@ -71,6 +71,15 @@ pub struct SinkConfig {
     /// sink is detectable within one TTL. Bounds-checked so the renewal cadence fits inside it.
     #[serde(with = "humantime_serde")]
     pub reload_lease_ttl: Duration,
+    /// Rows per reload chunk (PR 6.5 / reload H2): each chunk is one short PK-ordered SELECT — no
+    /// hours-long transaction pinning xmin. Bounds each statement; `max_concurrent_reloads` bounds
+    /// tables. ≥ 1.
+    pub reload_chunk_rows: u64,
+    /// How long a chunk waits for its watermark echo before the reload fails loudly (PR 6.5 /
+    /// reload H11): an unpublished signal table never echoes — this timeout turns that silent
+    /// failure into a `failed` row naming the fix.
+    #[serde(with = "humantime_serde")]
+    pub reload_echo_timeout: Duration,
     /// If true, the sink creates/alters `publication_name` to cover the required tables; else a gap
     /// is terminal (the operator owns the source setup — PR 2.19 `migrations/source`).
     pub manage_publication: bool,
@@ -103,6 +112,8 @@ impl Default for SinkConfig {
             health_addr: SocketAddr::from(([0, 0, 0, 0], 8080)),
             max_concurrent_reloads: 2,
             reload_lease_ttl: Duration::from_secs(60),
+            reload_chunk_rows: 10_000,
+            reload_echo_timeout: Duration::from_secs(30),
             manage_publication: false,
             strict_keys: true,
         }
@@ -217,6 +228,8 @@ impl SinkConfig {
         positive("max_bytes", self.max_bytes)?;
         positive("max_inflight_bytes", self.max_inflight_bytes)?;
         positive("max_concurrent_reloads", self.max_concurrent_reloads)?;
+        positive("reload_chunk_rows", self.reload_chunk_rows)?;
+        duration_bound("reload_echo_timeout", self.reload_echo_timeout)?;
         duration_bound("reload_lease_ttl", self.reload_lease_ttl)?;
         // The exporter renews at TTL/3 (crate::reload); a TTL under ~15s leaves too little slack
         // for a renewal round-trip before expiry — a misconfig, not an intent.

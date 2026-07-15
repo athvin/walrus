@@ -11,8 +11,8 @@
 //! at request time, not mid-export — H11), and spawn an exporter per survivor under a
 //! `tokio::sync::Semaphore` sized `max_concurrent_reloads` — "reload N tables" drains a queue
 //! politely. Exporters renew their lease at TTL/3 for as long as they run; a lost lease cancels
-//! the exporter. The exporter body itself is PR 6.5's chunk engine — here it parks, so the
-//! scheduling is observable.
+//! the exporter. The exporter body is PR 6.5's chunk
+//! engine (`crate::reload_export`), driven under the lease guard below.
 //!
 //! The lease is liveness today and the future fence: under loader sharding (deferred goal §2),
 //! `lease_holder` plus the `table_ownership` fencing-token pattern is how a stale sink would be
@@ -106,6 +106,10 @@ pub struct ReloadControllerConfig {
     pub instance: String,
     pub publication_name: String,
     pub epoch: i64,
+    /// Rows per chunk SELECT (PR 6.5).
+    pub chunk_rows: u64,
+    /// How long a chunk waits for its watermark echo before failing loudly (PR 6.5 / H11).
+    pub echo_timeout: Duration,
 }
 
 /// Sink-owned reload orchestration (H6). Never on the replication loop's path — it holds a
@@ -117,8 +121,10 @@ pub struct ReloadController {
     /// rare operator events, and a held-forever idle client is exactly what proxies/failovers
     /// silently kill — a dead connection must never masquerade as a preflight rejection.
     source_db_url: String,
-    #[allow(dead_code)] // handed to exporter tasks in PR 6.5 (subscribe-then-insert)
+    /// Exporters subscribe here before signalling; the decode loop resolves (PR 6.3).
     waiters: Arc<WatermarkWaiters>,
+    /// Each exporter clones a handle: chunk Parquet lands in the same epoch-prefixed layout.
+    sink: crate::sink::ParquetSink,
     cfg: ReloadControllerConfig,
     semaphore: Arc<Semaphore>,
     token: CancellationToken,
@@ -131,6 +137,7 @@ impl ReloadController {
         pool: sqlx::PgPool,
         source_db_url: &str,
         waiters: Arc<WatermarkWaiters>,
+        sink: crate::sink::ParquetSink,
         cfg: ReloadControllerConfig,
         token: CancellationToken,
     ) -> tokio::task::JoinHandle<()> {
@@ -138,6 +145,7 @@ impl ReloadController {
             pool,
             source_db_url: source_db_url.to_string(),
             waiters,
+            sink,
             semaphore: Arc::new(Semaphore::new(cfg.max_concurrent_reloads)),
             token: token.clone(),
             cfg,
@@ -263,6 +271,15 @@ impl ReloadController {
             let holder = self.cfg.instance.clone();
             let ttl = self.cfg.lease_ttl;
             let child = self.token.child_token();
+            let export_cfg = crate::reload_export::ChunkExportConfig {
+                chunk_rows: self.cfg.chunk_rows,
+                echo_timeout: self.cfg.echo_timeout,
+                instance: self.cfg.instance.clone(),
+                epoch: self.cfg.epoch,
+            };
+            let source_db_url = self.source_db_url.clone();
+            let waiters = self.waiters.clone();
+            let sink = self.sink.clone();
             tracing::info!(
                 reload_id = req.reload_id,
                 source_table = %format_args!("{}.{}", req.source_schema, req.source_table),
@@ -273,6 +290,27 @@ impl ReloadController {
                 let _permit = permit;
                 let reload_id = req.reload_id;
                 let renew_pool = pool.clone();
+                // The chunk engine (PR 6.5): dial the side connection, resume from the cursor,
+                // export until drained. Echo timeout fails the row inside; any other error leaves
+                // it `exporting` for lease-expiry + PR 6.9's adoption (infra errors are retried,
+                // never terminally mis-recorded).
+                let export = {
+                    let pool = pool.clone();
+                    let req = req.clone();
+                    async move {
+                        crate::reload_export::ChunkExporter::connect(
+                            &source_db_url,
+                            pool,
+                            waiters,
+                            sink,
+                            export_cfg,
+                            &req,
+                        )
+                        .await?
+                        .run()
+                        .await
+                    }
+                };
                 let end = lease_guarded_export(
                     child,
                     ttl / 3,
@@ -289,7 +327,7 @@ impl ReloadController {
                             .await?)
                         }
                     },
-                    export_table(req),
+                    export,
                 )
                 .await;
                 match &end {
@@ -395,18 +433,6 @@ impl ReloadController {
         }
         Ok(())
     }
-}
-
-/// PR 6.5 replaces this stub with the chunk engine (watermark INSERT → echo await → chunk SELECT
-/// → stamped Parquet → cursor advance). Here it parks until cancelled, holding its permit, so the
-/// semaphore's scheduling — and the lease renewal around it — are observable.
-async fn export_table(req: control::ReloadRow) -> anyhow::Result<()> {
-    tracing::info!(
-        reload_id = req.reload_id,
-        "export stub parked (chunk engine lands in PR 6.5)"
-    );
-    std::future::pending::<()>().await;
-    unreachable!("pending() never resolves")
 }
 
 #[cfg(test)]
