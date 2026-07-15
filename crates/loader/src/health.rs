@@ -19,8 +19,9 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug, Default)]
 pub struct LoaderState {
     ready: AtomicBool,
-    /// Set once a table is quarantined by a failed lossy DDL cast (PR 3.9) — degrades `/ready`. A
-    /// latch: quarantine is terminal in v1, never cleared at runtime.
+    /// Set once a table is quarantined by a failed lossy DDL cast (PR 3.9) — degrades `/ready`.
+    /// A latch with exactly one exit: a single-table-reload rebuild (PR 6.7) replaces the data,
+    /// so the failed cast no longer applies and the latch clears.
     quarantined: AtomicBool,
     /// The end of the last poll cycle — liveness proof, NOT a lag metric. `None` until bootstrap ends.
     last_poll_completed_at: Mutex<Option<Instant>>,
@@ -46,10 +47,19 @@ impl LoaderState {
         self.ready.load(Ordering::SeqCst) && !self.is_quarantined()
     }
 
-    /// Latch the quarantine flag — a failed lossy DDL cast (PR 3.9). Terminal: `/ready` degrades and
-    /// stays degraded. The caller also logs an error-level alert and exits.
+    /// Latch the quarantine flag — a failed lossy DDL cast (PR 3.9). `/ready` degrades and stays
+    /// degraded; the caller also logs an error-level alert and exits. Since PR 6.7 the latch has
+    /// exactly one exit: a single-table-reload rebuild, which REPLACES the data instead of
+    /// retrying the cast on it ([`LoaderState::clear_quarantine`]).
     pub fn quarantine(&self) {
         self.quarantined.store(true, Ordering::SeqCst);
+    }
+
+    /// The one legitimate quarantine exit (PR 6.7): a reload rebuild just recreated the table at
+    /// the attempt's schema_version, so the lossy cast the latch recorded no longer applies to
+    /// anything — `/ready` recovers.
+    pub fn clear_quarantine(&self) {
+        self.quarantined.store(false, Ordering::SeqCst);
     }
 
     pub fn is_quarantined(&self) -> bool {
@@ -143,5 +153,10 @@ mod tests {
             s.is_started(),
             "/startup stays satisfied — bootstrap did complete"
         );
+
+        // The one exit (PR 6.7): a reload rebuild replaced the data — /ready recovers.
+        s.clear_quarantine();
+        assert!(!s.is_quarantined(), "the rebuild clears the latch");
+        assert!(s.is_ready(), "/ready recovers after the rebuild");
     }
 }

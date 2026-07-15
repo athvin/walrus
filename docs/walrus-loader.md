@@ -899,6 +899,14 @@ A DuckDB truth the loader must design around: **`DELETE` only tombstones** — `
 heavily-deleted row groups, and **`VACUUM FULL` is unimplemented** [7]. So the single `.duckdb` file **does not
 shrink** on ordinary raw-retention deletes.
 
+> **Raw history under a single-table reload (PR 6.7).** A reload **rebuild** (the `reload` flavor,
+> [single-table-reload.md](./single-table-reload.md) H8) `CREATE OR REPLACE`s both `<table>` *and*
+> `<table>_raw` at the attempt's schema_version — **discarding that table's raw CDC history in
+> DuckDB by design**: the pre-reload raw rows describe the world the clear replaces (replaying
+> them would resurrect exactly the drift the reload exists to kill), and the staged Parquet
+> persists in S3 per its GC policy for forensic replay. The `resync` flavor never touches raw
+> history — its chunks append through Phase A like any file.
+
 | Operation | Reclaims space? |
 |---|---|
 | `DELETE` (raw-retention prune) | no — tombstones only |

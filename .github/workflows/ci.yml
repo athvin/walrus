@@ -293,6 +293,12 @@ jobs:
       - name: Reload export (compose)
         run: cargo test -p pg-sink --test reload_export -- --ignored --test-threads=1
 
+      # PR 6.7: the rebuild trigger — first kind='reload' file with a newer reload_id replaces both
+      # tables at the file's version (phantoms die, mid-export updates win, deletes hold), purges
+      # superseded pending rows, clears the quarantine; stale-id files retire unapplied.
+      - name: Reload rebuild (compose)
+        run: cargo test -p loader --test reload_rebuild -- --ignored --test-threads=1
+
       # PR 2.18/2.19: the sink pod-lifecycle shell against the live stack — full bootstrap (control +
       # S3 + source preflight) → /startup→/ready flip, SIGTERM exit 0, missing control DB → exit 11.
       - name: Sink pod-lifecycle smoke (health · SIGTERM · fail-fast exit code)

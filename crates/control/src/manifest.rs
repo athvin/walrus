@@ -168,6 +168,36 @@ pub async fn delete_claimed(
     Ok(result.rows_affected())
 }
 
+/// Purge a rebuilding table's SUPERSEDED pending rows at trigger time (PR 6.7 / reload H8): every
+/// non-reload row with `lsn_end <= first_lsn` describes a commit the chunks re-cover (`C <= L_1`
+/// ⇒ visible to chunk 1's SELECT), so applying it after the rebuild would only re-apply history
+/// the clear just replaced. Chunk 1 itself has `lsn_end = first_lsn` — the `kind` filter is what
+/// lets it survive its own purge. No status filter: a dead-lettered (`failed`) pre-`W` file is
+/// equally superseded. Idempotent (a re-run deletes nothing). Returns rows purged.
+pub async fn delete_superseded(
+    executor: impl PgExecutor<'_>,
+    epoch: i64,
+    source_schema: &str,
+    source_table: &str,
+    first_lsn: Lsn,
+) -> Result<u64, ControlError> {
+    let done = sqlx::query!(
+        r#"
+        DELETE FROM walrus.file_manifest
+        WHERE epoch = $1 AND source_schema = $2 AND source_table = $3
+          AND kind <> 'reload' AND lsn_end <= $4
+        "#,
+        epoch,
+        source_schema,
+        source_table,
+        first_lsn as Lsn,
+    )
+    .execute(executor)
+    .await
+    .map_err(ControlError::from_sqlx)?;
+    Ok(done.rows_affected())
+}
+
 /// Dead-letter a repeatedly-failing file (`status='failed'`) so a poison file can't block the queue.
 pub async fn mark_failed(executor: impl PgExecutor<'_>, id: i64) -> Result<(), ControlError> {
     sqlx::query!(
