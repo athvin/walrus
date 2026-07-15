@@ -61,7 +61,10 @@ pub enum PreflightError {
     },
     #[error("publication {pub_name} does not exist")]
     PublicationMissing { pub_name: String },
-    #[error("publication {pub_name} missing table {schema}.{table}")]
+    #[error(
+        "publication {pub_name} missing table {schema}.{table} \
+         (fix: ALTER PUBLICATION {pub_name} ADD TABLE {schema}.{table})"
+    )]
     PublicationGap {
         pub_name: String,
         schema: String,
@@ -73,6 +76,11 @@ pub enum PreflightError {
     NoReplicationPriv,
     #[error("DDL capture not installed: {detail} (apply migrations/source/0002_ddl_triggers.sql)")]
     DdlCaptureMissing { detail: &'static str },
+    #[error(
+        "reload signal table not installed: {detail} \
+         (apply migrations/source/0003_reload_signal.sql)"
+    )]
+    ReloadSignalMissing { detail: &'static str },
     #[error("preflight query failed: {0}")]
     Query(String),
 }
@@ -197,8 +205,49 @@ impl<'a> SourcePreflight<'a> {
         })
     }
 
-    /// The publication exists and covers `walrus.ddl_audit` + `walrus.heartbeat` (create/extend when
-    /// `manage_publication`, else a gap is terminal). `pg_publication_tables` already expands
+    /// The reload signal table (PR 6.2) is installed with its PK. Missing → terminal, because an
+    /// absent/unpublished signal table doesn't error at reload time — the echo just silently never
+    /// arrives (reload H11). Publication membership is asserted (and auto-added under
+    /// `manage_publication`) by [`Self::assert_publication_covers`], which treats `reload_signal`
+    /// as the third walrus-internal table; this existence check runs FIRST so a missing table gets
+    /// the migration-naming error, not a failed `ALTER PUBLICATION`.
+    pub async fn assert_reload_signal(&self) -> Result<(), PreflightError> {
+        if self
+            .first_text(
+                "SELECT EXISTS (SELECT 1 FROM pg_class c
+                                JOIN pg_namespace n ON n.oid = c.relnamespace
+                                WHERE n.nspname = 'walrus' AND c.relname = 'reload_signal'
+                                  AND c.relkind = 'r')::text",
+            )
+            .await?
+            != "true"
+        {
+            return Err(PreflightError::ReloadSignalMissing {
+                detail: "walrus.reload_signal table absent",
+            });
+        }
+        // The PK doubles as REPLICA IDENTITY DEFAULT — all an insert-only table needs.
+        if self
+            .first_text(
+                "SELECT EXISTS (SELECT 1 FROM pg_index i
+                                JOIN pg_class c ON c.oid = i.indrelid
+                                JOIN pg_namespace n ON n.oid = c.relnamespace
+                                WHERE n.nspname = 'walrus' AND c.relname = 'reload_signal'
+                                  AND i.indisprimary)::text",
+            )
+            .await?
+            != "true"
+        {
+            return Err(PreflightError::ReloadSignalMissing {
+                detail: "walrus.reload_signal has no PRIMARY KEY",
+            });
+        }
+        Ok(())
+    }
+
+    /// The publication exists and covers the walrus-internal tables — `heartbeat`, `ddl_audit`,
+    /// and `reload_signal` (create/extend when `manage_publication`, else a gap is terminal, with
+    /// the exact `ALTER PUBLICATION` fix in the error). `pg_publication_tables` already expands
     /// `FOR ALL TABLES` and partition roots, so we read it directly.
     pub async fn assert_publication_covers(&self) -> Result<(), PreflightError> {
         let pubname = &self.cfg.publication_name;
@@ -212,8 +261,8 @@ impl<'a> SourcePreflight<'a> {
         if !exists {
             if self.cfg.manage_publication {
                 self.exec(&format!(
-                    "CREATE PUBLICATION {} FOR TABLE walrus.heartbeat, walrus.ddl_audit \
-                     WITH (publish_via_partition_root = true)",
+                    "CREATE PUBLICATION {} FOR TABLE walrus.heartbeat, walrus.ddl_audit, \
+                     walrus.reload_signal WITH (publish_via_partition_root = true)",
                     ident(pubname)
                 ))
                 .await?;
@@ -225,7 +274,11 @@ impl<'a> SourcePreflight<'a> {
         }
 
         let published = self.published_tables(pubname).await?;
-        for (schema, table) in [("walrus", "heartbeat"), ("walrus", "ddl_audit")] {
+        for (schema, table) in [
+            ("walrus", "heartbeat"),
+            ("walrus", "ddl_audit"),
+            ("walrus", "reload_signal"),
+        ] {
             let id = TableId {
                 schema: schema.to_string(),
                 table: table.to_string(),
@@ -423,6 +476,9 @@ mod tests {
                 table: "heartbeat".into(),
             },
             PreflightError::NoReplicationPriv,
+            PreflightError::ReloadSignalMissing {
+                detail: "walrus.reload_signal table absent",
+            },
         ] {
             let e: common::Error = pe.into();
             assert_eq!(e.exit_code(), common::ExitCode::Preflight);
@@ -435,5 +491,25 @@ mod tests {
         assert_eq!(lit("wal_level"), "'wal_level'");
         assert_eq!(lit("a'b"), "'a''b'");
         assert_eq!(ident("walrus_pub"), "\"walrus_pub\"");
+    }
+
+    #[test]
+    fn gap_and_signal_errors_name_their_remediation() {
+        // An operator reading the crash log must be able to copy-paste the fix (reload H11).
+        let gap = PreflightError::PublicationGap {
+            pub_name: "walrus_pub".into(),
+            schema: "walrus".into(),
+            table: "reload_signal".into(),
+        };
+        assert!(gap
+            .to_string()
+            .contains("ALTER PUBLICATION walrus_pub ADD TABLE walrus.reload_signal"));
+
+        let missing = PreflightError::ReloadSignalMissing {
+            detail: "walrus.reload_signal table absent",
+        };
+        assert!(missing
+            .to_string()
+            .contains("migrations/source/0003_reload_signal.sql"));
     }
 }

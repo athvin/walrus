@@ -72,6 +72,12 @@ impl Harness {
         .execute(&source)
         .await
         .context("source 0002")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/source/0003_reload_signal.sql"
+        ))
+        .execute(&source)
+        .await
+        .context("source 0003")?;
         // The wide fidelity table (PR 4.2) — one column per mapped type family + a TOAST-able `big`. It
         // must exist BEFORE the sink bootstraps so the sink registers it and the loader owns it.
         sqlx::raw_sql(

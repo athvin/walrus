@@ -79,6 +79,7 @@ echo "runtime images: slim (no toolchain) + CA bundle present"
 $COMPOSE up --wait
 $COMPOSE exec -T source-pg psql -U postgres -d walrus -v ON_ERROR_STOP=1 -f - <migrations/source/0001_publication.sql
 $COMPOSE exec -T source-pg psql -U postgres -d walrus -v ON_ERROR_STOP=1 -f - <migrations/source/0002_ddl_triggers.sql
+$COMPOSE exec -T source-pg psql -U postgres -d walrus -v ON_ERROR_STOP=1 -f - <migrations/source/0003_reload_signal.sql
 
 # Credentials + object-store config shared by both containers (they reach compose by service DNS on
 # the compose network — portable across Linux CI and local Docker Desktop).

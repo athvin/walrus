@@ -269,6 +269,12 @@ jobs:
       - name: DDL capture (compose)
         run: cargo test -p pg-sink --test ddl_capture -- --ignored --test-threads=1
 
+      # PR 6.2: the reload signal table — a signal INSERT is decode-visible through the slot
+      # (wal_insert_lsn stamped by the DEFAULT), backfill never copies it, and preflight is terminal
+      # on a missing/unpublished table (or heals the gap under manage_publication).
+      - name: Reload signal (compose)
+        run: cargo test -p pg-sink --test reload_signal -- --ignored --test-threads=1
+
       # PR 2.18/2.19: the sink pod-lifecycle shell against the live stack — full bootstrap (control +
       # S3 + source preflight) → /startup→/ready flip, SIGTERM exit 0, missing control DB → exit 11.
       - name: Sink pod-lifecycle smoke (health · SIGTERM · fail-fast exit code)
