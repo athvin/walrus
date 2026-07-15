@@ -302,7 +302,7 @@ state — is the anchor use case and the phase-closing e2e.
 | ✅ | [6.2](./phase-6-single-table-reload/pr-6.2-source-reload-signal-table.md) | source `walrus.reload_signal` (insert-only, published) + preflight | reload §H1/H5/H11 |
 | ✅ | [6.3](./phase-6-single-table-reload/pr-6.3-sink-echo-routing-watermark.md) | echo routing + watermark waiter (`L_i` = decoded commit LSN) + race note | reload §H1/§6 |
 | ✅ | [6.4](./phase-6-single-table-reload/pr-6.4-sink-reload-controller.md) | reload controller: pickup, preflight, lease, `max_concurrent_reloads` | reload §H6/H7/H11 |
-| ☐ | [6.5](./phase-6-single-table-reload/pr-6.5-sink-chunk-export-engine.md) | chunk export engine: watermark → echo → stamped Parquet → manifest | reload §H1/H2/§5 |
+| ✅ | [6.5](./phase-6-single-table-reload/pr-6.5-sink-chunk-export-engine.md) | chunk export engine: watermark → echo → stamped Parquet → manifest | reload §H1/H2/§5 |
 | ☐ | [6.6](./phase-6-single-table-reload/pr-6.6-loader-pause-claims.md) | loader pauses a rebuilding table's claims (frontier freezes at `W`) | reload §2/H8 |
 | ☐ | [6.7](./phase-6-single-table-reload/pr-6.7-loader-rebuild-trigger.md) | rebuild trigger: `CREATE OR REPLACE` on first reload file; latest-id wins | reload §H3/H8/H9 |
 | ☐ | [6.8](./phase-6-single-table-reload/pr-6.8-ddl-invalidation-restart.md) | restart-on-DDL: fresh reload_id, purge, retry cap | reload §H9 |

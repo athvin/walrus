@@ -1,6 +1,6 @@
 # PR 6.5 — the chunk export engine: watermark → echo → stamped Parquet
 
-> **Status:** 📋 Planned
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/97
 
 > **Phase:** 6 — single-table reload · **Crates touched:** `pg-sink`, `control` ·
 > **Est. size:** L · **Depends on:** PR 6.4 · **Unlocks:** PR 6.6
@@ -139,25 +139,25 @@ async fn echo_timeout_fails_the_reload_with_publication_hint() { todo!() }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] 2,500 seeded rows at `reload_chunk_rows=1000` produce exactly 3 `kind='reload'` manifest
+- [x] 2,500 seeded rows at `reload_chunk_rows=1000` produce exactly 3 `kind='reload'` manifest
       rows with strictly increasing `lsn_end`, and DuckDB reading the 3 Parquet files back yields
       exactly the source rows — no duplicate, no miss (compose test 1).
-- [ ] Every chunk row's `SinkMeta` has `commit_lsn = lsn =` the chunk's `L_i` == the file's
+- [x] Every chunk row's `SinkMeta` has `commit_lsn = lsn =` the chunk's `L_i` == the file's
       `lsn_end`; `first_lsn` in `table_reload` equals chunk 1's `L_1` and never changes.
-- [ ] The embedded cross-check holds on every chunk (`wal_insert_lsn < L_i`; violation counter
+- [x] The embedded cross-check holds on every chunk (`wal_insert_lsn < L_i`; violation counter
       stays 0 through the compose run).
-- [ ] Resume: a cancelled exporter restarted from the cursor re-exports nothing before the cursor
+- [x] Resume: a cancelled exporter restarted from the cursor re-exports nothing before the cursor
       (compose test 2); chunk files are content-identical regardless of resume.
-- [ ] Echo timeout produces `failed` with the publication hint, not a hang (compose test 3).
-- [ ] Concurrent writes to the table **during** the export end correct in raw math: overlapping
+- [x] Echo timeout produces `failed` with the publication hint, not a hang (compose test 3).
+- [x] Concurrent writes to the table **during** the export end correct in raw math: overlapping
       stream events carry `commit_lsn > L_i` of any chunk containing the same PK (assert on the
       Parquet/meta level here; the mirror-level proof is PR 6.7's).
-- [ ] The replication stream for other tables never stalls during a full export (lag assertion).
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` then `cargo test -p pg-sink --test reload_export -- --ignored`
+- [x] The replication stream for other tables never stalls during a full export (lag assertion).
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` then `cargo test -p pg-sink --test reload_export -- --ignored`
 
 ## What completed looks like
 
