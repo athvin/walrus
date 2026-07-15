@@ -1,6 +1,6 @@
 # PR 6.1 — control-plane state machine: `walrus.table_reload` + manifest `kind='reload'`
 
-> **Status:** 📋 Planned
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/93
 
 > **Phase:** 6 — single-table reload · **Crates touched:** `control`, `migrations/control` ·
 > **Est. size:** M · **Depends on:** PR 5.9 · **Unlocks:** PR 6.2
@@ -185,24 +185,24 @@ async fn fail_purges_this_reloads_manifest_rows_only() { todo!() }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] Migration `0004` applies cleanly to both a fresh control DB and one already at `0003`;
+- [x] Migration `0004` applies cleanly to both a fresh control DB and one already at `0003`;
       existing `file_manifest` rows are untouched (`reload_id IS NULL`).
-- [ ] A second `request()` for a table with a live reload returns a **typed** already-in-progress
+- [x] A second `request()` for a table with a live reload returns a **typed** already-in-progress
       error (unique-violation mapped, not a raw `sqlx::Error`); after `complete`/`failed` a new
       request succeeds.
-- [ ] Every transition is a guarded UPDATE: calling `complete_export` on a `requested` row (or any
+- [x] Every transition is a guarded UPDATE: calling `complete_export` on a `requested` row (or any
       other illegal jump) changes zero rows and errors — asserted by test.
-- [ ] `advance_cursor` freezes `first_lsn` and `schema_version` on chunk 1 and never overwrites them.
-- [ ] `fail()` deletes exactly that reload's `kind='reload'` manifest rows in the same transaction —
+- [x] `advance_cursor` freezes `first_lsn` and `schema_version` on chunk 1 and never overwrites them.
+- [x] `fail()` deletes exactly that reload's `kind='reload'` manifest rows in the same transaction —
       other reloads' and stream/snapshot rows survive (asserted).
-- [ ] `insert_ready` accepts `kind='reload'` with a `reload_id`; claim order (`lsn_end, id`) is
+- [x] `insert_ready` accepts `kind='reload'` with a `reload_id`; claim order (`lsn_end, id`) is
       unchanged.
-- [ ] Docs/comments explain the bigserial-over-UUID decision and the partial-index invariant.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p control` (and `--workspace` stays green); `cargo sqlx prepare --check`
-  - [ ] `docker compose up --wait` then `cargo test -p control --test reload -- --ignored`
+- [x] Docs/comments explain the bigserial-over-UUID decision and the partial-index invariant.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p control` (and `--workspace` stays green); `cargo sqlx prepare --check`
+  - [x] `docker compose up --wait` then `cargo test -p control --test reload -- --ignored`
 
 ## What completed looks like
 
