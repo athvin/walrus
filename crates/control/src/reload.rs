@@ -228,10 +228,15 @@ pub async fn renew_lease(
 
 /// Record chunk `chunk_no` done: bump the cursor, store the new PK bound.
 ///
-/// On the FIRST chunk this also freezes `first_lsn = L₁` and `schema_version` — the `COALESCE`
-/// keeps later chunks' values from ever overwriting them (frozen means frozen; PR 6.8 restarts
-/// with a *fresh* row rather than mutating these). The `chunk_no = $new - 1` guard makes the
-/// cursor strictly in-order: a duplicate or out-of-order advance changes zero rows and errors.
+/// On the FIRST chunk this freezes `first_lsn = L₁` (the `COALESCE`: later chunks legitimately
+/// carry a new `L_i` each call, so their values are simply not the first and never overwrite it)
+/// and `schema_version` — which, unlike the LSN, is also **asserted**: every reload attempt is
+/// single-schema *by construction* (H9), so a later chunk arriving with a different version means
+/// the export engine missed a DDL restart (PR 6.8) — the WHERE rejects it and the mismatch is the
+/// same loud zero-rows error as any illegal transition, never a silent swallow. The
+/// `chunk_no = $new - 1` guard makes the cursor strictly in-order: a duplicate or out-of-order
+/// advance changes zero rows and errors. (PR 6.8 restarts with a *fresh* row rather than ever
+/// mutating the frozen fields.)
 pub async fn advance_cursor(
     ex: impl PgExecutor<'_>,
     reload_id: i64,
@@ -249,6 +254,7 @@ pub async fn advance_cursor(
             schema_version = COALESCE(schema_version, $5),
             updated_at = now()
         WHERE reload_id = $1 AND status = 'exporting' AND chunk_no = $2::bigint - 1
+          AND (schema_version IS NULL OR schema_version = $5)
         "#,
         reload_id,
         chunk_no,
@@ -262,7 +268,7 @@ pub async fn advance_cursor(
     if done.rows_affected() == 0 {
         return Err(ControlError::ReloadTransition {
             reload_id,
-            expected: "exporting (with the cursor at chunk_no - 1)",
+            expected: "exporting (in-order chunk_no, consistent schema_version)",
         });
     }
     Ok(())
