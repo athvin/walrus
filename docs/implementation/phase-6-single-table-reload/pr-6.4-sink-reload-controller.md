@@ -1,6 +1,6 @@
 # PR 6.4 — the reload controller: pickup, preflight, lease, concurrency cap
 
-> **Status:** 📋 Planned
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/96
 
 > **Phase:** 6 — single-table reload · **Crates touched:** `pg-sink`, `control`, `justfile` ·
 > **Est. size:** M · **Depends on:** PR 6.1, PR 6.3 · **Unlocks:** PR 6.5
@@ -129,23 +129,23 @@ reload table flavor='reload':
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `just reload table='public.orders'` flips the row `requested → exporting` within one
+- [x] `just reload table='public.orders'` flips the row `requested → exporting` within one
       heartbeat cadence, with `lease_holder`/`lease_expiry` set and `lease_expiry` observably
       advancing while the (stub) exporter runs.
-- [ ] A request for an unpublished table and one for a PK-less table both land in `failed` with
+- [x] A request for an unpublished table and one for a PK-less table both land in `failed` with
       the specific reason in `error` — before any signal row or chunk is attempted.
-- [ ] A `resync` request fails with the not-yet-implemented reason (lifted in PR 6.10).
-- [ ] With `max_concurrent_reloads=2` and three requests, at most two rows are ever `exporting`
+- [x] A `resync` request fails with the not-yet-implemented reason (lifted in PR 6.10).
+- [x] With `max_concurrent_reloads=2` and three requests, at most two rows are ever `exporting`
       simultaneously; the third starts when a permit frees (unit-tested with the parking stub).
-- [ ] The replication stream never pauses while the controller works — an unrelated table's
+- [x] The replication stream never pauses while the controller works — an unrelated table's
       changes keep flowing during pickup (compose-asserted).
-- [ ] Config bounds are validated: `max_concurrent_reloads ≥ 1`; lease TTL sanely exceeds the
+- [x] Config bounds are validated: `max_concurrent_reloads ≥ 1`; lease TTL sanely exceeds the
       renewal interval; violations are terminal at startup.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` then `cargo test -p pg-sink --test reload_pickup -- --ignored`
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` then `cargo test -p pg-sink --test reload_pickup -- --ignored`
 
 ## What completed looks like
 

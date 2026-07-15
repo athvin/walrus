@@ -202,6 +202,33 @@ pub async fn claim_requested(
     .map_err(ControlError::from_sqlx)
 }
 
+/// Return a claimed-but-never-started row to the queue: `exporting → requested`, lease cleared.
+///
+/// The controller's un-claim for infra failures BETWEEN claim and exporter spawn (PR 6.4) — a
+/// dead preflight connection, a control-pg blip while recording a rejection. An infra error must
+/// neither terminally `fail` a valid request nor leave it `exporting` unowned; back in
+/// `requested`, the next tick re-claims and retries. Holder-guarded (only the claimant un-claims)
+/// and `exporting`-guarded, so it can never clobber a row someone else adopted.
+pub async fn release_claim(
+    ex: impl PgExecutor<'_>,
+    reload_id: i64,
+    holder: &str,
+) -> Result<bool, ControlError> {
+    let done = sqlx::query!(
+        r#"
+        UPDATE walrus.table_reload
+        SET status = 'requested', lease_holder = NULL, lease_expiry = NULL, updated_at = now()
+        WHERE reload_id = $1 AND lease_holder = $2 AND status = 'exporting'
+        "#,
+        reload_id,
+        holder,
+    )
+    .execute(ex)
+    .await
+    .map_err(ControlError::from_sqlx)?;
+    Ok(done.rows_affected() > 0)
+}
+
 /// Renew this holder's lease on a live export. Affects zero rows — returning `false` — if we no
 /// longer hold it or the export left `exporting` (a phantom exporter must not renew).
 pub async fn renew_lease(

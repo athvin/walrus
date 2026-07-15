@@ -64,6 +64,13 @@ pub struct SinkConfig {
     pub startup_deadline: Duration,
     /// Where the K8s health endpoints bind.
     pub health_addr: SocketAddr,
+    /// Concurrent single-table reload exports (PR 6.4 / reload H6). "Reload N tables" drains a
+    /// queue this wide — a polite cap, never N simultaneous load spikes on the source. ≥ 1.
+    pub max_concurrent_reloads: u64,
+    /// Reload lease TTL (PR 6.4 / reload H7): a live exporter renews at TTL/3, so a died-mid-export
+    /// sink is detectable within one TTL. Bounds-checked so the renewal cadence fits inside it.
+    #[serde(with = "humantime_serde")]
+    pub reload_lease_ttl: Duration,
     /// If true, the sink creates/alters `publication_name` to cover the required tables; else a gap
     /// is terminal (the operator owns the source setup — PR 2.19 `migrations/source`).
     pub manage_publication: bool,
@@ -94,6 +101,8 @@ impl Default for SinkConfig {
             backpressure_resume_ratio: 0.75,
             startup_deadline: Duration::from_secs(60),
             health_addr: SocketAddr::from(([0, 0, 0, 0], 8080)),
+            max_concurrent_reloads: 2,
+            reload_lease_ttl: Duration::from_secs(60),
             manage_publication: false,
             strict_keys: true,
         }
@@ -207,6 +216,19 @@ impl SinkConfig {
         positive("max_rows", self.max_rows)?;
         positive("max_bytes", self.max_bytes)?;
         positive("max_inflight_bytes", self.max_inflight_bytes)?;
+        positive("max_concurrent_reloads", self.max_concurrent_reloads)?;
+        duration_bound("reload_lease_ttl", self.reload_lease_ttl)?;
+        // The exporter renews at TTL/3 (crate::reload); a TTL under ~15s leaves too little slack
+        // for a renewal round-trip before expiry — a misconfig, not an intent.
+        if self.reload_lease_ttl < Duration::from_secs(15) {
+            return Err(ConfigError::OutOfBounds {
+                field: "reload_lease_ttl",
+                detail: format!(
+                    "{:?} is too short — renewal runs at TTL/3 and needs headroom; use ≥ 15s",
+                    self.reload_lease_ttl
+                ),
+            });
+        }
         if self.max_inflight_bytes < self.max_bytes {
             return Err(ConfigError::OutOfBounds {
                 field: "max_inflight_bytes",
@@ -336,6 +358,29 @@ mod tests {
             cfg.validate().unwrap_err(),
             ConfigError::OutOfBounds {
                 field: "heartbeat_idle_after",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn reload_knobs_are_bounds_checked() {
+        let mut cfg = valid();
+        cfg.max_concurrent_reloads = 0;
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ConfigError::OutOfBounds {
+                field: "max_concurrent_reloads",
+                ..
+            }
+        ));
+
+        let mut cfg = valid();
+        cfg.reload_lease_ttl = Duration::from_secs(5); // renewal at TTL/3 has no headroom
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ConfigError::OutOfBounds {
+                field: "reload_lease_ttl",
                 ..
             }
         ));
