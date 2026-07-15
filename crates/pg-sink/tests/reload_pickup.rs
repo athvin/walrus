@@ -415,17 +415,28 @@ async fn cap_of_two_holds_and_the_stream_keeps_flowing() {
         )
         .await
         .unwrap();
+    // Match ONLY the customers insert by its relation OID — the exporters' own reload_signal
+    // inserts also decode as Inserts and must not satisfy the no-stall probe.
     let mut ctx = StreamCtx::default();
     tokio::time::timeout(Duration::from_secs(10), async {
+        let mut customers_oid: Option<u32> = None;
         loop {
             let frame = stream.next().await.unwrap().unwrap();
-            if let Some(Message::Insert { .. }) = on_frame(&mut ctx, frame).unwrap() {
-                return;
+            match on_frame(&mut ctx, frame).unwrap() {
+                Some(Message::Relation { relation, .. }) if relation.name == "customers" => {
+                    customers_oid = Some(relation.oid);
+                }
+                Some(Message::Insert { relation_oid, .. })
+                    if customers_oid == Some(relation_oid) =>
+                {
+                    return;
+                }
+                _ => {}
             }
         }
     })
     .await
-    .expect("a user insert decodes while the controller holds two exports");
+    .expect("the USER insert decodes while the controller holds two exports");
 
     token.cancel();
     handle.await.unwrap();

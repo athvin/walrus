@@ -186,6 +186,46 @@ fn spawn_echo_resolver(
     (handle, rx)
 }
 
+/// Prove the resolver is live end-to-end before the exporter signals through it: a sentinel
+/// signal row must echo back. A handshake, not a hopeful sleep — slot creation racing the first
+/// real signal would otherwise surface as a misleading echo timeout.
+async fn await_resolver_ready(
+    admin: &tokio_postgres::Client,
+    waiters: &Arc<WatermarkWaiters>,
+    epoch: i64,
+) {
+    let sentinel = -epoch; // never collides with real (bigserial, positive) reload ids
+                           // Retry the sentinel until the resolver answers: a signal committed BEFORE the resolver's
+                           // slot exists is never streamed, so each attempt re-signals fresh (DELETE + INSERT in one
+                           // implicit txn — the engine's own re-signal shape; only an INSERT echoes).
+    let mut ready = false;
+    for _ in 0..20 {
+        let rx = waiters.subscribe(sentinel, 1);
+        admin
+            .batch_execute(&format!(
+                "DELETE FROM walrus.reload_signal WHERE reload_id = {sentinel}; \
+                 INSERT INTO walrus.reload_signal (reload_id, chunk_no) VALUES ({sentinel}, 1);"
+            ))
+            .await
+            .unwrap();
+        if tokio::time::timeout(Duration::from_millis(500), rx)
+            .await
+            .is_ok()
+        {
+            ready = true;
+            break;
+        }
+    }
+    assert!(ready, "the echo resolver never answered the sentinel");
+    admin
+        .execute(
+            "DELETE FROM walrus.reload_signal WHERE reload_id = $1",
+            &[&sentinel],
+        )
+        .await
+        .unwrap();
+}
+
 fn export_cfg(epoch: i64, chunk_rows: u64, echo_timeout: Duration) -> ChunkExportConfig {
     ChunkExportConfig {
         chunk_rows,
@@ -288,8 +328,7 @@ async fn chunks_cover_the_table_exactly_with_per_chunk_stamps() {
     let token = CancellationToken::new();
     let (resolver, mut watch_rx) =
         spawn_echo_resolver("walrus_re_cover", waiters.clone(), TABLE, token.clone());
-    // Give the resolver's slot a moment to exist before the exporter signals through it.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    await_resolver_ready(&admin, &waiters, epoch).await;
 
     let req = request_and_claim(&pool, epoch).await;
     let reload_id = req.reload_id;
@@ -303,6 +342,34 @@ async fn chunks_cover_the_table_exactly_with_per_chunk_stamps() {
     )
     .await
     .unwrap();
+
+    // Chunk 1 first, then a concurrent write MID-EXPORT to a PK chunk 1 already covered: the
+    // stream event's commit LSN must outrank the chunk stamp (so it wins Phase B's dedup), and
+    // its prompt decode is the no-stall proof — both while the export is genuinely in flight.
+    exporter.export_next_chunk().await.unwrap();
+    admin
+        .execute(
+            &format!("UPDATE public.{TABLE} SET val = 'overlap' WHERE id = 1"),
+            &[],
+        )
+        .await
+        .unwrap();
+    let overlap_commit = tokio::time::timeout(Duration::from_secs(10), watch_rx.recv())
+        .await
+        .expect("the stream keeps decoding while the export is mid-flight")
+        .unwrap();
+    let chunk1_l1 = control::reload::get(&pool, reload_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .first_lsn
+        .unwrap();
+    assert!(
+        overlap_commit > chunk1_l1,
+        "the mid-export stream event ({overlap_commit}) outranks chunk 1's stamp ({chunk1_l1}) — \
+         it wins the loader's dedup for that PK"
+    );
+
     exporter.run().await.unwrap();
 
     // Exactly 3 chunk files: 1000 + 1000 + 500, strictly increasing lsn_end, all this reload's.
@@ -359,25 +426,6 @@ async fn chunks_cover_the_table_exactly_with_per_chunk_stamps() {
         "embedded < L_i held on every chunk"
     );
 
-    // Overlap math + the stream still flows: a write AFTER the chunks decodes promptly and its
-    // commit LSN outranks every chunk stamp — the stream event would win Phase B's dedup.
-    admin
-        .execute(
-            &format!("UPDATE public.{TABLE} SET val = 'overlap' WHERE id = 1"),
-            &[],
-        )
-        .await
-        .unwrap();
-    let overlap_commit = tokio::time::timeout(Duration::from_secs(10), watch_rx.recv())
-        .await
-        .expect("the stream keeps decoding during/after the export")
-        .unwrap();
-    assert!(
-        overlap_commit > ends[2],
-        "a post-chunk stream event outranks every chunk stamp ({overlap_commit} > {})",
-        ends[2]
-    );
-
     token.cancel();
     resolver.await.unwrap();
     scrub(&pool, epoch).await;
@@ -404,7 +452,7 @@ async fn resume_from_cursor_never_reexports_completed_chunks() {
     let token = CancellationToken::new();
     let (resolver, _watch) =
         spawn_echo_resolver("walrus_re_resume", waiters.clone(), TABLE, token.clone());
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    await_resolver_ready(&admin, &waiters, epoch).await;
 
     let req = request_and_claim(&pool, epoch).await;
     let reload_id = req.reload_id;
@@ -431,6 +479,35 @@ async fn resume_from_cursor_never_reexports_completed_chunks() {
         .unwrap();
     assert_eq!(mid.chunk_no, 1);
     let frozen_first_lsn = mid.first_lsn.expect("L_1 frozen at chunk 1");
+
+    // A STALE exporter (crash-redo shape: built from the pre-chunk-1 row) re-signals the same
+    // (reload_id, 1) via DELETE + INSERT and gets a FRESH echo — then its manifest+cursor txn
+    // hits the in-order cursor guard and rolls back: the duplicate S3 file is orphaned (eaten by
+    // design), the manifest stays clean, and the real cursor is untouched.
+    let mut stale = ChunkExporter::connect(
+        &source_url(),
+        pool.clone(),
+        waiters.clone(),
+        sink.clone(),
+        export_cfg(epoch, 1000, Duration::from_secs(20)),
+        &req,
+    )
+    .await
+    .unwrap();
+    let stale_err = stale.export_next_chunk().await.unwrap_err();
+    assert!(
+        format!("{stale_err:#}").contains("illegal reload transition"),
+        "the cursor guard rejects the stale advance (fresh echo notwithstanding): {stale_err:#}"
+    );
+    drop(stale);
+    let after_stale = control::reload::get(&pool, reload_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after_stale.chunk_no, 1,
+        "the stale attempt advanced nothing"
+    );
 
     // Resume from the cursor: chunks 2..3 export; chunk 1 is NOT re-exported.
     let mut resumed = ChunkExporter::connect(
@@ -505,7 +582,7 @@ async fn echo_timeout_fails_the_reload_with_publication_hint() {
     .await
     .unwrap();
     let err = exporter.run().await.unwrap_err();
-    assert!(err.to_string().contains("echo timeout"), "got: {err:#}");
+    assert!(format!("{err:#}").contains("no echo after"), "got: {err:#}");
 
     let row = control::reload::get(&pool, req.reload_id)
         .await
