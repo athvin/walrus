@@ -1,7 +1,8 @@
 //! Reload controller pickup against compose (`#[ignore]` — needs source + control PG). A
 //! `requested` row flips to `exporting` within one poll cadence with a live, observably-advancing
-//! lease; doomed requests (unpublished / keyless / resync) fail fast with operator-readable
-//! reasons; the `max_concurrent_reloads` cap holds under three requests while the replication
+//! lease; doomed requests (unpublished / keyless) fail fast with operator-readable reasons while a
+//! `resync` of a keyed table is accepted (PR 6.10); the `max_concurrent_reloads` cap holds under
+//! three requests while the replication
 //! stream keeps flowing. The scheduling/lease-cancel semantics are unit-tested in
 //! `src/reload.rs`; each test runs its own controller against its own epoch, so tests never
 //! claim each other's rows.
@@ -279,14 +280,16 @@ async fn preflight_failures_land_in_failed_with_reasons() {
     )
     .await
     .unwrap();
-    // (c) Resync: rejected until PR 6.10 lifts it.
+    // (c) Resync of a published, keyed table: NO LONGER rejected (PR 6.10 lifted the guard) — it
+    // passes preflight like a `reload` and reaches `exporting` (here it parks on the echo await,
+    // no resolver runs, exactly like the accepted-request case above).
     let resync = reload::request(&pool, epoch, "public", "orders", ReloadFlavor::Resync)
         .await
         .unwrap();
 
     await_status(&pool, ghost, ReloadStatus::Failed).await;
     await_status(&pool, keyless, ReloadStatus::Failed).await;
-    await_status(&pool, resync, ReloadStatus::Failed).await;
+    await_status(&pool, resync, ReloadStatus::Exporting).await;
 
     let (_, err) = status_of(&pool, ghost).await;
     assert!(
@@ -299,11 +302,6 @@ async fn preflight_failures_land_in_failed_with_reasons() {
     assert!(
         err.as_deref().unwrap().contains("has no primary key"),
         "keyless: {err:?}"
-    );
-    let (_, err) = status_of(&pool, resync).await;
-    assert!(
-        err.as_deref().unwrap().contains("PR 6.10"),
-        "resync: {err:?}"
     );
 
     token.cancel();
