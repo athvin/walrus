@@ -153,6 +153,7 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
             epoch,
             chunk_rows: cfg.reload_chunk_rows,
             echo_timeout: cfg.reload_echo_timeout,
+            reload_max_restarts: cfg.reload_max_restarts,
         },
         token.clone(),
     );

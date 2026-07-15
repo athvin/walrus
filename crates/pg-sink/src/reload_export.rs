@@ -40,6 +40,29 @@ pub enum ChunkOutcome {
     Drained { rows: u64 },
 }
 
+/// How a whole [`ChunkExporter::run`] ended (PR 6.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// The table drained at this attempt's frozen schema — the export is complete (PR 6.9 gives it
+    /// its `export_complete` ending).
+    Drained,
+    /// DDL bumped the table's structural `schema_version` past the frozen one between chunks: this
+    /// attempt is invalid and the controller must restart it at `new_version` (reload H9).
+    SchemaChanged { new_version: i64 },
+}
+
+/// Has the table's structural `schema_version` moved past the reload's `frozen` version? Returns
+/// the new version if so, else `None`. Deliberately compares the REGISTRY's version — which bumps
+/// only on structural DDL (a decoded Relation message, PR 2.33), so metadata-only DDL (`COMMENT
+/// ON`) never trips it — and never restarts backwards (`latest < frozen` is a stale read). Pure so
+/// the restart trigger unit-tests without a database.
+fn version_changed(frozen: i64, latest: Option<i64>) -> Option<i64> {
+    match latest {
+        Some(v) if v > frozen => Some(v),
+        _ => None,
+    }
+}
+
 /// Everything the exporter needs beyond the reload row itself.
 #[derive(Clone)]
 pub struct ChunkExportConfig {
@@ -171,8 +194,29 @@ impl ChunkExporter {
     /// Fresh start or cursor resume (H7): loop `export_next_chunk` until a short chunk says
     /// drained. The row then simply stays `exporting`, fully drained, cursor at end — PR 6.9
     /// gives it its `export_complete` ending and the final watermark `H`.
-    pub async fn run(&mut self) -> anyhow::Result<()> {
+    ///
+    /// Before each chunk, re-check the table's structural version (PR 6.8 / H9): a DDL that bumped
+    /// it past this attempt's frozen version returns [`RunOutcome::SchemaChanged`] so the
+    /// controller restarts the attempt at the new shape. Every attempt is single-schema by
+    /// construction; the loader therefore never reconciles a version change *inside* a rebuild.
+    ///
+    /// The tradeoff (H9): restart-on-DDL trades *wasted export work* (bounded by
+    /// `reload_max_restarts`, counted by `walrus_reload_restarts_total`) for the loader never
+    /// facing a half-populated table at a version boundary. Per-chunk version *tolerance* — letting
+    /// chunks straddle versions and reconciling in the rebuild — was rejected: its failure mode is
+    /// silent mis-reconciliation, not visible waste. Revisit only if restart churn on DDL-heavy
+    /// tables becomes a *measured* problem (`single-table-reload.md` H9).
+    pub async fn run(&mut self) -> anyhow::Result<RunOutcome> {
         loop {
+            if let Some(new_version) = self.check_schema_still_current().await? {
+                tracing::info!(
+                    reload_id = self.reload_id,
+                    frozen = self.schema_version,
+                    new_version,
+                    "reload interrupted: DDL bumped schema_version between chunks — restarting (H9)"
+                );
+                return Ok(RunOutcome::SchemaChanged { new_version });
+            }
             match self.export_next_chunk().await? {
                 ChunkOutcome::Exported { rows } => {
                     tracing::info!(
@@ -189,10 +233,32 @@ impl ChunkExporter {
                         rows,
                         "reload export drained (export_complete lands in PR 6.9)"
                     );
-                    return Ok(());
+                    return Ok(RunOutcome::Drained);
                 }
             }
         }
+    }
+
+    /// The per-chunk staleness check (PR 6.8): is the table still at this attempt's frozen
+    /// `schema_version`? Reads the REGISTRY's latest version (control-pg, a cheap indexed MAX) —
+    /// the sink's own structural-version source of truth, bumped only when a Relation message
+    /// decodes — never a per-chunk catalog query against the source. Returns the new version if a
+    /// structural bump landed, else `None`.
+    ///
+    /// A window remains between this check and the chunk's own SELECT where DDL can still slip in;
+    /// that chunk exports at the old shape, but the NEXT chunk's check catches the bump and the
+    /// restart throws that file away with the rest — harmless only because the restart's purge is
+    /// total (H9).
+    async fn check_schema_still_current(&self) -> anyhow::Result<Option<i64>> {
+        let latest = control::read_latest_version(
+            &self.pool,
+            self.cfg.epoch,
+            &self.rel.schema,
+            &self.rel.name,
+        )
+        .await
+        .context("read registry latest version for reload staleness check")?;
+        Ok(version_changed(self.schema_version, latest))
     }
 
     /// Signal chunk `chunk_no` and wait for its echo, retrying the full
@@ -573,6 +639,37 @@ mod tests {
         assert!(
             sql.ends_with("ORDER BY _src.\"b\", _src.\"a\" LIMIT 100"),
             "ORDER BY in INDEX order: {sql}"
+        );
+    }
+
+    #[test]
+    fn schema_bump_between_chunks_interrupts_with_new_version() {
+        // A structural bump past the frozen version restarts; equal (metadata-only DDL never bumps
+        // the registry) and a stale backwards read do not.
+        assert_eq!(version_changed(1, Some(2)), Some(2), "1 → 2 restarts");
+        assert_eq!(
+            version_changed(1, Some(1)),
+            None,
+            "metadata-only: no restart"
+        );
+        assert_eq!(version_changed(2, Some(1)), None, "never restart backwards");
+        assert_eq!(
+            version_changed(1, None),
+            None,
+            "no registry row: no restart"
+        );
+    }
+
+    #[test]
+    fn restart_cap_zero_means_first_ddl_fails_the_reload() {
+        // The controller consults the same pure cap check the control-layer restart uses.
+        assert!(
+            control::reload::restart_would_exceed_cap(0, 0),
+            "cap 0 ⇒ the first mid-export DDL fails the reload"
+        );
+        assert!(
+            !control::reload::restart_would_exceed_cap(0, 3),
+            "with headroom the first DDL restarts instead"
         );
     }
 

@@ -80,6 +80,12 @@ pub struct SinkConfig {
     /// failure into a `failed` row naming the fix.
     #[serde(with = "humantime_serde")]
     pub reload_echo_timeout: Duration,
+    /// How many times a reload may restart because DDL bumped its `schema_version` mid-export
+    /// (PR 6.8 / reload H9). Every attempt is single-schema by construction; a schema change past
+    /// chunk 1 invalidates the attempt and re-exports from zero at the new shape. This caps that
+    /// churn so a migration-heavy window can't livelock a huge table's reload. `0` fails the first
+    /// mid-export DDL; must be ≥ 0.
+    pub reload_max_restarts: i32,
     /// If true, the sink creates/alters `publication_name` to cover the required tables; else a gap
     /// is terminal (the operator owns the source setup — PR 2.19 `migrations/source`).
     pub manage_publication: bool,
@@ -114,6 +120,7 @@ impl Default for SinkConfig {
             reload_lease_ttl: Duration::from_secs(60),
             reload_chunk_rows: 10_000,
             reload_echo_timeout: Duration::from_secs(30),
+            reload_max_restarts: 3,
             manage_publication: false,
             strict_keys: true,
         }
@@ -231,6 +238,16 @@ impl SinkConfig {
         positive("reload_chunk_rows", self.reload_chunk_rows)?;
         duration_bound("reload_echo_timeout", self.reload_echo_timeout)?;
         duration_bound("reload_lease_ttl", self.reload_lease_ttl)?;
+        // 0 is legal (fail on first mid-export DDL); only a negative cap is a misconfig.
+        if self.reload_max_restarts < 0 {
+            return Err(ConfigError::OutOfBounds {
+                field: "reload_max_restarts",
+                detail: format!(
+                    "{} is negative — 0 disables restarts (first DDL fails the reload); use ≥ 0",
+                    self.reload_max_restarts
+                ),
+            });
+        }
         // The exporter renews at TTL/3 (crate::reload); a TTL under ~15s leaves too little slack
         // for a renewal round-trip before expiry — a misconfig, not an intent.
         if self.reload_lease_ttl < Duration::from_secs(15) {
@@ -394,6 +411,19 @@ mod tests {
             cfg.validate().unwrap_err(),
             ConfigError::OutOfBounds {
                 field: "reload_lease_ttl",
+                ..
+            }
+        ));
+
+        // 0 restarts is a legal policy (fail on the first mid-export DDL); only negative is a misconfig.
+        let mut cfg = valid();
+        cfg.reload_max_restarts = 0;
+        assert!(cfg.validate().is_ok(), "a cap of 0 is a valid policy");
+        cfg.reload_max_restarts = -1;
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ConfigError::OutOfBounds {
+                field: "reload_max_restarts",
                 ..
             }
         ));
