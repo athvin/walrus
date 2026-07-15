@@ -288,6 +288,7 @@ impl ChunkExporter {
         for attempt in 1..=ECHO_ATTEMPTS {
             // Subscribe-then-insert (PR 6.3): the waiter must exist before the echo can arrive.
             let rx = self.waiters.subscribe(self.reload_id, chunk_no);
+            let signalled_at = std::time::Instant::now();
             self.client
                 .batch_execute(&format!(
                     "DELETE FROM walrus.reload_signal WHERE reload_id = {r} AND chunk_no = {c}; \
@@ -298,7 +299,12 @@ impl ChunkExporter {
                 .await
                 .context("insert reload watermark signal")?;
             match tokio::time::timeout(self.cfg.echo_timeout, rx).await {
-                Ok(Ok(echo)) => return Ok(echo),
+                Ok(Ok(echo)) => {
+                    // The echo round-trip: signal INSERT → decoded-commit echo (PR 6.11). Its p99
+                    // bounds reload throughput and tracks end-to-end decode latency.
+                    common::metrics::record_reload_echo_wait(signalled_at.elapsed().as_secs_f64());
+                    return Ok(echo);
+                }
                 Ok(Err(_)) => {
                     anyhow::bail!("echo waiter superseded (a newer subscriber replaced it)")
                 }
@@ -323,6 +329,7 @@ impl ChunkExporter {
         );
         let mut conn = self.pool.acquire().await?;
         control::reload::fail(&mut conn, self.reload_id, &reason).await?;
+        common::metrics::record_reload_failed(&format!("{}.{}", self.rel.schema, self.rel.name));
         anyhow::bail!("reload {} failed: {reason}", self.reload_id);
     }
 
@@ -410,6 +417,8 @@ impl ChunkExporter {
         }
 
         let n = rows.len() as u64;
+        // One chunk file exported (PR 6.11): bump the per-table chunk + row counters.
+        common::metrics::record_reload_chunk(&format!("{}.{}", self.rel.schema, self.rel.name), n);
         if n < self.cfg.chunk_rows {
             Ok(ChunkOutcome::Drained { rows: n })
         } else {

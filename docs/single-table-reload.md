@@ -397,6 +397,70 @@ fan-out can later compose with the CTID-range machinery of
   the rebuild trigger runs under the table's ownership lease, so it inherits the fencing story —
   confirm the reload lease and the ownership lease can't deadlock or interleave badly.
 
+## Operating a reload (runbook — PR 6.11)
+
+The `walrus.table_reload` row **is** the operator interface. Metrics/dashboards (PR 6.11) show
+aggregate health; this runbook turns a row into a decision.
+
+**Request.** Pick the flavor with the [decision guide](#h3--refresh-and-rebuild-are-different-operations-the-proposal-conflates-them)
+above (`resync` = cheap drift repair, keeps the table queryable, tolerates phantoms; `reload` = the
+truth reset / quarantine recovery). Then:
+
+```
+just reload table='public.orders'                 # rebuild (default)
+just reload table='public.orders' flavor='resync' # refresh over the live mirror
+```
+
+**Watch.** One SQL query is the whole progress view — the status walk is
+`requested → exporting → export_complete → complete` (`failed` is terminal):
+
+```sql
+SELECT reload_id, flavor, status, chunk_no, restart_count,
+       first_lsn, final_lsn, lease_holder, lease_expiry, left(error, 60) AS error
+FROM walrus.table_reload
+WHERE source_schema = 'public' AND source_table = 'orders'
+ORDER BY reload_id DESC LIMIT 5;
+```
+
+`chunk_no` climbs during `exporting`; `final_lsn` (H) is set at `export_complete`; the loader flips
+`complete` once `transformed_lsn ≥ H`. On the dashboard, the "Single-table reload" row shows
+reloads-in-flight, chunks/rows-per-second, echo p99, and the failure/anomaly panel.
+
+**Unstick.** A reload `exporting` for a long time with a **stale lease** (`lease_expiry < now()`)
+means its exporter died and nothing adopted it (the `WalrusReloadLeaseStuck` page / the
+`walrus_reload_lease_stale` gauge). Two options:
+
+- **Preferred — restart the sink.** On startup the controller's adoption scan re-acquires its own /
+  expired `exporting` leases and resumes from the chunk cursor (PR 6.9). No data is re-exported at
+  or before the cursor.
+- **Give up on the attempt.** Mark it failed (this also purges its staged `kind='reload'` chunk
+  files, so the loader claims nothing stale — the coupling is in `reload::fail`):
+
+```sql
+-- Only a reload that is genuinely orphaned — verify lease_expiry < now() first.
+UPDATE walrus.table_reload SET status = 'failed', error = 'operator: stuck lease',
+       updated_at = now()
+WHERE reload_id = :id AND status = 'exporting';
+DELETE FROM walrus.file_manifest WHERE reload_id = :id;   -- (reload::fail does both atomically)
+```
+
+Then re-request with `just reload` when ready.
+
+**Cross-check violation (page, `WalrusReloadCrosscheckViolation`).** This is the one that means the
+watermark *model* is wrong — possible silent data loss. **Do not just restart the pod.** Stop issuing
+reloads, capture the `reload_id`/`chunk_no` from the error log lines (`embedded wal_insert_lsn >=
+commit LSN`), and open an issue. The cross-check counter should read `0` forever in a healthy system.
+
+**Retention.** The source `walrus.reload_signal` table is insert-only (one row per chunk watermark).
+It is tiny and bounded by concurrent reloads, but if you want to reclaim it, deleting rows for a
+`complete`/`failed` reload is safe — the echoes were consumed in-stream long ago:
+
+```sql
+DELETE FROM walrus.reload_signal s
+USING walrus.table_reload r
+WHERE s.reload_id = r.reload_id AND r.status IN ('complete', 'failed');
+```
+
 ## 7. References
 
 - [Debezium: Incremental Snapshots blog (2021)][incremental snapshots blog] — chunking rationale,

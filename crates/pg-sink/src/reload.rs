@@ -111,10 +111,11 @@ pub async fn handle_ddl_restart(
     new_version: i64,
     max_restarts: i32,
 ) -> anyhow::Result<RestartDecision> {
+    let table = format!("{}.{}", old.source_schema, old.source_table);
     let mut conn = pool.acquire().await?;
     match control::reload::restart_for_ddl(&mut conn, old, new_version, max_restarts).await? {
         Some(new_id) => {
-            common::metrics::record_reload_restart();
+            common::metrics::record_reload_restart(&table);
             tracing::info!(
                 old_reload_id = old.reload_id,
                 new_reload_id = new_id,
@@ -126,6 +127,7 @@ pub async fn handle_ddl_restart(
         }
         None => {
             common::metrics::record_reload_restart_cap_exhausted();
+            common::metrics::record_reload_failed(&table);
             tracing::error!(
                 reload_id = old.reload_id,
                 new_version,
@@ -351,6 +353,10 @@ impl ReloadController {
                         reason = %rejection,
                         "reload request rejected at preflight"
                     );
+                    common::metrics::record_reload_failed(&format!(
+                        "{}.{}",
+                        req.source_schema, req.source_table
+                    ));
                     if let Err(e) = self.fail_row(req.reload_id, &rejection.to_string()).await {
                         tracing::error!(
                             reload_id = req.reload_id,
@@ -411,6 +417,10 @@ impl ReloadController {
         let source_db_url = self.source_db_url.clone();
         let waiters = self.waiters.clone();
         let sink = self.sink.clone();
+        // The reload-active gauge (PR 6.11): +1 for this exporter task's flavor now, -1 when it
+        // ends (any exit path). The flavor is stable across DDL-restarts, so one task = one count.
+        let flavor = req.flavor.as_str();
+        common::metrics::inc_reload_active(flavor);
         tokio::spawn(async move {
             let _permit = permit;
             // The lease-renewal target: the export loop repoints this on every DDL-restart, so
@@ -470,6 +480,7 @@ impl ReloadController {
                     Err(e) => tracing::error!(reload_id, error = %e, "export failed"),
                 },
             }
+            common::metrics::dec_reload_active(flavor); // balances the inc above (PR 6.11)
         });
     }
 
@@ -520,12 +531,13 @@ impl ReloadController {
         }
     }
 
-    /// Per-tick surfacing (PR 6.9): a genuinely stuck export — `exporting`, lease expired, nobody
-    /// renewing — warns each tick with its id and last holder. The alert rule is PR 6.11's.
+    /// Per-tick surfacing (PR 6.9/6.11): genuinely stuck exports — `exporting`, lease expired,
+    /// nobody renewing — are warned per row AND counted into the `walrus_reload_lease_stale` gauge
+    /// the stuck-lease alert reads (a gauge, so the alert never queries control-pg).
     async fn warn_stuck(&self) -> anyhow::Result<()> {
-        for (reload_id, holder) in
-            control::reload::stuck_exporting(&self.pool, self.cfg.epoch).await?
-        {
+        let stuck = control::reload::stuck_exporting(&self.pool, self.cfg.epoch).await?;
+        common::metrics::set_reload_lease_stale(stuck.len() as u64);
+        for (reload_id, holder) in stuck {
             tracing::warn!(
                 reload_id,
                 lease_holder = ?holder,

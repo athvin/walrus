@@ -170,7 +170,7 @@
     {
       "type": "timeseries",
       "title": "Raw-append & transform lag (bytes, per table)",
-      "description": "Dashboard-only — deliberately not alerted; high lag after an outage is healthy catch-up.",
+      "description": "Dashboard-only — deliberately not alerted; high lag after an outage is healthy catch-up. Expected anomaly (PR 6.11): a rebuild-flavor reload PAUSES its table's claims, so raw-append lag for that table grows BY DESIGN during the export and drains once export_complete lifts the pause.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] },
       "gridPos": { "h": 8, "w": 8, "x": 8, "y": 28 },
@@ -188,6 +188,59 @@
       "targets": [
         { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "walrus_loader_ddl_pending", "legendFormat": "ddl-pending {{table}}" },
         { "refId": "B", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "rate(walrus_loader_failed_file_total[5m])", "legendFormat": "failed {{table}}" }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Single-table reload (PR 6.11)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 36 }
+    },
+    {
+      "type": "stat",
+      "title": "Reloads in flight (by flavor)",
+      "description": "Non-terminal reloads the controller is exporting; returns to 0 when the queue drains.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 37 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "walrus_reload_active", "legendFormat": "{{flavor}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Reload throughput (chunks & rows/s, per table)",
+      "description": "Export progress. Flat while paused/idle; rises during an active export.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "rows/s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 37 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "rate(walrus_reload_rows_exported_total[5m])", "legendFormat": "rows/s {{table}}" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "rate(walrus_reload_chunks_total[5m])", "legendFormat": "chunks/s {{table}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Echo round-trip (p99 seconds)",
+      "description": "Signal INSERT → decoded-commit echo (H1). p99 bounds reload throughput and tracks end-to-end decode latency.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 37 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "histogram_quantile(0.99, sum(rate(walrus_reload_echo_wait_seconds_bucket[5m])) by (le))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Reload failures & anomalies",
+      "description": "restarts/failed/cap are per table; lease-stale & cross-check are the paged anomalies (cross-check != 0 means the watermark model is wrong).",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 45 },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "rate(walrus_reload_restarts_total[5m])", "legendFormat": "restarts {{table}}" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "rate(walrus_reload_failed_total[5m])", "legendFormat": "failed {{table}}" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "walrus_reload_lease_stale", "legendFormat": "lease-stale" },
+        { "refId": "D", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "walrus_reload_crosscheck_violations_total", "legendFormat": "cross-check violations" }
       ]
     }
   ]
