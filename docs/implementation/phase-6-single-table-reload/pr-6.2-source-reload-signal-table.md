@@ -1,6 +1,6 @@
 # PR 6.2 — the source-side signal table: `walrus.reload_signal`, published
 
-> **Status:** 📋 Planned
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/94
 
 > **Phase:** 6 — single-table reload · **Crates touched:** `migrations/source`, `pg-sink` ·
 > **Est. size:** S · **Depends on:** PR 6.1 · **Unlocks:** PR 6.3
@@ -110,22 +110,22 @@ async fn backfill_never_copies_walrus_reload_signal() { todo!() }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] Migration `0003` applies to a fresh source and to one already at `0002`; the table is in
+- [x] Migration `0003` applies to a fresh source and to one already at `0002`; the table is in
       `walrus_pub` afterwards.
-- [ ] A manual `INSERT INTO walrus.reload_signal (reload_id, chunk_no) VALUES (…)` produces a
+- [x] A manual `INSERT INTO walrus.reload_signal (reload_id, chunk_no) VALUES (…)` produces a
       decoded insert in the replication stream, with `wal_insert_lsn` populated by the DEFAULT —
       no explicit LSN in the INSERT.
-- [ ] With the table removed from the publication, sink preflight fails **terminal** and the error
+- [x] With the table removed from the publication, sink preflight fails **terminal** and the error
       names the `ALTER PUBLICATION` fix; with `manage_publication=true` it is added automatically.
-- [ ] Bootstrap/backfill never emits a snapshot file for `walrus.reload_signal` (the existing
+- [x] Bootstrap/backfill never emits a snapshot file for `walrus.reload_signal` (the existing
       `walrus`-schema exclusion, now pinned by a test).
-- [ ] Docs/comments state the insert-only rule and that `wal_insert_lsn` is a cross-check, not the
+- [x] Docs/comments state the insert-only rule and that `wal_insert_lsn` is a cross-check, not the
       stamp.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` then `cargo test -p pg-sink --test reload_signal -- --ignored`
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` then `cargo test -p pg-sink --test reload_signal -- --ignored`
 
 ## What completed looks like
 
