@@ -12,6 +12,8 @@
 
 # PR X.Y — <imperative title, e.g. "Add the `Lsn` newtype">
 
+> **Status:** 📋 Planned <!-- flip to "✅ Done — <PR url>" when it merges -->
+
 > **Phase:** <n — name> · **Crates touched:** `<crate>` … · **Est. size:** <S | M | L> ·
 > **Depends on:** PR <a.b> · **Unlocks:** PR <c.d>
 
@@ -86,6 +88,18 @@ A reviewer merges this PR when **all** of the following hold:
   - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
   - [ ] `cargo test -p <crate>` (and `--workspace` stays green)
   - [ ] <if applicable> `docker compose up --wait` then `<the integration assertion>`
+
+## What completed looks like
+
+<!-- The observable demo, distinct from the DoD checklist above: the exact commands a
+     reviewer/operator runs and the output or state that proves the slice — a SQL status
+     walk, a `just` recipe transcript, metric names with the movement you expect. If this
+     block can't be reproduced against the merged branch, the PR isn't done. -->
+
+```
+$ <command>
+<expected observable output / state>
+```
 
 ## Hints & gotchas
 

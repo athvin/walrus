@@ -28,6 +28,14 @@ all without disturbing the slot or the other tables' loaders.
 (`crates/control/src/checkpoint.rs`), scoped to one table instead of the whole epoch. It is listed
 first by the design but is the **heaviest** of the three (it touches the snapshot↔stream boundary).
 
+**Design note.** [single-table-reload.md](./single-table-reload.md) critiques an in-band
+signal-table proposal for this goal and lands on a chunked, watermark-stamped shape (Debezium/DBLog
+lineage) that needs no extra slots and no stream pause.
+
+**Planned.** That design is now broken into 12 implementable PRs with Definitions of Done —
+[implementation curriculum, Phase 6](./implementation/README.md#the-roadmap)
+([task files](./implementation/phase-6-single-table-reload/)).
+
 ## 2. Multi-pod loader table-sharding (horizontal scale-out)
 
 **What.** Spread tables across **multiple loader replicas**, each owning a disjoint set — consistent
@@ -66,5 +74,5 @@ epoch, or ownership machinery — only concurrent `COPY` under the snapshot alre
 
 *v1 curriculum complete (phases 0–4) — these goals are the feature-work finish line
 ([docs/implementation/README.md](./implementation/README.md); phase 5 there is post-v1 hardening —
-benchmarks, hot-path cleanup, CI speed — not new features). The seams above are marked, not
-implemented; each changes no v1 runtime behaviour.*
+benchmarks, hot-path cleanup, CI speed — not new features; phase 6 plans goal §1 above as 12 PRs).
+The seams above are marked, not implemented; each changes no v1 runtime behaviour.*
