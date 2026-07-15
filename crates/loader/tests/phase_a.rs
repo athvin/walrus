@@ -241,3 +241,85 @@ async fn re_running_the_same_file_appends_zero_rows() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+#[ignore = "requires docker compose up --wait (control PG + MinIO)"]
+async fn pause_withholds_claims_and_lifts_on_failed() {
+    let _g = LOCK.lock().await;
+    let epoch = 3_200_004;
+    let uri = write_fixture(epoch);
+    let (ctx, dir) = setup(epoch).await;
+    seed_manifest(&ctx.pool, epoch, &uri).await;
+    sqlx::query("DELETE FROM walrus.table_reload WHERE epoch = $1")
+        .bind(epoch)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+
+    // A live rebuild-flavor reload: Phase A must treat the table as PAUSED, not idle (PR 6.6).
+    let reload_id = control::reload::request(
+        &ctx.pool,
+        epoch,
+        "public",
+        "orders",
+        control::reload::ReloadFlavor::Reload,
+    )
+    .await
+    .unwrap();
+
+    // Paused: nothing claimed or appended, the backlog stays ready, the frontier is frozen (no
+    // rewind, no CHECK violation — it simply does not move), and the once-per-pause latch holds
+    // exactly this reload_id.
+    assert_eq!(run_phase_a(&ctx).await.unwrap(), None);
+    assert_eq!(raw_count(&ctx), 0, "nothing appended while paused");
+    assert!(
+        control::max_ready_lsn_end(&ctx.pool, epoch, "public", "orders")
+            .await
+            .unwrap()
+            .is_some(),
+        "the ready backlog accumulates (the lag gauge SHOULD grow — PR 6.11)"
+    );
+    let cp = control::read_checkpoint(&ctx.pool, epoch, "public", "orders")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cp.raw_appended_lsn, Lsn::ZERO, "frontier frozen at W");
+    assert_eq!(
+        *ctx.pause_logged.lock().unwrap(),
+        Some(reload_id),
+        "the pause is latched (logged once)"
+    );
+
+    // A second poll changes nothing — same latch value means no re-log.
+    assert_eq!(run_phase_a(&ctx).await.unwrap(), None);
+    assert_eq!(*ctx.pause_logged.lock().unwrap(), Some(reload_id));
+
+    // `failed` lifts the pause: the backlog drains and the latch clears.
+    control::reload::claim_requested(&ctx.pool, epoch, "sink-t", 60, 10)
+        .await
+        .unwrap();
+    let mut conn = ctx.pool.acquire().await.unwrap();
+    control::reload::fail(&mut conn, reload_id, "demo")
+        .await
+        .unwrap();
+    drop(conn);
+    let lsn = run_phase_a(&ctx).await.unwrap();
+    assert_eq!(lsn, Some("0/64".parse().unwrap()));
+    assert_eq!(
+        raw_count(&ctx),
+        2,
+        "the paused backlog drained after the lift"
+    );
+    assert_eq!(
+        *ctx.pause_logged.lock().unwrap(),
+        None,
+        "the latch clears when claiming resumes"
+    );
+
+    sqlx::query("DELETE FROM walrus.table_reload WHERE epoch = $1")
+        .bind(epoch)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
