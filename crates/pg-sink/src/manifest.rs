@@ -20,11 +20,26 @@ pub async fn record_ready(
     epoch: i64,
     obj: &WrittenObject,
 ) -> Result<i64, ManifestError> {
-    Ok(control::insert_ready(ex, &to_ready_row(epoch, obj)).await?)
+    record_ready_with_reload(ex, epoch, obj, None).await
+}
+
+/// As [`record_ready`], carrying the `reload_id` a `kind='reload'` chunk file belongs to (PR 6.5)
+/// — the loader's routing/purge key. Stream/snapshot/spill objects pass `None`.
+pub async fn record_ready_with_reload(
+    ex: impl sqlx::PgExecutor<'_>,
+    epoch: i64,
+    obj: &WrittenObject,
+    reload_id: Option<i64>,
+) -> Result<i64, ManifestError> {
+    Ok(control::insert_ready(ex, &to_ready_row(epoch, obj, reload_id)).await?)
 }
 
 /// `WrittenObject` → the `ready` row (`kind` from the object, `lsn_end` = commit LSN).
-fn to_ready_row(epoch: i64, obj: &WrittenObject) -> control::NewManifestFile {
+fn to_ready_row(
+    epoch: i64,
+    obj: &WrittenObject,
+    reload_id: Option<i64>,
+) -> control::NewManifestFile {
     control::NewManifestFile {
         epoch,
         source_schema: obj.source_schema.clone(),
@@ -35,7 +50,7 @@ fn to_ready_row(epoch: i64, obj: &WrittenObject) -> control::NewManifestFile {
         lsn_start: obj.lsn_start,
         lsn_end: obj.lsn_end,
         schema_version: obj.schema_version,
-        reload_id: None,
+        reload_id,
     }
 }
 
@@ -64,8 +79,12 @@ mod tests {
             schema_version: 3,
             kind: FileKind::Stream,
         };
-        let row = to_ready_row(9, &obj);
+        let row = to_ready_row(9, &obj, None);
         assert_eq!(row.epoch, 9);
+        assert_eq!(
+            row.reload_id, None,
+            "stream objects never carry a reload_id"
+        );
         assert_eq!(row.source_schema, "public");
         assert_eq!(row.source_table, "orders");
         assert_eq!(row.kind, "stream");

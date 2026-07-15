@@ -143,6 +143,7 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
         ctx.control_pool.clone(),
         &cfg.source_db_url,
         waiters.clone(),
+        sink.clone(),
         pg_sink::reload::ReloadControllerConfig {
             poll_interval: cfg.heartbeat_idle_after,
             max_concurrent_reloads: cfg.max_concurrent_reloads as usize,
@@ -150,6 +151,8 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
             instance: cfg.instance.clone(),
             publication_name: cfg.publication_name.clone(),
             epoch,
+            chunk_rows: cfg.reload_chunk_rows,
+            echo_timeout: cfg.reload_echo_timeout,
         },
         token.clone(),
     );

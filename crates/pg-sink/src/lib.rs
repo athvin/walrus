@@ -22,6 +22,7 @@ pub mod pgoutput;
 pub mod preflight;
 pub mod relcache;
 pub mod reload;
+pub mod reload_export;
 pub mod reload_signal;
 pub mod replication;
 pub mod shutdown;
