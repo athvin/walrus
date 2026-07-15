@@ -404,7 +404,10 @@ async fn mid_export_ddl_restarts_fresh_attempt_at_new_schema() {
     )
     .await
     .unwrap();
-    assert_eq!(resumed.run().await.unwrap(), RunOutcome::Drained);
+    assert!(matches!(
+        resumed.run().await.unwrap(),
+        RunOutcome::Drained { .. }
+    ));
 
     let done = control::reload::get(&pool, new_id).await.unwrap().unwrap();
     assert_eq!(done.schema_version, Some(2), "the attempt froze at v2");

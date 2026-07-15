@@ -469,6 +469,117 @@ pub async fn restart_for_ddl(
     Ok(Some(rec.reload_id))
 }
 
+/// The loader's completion flip (PR 6.9 / H10): every `export_complete` reload for this table whose
+/// `final_lsn` (H) the mirror has now reached (`transformed_lsn >= H`) becomes `complete`. One
+/// guarded batch UPDATE that JOINs `loader_checkpoint` for the live `transformed_lsn` — no extra
+/// read, and a natural no-op (0 rows) on the vast majority of cycles that have no `export_complete`
+/// reload. Idempotent and at-least-once safe (a re-run flips nothing — the row is already terminal),
+/// so the loader can call it every cycle. Returns the reload_ids it completed (for the log). The
+/// LOADER owns this flip; the sink never writes `complete` (H10 — no service gets a write path into
+/// another's state row).
+pub async fn complete_reached(
+    ex: impl PgExecutor<'_>,
+    epoch: i64,
+    source_schema: &str,
+    source_table: &str,
+) -> Result<Vec<i64>, ControlError> {
+    let rows = sqlx::query!(
+        r#"
+        UPDATE walrus.table_reload r
+        SET status = 'complete', updated_at = now()
+        FROM walrus.loader_checkpoint c
+        WHERE r.epoch = $1 AND r.source_schema = $2 AND r.source_table = $3
+          AND r.status = 'export_complete'
+          AND c.epoch = r.epoch AND c.source_schema = r.source_schema
+          AND c.source_table = r.source_table
+          AND r.final_lsn <= c.transformed_lsn
+        RETURNING r.reload_id
+        "#,
+        epoch,
+        source_schema,
+        source_table,
+    )
+    .fetch_all(ex)
+    .await
+    .map_err(ControlError::from_sqlx)?;
+    Ok(rows.into_iter().map(|r| r.reload_id).collect())
+}
+
+/// Startup crash-recovery (PR 6.9 / H7): the `exporting` reloads this sink may resume — its OWN
+/// lease (a restart of the same instance) or an EXPIRED one (a dead instance). Re-acquires the
+/// lease in the SAME guarded `UPDATE … RETURNING` (with `FOR UPDATE SKIP LOCKED`) so two racing
+/// pods can never both adopt one row. A live FOREIGN lease (`lease_holder <> me AND lease_expiry >
+/// now()`) is deliberately excluded — never stolen. `requested` rows are excluded too: those go
+/// through ordinary pickup ([`claim_requested`]), keeping the two paths disjoint on status.
+///
+/// Recovery reads from control-pg, NOT from WAL redelivery (H7): by restart time the signals' LSNs
+/// are behind `confirmed_flush`, acked and gone — the chunk cursor on the returned row is the only
+/// thing a resume needs.
+pub async fn adopt_resumable(
+    ex: impl PgExecutor<'_>,
+    epoch: i64,
+    holder: &str,
+    lease_ttl_secs: i64,
+    limit: i64,
+) -> Result<Vec<ReloadRow>, ControlError> {
+    sqlx::query_as!(
+        ReloadRow,
+        r#"
+        UPDATE walrus.table_reload
+        SET lease_holder = $2,
+            lease_expiry = now() + make_interval(secs => $3),
+            updated_at = now()
+        WHERE reload_id IN (
+            SELECT reload_id FROM walrus.table_reload
+            WHERE epoch = $1 AND status = 'exporting'
+              AND (lease_holder = $2 OR lease_expiry < now())
+            ORDER BY reload_id
+            LIMIT $4
+            FOR UPDATE SKIP LOCKED
+        )
+        RETURNING reload_id, epoch, source_schema, source_table,
+                  flavor AS "flavor: ReloadFlavor", status AS "status: ReloadStatus",
+                  chunk_no, cursor_pk,
+                  first_lsn AS "first_lsn: Lsn", final_lsn AS "final_lsn: Lsn",
+                  schema_version, restart_count, lease_holder, error
+        "#,
+        epoch,
+        holder,
+        lease_ttl_secs as f64,
+        limit,
+    )
+    .fetch_all(ex)
+    .await
+    .map_err(ControlError::from_sqlx)
+}
+
+/// Genuinely stuck exports (PR 6.9): `exporting` rows whose lease has expired and which nobody is
+/// renewing — a dead exporter no startup scan adopted. Surfaced as a per-tick warn (the alert rule
+/// is PR 6.11's). `export_complete` rows with an expired lease are NOT stuck — they are waiting on
+/// the loader, by design — so the filter is `exporting` only.
+pub async fn stuck_exporting(
+    ex: impl PgExecutor<'_>,
+    epoch: i64,
+) -> Result<Vec<(i64, Option<String>)>, ControlError> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT reload_id, lease_holder
+        FROM walrus.table_reload
+        WHERE epoch = $1 AND status = 'exporting'
+          AND lease_expiry IS NOT NULL AND lease_expiry < now()
+        ORDER BY reload_id
+        "#,
+        epoch,
+    )
+    .fetch_all(ex)
+    .await
+    .map_err(ControlError::from_sqlx)?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.reload_id, r.lease_holder))
+        .collect())
+}
+
 /// Tables mid-rebuild — the loader-pause predicate's input (PR 6.6).
 ///
 /// Deliberately `flavor = 'reload'` only (a `resync` never pauses anything — H3) and deliberately

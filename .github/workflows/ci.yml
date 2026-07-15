@@ -305,6 +305,12 @@ jobs:
       - name: Reload DDL restart (compose)
         run: cargo test -p pg-sink --test reload_ddl -- --ignored --test-threads=1
 
+      # PR 6.9: completion & crash recovery — a dropped export is adopted from control-pg and
+      # resumes from the cursor (no re-export), flips export_complete(H); the loader flips complete
+      # only once transformed_lsn ≥ H; a live foreign lease is never stolen, an expired one is.
+      - name: Reload recovery (compose)
+        run: cargo test -p pg-sink --test reload_recovery -- --ignored --test-threads=1
+
       # PR 2.18/2.19: the sink pod-lifecycle shell against the live stack — full bootstrap (control +
       # S3 + source preflight) → /startup→/ready flip, SIGTERM exit 0, missing control DB → exit 11.
       - name: Sink pod-lifecycle smoke (health · SIGTERM · fail-fast exit code)
