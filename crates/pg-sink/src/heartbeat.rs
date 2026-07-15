@@ -42,18 +42,37 @@ pub struct InternalTables {
     /// The `ddl_audit` relation shape (its INSERTs are never cached), so [`crate::ddl::DdlEvent`] can
     /// parse a decoded tuple by column name.
     ddl_audit_rel: Option<common::PgRelation>,
+    /// `walrus.reload_signal`'s OID — its INSERTs are chunk-watermark echoes (PR 6.3), consumed to
+    /// resolve [`crate::reload_signal::WatermarkWaiters`] and NEVER materialised.
+    pub reload_signal_oid: Option<u32>,
+    /// The `reload_signal` relation shape, so [`crate::reload_signal::PendingSignal`] can parse a
+    /// decoded tuple by column name.
+    reload_signal_rel: Option<common::PgRelation>,
 }
 
 impl InternalTables {
-    /// Is this relation OID one of walrus's own control tables (never staged as user data)? Both
-    /// `walrus.heartbeat` and `walrus.ddl_audit` are consumed specially, never materialised.
+    /// Is this relation OID one of walrus's own control tables (never staged as user data)?
+    /// `walrus.heartbeat`, `walrus.ddl_audit`, and `walrus.reload_signal` are all consumed
+    /// specially, never materialised.
     pub fn is_internal(&self, rel_oid: u32) -> bool {
-        self.heartbeat_oid == Some(rel_oid) || self.ddl_audit_oid == Some(rel_oid)
+        self.heartbeat_oid == Some(rel_oid)
+            || self.ddl_audit_oid == Some(rel_oid)
+            || self.reload_signal_oid == Some(rel_oid)
     }
 
     /// Whether this OID is the DDL-audit table (its INSERTs drive [`crate::ddl::DdlConsumer`]).
     pub fn is_ddl_audit(&self, rel_oid: u32) -> bool {
         self.ddl_audit_oid == Some(rel_oid)
+    }
+
+    /// Whether this OID is the heartbeat table (only its tuples carry a `beat_seq`).
+    pub fn is_heartbeat(&self, rel_oid: u32) -> bool {
+        self.heartbeat_oid == Some(rel_oid)
+    }
+
+    /// Whether this OID is the reload signal table (its INSERTs resolve watermark waiters).
+    pub fn is_reload_signal(&self, rel_oid: u32) -> bool {
+        self.reload_signal_oid == Some(rel_oid)
     }
 
     /// Learn a walrus-internal table's OID + relevant column offsets from its `Relation` message.
@@ -69,11 +88,20 @@ impl InternalTables {
             self.ddl_audit_oid = Some(relation.oid);
             self.ddl_audit_rel = Some(relation.clone());
         }
+        if relation.schema == "walrus" && relation.name == "reload_signal" {
+            self.reload_signal_oid = Some(relation.oid);
+            self.reload_signal_rel = Some(relation.clone());
+        }
     }
 
     /// The `ddl_audit` relation shape, once its `Relation` message has been seen.
     pub fn ddl_audit_rel(&self) -> Option<&common::PgRelation> {
         self.ddl_audit_rel.as_ref()
+    }
+
+    /// The `reload_signal` relation shape, once its `Relation` message has been seen.
+    pub fn reload_signal_rel(&self) -> Option<&common::PgRelation> {
+        self.reload_signal_rel.as_ref()
     }
 
     /// Extract the returned `beat_seq` from a decoded `walrus.heartbeat` new-tuple (text format).

@@ -133,6 +133,10 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
     // DDL capture (§3): consume walrus.ddl_audit INSERTs → ddl_manifest + per-table structural version.
     let mut ddl = pg_sink::ddl::DdlConsumer::new(epoch);
 
+    // Reload echo waiters (PR 6.3): Arc-shared so the reload controller's exporter tasks (PR 6.5)
+    // can subscribe while the decode loop resolves.
+    let waiters = std::sync::Arc::new(pg_sink::reload_signal::WatermarkWaiters::default());
+
     let result = consume::run_decode_loop(
         &mut stream,
         token.clone(),
@@ -147,6 +151,7 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
         &ctx.control_pool,
         epoch,
         SCHEMA_VERSION,
+        &waiters,
     )
     .await;
 

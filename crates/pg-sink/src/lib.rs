@@ -21,6 +21,7 @@ pub mod memory;
 pub mod pgoutput;
 pub mod preflight;
 pub mod relcache;
+pub mod reload_signal;
 pub mod replication;
 pub mod shutdown;
 pub mod sink;

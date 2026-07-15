@@ -42,9 +42,13 @@ pub async fn run_decode_loop(
     pool: &sqlx::PgPool,
     epoch: i64,
     _schema_version: i64, // structural version now rides the DDL consumer / cached shape (PR 2.33)
+    waiters: &crate::reload_signal::WatermarkWaiters,
 ) -> anyhow::Result<()> {
     let mut ctx = StreamCtx::default();
     let mut internal = InternalTables::default();
+    // reload_signal echoes buffered between their Insert and their transaction's fate (PR 6.3):
+    // the watermark is the COMMIT LSN, which only the Commit message carries.
+    let mut pending_signals = crate::reload_signal::PendingSignals::default();
     // Idle windows are monotonic (`tokio::time::Instant`); `last_activity` moves on every user change,
     // never on keepalives or the heartbeat's own round-trip.
     let mut last_activity = Instant::now();
@@ -132,18 +136,44 @@ pub async fn run_decode_loop(
                                         }
                                     }
                                 }
+                                // The reload echo (PR 6.3): the sink's own signal INSERT returning
+                                // through the stream. Buffered here; the waiter resolves at the
+                                // transaction's Commit with its commit LSN (= the chunk watermark
+                                // L_i). NEVER batched, never a Parquet file or manifest row.
+                                Message::Insert { relation_oid, new, xid }
+                                    if internal.is_reload_signal(*relation_oid) =>
+                                {
+                                    if let Some(rel) = internal.reload_signal_rel() {
+                                        match crate::reload_signal::PendingSignal::from_tuple(rel, new, *xid) {
+                                            Some(sig) => pending_signals.push(sig),
+                                            None => tracing::warn!(
+                                                "malformed walrus.reload_signal tuple; ignoring"
+                                            ),
+                                        }
+                                    }
+                                }
                                 // The heartbeat round-trip: record it, mark the txn, and NEVER stage it
-                                // to S3 / a manifest row — it is control-plane, not user data.
+                                // to S3 / a manifest row — it is control-plane, not user data. Other
+                                // internal tables' non-signal ops (a ddl_audit UPDATE, a reload_signal
+                                // UPDATE — neither should happen) are consumed-and-ignored here: only
+                                // the heartbeat's tuple carries a beat_seq.
                                 Message::Insert { relation_oid, new, .. }
                                 | Message::Update { relation_oid, new, .. }
                                     if internal.is_internal(*relation_oid) =>
                                 {
-                                    if let Some(seq) = internal.beat_seq_of(new) {
-                                        heartbeat.observe_return(seq, Instant::now());
-                                        tracing::info!(beat_seq = seq, "heartbeat round-trip observed");
+                                    if internal.is_heartbeat(*relation_oid) {
+                                        if let Some(seq) = internal.beat_seq_of(new) {
+                                            heartbeat.observe_return(seq, Instant::now());
+                                            tracing::info!(beat_seq = seq, "heartbeat round-trip observed");
+                                        }
+                                        txn_has_heartbeat = true;
                                     }
-                                    txn_has_heartbeat = true;
                                 }
+                                // Non-insert ops on internal tables — e.g. the future reload_signal
+                                // pruning DELETEs (PR 6.11's runbook) — are consumed-and-ignored:
+                                // acked like any record, never routed toward a batcher.
+                                Message::Delete { relation_oid, .. }
+                                    if internal.is_internal(*relation_oid) => {}
                                 Message::Commit { commit_lsn, .. } => {
                                     // First seal/flush any user batch this commit made eligible.
                                     flush_sealed(
@@ -151,6 +181,10 @@ pub async fn run_decode_loop(
                                         stream, sink, checkpoint, pool, epoch,
                                     )
                                     .await?;
+                                    // Resolve any signal echoes this transaction carried: its commit
+                                    // LSN IS the chunk watermark L_i (PR 6.3). The signal txn needs no
+                                    // special ack — confirmed_flush passes it like any consumed record.
+                                    pending_signals.on_commit(*commit_lsn, waiters);
                                     // Then, for an idle heartbeat-only txn, advance to its commit LSN —
                                     // but never past un-durable user data (a floor the flush above just
                                     // cleared if it was eligible).
@@ -232,6 +266,9 @@ pub async fn run_decode_loop(
                                         .send(stream, false)
                                         .await
                                         .context("send streamed-commit standby status")?;
+                                    // Can't-happen defense (PR 6.3): a single-row signal txn never
+                                    // streams, but if one somehow did, its surviving echo resolves here.
+                                    pending_signals.on_stream_commit(*commit_lsn, waiters);
                                     tracing::info!(
                                         xid,
                                         files = objs.len(),
@@ -245,6 +282,9 @@ pub async fn run_decode_loop(
                                     // savepoint's rows (proto §9b) while the top-level txn commits on.
                                     demux.on_stream_abort(*top_xid, *sub_xid, sink).await;
                                     checkpoint.set_open_txn_floor(demux.open_floor());
+                                    // An aborted (sub)transaction's signal echo must never resolve a
+                                    // waiter — the commit never carried it (PR 6.3).
+                                    pending_signals.on_stream_abort(*top_xid, *sub_xid);
                                 }
                                 other => {
                                     // A user change is activity — it suppresses the idle beat.
