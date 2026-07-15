@@ -11,6 +11,8 @@ use pg_sink::preflight::{connect_source, PkMode, PreflightError, SourcePreflight
 use tokio_postgres::NoTls;
 
 const SOURCE_MIGRATION: &str = include_str!("../../../migrations/source/0001_publication.sql");
+const SOURCE_MIGRATION_0003: &str =
+    include_str!("../../../migrations/source/0003_reload_signal.sql");
 
 static SOURCE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -50,6 +52,7 @@ async fn good_source_passes_all_assertions() {
     let _guard = SOURCE_LOCK.lock().await;
     let setup = plain(&source_url()).await;
     setup.batch_execute(SOURCE_MIGRATION).await.unwrap(); // idempotent: ensure walrus tables
+    setup.batch_execute(SOURCE_MIGRATION_0003).await.unwrap(); // …incl. the reload signal (PR 6.2)
     setup
         .batch_execute("DROP TABLE IF EXISTS public._walrus_pf_keyless") // defensive cleanup
         .await
@@ -65,9 +68,13 @@ async fn good_source_passes_all_assertions() {
     assert_eq!(info.wal_level, "logical");
     assert!(info.version_num >= 140_000, "PG {info:?} must be ≥14");
 
+    pf.assert_reload_signal()
+        .await
+        .expect("reload signal table installed with its PK");
+
     pf.assert_publication_covers()
         .await
-        .expect("publication covers ddl_audit + heartbeat");
+        .expect("publication covers ddl_audit + heartbeat + reload_signal");
 
     let report = pf
         .assert_tables_have_pk(PkMode::Strict)

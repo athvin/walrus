@@ -62,6 +62,7 @@ echo "=== bench-e2e: $SCENARIO (DURATION=${DURATION}s CLIENTS=$CLIENTS) ==="
 $COMPOSE up --wait
 $COMPOSE exec -T source-pg psql -U postgres -d walrus -v ON_ERROR_STOP=1 -f - <migrations/source/0001_publication.sql
 $COMPOSE exec -T source-pg psql -U postgres -d walrus -v ON_ERROR_STOP=1 -f - <migrations/source/0002_ddl_triggers.sql
+$COMPOSE exec -T source-pg psql -U postgres -d walrus -v ON_ERROR_STOP=1 -f - <migrations/source/0003_reload_signal.sql
 echo "--- building release binaries ---"
 cargo build --release -p pg-sink -p loader
 

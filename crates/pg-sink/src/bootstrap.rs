@@ -87,6 +87,9 @@ pub async fn run_shared(cfg: &SinkConfig, deadline: Instant) -> Result<Bootstrap
     .await?;
     let pf = SourcePreflight::new(&source_client, cfg);
     let server = pf.assert_server_prereqs().await?;
+    // Signal-table existence BEFORE publication coverage: a missing table must yield the
+    // migration-naming error, not a failed ALTER PUBLICATION under manage_publication (PR 6.2).
+    pf.assert_reload_signal().await?;
     pf.assert_publication_covers().await?;
     pf.assert_ddl_capture().await?;
     let pk = pf.assert_tables_have_pk(cfg.pk_mode()).await?;

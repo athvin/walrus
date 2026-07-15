@@ -28,6 +28,7 @@ configMapGenerator:
     files:
       - 0001_publication.sql=../../../migrations/source/0001_publication.sql
       - 0002_ddl_triggers.sql=../../../migrations/source/0002_ddl_triggers.sql
+      - 0003_reload_signal.sql=../../../migrations/source/0003_reload_signal.sql
 
 generatorOptions:
   disableNameSuffixHash: true # stable name so slot-init-job.yaml can reference it directly
