@@ -84,14 +84,51 @@ pub async fn bootstrap(
         // snapshot rebuilds it. A no-op for a fresh file or a same-epoch resume. Both watermarks reset for
         // free — the new epoch's `loader_checkpoint` (loaded below) is a fresh `0/0`.
         crate::epoch::rebuild_for_new_epoch(&db, &rel.name, epoch)?;
-        // Build the DuckDB shape from the registry descriptors (Tier-2 emit/recombine, PR 4.2); with no
-        // descriptors this is the plain scalar shape. Then stamp the generation this file is now built for.
-        db.ensure_tables_planned(
-            &crate::plan::TablePlan::from_registry(&rel, &row.descriptors),
-            version,
-        )?;
-        db.set_built_epoch(epoch)?;
-        crate::ddl::reconcile_to_version(&db, pool, epoch, &rel.schema, &rel.name, version).await?;
+        // Quarantine-recovery (PR 6.12): a pending **rebuild-flavor** reload will CREATE OR REPLACE
+        // this table's mirror at the reload's version (Phase A, PR 6.7). Reconciling the resumed
+        // `.duckdb` to the registry's LATEST version here would re-run the very lossy cast that
+        // quarantined it (the mirror still holds the un-castable data) and RE-QUARANTINE during
+        // bootstrap — before Phase A can ever reach the reload chunk that recovers it. So when a
+        // rebuild is pending, ensure the tables at the `.duckdb`'s CURRENT version and SKIP the
+        // forward reconcile; the rebuild resets both shape and data. Steady-state has no pending
+        // rebuild, so this is the normal ensure-at-latest + reconcile.
+        let pending_rebuild =
+            control::reload::reload_supersede_floor(pool, epoch, &rel.schema, &rel.name)
+                .await?
+                .is_some();
+        if pending_rebuild {
+            let cur = db.schema_version().unwrap_or(version);
+            let cur_plan = match control::read_registry(pool, epoch, &rel.schema, &rel.name, cur)
+                .await?
+            {
+                Some(r) => {
+                    let rel_cur: PgRelation = serde_json::from_value(r.columns).map_err(|e| {
+                        LoaderError::Internal(format!("decode registry columns: {e}"))
+                    })?;
+                    crate::plan::TablePlan::from_registry(&rel_cur, &r.descriptors)
+                }
+                None => crate::plan::TablePlan::from_registry(&rel, &row.descriptors),
+            };
+            db.ensure_tables_planned(&cur_plan, cur)?;
+            db.set_built_epoch(epoch)?;
+            tracing::warn!(
+                table = %format_args!("{}.{}", rel.schema, rel.name),
+                current_version = cur,
+                registry_version = version,
+                "bootstrap: a rebuild reload is pending — skipping the forward reconcile (Phase A rebuilds this table)"
+            );
+        } else {
+            // Build the DuckDB shape from the registry descriptors (Tier-2 emit/recombine, PR 4.2);
+            // with no descriptors this is the plain scalar shape. Stamp the built generation, then
+            // reconcile a RESUMED file forward to the registered latest version (PR 3.8).
+            db.ensure_tables_planned(
+                &crate::plan::TablePlan::from_registry(&rel, &row.descriptors),
+                version,
+            )?;
+            db.set_built_epoch(epoch)?;
+            crate::ddl::reconcile_to_version(&db, pool, epoch, &rel.schema, &rel.name, version)
+                .await?;
+        }
 
         // (3) Load both watermarks (the fence is already held) and assert the DB-enforced invariant.
         control::ensure_checkpoint(pool, epoch, &rel.schema, &rel.name).await?;

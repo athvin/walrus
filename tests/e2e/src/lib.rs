@@ -89,8 +89,23 @@ impl Harness {
         .execute(&source)
         .await
         .context("create types_matrix")?;
+        // The single-table-reload fixtures (PR 6.12). Like `types_matrix`, they must exist BEFORE
+        // the sink bootstraps so the sink registers them and the loader OWNS them (the loader only
+        // picks up tables at bootstrap — a table created after start is never owned). `q_target.n`
+        // is the column the quarantine e2e narrows to int2; `rl1..3` are the scale/others tables.
+        // Idle for every other e2e test (streamed, no asserts).
+        sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS public.q_target (id int PRIMARY KEY, status text, n int); \
+             CREATE TABLE IF NOT EXISTS public.rl1 (id int PRIMARY KEY, status text); \
+             CREATE TABLE IF NOT EXISTS public.rl2 (id int PRIMARY KEY, status text); \
+             CREATE TABLE IF NOT EXISTS public.rl3 (id int PRIMARY KEY, status text);",
+        )
+        .execute(&source)
+        .await
+        .context("create reload fixtures")?;
         sqlx::raw_sql(&format!(
             "TRUNCATE public.orders; TRUNCATE public.types_matrix; \
+             TRUNCATE public.q_target; TRUNCATE public.rl1; TRUNCATE public.rl2; TRUNCATE public.rl3; \
              SELECT pg_drop_replication_slot('{SLOT}') \
                 FROM pg_replication_slots WHERE slot_name = '{SLOT}';"
         ))
@@ -110,7 +125,7 @@ impl Harness {
             .await
             .context("sink /ready")?;
         let loader = spawn_loader(&bins, &duckdb_dir)?;
-        wait_ready("http://127.0.0.1:8131", Duration::from_secs(45))
+        wait_ready("http://127.0.0.1:8131", Duration::from_secs(90))
             .await
             .context("loader /ready")?;
 
@@ -302,9 +317,29 @@ impl Harness {
     /// DuckDB lock was freed on `SIGKILL`. Resume is from the two persisted watermarks.
     pub async fn restart_loader(&mut self) -> Result<()> {
         self.loader = spawn_loader(&self.bins, &self.duckdb_dir)?;
-        wait_ready("http://127.0.0.1:8131", Duration::from_secs(45))
+        wait_ready("http://127.0.0.1:8131", Duration::from_secs(90))
             .await
             .context("loader /ready after restart")
+    }
+
+    /// Whether the loader child is still running (`try_wait() == Ok(None)`). A lossy-cast QUARANTINE
+    /// makes a table worker return `Err`, which cancels the token and drains the whole loader — so
+    /// this flips to `false`. PR 6.12 waits on it to observe the quarantine before requesting the
+    /// recovery reload.
+    pub fn loader_running(&mut self) -> bool {
+        matches!(self.loader.try_wait(), Ok(None))
+    }
+
+    /// Await the loader child's FULL exit (a quarantine self-exit, PR 6.12) — `wait()` reaps the
+    /// process, so by the time this returns the loader has released every table's lease and DuckDB
+    /// lock. A plain `try_wait()` poll can report "exited" while the OS is still tearing the process
+    /// down, which would let a `restart_loader` race the old loader for the quarantined table's lock.
+    pub async fn await_loader_exited(&mut self, deadline: Duration) -> Result<()> {
+        tokio::time::timeout(deadline, self.loader.wait())
+            .await
+            .context("loader did not exit (quarantine) in time")?
+            .context("waiting on loader exit")?;
+        Ok(())
     }
 
     /// Poll the source until the replication slot is `active = false` (the dead walsender cleaned up), so a
@@ -718,6 +753,9 @@ fn spawn_sink(bins: &std::path::Path, log: &std::path::Path) -> Result<Child> {
 }
 
 fn spawn_loader(bins: &std::path::Path, duckdb_dir: &std::path::Path) -> Result<Child> {
+    // Inherit the test's stdout/stderr (the loader's `tracing` log) so a bootstrap failure is
+    // visible — cargo test surfaces a failed test's captured output, which is how a CI failure is
+    // diagnosed. (An earlier `loader.log` file-redirect hid the reason from the CI job log.)
     Command::new(bins.join("walrus-loader"))
         .env("WALRUS_CONTROL_DB_URL", CONTROL_URL)
         .env("WALRUS_OBJECT_STORE__BUCKET", BUCKET)
@@ -726,7 +764,8 @@ fn spawn_loader(bins: &std::path::Path, duckdb_dir: &std::path::Path) -> Result<
         .env("WALRUS_INSTANCE", "e2e-loader")
         .env("WALRUS_DUCKDB_DIR", duckdb_dir.to_string_lossy().as_ref())
         .env("WALRUS_POLL_INTERVAL", "1s")
-        .env("WALRUS_STARTUP_DEADLINE", "30s")
+        // Generous for a cold CI runner (a dev-profile binary bootstrapping 6 tables).
+        .env("WALRUS_STARTUP_DEADLINE", "90s")
         .env("WALRUS_HEALTH_ADDR", "127.0.0.1:8131")
         .env("AWS_ACCESS_KEY_ID", "minioadmin")
         .env("AWS_SECRET_ACCESS_KEY", "minioadmin")

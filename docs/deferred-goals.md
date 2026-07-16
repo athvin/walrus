@@ -32,9 +32,14 @@ first by the design but is the **heaviest** of the three (it touches the snapsho
 signal-table proposal for this goal and lands on a chunked, watermark-stamped shape (Debezium/DBLog
 lineage) that needs no extra slots and no stream pause.
 
-**Planned.** That design is now broken into 12 implementable PRs with Definitions of Done —
+**Implemented (Phase 6).** Shipped across 12 PRs —
 [implementation curriculum, Phase 6](./implementation/README.md#the-roadmap)
-([task files](./implementation/phase-6-single-table-reload/)).
+([task files](./implementation/phase-6-single-table-reload/)). Chunked, watermark-stamped reloads of
+N tables through the one lifelong slot: `reload` (rebuild — the quarantine-recovery exit) and
+`resync` (refresh over the live mirror) flavors, echo-wait watermarks, restart-on-DDL, crash recovery
+from the chunk cursor, and observability. The anchor use case — a lossy-`ALTER` quarantine recovering
+via `just reload` while every other table streams on — is proven end to end in
+[PR 6.12](./implementation/phase-6-single-table-reload/pr-6.12-e2e-quarantine-recovery.md).
 
 ## 2. Multi-pod loader table-sharding (horizontal scale-out)
 

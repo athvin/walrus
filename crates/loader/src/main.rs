@@ -122,10 +122,24 @@ async fn run(cfg: LoaderConfig) -> Result<(), LoaderError> {
                 pause_logged: Default::default(),
                 resync_ids: Default::default(),
             };
-            local.spawn_local(loader::apply_loop::apply_loop(ctx, token.clone()))
+            // A worker that fails (e.g. a lossy-cast QUARANTINE, PR 3.9) cancels the shutdown token
+            // **itself**, so every OTHER worker sees the cancel and drains and the whole loader
+            // exits promptly (→ `main` restarts the process). Without this, the sequential
+            // `h.await` below would block on a healthy worker that never returns until cancelled —
+            // an unobserved error on a non-first table would deadlock the loader instead of taking
+            // it down (the exact multi-table quarantine the reload feature must recover from).
+            let worker_token = token.clone();
+            local.spawn_local(async move {
+                let result = loader::apply_loop::apply_loop(ctx, worker_token.clone()).await;
+                if result.is_err() {
+                    worker_token.cancel();
+                }
+                result
+            })
         })
         .collect();
-    // Drive the loops until they all exit (each returns on the shutdown token).
+    // Drive the loops until they all exit — each returns on the shutdown token, and a failed worker
+    // cancelled it (above), so this sequential drain always makes progress.
     local
         .run_until(async {
             for h in handles {

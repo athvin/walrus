@@ -1,5 +1,10 @@
 # Single-table reload — critique of the in-band signal proposal, and a revised shape
 
+> **Status: BUILT (Phase 6).** This design shipped across 12 PRs — see the
+> [Phase 6 curriculum](./implementation/phase-6-single-table-reload/) (task files 6.1–6.12). The
+> holes below (H1–H11) each map to a task; the anchor use case is proven end to end in
+> [PR 6.12](./implementation/phase-6-single-table-reload/pr-6.12-e2e-quarantine-recovery.md).
+
 This note poke-holes a concrete proposal for
 [deferred goal §1](./deferred-goals.md#1-single-table-reload--re-sync-while-streaming):
 reload **N individual tables** through the one lifelong replication slot

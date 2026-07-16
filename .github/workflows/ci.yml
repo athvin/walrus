@@ -378,6 +378,59 @@ jobs:
         if: always()
         run: docker compose -f deploy/docker/docker-compose.yml down -v
 
+  e2e:
+    name: e2e (full pipeline — quarantine recovery + N-table scale)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    # A DEDICATED job (PR 6.12): the e2e harness spawns the real sink+loader binaries — its
+    # `build_bins` compiles the bundled DuckDB in the DEV profile ON TOP of the test-profile builds,
+    # which overflowed the integration runner's disk ("No space left on device"). A fresh runner with
+    # only the e2e crate's builds stays under the ceiling.
+    env:
+      # The harness hardcodes the compose URLs and must NOT set WALRUS_SOURCE_DB_URL — the loader's
+      # strict figment config rejects the unknown field. sqlx query! macros compile against the
+      # committed .sqlx offline cache (no live DB needed at compile time).
+      SQLX_OFFLINE: "true"
+      RUSTC_WRAPPER: sccache
+      CC: sccache cc
+      CXX: sccache c++
+      SCCACHE_GHA_ENABLED: "true"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      # This job also cold-builds the bundled DuckDB (twice — test + dev profile). Reclaim headroom.
+      - uses: ./.github/actions/free-disk-space
+
+      - name: Install pinned Rust toolchain (from rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustc --version
+
+      - uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Boot the dev stack (up --wait)
+        run: docker compose -f deploy/docker/docker-compose.yml up --wait
+
+      # PR 6.12: the anchor use case + scale, end to end. The harness resets control + source and
+      # builds the sink/loader binaries itself, then spawns them against the live compose stack.
+      - name: Reload quarantine recovery (e2e)
+        run: cargo test -p e2e --features it --test reload_quarantine -- --ignored --test-threads=1
+      - name: Reload N-table scale (e2e)
+        run: cargo test -p e2e --features it --test reload_scale -- --ignored --test-threads=1
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
+
+      - name: Tear down (remove volumes)
+        if: always()
+        run: docker compose -f deploy/docker/docker-compose.yml down -v
+
   conformance:
     name: conformance (DuckDB read-back)
     needs: changes

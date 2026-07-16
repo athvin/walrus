@@ -505,6 +505,44 @@ pub async fn complete_reached(
     Ok(rows.into_iter().map(|r| r.reload_id).collect())
 }
 
+/// The floor `first_lsn` (`L₁`) below which a pending **rebuild** supersedes this table's pending
+/// manifest files (PR 6.12). A live `reload`-flavor reload's rebuild trigger will `CREATE OR
+/// REPLACE` the mirror at the new schema and `delete_superseded` every non-reload file with
+/// `lsn_end <= first_lsn` — so the loader must NOT reconcile (and possibly quarantine on) such a
+/// file: it skips it and lets the rebuild replace the mirror. Returns `first_lsn` for a
+/// `reload`-flavor reload in `requested|exporting|export_complete` with `first_lsn` frozen, else
+/// `None` (there is at most one live reload per table — the `table_reload_one_live` index).
+///
+/// This is what closes the quarantine-recovery loop: without it, a lossy-`ALTER` stream file
+/// (lower `lsn_end` than the reload's `first_lsn`) re-quarantines the loader on every restart before
+/// it can reach the reload chunk file that would clear the quarantine.
+pub async fn reload_supersede_floor(
+    ex: impl PgExecutor<'_>,
+    epoch: i64,
+    source_schema: &str,
+    source_table: &str,
+) -> Result<Option<Lsn>, ControlError> {
+    let rec = sqlx::query!(
+        r#"
+        SELECT first_lsn AS "first_lsn: Lsn"
+        FROM walrus.table_reload
+        WHERE epoch = $1 AND source_schema = $2 AND source_table = $3
+          AND flavor = 'reload'
+          AND status IN ('requested', 'exporting', 'export_complete')
+          AND first_lsn IS NOT NULL
+        ORDER BY reload_id DESC
+        LIMIT 1
+        "#,
+        epoch,
+        source_schema,
+        source_table,
+    )
+    .fetch_optional(ex)
+    .await
+    .map_err(ControlError::from_sqlx)?;
+    Ok(rec.and_then(|r| r.first_lsn))
+}
+
 /// Startup crash-recovery (PR 6.9 / H7): the `exporting` reloads this sink may resume — its OWN
 /// lease (a restart of the same instance) or an EXPIRED one (a dead instance). Re-acquires the
 /// lease in the SAME guarded `UPDATE … RETURNING` (with `FOR UPDATE SKIP LOCKED`) so two racing

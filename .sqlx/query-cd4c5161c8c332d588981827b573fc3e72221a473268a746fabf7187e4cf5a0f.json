@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT first_lsn AS \"first_lsn: Lsn\"\n        FROM walrus.table_reload\n        WHERE epoch = $1 AND source_schema = $2 AND source_table = $3\n          AND flavor = 'reload'\n          AND status IN ('requested', 'exporting', 'export_complete')\n          AND first_lsn IS NOT NULL\n        ORDER BY reload_id DESC\n        LIMIT 1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "first_lsn: Lsn",
+        "type_info": {
+          "Custom": {
+            "name": "pg_lsn",
+            "kind": "Simple"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "cd4c5161c8c332d588981827b573fc3e72221a473268a746fabf7187e4cf5a0f"
+}

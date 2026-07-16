@@ -115,6 +115,15 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     //    file at a NEWER version, reconcile both tables UP TO it (PR 3.8) — so `<table>_raw` always has
     //    exactly the file's columns and the verbatim `SELECT *` append lines up; already-appended older
     //    rows read NULL for the freshly-added column (additive superset).
+    // A pending rebuild-flavor reload (PR 6.12) will CREATE OR REPLACE the mirror at the new schema
+    // and `delete_superseded` every non-reload file at `lsn_end <= first_lsn`. Such a file must NOT
+    // reconcile here: a lossy cast would re-quarantine the loader on every restart BEFORE it ever
+    // reaches the reload chunk file that clears the quarantine (the claim order puts the low-`lsn_end`
+    // blocker first). Compute the floor once; skip superseded version-crossing files in the loop.
+    let supersede_floor =
+        control::reload::reload_supersede_floor(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table)
+            .await?;
+
     let mut max_lsn = Lsn::ZERO;
     let mut ids = Vec::with_capacity(claimed.len());
     let mut appended = 0u64;
@@ -130,6 +139,24 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
                 "stale reload file retired unapplied (latest-id wins)"
             );
             ids.push(f.id);
+            continue;
+        }
+        // Skip a version-crossing non-reload file a pending rebuild will supersede (PR 6.12): leave
+        // it `ready` (do NOT append, advance the frontier, or delete it) so the rebuild's
+        // `delete_superseded` purges it, and so the loop reaches the reload chunk file that clears
+        // the quarantine. Same-version files still apply normally and drop through the rebuild's
+        // clear as PR 6.7's "wasted but harmless" pre-`W` backlog.
+        if f.kind != "reload"
+            && f.schema_version > ctx.db.schema_version()?
+            && supersede_floor.is_some_and(|floor| f.lsn_end <= floor)
+        {
+            tracing::warn!(
+                table = %format_args!("{}.{}", ctx.schema, ctx.table),
+                manifest_id = f.id,
+                lsn_end = %f.lsn_end,
+                schema_version = f.schema_version,
+                "skipping a version-crossing file superseded by a pending reload rebuild (quarantine-recovery in flight)"
+            );
             continue;
         }
         if f.schema_version > ctx.db.schema_version()? {
