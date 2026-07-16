@@ -6,7 +6,7 @@
 
 # PR 7.1 — Tests to sibling files: `common`, `control`, `loader`
 
-> **Status:** 📋 Planned <!-- flip to "✅ Done — <PR url>" when it merges -->
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/106
 
 > **Phase:** 7 — conventions hardening · **Crates touched:** `common`, `control`, `loader`, docs ·
 > **Est. size:** M · **Depends on:** — · **Unlocks:** PR 7.2, PR 7.3 (they copy the pattern set here)
@@ -107,21 +107,21 @@ fn parses_and_orders() { /* … unchanged … */ }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] All 14 files now carry `#[cfg(test)] #[path = "<module>_test.rs"] mod tests;`; the matching
+- [x] All 14 files now carry `#[cfg(test)] #[path = "<module>_test.rs"] mod tests;`; the matching
       `src/<module>_test.rs` holds the moved body; **no** `#[cfg(test)] mod tests {` brace-block
       remains in the three crates.
-- [ ] Pure relocation: `cargo test -p common -p control -p loader` reports the **same test count** as
+- [x] Pure relocation: `cargo test -p common -p control -p loader` reports the **same test count** as
       before (55 unit tests across the 14 modules); the diff is moves only (no test-body edits); no
       `foo.rs` was turned into `foo/mod.rs`.
-- [ ] The crate-root case is confirmed absent (no `lib.rs`/`main.rs` carries an inline test module, so
+- [x] The crate-root case is confirmed absent (no `lib.rs`/`main.rs` carries an inline test module, so
       no `src/lib_test.rs` special case is needed).
-- [ ] README Conventions **Tests** row updated to the `foo_test.rs` rule; `TEMPLATE.md` header +
+- [x] README Conventions **Tests** row updated to the `foo_test.rs` rule; `TEMPLATE.md` header +
       Skeleton + Files example updated so 7.2/7.3 and future tasks model it.
-- [ ] Docs/comments explain the `#[path]` resolution where a reader might be surprised.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p common -p control -p loader` (and `--workspace` stays green)
+- [x] Docs/comments explain the `#[path]` resolution where a reader might be surprised.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p common -p control -p loader` (and `--workspace` stays green)
 
 ## What completed looks like
 
