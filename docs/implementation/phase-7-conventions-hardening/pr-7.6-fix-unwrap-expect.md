@@ -124,9 +124,9 @@ A reviewer merges this PR when **all** of the following hold:
 ## What completed looks like
 
 ```
-$ # production regions only (exclude #[cfg(test)] modules and tests/ dirs)
+$ # production regions only (exclude *_test.rs siblings and #[cfg(test)] modules)
 $ grep -rn '\.unwrap()\|\.expect(' crates/*/src \
-    | grep -v '/tests.rs' | grep -vf <(git grep -l '#!\[cfg(test)\]')
+    | grep -v '_test.rs' | grep -vf <(git grep -l '#!\[cfg(test)\]')
 (no matches)
 $ cargo test --workspace
 test result: ok.        # behaviour unchanged

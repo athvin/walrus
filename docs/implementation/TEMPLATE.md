@@ -8,6 +8,8 @@
     * every crate is `#![deny(warnings)]`-clean under `clippy --all-targets`.
     * "green" always means: cargo fmt --check && cargo clippy --all-targets -D warnings && cargo test.
     * skeletons are compilable SHAPES with `todo!()` — you write the logic.
+    * unit tests live in a sibling `foo_test.rs` (Go-style: `src/foo.rs` → `src/foo_test.rs` via
+      `#[cfg(test)] #[path = "foo_test.rs"] mod tests;`), not inline.
 -->
 
 # PR X.Y — <imperative title, e.g. "Add the `Lsn` newtype">
@@ -49,6 +51,7 @@ By the end of this PR you will have practised:
 ```
 <crate>/Cargo.toml                 # + <dep> = "x.y"
 <crate>/src/<module>.rs            # new
+<crate>/src/<module>_test.rs       # new — unit tests (Go-style sibling via #[path])
 <crate>/tests/<name>.rs            # new (if integration/golden tests)
 ```
 
@@ -68,12 +71,17 @@ impl Foo {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+#[path = "<module>_test.rs"]
+mod tests;
+```
 
-    #[test]
-    fn <descriptive_test_name>() { todo!() }
-}
+```rust
+// <crate>/src/<module>_test.rs   — unit tests live in a Go-style sibling file
+
+use super::*;
+
+#[test]
+fn <descriptive_test_name>() { todo!() }
 ```
 
 ## Definition of Done
