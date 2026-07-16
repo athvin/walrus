@@ -61,6 +61,48 @@ groups:
           summary: "walrus loader backlog is not draining"
           description: "Table {{ $labels.table }} has had ready files unprocessed and non-decreasing for 15m — the apply loop is stuck, not merely behind."
 
+  - name: walrus-reload
+    rules:
+      # Stuck reload: an `exporting` reload whose lease expired with nobody renewing it — a dead
+      # exporter no startup scan adopted (PR 6.9/6.11). The controller sets this gauge each tick from
+      # `stuck_exporting`, so the alert reads a gauge, never control-pg. Runbook: restart the sink to
+      # trigger adoption, or fail the row (docs/single-table-reload.md § "Operating a reload").
+      - alert: WalrusReloadLeaseStuck
+        expr: walrus_reload_lease_stale > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "walrus reload is stuck with an expired lease"
+          description: "{{ $value }} reload(s) have been `exporting` with an expired, unadopted lease for 5m — a dead exporter. Restart the sink to adopt, or fail the row."
+
+      # Restart-cap exhaustion: a reload lost the race against DDL within reload_max_restarts and is
+      # now `failed` (PR 6.8). Visible waste — page so an operator re-requests when the churn settles.
+      - alert: WalrusReloadRestartCapExhausted
+        expr: increase(walrus_reload_restart_cap_exhausted_total[10m]) > 0
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: "walrus reload exhausted its restart cap"
+          description: "A reload hit reload_max_restarts against mid-export DDL and failed. Re-request `just reload` once the migration churn settles."
+
+      # Cross-check violation: the echo's embedded wal_insert_lsn >= its decoded commit LSN — the
+      # watermark MODEL is wrong, i.e. possible silent data loss (PR 6.3). The one true page here.
+      # Runbook: STOP reloads and open an issue with the log lines — do NOT just restart the pod.
+      - alert: WalrusReloadCrosscheckViolation
+        expr: increase(walrus_reload_crosscheck_violations_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: page
+        annotations:
+          summary: "walrus reload watermark cross-check FAILED (possible data loss)"
+          description: "embedded wal_insert_lsn >= commit LSN on a reload echo — the watermark model is wrong. Stop reloads and open an issue with the reload_id/chunk_no log lines; do not just restart."
+
 # Intentionally absent: no alert references walrus_loader_transform_lag_bytes,
 # walrus_loader_raw_append_lag_bytes, or walrus_sink_replication_lag_bytes as an absolute threshold —
-# those are dashboard signals only. High lag after an outage is healthy catch-up.
+# those are dashboard signals only. High lag after an outage is healthy catch-up. NOTE (PR 6.11): a
+# rebuild-flavor reload PAUSES its table's loader claims (PR 6.6), so walrus_loader_raw_append_lag_bytes
+# for that table GROWS BY DESIGN during the export — an alert that thresholded absolute lag would page
+# for a feature working correctly. The WalrusLoaderBacklogNotDraining alert is safe because a paused
+# table's backlog drains promptly once export_complete lifts the pause (deriv turns negative).

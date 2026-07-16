@@ -317,6 +317,11 @@ jobs:
       - name: Reload resync (compose)
         run: cargo test -p loader --test reload_resync -- --ignored --test-threads=1
 
+      # PR 6.11: reload observability — the chunk/row/echo metrics MOVE during an export, the failed
+      # counter ticks on an echo timeout, and the active gauge rises to 1 then returns to 0.
+      - name: Reload metrics (compose)
+        run: cargo test -p pg-sink --test reload_metrics -- --ignored --test-threads=1
+
       # PR 2.18/2.19: the sink pod-lifecycle shell against the live stack — full bootstrap (control +
       # S3 + source preflight) → /startup→/ready flip, SIGTERM exit 0, missing control DB → exit 11.
       - name: Sink pod-lifecycle smoke (health · SIGTERM · fail-fast exit code)

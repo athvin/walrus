@@ -41,18 +41,36 @@ pub mod names {
     pub const SINK_PAUSE_POLL_COUNT: &str = "walrus_sink_pause_poll_total";
     pub const SINK_ABORTED_TXN_COUNT: &str = "walrus_sink_aborted_txn_total";
     pub const SINK_FAILED_FILE_COUNT: &str = "walrus_sink_failed_file_total";
-    /// Reload echo cross-check failures (`embedded wal_insert_lsn >= commit LSN`, PR 6.3) — any
-    /// tick means the watermark model is wrong (page severity; PR 6.11 wires the alert).
-    pub const RELOAD_CROSSCHECK_VIOLATIONS: &str = "walrus_reload_crosscheck_violations_total";
-    /// DDL-restarts of a reload attempt (PR 6.8 / reload H9): a schema change past the reload's
-    /// first watermark invalidates the attempt and re-exports at the new schema. Steady churn here
-    /// on one table means a migration-heavy window racing a large reload (PR 6.11 wires the alert).
+    // --- reload (single-table-reload subsystem, PR 6.3/6.8/6.11) ---
+    /// Non-terminal reloads in flight, labelled by `FLAVOR_LABEL` — a gauge the controller inc/decs
+    /// as exporters start and end; returns to 0 when the queue drains (PR 6.11).
+    pub const RELOAD_ACTIVE: &str = "walrus_reload_active";
+    /// Chunk files exported, per table (PR 6.11).
+    pub const RELOAD_CHUNKS_TOTAL: &str = "walrus_reload_chunks_total";
+    /// Rows exported across all chunks, per table (PR 6.11).
+    pub const RELOAD_ROWS_EXPORTED_TOTAL: &str = "walrus_reload_rows_exported_total";
+    /// Echo round-trip latency (H1): signal INSERT → decoded-commit echo. Its p99 bounds reload
+    /// throughput and tracks end-to-end decode latency (PR 6.11). Global histogram.
+    pub const RELOAD_ECHO_WAIT_SECONDS: &str = "walrus_reload_echo_wait_seconds";
+    /// DDL-restarts of a reload attempt, per table (PR 6.8 / reload H9): a schema change past the
+    /// reload's first watermark invalidates the attempt and re-exports at the new schema.
     pub const RELOAD_RESTARTS_TOTAL: &str = "walrus_reload_restarts_total";
+    /// Reloads that reached a terminal `failed`, per table (preflight rejection, echo timeout, or
+    /// restart-cap exhaustion) — PR 6.11.
+    pub const RELOAD_FAILED_TOTAL: &str = "walrus_reload_failed_total";
+    /// Reload echo cross-check failures (`embedded wal_insert_lsn >= commit LSN`, PR 6.3) — any
+    /// tick means the watermark model is wrong (page severity, PR 6.11). Global.
+    pub const RELOAD_CROSSCHECK_VIOLATIONS: &str = "walrus_reload_crosscheck_violations_total";
     /// Reloads abandoned because they hit `reload_max_restarts` (PR 6.8): the export could not win
-    /// the race against DDL within the cap and is now `failed`. Any increment is operator-visible
-    /// waste — a page-worthy signal (PR 6.11).
+    /// the race against DDL within the cap and is now `failed`. Global page-worthy signal.
     pub const RELOAD_RESTART_CAP_EXHAUSTED_TOTAL: &str =
         "walrus_reload_restart_cap_exhausted_total";
+    /// Count of `exporting` reloads whose lease has expired with nobody renewing (PR 6.11) — the
+    /// controller sets this each tick from `stuck_exporting`. The stuck-lease alert reads it (a
+    /// gauge, not a control-pg query, since the stack has no SQL-exporter). Global.
+    pub const RELOAD_LEASE_STALE: &str = "walrus_reload_lease_stale";
+    /// The reload-active gauge's one label — the flavor (`reload` | `resync`). Bounded (two values).
+    pub const FLAVOR_LABEL: &str = "flavor";
 
     // --- loader (per-table; labelled by TABLE_LABEL = "schema.table") ---
     pub const LOADER_FILES_READY: &str = "walrus_loader_files_ready";
@@ -84,9 +102,19 @@ pub mod names {
         SINK_PAUSE_POLL_COUNT,
         SINK_ABORTED_TXN_COUNT,
         SINK_FAILED_FILE_COUNT,
+        RELOAD_ECHO_WAIT_SECONDS,
         RELOAD_CROSSCHECK_VIOLATIONS,
-        RELOAD_RESTARTS_TOTAL,
         RELOAD_RESTART_CAP_EXHAUSTED_TOTAL,
+        RELOAD_LEASE_STALE,
+    ];
+
+    /// Every per-table reload series (PR 6.11) — labelled by `TABLE_LABEL`, like the loader set. Not
+    /// zero-inited globally (reloads are rare operator events); each appears on its first emission.
+    pub const RELOAD_PER_TABLE: &[&str] = &[
+        RELOAD_CHUNKS_TOTAL,
+        RELOAD_ROWS_EXPORTED_TOTAL,
+        RELOAD_RESTARTS_TOTAL,
+        RELOAD_FAILED_TOTAL,
     ];
 
     /// Every per-table loader series, for per-table zero-init + the loader scrape test.
@@ -113,6 +141,11 @@ pub fn init() {
             .expect("install a global Prometheus recorder exactly once");
         describe_all();
         zero_init_global();
+        // The reload-active gauge is flavor-labelled: seed both flavors at 0 so the panel shows a
+        // flat line (not a gap) before the first reload of that flavor (PR 6.11).
+        for flavor in ["reload", "resync"] {
+            metrics::gauge!(names::RELOAD_ACTIVE, names::FLAVOR_LABEL => flavor).set(0.0);
+        }
         handle
     });
 }
@@ -208,18 +241,43 @@ fn describe_all() {
         names::SINK_FAILED_FILE_COUNT,
         "files that failed to write / PUT"
     );
+    describe_gauge!(
+        names::RELOAD_ACTIVE,
+        "non-terminal reloads in flight, by flavor"
+    );
+    describe_counter!(
+        names::RELOAD_CHUNKS_TOTAL,
+        "reload chunk files exported, per table"
+    );
+    describe_counter!(
+        names::RELOAD_ROWS_EXPORTED_TOTAL,
+        "rows exported across reload chunks, per table"
+    );
+    describe_histogram!(
+        names::RELOAD_ECHO_WAIT_SECONDS,
+        Unit::Seconds,
+        "reload echo round-trip: signal INSERT → decoded-commit echo (≈ end-to-end decode latency)"
+    );
+    describe_counter!(
+        names::RELOAD_RESTARTS_TOTAL,
+        "reload attempts restarted because DDL bumped schema_version mid-export (PR 6.8), per table"
+    );
+    describe_counter!(
+        names::RELOAD_FAILED_TOTAL,
+        "reloads that reached terminal 'failed' (preflight, echo timeout, or cap), per table"
+    );
     describe_counter!(
         names::RELOAD_CROSSCHECK_VIOLATIONS,
         "reload echo cross-check failures (embedded wal_insert_lsn >= commit LSN) — any tick means \
          the watermark model is wrong"
     );
     describe_counter!(
-        names::RELOAD_RESTARTS_TOTAL,
-        "reload attempts restarted because DDL bumped schema_version mid-export (PR 6.8)"
-    );
-    describe_counter!(
         names::RELOAD_RESTART_CAP_EXHAUSTED_TOTAL,
         "reloads failed after exhausting reload_max_restarts against mid-export DDL (PR 6.8)"
+    );
+    describe_gauge!(
+        names::RELOAD_LEASE_STALE,
+        "exporting reloads with an expired, unadopted lease (nobody renewing) — the stuck signal"
     );
 
     describe_gauge!(
@@ -257,7 +315,9 @@ fn describe_all() {
 
 fn zero_init_global() {
     for name in names::SINK_ALL {
-        if *name == names::SINK_BATCH_FLUSH_LATENCY_SECONDS {
+        if *name == names::SINK_BATCH_FLUSH_LATENCY_SECONDS
+            || *name == names::RELOAD_ECHO_WAIT_SECONDS
+        {
             // A histogram only appears in the exposition once it has a sample; seed one 0s observation so
             // the series (and the dashboard panel) exists from startup. Negligible against real traffic.
             metrics::histogram!(*name).record(0.0);
@@ -285,14 +345,49 @@ pub fn record_reload_crosscheck_violation() {
     metrics::counter!(names::RELOAD_CROSSCHECK_VIOLATIONS).increment(1);
 }
 
-/// One reload attempt re-issued because DDL bumped its table's `schema_version` mid-export (PR 6.8).
-pub fn record_reload_restart() {
-    metrics::counter!(names::RELOAD_RESTARTS_TOTAL).increment(1);
+/// One reload attempt re-issued because DDL bumped `table`'s `schema_version` mid-export (PR 6.8).
+pub fn record_reload_restart(table: &str) {
+    metrics::counter!(names::RELOAD_RESTARTS_TOTAL, names::TABLE_LABEL => table.to_string())
+        .increment(1);
 }
 
 /// One reload abandoned at the restart cap (PR 6.8): visible waste, not silent corruption.
 pub fn record_reload_restart_cap_exhausted() {
     metrics::counter!(names::RELOAD_RESTART_CAP_EXHAUSTED_TOTAL).increment(1);
+}
+
+/// A reload exporter started / ended: inc/dec the in-flight gauge for its flavor (PR 6.11). The
+/// pair balances per exporter task, so the gauge returns to 0 when the queue drains.
+pub fn inc_reload_active(flavor: &str) {
+    metrics::gauge!(names::RELOAD_ACTIVE, names::FLAVOR_LABEL => flavor.to_string()).increment(1.0);
+}
+pub fn dec_reload_active(flavor: &str) {
+    metrics::gauge!(names::RELOAD_ACTIVE, names::FLAVOR_LABEL => flavor.to_string()).decrement(1.0);
+}
+
+/// One reload chunk file exported: bump the per-table chunk and row counters (PR 6.11).
+pub fn record_reload_chunk(table: &str, rows: u64) {
+    metrics::counter!(names::RELOAD_CHUNKS_TOTAL, names::TABLE_LABEL => table.to_string())
+        .increment(1);
+    metrics::counter!(names::RELOAD_ROWS_EXPORTED_TOTAL, names::TABLE_LABEL => table.to_string())
+        .increment(rows);
+}
+
+/// One reload echo round-trip observed (H1): signal INSERT → decoded-commit echo (PR 6.11).
+pub fn record_reload_echo_wait(secs: f64) {
+    metrics::histogram!(names::RELOAD_ECHO_WAIT_SECONDS).record(secs);
+}
+
+/// One reload reached terminal `failed`, per table (PR 6.11) — preflight, echo timeout, or cap.
+pub fn record_reload_failed(table: &str) {
+    metrics::counter!(names::RELOAD_FAILED_TOTAL, names::TABLE_LABEL => table.to_string())
+        .increment(1);
+}
+
+/// How many `exporting` reloads have a stale, unadopted lease right now (PR 6.11) — set each
+/// controller tick, so the stuck-lease alert reads a gauge instead of querying control-pg.
+pub fn set_reload_lease_stale(count: u64) {
+    metrics::gauge!(names::RELOAD_LEASE_STALE).set(count as f64);
 }
 
 /// One batch flush: its wall-clock latency and the row count written (Parquet throughput).

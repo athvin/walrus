@@ -1,6 +1,6 @@
 # PR 6.11 — reload observability: metrics, alerts, runbook
 
-> **Status:** 📋 Planned
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/103
 
 > **Phase:** 6 — single-table reload · **Crates touched:** `common`, `pg-sink`, `loader`,
 > `deploy` · **Est. size:** S · **Depends on:** PR 6.9 · **Unlocks:** PR 6.12
@@ -90,20 +90,20 @@ pub fn record_reload_chunk(/* table, rows, echo_wait */) { todo!() }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] All seven metrics are registered and described (`describe_all`), and every one **moves**
+- [x] All seven metrics are registered and described (`describe_all`), and every one **moves**
       during a compose reload run — zero-valued metrics that never tick are asserted against.
-- [ ] `walrus_reload_active` returns to 0 after completion; `_failed_total` ticks on a forced
+- [x] `walrus_reload_active` returns to 0 after completion; `_failed_total` ticks on a forced
       failure; `_restarts_total` ticks on a forced DDL restart.
-- [ ] The three alert rules ship in 4.10's format and their PromQL parses (whatever validation
+- [x] The three alert rules ship in 4.10's format and their PromQL parses (whatever validation
       4.10 used, reuse).
-- [ ] The `raw_append_lag_bytes` alert carries the paused-table annotation.
-- [ ] The runbook section exists with copy-pasteable SQL for watch + unstick, the flavor guide,
+- [x] The `raw_append_lag_bytes` alert carries the paused-table annotation.
+- [x] The runbook section exists with copy-pasteable SQL for watch + unstick, the flavor guide,
       and the signal-table pruning note.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test --workspace`
-  - [ ] `docker compose up --wait`, run a reload, then the metrics-move assertion (named compose
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test --workspace`
+  - [x] `docker compose up --wait`, run a reload, then the metrics-move assertion (named compose
         test or scripted scrape-diff — match 4.10's approach).
 
 ## What completed looks like
