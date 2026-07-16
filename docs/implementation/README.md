@@ -131,7 +131,7 @@ Two deliberate structural notes:
 | Time | every walrus-stamped datetime is **UTC, RFC-3339, `Z`** — never local, never source offset. |
 | Ordering | everything keys on **commit LSN** (`(commit_lsn, lsn)` tuples), never max-row-LSN. |
 | Lints | `#![deny(warnings)]` via `[workspace.lints]`; `clippy --all-targets -D warnings` in CI. |
-| Tests | unit tests inline (`#[cfg(test)]`); golden-vector & conformance tests in `tests/`; e2e feature-gated. |
+| Tests | unit tests in a sibling `foo_test.rs` (`src/foo.rs` → `src/foo_test.rs`, Go-style, via `#[cfg(test)] #[path = "foo_test.rs"] mod tests;`; private access preserved); golden-vector & conformance tests in `tests/`; e2e feature-gated. |
 | Commits/PRs | one PR per task file; PR description links the task file and pastes its DoD checklist. |
 
 ### Testing layers (fastest first — prefer the cheapest that proves the thing)
@@ -331,7 +331,7 @@ the `"first_lsn: Lsn"` false alarm (it was always a sqlx type-cast, never a colu
 
 | ✅ | PR | Delivers | Design |
 |---|---|---|---|
-| ☐ | [7.1](./phase-7-conventions-hardening/pr-7.1-tests-sibling-common-control-loader.md) | inline `mod tests` → sibling `src/*/tests.rs` (common, control, loader) | Conventions (Tests) |
+| ✅ | [7.1](./phase-7-conventions-hardening/pr-7.1-tests-sibling-common-control-loader.md) | inline `mod tests` → sibling `src/*_test.rs` (common, control, loader) | Conventions (Tests) |
 | ☐ | [7.2](./phase-7-conventions-hardening/pr-7.2-tests-sibling-pg-to-arrow.md) | same for `pg-to-arrow` (9 files; `batch`/`schema` largest) | Conventions (Tests) |
 | ☐ | [7.3](./phase-7-conventions-hardening/pr-7.3-tests-sibling-pg-sink.md) | same for `pg-sink` (21 files, incl. nested `pgoutput/typmod`) | Conventions (Tests) |
 | ☐ | [7.4](./phase-7-conventions-hardening/pr-7.4-control-sql-query-file.md) | control SQL → `sql/postgres/` via `sqlx::query_file!` | Conventions (SQL) |

@@ -13,15 +13,17 @@
 
 The largest test surface in the phase: `pg-sink`'s **21** files with inline test modules, including
 the decoder-state monster `stream_txn.rs` (~224-line module) and `batch.rs` (~214), plus the one
-**nested** case — `pgoutput/typmod.rs`, whose sibling lands at `pgoutput/typmod/tests.rs`. Same
-mechanical transform as 7.1/7.2, larger blast radius, so it earns its own PR.
+**nested** case — `pgoutput/typmod.rs`, whose Go-style sibling lands at `pgoutput/typmod_test.rs`
+(same directory, `#[path]` relative to `pgoutput/`). Same mechanical transform as 7.1/7.2, larger
+blast radius, so it earns its own PR.
 
 ## Why — learning objectives
 
 By the end of this PR you will have practised:
 
-- **The nested-module resolution case** — a `mod tests;` inside a *submodule* (`pgoutput/typmod.rs`)
-  resolves into that submodule's directory (`pgoutput/typmod/tests.rs`), not the crate root.
+- **`#[path]` in a submodule** — `#[path = "typmod_test.rs"]` inside `pgoutput/typmod.rs` resolves
+  relative to `pgoutput/` (the submodule's directory), landing the sibling at
+  `pgoutput/typmod_test.rs`.
 - **Refactoring at scale without drift** — 21 identical transforms, each independently compile-checked.
 
 ## Read first
@@ -35,7 +37,8 @@ By the end of this PR you will have practised:
 **In scope**
 
 - Convert all **21** `pg-sink` files with an inline `#[cfg(test)] mod tests { … }` to
-  `#[cfg(test)] mod tests;` + a sibling `src/<module>/tests.rs`. The set includes `stream_txn`,
+  `#[cfg(test)] #[path = "<module>_test.rs"] mod tests;` + a sibling `src/<module>_test.rs`. The set
+  includes `stream_txn`,
   `batch`, `reload_signal`, `reload_export`, `snapshot`, `config`, `ddl`, `reload`, `heartbeat`,
   `relcache`, `preflight`, `memory`, `replication`, `bootstrap`, `checkpoint`, `epoch`, `manifest`,
   `health`, `sink`, `shutdown`, and the nested `pgoutput/typmod`.
@@ -49,10 +52,10 @@ By the end of this PR you will have practised:
 ## Files to create / modify
 
 ```
-crates/pg-sink/src/<module>.rs            # modify ×21 — inline block → `mod tests;`
-crates/pg-sink/src/<module>/tests.rs      # new ×21 — moved bodies
+crates/pg-sink/src/<module>.rs            # modify ×21 — inline block → #[path] mod tests;
+crates/pg-sink/src/<module>_test.rs       # new ×21 — moved bodies
 crates/pg-sink/src/pgoutput/typmod.rs     # modify — nested case
-crates/pg-sink/src/pgoutput/typmod/tests.rs  # new — nested sibling
+crates/pg-sink/src/pgoutput/typmod_test.rs   # new — nested sibling
 ```
 
 ## Skeleton
@@ -60,22 +63,24 @@ crates/pg-sink/src/pgoutput/typmod/tests.rs  # new — nested sibling
 ```rust
 // AFTER — crates/pg-sink/src/stream_txn.rs (tail)
 #[cfg(test)]
+#[path = "stream_txn_test.rs"]
 mod tests;
 ```
 
 ```rust
 // AFTER — crates/pg-sink/src/pgoutput/typmod.rs (the nested case)
 #[cfg(test)]
-mod tests;   // resolves to crates/pg-sink/src/pgoutput/typmod/tests.rs
+#[path = "typmod_test.rs"]
+mod tests;   // resolves to crates/pg-sink/src/pgoutput/typmod_test.rs
 ```
 
 ## Definition of Done
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] All 21 files carry `#[cfg(test)] mod tests;` with the body moved to `src/<module>/tests.rs`
-      (and `pgoutput/typmod/tests.rs` for the nested one); no `mod tests {` brace-block remains in
-      `pg-sink`.
+- [ ] All 21 files carry `#[cfg(test)] #[path = "<module>_test.rs"] mod tests;` with the body moved to
+      `src/<module>_test.rs` (and `pgoutput/typmod_test.rs` for the nested one); no `mod tests {`
+      brace-block remains in `pg-sink`.
 - [ ] Pure relocation: `cargo test -p pg-sink` reports the same count as before; the diff is moves
       only; no `#[path]`; no `foo.rs`→`foo/mod.rs`; production code untouched.
 - [ ] The nested `pgoutput/typmod` case compiles and its test runs (resolution into the submodule dir
@@ -90,7 +95,7 @@ A reviewer merges this PR when **all** of the following hold:
 ```
 $ grep -rl 'mod tests {' crates/pg-sink --include='*.rs' | wc -l
 0
-$ find crates/pg-sink -name tests.rs | wc -l
+$ find crates/pg-sink -name '*_test.rs' | wc -l
 21
 $ cargo test -p pg-sink 2>&1 | grep -Eo '[0-9]+ passed' | tail -1
 <same count as before this PR>
@@ -103,8 +108,8 @@ $ cargo test -p pg-sink 2>&1 | grep -Eo '[0-9]+ passed' | tail -1
   only the `#[cfg(test)]` block moves. Keeping the two PRs disjoint keeps each reviewable.
 - Any `.unwrap()`/`.expect()` *inside* the moved test bodies is fine and stays — it will be legal once
   PR 7.7's `clippy.toml` allows unwrap/expect in tests; there is no lint pressure on tests before then.
-- For the nested `pgoutput/typmod.rs`, create the directory `pgoutput/typmod/` next to the file; the
-  child resolves there exactly as `pgoutput/reader.rs` already resolves from `pgoutput/mod.rs`.
+- For the nested `pgoutput/typmod.rs`, the sibling is `pgoutput/typmod_test.rs` (same directory) —
+  `#[path]` on a `mod` in `typmod.rs` resolves relative to `pgoutput/`, so no subdirectory is needed.
 - Work in batches (e.g. 5 files at a time) with `cargo test -p pg-sink` between batches; a missed
   `use super::*;` fails fast at compile time.
 
