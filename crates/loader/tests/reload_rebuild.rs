@@ -91,6 +91,20 @@ async fn seed_file(
     lsn_end: &str,
     reload_id: Option<i64>,
 ) -> i64 {
+    seed_file_v(pool, epoch, uri, kind, lsn_end, reload_id, 1).await
+}
+
+/// Like [`seed_file`] but at an explicit `schema_version` — a file at a version NEWER than the
+/// loader's would trigger a reconcile (PR 6.12's skip path).
+async fn seed_file_v(
+    pool: &sqlx::PgPool,
+    epoch: i64,
+    uri: &str,
+    kind: &str,
+    lsn_end: &str,
+    reload_id: Option<i64>,
+    schema_version: i64,
+) -> i64 {
     control::insert_ready(
         pool,
         &control::NewManifestFile {
@@ -102,7 +116,7 @@ async fn seed_file(
             row_count: 1,
             lsn_start: lsn_end.parse().unwrap(),
             lsn_end: lsn_end.parse().unwrap(),
-            schema_version: 1,
+            schema_version,
             reload_id,
         },
     )
@@ -576,6 +590,76 @@ async fn resync_flavor_never_rebuilds_and_merges_over_the_live_mirror() {
         ctx.state.is_quarantined(),
         "resync is not a quarantine exit — the latch still holds"
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose up --wait (control PG + MinIO)"]
+async fn superseded_version_crossing_file_is_skipped_not_reconciled() {
+    let _g = LOCK.lock().await;
+    let epoch = 670_007;
+    let (ctx, dir) = setup(epoch).await;
+
+    // A live mirror {1} at the loader's current schema_version (1).
+    let live = write_rows(
+        epoch,
+        "live",
+        &[(1, "live", "i", "0000000000000050", "0000000000000050")],
+    );
+    seed_file(&ctx.pool, epoch, &live, "stream", "0/50", None).await;
+    run_phase_a(&ctx).await.unwrap();
+    run_phase_b(&ctx).await.unwrap();
+
+    // A BLOCKER stream file at a NEWER schema_version (2) — reconciling it would run the DDL path
+    // (and on a lossy cast, quarantine). It sits BELOW the reload's first_lsn, so a pending rebuild
+    // supersedes it. This is the quarantine-recovery blocker (PR 6.12), simulated without the ddl
+    // machinery: the skip happens BEFORE reconcile, so no v2 registry row is needed.
+    let blocker = write_rows(
+        epoch,
+        "blocker",
+        &[(8, "blocker", "i", "0000000000000060", "0000000000000060")],
+    );
+    let blocker_id = seed_file_v(&ctx.pool, epoch, &blocker, "stream", "0/60", None, 2).await;
+
+    // A drained rebuild reload at first_lsn = 0/100 (>= the blocker's 0/60 ⇒ supersedes it).
+    let reload_id = drained_reload(&ctx.pool, epoch, "0/100", "0/100", ReloadFlavor::Reload).await;
+    let chunk = write_rows(
+        epoch,
+        "chunk1",
+        &[(1, "rebuilt", "i", "0000000000000100", "0000000000000100")],
+    );
+    seed_file(&ctx.pool, epoch, &chunk, "reload", "0/100", Some(reload_id)).await;
+
+    run_phase_a(&ctx).await.unwrap();
+    run_phase_b(&ctx).await.unwrap();
+
+    // The blocker was SKIPPED: never reconciled (NO quarantine), never appended to raw, and purged
+    // by the rebuild's delete_superseded. The rebuild replaced the mirror from the chunk. Without
+    // the skip, the blocker (lower lsn_end) would reconcile-then-quarantine before the chunk fired.
+    assert!(
+        !ctx.state.is_quarantined(),
+        "the superseded blocker did not quarantine the loader"
+    );
+    let raw_blocker: i64 = ctx
+        .db
+        .conn()
+        .query_row("SELECT count(*) FROM orders_raw WHERE id = 8", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        raw_blocker, 0,
+        "the blocker's rows were never appended to raw"
+    );
+    assert_eq!(mirror_status(&ctx, 1).as_deref(), Some("rebuilt"));
+    let blocker_gone: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM walrus.file_manifest WHERE id = $1")
+            .bind(blocker_id)
+            .fetch_one(&ctx.pool)
+            .await
+            .unwrap();
+    assert_eq!(blocker_gone, 0, "the rebuild purged the skipped blocker");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

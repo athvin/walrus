@@ -322,6 +322,16 @@ jobs:
       - name: Reload metrics (compose)
         run: cargo test -p pg-sink --test reload_metrics -- --ignored --test-threads=1
 
+      # PR 6.12: the anchor use case e2e — a lossy-cast QUARANTINE recovered via `just reload` (the
+      # loader exits on the multi-table quarantine, restarts, skips the superseded blocker, rebuilds)
+      # while the other tables recover; and N-table concurrent reloads on ONE slot under the cap.
+      # These spawn the real sink+loader binaries (the harness builds them), so they must NOT inherit
+      # WALRUS_SOURCE_DB_URL — the loader's strict config rejects it; the integration job sets neither.
+      - name: Reload quarantine recovery (e2e)
+        run: cargo test -p e2e --features it --test reload_quarantine -- --ignored --test-threads=1
+      - name: Reload N-table scale (e2e)
+        run: cargo test -p e2e --features it --test reload_scale -- --ignored --test-threads=1
+
       # PR 2.18/2.19: the sink pod-lifecycle shell against the live stack — full bootstrap (control +
       # S3 + source preflight) → /startup→/ready flip, SIGTERM exit 0, missing control DB → exit 11.
       - name: Sink pod-lifecycle smoke (health · SIGTERM · fail-fast exit code)
