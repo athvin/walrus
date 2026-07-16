@@ -79,7 +79,7 @@ A reviewer merges this PR when **all** of the following hold:
 - [ ] All 9 files carry `#[cfg(test)] #[path = "<module>_test.rs"] mod tests;` with the body moved to
       `src/<module>_test.rs`; no `mod tests {` brace-block remains in `pg-to-arrow`.
 - [ ] Pure relocation: `cargo test -p pg-to-arrow` (and the `conformance` feature) reports the same
-      count as before; the diff is moves only; no `#[path]`; no `foo.rs`→`foo/mod.rs`.
+      count as before (67 tests); the diff is moves only; no `foo.rs`→`foo/mod.rs` conversion.
 - [ ] Docs/comments unchanged except where a moved doc-comment now needs its `//!`/`//` home.
 - [ ] **Green locally and in CI:**
   - [ ] `cargo fmt --check`
