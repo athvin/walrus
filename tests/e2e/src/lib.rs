@@ -125,7 +125,7 @@ impl Harness {
             .await
             .context("sink /ready")?;
         let loader = spawn_loader(&bins, &duckdb_dir)?;
-        wait_ready("http://127.0.0.1:8131", Duration::from_secs(45))
+        wait_ready("http://127.0.0.1:8131", Duration::from_secs(90))
             .await
             .context("loader /ready")?;
 
@@ -317,7 +317,7 @@ impl Harness {
     /// DuckDB lock was freed on `SIGKILL`. Resume is from the two persisted watermarks.
     pub async fn restart_loader(&mut self) -> Result<()> {
         self.loader = spawn_loader(&self.bins, &self.duckdb_dir)?;
-        wait_ready("http://127.0.0.1:8131", Duration::from_secs(45))
+        wait_ready("http://127.0.0.1:8131", Duration::from_secs(90))
             .await
             .context("loader /ready after restart")
     }
@@ -753,15 +753,10 @@ fn spawn_sink(bins: &std::path::Path, log: &std::path::Path) -> Result<Child> {
 }
 
 fn spawn_loader(bins: &std::path::Path, duckdb_dir: &std::path::Path) -> Result<Child> {
-    // Capture the loader's stdout+stderr into `loader.log` (a restart truncates it, so it always
-    // holds the LATEST loader's output) instead of interleaving into the test's inherited stdout —
-    // so a bootstrap hang / restart-race is legible on its own.
-    let stdout =
-        std::fs::File::create(duckdb_dir.join("loader.log")).context("create loader log")?;
-    let stderr = stdout.try_clone().context("clone loader log handle")?;
+    // Inherit the test's stdout/stderr (the loader's `tracing` log) so a bootstrap failure is
+    // visible — cargo test surfaces a failed test's captured output, which is how a CI failure is
+    // diagnosed. (An earlier `loader.log` file-redirect hid the reason from the CI job log.)
     Command::new(bins.join("walrus-loader"))
-        .stdout(std::process::Stdio::from(stdout))
-        .stderr(std::process::Stdio::from(stderr))
         .env("WALRUS_CONTROL_DB_URL", CONTROL_URL)
         .env("WALRUS_OBJECT_STORE__BUCKET", BUCKET)
         .env("WALRUS_OBJECT_STORE__ENDPOINT", S3_ENDPOINT)
@@ -769,7 +764,8 @@ fn spawn_loader(bins: &std::path::Path, duckdb_dir: &std::path::Path) -> Result<
         .env("WALRUS_INSTANCE", "e2e-loader")
         .env("WALRUS_DUCKDB_DIR", duckdb_dir.to_string_lossy().as_ref())
         .env("WALRUS_POLL_INTERVAL", "1s")
-        .env("WALRUS_STARTUP_DEADLINE", "30s")
+        // Generous for a cold CI runner (a dev-profile binary bootstrapping 6 tables).
+        .env("WALRUS_STARTUP_DEADLINE", "90s")
         .env("WALRUS_HEALTH_ADDR", "127.0.0.1:8131")
         .env("AWS_ACCESS_KEY_ID", "minioadmin")
         .env("AWS_SECRET_ACCESS_KEY", "minioadmin")
