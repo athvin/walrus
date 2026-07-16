@@ -16,10 +16,12 @@ The **design is already finished** and lives one directory up:
   reproducible Docker harness and a Python decoder + golden vectors under
   [`../examples/proto-version/`](../examples/proto-version/).
 
-This curriculum turns that design into **89 PRs across 7 phases** (phases 0–4 build v1; phase 5
+This curriculum turns that design into **97 PRs across 8 phases** (phases 0–4 build v1; phase 5
 hardens it — benchmarking, hot-path cleanup, and a much faster CI; phase 6 opens post-v1 feature
-work — single-table reload through the one slot). Each PR is a self-contained task file with an
-explicit *Definition of Done*. You write the code; the task tells you what "done and green" means.
+work — single-table reload through the one slot; phase 7 is a conventions-hardening hygiene pass —
+sibling test files, SQL-in-folders, no-unwrap lints, identifier audit). Each PR is a self-contained
+task file with an explicit *Definition of Done*. You write the code; the task tells you what "done and
+green" means.
 
 ---
 
@@ -145,7 +147,7 @@ Two deliberate structural notes:
 
 ## The roadmap
 
-89 PRs. Tick each box as you merge. Every DoD is traceable to a design section (right column).
+97 PRs. Tick each box as you merge. Every DoD is traceable to a design section (right column).
 
 ### Phase 0 — Foundations & CI  ·  [`phase-0-foundations/`](./phase-0-foundations/)
 
@@ -310,6 +312,33 @@ state — is the anchor use case and the phase-closing e2e.
 | ✅ | [6.10](./phase-6-single-table-reload/pr-6.10-resync-flavor.md) | `resync` flavor: merge over the live mirror; the phantom caveat | reload §H3 |
 | ✅ | [6.11](./phase-6-single-table-reload/pr-6.11-reload-observability.md) | reload metrics, alerts, runbook (stuck lease / restart cap / cross-check) | Observability |
 | ✅ | [6.12](./phase-6-single-table-reload/pr-6.12-e2e-quarantine-recovery.md) | e2e quarantine recovery + N-table scale on one slot; docs sweep | reload §2/§5 |
+
+> **🧹 Hardening pass.** Phase 7 is a post-v1 *hygiene* sweep over the finished v1+reload codebase —
+> no new behaviour: relocate every inline `#[cfg(test)] mod tests { … }` to a sibling `mod tests;`
+> file, pull inline SQL into per-crate `sql/<engine>/` folders (control's `sqlx::query!` →
+> `query_file!`; the loader's `format!`-built DuckDB DDL → `include_str!` templates), and ban
+> `unwrap`/`expect` outside tests (fix the offenders first, flip the lint last). The Conventions table
+> is the deliverable that ships with it.
+
+### Phase 7 — Conventions hardening  ·  [`phase-7-conventions-hardening/`](./phase-7-conventions-hardening/)
+
+A debt pass, not feature work: every PR is a behaviour-preserving refactor/lint/docs delta that stays
+green. Tests move into sibling files so a source file shows only its production surface; SQL moves into
+per-engine folders so a query is a reviewable `.sql`, not a buried string; and the compiler starts
+forbidding a production `unwrap`. The fix-then-flip split (7.6 fixes, 7.7 denies) makes CI-green the
+proof that production is panic-free, and the phase closes with an identifier-naming audit that retires
+the `"first_lsn: Lsn"` false alarm (it was always a sqlx type-cast, never a column name).
+
+| ✅ | PR | Delivers | Design |
+|---|---|---|---|
+| ☐ | [7.1](./phase-7-conventions-hardening/pr-7.1-tests-sibling-common-control-loader.md) | inline `mod tests` → sibling `src/*/tests.rs` (common, control, loader) | Conventions (Tests) |
+| ☐ | [7.2](./phase-7-conventions-hardening/pr-7.2-tests-sibling-pg-to-arrow.md) | same for `pg-to-arrow` (9 files; `batch`/`schema` largest) | Conventions (Tests) |
+| ☐ | [7.3](./phase-7-conventions-hardening/pr-7.3-tests-sibling-pg-sink.md) | same for `pg-sink` (21 files, incl. nested `pgoutput/typmod`) | Conventions (Tests) |
+| ☐ | [7.4](./phase-7-conventions-hardening/pr-7.4-control-sql-query-file.md) | control SQL → `sql/postgres/` via `sqlx::query_file!` | Conventions (SQL) |
+| ☐ | [7.5](./phase-7-conventions-hardening/pr-7.5-loader-duckdb-templates.md) | loader DuckDB DDL → `sql/duckdb/` `include_str!` templates | Conventions (SQL) |
+| ☐ | [7.6](./phase-7-conventions-hardening/pr-7.6-fix-unwrap-expect.md) | remove production `unwrap`/`expect` (parking_lot, typed errors) | Conventions (Lints) |
+| ☐ | [7.7](./phase-7-conventions-hardening/pr-7.7-deny-unwrap-expect-lint.md) | deny `unwrap_used`/`expect_used` + `clippy.toml` (allow in tests) | Conventions (Lints) |
+| ☐ | [7.8](./phase-7-conventions-hardening/pr-7.8-identifier-convention-audit.md) | identifier convention + naming audit (docs) | Conventions (Identifiers) |
 
 ---
 
