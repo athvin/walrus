@@ -39,13 +39,8 @@ pub async fn insert_ddl(
     c_columns: Option<&serde_json::Value>,
 ) -> Result<i64, ControlError> {
     let c_rel_oid = c_rel_oid.map(sqlx::postgres::types::Oid);
-    let rec = sqlx::query!(
-        r#"
-        INSERT INTO walrus.ddl_manifest
-            (epoch, source_schema, source_table, c_lsn, c_event, c_tag, schema_version, c_rel_oid, c_columns)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        RETURNING id
-        "#,
+    let rec = sqlx::query_file!(
+        "sql/postgres/queries/insert_ddl.sql",
         row.epoch,
         row.source_schema,
         row.source_table,
@@ -71,15 +66,9 @@ pub async fn read_pending_ddl(
     table: &str,
     after_lsn: Lsn,
 ) -> Result<Vec<DdlRow>, ControlError> {
-    sqlx::query_as!(
+    sqlx::query_file_as!(
         DdlRow,
-        r#"
-        SELECT id, epoch, source_schema, source_table,
-               c_lsn AS "c_lsn: Lsn", c_event, c_tag, schema_version
-        FROM walrus.ddl_manifest
-        WHERE epoch = $1 AND source_schema = $2 AND source_table = $3 AND c_lsn > $4
-        ORDER BY c_lsn, id
-        "#,
+        "sql/postgres/queries/read_pending_ddl.sql",
         epoch,
         schema,
         table,

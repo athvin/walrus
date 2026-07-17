@@ -55,14 +55,8 @@ pub async fn insert_ready(
     executor: impl PgExecutor<'_>,
     f: &NewManifestFile,
 ) -> Result<i64, ControlError> {
-    let rec = sqlx::query!(
-        r#"
-        INSERT INTO walrus.file_manifest
-            (epoch, source_schema, source_table, s3_uri, kind, row_count,
-             lsn_start, lsn_end, schema_version, status, reload_id)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'ready', $10)
-        RETURNING id
-        "#,
+    let rec = sqlx::query_file!(
+        "sql/postgres/queries/insert_ready.sql",
         f.epoch,
         f.source_schema,
         f.source_table,
@@ -102,25 +96,9 @@ pub async fn claim_ready(
     source_table: &str,
     limit: i64,
 ) -> Result<Vec<ManifestRow>, ControlError> {
-    sqlx::query_as!(
+    sqlx::query_file_as!(
         ManifestRow,
-        r#"
-        SELECT m.id, m.epoch, m.source_schema, m.source_table, m.s3_uri, m.kind, m.row_count,
-               m.lsn_start AS "lsn_start: Lsn", m.lsn_end AS "lsn_end: Lsn", m.schema_version,
-               m.status, m.reload_id
-        FROM walrus.file_manifest m
-        WHERE m.epoch = $1 AND m.source_schema = $2 AND m.source_table = $3 AND m.status = 'ready'
-          AND NOT EXISTS (
-              SELECT 1 FROM walrus.table_reload r
-              WHERE r.epoch = m.epoch
-                AND r.source_schema = m.source_schema
-                AND r.source_table = m.source_table
-                AND r.flavor = 'reload'
-                AND r.status IN ('requested', 'exporting')
-          )
-        ORDER BY m.lsn_end, m.id
-        LIMIT $4
-        "#,
+        "sql/postgres/queries/claim_ready.sql",
         epoch,
         source_schema,
         source_table,
@@ -140,12 +118,8 @@ pub async fn max_ready_lsn_end(
     source_schema: &str,
     source_table: &str,
 ) -> Result<Option<Lsn>, ControlError> {
-    let row = sqlx::query!(
-        r#"
-        SELECT MAX(lsn_end) AS "max_lsn_end: Lsn"
-        FROM walrus.file_manifest
-        WHERE epoch = $1 AND source_schema = $2 AND source_table = $3 AND status = 'ready'
-        "#,
+    let row = sqlx::query_file!(
+        "sql/postgres/queries/max_ready_lsn_end.sql",
         epoch,
         source_schema,
         source_table,
@@ -161,7 +135,7 @@ pub async fn delete_claimed(
     executor: impl PgExecutor<'_>,
     ids: &[i64],
 ) -> Result<u64, ControlError> {
-    let result = sqlx::query!("DELETE FROM walrus.file_manifest WHERE id = ANY($1)", ids,)
+    let result = sqlx::query_file!("sql/postgres/queries/delete_claimed.sql", ids,)
         .execute(executor)
         .await
         .map_err(ControlError::Connect)?;
@@ -181,12 +155,8 @@ pub async fn delete_superseded(
     source_table: &str,
     first_lsn: Lsn,
 ) -> Result<u64, ControlError> {
-    let done = sqlx::query!(
-        r#"
-        DELETE FROM walrus.file_manifest
-        WHERE epoch = $1 AND source_schema = $2 AND source_table = $3
-          AND kind <> 'reload' AND lsn_end <= $4
-        "#,
+    let done = sqlx::query_file!(
+        "sql/postgres/queries/delete_superseded.sql",
         epoch,
         source_schema,
         source_table,
@@ -200,12 +170,9 @@ pub async fn delete_superseded(
 
 /// Dead-letter a repeatedly-failing file (`status='failed'`) so a poison file can't block the queue.
 pub async fn mark_failed(executor: impl PgExecutor<'_>, id: i64) -> Result<(), ControlError> {
-    sqlx::query!(
-        "UPDATE walrus.file_manifest SET status = 'failed' WHERE id = $1",
-        id,
-    )
-    .execute(executor)
-    .await
-    .map_err(ControlError::Connect)?;
+    sqlx::query_file!("sql/postgres/queries/mark_failed.sql", id,)
+        .execute(executor)
+        .await
+        .map_err(ControlError::Connect)?;
     Ok(())
 }

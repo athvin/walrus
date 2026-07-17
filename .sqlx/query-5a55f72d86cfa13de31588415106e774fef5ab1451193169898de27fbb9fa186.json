@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO walrus.table_reload\n    (epoch, source_schema, source_table, flavor, status, restart_count,\n     lease_holder, lease_expiry)\nSELECT epoch, source_schema, source_table, flavor, 'exporting', $2,\n       lease_holder, lease_expiry\nFROM walrus.table_reload\nWHERE reload_id = $1\nRETURNING reload_id\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "reload_id",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "5a55f72d86cfa13de31588415106e774fef5ab1451193169898de27fbb9fa186"
+}

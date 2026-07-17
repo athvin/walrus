@@ -30,14 +30,8 @@ pub async fn upsert_registry(
     ex: impl PgExecutor<'_>,
     row: &RegistryRow,
 ) -> Result<(), ControlError> {
-    sqlx::query!(
-        r#"
-        INSERT INTO walrus.schema_registry
-            (epoch, source_schema, source_table, schema_version, descriptors, columns)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        ON CONFLICT (epoch, source_schema, source_table, schema_version) DO UPDATE
-            SET descriptors = EXCLUDED.descriptors, columns = EXCLUDED.columns
-        "#,
+    sqlx::query_file!(
+        "sql/postgres/queries/upsert_registry.sql",
         row.epoch,
         row.source_schema,
         row.source_table,
@@ -59,14 +53,8 @@ pub async fn read_registry(
     table: &str,
     version: i64,
 ) -> Result<Option<RegistryRow>, ControlError> {
-    let rec = sqlx::query!(
-        r#"
-        SELECT epoch, source_schema, source_table, schema_version,
-               descriptors AS "descriptors: Json<Vec<TypeDescriptor>>",
-               columns AS "columns: serde_json::Value"
-        FROM walrus.schema_registry
-        WHERE epoch = $1 AND source_schema = $2 AND source_table = $3 AND schema_version = $4
-        "#,
+    let rec = sqlx::query_file!(
+        "sql/postgres/queries/read_registry.sql",
         epoch,
         schema,
         table,
@@ -93,12 +81,8 @@ pub async fn read_latest_version(
     schema: &str,
     table: &str,
 ) -> Result<Option<i64>, ControlError> {
-    let rec = sqlx::query!(
-        r#"
-        SELECT MAX(schema_version) AS "max_version"
-        FROM walrus.schema_registry
-        WHERE epoch = $1 AND source_schema = $2 AND source_table = $3
-        "#,
+    let rec = sqlx::query_file!(
+        "sql/postgres/queries/read_latest_version.sql",
         epoch,
         schema,
         table,

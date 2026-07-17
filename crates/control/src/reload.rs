@@ -131,12 +131,8 @@ pub async fn request(
     source_table: &str,
     flavor: ReloadFlavor,
 ) -> Result<i64, ControlError> {
-    let rec = sqlx::query!(
-        r#"
-        INSERT INTO walrus.table_reload (epoch, source_schema, source_table, flavor)
-        VALUES ($1, $2, $3, $4)
-        RETURNING reload_id
-        "#,
+    let rec = sqlx::query_file!(
+        "sql/postgres/queries/request_reload.sql",
         epoch,
         source_schema,
         source_table,
@@ -171,27 +167,9 @@ pub async fn claim_requested(
     lease_ttl_secs: i64,
     limit: i64,
 ) -> Result<Vec<ReloadRow>, ControlError> {
-    sqlx::query_as!(
+    sqlx::query_file_as!(
         ReloadRow,
-        r#"
-        UPDATE walrus.table_reload
-        SET status = 'exporting',
-            lease_holder = $2,
-            lease_expiry = now() + make_interval(secs => $3),
-            updated_at = now()
-        WHERE reload_id IN (
-            SELECT reload_id FROM walrus.table_reload
-            WHERE epoch = $1 AND status = 'requested'
-            ORDER BY reload_id
-            LIMIT $4
-            FOR UPDATE SKIP LOCKED
-        )
-        RETURNING reload_id, epoch, source_schema, source_table,
-                  flavor AS "flavor: ReloadFlavor", status AS "status: ReloadStatus",
-                  chunk_no, cursor_pk,
-                  first_lsn AS "first_lsn: Lsn", final_lsn AS "final_lsn: Lsn",
-                  schema_version, restart_count, lease_holder, error
-        "#,
+        "sql/postgres/queries/claim_requested.sql",
         epoch,
         holder,
         lease_ttl_secs as f64,
@@ -214,18 +192,10 @@ pub async fn release_claim(
     reload_id: i64,
     holder: &str,
 ) -> Result<bool, ControlError> {
-    let done = sqlx::query!(
-        r#"
-        UPDATE walrus.table_reload
-        SET status = 'requested', lease_holder = NULL, lease_expiry = NULL, updated_at = now()
-        WHERE reload_id = $1 AND lease_holder = $2 AND status = 'exporting'
-        "#,
-        reload_id,
-        holder,
-    )
-    .execute(ex)
-    .await
-    .map_err(ControlError::from_sqlx)?;
+    let done = sqlx::query_file!("sql/postgres/queries/release_claim.sql", reload_id, holder,)
+        .execute(ex)
+        .await
+        .map_err(ControlError::from_sqlx)?;
     Ok(done.rows_affected() > 0)
 }
 
@@ -237,12 +207,8 @@ pub async fn renew_lease(
     holder: &str,
     lease_ttl_secs: i64,
 ) -> Result<bool, ControlError> {
-    let done = sqlx::query!(
-        r#"
-        UPDATE walrus.table_reload
-        SET lease_expiry = now() + make_interval(secs => $3), updated_at = now()
-        WHERE reload_id = $1 AND lease_holder = $2 AND status = 'exporting'
-        "#,
+    let done = sqlx::query_file!(
+        "sql/postgres/queries/renew_lease.sql",
         reload_id,
         holder,
         lease_ttl_secs as f64,
@@ -272,17 +238,8 @@ pub async fn advance_cursor(
     chunk_lsn: Lsn,
     schema_version: i64,
 ) -> Result<(), ControlError> {
-    let done = sqlx::query!(
-        r#"
-        UPDATE walrus.table_reload
-        SET chunk_no = $2,
-            cursor_pk = $3,
-            first_lsn = COALESCE(first_lsn, $4),
-            schema_version = COALESCE(schema_version, $5),
-            updated_at = now()
-        WHERE reload_id = $1 AND status = 'exporting' AND chunk_no = $2::bigint - 1
-          AND (schema_version IS NULL OR schema_version = $5)
-        "#,
+    let done = sqlx::query_file!(
+        "sql/postgres/queries/advance_cursor.sql",
         reload_id,
         chunk_no,
         cursor_pk,
@@ -308,12 +265,8 @@ pub async fn complete_export(
     reload_id: i64,
     final_lsn: Lsn,
 ) -> Result<(), ControlError> {
-    let done = sqlx::query!(
-        r#"
-        UPDATE walrus.table_reload
-        SET status = 'export_complete', final_lsn = $2, updated_at = now()
-        WHERE reload_id = $1 AND status = 'exporting'
-        "#,
+    let done = sqlx::query_file!(
+        "sql/postgres/queries/complete_export.sql",
         reload_id,
         final_lsn as Lsn,
     )
@@ -333,17 +286,10 @@ pub async fn complete_export(
 /// (PR 6.9). Terminal: the row leaves the `table_reload_one_live` index and the table can be
 /// reloaded again.
 pub async fn complete(ex: impl PgExecutor<'_>, reload_id: i64) -> Result<(), ControlError> {
-    let done = sqlx::query!(
-        r#"
-        UPDATE walrus.table_reload
-        SET status = 'complete', updated_at = now()
-        WHERE reload_id = $1 AND status = 'export_complete'
-        "#,
-        reload_id,
-    )
-    .execute(ex)
-    .await
-    .map_err(ControlError::from_sqlx)?;
+    let done = sqlx::query_file!("sql/postgres/queries/complete.sql", reload_id,)
+        .execute(ex)
+        .await
+        .map_err(ControlError::from_sqlx)?;
     if done.rows_affected() == 0 {
         return Err(ControlError::ReloadTransition {
             reload_id,
@@ -367,18 +313,10 @@ pub async fn fail(
     reason: &str,
 ) -> Result<(), ControlError> {
     let mut tx = conn.begin().await.map_err(ControlError::from_sqlx)?;
-    let done = sqlx::query!(
-        r#"
-        UPDATE walrus.table_reload
-        SET status = 'failed', error = $2, updated_at = now()
-        WHERE reload_id = $1 AND status IN ('exporting', 'export_complete')
-        "#,
-        reload_id,
-        reason,
-    )
-    .execute(&mut *tx)
-    .await
-    .map_err(ControlError::from_sqlx)?;
+    let done = sqlx::query_file!("sql/postgres/queries/fail.sql", reload_id, reason,)
+        .execute(&mut *tx)
+        .await
+        .map_err(ControlError::from_sqlx)?;
     if done.rows_affected() == 0 {
         // Dropping `tx` rolls the savepoint/transaction back.
         return Err(ControlError::ReloadTransition {
@@ -386,13 +324,10 @@ pub async fn fail(
             expected: "exporting or export_complete",
         });
     }
-    sqlx::query!(
-        "DELETE FROM walrus.file_manifest WHERE reload_id = $1",
-        reload_id,
-    )
-    .execute(&mut *tx)
-    .await
-    .map_err(ControlError::from_sqlx)?;
+    sqlx::query_file!("sql/postgres/queries/fail_purge_files.sql", reload_id,)
+        .execute(&mut *tx)
+        .await
+        .map_err(ControlError::from_sqlx)?;
     tx.commit().await.map_err(ControlError::from_sqlx)?;
     Ok(())
 }
@@ -448,17 +383,8 @@ pub async fn restart_for_ddl(
     // The successor: copy identity + lease from the (now failed) predecessor, reset the cursor and
     // schema_version, bump restart_count. Selecting only the carried columns leaves chunk_no/
     // cursor_pk/first_lsn/final_lsn/schema_version/error at their table defaults (fresh start).
-    let rec = sqlx::query!(
-        r#"
-        INSERT INTO walrus.table_reload
-            (epoch, source_schema, source_table, flavor, status, restart_count,
-             lease_holder, lease_expiry)
-        SELECT epoch, source_schema, source_table, flavor, 'exporting', $2,
-               lease_holder, lease_expiry
-        FROM walrus.table_reload
-        WHERE reload_id = $1
-        RETURNING reload_id
-        "#,
+    let rec = sqlx::query_file!(
+        "sql/postgres/queries/restart_for_ddl.sql",
         old.reload_id,
         next_restart,
     )
@@ -483,18 +409,8 @@ pub async fn complete_reached(
     source_schema: &str,
     source_table: &str,
 ) -> Result<Vec<i64>, ControlError> {
-    let rows = sqlx::query!(
-        r#"
-        UPDATE walrus.table_reload r
-        SET status = 'complete', updated_at = now()
-        FROM walrus.loader_checkpoint c
-        WHERE r.epoch = $1 AND r.source_schema = $2 AND r.source_table = $3
-          AND r.status = 'export_complete'
-          AND c.epoch = r.epoch AND c.source_schema = r.source_schema
-          AND c.source_table = r.source_table
-          AND r.final_lsn <= c.transformed_lsn
-        RETURNING r.reload_id
-        "#,
+    let rows = sqlx::query_file!(
+        "sql/postgres/queries/complete_reached.sql",
         epoch,
         source_schema,
         source_table,
@@ -522,17 +438,8 @@ pub async fn reload_supersede_floor(
     source_schema: &str,
     source_table: &str,
 ) -> Result<Option<Lsn>, ControlError> {
-    let rec = sqlx::query!(
-        r#"
-        SELECT first_lsn AS "first_lsn: Lsn"
-        FROM walrus.table_reload
-        WHERE epoch = $1 AND source_schema = $2 AND source_table = $3
-          AND flavor = 'reload'
-          AND status IN ('requested', 'exporting', 'export_complete')
-          AND first_lsn IS NOT NULL
-        ORDER BY reload_id DESC
-        LIMIT 1
-        "#,
+    let rec = sqlx::query_file!(
+        "sql/postgres/queries/reload_supersede_floor.sql",
         epoch,
         source_schema,
         source_table,
@@ -560,27 +467,9 @@ pub async fn adopt_resumable(
     lease_ttl_secs: i64,
     limit: i64,
 ) -> Result<Vec<ReloadRow>, ControlError> {
-    sqlx::query_as!(
+    sqlx::query_file_as!(
         ReloadRow,
-        r#"
-        UPDATE walrus.table_reload
-        SET lease_holder = $2,
-            lease_expiry = now() + make_interval(secs => $3),
-            updated_at = now()
-        WHERE reload_id IN (
-            SELECT reload_id FROM walrus.table_reload
-            WHERE epoch = $1 AND status = 'exporting'
-              AND (lease_holder = $2 OR lease_expiry < now())
-            ORDER BY reload_id
-            LIMIT $4
-            FOR UPDATE SKIP LOCKED
-        )
-        RETURNING reload_id, epoch, source_schema, source_table,
-                  flavor AS "flavor: ReloadFlavor", status AS "status: ReloadStatus",
-                  chunk_no, cursor_pk,
-                  first_lsn AS "first_lsn: Lsn", final_lsn AS "final_lsn: Lsn",
-                  schema_version, restart_count, lease_holder, error
-        "#,
+        "sql/postgres/queries/adopt_resumable.sql",
         epoch,
         holder,
         lease_ttl_secs as f64,
@@ -599,19 +488,10 @@ pub async fn stuck_exporting(
     ex: impl PgExecutor<'_>,
     epoch: i64,
 ) -> Result<Vec<(i64, Option<String>)>, ControlError> {
-    let rows = sqlx::query!(
-        r#"
-        SELECT reload_id, lease_holder
-        FROM walrus.table_reload
-        WHERE epoch = $1 AND status = 'exporting'
-          AND lease_expiry IS NOT NULL AND lease_expiry < now()
-        ORDER BY reload_id
-        "#,
-        epoch,
-    )
-    .fetch_all(ex)
-    .await
-    .map_err(ControlError::from_sqlx)?;
+    let rows = sqlx::query_file!("sql/postgres/queries/stuck_exporting.sql", epoch,)
+        .fetch_all(ex)
+        .await
+        .map_err(ControlError::from_sqlx)?;
     Ok(rows
         .into_iter()
         .map(|r| (r.reload_id, r.lease_holder))
@@ -628,23 +508,10 @@ pub async fn active_rebuilds(
     ex: impl PgExecutor<'_>,
     epoch: i64,
 ) -> Result<Vec<ReloadRow>, ControlError> {
-    sqlx::query_as!(
-        ReloadRow,
-        r#"
-        SELECT reload_id, epoch, source_schema, source_table,
-               flavor AS "flavor: ReloadFlavor", status AS "status: ReloadStatus",
-               chunk_no, cursor_pk,
-               first_lsn AS "first_lsn: Lsn", final_lsn AS "final_lsn: Lsn",
-               schema_version, restart_count, lease_holder, error
-        FROM walrus.table_reload
-        WHERE epoch = $1 AND flavor = 'reload' AND status IN ('requested', 'exporting')
-        ORDER BY reload_id
-        "#,
-        epoch,
-    )
-    .fetch_all(ex)
-    .await
-    .map_err(ControlError::from_sqlx)
+    sqlx::query_file_as!(ReloadRow, "sql/postgres/queries/active_rebuilds.sql", epoch,)
+        .fetch_all(ex)
+        .await
+        .map_err(ControlError::from_sqlx)
 }
 
 /// Read one reload attempt, if it exists.
@@ -652,22 +519,10 @@ pub async fn get(
     ex: impl PgExecutor<'_>,
     reload_id: i64,
 ) -> Result<Option<ReloadRow>, ControlError> {
-    sqlx::query_as!(
-        ReloadRow,
-        r#"
-        SELECT reload_id, epoch, source_schema, source_table,
-               flavor AS "flavor: ReloadFlavor", status AS "status: ReloadStatus",
-               chunk_no, cursor_pk,
-               first_lsn AS "first_lsn: Lsn", final_lsn AS "final_lsn: Lsn",
-               schema_version, restart_count, lease_holder, error
-        FROM walrus.table_reload
-        WHERE reload_id = $1
-        "#,
-        reload_id,
-    )
-    .fetch_optional(ex)
-    .await
-    .map_err(ControlError::from_sqlx)
+    sqlx::query_file_as!(ReloadRow, "sql/postgres/queries/get.sql", reload_id,)
+        .fetch_optional(ex)
+        .await
+        .map_err(ControlError::from_sqlx)
 }
 
 #[cfg(test)]

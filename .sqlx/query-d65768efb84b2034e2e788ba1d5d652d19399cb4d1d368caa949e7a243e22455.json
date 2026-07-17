@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT MAX(lsn_end) AS \"max_lsn_end: Lsn\"\nFROM walrus.file_manifest\nWHERE epoch = $1 AND source_schema = $2 AND source_table = $3 AND status = 'ready'\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "max_lsn_end: Lsn",
+        "type_info": {
+          "Custom": {
+            "name": "pg_lsn",
+            "kind": "Simple"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "d65768efb84b2034e2e788ba1d5d652d19399cb4d1d368caa949e7a243e22455"
+}

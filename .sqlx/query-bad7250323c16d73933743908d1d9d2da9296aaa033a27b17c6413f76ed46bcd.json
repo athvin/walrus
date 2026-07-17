@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE walrus.table_reload\nSET status = 'requested', lease_holder = NULL, lease_expiry = NULL, updated_at = now()\nWHERE reload_id = $1 AND lease_holder = $2 AND status = 'exporting'\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "bad7250323c16d73933743908d1d9d2da9296aaa033a27b17c6413f76ed46bcd"
+}
