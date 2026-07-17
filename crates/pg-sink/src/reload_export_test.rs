@@ -132,7 +132,11 @@ fn short_chunk_means_drained() {
         (0, 1000, true),
     ] {
         let outcome = if rows < cap {
-            ChunkOutcome::Drained { rows }
+            // `final_lsn` is irrelevant to the drain-arithmetic assertion below.
+            ChunkOutcome::Drained {
+                rows,
+                final_lsn: common::Lsn::ZERO,
+            }
         } else {
             ChunkOutcome::Exported { rows }
         };

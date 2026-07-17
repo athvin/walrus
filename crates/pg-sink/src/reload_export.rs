@@ -36,8 +36,10 @@ pub enum ChunkOutcome {
     /// A full chunk exported; more rows may remain.
     Exported { rows: u64 },
     /// The table is drained: this chunk came back short (possibly empty). A short-but-non-empty
-    /// chunk still produced a file; an empty one produced nothing.
-    Drained { rows: u64 },
+    /// chunk still produced a file; an empty one produced nothing. `final_lsn` is this drain
+    /// probe's watermark `H`, always available since every probe echoes (and thus sets the
+    /// watermark) before it can report drained.
+    Drained { rows: u64, final_lsn: Lsn },
 }
 
 /// How a whole [`ChunkExporter::run`] ended (PR 6.8).
@@ -95,9 +97,6 @@ pub struct ChunkExporter {
     cursor: Option<serde_json::Value>,
     /// Chunk 1's `L_1` once frozen (mirrors `table_reload.first_lsn`).
     first_lsn: Option<Lsn>,
-    /// The most recent chunk probe's watermark — `H` on drain (PR 6.9). Set every
-    /// `export_next_chunk` right after the echo, so even an empty drain probe carries a valid `H`.
-    last_lsn: Option<Lsn>,
 }
 
 impl ChunkExporter {
@@ -193,7 +192,6 @@ impl ChunkExporter {
             chunk_no: req.chunk_no,
             cursor: req.cursor_pk.clone(),
             first_lsn: req.first_lsn,
-            last_lsn: None,
         })
     }
 
@@ -232,11 +230,9 @@ impl ChunkExporter {
                         "reload chunk exported"
                     );
                 }
-                ChunkOutcome::Drained { rows } => {
-                    // H = the last probe's watermark (always set: every probe echoes first).
-                    let final_lsn = self
-                        .last_lsn
-                        .expect("a chunk probe set the watermark before draining");
+                ChunkOutcome::Drained { rows, final_lsn } => {
+                    // H = the last probe's watermark, carried by the drain outcome itself (every
+                    // probe echoes and sets the watermark before it can report drained).
                     tracing::info!(
                         reload_id = self.reload_id,
                         chunk_no = self.chunk_no,
@@ -339,10 +335,10 @@ impl ChunkExporter {
     pub async fn export_next_chunk(&mut self) -> anyhow::Result<ChunkOutcome> {
         let chunk_no = self.chunk_no + 1;
         let echo = self.await_echo(chunk_no).await?;
+        // The probe's watermark — carried into every `ChunkOutcome`'s `final_lsn` below so even an
+        // empty drain (no file, no cursor advance) reports a valid `H` (>= first_lsn and every
+        // chunk `L_i`, LSNs being monotonic). PR 6.9.
         let watermark = echo.commit_lsn;
-        // Record the probe's watermark now — even an empty drain (no file, no cursor advance) then
-        // carries a valid `H` (>= first_lsn and every chunk `L_i`, LSNs being monotonic). PR 6.9.
-        self.last_lsn = Some(watermark);
 
         // The chunk read: one short autocommit statement, strictly after the echo was observed.
         let rows = self
@@ -353,7 +349,10 @@ impl ChunkExporter {
         if rows.is_empty() {
             // Nothing at all past the cursor — drained with no file (the signal row for this
             // empty probe is harmless; its echo resolved above).
-            return Ok(ChunkOutcome::Drained { rows: 0 });
+            return Ok(ChunkOutcome::Drained {
+                rows: 0,
+                final_lsn: watermark,
+            });
         }
 
         // Stamp + write: every row `commit_lsn = lsn = L_i` (see the module doc for the proof).
@@ -386,7 +385,8 @@ impl ChunkExporter {
         // The cursor comes from the LAST ROW of the chunk just written — never a separate MAX()
         // query (racy). Values stay in their text output form (precision-safe for bigint PKs).
         let last = &rows[rows.len() - 1];
-        let cursor = cursor_from_row(&self.rel, &self.pk_cols, last);
+        let cursor = cursor_from_row(&self.rel, &self.pk_cols, last)
+            .context("build reload cursor from last chunk row")?;
 
         // ONE control-pg transaction: manifest row + cursor advance (see the module doc).
         let mut tx = self.pool.begin().await.context("begin chunk commit txn")?;
@@ -420,7 +420,10 @@ impl ChunkExporter {
         // One chunk file exported (PR 6.11): bump the per-table chunk + row counters.
         common::metrics::record_reload_chunk(&format!("{}.{}", self.rel.schema, self.rel.name), n);
         if n < self.cfg.chunk_rows {
-            Ok(ChunkOutcome::Drained { rows: n })
+            Ok(ChunkOutcome::Drained {
+                rows: n,
+                final_lsn: watermark,
+            })
         } else {
             Ok(ChunkOutcome::Exported { rows: n })
         }
@@ -537,7 +540,7 @@ fn cursor_from_row(
     rel: &PgRelation,
     pk_cols: &[String],
     row: &tokio_postgres::Row,
-) -> serde_json::Value {
+) -> anyhow::Result<serde_json::Value> {
     let values: Vec<serde_json::Value> = pk_cols
         .iter()
         .map(|key| {
@@ -545,14 +548,20 @@ fn cursor_from_row(
                 .columns
                 .iter()
                 .position(|c| &c.name == key)
-                .expect("key column is in the relation");
-            match row.get::<_, Option<String>>(idx) {
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "PK column {key:?} not found in relation {}.{}",
+                        rel.schema,
+                        rel.name
+                    )
+                })?;
+            Ok(match row.get::<_, Option<String>>(idx) {
                 Some(s) => serde_json::Value::String(s),
                 None => serde_json::Value::Null, // PK columns are NOT NULL; defensive only
-            }
+            })
         })
-        .collect();
-    serde_json::Value::Array(values)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(serde_json::Value::Array(values))
 }
 
 fn row_to_tuple(row: &tokio_postgres::Row, rel: &PgRelation) -> Vec<TupleValue> {

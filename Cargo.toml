@@ -30,6 +30,10 @@ tokio = "1"
 sqlx = "0.8"
 anyhow = "1"
 hex = "0.4"
+# Non-poisoning mutex (PR 7.6): `.lock()` returns the guard directly, so there is no `unwrap`/`expect`
+# on the lock — the clean fit for the `clippy::unwrap_used`/`expect_used` deny (PR 7.7). Already in the
+# lock file (transitive), MIT/Apache: a zero-cost direct-dep promotion.
+parking_lot = "0.12"
 # Pinned to EXACT versions (PR 2.16): DuckDB reads a native `UUID` only when arrow-rs annotates the
 # FixedSizeBinary(16) with the `arrow.uuid` canonical extension → Parquet UUID logical type. That
 # annotation is behaviour a minor bump could change, so the (CI-guarded) uuid mapping pins arrow +

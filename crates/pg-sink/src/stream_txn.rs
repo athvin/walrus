@@ -222,7 +222,11 @@ impl StreamDemux {
                 self.sink_instance.clone(),
             );
             let (begin, rows) = {
-                let txn = self.open.get_mut(&top).expect("top exists");
+                let Some(txn) = self.open.get_mut(&top) else {
+                    // `top` was just derived from `self.open`'s own keys, so this is unreachable;
+                    // skip this speculative-spill iteration rather than panic.
+                    continue;
+                };
                 let mut take = Vec::new();
                 txn.changes.retain(|c| {
                     if c.oid == oid && c.sub_xid == sub_xid {
@@ -287,11 +291,12 @@ impl StreamDemux {
                 uri = %written.s3_uri,
                 "spilled open-txn buffer speculatively (no manifest, slot held)"
             );
-            self.open
-                .get_mut(&top)
-                .expect("top exists")
-                .staged
-                .push(StagedSpill { sub_xid, written });
+            let Some(txn) = self.open.get_mut(&top) else {
+                // `top` came from `self.open`'s own keys and the txn is not removed within this
+                // loop body, so this is unreachable; skip recording the staged spill rather than panic.
+                continue;
+            };
+            txn.staged.push(StagedSpill { sub_xid, written });
         }
         Ok(())
     }

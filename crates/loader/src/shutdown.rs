@@ -34,10 +34,24 @@ pub fn install_signal_handlers() -> CancellationToken {
     let token = CancellationToken::new();
     let child = token.clone();
     tokio::spawn(async move {
-        // `.expect` on registration: if the process can't install signal handlers something is deeply
-        // wrong; failing loudly at startup is correct (there is no graceful drain without them).
-        let mut term = signal(SignalKind::terminate()).expect("register SIGTERM handler");
-        let mut int = signal(SignalKind::interrupt()).expect("register SIGINT handler");
+        // If registration fails the process can't drain; log, cancel the token so the drain path fires
+        // (there is no graceful drain without the handlers), and stop the task rather than leak it.
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("failed to install SIGTERM handler: {e}");
+                child.cancel();
+                return;
+            }
+        };
+        let mut int = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("failed to install SIGINT handler: {e}");
+                child.cancel();
+                return;
+            }
+        };
         tokio::select! {
             _ = term.recv() => tracing::info!("SIGTERM received — draining"),
             _ = int.recv() => tracing::info!("SIGINT received — draining"),

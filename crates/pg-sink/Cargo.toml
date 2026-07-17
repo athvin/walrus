@@ -27,6 +27,8 @@ sqlx = { workspace = true, features = [
 ] }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+# Non-poisoning mutex for the reload-signal waiters (PR 7.6).
+parking_lot = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 # Relation cache (PR 2.22): decoded PgRelation → Arrow schema + TypeDescriptors.
