@@ -333,7 +333,7 @@ the `"first_lsn: Lsn"` false alarm (it was always a sqlx type-cast, never a colu
 |---|---|---|---|
 | ✅ | [7.1](./phase-7-conventions-hardening/pr-7.1-tests-sibling-common-control-loader.md) | inline `mod tests` → sibling `src/*_test.rs` (common, control, loader) | Conventions (Tests) |
 | ✅ | [7.2](./phase-7-conventions-hardening/pr-7.2-tests-sibling-pg-to-arrow.md) | same for `pg-to-arrow` (9 files; `batch`/`schema` largest) | Conventions (Tests) |
-| ☐ | [7.3](./phase-7-conventions-hardening/pr-7.3-tests-sibling-pg-sink.md) | same for `pg-sink` (21 files, incl. nested `pgoutput/typmod`) | Conventions (Tests) |
+| ✅ | [7.3](./phase-7-conventions-hardening/pr-7.3-tests-sibling-pg-sink.md) | same for `pg-sink` (21 files, incl. nested `pgoutput/typmod`) | Conventions (Tests) |
 | ☐ | [7.4](./phase-7-conventions-hardening/pr-7.4-control-sql-query-file.md) | control SQL → `sql/postgres/` via `sqlx::query_file!` | Conventions (SQL) |
 | ☐ | [7.5](./phase-7-conventions-hardening/pr-7.5-loader-duckdb-templates.md) | loader DuckDB DDL → `sql/duckdb/` `include_str!` templates | Conventions (SQL) |
 | ☐ | [7.6](./phase-7-conventions-hardening/pr-7.6-fix-unwrap-expect.md) | remove production `unwrap`/`expect` (parking_lot, typed errors) | Conventions (Lints) |
