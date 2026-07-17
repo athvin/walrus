@@ -16,10 +16,11 @@ The **design is already finished** and lives one directory up:
   reproducible Docker harness and a Python decoder + golden vectors under
   [`../examples/proto-version/`](../examples/proto-version/).
 
-This curriculum turns that design into **97 PRs across 8 phases** (phases 0–4 build v1; phase 5
+This curriculum turns that design into **102 PRs across 9 phases** (phases 0–4 build v1; phase 5
 hardens it — benchmarking, hot-path cleanup, and a much faster CI; phase 6 opens post-v1 feature
 work — single-table reload through the one slot; phase 7 is a conventions-hardening hygiene pass —
-sibling test files, SQL-in-folders, no-unwrap lints, identifier audit). Each PR is a self-contained
+sibling test files, SQL-in-folders, no-unwrap lints, identifier audit; phase 8 is a cleanup audit —
+DRY and type-modeling refinements over the finished tree, no new behaviour). Each PR is a self-contained
 task file with an explicit *Definition of Done*. You write the code; the task tells you what "done and
 green" means.
 
@@ -149,7 +150,7 @@ Two deliberate structural notes:
 
 ## The roadmap
 
-97 PRs. Tick each box as you merge. Every DoD is traceable to a design section (right column).
+102 PRs. Tick each box as you merge. Every DoD is traceable to a design section (right column).
 
 ### Phase 0 — Foundations & CI  ·  [`phase-0-foundations/`](./phase-0-foundations/)
 
@@ -341,6 +342,29 @@ the `"first_lsn: Lsn"` false alarm (it was always a sqlx type-cast, never a colu
 | ✅ | [7.6](./phase-7-conventions-hardening/pr-7.6-fix-unwrap-expect.md) | remove production `unwrap`/`expect` (parking_lot, typed errors) | Conventions (Lints) |
 | ✅ | [7.7](./phase-7-conventions-hardening/pr-7.7-deny-unwrap-expect-lint.md) | deny `unwrap_used`/`expect_used` + `clippy.toml` (allow in tests) | Conventions (Lints) |
 | ✅ | [7.8](./phase-7-conventions-hardening/pr-7.8-identifier-convention-audit.md) | identifier convention + naming audit (docs) | Conventions (Identifiers) |
+
+> **🧽 Cleanup audit.** Phase 8 is a critical-but-honest pass over the finished v1 + reload
+> codebase: no new behaviour, only DRY and type-modeling refinements. The tree is already
+> strong (centralized lints, a real error taxonomy, no production `unwrap`, ~51% test ratio),
+> so these rank *cleanup value*, not defect severity — see the phase
+> [README](./phase-8-cleanup/README.md) for the honest headline and the *rejected findings*
+> (e.g. the `as_common` "drift" that the exhaustive match already prevents).
+
+### Phase 8 — Codebase cleanup  ·  [`phase-8-cleanup/`](./phase-8-cleanup/)
+
+A cleanup audit, not feature work: each PR is a behaviour-preserving refactor that stays
+green. Findings are tiered — SQL-escaping and stringly-typed manifest columns (Tier 1),
+duplicated OID literals (Tier 2), the opt-in domain-ID newtype sweep (Tier 3), and true nits
+(Tier 4). The PRs are independent; suggested order is 8.1 → 8.2 → 8.3 → 8.5, then the opt-in
+8.4. See the phase README for the full findings table.
+
+| ✅ | PR | Delivers | Design |
+|---|---|---|---|
+| 📋 | [8.1](./phase-8-cleanup/pr-8.1-sql-literal-helper.md) | one audited `common::sql::sql_literal` (6 hand-rolled escapes) | Conventions (SQL) |
+| 📋 | [8.2](./phase-8-cleanup/pr-8.2-manifest-kind-status-enums.md) | type manifest `kind`/`status`; retire the stringly-typed columns (spill drift) | Conventions (Errors) |
+| 📋 | [8.3](./phase-8-cleanup/pr-8.3-centralize-pg-oids.md) | one home for pg OID constants in `common::oids` (4 duplicate literal sites) | Crate DAG |
+| 📋 | [8.4](./phase-8-cleanup/pr-8.4-domain-id-newtypes.md) | `EpochNo`/`SchemaVersion`/`ReloadId`/`ManifestId` newtypes (opt-in) | PR 0.3 `Lsn` precedent |
+| 📋 | [8.5](./phase-8-cleanup/pr-8.5-nits-cluster.md) | nits: `pause_began` visibility, explicit plan tier, `Clock` documented-keep | Conventions / tiers |
 
 ---
 
