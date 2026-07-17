@@ -136,6 +136,12 @@ static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 /// helpers below do nothing.
 pub fn init() {
     HANDLE.get_or_init(|| {
+        // Install-once at process init: `install_recorder` only errors if a *different* global
+        // recorder is already set (a programming error, not a runtime condition), and `get_or_init`
+        // guarantees this closure runs at most once — so the panic is unreachable in practice. `init`
+        // is infallible by signature and called from `main`/scrape-test setup; threading a `Result`
+        // out (stable `OnceLock` has no `get_or_try_init`) would ripple with no recoverable path.
+        #[allow(clippy::expect_used)]
         let handle = PrometheusBuilder::new()
             .install_recorder()
             .expect("install a global Prometheus recorder exactly once");

@@ -20,9 +20,9 @@ fn standby_status_frame_layout() {
     let len = u32::from_be_bytes([msg[1], msg[2], msg[3], msg[4]]) as usize;
     assert_eq!(len, msg.len() - 1); // length is self-inclusive, excludes the tag
     assert_eq!(msg[5], b'r'); // standby status update
-    assert_eq!(read_lsn(&msg[6..14]).as_u64(), 0x100); // write
-    assert_eq!(read_lsn(&msg[14..22]).as_u64(), 0x80); // flush
-    assert_eq!(read_lsn(&msg[22..30]).as_u64(), 0x40); // apply
+    assert_eq!(read_lsn(&msg[6..14]).unwrap().as_u64(), 0x100); // write
+    assert_eq!(read_lsn(&msg[14..22]).unwrap().as_u64(), 0x80); // flush
+    assert_eq!(read_lsn(&msg[22..30]).unwrap().as_u64(), 0x40); // apply
     assert_eq!(*msg.last().unwrap(), 1); // reply_requested
 }
 

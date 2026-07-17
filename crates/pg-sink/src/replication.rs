@@ -143,7 +143,7 @@ impl ReplicationStream {
                 // RowDescription 'T' — the column order is fixed and documented; DataRow 'D' carries
                 // the values; CommandComplete 'C'; ReadyForQuery 'Z' ends the simple query.
                 b'T' | b'C' | b'N' | b'S' => {}
-                b'D' => data_row = Some(parse_data_row(&body)),
+                b'D' => data_row = Some(parse_data_row(&body)?),
                 b'Z' => break,
                 b'E' => bail!("CREATE_REPLICATION_SLOT failed: {}", error_message(&body)),
                 other => bail!(
@@ -268,9 +268,9 @@ impl ReplicationStream {
                 if body.len() < 25 {
                     bail!("short XLogData frame ({} bytes)", body.len());
                 }
-                let wal_start = read_lsn(&body[1..9]);
-                let wal_end = read_lsn(&body[9..17]);
-                let server_clock = read_i64(&body[17..25]);
+                let wal_start = read_lsn(&body[1..9])?;
+                let wal_end = read_lsn(&body[9..17])?;
+                let server_clock = read_i64(&body[17..25])?;
                 let data = body.slice(25..);
                 self.last_received = self.last_received.max(wal_end.max(wal_start));
                 Ok(Some(ReplicationMessage::XLogData {
@@ -285,8 +285,8 @@ impl ReplicationStream {
                 if body.len() < 18 {
                     bail!("short keepalive frame ({} bytes)", body.len());
                 }
-                let wal_end = read_lsn(&body[1..9]);
-                let server_clock = read_i64(&body[9..17]);
+                let wal_end = read_lsn(&body[1..9])?;
+                let server_clock = read_i64(&body[9..17])?;
                 let reply_requested = body[17] != 0;
                 self.last_received = self.last_received.max(wal_end);
                 // A demanded reply is answered *immediately*, not on the next interval.
@@ -346,7 +346,7 @@ impl ReplicationStream {
             let (tag, body) = self.read_message().await?;
             match tag {
                 b'R' => {
-                    let sub = read_i32(&body[0..4]);
+                    let sub = read_i32(&body[0..4])?;
                     if sub != 0 {
                         bail!(
                             "source demands auth type {sub}; the dev harness must use trust auth \
@@ -446,10 +446,10 @@ fn build_standby_status(s: StandbyStatus) -> Vec<u8> {
 
 /// Parse a `DataRow` ('D') body: `Int16` column count, then per column an `Int32` length (`-1` =
 /// NULL) and that many bytes (UTF-8 text values, since walrus never enables binary output).
-fn parse_data_row(body: &[u8]) -> Vec<Option<String>> {
+fn parse_data_row(body: &[u8]) -> anyhow::Result<Vec<Option<String>>> {
     let mut out = Vec::new();
     if body.len() < 2 {
-        return out;
+        return Ok(out);
     }
     let ncols = u16::from_be_bytes([body[0], body[1]]) as usize;
     let mut i = 2;
@@ -457,7 +457,7 @@ fn parse_data_row(body: &[u8]) -> Vec<Option<String>> {
         if i + 4 > body.len() {
             break;
         }
-        let len = read_i32(&body[i..i + 4]);
+        let len = read_i32(&body[i..i + 4])?;
         i += 4;
         if len < 0 {
             out.push(None);
@@ -472,7 +472,7 @@ fn parse_data_row(body: &[u8]) -> Vec<Option<String>> {
         ));
         i += len;
     }
-    out
+    Ok(out)
 }
 
 /// Take one framed backend message (`tag` + 4-byte self-inclusive length + body) from `buf`, or
@@ -497,14 +497,23 @@ fn lsn_xy(lsn: Lsn) -> String {
     format!("{:X}/{:X}", v >> 32, v & 0xFFFF_FFFF)
 }
 
-fn read_lsn(b: &[u8]) -> Lsn {
-    Lsn::new(u64::from_be_bytes(b.try_into().expect("8 bytes")))
+fn read_lsn(b: &[u8]) -> anyhow::Result<Lsn> {
+    let arr = b
+        .try_into()
+        .map_err(|_| anyhow!("read_lsn: expected 8 bytes, got {}", b.len()))?;
+    Ok(Lsn::new(u64::from_be_bytes(arr)))
 }
-fn read_i64(b: &[u8]) -> i64 {
-    i64::from_be_bytes(b.try_into().expect("8 bytes"))
+fn read_i64(b: &[u8]) -> anyhow::Result<i64> {
+    let arr = b
+        .try_into()
+        .map_err(|_| anyhow!("read_i64: expected 8 bytes, got {}", b.len()))?;
+    Ok(i64::from_be_bytes(arr))
 }
-fn read_i32(b: &[u8]) -> i32 {
-    i32::from_be_bytes(b.try_into().expect("4 bytes"))
+fn read_i32(b: &[u8]) -> anyhow::Result<i32> {
+    let arr = b
+        .try_into()
+        .map_err(|_| anyhow!("read_i32: expected 4 bytes, got {}", b.len()))?;
+    Ok(i32::from_be_bytes(arr))
 }
 
 /// The `'M'` (human message) field of an ErrorResponse/NoticeResponse body.

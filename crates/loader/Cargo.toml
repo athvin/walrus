@@ -32,6 +32,8 @@ tokio-util = { workspace = true }
 axum = { workspace = true }
 object_store = { workspace = true, features = ["aws"] }
 tracing = { workspace = true }
+# Non-poisoning mutex for the health / Phase-A shared state (PR 7.6).
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 # Raw-HTTP scrape test (metrics_scrape.rs) reads the /metrics body via AsyncReadExt/AsyncWriteExt.

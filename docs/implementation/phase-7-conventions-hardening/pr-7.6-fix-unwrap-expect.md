@@ -6,7 +6,7 @@
 
 # PR 7.6 — Remove production `unwrap` / `expect`
 
-> **Status:** 📋 Planned <!-- flip to "✅ Done — <PR url>" when it merges -->
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/112
 
 > **Phase:** 7 — conventions hardening · **Crates touched:** `common`, `loader`, `pg-sink`,
 > `pg-to-arrow` · **Est. size:** M · **Depends on:** PR 7.1–7.5 (rebase onto the cleaned tree) ·
@@ -106,20 +106,24 @@ let Some(txn) = self.open.get_mut(&top) else { continue };   // was .expect("top
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] No production `.unwrap()`/`.expect(...)` remains in `common`, `loader`, `pg-sink`, `pg-to-arrow`
-      (verified by grep over non-test regions); test-side `unwrap`/`expect` is untouched.
-- [ ] The `parking_lot::Mutex` swap is behaviour-preserving (guards held over the same critical
+- [x] No production `.unwrap()`/`.expect(...)` remains in `common`, `loader`, `pg-sink`, `pg-to-arrow`
+      (verified by grep over non-test regions), **except** the global Prometheus recorder install in
+      `common/metrics.rs` — it lives inside a `OnceLock::get_or_init` closure (which must return the
+      handle, not a `Result`; stable `OnceLock` has no `get_or_try_init`) and can only fail if a
+      second global recorder was already installed (a programming error), so it keeps a narrowly-scoped
+      documented `#[allow(clippy::expect_used)]`. Test-side `unwrap`/`expect` is untouched.
+- [x] The `parking_lot::Mutex` swap is behaviour-preserving (guards held over the same critical
       sections; `Debug`/`Default` derives still hold); `cargo deny check` stays green (parking_lot is
       already in `Cargo.lock`, MIT/Apache).
-- [ ] The decode-error propagation compiles through all callers; existing decoder/replication tests
+- [x] The decode-error propagation compiles through all callers; existing decoder/replication tests
       still pass.
-- [ ] The invariant restructures are provably equivalent (single borrow, threaded value) — a comment
-      records why the removed `expect` could never fire.
-- [ ] No lint config changed in this PR (that's 7.7).
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test --workspace`
+- [x] The invariant restructures are provably equivalent (single borrow, threaded `final_lsn`) — a
+      comment records why the removed `expect` could never fire.
+- [x] No lint config changed in this PR (that's 7.7).
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test --workspace`
 
 ## What completed looks like
 

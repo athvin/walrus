@@ -286,14 +286,14 @@ async fn pause_withholds_claims_and_lifts_on_failed() {
         .unwrap();
     assert_eq!(cp.raw_appended_lsn, Lsn::ZERO, "frontier frozen at W");
     assert_eq!(
-        *ctx.pause_logged.lock().unwrap(),
+        *ctx.pause_logged.lock(),
         Some(reload_id),
         "the pause is latched (logged once)"
     );
 
     // A second poll changes nothing — same latch value means no re-log.
     assert_eq!(run_phase_a(&ctx).await.unwrap(), None);
-    assert_eq!(*ctx.pause_logged.lock().unwrap(), Some(reload_id));
+    assert_eq!(*ctx.pause_logged.lock(), Some(reload_id));
 
     // `failed` lifts the pause: the backlog drains and the latch clears.
     control::reload::claim_requested(&ctx.pool, epoch, "sink-t", 60, 10)
@@ -312,7 +312,7 @@ async fn pause_withholds_claims_and_lifts_on_failed() {
         "the paused backlog drained after the lift"
     );
     assert_eq!(
-        *ctx.pause_logged.lock().unwrap(),
+        *ctx.pause_logged.lock(),
         None,
         "the latch clears when claiming resumes"
     );
