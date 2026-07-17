@@ -6,7 +6,7 @@
 
 # PR 8.1 — One audited `sql_literal()` helper for single-quote escaping
 
-> **Status:** 📋 Planned <!-- flip to "✅ Done — <PR url>" when it merges -->
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/117
 
 > **Phase:** 8 — cleanup · **Crates touched:** `common`, `loader`, `pg-sink` ·
 > **Est. size:** S · **Depends on:** PR 7.8 (phase 7 complete) · **Unlocks:** —
@@ -116,14 +116,14 @@ fn empty_string_is_empty() { todo!() }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `common::sql::sql_literal` exists, is documented, and has a passing doc-test.
-- [ ] All six production call sites use it; `rg -n "replace\('\\\\''" crates -g '!*_test.rs'`
-      returns **no** production hits (only the optional conformance test may remain).
-- [ ] The `esc` closure in `duck.rs` is gone; behaviour at every swapped site is unchanged.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p common` (and `--workspace` stays green)
+- [x] `common::sql::sql_literal` exists, is documented, and has a passing doc-test.
+- [x] All six production call sites use it; `rg -n "replace\('\\\\''" crates -g '!*_test.rs'`
+      returns **no** production hits (only the helper definition + the optional conformance test remain).
+- [x] The `esc` closure in `duck.rs` is gone; behaviour at every swapped site is unchanged.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p common` (and `--workspace` stays green)
 
 ## What completed looks like
 
