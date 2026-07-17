@@ -6,7 +6,7 @@
 
 # PR 7.4 — Control SQL into `sql/postgres/` via `query_file!`
 
-> **Status:** 📋 Planned <!-- flip to "✅ Done — <PR url>" when it merges -->
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/110
 
 > **Phase:** 7 — conventions hardening · **Crates touched:** `control`, docs ·
 > **Est. size:** M · **Depends on:** — · **Unlocks:** —
@@ -95,20 +95,20 @@ sqlx::query_file_as!(Checkpoint, "sql/postgres/queries/read_checkpoint.sql", epo
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] Every static control query lives in `sql/postgres/queries/<name>.sql` and its call site uses
+- [x] Every static control query lives in `sql/postgres/queries/<name>.sql` and its call site uses
       `query_file!`/`query_file_as!`; the only inline SQL left in `control/src` is the documented
-      runtime `read_all_latest_registry`.
-- [ ] The `AS "col: Type"` overrides moved into the `.sql` files verbatim; result structs decode
+      runtime `read_all_latest_registry` (and `table_ownership`'s runtime reads).
+- [x] The `AS "col: Type"` overrides moved into the `.sql` files verbatim; result structs decode
       unchanged.
-- [ ] `.sqlx/` regenerated and committed; `cargo sqlx prepare --check --workspace` is green (and the
+- [x] `.sqlx/` regenerated and committed; `cargo sqlx prepare --check --workspace` is green (and the
       offline `gates`/clippy job, which has no DB, still compiles against the committed cache).
-- [ ] `control`'s integration tests (which call the public fns, not the SQL) pass unchanged.
-- [ ] README Conventions gains the **SQL location** row (Postgres half).
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p control` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` → migrate control-pg → `cargo sqlx prepare --check --workspace`
+- [x] `control`'s integration tests (which call the public fns, not the SQL) pass unchanged.
+- [x] README Conventions gains the **SQL location** row (Postgres half).
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p control` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` → migrate control-pg → `cargo sqlx prepare --check --workspace`
 
 ## What completed looks like
 
