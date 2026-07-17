@@ -6,7 +6,7 @@
 
 # PR 7.8 — Identifier convention + naming audit (phase close)
 
-> **Status:** 📋 Planned <!-- flip to "✅ Done — <PR url>" when it merges -->
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/114
 
 > **Phase:** 7 — conventions hardening · **Crates touched:** docs (read-only audit over `crates/**`) ·
 > **Est. size:** S · **Depends on:** PR 7.7 · **Unlocks:** — (phase close)
@@ -78,24 +78,25 @@ a rename. |
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] The Conventions **Identifiers** row is added and reads cleanly in the table.
-- [ ] The audit is recorded and reproducible: the `AS "x: Type"` cast bucket resolves to sqlx casts
-      only (all in `crates/control/src`); the `{name}_…` bucket resolves to source-mirror expansion
-      fields only; the disproving grep for quoted identifiers with a space/colon/uppercase that are
-      *neither* returns **no** persisted walrus-authored column.
-- [ ] The `first_lsn: Lsn` false alarm is documented (one line: it's a cast alias, not a column).
-- [ ] Phase close: all Phase 7 roadmap boxes are ✅; the intro counts read `97 PRs across 8 phases`
+- [x] The Conventions **Identifiers** row is added and reads cleanly in the table.
+- [x] The audit is recorded and reproducible: the `AS "x: Type"` cast bucket resolves to sqlx casts
+      only (17, all in `crates/control/sql/postgres/queries/*.sql` — PR 7.4 moved them there); the
+      `{name}_…` bucket resolves to source-mirror expansion fields only; the disproving grep for quoted
+      identifiers with a space/colon/uppercase that are *neither* returns **no** persisted
+      walrus-authored column.
+- [x] The `first_lsn: Lsn` false alarm is documented (one line: it's a cast alias, not a column).
+- [x] Phase close: all Phase 7 roadmap boxes are ✅; the intro counts read `97 PRs across 8 phases`
       and `97 PRs.`; every Phase 7 link resolves.
-- [ ] **Green locally and in CI:** (docs-only — the standard gates still run)
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test --workspace`
+- [x] **Green locally and in CI:** (docs-only — the standard gates still run)
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test --workspace`
 
 ## What completed looks like
 
 ```
-$ # 1. the sqlx type-cast bucket — all in control, none are column renames
-$ grep -rEn 'AS "[a-z_]+: ' crates/control/src | wc -l
+$ # 1. the sqlx type-cast bucket — now in the .sql files (PR 7.4), none are column renames
+$ grep -rEn 'AS "[a-z_]+: ' crates/control/sql/postgres/queries/*.sql | wc -l
 17
 $ # 2. the source-mirror bucket — expansion fields, lower_snake_case
 $ grep -rEn 'format!\("\{name\}_' crates/pg-to-arrow/src | head

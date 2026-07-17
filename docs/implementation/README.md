@@ -129,6 +129,7 @@ Two deliberate structural notes:
 | Async | `tokio` in the binaries and `control`; `pgoutput` decode and the loader transform stay **sync + pure**. |
 | Config | `serde`-typed, loaded from env/file, **bounds-validated** — invalid config is a terminal error. |
 | Time | every walrus-stamped datetime is **UTC, RFC-3339, `Z`** — never local, never source offset. |
+| Identifiers | walrus-authored columns are `lower_snake_case` (`_walrus_op`, `_walrus_commit_lsn`, `_walrus_lsn`, `_walrus_sink_processed_at`, `_applied_commit_lsn`, `_applied_lsn`, `walrus_pg_sink_meta`); source-derived DuckDB/Arrow columns are quoted **only** to mirror the source name faithfully (`{col}_months`, `{col}_lower`, …), never invented case-sensitive/spaced names of walrus's own; the sqlx `AS "col: Type"` in `control/sql/postgres/queries/*.sql` (e.g. `first_lsn AS "first_lsn: Lsn"`) is a compile-time type-cast, not a rename. |
 | Ordering | everything keys on **commit LSN** (`(commit_lsn, lsn)` tuples), never max-row-LSN. |
 | Lints | `#![deny(warnings)]` + `clippy = all/deny` via `[workspace.lints]`; `unwrap_used`/`expect_used` denied in production (a `clippy.toml` allows them in `#[cfg(test)]`/`#[test]` code; benches, integration test files, and the e2e harness lib carry a file-level allow); `clippy --all-targets -D warnings` in CI. |
 | Tests | unit tests in a sibling `foo_test.rs` (`src/foo.rs` → `src/foo_test.rs`, Go-style, via `#[cfg(test)] #[path = "foo_test.rs"] mod tests;`; private access preserved); golden-vector & conformance tests in `tests/`; e2e feature-gated. |
@@ -339,7 +340,7 @@ the `"first_lsn: Lsn"` false alarm (it was always a sqlx type-cast, never a colu
 | ✅ | [7.5](./phase-7-conventions-hardening/pr-7.5-loader-duckdb-templates.md) | loader DuckDB DDL → `sql/duckdb/` `include_str!` templates | Conventions (SQL) |
 | ✅ | [7.6](./phase-7-conventions-hardening/pr-7.6-fix-unwrap-expect.md) | remove production `unwrap`/`expect` (parking_lot, typed errors) | Conventions (Lints) |
 | ✅ | [7.7](./phase-7-conventions-hardening/pr-7.7-deny-unwrap-expect-lint.md) | deny `unwrap_used`/`expect_used` + `clippy.toml` (allow in tests) | Conventions (Lints) |
-| ☐ | [7.8](./phase-7-conventions-hardening/pr-7.8-identifier-convention-audit.md) | identifier convention + naming audit (docs) | Conventions (Identifiers) |
+| ✅ | [7.8](./phase-7-conventions-hardening/pr-7.8-identifier-convention-audit.md) | identifier convention + naming audit (docs) | Conventions (Identifiers) |
 
 ---
 
