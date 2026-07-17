@@ -11,6 +11,19 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+// DuckDB DDL templates (see `sql/duckdb/templates/`). Fixed structure with `{placeholder}` holes,
+// rendered by `.replace(...)`; per-table column lists stay interpolated in Rust (they can't be
+// static). `include_str!` paths are source-file-relative (contrast `sqlx::query_file!`).
+const CREATE_MIRROR: &str = include_str!("../sql/duckdb/templates/create_mirror.sql");
+const ALTER_ADD_APPLIED: &str = include_str!("../sql/duckdb/templates/alter_add_applied.sql");
+const CREATE_RAW: &str = include_str!("../sql/duckdb/templates/create_raw.sql");
+const CREATE_USER_VIEW: &str = include_str!("../sql/duckdb/templates/create_user_view.sql");
+const CREATE_META: &str = include_str!("../sql/duckdb/templates/create_meta.sql");
+const CONFIGURE_S3: &str = include_str!("../sql/duckdb/templates/configure_s3.sql");
+const APPEND_PARQUET: &str = include_str!("../sql/duckdb/templates/append_parquet.sql");
+const RELOAD_REBUILD_DROP: &str = include_str!("../sql/duckdb/templates/reload_rebuild_drop.sql");
+const WIPE_GENERATION: &str = include_str!("../sql/duckdb/templates/wipe_generation.sql");
+
 /// Owns one table's `.duckdb` connection (mirror `<table>` + CDC log `<table>_raw`).
 pub struct TableDb {
     conn: duckdb::Connection,
@@ -75,31 +88,23 @@ impl TableDb {
         // that makes a stale straddle winner a no-op. Seeded from the low sentinel `0/0`; a pre-3.7 mirror
         // gains them via `ALTER … IF NOT EXISTS`, which back-fills existing rows with that sentinel (a
         // too-low seed just means the first real event wins — which is correct).
-        let mut mirror = format!(
-            "CREATE TABLE IF NOT EXISTS \"{table}\" ({}, \
-             \"_applied_commit_lsn\" VARCHAR DEFAULT '0000000000000000', \
-             \"_applied_lsn\" VARCHAR DEFAULT '0000000000000000'",
-            cols.join(", ")
-        );
-        if !keys.is_empty() {
-            mirror.push_str(&format!(", PRIMARY KEY ({})", keys.join(", ")));
-        }
-        mirror.push(')');
+        let primary_key = if keys.is_empty() {
+            String::new()
+        } else {
+            format!(", PRIMARY KEY ({})", keys.join(", "))
+        };
+        let mirror = CREATE_MIRROR
+            .replace("{table}", table)
+            .replace("{cols}", &cols.join(", "))
+            .replace("{primary_key}", &primary_key);
         // Idempotent back-fill for a mirror created before PR 3.7 (compose resume).
-        let applied_cols = format!(
-            "ALTER TABLE \"{table}\" ADD COLUMN IF NOT EXISTS \"_applied_commit_lsn\" VARCHAR DEFAULT '0000000000000000'; \
-             ALTER TABLE \"{table}\" ADD COLUMN IF NOT EXISTS \"_applied_lsn\" VARCHAR DEFAULT '0000000000000000';"
-        );
+        let applied_cols = ALTER_ADD_APPLIED.replace("{table}", table);
         // The user-facing projection: the mirror WITHOUT the internal guard columns (DoD §7 "hidden from
         // user projections"). Users read `<table>_current`; `_applied_*` never leak. Recreated by the DDL
         // applier after any structural change (a `SELECT *` view binds its columns at creation time).
         let user_view = user_view_sql(table);
         // The per-table DDL-reconcile watermark (PR 3.8). Seeded once; the applier advances it.
-        let meta = format!(
-            "CREATE TABLE IF NOT EXISTS \"_walrus_meta\" (k VARCHAR PRIMARY KEY, v BIGINT); \
-             INSERT INTO \"_walrus_meta\" VALUES ('schema_version', {schema_version}) \
-             ON CONFLICT (k) DO NOTHING;"
-        );
+        let meta = CREATE_META.replace("{schema_version}", &schema_version.to_string());
 
         // The CDC log: every change verbatim (the emit columns), with the intact `walrus_pg_sink_meta`
         // JSON plus four columns PROMOTED out of it (op / commit_lsn / lsn / sink_processed_at) as sortable
@@ -109,18 +114,13 @@ impl TableDb {
         let mut raw_pk = keys.clone();
         raw_pk.push("\"_walrus_sink_processed_at\"".into());
         raw_pk.push("\"_walrus_lsn\"".into());
-        let raw = format!(
-            "CREATE TABLE IF NOT EXISTS \"{table}_raw\" ({}, \"walrus_pg_sink_meta\" VARCHAR, \
-             \"_walrus_op\" VARCHAR, \"_walrus_commit_lsn\" VARCHAR, \"_walrus_lsn\" VARCHAR, \
-             \"_walrus_sink_processed_at\" VARCHAR, PRIMARY KEY ({}))",
-            raw_cols.join(", "),
-            raw_pk.join(", ")
-        );
+        let raw = CREATE_RAW
+            .replace("{table}", table)
+            .replace("{raw_cols}", &raw_cols.join(", "))
+            .replace("{raw_pk}", &raw_pk.join(", "));
 
         self.conn
-            .execute_batch(&format!(
-                "{mirror}; {applied_cols} {raw}; {user_view} {meta}"
-            ))
+            .execute_batch(&format!("{mirror} {applied_cols} {raw} {user_view} {meta}"))
             .map_err(|e| LoaderError::Duck(format!("ensure tables for {table}: {e}")))?;
         Ok(())
     }
@@ -131,15 +131,12 @@ impl TableDb {
     pub fn configure_s3(&self, s3: &S3Access) -> Result<(), LoaderError> {
         let esc = |v: &str| v.replace('\'', "''");
         let use_ssl = if s3.use_ssl { "true" } else { "false" };
-        let sql = format!(
-            "INSTALL httpfs; LOAD httpfs; INSTALL json; LOAD json; \
-             SET s3_region='{}'; SET s3_endpoint='{}'; SET s3_url_style='path'; \
-             SET s3_use_ssl={use_ssl}; SET s3_access_key_id='{}'; SET s3_secret_access_key='{}';",
-            esc(&s3.region),
-            esc(&s3.endpoint),
-            esc(&s3.access_key_id),
-            esc(&s3.secret_access_key),
-        );
+        let sql = CONFIGURE_S3
+            .replace("{region}", &esc(&s3.region))
+            .replace("{endpoint}", &esc(&s3.endpoint))
+            .replace("{use_ssl}", use_ssl)
+            .replace("{access_key}", &esc(&s3.access_key_id))
+            .replace("{secret_key}", &esc(&s3.secret_access_key));
         self.conn
             .execute_batch(&sql)
             .map_err(|e| LoaderError::Duck(format!("configure S3: {e}")))
@@ -179,17 +176,11 @@ impl TableDb {
             Some(lsn) => format!("'{}'", lsn.replace('\'', "''")),
             None => "json_extract_string(walrus_pg_sink_meta, '$.commit_lsn')".to_string(),
         };
-        let sql = format!(
-            "INSERT INTO \"{table}_raw\" \
-                 ({quoted}, \"_walrus_op\", \"_walrus_commit_lsn\", \"_walrus_lsn\", \
-                  \"_walrus_sink_processed_at\") \
-             SELECT {quoted}, \
-                 json_extract_string(walrus_pg_sink_meta, '$.op'), \
-                 {commit_lsn_expr}, \
-                 json_extract_string(walrus_pg_sink_meta, '$.lsn'), \
-                 json_extract_string(walrus_pg_sink_meta, '$.sink_processed_at') \
-             FROM read_parquet('{uri}') ON CONFLICT DO NOTHING"
-        );
+        let sql = APPEND_PARQUET
+            .replace("{table}", table)
+            .replace("{quoted}", &quoted)
+            .replace("{commit_lsn_expr}", &commit_lsn_expr)
+            .replace("{uri}", &uri);
         let n = self
             .conn
             .execute(&sql, [])
@@ -349,11 +340,7 @@ impl TableDb {
     ) -> Result<(), LoaderError> {
         let table = &plan.table;
         self.conn
-            .execute_batch(&format!(
-                "DROP VIEW IF EXISTS \"{table}_current\"; \
-                 DROP TABLE IF EXISTS \"{table}\"; \
-                 DROP TABLE IF EXISTS \"{table}_raw\";"
-            ))
+            .execute_batch(&RELOAD_REBUILD_DROP.replace("{table}", table))
             .map_err(|e| LoaderError::Duck(format!("reload rebuild drop for {table}: {e}")))?;
         self.ensure_tables_planned(plan, schema_version)?;
         self.set_schema_version(schema_version)?;
@@ -366,12 +353,7 @@ impl TableDb {
     /// from scratch (both watermarks reset — the new epoch's `loader_checkpoint` is a fresh `0/0`).
     pub fn wipe_generation(&self, table: &str) -> Result<(), LoaderError> {
         self.conn
-            .execute_batch(&format!(
-                "DROP VIEW IF EXISTS \"{table}_current\"; \
-                 DROP TABLE IF EXISTS \"{table}\"; \
-                 DROP TABLE IF EXISTS \"{table}_raw\"; \
-                 DROP TABLE IF EXISTS \"_walrus_meta\";"
-            ))
+            .execute_batch(&WIPE_GENERATION.replace("{table}", table))
             .map_err(|e| LoaderError::Duck(format!("wipe generation for {table}: {e}")))?;
         Ok(())
     }
@@ -381,10 +363,7 @@ impl TableDb {
 /// (§7). A `SELECT *` view binds its column list at creation, so the DDL applier ([`crate::ddl`])
 /// re-runs this after any structural change to pick up added/renamed columns.
 pub(crate) fn user_view_sql(table: &str) -> String {
-    format!(
-        "CREATE OR REPLACE VIEW \"{table}_current\" AS \
-         SELECT * EXCLUDE (\"_applied_commit_lsn\", \"_applied_lsn\") FROM \"{table}\";"
-    )
+    CREATE_USER_VIEW.replace("{table}", table)
 }
 
 /// DuckDB S3/httpfs credentials for reading the staging bucket.

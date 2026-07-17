@@ -1,0 +1,1 @@
+CREATE TABLE IF NOT EXISTS "{table}_raw" ({raw_cols}, "walrus_pg_sink_meta" VARCHAR, "_walrus_op" VARCHAR, "_walrus_commit_lsn" VARCHAR, "_walrus_lsn" VARCHAR, "_walrus_sink_processed_at" VARCHAR, PRIMARY KEY ({raw_pk}));

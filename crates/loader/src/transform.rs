@@ -15,7 +15,7 @@ use crate::error::LoaderError;
 use common::{Lsn, PgRelation};
 
 /// The transform template (single source of truth). Rendered by [`TransformSql::render`].
-pub const TRANSFORM_SQL: &str = include_str!("transform.sql");
+pub const TRANSFORM_SQL: &str = include_str!("../sql/duckdb/templates/transform.sql");
 
 /// The latest `TRUNCATE` tuple `(Ct, Lt)` in the un-transformed tail — `(None, None)` if there is none.
 /// The wipe boundary is the **tuple**, never the scalar `commit_lsn`.
