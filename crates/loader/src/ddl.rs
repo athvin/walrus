@@ -20,6 +20,7 @@
 
 use crate::duck::{duck_type, user_view_sql, TableDb};
 use crate::error::LoaderError;
+use common::oids::{FLOAT4, FLOAT8, INT2, INT4, INT8};
 use common::{PgColumn, PgRelation};
 
 /// One `schema_version` of a table's shape — the `schema_registry` `columns` snapshot for that version.
@@ -83,8 +84,8 @@ fn same_duck_type(a: &PgColumn, b: &PgColumn) -> bool {
 fn is_lossless_widen(old: &PgColumn, new: &PgColumn) -> bool {
     matches!(
         (old.type_oid, new.type_oid),
-        (21, 23) | (21, 20) | (23, 20) // int2→int4→int8
-            | (700, 701) // float4→float8
+        (INT2, INT4) | (INT2, INT8) | (INT4, INT8) // int2→int4→int8
+            | (FLOAT4, FLOAT8) // float4→float8
     )
 }
 

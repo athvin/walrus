@@ -5,6 +5,7 @@ pub mod config;
 pub mod error;
 pub mod lsn;
 pub mod metrics;
+pub mod oids;
 pub mod pg_shape;
 pub mod sink_meta;
 pub mod sql;
