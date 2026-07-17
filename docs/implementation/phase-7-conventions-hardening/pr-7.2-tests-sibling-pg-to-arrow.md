@@ -6,7 +6,7 @@
 
 # PR 7.2 — Tests to sibling files: `pg-to-arrow`
 
-> **Status:** 📋 Planned <!-- flip to "✅ Done — <PR url>" when it merges -->
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/107
 
 > **Phase:** 7 — conventions hardening · **Crates touched:** `pg-to-arrow` ·
 > **Est. size:** M · **Depends on:** PR 7.1 (pattern + Conventions row) · **Unlocks:** —
@@ -76,15 +76,15 @@ fn tier1_recordbatch_roundtrips() { /* … unchanged … */ }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] All 9 files carry `#[cfg(test)] #[path = "<module>_test.rs"] mod tests;` with the body moved to
+- [x] All 9 files carry `#[cfg(test)] #[path = "<module>_test.rs"] mod tests;` with the body moved to
       `src/<module>_test.rs`; no `mod tests {` brace-block remains in `pg-to-arrow`.
-- [ ] Pure relocation: `cargo test -p pg-to-arrow` (and the `conformance` feature) reports the same
-      count as before; the diff is moves only; no `#[path]`; no `foo.rs`→`foo/mod.rs`.
-- [ ] Docs/comments unchanged except where a moved doc-comment now needs its `//!`/`//` home.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-to-arrow` (and `--workspace` stays green)
+- [x] Pure relocation: `cargo test -p pg-to-arrow` (and the `conformance` feature) reports the same
+      count as before (67 tests); the diff is moves only; no `foo.rs`→`foo/mod.rs` conversion.
+- [x] Docs/comments unchanged except where a moved doc-comment now needs its `//!`/`//` home.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-to-arrow` (and `--workspace` stays green)
 
 ## What completed looks like
 

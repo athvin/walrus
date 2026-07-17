@@ -82,7 +82,7 @@ A reviewer merges this PR when **all** of the following hold:
       `src/<module>_test.rs` (and `pgoutput/typmod_test.rs` for the nested one); no `mod tests {`
       brace-block remains in `pg-sink`.
 - [ ] Pure relocation: `cargo test -p pg-sink` reports the same count as before; the diff is moves
-      only; no `#[path]`; no `foo.rs`→`foo/mod.rs`; production code untouched.
+      only; no `foo.rs`→`foo/mod.rs` conversion; production code untouched.
 - [ ] The nested `pgoutput/typmod` case compiles and its test runs (resolution into the submodule dir
       is correct).
 - [ ] **Green locally and in CI:**
