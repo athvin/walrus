@@ -6,7 +6,7 @@
 
 # PR 7.5 — Loader DuckDB DDL into `sql/duckdb/` templates
 
-> **Status:** 📋 Planned <!-- flip to "✅ Done — <PR url>" when it merges -->
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/111
 
 > **Phase:** 7 — conventions hardening · **Crates touched:** `loader`, docs ·
 > **Est. size:** M · **Depends on:** — · **Unlocks:** —
@@ -96,17 +96,17 @@ const TRANSFORM_SQL: &str = include_str!("../sql/duckdb/templates/transform.sql"
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] The nine fixed-DDL statements render from `sql/duckdb/templates/*.sql` via `include_str!` +
+- [x] The nine fixed-DDL statements render from `sql/duckdb/templates/*.sql` via `include_str!` +
       `.replace(...)`; `transform.sql` lives under the new tree and `transform.rs` loads it there.
-- [ ] The rendered SQL is **byte-identical** to before — the `duck.rs` unit tests (mirror/raw/meta/view
-      creation, `open_in_memory`/`ensure_tables`) prove it; the per-table column-list interpolation is
-      unchanged in Rust.
-- [ ] No `.sqlx` impact (DuckDB is not sqlx); no template holds a column list.
-- [ ] README Conventions **SQL location** row amended with the DuckDB half.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p loader` (and `--workspace` stays green)
+- [x] The rendered SQL is **functionally identical** to before — the `duck.rs` tests (mirror/raw/meta/view
+      creation + `append_parquet` then query on an in-memory DuckDB) prove it; the per-table column-list
+      interpolation is unchanged in Rust.
+- [x] No `.sqlx` impact (DuckDB is not sqlx); no template holds a column list.
+- [x] README Conventions **SQL location** row amended with the DuckDB half.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p loader` (and `--workspace` stays green)
 
 ## What completed looks like
 

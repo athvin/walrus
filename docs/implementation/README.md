@@ -132,7 +132,7 @@ Two deliberate structural notes:
 | Ordering | everything keys on **commit LSN** (`(commit_lsn, lsn)` tuples), never max-row-LSN. |
 | Lints | `#![deny(warnings)]` via `[workspace.lints]`; `clippy --all-targets -D warnings` in CI. |
 | Tests | unit tests in a sibling `foo_test.rs` (`src/foo.rs` → `src/foo_test.rs`, Go-style, via `#[cfg(test)] #[path = "foo_test.rs"] mod tests;`; private access preserved); golden-vector & conformance tests in `tests/`; e2e feature-gated. |
-| SQL location | per-crate `sql/<engine>/{queries,templates,test}/` (engine at the head); control's Postgres queries via `sqlx::query_file!` (compile-time checked; offline `.sqlx` cache committed); schema migrations stay under `/migrations/{control,source}/`. |
+| SQL location | per-crate `sql/<engine>/{queries,templates,test}/` (engine at the head); control's Postgres queries via `sqlx::query_file!` (compile-time checked; offline `.sqlx` cache committed); the loader's DuckDB DDL via `include_str!` templates with `{placeholder}` substitution; schema migrations stay under `/migrations/{control,source}/`. |
 | Commits/PRs | one PR per task file; PR description links the task file and pastes its DoD checklist. |
 
 ### Testing layers (fastest first — prefer the cheapest that proves the thing)
@@ -336,7 +336,7 @@ the `"first_lsn: Lsn"` false alarm (it was always a sqlx type-cast, never a colu
 | ✅ | [7.2](./phase-7-conventions-hardening/pr-7.2-tests-sibling-pg-to-arrow.md) | same for `pg-to-arrow` (9 files; `batch`/`schema` largest) | Conventions (Tests) |
 | ✅ | [7.3](./phase-7-conventions-hardening/pr-7.3-tests-sibling-pg-sink.md) | same for `pg-sink` (21 files, incl. nested `pgoutput/typmod`) | Conventions (Tests) |
 | ✅ | [7.4](./phase-7-conventions-hardening/pr-7.4-control-sql-query-file.md) | control SQL → `sql/postgres/` via `sqlx::query_file!` | Conventions (SQL) |
-| ☐ | [7.5](./phase-7-conventions-hardening/pr-7.5-loader-duckdb-templates.md) | loader DuckDB DDL → `sql/duckdb/` `include_str!` templates | Conventions (SQL) |
+| ✅ | [7.5](./phase-7-conventions-hardening/pr-7.5-loader-duckdb-templates.md) | loader DuckDB DDL → `sql/duckdb/` `include_str!` templates | Conventions (SQL) |
 | ✅ | [7.6](./phase-7-conventions-hardening/pr-7.6-fix-unwrap-expect.md) | remove production `unwrap`/`expect` (parking_lot, typed errors) | Conventions (Lints) |
 | ☐ | [7.7](./phase-7-conventions-hardening/pr-7.7-deny-unwrap-expect-lint.md) | deny `unwrap_used`/`expect_used` + `clippy.toml` (allow in tests) | Conventions (Lints) |
 | ☐ | [7.8](./phase-7-conventions-hardening/pr-7.8-identifier-convention-audit.md) | identifier convention + naming audit (docs) | Conventions (Identifiers) |
