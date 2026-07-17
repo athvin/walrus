@@ -32,6 +32,12 @@ pub enum ControlError {
         reload_id: i64,
         expected: &'static str,
     },
+
+    /// A text column held a value outside its enum's known set (e.g. an unrecognised `file_manifest`
+    /// `kind`/`status`). The DB CHECK and the sink's `as_str()` writer should make this impossible,
+    /// so it is a data-integrity bug — terminal, never transient.
+    #[error("control-plane decode: {0}")]
+    Decode(String),
 }
 
 impl ControlError {
@@ -42,7 +48,8 @@ impl ControlError {
             ControlError::Migrate(_)
             | ControlError::CheckViolation(_)
             | ControlError::ReloadInProgress { .. }
-            | ControlError::ReloadTransition { .. } => true,
+            | ControlError::ReloadTransition { .. }
+            | ControlError::Decode(_) => true,
             ControlError::Connect(_) => false,
         }
     }

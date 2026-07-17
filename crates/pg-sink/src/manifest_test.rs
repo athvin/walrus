@@ -23,7 +23,7 @@ fn maps_written_object_to_a_stream_ready_row() {
     );
     assert_eq!(row.source_schema, "public");
     assert_eq!(row.source_table, "orders");
-    assert_eq!(row.kind, "stream");
+    assert_eq!(row.kind, FileKind::Stream);
     assert_eq!(row.row_count, 42);
     assert_eq!(row.lsn_end, "0/A100".parse().unwrap());
     assert_eq!(row.schema_version, 3);

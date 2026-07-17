@@ -23,27 +23,10 @@ use std::sync::Arc;
 /// the file's `lsn_end`, stamped onto the manifest at `Stream Commit`. The loader therefore treats
 /// `lsn_end` — not the per-row placeholder — as the authoritative `commit_lsn` for a `Spill` file, which
 /// keeps commit-order correct (architecture.md §1.6). A multi-txn `Stream` batch keeps its per-row LSNs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileKind {
-    Stream,
-    Snapshot,
-    Spill,
-    /// A single-table-reload chunk (PR 6.5): every row stamped `commit_lsn = lsn = L_i`, the
-    /// file's `lsn_end = L_i`, so chunks sort into the loader's `(lsn_end, id)` claim order.
-    Reload,
-}
-
-impl FileKind {
-    /// The `file_manifest.kind` string.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            FileKind::Stream => "stream",
-            FileKind::Snapshot => "snapshot",
-            FileKind::Spill => "spill",
-            FileKind::Reload => "reload",
-        }
-    }
-}
+///
+/// This is `control::ManifestKind`, the canonical enum for the `file_manifest.kind` column;
+/// re-exported here under the sink-local name the writer path already uses (PR 8.2).
+pub use control::ManifestKind as FileKind;
 
 /// The result of a durable S3 PUT — everything PR 2.25 needs for the manifest row.
 #[derive(Debug, Clone)]

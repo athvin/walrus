@@ -107,7 +107,7 @@ async fn insert_file(pool: &sqlx::PgPool, epoch: i64, uri: String, kind: &str, l
             source_schema: "public".into(),
             source_table: "orders".into(),
             s3_uri: uri,
-            kind: kind.into(),
+            kind: kind.parse::<control::ManifestKind>().unwrap(),
             row_count: 1,
             lsn_start: lsn_end.parse().unwrap(),
             lsn_end: lsn_end.parse().unwrap(),

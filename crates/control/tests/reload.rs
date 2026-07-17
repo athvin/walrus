@@ -35,7 +35,7 @@ fn chunk_file(epoch: i64, table: &str, reload_id: i64, lsn_end: &str) -> NewMani
         source_schema: "public".to_string(),
         source_table: table.to_string(),
         s3_uri: format!("s3://walrus/{epoch}/public/{table}/reload-{reload_id}-{lsn_end}.parquet"),
-        kind: "reload".to_string(),
+        kind: control::ManifestKind::Reload,
         row_count: 1,
         lsn_start: lsn,
         lsn_end: lsn,
@@ -65,7 +65,7 @@ fn stream_file(epoch: i64, table: &str, lsn_end: &str) -> NewManifestFile {
         source_schema: "public".to_string(),
         source_table: table.to_string(),
         s3_uri: format!("s3://walrus/{epoch}/public/{table}/{lsn_end}.parquet"),
-        kind: "stream".to_string(),
+        kind: control::ManifestKind::Stream,
         row_count: 1,
         lsn_start: lsn,
         lsn_end: lsn,
@@ -417,7 +417,7 @@ async fn fail_purges_this_reloads_manifest_rows_only() {
         customers_left.iter().map(|r| r.id).collect::<Vec<_>>(),
         vec![keep_chunk]
     );
-    assert_eq!(customers_left[0].kind, "reload");
+    assert_eq!(customers_left[0].kind, control::ManifestKind::Reload);
     assert_eq!(customers_left[0].reload_id, Some(r2));
 
     // A failed reload is terminal: the table is immediately requestable again.

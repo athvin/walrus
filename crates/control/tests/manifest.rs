@@ -32,7 +32,7 @@ fn file(epoch: i64, table: &str, lsn_end: &str) -> NewManifestFile {
         source_schema: "public".to_string(),
         source_table: table.to_string(),
         s3_uri: format!("s3://walrus/{epoch}/public/{table}/{lsn_end}.parquet"),
-        kind: "stream".to_string(),
+        kind: control::ManifestKind::Stream,
         row_count: 1,
         lsn_start: lsn,
         lsn_end: lsn,
