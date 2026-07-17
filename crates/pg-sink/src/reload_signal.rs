@@ -18,9 +18,9 @@
 //! `docs/implementation/notes/commit-visibility-race.md` for the race this bounds).
 
 use common::Lsn;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 use tokio::sync::oneshot;
 
 /// One resolved echo: the authoritative stamp and its cross-check.
@@ -54,10 +54,7 @@ impl WatermarkWaiters {
     /// the previous receiver resolves as `Err(Closed)`, which the exporter treats as superseded.
     pub fn subscribe(&self, reload_id: i64, chunk_no: i64) -> oneshot::Receiver<Echo> {
         let (tx, rx) = oneshot::channel();
-        self.waiters
-            .lock()
-            .expect("waiters mutex poisoned")
-            .insert((reload_id, chunk_no), tx);
+        self.waiters.lock().insert((reload_id, chunk_no), tx);
         rx
     }
 
@@ -80,12 +77,7 @@ impl WatermarkWaiters {
                  the watermark model is wrong; stop reloads and investigate"
             );
         }
-        match self
-            .waiters
-            .lock()
-            .expect("waiters mutex poisoned")
-            .remove(&(reload_id, chunk_no))
-        {
+        match self.waiters.lock().remove(&(reload_id, chunk_no)) {
             Some(tx) => {
                 if tx.send(echo).is_err() {
                     // The exporter gave up (timeout) and dropped its receiver — fine.

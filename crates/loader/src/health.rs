@@ -11,8 +11,9 @@
 use axum::{
     extract::State, http::header, http::StatusCode, response::IntoResponse, routing::get, Router,
 };
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -69,12 +70,12 @@ impl LoaderState {
     /// Stamp progress — called at the end of **every** poll cycle (and once at bootstrap end so an
     /// idle loader stays live).
     pub fn stamp_poll(&self) {
-        *self.last_poll_completed_at.lock().unwrap() = Some(Instant::now());
+        *self.last_poll_completed_at.lock() = Some(Instant::now());
     }
 
     /// Liveness = we have completed at least one cycle (progress stamped). Deliberately lag-free.
     pub fn is_live(&self) -> bool {
-        self.last_poll_completed_at.lock().unwrap().is_some()
+        self.last_poll_completed_at.lock().is_some()
     }
 }
 

@@ -38,19 +38,19 @@ pub struct TableCtx {
     /// The reload_id whose claim pause was already logged (PR 6.6) — a paused table says *why* it
     /// is idle once per pause, not once per poll. Per-table by construction (one `TableCtx` per
     /// worker); interior mutability so `run_phase_a(&ctx)` keeps its shared-ref signature.
-    pub pause_logged: std::sync::Mutex<Option<i64>>,
+    pub pause_logged: parking_lot::Mutex<Option<i64>>,
     /// reload_ids already identified as `resync` (PR 6.10). A resync never sets the meta latch, so
     /// every one of its chunk files would otherwise re-enter `route_reload_file`'s "greater" arm and
     /// re-fetch the reload row; caching the flavor here makes chunks 2…n a plain append with no
     /// per-file lookup. Per-table interior mutability, like `pause_logged`.
-    pub resync_ids: std::sync::Mutex<std::collections::HashSet<i64>>,
+    pub resync_ids: parking_lot::Mutex<std::collections::HashSet<i64>>,
 }
 
 /// The once-per-pause transition: `Some(reload_id)` exactly when a NEW pause begins (a different
 /// reload than last logged, or the first). A lifted pause (no live rebuild) clears the latch so
 /// the next reload logs again.
-pub fn pause_began(logged: &std::sync::Mutex<Option<i64>>, live: Option<i64>) -> Option<i64> {
-    let mut slot = logged.lock().unwrap();
+pub fn pause_began(logged: &parking_lot::Mutex<Option<i64>>, live: Option<i64>) -> Option<i64> {
+    let mut slot = logged.lock();
     match (*slot, live) {
         (prev, Some(id)) if prev != Some(id) => {
             *slot = Some(id);
@@ -241,7 +241,7 @@ async fn route_reload_file(ctx: &TableCtx, f: &control::ManifestRow) -> Result<b
     // Fast path (PR 6.10): a resync we've already classified — plain append, no `recorded` read and
     // no per-file reload-row fetch. A resync never latches, so without this cache every chunk would
     // re-enter the "greater" arm below and re-fetch.
-    if ctx.resync_ids.lock().unwrap().contains(&file_reload_id) {
+    if ctx.resync_ids.lock().contains(&file_reload_id) {
         return Ok(true);
     }
     let recorded = ctx.db.recorded_reload_id()?;
@@ -263,7 +263,7 @@ async fn route_reload_file(ctx: &TableCtx, f: &control::ManifestRow) -> Result<b
             ))
         })?;
     if row.flavor == control::ReloadFlavor::Resync {
-        ctx.resync_ids.lock().unwrap().insert(file_reload_id);
+        ctx.resync_ids.lock().insert(file_reload_id);
         return Ok(true);
     }
     let first_lsn = row.first_lsn.ok_or_else(|| {

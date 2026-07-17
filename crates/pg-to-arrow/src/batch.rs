@@ -168,7 +168,11 @@ impl BatchBuilder {
         }
         self.meta_buf.clear();
         self.meta_buf.push('{');
-        self.meta_buf.push_str(self.meta_const.as_deref().unwrap());
+        // `meta_const` is `Some` here — the block above sets it on the first row and it is never
+        // cleared — so this always appends; the `if let` just avoids an infallible unwrap.
+        if let Some(mc) = self.meta_const.as_deref() {
+            self.meta_buf.push_str(mc);
+        }
         self.meta_buf.push(',');
         meta.write_row_json_inner(&mut self.meta_buf)
             .map_err(meta_err)?;

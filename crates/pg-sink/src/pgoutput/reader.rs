@@ -52,7 +52,13 @@ impl<'a> Reader<'a> {
     /// Big-endian `Int16`.
     pub fn int16(&mut self) -> Result<u16, DecodeError> {
         self.need(2)?;
-        let arr: [u8; 2] = self.buf[self.pos..self.pos + 2].try_into().unwrap();
+        let arr: [u8; 2] = self.buf[self.pos..self.pos + 2].try_into().map_err(|_| {
+            DecodeError::UnexpectedEof {
+                needed: 2,
+                offset: self.pos,
+                remaining: self.remaining(),
+            }
+        })?;
         self.pos += 2;
         Ok(u16::from_be_bytes(arr))
     }
@@ -60,7 +66,13 @@ impl<'a> Reader<'a> {
     /// Big-endian `Int32` (OID / xid).
     pub fn int32(&mut self) -> Result<u32, DecodeError> {
         self.need(4)?;
-        let arr: [u8; 4] = self.buf[self.pos..self.pos + 4].try_into().unwrap();
+        let arr: [u8; 4] = self.buf[self.pos..self.pos + 4].try_into().map_err(|_| {
+            DecodeError::UnexpectedEof {
+                needed: 4,
+                offset: self.pos,
+                remaining: self.remaining(),
+            }
+        })?;
         self.pos += 4;
         Ok(u32::from_be_bytes(arr))
     }
@@ -69,7 +81,13 @@ impl<'a> Reader<'a> {
     /// commit timestamps keep it as signed µs).
     pub fn int64(&mut self) -> Result<i64, DecodeError> {
         self.need(8)?;
-        let arr: [u8; 8] = self.buf[self.pos..self.pos + 8].try_into().unwrap();
+        let arr: [u8; 8] = self.buf[self.pos..self.pos + 8].try_into().map_err(|_| {
+            DecodeError::UnexpectedEof {
+                needed: 8,
+                offset: self.pos,
+                remaining: self.remaining(),
+            }
+        })?;
         self.pos += 8;
         Ok(i64::from_be_bytes(arr))
     }

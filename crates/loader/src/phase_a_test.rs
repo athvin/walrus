@@ -23,7 +23,7 @@ fn frontier_ahead_of_queue_saturates_to_zero() {
 
 #[test]
 fn pause_logs_once_per_pause_and_relatches_on_a_new_reload() {
-    let latch = std::sync::Mutex::new(None);
+    let latch = parking_lot::Mutex::new(None);
     assert_eq!(pause_began(&latch, Some(7)), Some(7), "a new pause logs");
     assert_eq!(
         pause_began(&latch, Some(7)),
