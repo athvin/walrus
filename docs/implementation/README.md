@@ -360,11 +360,11 @@ duplicated OID literals (Tier 2), the opt-in domain-ID newtype sweep (Tier 3), a
 
 | ✅ | PR | Delivers | Design |
 |---|---|---|---|
-| 📋 | [8.1](./phase-8-cleanup/pr-8.1-sql-literal-helper.md) | one audited `common::sql::sql_literal` (6 hand-rolled escapes) | Conventions (SQL) |
-| 📋 | [8.2](./phase-8-cleanup/pr-8.2-manifest-kind-status-enums.md) | type manifest `kind`/`status`; retire the stringly-typed columns (spill drift) | Conventions (Errors) |
-| 📋 | [8.3](./phase-8-cleanup/pr-8.3-centralize-pg-oids.md) | one home for pg OID constants in `common::oids` (4 duplicate literal sites) | Crate DAG |
-| 📋 | [8.4](./phase-8-cleanup/pr-8.4-domain-id-newtypes.md) | `EpochNo`/`SchemaVersion`/`ReloadId`/`ManifestId` newtypes (opt-in) | PR 0.3 `Lsn` precedent |
-| 📋 | [8.5](./phase-8-cleanup/pr-8.5-nits-cluster.md) | nits: `pause_began` visibility, explicit plan tier, `Clock` documented-keep | Conventions / tiers |
+| ☐ | [8.1](./phase-8-cleanup/pr-8.1-sql-literal-helper.md) | one audited `common::sql::sql_literal` (6 hand-rolled escapes) | Conventions (SQL) |
+| ☐ | [8.2](./phase-8-cleanup/pr-8.2-manifest-kind-status-enums.md) | type manifest `kind`/`status`; retire the stringly-typed columns (spill drift) | Conventions (Errors) |
+| ☐ | [8.3](./phase-8-cleanup/pr-8.3-centralize-pg-oids.md) | one home for pg OID constants in `common::oids` (4 duplicate literal sites) | Crate DAG |
+| ☐ | [8.4](./phase-8-cleanup/pr-8.4-domain-id-newtypes.md) | `EpochNo`/`SchemaVersion`/`ReloadId`/`ManifestId` newtypes (opt-in) | PR 0.3 `Lsn` precedent |
+| ☐ | [8.5](./phase-8-cleanup/pr-8.5-nits-cluster.md) | nits: `pause_began` visibility, explicit plan tier, `Clock` documented-keep | Conventions / tiers |
 
 ---
 
