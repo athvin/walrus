@@ -129,7 +129,7 @@ impl TableDb {
     /// `read_parquet('s3://…')` then needs no per-call credentials. For MinIO the endpoint is
     /// `host:port` (no scheme), path-style, TLS off.
     pub fn configure_s3(&self, s3: &S3Access) -> Result<(), LoaderError> {
-        let esc = |v: &str| v.replace('\'', "''");
+        let esc = common::sql::sql_literal;
         let use_ssl = if s3.use_ssl { "true" } else { "false" };
         let sql = CONFIGURE_S3
             .replace("{region}", &esc(&s3.region))
@@ -159,7 +159,7 @@ impl TableDb {
         schema_version: i64,
         commit_lsn_override: Option<&str>,
     ) -> Result<u64, LoaderError> {
-        let uri = s3_uri.replace('\'', "''");
+        let uri = common::sql::sql_literal(s3_uri);
         // Map the file's columns into `<table>_raw` **by name**, not by position (PR 3.8). After an
         // `ADD COLUMN`, DuckDB appends the new column at the physical END of `<table>_raw` (after the
         // promoted columns), while the homogeneous file carries it in source order — a positional
@@ -173,7 +173,7 @@ impl TableDb {
             .collect::<Vec<_>>()
             .join(", ");
         let commit_lsn_expr = match commit_lsn_override {
-            Some(lsn) => format!("'{}'", lsn.replace('\'', "''")),
+            Some(lsn) => format!("'{}'", common::sql::sql_literal(lsn)),
             None => "json_extract_string(walrus_pg_sink_meta, '$.commit_lsn')".to_string(),
         };
         let sql = APPEND_PARQUET

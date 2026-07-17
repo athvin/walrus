@@ -435,7 +435,7 @@ impl<'a> SourcePreflight<'a> {
 
 /// A SQL string literal (single-quoted, quotes doubled).
 fn lit(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
+    format!("'{}'", common::sql::sql_literal(s))
 }
 
 /// A SQL identifier (double-quoted, quotes doubled).

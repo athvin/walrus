@@ -229,7 +229,7 @@ pub fn apply_additive(
                 // Metadata only — mirror `<table>` never `<table>_raw`; does NOT set `structural`, so it
                 // neither recreates the view nor implies a data gate.
                 let lit = match text {
-                    Some(t) => format!("'{}'", t.replace('\'', "''")),
+                    Some(t) => format!("'{}'", common::sql::sql_literal(t)),
                     None => "NULL".to_string(),
                 };
                 match target {
