@@ -14,6 +14,11 @@ warnings = "deny"
 
 [workspace.lints.clippy]
 all = "deny"
+# No `unwrap`/`expect` in production (PR 7.6 cleaned the tree). Both are `clippy::restriction` lints
+# (not in `all`), so no `priority` juggling is needed. `clippy.toml` re-allows them under `#[cfg(test)]`
+# and integration `tests/`; benches (`harness = false`) and the e2e harness lib carry a file-level allow.
+unwrap_used = "deny"
+expect_used = "deny"
 
 [workspace.dependencies]
 # Shared version pins land here as later PRs add deps (tracing, sqlx, arrow, …).

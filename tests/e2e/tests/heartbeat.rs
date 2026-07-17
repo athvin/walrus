@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! End-to-end idle-publication heartbeat (`architecture.md` "Idle-publication heartbeat" + §1.9): keep
 //! the published tables idle while the rest of the DB churns WAL, and assert the sink fires a beat
 //! **only after** `heartbeat_idle_after` (suppressed under active user-table writes), that the beat's

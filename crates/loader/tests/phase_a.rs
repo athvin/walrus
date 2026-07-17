@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! Phase A against compose (`#[ignore]` — needs control PG + MinIO). A seeded `ready` Parquet is
 //! claimed and appended **verbatim** to `<table>_raw` (meta intact + op/commit_lsn/lsn/sink_processed_at
 //! promoted), the watermark advances and the queue row is deleted in one control txn, and a replay of

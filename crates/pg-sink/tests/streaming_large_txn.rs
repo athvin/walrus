@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! Large-transaction streaming against compose (`#[ignore]` — needs source PG with
 //! `logical_decoding_work_mem=64kB` + MinIO + control PG). An 8000-row txn arrives *before* its commit
 //! as interleaved `Stream` blocks: the demux stages speculatively (no manifest), holds

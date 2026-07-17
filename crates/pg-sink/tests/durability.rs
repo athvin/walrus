@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! The durability checkpoint against compose (`#[ignore]` — needs source PG + MinIO + control PG). The
 //! slot's `confirmed_flush_lsn` reaches a batch's `lsn_end` only *after* the S3 PUT + manifest commit;
 //! and a crash between the PUT and the standby update re-streams the batch (at-least-once, no loss).

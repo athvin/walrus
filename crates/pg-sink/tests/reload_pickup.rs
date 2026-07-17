@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! Reload controller pickup against compose (`#[ignore]` — needs source + control PG). A
 //! `requested` row flips to `exporting` within one poll cadence with a live, observably-advancing
 //! lease; doomed requests (unpublished / keyless) fail fast with operator-readable reasons while a

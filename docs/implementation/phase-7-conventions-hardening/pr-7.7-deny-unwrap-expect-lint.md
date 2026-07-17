@@ -6,7 +6,7 @@
 
 # PR 7.7 — Deny `unwrap_used` / `expect_used`, allow in tests
 
-> **Status:** 📋 Planned <!-- flip to "✅ Done — <PR url>" when it merges -->
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/113
 
 > **Phase:** 7 — conventions hardening · **Crates touched:** workspace root, `loader`, `pg-sink`,
 > `pg-to-arrow`, `tests/e2e`, docs · **Est. size:** S ·
@@ -14,10 +14,12 @@
 
 The flip. With PR 7.6 having cleaned every production offender, add `unwrap_used = "deny"` and
 `expect_used = "deny"` to `[workspace.lints.clippy]` and a repo-root `clippy.toml` that re-allows both
-**in tests**. The whole point of the fix-then-flip split is here: CI going green on this tiny config
-PR *is the proof* that production is clean. The one non-obvious part is scoping — `clippy.toml` covers
-`#[cfg(test)]` modules and `tests/` dirs, but **not** benches (`harness = false`) or the e2e harness
-*library*, so those carry a file-level `#![allow]`.
+**in tests**. The whole point of the fix-then-flip split is here: CI going green on this config PR *is
+the proof* that production is clean. The non-obvious part is scoping — `allow-unwrap-in-tests` only
+covers `#[cfg(test)]`/`#[test]` code (the `foo_test.rs` unit modules are exempt), **not**: benches
+(`harness = false`), the e2e harness *library*, or the **helper fns** in integration test files
+(`crates/*/tests/*.rs`, `tests/e2e/tests/*.rs` — their `fn meta()`/setup helpers aren't `#[test]`).
+All of those carry a one-line file-level `#![allow(clippy::unwrap_used, clippy::expect_used)]`.
 
 ## Why — learning objectives
 
@@ -46,7 +48,9 @@ By the end of this PR you will have practised:
 - New repo-root `clippy.toml`: `allow-unwrap-in-tests = true`, `allow-expect-in-tests = true`.
 - Add a file-level `#![allow(clippy::unwrap_used, clippy::expect_used)]` to the compilation units
   `clippy.toml` can't reach: the **4 bench files** (`loader/benches/*`, `pg-sink/benches/*`,
-  `pg-to-arrow/benches/*` — `harness = false`) and **`tests/e2e/src/lib.rs`** (the harness lib).
+  `pg-to-arrow/benches/*` — `harness = false`), **`tests/e2e/src/lib.rs`** (the harness lib), and
+  **every integration test file** (`crates/*/tests/*.rs`, `tests/e2e/tests/*.rs` — 57 files; their
+  helper fns aren't `#[test]`, so `allow-unwrap-in-tests` doesn't reach them).
 - Edit README Conventions **Lints** row + add the **CI grows** row (from PR 7.7); add the no-unwrap
   bullet to `TEMPLATE.md`'s header conventions.
 
@@ -61,10 +65,9 @@ By the end of this PR you will have practised:
 ```
 Cargo.toml                                  # + unwrap_used/expect_used = "deny" in [workspace.lints.clippy]
 clippy.toml                                 # new — allow-unwrap-in-tests / allow-expect-in-tests
-crates/loader/benches/*.rs                  # + #![allow(clippy::unwrap_used, clippy::expect_used)]
-crates/pg-sink/benches/*.rs                 # + same
-crates/pg-to-arrow/benches/*.rs             # + same
+crates/{loader,pg-sink,pg-to-arrow}/benches/*.rs  # + #![allow(clippy::unwrap_used, clippy::expect_used)]
 tests/e2e/src/lib.rs                        # + same (non-test-cfg harness lib)
+crates/*/tests/*.rs, tests/e2e/tests/*.rs   # + same (57 integration test files — helpers aren't #[test])
 docs/implementation/README.md               # modify — Conventions "Lints" row + "CI grows" row
 docs/implementation/TEMPLATE.md             # modify — header conventions bullet (no-unwrap)
 ```
@@ -93,18 +96,20 @@ allow-expect-in-tests = true
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `[workspace.lints.clippy]` denies `unwrap_used` and `expect_used`; `clippy.toml` allows both in
-      tests; the 4 benches + `tests/e2e/src/lib.rs` carry the file-level allow.
-- [ ] `cargo clippy --all-targets --all-features -- -D warnings` is green **with zero new
-      `#[allow]`s in production code** — the green build is the proof the tree is clean.
-- [ ] Inline `#[cfg(test)] mod tests` and `tests/` integration files still compile with their
-      `unwrap`/`expect` (confirming the `clippy.toml` exemption works after the 7.1–7.3 relocation).
-- [ ] README Conventions **Lints** row updated; a **CI grows** row added (from PR 7.7); `TEMPLATE.md`
+- [x] `[workspace.lints.clippy]` denies `unwrap_used` and `expect_used`; `clippy.toml` allows both in
+      `#[cfg(test)]`/`#[test]` code; the 4 benches, `tests/e2e/src/lib.rs`, and the 57 integration test
+      files carry the file-level allow.
+- [x] `cargo clippy --all-targets --all-features -- -D warnings` is green **with zero new
+      `#[allow]`s in production code** (the only production `#[allow]` is 7.6's documented recorder one)
+      — the green build is the proof the tree is clean.
+- [x] The `foo_test.rs` unit modules (exempt via `clippy.toml`) and the integration test files (exempt
+      via their file-level allow) keep their `unwrap`/`expect` unchanged; test count unchanged.
+- [x] README Conventions **Lints** row updated; a **CI grows** row added (from PR 7.7); `TEMPLATE.md`
       header gains the no-unwrap bullet.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test --workspace`
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test --workspace`
 
 ## What completed looks like
 

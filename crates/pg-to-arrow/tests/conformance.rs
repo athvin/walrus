@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! DuckDB read-back conformance harness (Tier-1).
 //!
 //! The keystone of Phase 2b: write a `RecordBatch` to Parquet, then read it back through in-process

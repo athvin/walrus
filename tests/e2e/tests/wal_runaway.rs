@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! End-to-end WAL-runaway chaos (`architecture.md` "WAL-runaway chaos" + §1.9): stall the sink's S3
 //! durability and keep writing to source; the slot's retained WAL rises (the retained-WAL alert
 //! condition trips) while the walsender stays connected and `confirmed_flush_lsn` holds — bounded,

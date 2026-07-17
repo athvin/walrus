@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! End-to-end: N-table reloads at scale on ONE slot (PR 6.12, reload §2/§5). Three tables are
 //! seeded and streamed by the real sink+loader, then reloaded concurrently with the sink's
 //! `max_concurrent_reloads = 2`. The load-bearing assertions: never more than 2 `exporting` at any

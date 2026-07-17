@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! Golden-vector fixtures for the pgoutput decoder — a faithful, byte-for-byte port of
 //! `docs/examples/proto-version/test_decode_pgoutput.py::VECTORS`.
 //!

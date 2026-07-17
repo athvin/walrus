@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! Source-side preflight against the compose stack (`#[ignore]` — needs source + control PG).
 //!
 //! After `docker compose up --wait`:

@@ -10,6 +10,7 @@
     * skeletons are compilable SHAPES with `todo!()` — you write the logic.
     * unit tests live in a sibling `foo_test.rs` (Go-style: `src/foo.rs` → `src/foo_test.rs` via
       `#[cfg(test)] #[path = "foo_test.rs"] mod tests;`), not inline.
+    * no `unwrap()`/`expect()` in non-test code — model the error (a `clippy.toml` allows them in tests).
 -->
 
 # PR X.Y — <imperative title, e.g. "Add the `Lsn` newtype">

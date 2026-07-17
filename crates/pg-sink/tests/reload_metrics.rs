@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! Reload observability against compose (`#[ignore]` — source + control PG + MinIO). Proves the
 //! PR 6.11 metrics MOVE during a reload: chunk/row counters and the echo-wait histogram tick as an
 //! export runs; the failed counter ticks on an echo timeout; the active gauge rises to 1 while an

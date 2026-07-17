@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! Snapshot / backfill bootstrap against compose (`#[ignore]` — needs source PG + MinIO + control PG).
 //! Rows that exist before the slot's `consistent_point` are backfilled as `kind='snapshot'` Parquet +
 //! manifest rows (all sharing `lsn_end = consistent_point`); a row written *after* the export is not in

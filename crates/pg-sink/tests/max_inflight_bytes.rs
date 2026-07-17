@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! Aggregate `max_inflight_bytes` ceiling (§1.3) against compose (`#[ignore]` — needs source PG with
 //! `logical_decoding_work_mem=64kB` + MinIO + control PG). A large open transaction under a
 //! deliberately **low** ceiling spills its buffer speculatively (bounding memory) while

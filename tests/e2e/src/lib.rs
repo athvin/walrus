@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // e2e harness lib (not test-cfg)
 //! The walrus end-to-end harness (`architecture.md` "Local harness"). It brings up **both binaries** —
 //! `walrus-pg-sink` and `walrus-loader` — as child processes against the already-running compose stack
 //! (source PG :5432, control PG :5433, MinIO :9000), drives the *source* database, and lets a test assert

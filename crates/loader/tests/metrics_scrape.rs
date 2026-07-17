@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! `/metrics` exposes every loader series the design enumerates (PR 4.10). The loader's series are
 //! per-table, so `init_table_series` is how they first appear (the loader calls it per owned table at
 //! bootstrap); here we register a demo table and assert the exposition lists every

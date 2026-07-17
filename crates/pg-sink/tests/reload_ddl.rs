@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! Restart-on-DDL against compose (`#[ignore]` — needs source PG + control PG + MinIO). A schema
 //! change landing BETWEEN chunks invalidates the attempt: the exporter's per-chunk staleness check
 //! returns `SchemaChanged`, and the controller fails-and-reissues in one transaction — the old row

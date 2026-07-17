@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! End-to-end large-transaction streaming (`architecture.md` §1.6 / §1.3): a large txn stays
 //! memory-bounded (the `max_inflight_bytes` ceiling spills open-txn buffers to S3) and appears
 //! ATOMICALLY after commit; an aborted large txn leaks nothing; a late-committing large txn is not

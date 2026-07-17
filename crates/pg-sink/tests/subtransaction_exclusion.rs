@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! The flagship correctness test (§1.6, proto §9b) against compose (`#[ignore]` — needs source PG with
 //! `logical_decoding_work_mem=64kB` + MinIO + control PG). A rolled-back **savepoint** inside an
 //! otherwise-committing streamed transaction is *still streamed*; only `Stream Abort {sub != top}` tells

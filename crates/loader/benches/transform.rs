@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // bench (harness=false, not test-cfg)
 //! PR 5.5 — criterion micro-benches for the loader's raw→mirror transform.
 //!
 //! Runs the **production** SQL (`loader::transform::apply_transform` over `TransformSql`) against an

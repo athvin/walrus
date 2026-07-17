@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! Live-wire decode against the compose source (`#[ignore]` — needs source PG on `trust` auth). The
 //! Rust analogue of the proof harness's `run-tests.sh`: an `INSERT` decodes to the canonical
 //! `Begin → Relation → Insert → Commit` sequence.

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! The thin vertical slice (`architecture.md` "Local harness"): one `INSERT` / `UPDATE` / `DELETE` on
 //! `orders`, asserted through the full chain — Parquet in MinIO, verbatim `orders_raw`, and the `orders`
 //! mirror equal to the current source (the row gone after the `DELETE`).

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! Full-rebuild / compaction (loader §5.7, §9.4). Three hermetic tests prove the rebuild matches the
 //! incremental mirror, preserves a pruned value via the mirror baseline, and drops `op='d'` winners; the
 //! `#[ignore]` test proves the `CREATE OR REPLACE` rebuild reclaims space a `DELETE` would not.

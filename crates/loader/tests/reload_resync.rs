@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! The `resync` flavor against compose (`#[ignore]` — needs control PG + MinIO). Unlike `reload`
 //! (clear + rebuild, PR 6.7), `resync` merges chunks over the LIVE mirror: no pause, no
 //! `CREATE OR REPLACE`, no purge, no meta latch, raw history preserved. It repairs stale and

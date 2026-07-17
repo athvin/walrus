@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! End-to-end: the anchor use case (reload §2) — a lossy `ALTER COLUMN TYPE` quarantine recovered
 //! via `just reload`, while the other tables stream on. The real sink+loader run; the lossy
 //! narrowing is INJECTED (a v2 int2 registry + a v2 manifest file, as `ddl_destructive.rs` does)

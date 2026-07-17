@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! Compose-gated integration tests for the `file_manifest` queue models.
 //!
 //! Each test runs inside a rolled-back transaction and namespaces its rows by a unique `epoch`, so

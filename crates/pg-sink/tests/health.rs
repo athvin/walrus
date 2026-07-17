@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! The health server, end to end: `/startup` gates `/ready` until bootstrap completes, and a
 //! cancelled token drives `with_graceful_shutdown` to return — the same path SIGTERM trips.
 
