@@ -6,7 +6,7 @@
 
 # PR 7.3 — Tests to sibling files: `pg-sink`
 
-> **Status:** 📋 Planned <!-- flip to "✅ Done — <PR url>" when it merges -->
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/108
 
 > **Phase:** 7 — conventions hardening · **Crates touched:** `pg-sink` ·
 > **Est. size:** L · **Depends on:** PR 7.1 (pattern + Conventions row) · **Unlocks:** —
@@ -78,17 +78,17 @@ mod tests;   // resolves to crates/pg-sink/src/pgoutput/typmod_test.rs
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] All 21 files carry `#[cfg(test)] #[path = "<module>_test.rs"] mod tests;` with the body moved to
+- [x] All 21 files carry `#[cfg(test)] #[path = "<module>_test.rs"] mod tests;` with the body moved to
       `src/<module>_test.rs` (and `pgoutput/typmod_test.rs` for the nested one); no `mod tests {`
       brace-block remains in `pg-sink`.
-- [ ] Pure relocation: `cargo test -p pg-sink` reports the same count as before; the diff is moves
-      only; no `foo.rs`→`foo/mod.rs` conversion; production code untouched.
-- [ ] The nested `pgoutput/typmod` case compiles and its test runs (resolution into the submodule dir
-      is correct).
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink` (and `--workspace` stays green)
+- [x] Pure relocation: `cargo test -p pg-sink` reports the same count as before (77 tests); the diff is
+      moves only; no `foo.rs`→`foo/mod.rs` conversion; production code untouched.
+- [x] The nested `pgoutput/typmod` case compiles and its test runs (`pgoutput/typmod_test.rs` resolves
+      via `#[path]` relative to `pgoutput/`).
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink` (and `--workspace` stays green)
 
 ## What completed looks like
 
