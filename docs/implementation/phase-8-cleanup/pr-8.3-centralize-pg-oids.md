@@ -6,7 +6,7 @@
 
 # PR 8.3 — One home for Postgres OID constants (kill the re-hardcoded literals)
 
-> **Status:** 📋 Planned <!-- flip to "✅ Done — <PR url>" when it merges -->
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/121
 
 > **Phase:** 8 — cleanup · **Crates touched:** `common`, `pg-to-arrow`, `loader` ·
 > **Est. size:** M · **Depends on:** PR 7.8 (phase 7 complete) · **Unlocks:** —
@@ -109,18 +109,18 @@ fn is_lossless_widen(old: &PgColumn, new: &PgColumn) -> bool {
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] The OID constants live in `common::oids`; `pg_to_arrow::oids::*` still resolves (via
+- [x] The OID constants live in `common::oids`; `pg_to_arrow::oids::*` still resolves (via
       re-export) so no downstream import breaks.
-- [ ] `duck.rs`, `plan.rs`, `ddl.rs`, and `pg_shape.rs` reference named constants; no bare
+- [x] `duck.rs`, `plan.rs`, `ddl.rs`, and `pg_shape.rs` reference named constants; no bare
       OID integer literals remain in those four sites.
-- [ ] `plan.rs` no longer defines local `const INTERVAL`/`const TIMETZ`;
+- [x] `plan.rs` no longer defines local `const INTERVAL`/`const TIMETZ`;
       `pg_shape.rs` no longer defines `NUMERIC_OID`.
-- [ ] Behaviour is identical — this is a rename/relocate; existing type tests
+- [x] Behaviour is identical — this is a rename/relocate; existing type tests
       (`plan_test`, `duck_test`, `pg_shape_test`, pg-to-arrow tier tests) pass unchanged.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test --workspace`
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test --workspace`
 
 ## What completed looks like
 
