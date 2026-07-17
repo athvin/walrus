@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // bench (harness=false, not test-cfg)
 //! PR 5.4 — criterion micro-benches for the Arrow batch-building hot path.
 //!
 //! Measures `BatchBuilder::append_row` across Tier-1 shapes (narrow/wide/text-heavy) and a Tier-2

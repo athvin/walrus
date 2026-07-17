@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! The rebuild trigger against compose (`#[ignore]` — needs control PG + MinIO). The first
 //! claimed `kind='reload'` file with `reload_id >` the `_walrus_meta` latch replaces both tables
 //! at the file's schema_version, clears the quarantine, purges superseded pending rows, sets the

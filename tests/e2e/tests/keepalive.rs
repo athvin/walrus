@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! End-to-end keepalive-vs-durability (`architecture.md` "Keepalive vs durability" + §1.9): stall the S3
 //! flush past `wal_sender_timeout` and assert keepalive feedback keeps the walsender **connected** (no
 //! `terminating walsender` reconnect churn) while `confirmed_flush_lsn` does **not** advance until the

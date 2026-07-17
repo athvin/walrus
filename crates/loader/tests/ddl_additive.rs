@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! Additive/lossless DDL apply (loader §5.7, architecture per-change-type). The four hermetic tests
 //! (`Connection::open_in_memory()` via `TableDb`) prove the schema-DIFF + DuckDB `ALTER`s per taxonomy
 //! row; the `#[ignore]` compose test proves both tables evolve at the correct LSN relative to data.

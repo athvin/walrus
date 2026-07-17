@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! Micro-batching against the live stream (`#[ignore]` — needs source PG on `trust`). A stream of
 //! inserts forms and seals ≥ 1 batch. The fake-clock threshold logic is unit-tested inline in
 //! `src/batch.rs`; this proves the routing seals a real batch end to end.

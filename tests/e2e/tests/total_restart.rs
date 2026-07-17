@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! End-to-end total-restart (`architecture.md` "Slot loss / total-restart" + §1.8): when the single
 //! lifelong slot is **lost** on a successful connection, the sink bumps the epoch, opens a new slot with
 //! a fresh exported snapshot, and re-snapshots every table under the new generation; the loaders detect

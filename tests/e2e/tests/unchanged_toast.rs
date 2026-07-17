@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! End-to-end unchanged-TOAST carry-forward (`architecture.md` "Intra-batch TOAST carry-forward",
 //! loader §5.6): a big TOASTed value written, then an update that does NOT touch it (`REPLICA IDENTITY
 //! DEFAULT` sends the unchanged-TOAST sentinel), must land in the mirror as the OLD big value — never

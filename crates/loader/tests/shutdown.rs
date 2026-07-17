@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! Graceful SIGTERM drain (loader §8.5) — compose (`#[ignore]`). On cancel each worker finishes the
 //! in-flight Phase A + Phase B (both watermarks committed), the lease is released and the file is
 //! checkpointed + closed (no stale lock), and an in-flight full-rebuild is aborted (rolled back).

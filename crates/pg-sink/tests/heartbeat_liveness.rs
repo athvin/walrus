@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! The idle heartbeat + round-trip liveness against compose (`#[ignore]` — needs source PG + control
 //! PG). On an idle publication a beat fires only after `idle_after`, its `beat_seq` returns through the
 //! stream, and `confirmed_flush_lsn` advances as a result — while the beat is **never** staged to S3

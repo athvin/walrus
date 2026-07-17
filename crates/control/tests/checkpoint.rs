@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! Compose-gated integration tests for `loader_checkpoint` and `replication_state`.
 //!
 //! Each test runs inside a rolled-back transaction under a unique `epoch`, so tests are isolated

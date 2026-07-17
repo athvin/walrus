@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! `START_REPLICATION` transport spike against the compose source (`#[ignore]` — needs source PG on
 //! `trust` auth with `wal_sender_timeout=5s`). After `docker compose up --wait`:
 //!

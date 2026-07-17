@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! Compose-gated integration tests for the control-plane migrations.
 //!
 //! Requires the control Postgres from the PR 0.6 dev harness (`just up`). Gated behind the

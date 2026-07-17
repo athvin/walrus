@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! Phase B against compose (`#[ignore]` — needs control PG + MinIO). Append a seeded Parquet with
 //! intra-batch PK churn, then transform: the mirror `<table>` ends equal to the **current** source
 //! (one row per PK, latest values, deletes absent), `transformed_lsn` advances to `max(commit_lsn)`

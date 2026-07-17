@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! Loader bootstrap against compose (`#[ignore]` — needs control PG + MinIO). Bootstrap acquires the
 //! ownership lease, opens `<table>.duckdb` with both `<table>` and `<table>_raw`, loads the watermarks,
 //! and verifies S3 read. A second live-lease instance exits terminal; a stale lock behind an expired

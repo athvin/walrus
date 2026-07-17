@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! Graceful SIGTERM drain against compose (`#[ignore]` — needs source PG + MinIO + control PG). A
 //! committed-but-unflushed batch, on drain, is flushed to S3 + manifested, `confirmed_flush_lsn`
 //! advances via a final standby update, `CopyDone` closes the connection, and the **slot is never

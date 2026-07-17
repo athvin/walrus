@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! Compose-gated integration tests for the `table_reload` state machine (PR 6.1).
 //!
 //! Same discipline as the manifest tests: every test runs inside a rolled-back transaction and

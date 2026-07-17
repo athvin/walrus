@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! End-to-end type-fidelity matrix (`architecture.md` "Types"): one wide `types_matrix` row driven
 //! through the LIVE pipeline (Postgres → Arrow → Parquet → DuckDB), asserting each mapped type's DuckDB
 //! `typeof` AND value in the mirror. Reuses the conformance expectations from PRs 2.11–2.16.

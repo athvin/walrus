@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! Compose-gated integration tests for `schema_registry` and `ddl_manifest`.
 //!
 //! Each test runs inside a rolled-back transaction under a unique `epoch`. Gated behind the

@@ -130,7 +130,7 @@ Two deliberate structural notes:
 | Config | `serde`-typed, loaded from env/file, **bounds-validated** — invalid config is a terminal error. |
 | Time | every walrus-stamped datetime is **UTC, RFC-3339, `Z`** — never local, never source offset. |
 | Ordering | everything keys on **commit LSN** (`(commit_lsn, lsn)` tuples), never max-row-LSN. |
-| Lints | `#![deny(warnings)]` via `[workspace.lints]`; `clippy --all-targets -D warnings` in CI. |
+| Lints | `#![deny(warnings)]` + `clippy = all/deny` via `[workspace.lints]`; `unwrap_used`/`expect_used` denied in production (a `clippy.toml` allows them in `#[cfg(test)]`/`#[test]` code; benches, integration test files, and the e2e harness lib carry a file-level allow); `clippy --all-targets -D warnings` in CI. |
 | Tests | unit tests in a sibling `foo_test.rs` (`src/foo.rs` → `src/foo_test.rs`, Go-style, via `#[cfg(test)] #[path = "foo_test.rs"] mod tests;`; private access preserved); golden-vector & conformance tests in `tests/`; e2e feature-gated. |
 | SQL location | per-crate `sql/<engine>/{queries,templates,test}/` (engine at the head); control's Postgres queries via `sqlx::query_file!` (compile-time checked; offline `.sqlx` cache committed); the loader's DuckDB DDL via `include_str!` templates with `{placeholder}` substitution; schema migrations stay under `/migrations/{control,source}/`. |
 | Commits/PRs | one PR per task file; PR description links the task file and pastes its DoD checklist. |
@@ -338,7 +338,7 @@ the `"first_lsn: Lsn"` false alarm (it was always a sqlx type-cast, never a colu
 | ✅ | [7.4](./phase-7-conventions-hardening/pr-7.4-control-sql-query-file.md) | control SQL → `sql/postgres/` via `sqlx::query_file!` | Conventions (SQL) |
 | ✅ | [7.5](./phase-7-conventions-hardening/pr-7.5-loader-duckdb-templates.md) | loader DuckDB DDL → `sql/duckdb/` `include_str!` templates | Conventions (SQL) |
 | ✅ | [7.6](./phase-7-conventions-hardening/pr-7.6-fix-unwrap-expect.md) | remove production `unwrap`/`expect` (parking_lot, typed errors) | Conventions (Lints) |
-| ☐ | [7.7](./phase-7-conventions-hardening/pr-7.7-deny-unwrap-expect-lint.md) | deny `unwrap_used`/`expect_used` + `clippy.toml` (allow in tests) | Conventions (Lints) |
+| ✅ | [7.7](./phase-7-conventions-hardening/pr-7.7-deny-unwrap-expect-lint.md) | deny `unwrap_used`/`expect_used` + `clippy.toml` (allow in tests) | Conventions (Lints) |
 | ☐ | [7.8](./phase-7-conventions-hardening/pr-7.8-identifier-convention-audit.md) | identifier convention + naming audit (docs) | Conventions (Identifiers) |
 
 ---
@@ -361,6 +361,7 @@ that needs them lands:
 | 5.2 | sccache (Rust + bundled-DuckDB C++ object cache, GHA backend) in every compiling job |
 | 5.3 | image builds via buildx with BuildKit cache mounts + `type=gha` layer cache |
 | 5.4+ | bench targets compile-checked by `clippy --all-targets` (benches run locally, never a CI gate) |
+| 7.7 | `clippy` denies `unwrap_used` + `expect_used` in production (a `clippy.toml` re-allows both under `#[cfg(test)]`/`#[test]`; benches, integration test files, and the e2e harness lib carry a file-level allow) |
 
 ---
 

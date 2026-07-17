@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! Durability step (b) against compose (`#[ignore]` — needs MinIO + control PG). After a durable PUT,
 //! a `file_manifest` `ready` row is committed with `lsn_end` = the **commit** LSN. Each test runs in a
 //! rolled-back transaction (control DB) under a unique epoch, and cleans up its S3 object.

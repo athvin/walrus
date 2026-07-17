@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
 //! Compose tests for the reload signal table (PR 6.2, `#[ignore]` — needs the compose source PG).
 //!
 //!   cargo test -p pg-sink --test reload_signal -- --ignored
