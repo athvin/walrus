@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM walrus.file_manifest\nWHERE epoch = $1 AND source_schema = $2 AND source_table = $3\n  AND kind <> 'reload' AND lsn_end <= $4\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text",
+        {
+          "Custom": {
+            "name": "pg_lsn",
+            "kind": "Simple"
+          }
+        }
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c6de6ba5ee95042aed52fdb6e4f325e2df91c66195f280370cc2f5d43089111e"
+}

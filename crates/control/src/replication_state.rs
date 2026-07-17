@@ -20,14 +20,9 @@ pub struct ReplicationState {
 pub async fn read_current_epoch(
     ex: impl PgExecutor<'_>,
 ) -> Result<Option<ReplicationState>, ControlError> {
-    sqlx::query_as!(
+    sqlx::query_file_as!(
         ReplicationState,
-        r#"
-        SELECT epoch, slot_name, created_lsn AS "created_lsn: Lsn", status
-        FROM walrus.replication_state
-        ORDER BY epoch DESC
-        LIMIT 1
-        "#,
+        "sql/postgres/queries/read_current_epoch.sql",
     )
     .fetch_optional(ex)
     .await
@@ -39,11 +34,8 @@ pub async fn insert_epoch(
     ex: impl PgExecutor<'_>,
     s: &ReplicationState,
 ) -> Result<(), ControlError> {
-    sqlx::query!(
-        r#"
-        INSERT INTO walrus.replication_state (epoch, slot_name, created_lsn, status)
-        VALUES ($1, $2, $3, $4)
-        "#,
+    sqlx::query_file!(
+        "sql/postgres/queries/insert_epoch.sql",
         s.epoch,
         s.slot_name,
         s.created_lsn as Lsn,
@@ -67,13 +59,8 @@ pub async fn bump_epoch(
     created_lsn: Lsn,
     status: &str,
 ) -> Result<i64, ControlError> {
-    let rec = sqlx::query!(
-        r#"
-        INSERT INTO walrus.replication_state (epoch, slot_name, created_lsn, status)
-        SELECT COALESCE(MAX(epoch), 0) + 1, $1, $2, $3
-        FROM walrus.replication_state
-        RETURNING epoch
-        "#,
+    let rec = sqlx::query_file!(
+        "sql/postgres/queries/bump_epoch.sql",
         slot_name,
         created_lsn as Lsn,
         status,

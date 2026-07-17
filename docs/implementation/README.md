@@ -132,6 +132,7 @@ Two deliberate structural notes:
 | Ordering | everything keys on **commit LSN** (`(commit_lsn, lsn)` tuples), never max-row-LSN. |
 | Lints | `#![deny(warnings)]` via `[workspace.lints]`; `clippy --all-targets -D warnings` in CI. |
 | Tests | unit tests in a sibling `foo_test.rs` (`src/foo.rs` → `src/foo_test.rs`, Go-style, via `#[cfg(test)] #[path = "foo_test.rs"] mod tests;`; private access preserved); golden-vector & conformance tests in `tests/`; e2e feature-gated. |
+| SQL location | per-crate `sql/<engine>/{queries,templates,test}/` (engine at the head); control's Postgres queries via `sqlx::query_file!` (compile-time checked; offline `.sqlx` cache committed); schema migrations stay under `/migrations/{control,source}/`. |
 | Commits/PRs | one PR per task file; PR description links the task file and pastes its DoD checklist. |
 
 ### Testing layers (fastest first — prefer the cheapest that proves the thing)

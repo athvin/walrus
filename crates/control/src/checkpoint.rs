@@ -30,15 +30,9 @@ pub async fn read_checkpoint(
     schema: &str,
     table: &str,
 ) -> Result<Option<Checkpoint>, ControlError> {
-    sqlx::query_as!(
+    sqlx::query_file_as!(
         Checkpoint,
-        r#"
-        SELECT epoch, source_schema, source_table,
-               raw_appended_lsn AS "raw_appended_lsn: Lsn",
-               transformed_lsn AS "transformed_lsn: Lsn"
-        FROM walrus.loader_checkpoint
-        WHERE epoch = $1 AND source_schema = $2 AND source_table = $3
-        "#,
+        "sql/postgres/queries/read_checkpoint.sql",
         epoch,
         schema,
         table,
@@ -57,13 +51,8 @@ pub async fn ensure_checkpoint(
     schema: &str,
     table: &str,
 ) -> Result<(), ControlError> {
-    sqlx::query!(
-        r#"
-        INSERT INTO walrus.loader_checkpoint
-            (epoch, source_schema, source_table, raw_appended_lsn, transformed_lsn)
-        VALUES ($1, $2, $3, '0/0'::pg_lsn, '0/0'::pg_lsn)
-        ON CONFLICT (epoch, source_schema, source_table) DO NOTHING
-        "#,
+    sqlx::query_file!(
+        "sql/postgres/queries/ensure_checkpoint.sql",
         epoch,
         schema,
         table,
@@ -84,16 +73,8 @@ pub async fn advance_raw_appended(
     table: &str,
     lsn: Lsn,
 ) -> Result<(), ControlError> {
-    sqlx::query!(
-        r#"
-        INSERT INTO walrus.loader_checkpoint
-            (epoch, source_schema, source_table, raw_appended_lsn, transformed_lsn)
-        VALUES ($1, $2, $3, $4, '0/0'::pg_lsn)
-        ON CONFLICT (epoch, source_schema, source_table) DO UPDATE
-            SET raw_appended_lsn =
-                    GREATEST(walrus.loader_checkpoint.raw_appended_lsn, EXCLUDED.raw_appended_lsn),
-                updated_at = now()
-        "#,
+    sqlx::query_file!(
+        "sql/postgres/queries/advance_raw_appended.sql",
         epoch,
         schema,
         table,
@@ -116,16 +97,8 @@ pub async fn advance_transformed(
     table: &str,
     lsn: Lsn,
 ) -> Result<(), ControlError> {
-    sqlx::query!(
-        r#"
-        INSERT INTO walrus.loader_checkpoint
-            (epoch, source_schema, source_table, raw_appended_lsn, transformed_lsn)
-        VALUES ($1, $2, $3, $4, $4)
-        ON CONFLICT (epoch, source_schema, source_table) DO UPDATE
-            SET transformed_lsn =
-                    GREATEST(walrus.loader_checkpoint.transformed_lsn, EXCLUDED.transformed_lsn),
-                updated_at = now()
-        "#,
+    sqlx::query_file!(
+        "sql/postgres/queries/advance_transformed.sql",
         epoch,
         schema,
         table,

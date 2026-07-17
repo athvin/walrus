@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO walrus.schema_registry\n    (epoch, source_schema, source_table, schema_version, descriptors, columns)\nVALUES ($1, $2, $3, $4, $5, $6)\nON CONFLICT (epoch, source_schema, source_table, schema_version) DO UPDATE\n    SET descriptors = EXCLUDED.descriptors, columns = EXCLUDED.columns\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text",
+        "Int8",
+        "Jsonb",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "18a2fe473f2748269e43f35081b309d32c462a11fd5cb15480376657118cdbc7"
+}

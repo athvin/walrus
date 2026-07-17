@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO walrus.ddl_manifest\n    (epoch, source_schema, source_table, c_lsn, c_event, c_tag, schema_version, c_rel_oid, c_columns)\nVALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)\nRETURNING id\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text",
+        {
+          "Custom": {
+            "name": "pg_lsn",
+            "kind": "Simple"
+          }
+        },
+        "Text",
+        "Text",
+        "Int8",
+        "Oid",
+        "Jsonb"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "f8128053dad4bcb94dbe17ff21422da7f8bfd4a6f7b572a7db9186308f7ae0e2"
+}
