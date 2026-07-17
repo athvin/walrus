@@ -575,7 +575,7 @@ fn row_to_tuple(row: &tokio_postgres::Row, rel: &PgRelation) -> Vec<TupleValue> 
 
 /// A SQL string literal (single-quoted, quotes doubled).
 fn sql_lit(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
+    format!("'{}'", common::sql::sql_literal(s))
 }
 
 #[cfg(test)]
