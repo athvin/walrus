@@ -21,7 +21,7 @@ pub use db::{connect, run_migrations, ControlError};
 pub use ddl_manifest::{insert_ddl, read_pending_ddl, DdlRow};
 pub use manifest::{
     claim_ready, delete_claimed, delete_superseded, insert_ready, mark_failed, max_ready_lsn_end,
-    ManifestRow, NewManifestFile,
+    ManifestKind, ManifestRow, ManifestStatus, NewManifestFile,
 };
 // The reload transition functions stay module-qualified (`reload::request`, `reload::fail`, …):
 // several of their names (`renew_lease`, `complete`, `get`) would collide with or read vaguer

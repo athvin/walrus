@@ -161,7 +161,7 @@ async fn quarantined_table_recovers_via_reload_without_stalling_others() {
             source_schema: "public".into(),
             source_table: "q_target".into(),
             s3_uri: uri,
-            kind: "stream".into(),
+            kind: control::ManifestKind::Stream,
             row_count: 1,
             lsn_start: "0/C8".parse().unwrap(),
             lsn_end: "0/C8".parse().unwrap(),

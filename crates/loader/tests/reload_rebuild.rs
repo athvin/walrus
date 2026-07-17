@@ -113,7 +113,7 @@ async fn seed_file_v(
             source_schema: "public".into(),
             source_table: "orders".into(),
             s3_uri: uri.into(),
-            kind: kind.into(),
+            kind: kind.parse::<control::ManifestKind>().unwrap(),
             row_count: 1,
             lsn_start: lsn_end.parse().unwrap(),
             lsn_end: lsn_end.parse().unwrap(),

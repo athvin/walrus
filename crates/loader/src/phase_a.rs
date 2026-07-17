@@ -131,7 +131,7 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
         // kind='reload' routing (PR 6.7, H8/H9): greater ⇒ rebuild-then-append; equal ⇒ plain
         // append (chunks 2…n); less ⇒ a stale attempt's file — retire it unapplied (its id joins
         // the end-of-batch delete, its lsn_end never advances the frontier, DuckDB is untouched).
-        if f.kind == "reload" && !route_reload_file(ctx, f).await? {
+        if f.kind == control::ManifestKind::Reload && !route_reload_file(ctx, f).await? {
             tracing::debug!(
                 table = %format_args!("{}.{}", ctx.schema, ctx.table),
                 manifest_id = f.id,
@@ -146,7 +146,7 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
         // `delete_superseded` purges it, and so the loop reaches the reload chunk file that clears
         // the quarantine. Same-version files still apply normally and drop through the rebuild's
         // clear as PR 6.7's "wasted but harmless" pre-`W` backlog.
-        if f.kind != "reload"
+        if f.kind != control::ManifestKind::Reload
             && f.schema_version > ctx.db.schema_version()?
             && supersede_floor.is_some_and(|floor| f.lsn_end <= floor)
         {
@@ -187,7 +187,8 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
         // `commit_lsn` is a placeholder; `lsn_end` (corrected on `Stream Commit`) is the real commit LSN
         // for every row. Stamp it so the transform's commit-LSN window can't drop a neighbour txn that
         // committed inside the spill's placeholder range (architecture.md §1.6). Other kinds append verbatim.
-        let commit_lsn_override = (f.kind == "spill").then(|| f.lsn_end.to_string());
+        let commit_lsn_override =
+            (f.kind == control::ManifestKind::Spill).then(|| f.lsn_end.to_string());
         appended += ctx.db.append_parquet(
             &ctx.table,
             &f.s3_uri,

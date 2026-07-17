@@ -126,7 +126,7 @@ async fn setup(epoch: i64) -> (TableCtx, std::path::PathBuf) {
             source_schema: "public".into(),
             source_table: "orders".into(),
             s3_uri: uri,
-            kind: "stream".into(),
+            kind: control::ManifestKind::Stream,
             row_count: 5,
             lsn_start: "0/64".parse().unwrap(),
             lsn_end: "0/64".parse().unwrap(),

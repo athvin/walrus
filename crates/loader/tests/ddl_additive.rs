@@ -455,7 +455,7 @@ async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
                 source_schema: "public".into(),
                 source_table: "orders".into(),
                 s3_uri: uri,
-                kind: "stream".into(),
+                kind: control::ManifestKind::Stream,
                 row_count: 2,
                 lsn_start: lsn.parse().unwrap(),
                 lsn_end: lsn.parse().unwrap(),
