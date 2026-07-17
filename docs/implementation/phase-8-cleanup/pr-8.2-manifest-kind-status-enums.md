@@ -6,7 +6,7 @@
 
 # PR 8.2 — Type the manifest `kind` and `status` (retire the stringly-typed columns)
 
-> **Status:** 📋 Planned <!-- flip to "✅ Done — <PR url>" when it merges -->
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/119
 
 > **Phase:** 8 — cleanup · **Crates touched:** `control`, `loader` ·
 > **Est. size:** M · **Depends on:** PR 7.8 (phase 7 complete) · **Unlocks:** —
@@ -114,19 +114,19 @@ match f.kind {
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `ManifestKind` and `ManifestStatus` exist with total `as_str()`/`FromStr`, and an
+- [x] `ManifestKind` and `ManifestStatus` exist with total `as_str()`/`FromStr`, and an
       unknown string parses to `Err` (tested), never a silent default.
-- [ ] `ManifestRow`/`NewManifestFile` use the enums; no `kind: String`/`status: String`
+- [x] `ManifestRow`/`NewManifestFile` use the enums; no `kind: String`/`status: String`
       remain (`rg -n 'kind: String|status: String' crates/control/src/manifest.rs` empty).
-- [ ] `phase_a.rs` has no `== "reload"` / `!= "reload"` / `== "spill"`; it matches the enum.
-- [ ] The `ManifestRow` doc comment lists **all four** kinds (spill included).
-- [ ] The `.sqlx` offline cache is regenerated if any query text changed
+- [x] `phase_a.rs` has no `== "reload"` / `!= "reload"` / `== "spill"`; it matches the enum.
+- [x] The `ManifestRow` doc comment lists **all four** kinds (spill included).
+- [x] The `.sqlx` offline cache is regenerated if any query text changed
       (`cargo sqlx prepare` / `--check` passes).
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p control -p loader` (and `--workspace` stays green)
-  - [ ] `docker compose up --wait` then the existing loader integration/e2e reload tests
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p control -p loader` (and `--workspace` stays green)
+  - [x] `docker compose up --wait` then the existing loader integration/e2e reload tests
         still pass (kind routing is load-bearing for reload).
 
 ## What completed looks like
