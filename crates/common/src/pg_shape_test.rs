@@ -34,12 +34,12 @@ fn replica_identity_from_wire_char() {
 #[test]
 fn numeric_typmod_decodes_precision_and_scale() {
     // The proto §4 example: atttypmod 655366 → numeric(10, 2).
-    let c = col("amount", NUMERIC_OID, 655366, false);
+    let c = col("amount", crate::oids::NUMERIC, 655366, false);
     assert_eq!(c.numeric_precision_scale(), Some((10, 2)));
 
     // Unconstrained numeric → None (no panic).
     assert_eq!(
-        col("n", NUMERIC_OID, -1, false).numeric_precision_scale(),
+        col("n", crate::oids::NUMERIC, -1, false).numeric_precision_scale(),
         None
     );
 

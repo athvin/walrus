@@ -16,6 +16,7 @@
 //! tests that pass a `PgRelation` are unchanged; the registry path ([`TablePlan::from_registry`]) adds
 //! the Tier-2 shapes.
 
+use common::oids::{INTERVAL, TIMETZ};
 use common::{PgRelation, TypeDescriptor};
 
 /// A `<table>_raw` column: the verbatim emit column the sink wrote to Parquet.
@@ -202,8 +203,6 @@ fn parse_emit(emit: &[String]) -> Vec<(String, String)> {
 /// The loader recombine expression for a type that collapses to one DuckDB scalar — over the winning raw
 /// row `s`. `None` for anything that stays flat (Tier-1, range, geometric).
 fn recombine_expr(pg_type_oid: u32, emit: &[(String, String)]) -> Option<String> {
-    const INTERVAL: u32 = 1186;
-    const TIMETZ: u32 = 1266;
     match pg_type_oid {
         INTERVAL if emit.len() == 3 => Some(format!(
             "to_months(s.\"{}\") + to_days(s.\"{}\") + to_microseconds(s.\"{}\")",

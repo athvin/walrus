@@ -5,6 +5,10 @@
 
 use crate::error::LoaderError;
 use crate::plan::TablePlan;
+use common::oids::{
+    BOOL, BYTEA, DATE, FLOAT4, FLOAT8, INT2, INT4, INT8, JSON, JSONB, NUMERIC, TIMESTAMP,
+    TIMESTAMPTZ, UUID,
+};
 use common::PgRelation;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -380,20 +384,20 @@ pub struct S3Access {
 /// stages *text*-format tuples; the exact numeric/temporal fidelity is refined as the transform lands).
 pub(crate) fn duck_type(oid: u32) -> &'static str {
     match oid {
-        21 => "SMALLINT",                   // int2
-        23 => "INTEGER",                    // int4
-        20 => "BIGINT",                     // int8
-        16 => "BOOLEAN",                    // bool
-        700 => "REAL",                      // float4
-        701 => "DOUBLE",                    // float8
-        1700 => "DECIMAL(38,10)",           // numeric
-        1082 => "DATE",                     // date
-        1114 => "TIMESTAMP",                // timestamp
-        1184 => "TIMESTAMP WITH TIME ZONE", // timestamptz
-        2950 => "UUID",                     // uuid
-        114 | 3802 => "JSON",               // json / jsonb
-        17 => "BLOB",                       // bytea
-        _ => "VARCHAR",                     // text, varchar, enums, and everything else
+        INT2 => "SMALLINT",
+        INT4 => "INTEGER",
+        INT8 => "BIGINT",
+        BOOL => "BOOLEAN",
+        FLOAT4 => "REAL",
+        FLOAT8 => "DOUBLE",
+        NUMERIC => "DECIMAL(38,10)",
+        DATE => "DATE",
+        TIMESTAMP => "TIMESTAMP",
+        TIMESTAMPTZ => "TIMESTAMP WITH TIME ZONE",
+        UUID => "UUID",
+        JSON | JSONB => "JSON",
+        BYTEA => "BLOB",
+        _ => "VARCHAR", // text, varchar, enums, and everything else
     }
 }
 

@@ -11,9 +11,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::Error;
 
-/// Postgres OID of the `numeric` type — `numeric_precision_scale` only decodes for this type.
-const NUMERIC_OID: u32 = 1700;
-
 /// Postgres `relreplident` — governs which old-image columns Update/Delete carry (proto §6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReplicaIdentity {
@@ -61,7 +58,7 @@ impl PgColumn {
     /// The packing (the exact math PR 2.3 relies on): `precision = ((mod - 4) >> 16) & 0xFFFF`,
     /// `scale = (mod - 4) & 0xFFFF`.
     pub fn numeric_precision_scale(&self) -> Option<(u16, u16)> {
-        if self.type_oid != NUMERIC_OID || self.type_modifier < 0 {
+        if self.type_oid != crate::oids::NUMERIC || self.type_modifier < 0 {
             return None;
         }
         let packed = (self.type_modifier as u32).wrapping_sub(4);
