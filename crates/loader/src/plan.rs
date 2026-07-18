@@ -133,6 +133,13 @@ fn plan_column(
     mirror_cols: &mut Vec<MirrorCol>,
 ) {
     let emit = parse_emit(&d.emit);
+    // These branches dispatch on the column's EMIT SHAPE (recombine / single-column / flat), which is
+    // deliberately NOT the descriptor's declared `tier` (audited PR 8.5): a Tier-2 `geometric`/
+    // `multirange` stays NESTED — one struct/list emit column — so it flows through the single-column
+    // arm below alongside Tier-1/Tier-3, while a Tier-2 `range` expands to 5 flat columns. A
+    // `debug_assert!(inferred == d.tier)` would therefore be wrong. Emit shape is the sole source of
+    // truth: it comes from the same `emit_fields` dispatch the sink wrote the Parquet with, so it
+    // can't drift from the staged file.
     // Tier-2 that recombines to a single DuckDB scalar (interval / timetz).
     if let Some(expr) = recombine_expr(d.pg_type_oid, &emit) {
         for (n, t) in &emit {
