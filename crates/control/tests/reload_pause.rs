@@ -44,7 +44,7 @@ fn stream_file(epoch: i64, table: &str, lsn_end: &str) -> NewManifestFile {
     }
 }
 
-fn ids(rows: &[ManifestRow]) -> Vec<i64> {
+fn ids(rows: &[ManifestRow]) -> Vec<common::ManifestId> {
     rows.iter().map(|r| r.id).collect()
 }
 

@@ -9,7 +9,7 @@
 //! is a `DELETE`, not a status flip — the queue's frontier advances by removal.
 
 use crate::ControlError;
-use common::Lsn;
+use common::{Lsn, ManifestId};
 use sqlx::PgExecutor;
 
 /// The kind of a `file_manifest` row — the canonical enum for the `kind` text column, shared by the
@@ -91,7 +91,7 @@ impl std::str::FromStr for ManifestStatus {
 /// rebuild trigger routes on (PR 6.7). Stream/snapshot/spill rows never set `reload_id`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestRow {
-    pub id: i64,
+    pub id: ManifestId,
     pub epoch: i64,
     pub source_schema: String,
     pub source_table: String,
@@ -126,7 +126,7 @@ pub struct NewManifestFile {
 pub async fn insert_ready(
     executor: impl PgExecutor<'_>,
     f: &NewManifestFile,
-) -> Result<i64, ControlError> {
+) -> Result<ManifestId, ControlError> {
     let rec = sqlx::query_file!(
         "sql/postgres/queries/insert_ready.sql",
         f.epoch,
@@ -143,7 +143,7 @@ pub async fn insert_ready(
     .fetch_one(executor)
     .await
     .map_err(ControlError::Connect)?;
-    Ok(rec.id)
+    Ok(ManifestId(rec.id))
 }
 
 /// Claim the next `ready` files for a table **in commit order**.
@@ -185,7 +185,7 @@ pub async fn claim_ready(
     rows.into_iter()
         .map(|r| {
             Ok(ManifestRow {
-                id: r.id,
+                id: ManifestId(r.id),
                 epoch: r.epoch,
                 source_schema: r.source_schema,
                 source_table: r.source_table,
@@ -226,9 +226,11 @@ pub async fn max_ready_lsn_end(
 /// Retire claimed rows — the queue's "done" is a `DELETE`, not a status flip. Returns the count.
 pub async fn delete_claimed(
     executor: impl PgExecutor<'_>,
-    ids: &[i64],
+    ids: &[ManifestId],
 ) -> Result<u64, ControlError> {
-    let result = sqlx::query_file!("sql/postgres/queries/delete_claimed.sql", ids,)
+    // The transparent `Type` impl carries no `PgHasArrayType`, so unwrap to `&[i64]` for the array bind.
+    let raw: Vec<i64> = ids.iter().map(|id| id.0).collect();
+    let result = sqlx::query_file!("sql/postgres/queries/delete_claimed.sql", raw.as_slice())
         .execute(executor)
         .await
         .map_err(ControlError::Connect)?;
@@ -262,8 +264,13 @@ pub async fn delete_superseded(
 }
 
 /// Dead-letter a repeatedly-failing file (`status='failed'`) so a poison file can't block the queue.
-pub async fn mark_failed(executor: impl PgExecutor<'_>, id: i64) -> Result<(), ControlError> {
-    sqlx::query_file!("sql/postgres/queries/mark_failed.sql", id,)
+pub async fn mark_failed(
+    executor: impl PgExecutor<'_>,
+    id: ManifestId,
+) -> Result<(), ControlError> {
+    // Unwrap to `i64` for the bind: `query_file!` (unlike `query_file_as!`) offline-checks the arg
+    // against the column's concrete `i64`, so a scalar bind passes the inner value.
+    sqlx::query_file!("sql/postgres/queries/mark_failed.sql", id.0)
         .execute(executor)
         .await
         .map_err(ControlError::Connect)?;

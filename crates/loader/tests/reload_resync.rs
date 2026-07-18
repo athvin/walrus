@@ -108,6 +108,7 @@ async fn seed_file(
     )
     .await
     .unwrap()
+    .0
 }
 
 async fn setup(epoch: i64) -> (TableCtx, std::path::PathBuf) {

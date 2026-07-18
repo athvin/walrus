@@ -134,7 +134,7 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
         if f.kind == control::ManifestKind::Reload && !route_reload_file(ctx, f).await? {
             tracing::debug!(
                 table = %format_args!("{}.{}", ctx.schema, ctx.table),
-                manifest_id = f.id,
+                manifest_id = f.id.0,
                 stale_reload_id = f.reload_id,
                 "stale reload file retired unapplied (latest-id wins)"
             );
@@ -152,7 +152,7 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
         {
             tracing::warn!(
                 table = %format_args!("{}.{}", ctx.schema, ctx.table),
-                manifest_id = f.id,
+                manifest_id = f.id.0,
                 lsn_end = %f.lsn_end,
                 schema_version = f.schema_version,
                 "skipping a version-crossing file superseded by a pending reload rebuild (quarantine-recovery in flight)"

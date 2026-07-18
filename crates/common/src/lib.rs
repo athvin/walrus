@@ -3,6 +3,7 @@
 
 pub mod config;
 pub mod error;
+pub mod ids;
 pub mod lsn;
 pub mod metrics;
 pub mod oids;
@@ -14,6 +15,7 @@ pub mod type_descriptor;
 
 pub use config::CommonConfig;
 pub use error::{Error, ExitCode, Result};
+pub use ids::ManifestId;
 pub use lsn::Lsn;
 pub use pg_shape::{PgColumn, PgRelation, ReplicaIdentity, TupleValue};
 pub use sink_meta::{Kind, Op, SinkMeta, UtcTimestamp};

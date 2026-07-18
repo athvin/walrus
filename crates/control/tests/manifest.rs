@@ -65,7 +65,7 @@ async fn claim_orders_by_lsn_end_then_id() {
     let claimed = claim_ready(&mut *tx, epoch, "public", "t", 100)
         .await
         .unwrap();
-    let order: Vec<i64> = claimed.iter().map(|r| r.id).collect();
+    let order: Vec<common::ManifestId> = claimed.iter().map(|r| r.id).collect();
     // (lsn_end ASC, id ASC): 0/10 (b), then 0/20 (c before d), then 0/30 (a).
     assert_eq!(order, vec![b, c, d, a]);
 
