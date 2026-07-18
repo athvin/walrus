@@ -49,7 +49,10 @@ pub struct TableCtx {
 /// The once-per-pause transition: `Some(reload_id)` exactly when a NEW pause begins (a different
 /// reload than last logged, or the first). A lifted pause (no live rebuild) clears the latch so
 /// the next reload logs again.
-pub fn pause_began(logged: &parking_lot::Mutex<Option<i64>>, live: Option<i64>) -> Option<i64> {
+pub(crate) fn pause_began(
+    logged: &parking_lot::Mutex<Option<i64>>,
+    live: Option<i64>,
+) -> Option<i64> {
     let mut slot = logged.lock();
     match (*slot, live) {
         (prev, Some(id)) if prev != Some(id) => {

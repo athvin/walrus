@@ -16,7 +16,9 @@ use pg_to_arrow::BatchBuilder;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Injectable clock so `max_fill` is testable without sleeping. Production uses [`SystemClock`].
+/// Injectable clock so `max_fill` is testable without sleeping. Production uses [`SystemClock`]; the
+/// single production impl is deliberate — the trait exists **for that test seam**, not as dead
+/// generality (audited PR 8.5, kept by design).
 pub trait Clock: Send + Sync {
     fn now(&self) -> Instant;
 }
