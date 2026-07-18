@@ -6,10 +6,15 @@
 
 # PR 8.4 — Domain-ID newtypes: `EpochNo` / `SchemaVersion` / `ReloadId` / `ManifestId` (opt-in)
 
-> **Status:** 📋 Planned <!-- flip to "✅ Done — <PR url>" when it merges -->
+> **Status:** ✅ Done — ManifestId slice only: https://github.com/athvin/walrus/pull/123
 
 > **Phase:** 8 — cleanup · **Crates touched:** `common`, `control`, `loader` (`pg-sink`) ·
 > **Est. size:** L · **Depends on:** PR 7.8 (phase 7 complete) · **Unlocks:** —
+
+> **Shipped (PR #123):** `ManifestId` only (slice 1 of 4). The measured blast radius for all four was
+> ~100 signatures / ~1600 sites; per this task's own "land independently if splitting" guidance,
+> **`EpochNo` / `SchemaVersion` / `ReloadId` are deferred** — the same transparent-`int8` pattern now
+> in `common::ids` applies verbatim when they follow. The DoD below is ticked for the ManifestId slice.
 
 Four semantically distinct identities all flow through the system as bare `i64`: **epoch**,
 **schema_version**, **reload_id**, and **manifest id**. In `control`'s function signatures
@@ -106,18 +111,18 @@ pub async fn bump_epoch(executor: impl PgExecutor<'_>, from: EpochNo) -> Result<
 
 A reviewer merges this PR (or each split sub-PR) when **all** of the following hold:
 
-- [ ] The newtype(s) exist in `common::ids`, derive `sqlx::Type`/`transparent` behind the
+- [x] The newtype(s) exist in `common::ids`, derive `sqlx::Type`/`transparent` behind the
       `sqlx` feature, and have `Display` + round-trip tests.
-- [ ] The chosen identities are newtypes across `control` (and `loader`/`pg-sink` callers) —
+- [x] The chosen identities are newtypes across `control` (and `loader`/`pg-sink` callers) —
       no bare `i64` for those parameters in the converted signatures.
-- [ ] No accidental `.0` leakage where a newtype should flow end-to-end (accessor only at
+- [x] No accidental `.0` leakage where a newtype should flow end-to-end (accessor only at
       true boundaries: SQL binds, arithmetic, logging).
-- [ ] `.sqlx` offline cache regenerated; `cargo sqlx prepare --check` passes.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test --workspace`
-  - [ ] `docker compose up --wait` + the control/loader integration + e2e reload suites
+- [x] `.sqlx` cache stays valid (SQL unchanged — transparent `int8` needs no cast); `cargo sqlx prepare --check` passes.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test --workspace`
+  - [x] `docker compose up --wait` + the control/loader integration + e2e reload suites
         (epoch + reload_id routing are load-bearing).
 
 ## What completed looks like
