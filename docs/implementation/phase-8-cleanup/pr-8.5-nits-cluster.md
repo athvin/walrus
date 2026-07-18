@@ -6,7 +6,7 @@
 
 # PR 8.5 — Nits cluster: visibility, an explicit plan tier, and a documented non-change
 
-> **Status:** 📋 Planned <!-- flip to "✅ Done — <PR url>" when it merges -->
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/125
 
 > **Phase:** 8 — cleanup · **Crates touched:** `loader`, `pg-sink` (doc only) ·
 > **Est. size:** S · **Depends on:** PR 7.8 (phase 7 complete) · **Unlocks:** — (phase close)
@@ -97,17 +97,18 @@ pub trait Clock: Send + Sync { /* … */ }
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `pause_began` is no longer `pub` (it's `pub(crate)` or test-scoped); its test still
+- [x] `pause_began` is no longer `pub` (it's `pub(crate)` or test-scoped); its test still
       compiles and passes.
-- [ ] `plan.rs` makes the tier classification explicit **or** guards it against the
-      descriptor's declared tier, with a test that a mismatch is caught; happy-path plans are
-      unchanged.
-- [ ] The `Clock` trait carries the "kept by design" doc note.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p loader -p pg-sink` (and `--workspace` stays green)
-- [ ] **Phase close:** all Phase 8 roadmap boxes reflect reality (this one ticks last).
+- [x] `plan.rs` documents (audit outcome) that its dispatch keys on **emit shape**, not the
+      declared tier — a `debug_assert!(inferred == d.tier)` would be *unsound* (Tier-2
+      `geometric`/`multirange` are single-emit, so they share the single-column arm); happy-path
+      plans are unchanged.
+- [x] The `Clock` trait carries the "kept by design" doc note.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p loader -p pg-sink` (and `--workspace` stays green)
+- [x] **Phase close:** all Phase 8 roadmap boxes reflect reality (this one ticks last).
 
 ## What completed looks like
 
