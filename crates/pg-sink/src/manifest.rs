@@ -19,7 +19,7 @@ pub async fn record_ready(
     ex: impl sqlx::PgExecutor<'_>,
     epoch: i64,
     obj: &WrittenObject,
-) -> Result<i64, ManifestError> {
+) -> Result<common::ManifestId, ManifestError> {
     record_ready_with_reload(ex, epoch, obj, None).await
 }
 
@@ -30,7 +30,7 @@ pub async fn record_ready_with_reload(
     epoch: i64,
     obj: &WrittenObject,
     reload_id: Option<i64>,
-) -> Result<i64, ManifestError> {
+) -> Result<common::ManifestId, ManifestError> {
     Ok(control::insert_ready(ex, &to_ready_row(epoch, obj, reload_id)).await?)
 }
 

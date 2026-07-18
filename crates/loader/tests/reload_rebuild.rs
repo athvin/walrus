@@ -123,6 +123,7 @@ async fn seed_file_v(
     )
     .await
     .unwrap()
+    .0
 }
 
 /// Fresh control state + an owned `TableCtx` (DuckDB in a temp dir).
