@@ -441,8 +441,16 @@ fn append_range(
     }
     let r = crate::range::parse_range(text(value, col, fields[0].data_type())?)?;
     // Bounds reuse the Tier-1 text parsing; a `None` (unbounded) bound appends null.
-    append_value(builders[0].as_mut(), &fields[0], &opt_text_value(&r.lower))?;
-    append_value(builders[1].as_mut(), &fields[1], &opt_text_value(&r.upper))?;
+    append_value(
+        builders[0].as_mut(),
+        &fields[0],
+        &opt_text_value(r.lower.as_deref()),
+    )?;
+    append_value(
+        builders[1].as_mut(),
+        &fields[1],
+        &opt_text_value(r.upper.as_deref()),
+    )?;
     bool_builder(builders[2].as_mut(), col)?.append_value(r.lower_inc);
     bool_builder(builders[3].as_mut(), col)?.append_value(r.upper_inc);
     bool_builder(builders[4].as_mut(), col)?.append_value(r.empty);
@@ -589,9 +597,9 @@ fn bool_builder<'a>(
 }
 
 /// A range bound as a `TupleValue`: `Some(text)` → `Text`, `None` (unbounded) → `Null` (→ append_null).
-fn opt_text_value(bound: &Option<String>) -> TupleValue {
+fn opt_text_value(bound: Option<&str>) -> TupleValue {
     match bound {
-        Some(s) => TupleValue::Text(s.clone()),
+        Some(s) => TupleValue::Text(s.to_owned()),
         None => TupleValue::Null,
     }
 }
