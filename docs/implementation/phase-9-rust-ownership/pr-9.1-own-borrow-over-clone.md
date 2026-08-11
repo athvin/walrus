@@ -6,7 +6,7 @@
 
 # PR 9.1 — Delete the redundant and implicit clones the borrow checker never needed
 
-> **Status:** 📋 Planned <!-- flip to "✅ Done — <PR url>" when it merges -->
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/128
 
 > **Readiness:** audited · **Outcome:** change
 > **Gates:** fmt,clippy,test · **Test packages:** loader,pg-sink,pg-to-arrow
@@ -158,21 +158,21 @@ diff-check = git diff --check origin/main...HEAD
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `[workspace.lints.clippy]` in `Cargo.toml` contains `redundant_clone = "deny"` **and**
+- [x] `[workspace.lints.clippy]` in `Cargo.toml` contains `redundant_clone = "deny"` **and**
       `implicit_clone = "deny"`, each explained by a comment in the style of the existing
       `unwrap_used`/`expect_used` note.
-- [ ] `crates/loader/src/duck.rs` no longer clones `keys`; `cargo test -p loader --test ddl_additive`
+- [x] `crates/loader/src/duck.rs` no longer clones `keys`; `cargo test -p loader --test ddl_additive`
       is green, proving the rendered `{raw_pk}` list is byte-identical.
-- [ ] `crates/pg-to-arrow/src/batch.rs` calls `.to_string()` on no `&String`: `append_value` binds
+- [x] `crates/pg-to-arrow/src/batch.rs` calls `.to_string()` on no `&String`: `append_value` binds
       `col: &str`, and `multirange_elem_type` uses `.clone()`.
-- [ ] `crates/pg-sink/src/snapshot_test.rs:91` passes `meta` by move.
-- [ ] `cargo clippy --all-targets --all-features -- -D warnings` reports **zero**
+- [x] `crates/pg-sink/src/snapshot_test.rs:91` passes `meta` by move.
+- [x] `cargo clippy --all-targets --all-features -- -D warnings` reports **zero**
       `redundant_clone` / `implicit_clone` diagnostics (4 sites → 0).
-- [ ] No function signature, no `.sql` file, and no `.sqlx` cache entry changed.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p loader` (and `--workspace` stays green)
+- [x] No function signature, no `.sql` file, and no `.sqlx` cache entry changed.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p loader` (and `--workspace` stays green)
 
 ## What completed looks like
 
