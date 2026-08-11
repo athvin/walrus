@@ -19,6 +19,9 @@ all = "deny"
 # and integration `tests/`; benches (`harness = false`) and the e2e harness lib carry a file-level allow.
 unwrap_used = "deny"
 expect_used = "deny"
+# `redundant_clone` is nursery and `implicit_clone` is pedantic; neither is in `all`, so no priority juggling is needed.
+redundant_clone = "deny"
+implicit_clone = "deny"
 
 [workspace.dependencies]
 # Shared version pins land here as later PRs add deps (tracing, sqlx, arrow, …).

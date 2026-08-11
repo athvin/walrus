@@ -115,7 +115,7 @@ impl TableDb {
         // 16-hex / RFC-3339 text. **Composite PK = source key + sink_processed_at + lsn** — the load-bearing
         // idempotency fence (a ms-resolution `sink_processed_at` collision is broken by the always-distinct
         // `lsn`): `ON CONFLICT DO NOTHING` makes a crash-window replay a no-op.
-        let mut raw_pk = keys.clone();
+        let mut raw_pk = keys;
         raw_pk.push("\"_walrus_sink_processed_at\"".into());
         raw_pk.push("\"_walrus_lsn\"".into());
         let raw = CREATE_RAW
