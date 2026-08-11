@@ -88,7 +88,7 @@ fn snapshot_rows_carry_kind_snapshot_and_consistent_point_commit_lsn() {
     )
     .unwrap();
     b.push(
-        meta.clone(),
+        meta,
         &[TupleValue::Text("1".into()), TupleValue::Text("new".into())],
     );
     b.on_commit(cp, UtcTimestamp::now()).unwrap();

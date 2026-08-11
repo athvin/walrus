@@ -264,7 +264,7 @@ fn append_value(
     field: &Field,
     value: &TupleValue,
 ) -> Result<(), Error> {
-    let col = field.name();
+    let col: &str = field.name();
     let dt = field.data_type();
     // NULL and unchanged-TOAST both append a null on the validity bitmap. (The TOAST placeholder's
     // column name lives in SinkMeta.unchanged_toast, echoed into the meta JSON, not resolved here.)
@@ -487,7 +487,7 @@ fn multirange_elem_type(field: &Field) -> Result<DataType, Error> {
         }
     }
     Err(Error::Downcast {
-        column: field.name().to_string(),
+        column: field.name().clone(),
     })
 }
 
