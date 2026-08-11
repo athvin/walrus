@@ -1,8 +1,9 @@
 # Design docs map
 
-Which of the four canonical design docs to read for a given task, plus each doc's section index so
-you can jump straight to the section a task's **Read first** cites instead of re-reading the whole
-doc. All four total ~4,100 lines — read them in full once per run, then navigate by section.
+Which canonical doc to read for a given task, plus each doc's section index so you can jump straight
+to the section a task's **Read first** cites instead of re-reading the whole doc. Read by the
+implementer subagent — never by the orchestrator, and never in full: a task names its sections, and
+this map turns those names into locations.
 
 ## Contents
 - When to consult which doc
@@ -10,6 +11,7 @@ doc. All four total ~4,100 lines — read them in full once per run, then naviga
 - proto-version.md — section index
 - walrus-loader.md — section index
 - walrus-pg-sink.md — section index
+- Phases 9+ — the rust-skills rule files
 
 ## When to consult which doc
 
@@ -19,6 +21,7 @@ doc. All four total ~4,100 lines — read them in full once per run, then naviga
 | pgoutput wire format: framing, messages, streaming, xid, abort/rollback | `proto-version.md` | golden vectors in `docs/examples/proto-version/` |
 | The sink: type conversion, DDL capture, sink pod lifecycle | `walrus-pg-sink.md` | `architecture.md` §1 |
 | The loader: manifest queue, commit-gating, raw→mirror transform, guards, lifecycle | `walrus-loader.md` | `architecture.md` §2 |
+| A phase 9–13 refactor (ownership, errors, memory, unsafe, API design) | the rule file the task cites under `.claude/skills/rust-skills/rules/` | the exact source lines the task names |
 
 The deep-dive docs **extend and sometimes correct** `architecture.md`. When they disagree, the
 component doc (`walrus-pg-sink.md` / `walrus-loader.md` / `proto-version.md`) wins for its own area.
@@ -56,3 +59,27 @@ component doc (`walrus-pg-sink.md` / `walrus-loader.md` / `proto-version.md`) wi
 - 3 DDL capture (event triggers → audit table → sink consumption; limitations)
 - 4 Kubernetes pod lifecycle (startup, probes, steady state, graceful drain, decommission)
 - 5 What it supersedes in architecture.md
+
+## Phases 9+ — the rust-skills rule files
+
+Phases 9–13 refactor the finished tree against `.claude/skills/rust-skills` (265 rules across 26
+categories). A phase-9+ task cites its rule by filename, e.g.
+`.claude/skills/rust-skills/rules/own-borrow-over-clone.md`. Read **the cited rule plus the exact
+source lines the task names** — not the whole rule set, and not other rules in the category.
+
+| Phase | Directory | Rule family |
+|---|---|---|
+| 9 | `phase-9-rust-ownership/` | `own-*` — borrow over clone, slices over `Vec`, `Cow`, `Arc`/`Rc`, interior mutability |
+| 10 | `phase-10-rust-errors/` | `err-*` — `From` impls, `?`, source chains, thiserror/anyhow split, no unwrap in production |
+| 11 | `phase-11-rust-memory/` | `mem-*` — `with_capacity`, `clone_from`, `take`/`replace`, boxed slices, zero-copy |
+| 12 | `phase-12-rust-unsafe/` | `unsafe-*` — safety comments, minimal scope, extern blocks, Miri in CI |
+| 13 | `phase-13-rust-api-design/` | `api-*` — `Default` impls and the rest of the API-guideline surface |
+| 14 | `phase-14-rust-async/` | `async-*` — `select!` racing, cancel safety, structured `JoinSet` |
+| 15 | `phase-15-rust-concurrency/` | `conc-*` — atomic ordering, thread-locals |
+| 16 | `phase-16-rust-codegen-opt/` | `opt-*` — codegen and branch hints |
+
+The phase list grows as the curriculum is authored; the pattern holds — directory `phase-N-rust-<topic>/`,
+task files `pr-N.k-<prefix>-<slug>.md`, rule at `.claude/skills/rust-skills/rules/<prefix>-<slug>.md`.
+
+These tasks change **no behaviour**: the design docs above are context, not the contract. The
+contract is the cited rule, the named sites, and the tests that must stay green.

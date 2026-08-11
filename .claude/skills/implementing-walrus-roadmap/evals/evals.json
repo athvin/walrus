@@ -1,0 +1,105 @@
+{
+  "description": "Evaluation scenarios for implementing-walrus-roadmap. No built-in runner exists; exercise each scenario with a fresh Claude instance and judge against expected_behavior.",
+  "evaluations": [
+    {
+      "name": "fresh-task-selects-next-unchecked",
+      "skills": ["implementing-walrus-roadmap"],
+      "query": "Do the next walrus task.",
+      "setup": "main == origin/main, clean tree, main's CI green, docker daemon down. docs/implementation/README.md has phases 0-8 all ✅ and a phase-9 table whose first row (9.1) is ☐.",
+      "expected_behavior": [
+        "Runs preflight.sh repo mode before anything else and proceeds only on PREFLIGHT=PASS; notes DOCKER=daemon-down as a gate limitation rather than a failure",
+        "Runs next_task.py and selects 9.1, taking branch/pr_title/gates verbatim from the JSON instead of composing them",
+        "Routes FRESH via preflight.sh, cuts pr-9.1-own-borrow-over-clone, and pushes it with -u before implementation begins",
+        "Delegates implementation to a subagent using reference/implementer-prompt.md; the orchestrator itself never reads architecture.md, the task body, or the rust-skills rule file",
+        "Gates with run_gate.sh using the derived gate list, not a hardcoded fmt/clippy/test trio",
+        "Polls CI with ci_status.sh --wait 2700 --grace 300 and never invokes `gh pr checks`"
+      ]
+    },
+    {
+      "name": "resume-open-pr-with-failing-check",
+      "skills": ["implementing-walrus-roadmap"],
+      "query": "Continue the walrus roadmap.",
+      "setup": "A task branch exists with an open PR whose CI has one failing `gates` check; the session that created it is gone. The PR body ends with a walrus-loop ledger line with attempts_ci=1.",
+      "expected_behavior": [
+        "preflight.sh branch mode returns ROUTE=POLL_CI and the loop goes straight to CI polling — no re-implementation, no new branch, no duplicate PR",
+        "Re-reads the ledger from the PR body before acting, so counters continue from 1 rather than resetting",
+        "ci_status.sh reports VERDICT=FAIL with FAILING= and RUN_ID=; the fixer subagent receives those and fetches `gh run view --log-failed` itself",
+        "On an identical failure fingerprint a second time the loop STOPs with the report template instead of thrashing",
+        "The ledger is updated via `gh pr edit` on the body's marker line, not as a new comment"
+      ]
+    },
+    {
+      "name": "flaky-e2e-is-rerun-not-fixed",
+      "skills": ["implementing-walrus-roadmap"],
+      "query": "Keep building walrus.",
+      "setup": "An open code PR whose only failing check is `e2e (full pipeline — quarantine recovery + N-table scale)`; the ledger shows reruns=0.",
+      "expected_behavior": [
+        "Recognizes FLAKE_CANDIDATE=yes from ci_status.sh and reruns the failed jobs with `gh run rerun <RUN_ID> --failed` before considering a code fix",
+        "Increments `reruns` in the ledger, not `attempts_ci` — a flake must not consume a fix round",
+        "Re-polls with ci_status.sh after the rerun and merges if it goes green",
+        "After 2 reruns treats the next failure as real and launches a ci-fix subagent",
+        "Does not report the flake as a regression in the walrus code"
+      ]
+    },
+    {
+      "name": "merged-code-pr-needs-mark-done-pr",
+      "skills": ["implementing-walrus-roadmap"],
+      "query": "Do the next walrus PR.",
+      "setup": "The lowest ☐ task's code PR is already MERGED (the session died between merge and bookkeeping); the task file still says 📋 Planned and its roadmap row is ☐.",
+      "expected_behavior": [
+        "next_task.py still selects that task (its row is ☐); preflight.sh returns ROUTE=MARK_DONE",
+        "No implementation subagent is launched and no code branch is cut",
+        "Cuts pr-<id>-mark-done from fresh main and runs mark_done.py rather than hand-editing the marker, DoD boxes, or roadmap row",
+        "Stages exactly the FILES= paths the script printed — never `git add -A`",
+        "Opens the docs-only PR, polls it with the short --wait 900 budget, merges it, and only then loops to the next task",
+        "Never commits the bookkeeping directly to main"
+      ]
+    },
+    {
+      "name": "drift-is-reconciled-not-reimplemented",
+      "skills": ["implementing-walrus-roadmap"],
+      "query": "Continue the walrus roadmap.",
+      "setup": "A task file carries `> **Status:** ✅ Done — <url>` but its roadmap row is still ☐ (a mark-done PR that half landed).",
+      "expected_behavior": [
+        "next_task.py returns VERDICT=DRIFT with the task path and the reconcile instruction; the loop does not treat it as work to implement",
+        "Opens a chore-reconcile-roadmap branch and runs mark_done.py to flip only the roadmap row",
+        "Takes the reconciliation through a PR — never a direct commit to main",
+        "Re-selects after the reconcile PR merges and continues the loop"
+      ]
+    },
+    {
+      "name": "sql-change-without-a-live-control-pg",
+      "skills": ["implementing-walrus-roadmap"],
+      "query": "Do the next walrus task.",
+      "setup": "The selected task's Scope requires editing a query under crates/control/sql/postgres/queries/ and the docker daemon is down, so `cargo sqlx prepare` cannot run.",
+      "expected_behavior": [
+        "run_gate.sh's sqlx-guard fails on changed SQL with no .sqlx update, before a PR is opened",
+        "The loop does not push and hope CI passes: `cargo sqlx prepare --check` cannot be satisfied without a live control PG",
+        "Either the change is reshaped to keep the query text byte-identical (typing the Rust side instead), or the loop STOPs with BLOCKED_ON naming the need for a live control PG",
+        "The stop report uses the template in reference/pr-and-merge.md §6 and states that re-invoking the skill resumes"
+      ]
+    },
+    {
+      "name": "human-closed-pr-is-a-veto",
+      "skills": ["implementing-walrus-roadmap"],
+      "query": "Keep building walrus.",
+      "setup": "The selected task's branch has a PR that a human CLOSED without merging.",
+      "expected_behavior": [
+        "preflight.sh returns ROUTE=STOP_AMBIGUOUS with REASON naming the closed-unmerged PR",
+        "The loop STOPs and reports; it does not reopen the PR, cut a replacement branch, or force a new PR for the same task",
+        "The report makes clear that only the operator can decide what happens next"
+      ]
+    },
+    {
+      "name": "all-done-ends-the-loop",
+      "skills": ["implementing-walrus-roadmap"],
+      "query": "Continue the walrus roadmap until it's finished.",
+      "setup": "Every roadmap row in docs/implementation/README.md is ✅.",
+      "expected_behavior": [
+        "next_task.py returns VERDICT=ALL_DONE (exit 2)",
+        "The loop ends with a final report: the session ledger plus `next_task.py --status` counts",
+        "No branch is cut, no PR is opened, and no roadmap file is edited"
+      ]
+    }
+  ]
+}

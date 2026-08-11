@@ -1,138 +1,177 @@
-# PR, merge & verify
+# PR, merge & bookkeeping playbook
 
-The mechanics for turning a green local task into a merged PR on `main`, then confirming the merge.
+Read by the orchestrator once per session. Exact command sequences for the
+fragile PR / merge / mark-done steps; the loop follows these verbatim.
 
 ## Contents
-- Branch naming
-- Open the PR
-- Drive CI green
-- Mark the task done (after CI is green)
-- Merge (hard-gated on green CI)
-- Verify the merge into main
-- Reconcile roadmap drift
-- Follow-up fix PRs
-- Update the PR description
 
-## Branch naming
+1. [PR creation](#1-pr-creation)
+2. [Loop-state ledger](#2-loop-state-ledger)
+3. [Merge sequence](#3-merge-sequence)
+4. [Post-merge](#4-post-merge)
+5. [The mark-done PR](#5-the-mark-done-pr)
+6. [Stop-report template](#6-stop-report-template)
+7. [Conflict recipe](#7-conflict-recipe)
+8. [Follow-up fix PRs](#8-follow-up-fix-prs)
 
-`pr-<phase>.<n>-<slug>`, matching the task file's slug — e.g. the file
-`phase-0-foundations/pr-0.1-workspace-skeleton-and-ci.md` → branch
-`pr-0.1-workspace-skeleton-and-ci`. Always branch from an up-to-date `main`:
+## 1. PR creation
 
-```
-git checkout main && git pull --ff-only
-git checkout -b pr-<phase>.<n>-<slug>
-```
+- Branch: the `branch` field from `next_task.py` JSON — the task file's own slug
+  (`pr-9.1-own-borrow-over-clone`). Always cut from an up-to-date `main`.
+- Title: the `pr_title` field **verbatim** (`PR <id> — <task H1 title>`). It
+  becomes the squash subject; never compose it by hand. For a slice, append the
+  slice marker: `PR 8.4a — ManifestId newtype (domain-ID newtypes, slice 1 of 4)`.
+- Body (strict skeleton, flexible prose inside each section):
 
-## Open the PR
-
-```
-git push -u origin pr-<phase>.<n>-<slug>
-gh pr create --base main --title "PR <phase>.<n> — <task title>" --body-file <tmp>
-```
-
-Body template:
-
-```
-Implements task `docs/implementation/<path-to-task>.md`.
+```markdown
+Implements `docs/implementation/<path to task file>`.
 
 ## What changed
-- <bullet per meaningful change / decision>
+<2–5 bullets: what shipped and the decisions behind it>
 
 ## Definition of Done
-<paste the task's DoD checklist, every box checked>
+<the task's DoD restated with a status per item; the task FILE's own boxes are
+ LEFT UNTOUCHED — the mark-done PR ticks them after this one merges>
 
-Green locally: `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
-`cargo test --workspace`<, plus any task-specific gates>.
+## Green locally
+<the CHECK: lines from run_gate.sh, including the SKIP:reasons — a reader must
+ be able to see which gates only CI can prove on this machine>
+
+## Deviations
+<"None." | what deviated from the task and why>
+
+<!-- walrus-loop: phase=ci attempts_impl=1 attempts_ci=0 reruns=0 fingerprints=[] -->
 ```
 
-## Drive CI green
+- Command: `gh pr create --base main --title "<pr_title>" --body-file <tmpfile>`.
+
+## 2. Loop-state ledger
+
+Durable per-task state lives in an HTML comment as the **last line of the PR
+body** (session context dies; the PR body does not):
 
 ```
-gh pr checks --watch
+<!-- walrus-loop: phase=<implement|ci|merge> attempts_impl=N attempts_ci=N reruns=N fingerprints=["…"] -->
 ```
 
-On any failure: `gh run view --log-failed` (or `gh pr checks` for the run URL), reproduce the
-failing gate locally, fix, `git push`, and re-watch. Because you ran the same gates locally, most CI
-failures are environment-specific (toolchain pin, cache, compose) — read the log before changing
-code. If the **same** check fails after 3 fix attempts, stop and ask the human — do not thrash.
+- Update: `gh pr view <N> --json body -q .body` → rewrite **only** the marker
+  line → `gh pr edit <N> --body-file <tmpfile>`.
+- On resume, re-read the marker before doing anything else: counters only ever
+  increment, never reset — that is what keeps the caps monotonic across session
+  deaths.
+- `reruns` counts flake reruns (`gh run rerun --failed`) separately from
+  `attempts_ci`, so a flaky `e2e` job never consumes a real fix round.
 
-## Mark the task done (after CI is green)
+## 3. Merge sequence
 
-Only once CI on the PR is green — so the DoD's "…green in CI" boxes are genuinely true — record
-completion **in the repository** so a task's "done" state is provable from code, not only from GitHub.
-Make **one** "mark done" commit on the same branch with three edits, then push it:
+Pre-merge invariants, all required:
 
-1. **Task-file status marker** — add this line directly under the task file's H1 title, above the
-   `> **Phase:** …` metadata line:
+1. `ci_status.sh` verdict `PASS` on the current head.
+2. Base freshness after a fresh `git fetch origin`:
+   `git merge-base --is-ancestor origin/main <branch>`. If main moved: rebase →
+   re-run the task's gates → `git push --force-with-lease` → re-poll CI → retry.
+   A stale-but-textually-clean base is the classic semantic-conflict window
+   (walrus's shared `common` types make it a real risk); never merge across it.
+3. `MERGEABLE=UNKNOWN` (GitHub computes mergeability asynchronously): re-poll
+   `gh pr view <N> --json mergeable` every 15s for up to 60s before deciding.
 
-   ```
-   > **Status:** ✅ Done — <PR URL>
-   ```
-
-   `scripts/next-task.sh` treats the substring `**Status:** ✅ Done` as an authoritative done signal,
-   so this marker (together with the README box) is what makes the roadmap self-describing. Keep the
-   exact marker text — the script matches it literally.
-
-2. **Definition-of-Done ticks** — in the same task file, change every `- [ ]` in the *Definition of
-   Done* to `- [x]`. Every box is genuinely met now: the local ones from steps D–E, and the "…in CI"
-   ones because CI just went green.
-
-3. **README roadmap box** — in `docs/implementation/README.md`, change this task's row from `| ☐ |`
-   to `| ✅ |`.
-
-This commit is docs-only, so let `gh pr checks --watch` confirm it stays green before merging.
-
-## Merge (hard-gated on green CI)
-
-Gate the merge on a machine check, not a judgement call — run `gh pr checks` and merge only if it
-exits `0` (all checks passed, none pending):
+Then, in one command:
 
 ```
-gh pr checks && gh pr merge --squash --delete-branch
+gh pr merge <N> --squash --delete-branch \
+  --match-head-commit <HEAD_SHA from ci_status.sh> \
+  --subject "<pr_title> (#<N>)"
 ```
 
-Never `--admin`-override a red or pending merge; never force-merge. For defence in depth, enable
-branch protection on `main` requiring the CI status checks, so a red/pending PR is blocked
-server-side even if the client-side gate is skipped.
+- `--match-head-commit` closes the race between the green verdict and the merge
+  call — the merge fails rather than merging a head that was never verified.
+- Explicit `--subject` because GitHub uses the single commit's message, not the
+  PR title, for one-commit squashes — without it main's history drifts from the
+  roadmap ids.
+- Transient failure mentioning "not mergeable" / "clean status": retry **once**
+  after 15s.
+- Review-required or branch-protection errors: **STOP**. Never `--admin`, never
+  change protection settings.
 
-## Verify the merge into main
-
-```
-git checkout main && git pull --ff-only
-git log --oneline -1          # confirm the squash commit landed
-```
-
-Then re-run the baseline gates on `main` (`scripts/green.sh`). `main` must be green after the merge.
-
-## Reconcile roadmap drift
-
-The mark-done commit writes the task-file marker, the DoD ticks, and the README box together, so in a
-normal autonomous run these never disagree. Drift only appears from outside that flow — a task
-finished without this skill, or a mark-done commit that half-landed during a squash conflict:
-
-- **Marker present, README box still `☐`** (what `next-task.sh` warns about): a mark-done that only
-  partly landed.
-- **PR merged, but neither marker nor box** (a task completed outside the skill): `next-task.sh` will
-  return it as the next task, and the `gh pr list --state merged` cross-check in step A is what
-  catches it.
-
-Either way the fix is a documentation-only tick, and it **must still go through a branch → PR →
-merge — never commit the reconciliation directly to `main`.** Open a short-lived
-`chore-reconcile-roadmap` branch, add the missing marker and/or tick the README box for the affected
-task(s), and merge it like any other PR. Do **not** re-implement an already-done task.
-
-## Follow-up fix PRs
-
-If `main` is red after a merge (or a later task reveals a defect in a merged one), open a new branch
-`pr-<phase>.<n>-fix-<slug>`, fix it, and take it through the same PR → CI → merge → verify cycle. Do
-not force-push corrections onto `main`.
-
-## Update the PR description
-
-If the CI-fix loop changed what shipped, update the PR body so the description matches the final
-diff:
+## 4. Post-merge
 
 ```
-gh pr edit <n> --body-file <tmp>
+gh pr view <N> --json state,mergedAt      # must show MERGED
+git switch main && git fetch origin && git merge --ff-only origin/main
 ```
+
+## 5. The mark-done PR
+
+walrus records "done" **in the repository**, not only on GitHub: the task file's
+`> **Status:** ✅ Done — <url>` marker, its ticked DoD boxes, and the roadmap row
+in `docs/implementation/README.md`. All three ship as their own docs-only PR
+after the code PR merges.
+
+Why split from the code PR:
+
+- The DoD's "…green in CI" boxes are only genuinely true once the code PR's CI
+  went green — ticking them in the same PR asserts something not yet proven.
+- A docs-only diff skips the eight code-gated CI jobs (`changes` classifies the
+  diff; skipped jobs still report success), so the bookkeeping costs ~2 minutes
+  instead of another full bundled-DuckDB build.
+
+```
+git switch main && git fetch origin && git merge --ff-only origin/main
+git switch -c pr-<id>-mark-done
+python3 .claude/skills/implementing-walrus-roadmap/scripts/mark_done.py <id> --pr <url>
+git add <exactly the FILES= paths the script printed>
+git commit -m "docs: mark PR <id> done (Status ✅, DoD ticks, README box)"
+git push -u origin pr-<id>-mark-done
+gh pr create --base main --title "PR <id> — mark done (Status ✅, DoD ticks, README box)" \
+  --body "Bookkeeping for #<N> (merged). Docs-only: task marker + DoD ticks + roadmap row."
+```
+
+Then poll `ci_status.sh <pr> --wait 900 --grace 300` and merge with the §3
+invariants. On push rejection (main moved): `git pull --rebase` and retry, twice
+max — the edits touch one row and one file section, so the rebase is clean.
+
+Slices and phase closers take a `--note`:
+
+```
+mark_done.py 8.4 --pr 123 --note "ManifestId slice only"
+```
+
+**Drift** — a ☐ row whose task file already says Done (`next_task.py` returns
+`VERDICT=DRIFT`) is a mark-done that only half landed. Fix it exactly like the
+above but on branch `chore-reconcile-roadmap`, covering every drifted task in one
+PR. Never re-implement a task that already merged.
+
+## 6. Stop-report template
+
+Every stop emits exactly this block (one line per key):
+
+```
+TASK=<id>
+PHASE=<select|route|implement|gate|pr|ci|merge|mark-done>
+BRANCH=<branch or ->
+PR=<number or ->
+VERDICT=<last script verdict>
+FAILING=<check names or ->
+WHY_STOPPED=<one sentence>
+HOW_TO_RESUME=re-invoke the skill — preflight routes automatically; <plus any decision only the operator can make>
+```
+
+## 7. Conflict recipe
+
+On the task branch: `git fetch origin && git rebase origin/main`.
+
+- Conflicts confined to `docs/implementation/README.md` roadmap rows: take both
+  rows and `git rebase --continue`.
+- `.sqlx/` conflicts: never hand-merge the cache. If the daemon is up, resolve
+  the Rust/SQL side and regenerate with `cargo sqlx prepare --workspace`;
+  otherwise `git rebase --abort` and STOP.
+- Any other conflict: **one** fixer-subagent attempt with the task context; if it
+  cannot resolve, `git rebase --abort` and STOP.
+- Force-push only ever with `--force-with-lease`.
+
+## 8. Follow-up fix PRs
+
+If `main` goes red after a merge (preflight's `MAIN_CI=red` at the next
+iteration), branch `pr-<id>-fix-<slug>` from main, fix it, and take it through
+the same PR → CI → merge cycle. Never force-push a correction onto `main`, and do
+not start the next task until main is green again.
