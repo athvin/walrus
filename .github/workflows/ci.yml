@@ -4,7 +4,8 @@ name: CI
 # machine-checked definition of "green" that every later PR in the roadmap inherits
 # (docs/implementation/README.md → "CI grows with the phases"). New gates (compose, sqlx offline,
 # conformance, cargo-deny, kubeconform) switch on in later phases as the code that needs them lands.
-# A cheap `changes` job classifies the diff so a docs-only commit skips the compile-heavy jobs
+# A cheap roadmap-contract job validates every implementation task on every run. A separate
+# `changes` job classifies the diff so a docs-only commit skips the compile-heavy jobs
 # (gates / integration / conformance / images / compose); the ungated jobs (supply-chain, msrv,
 # manifests) are seconds each and always run (PR 5.1).
 on:
@@ -20,6 +21,30 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  roadmap:
+    name: implementation roadmap contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate roadmap index and task contracts
+        run: |
+          # A half-landed bookkeeping edit must fail on every PR/branch. The one
+          # recovery exception is the push run on main itself: allowing exit 5
+          # there lets preflight prove DRIFT and open the docs-only reconcile PR.
+          # Structural/coverage/readiness errors (exit 4) always remain red.
+          if python3 .claude/skills/implementing-walrus-roadmap/scripts/next_task.py \
+              --validate-all --require-tracked; then
+            exit 0
+          else
+            rc=$?
+          fi
+          if [ "$rc" -eq 5 ] && [ "$GITHUB_EVENT_NAME" = push ] \
+              && [ "$GITHUB_REF" = refs/heads/main ]; then
+            echo "Validated state drift on main; reconciliation is the only permitted next action."
+            exit 0
+          fi
+          exit "$rc"
+
   # A cheap classifier (runs in seconds) so a docs-only change can skip the compile-heavy jobs. It
   # emits `code: true` when the diff touches anything that can affect a build/test/image, and
   # `code: false` for pure docs (docs/**, *.md, LICENSE). The heavy jobs gate on this output; an

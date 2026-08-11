@@ -8,16 +8,18 @@
 
 > **Status:** 📋 Planned <!-- flip to "✅ Done — <PR url>" when it merges -->
 
-> **Phase:** 9 — Rust ownership & borrowing · **Crates touched:** `common`, `control`, `loader`,
-> `pg-sink`, `pg-to-arrow` · **Est. size:** M · **Depends on:** PR 9.3 · **Unlocks:** PR 9.5
+> **Readiness:** audited · **Outcome:** change
+> **Gates:** fmt,clippy,test · **Test packages:** pg-sink
 
-**28 production types derive `Copy`; 44 derive `Clone` without it.** At least four of those 44 are
-public, hold nothing but `Copy` fields, and force callers into an explicit `.clone()` for no reason:
-`DurabilityCheckpoint { confirmed_flush: Lsn, open_txn_floor: Option<Lsn> }`
-(`crates/pg-sink/src/checkpoint.rs:19`), the `SlotStatus` and `SlotAction` enums
-(`crates/pg-sink/src/epoch.rs:18` and `:31`, whose only payload is an `Lsn`), and
-`HeartbeatConfig { idle_after: Duration, roundtrip_deadline: Duration }`
-(`crates/pg-sink/src/heartbeat.rs:25`). The rustc lint that finds *all* of them —
+> **Phase:** 9 — Rust ownership & borrowing · **Crates touched:** `pg-sink` ·
+> **Est. size:** M · **Depends on:** PR 9.3 · **Unlocks:** PR 9.5
+
+The pinned-toolchain baseline reports exactly **11** `missing_copy_implementations` findings, all
+under `pg-sink`: ten production types and the `Vector` integration-test fixture. The audited
+decision is explicit: derive `Copy` for the immutable value types (`SystemClock`, `SlotStatus`,
+`SlotAction`, `HeartbeatConfig`, `ShedAction`, `DecodeError`, `RestartDecision`, `DrainOutcome`, and
+`Vector`), while keeping the mutable state machines `DurabilityCheckpoint` and `Backpressure`
+non-`Copy` with reasoned allows. The rustc lint that finds *all* of them —
 `missing_copy_implementations` — is absent: `[workspace.lints.rust]` currently sets only
 `warnings = "deny"`, and because the lint is allow-by-default that group never switched it on. This
 PR turns it on, works the resulting list, and pairs it with `clippy::trivially_copy_pass_by_ref` so
@@ -41,7 +43,7 @@ a newly-`Copy` type does not keep being passed by reference.
 
 ## Read first
 
-- [`own-copy-small`](../../.claude/skills/rust-skills/rules/own-copy-small.md) — take the three
+- [`own-copy-small`](../../../.claude/skills/rust-skills/rules/own-copy-small.md) — take the three
   `Copy` requirements and the size table verbatim; they are the triage rubric for every type the lint
   reports.
 - `crates/pg-sink/src/checkpoint.rs:15-60` — `DurabilityCheckpoint`, its `#[derive(Debug, Clone)]` at
@@ -54,17 +56,35 @@ a newly-`Copy` type does not keep being passed by reference.
 - `Cargo.toml:10-21` — `[workspace.lints.rust]` (today: `warnings = "deny"` only) and
   `[workspace.lints.clippy]`.
 
+## Baseline contract
+
+- **Precondition:** Confirm `rule-present`, then inspect the immediate predecessor's named paths and
+  symbols with `rg`. Historical line coordinates in the audit are navigation hints only; the
+  named symbol and stated precondition are authoritative.
+- **Allowed files:** The **Files to create / modify** block is exhaustive.
+
+- Any other current-tree mismatch blocks before editing.
+
 ## Scope
+
+**Baseline precondition.** Before editing, reproduce the task's authored finding from its named
+source paths, symbols, counts, and read-only probes; run the full **Verification commands** block
+after implementation. The named sites and allowed paths are the complete task boundary.
+
+**Baseline mismatch.** If the current tree differs from that authored finding, **STOP and request
+task re-authoring before editing.** Do not choose another site, implementation, evidence conclusion,
+or outcome.
 
 **In scope**
 
 - Add `missing_copy_implementations = "deny"` to `[workspace.lints.rust]` and
   `trivially_copy_pass_by_ref = "deny"` to `[workspace.lints.clippy]` (0 sites in the 51-lint sweep
   today, so it is free — it exists to stop a newly-`Copy` type being passed by reference).
-- Resolve **every** type the lint reports across all five crates, one of two ways:
-  1. add `Copy` to its `derive` (adding `Clone` alongside if it lacks one), or
-  2. keep it `Clone`-only with `#[allow(missing_copy_implementations)]` and a one-line comment
-     stating *why* (mutation hazard, imminent heap field, deliberate move semantics).
+- Add `Clone, Copy` where needed to `SystemClock`, `SlotStatus`, `SlotAction`, `HeartbeatConfig`,
+  `ShedAction`, `DecodeError`, `RestartDecision`, `DrainOutcome`, and the test-only `Vector`.
+- Keep `DurabilityCheckpoint` and `Backpressure` non-`Copy`; add a reasoned
+  `#[allow(missing_copy_implementations, reason = "…")]` to each because both expose mutating state
+  transitions and copying either would silently mutate a detached duplicate.
 - Fix any `trivially_copy_pass_by_ref` site the new `Copy` derives create, by taking the value.
 - Drop only those `.clone()` call sites the compiler now rejects or clippy now flags.
 
@@ -83,13 +103,15 @@ a newly-`Copy` type does not keep being passed by reference.
 ```
 Cargo.toml                          # + missing_copy_implementations = "deny"  [workspace.lints.rust]
                                     # + clippy::trivially_copy_pass_by_ref = "deny"
-crates/pg-sink/src/checkpoint.rs    # :19  — DurabilityCheckpoint: derive Copy, or allow + reason
+crates/pg-sink/src/checkpoint.rs    # DurabilityCheckpoint: keep non-Copy with reasoned allow
 crates/pg-sink/src/epoch.rs         # :18, :31 — SlotStatus / SlotAction: derive Copy
 crates/pg-sink/src/heartbeat.rs     # :25  — HeartbeatConfig: derive Copy
-crates/common/src/*.rs              # whatever else the lint reports — triage each
-crates/control/src/*.rs             # "
-crates/loader/src/*.rs              # "
-crates/pg-to-arrow/src/*.rs         # "
+crates/pg-sink/src/batch.rs         # SystemClock: derive Clone, Copy
+crates/pg-sink/src/memory.rs        # ShedAction: derive Clone, Copy; Backpressure: reasoned allow
+crates/pg-sink/src/pgoutput/error.rs # DecodeError: derive Clone, Copy
+crates/pg-sink/src/reload.rs        # RestartDecision: derive Clone, Copy
+crates/pg-sink/src/shutdown.rs      # DrainOutcome: derive Clone, Copy
+crates/pg-sink/tests/pgoutput_vectors.rs # Vector: derive Clone, Copy
 ```
 
 ## Skeleton
@@ -111,8 +133,12 @@ trivially_copy_pass_by_ref = "deny"
 
 ```rust
 // crates/pg-sink/src/checkpoint.rs:19 — every field is Copy (`Lsn` is `Clone, Copy, …`), but the
-// type has `&mut self` mutators. Decide, then record the decision in the derive or in an allow.
-#[derive(Debug, Clone)] // ← todo!(): + Copy, or #[allow(missing_copy_implementations)] + why not
+// type has `&mut self` mutators. The audited decision is locked: keep it non-Copy and document why.
+#[allow(
+    missing_copy_implementations,
+    reason = "copying this mutable durability state could silently detach checkpoint advances"
+)]
+#[derive(Debug, Clone)]
 pub struct DurabilityCheckpoint {
     confirmed_flush: Lsn,
     open_txn_floor: Option<Lsn>,
@@ -148,6 +174,14 @@ pub struct HeartbeatConfig {
 }
 ```
 
+## Verification commands
+
+```text
+rule-present = test -f .claude/skills/rust-skills/rules/own-copy-small.md
+focused-test = cargo test -p common -p control -p loader -p pg-sink -p pg-to-arrow
+diff-check = git diff --check origin/main...HEAD
+```
+
 ## Definition of Done
 
 A reviewer merges this PR when **all** of the following hold:
@@ -155,12 +189,10 @@ A reviewer merges this PR when **all** of the following hold:
 - [ ] `[workspace.lints.rust]` contains `missing_copy_implementations = "deny"`, with a comment
       recording that it is allow-by-default and therefore was *not* covered by `warnings = "deny"`.
 - [ ] `[workspace.lints.clippy]` contains `trivially_copy_pass_by_ref = "deny"`.
-- [ ] `DurabilityCheckpoint`, `SlotStatus`, `SlotAction` and `HeartbeatConfig` each either derive
-      `Copy` or carry `#[allow(missing_copy_implementations)]` with a one-line reason — no silent
-      third option.
-- [ ] Every other type the lint reports across `common`, `control`, `loader`, `pg-sink` and
-      `pg-to-arrow` is resolved the same way; there is **no** bare `#[allow]` without a reason
-      comment anywhere in the diff.
+- [ ] The nine immutable audited types derive `Copy`; `DurabilityCheckpoint` and `Backpressure`
+      remain non-`Copy` with the two specified reasoned allows — no implementation-time triage.
+- [ ] The baseline remains exactly the audited 11 paths. Any extra or missing finding blocks rather
+      than expanding the allowlist or changing the decision.
 - [ ] The production `Copy`-derive count is **≥ 32** (28 today), and no type holding a `String`,
       `Vec` or `Bytes` gained `Copy`.
 - [ ] Any `trivially_copy_pass_by_ref` site created by the new derives is fixed by taking the value,
@@ -195,15 +227,14 @@ $ cargo clippy --all-targets --all-features -- -D warnings
 
 ## Hints & gotchas
 
-- **Enumerate before you edit.** Land the lint at `"warn"` first, run
-  `cargo clippy --all-targets --all-features 2>&1 | grep -A2 missing_copy_implementations`, write the
-  list down, triage it, *then* flip it to `"deny"`. Going straight to `deny` turns the first
-  compilation into an unreadable wall.
+- **Confirm before you edit.** A temporary local `"warn"` run may be used only to reproduce the
+  exact audited 11 findings. Any extra or missing finding is a baseline mismatch and STOP; do not
+  re-triage the population. The committed result is `"deny"`.
 - **`Copy` on a type with `&mut self` mutators is a real hazard.** `DurabilityCheckpoint` advances
   `confirmed_flush_lsn` — the single most safety-critical value in the sink. If it is `Copy`, an
   accidental `let mut c = *checkpoint;` mutates a *duplicate* and silently loses the advance. That is
-  a legitimate reason to choose the `#[allow]` branch; if you choose `Copy` anyway, say in the PR body
-  why the call sites (all of which thread `&mut DurabilityCheckpoint`) make it safe.
+  why this task explicitly keeps it non-`Copy` with the reasoned allow. Do not revisit that verdict
+  during implementation; a contradictory baseline requires re-authoring.
 - Size reality check, so you argue from numbers rather than vibes: `Lsn` is a `u64` (8 bytes),
   `Option<Lsn>` has no niche (16 bytes), `Duration` is 16 bytes. So `SlotStatus`/`SlotAction` land in
   the "≤ 16, derive it" band, `DurabilityCheckpoint` and `HeartbeatConfig` in the "17–64, consider it"
@@ -223,7 +254,7 @@ $ cargo clippy --all-targets --all-features -- -D warnings
 
 ## References
 
-- Rule: [`own-copy-small`](../../.claude/skills/rust-skills/rules/own-copy-small.md)
+- Rule: [`own-copy-small`](../../../.claude/skills/rust-skills/rules/own-copy-small.md)
 - Design: `docs/architecture.md` § "Component 1 — Postgres Sink (`walrus-pg-sink`)" — the
   durability checkpoint (§1.5) and the slot-loss classification guard (§1.8).
-- Prev: [PR 9.3](./pr-9.3-own-clone-explicit.md) · Next: [PR 9.5](./pr-9.5-own-cow-conditional.md) · [Phase 9](./README.md) · [Roadmap](../README.md)
+- Prev: [PR 9.3](./pr-9.3-own-clone-explicit.md) · Next: [PR 9.5](./pr-9.5-own-cow-conditional.md) · [Roadmap](../README.md)

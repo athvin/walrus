@@ -8,6 +8,9 @@
 
 > **Status:** 📋 Planned <!-- flip to "✅ Done — <PR url>" when it merges -->
 
+> **Readiness:** audited · **Outcome:** change
+> **Gates:** fmt,clippy,test · **Test packages:** loader
+
 > **Phase:** 9 — Rust ownership & borrowing · **Crates touched:** `loader` ·
 > **Est. size:** M · **Depends on:** PR 9.8 · **Unlocks:** PR 9.10
 
@@ -31,7 +34,7 @@ cache is thread-local.
 
 ## Read first
 
-- [`own-rc-single-thread`](../../.claude/skills/rust-skills/rules/own-rc-single-thread.md) — take the
+- [`own-rc-single-thread`](../../../.claude/skills/rust-skills/rules/own-rc-single-thread.md) — take the
   Arc-vs-Rc decision table and the "prefer `Rc::clone(&x)` to `x.clone()`" key point. Skip the
   `Weak`/cycle-breaking section: this cache is a flat map with no back-references and PR 9.9
   introduces no cycles.
@@ -45,7 +48,24 @@ cache is thread-local.
 - `crates/loader/src/duck_test.rs` — `cached_schema_versions()` and the assertion that two v1 files
   produce exactly one cached introspection. That test is the behavioural contract to keep green.
 
+## Baseline contract
+
+- **Precondition:** Confirm `rule-present`, then inspect the immediate predecessor's named paths and
+  symbols with `rg`. Historical line coordinates in the audit are navigation hints only; the
+  named symbol and stated precondition are authoritative.
+- **Allowed files:** The **Files to create / modify** block is exhaustive.
+
+- Any other current-tree mismatch blocks before editing.
+
 ## Scope
+
+**Baseline precondition.** Before editing, reproduce the task's authored finding from its named
+source paths, symbols, counts, and read-only probes; run the full **Verification commands** block
+after implementation. The named sites and allowed paths are the complete task boundary.
+
+**Baseline mismatch.** If the current tree differs from that authored finding, **STOP and request
+task re-authoring before editing.** Do not choose another site, implementation, evidence conclusion,
+or outcome.
 
 **In scope**
 
@@ -143,6 +163,14 @@ let quoted = file_cols
 rc_buffer = "deny"
 ```
 
+## Verification commands
+
+```text
+rule-present = test -f .claude/skills/rust-skills/rules/own-rc-single-thread.md
+focused-test = cargo test -p loader
+diff-check = git diff --check origin/main...HEAD
+```
+
 ## Definition of Done
 
 A reviewer merges this PR when **all** of the following hold:
@@ -215,7 +243,7 @@ test result: ok. 6 passed; 0 failed
 
 ## References
 
-- Rule: [`own-rc-single-thread`](../../.claude/skills/rust-skills/rules/own-rc-single-thread.md)
+- Rule: [`own-rc-single-thread`](../../../.claude/skills/rust-skills/rules/own-rc-single-thread.md)
 - Design: `docs/walrus-loader.md` §8.1 (one read-write `.duckdb` connection per table — the
   single-writer fence that makes the one-worker-per-file model, and this cache, single-threaded).
-- Prev: [PR 9.8](./pr-9.8-own-arc-shared.md) · Next: [PR 9.10](./pr-9.10-own-refcell-interior.md) · [Phase 9](./README.md) · [Roadmap](../README.md)
+- Prev: [PR 9.8](./pr-9.8-own-arc-shared.md) · Next: [PR 9.10](./pr-9.10-own-refcell-interior.md) · [Roadmap](../README.md)

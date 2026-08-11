@@ -8,6 +8,9 @@
 
 > **Status:** 📋 Planned <!-- flip to "✅ Done — <PR url>" when it merges -->
 
+> **Readiness:** audited · **Outcome:** change
+> **Gates:** fmt,clippy,test · **Test packages:** common,pg-sink
+
 > **Phase:** 9 — Rust ownership & borrowing · **Crates touched:** `common`, `pg-sink` ·
 > **Est. size:** M · **Depends on:** PR 9.6 · **Unlocks:** PR 9.8
 
@@ -32,7 +35,7 @@ four are already at 0 sites).
 
 ## Read first
 
-- [`own-move-large`](../../.claude/skills/rust-skills/rules/own-move-large.md) — take the size/move
+- [`own-move-large`](../../../.claude/skills/rust-skills/rules/own-move-large.md) — take the size/move
   -frequency table (`< 128 B` never box, `> 512 B` always) and the `size_of` measurement habit.
   Ignore the "Pattern: Builder Returns Boxed" section — walrus has no such builder, and this PR
   boxes nothing.
@@ -47,7 +50,24 @@ four are already at 0 sites).
 - `Cargo.toml:15-21` — the `[workspace.lints.clippy]` block and the comment explaining why
   restriction/pedantic lints need no `priority` juggling next to `all = "deny"`.
 
+## Baseline contract
+
+- **Precondition:** Confirm `rule-present`, then inspect the immediate predecessor's named paths and
+  symbols with `rg`. Historical line coordinates in the audit are navigation hints only; the
+  named symbol and stated precondition are authoritative.
+- **Allowed files:** The **Files to create / modify** block is exhaustive.
+
+- Any other current-tree mismatch blocks before editing.
+
 ## Scope
+
+**Baseline precondition.** Before editing, reproduce the task's authored finding from its named
+source paths, symbols, counts, and read-only probes; run the full **Verification commands** block
+after implementation. The named sites and allowed paths are the complete task boundary.
+
+**Baseline mismatch.** If the current tree differs from that authored finding, **STOP and request
+task re-authoring before editing.** Do not choose another site, implementation, evidence conclusion,
+or outcome.
 
 **In scope**
 
@@ -138,6 +158,14 @@ large_stack_frames = "deny"
 large_futures = "deny"
 ```
 
+## Verification commands
+
+```text
+rule-present = test -f .claude/skills/rust-skills/rules/own-move-large.md
+focused-test = cargo test -p common -p pg-sink
+diff-check = git diff --check origin/main...HEAD
+```
+
 ## Definition of Done
 
 A reviewer merges this PR when **all** of the following hold:
@@ -216,7 +244,7 @@ error[E0080]: evaluation panicked: assertion failed: size_of::<SinkMeta>() <= SI
 
 ## References
 
-- Rule: [`own-move-large`](../../.claude/skills/rust-skills/rules/own-move-large.md)
+- Rule: [`own-move-large`](../../../.claude/skills/rust-skills/rules/own-move-large.md)
 - Design: `docs/architecture.md` §1.2 (hand-rolled replication consumer) and §1.4 (Arrow conversion
   & Parquet write) — the per-message / per-row paths these budgets protect.
-- Prev: [PR 9.6](./pr-9.6-own-lifetime-elision.md) · Next: [PR 9.8](./pr-9.8-own-arc-shared.md) · [Phase 9](./README.md) · [Roadmap](../README.md)
+- Prev: [PR 9.6](./pr-9.6-own-lifetime-elision.md) · Next: [PR 9.8](./pr-9.8-own-arc-shared.md) · [Roadmap](../README.md)

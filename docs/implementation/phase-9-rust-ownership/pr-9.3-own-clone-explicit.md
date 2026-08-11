@@ -8,6 +8,9 @@
 
 > **Status:** 📋 Planned <!-- flip to "✅ Done — <PR url>" when it merges -->
 
+> **Readiness:** audited · **Outcome:** change
+> **Gates:** fmt,clippy,test · **Test packages:** loader
+
 > **Phase:** 9 — Rust ownership & borrowing · **Crates touched:** `loader` ·
 > **Est. size:** S · **Depends on:** PR 9.2 · **Unlocks:** PR 9.4
 
@@ -34,7 +37,7 @@ half, pins the lint at `deny`, and adds the rename-fold test `ddl_additive.rs` i
 
 ## Read first
 
-- [`own-clone-explicit`](../../.claude/skills/rust-skills/rules/own-clone-explicit.md) — take the
+- [`own-clone-explicit`](../../../.claude/skills/rust-skills/rules/own-clone-explicit.md) — take the
   "`clone_from` optimization" section from it (`buffer = source.clone()` vs
   `buffer.clone_from(&source)`), and the "derive vs manual `Clone`" boundary that keeps this ticket
   from turning into a hand-written-`impl` exercise.
@@ -45,7 +48,24 @@ half, pins the lint at `deny`, and adds the rename-fold test `ddl_additive.rs` i
   `TableDb` on `:memory:`) plus the `columns_of` / `data_type_of` probes the four existing tests use.
 - `Cargo.toml:15-21` — `[workspace.lints.clippy]`.
 
+## Baseline contract
+
+- **Precondition:** Confirm `rule-present`, then inspect the immediate predecessor's named paths and
+  symbols with `rg`. Historical line coordinates in the audit are navigation hints only; the
+  named symbol and stated precondition are authoritative.
+- **Allowed files:** The **Files to create / modify** block is exhaustive.
+
+- Any other current-tree mismatch blocks before editing.
+
 ## Scope
+
+**Baseline precondition.** Before editing, reproduce the task's authored finding from its named
+source paths, symbols, counts, and read-only probes; run the full **Verification commands** block
+after implementation. The named sites and allowed paths are the complete task boundary.
+
+**Baseline mismatch.** If the current tree differs from that authored finding, **STOP and request
+task re-authoring before editing.** Do not choose another site, implementation, evidence conclusion,
+or outcome.
 
 **In scope**
 
@@ -123,6 +143,14 @@ fn rename_table_carries_current_name_through_the_fold() {
 }
 ```
 
+## Verification commands
+
+```text
+rule-present = test -f .claude/skills/rust-skills/rules/own-clone-explicit.md
+focused-test = cargo test -p loader
+diff-check = git diff --check origin/main...HEAD
+```
+
 ## Definition of Done
 
 A reviewer merges this PR when **all** of the following hold:
@@ -189,7 +217,7 @@ test result: ok. 6 passed; 0 failed; 1 ignored
 
 ## References
 
-- Rule: [`own-clone-explicit`](../../.claude/skills/rust-skills/rules/own-clone-explicit.md)
+- Rule: [`own-clone-explicit`](../../../.claude/skills/rust-skills/rules/own-clone-explicit.md)
 - Design: `docs/architecture.md` § "DDL capture (schema evolution)" — the additive-change taxonomy
   `apply_additive` implements.
-- Prev: [PR 9.2](./pr-9.2-own-slice-over-vec.md) · Next: [PR 9.4](./pr-9.4-own-copy-small.md) · [Phase 9](./README.md) · [Roadmap](../README.md)
+- Prev: [PR 9.2](./pr-9.2-own-slice-over-vec.md) · Next: [PR 9.4](./pr-9.4-own-copy-small.md) · [Roadmap](../README.md)

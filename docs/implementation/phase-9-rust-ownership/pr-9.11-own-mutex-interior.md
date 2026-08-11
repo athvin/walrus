@@ -8,6 +8,9 @@
 
 > **Status:** 📋 Planned <!-- flip to "✅ Done — <PR url>" when it merges -->
 
+> **Readiness:** audited · **Outcome:** change
+> **Gates:** fmt,clippy,test · **Test packages:** pg-sink
+
 > **Phase:** 9 — Rust ownership & borrowing · **Crates touched:** `pg-sink` ·
 > **Est. size:** S · **Depends on:** PR 9.10 · **Unlocks:** PR 9.12
 
@@ -32,7 +35,7 @@ shape cannot come back.
 
 ## Read first
 
-- [`own-mutex-interior`](../../.claude/skills/rust-skills/rules/own-mutex-interior.md) — take the
+- [`own-mutex-interior`](../../../.claude/skills/rust-skills/rules/own-mutex-interior.md) — take the
   "When to Use What" table and the `parking_lot` section. Ignore its **Mutex Poisoning** examples:
   they are `std::sync::Mutex` shapes that walrus deliberately does not have (PR 7.6), and copying
   `lock().unwrap()` in here would violate `clippy::unwrap_used = "deny"`.
@@ -47,7 +50,24 @@ shape cannot come back.
   keep green.
 - `Cargo.toml:38-41` — the comment recording *why* `parking_lot` is a direct dependency.
 
+## Baseline contract
+
+- **Precondition:** Confirm `rule-present`, then inspect the immediate predecessor's named paths and
+  symbols with `rg`. Historical line coordinates in the audit are navigation hints only; the
+  named symbol and stated precondition are authoritative.
+- **Allowed files:** The **Files to create / modify** block is exhaustive.
+
+- Any other current-tree mismatch blocks before editing.
+
 ## Scope
+
+**Baseline precondition.** Before editing, reproduce the task's authored finding from its named
+source paths, symbols, counts, and read-only probes; run the full **Verification commands** block
+after implementation. The named sites and allowed paths are the complete task boundary.
+
+**Baseline mismatch.** If the current tree differs from that authored finding, **STOP and request
+task re-authoring before editing.** Do not choose another site, implementation, evidence conclusion,
+or outcome.
 
 **In scope**
 
@@ -143,6 +163,14 @@ significant_drop_in_scrutinee = "deny"
 significant_drop_tightening = "deny"
 ```
 
+## Verification commands
+
+```text
+rule-present = test -f .claude/skills/rust-skills/rules/own-mutex-interior.md
+focused-test = cargo test -p pg-sink
+diff-check = git diff --check origin/main...HEAD
+```
+
 ## Definition of Done
 
 A reviewer merges this PR when **all** of the following hold:
@@ -219,8 +247,8 @@ test result: ok. 8 passed; 0 failed
 
 ## References
 
-- Rule: [`own-mutex-interior`](../../.claude/skills/rust-skills/rules/own-mutex-interior.md)
+- Rule: [`own-mutex-interior`](../../../.claude/skills/rust-skills/rules/own-mutex-interior.md)
 - Design: `docs/single-table-reload.md` H1 (the echo-wait watermark — why the registry is shared
   between the decode loop and the exporter tasks) and
   `docs/implementation/notes/commit-visibility-race.md` (the race the cross-check bounds).
-- Prev: [PR 9.10](./pr-9.10-own-refcell-interior.md) · Next: [PR 9.12](./pr-9.12-own-rwlock-readers.md) · [Phase 9](./README.md) · [Roadmap](../README.md)
+- Prev: [PR 9.10](./pr-9.10-own-refcell-interior.md) · Next: [PR 9.12](./pr-9.12-own-rwlock-readers.md) · [Roadmap](../README.md)

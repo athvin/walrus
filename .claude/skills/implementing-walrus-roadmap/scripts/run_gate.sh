@@ -9,8 +9,8 @@
 #             workspace run (from next_task.py's `test_packages`)
 #   --keep-stack  leave `docker compose` running afterwards (default: down -v)
 #
-# The gate list comes from next_task.py's `gates` field, which derives it from
-# the task's Definition of Done — run exactly the gates that task's DoD claims.
+# The gate list comes from next_task.py's `gates` field. Phase 9+ tasks declare
+# it explicitly; only legacy phase 0-8 tasks use Definition-of-Done inference.
 #
 # Prints one CHECK:<name>=PASS|FAIL|SKIP:<reason> line per check, a 40-line tail
 # of each failing check's output, and a final GATE=PASS|FAIL.
@@ -27,12 +27,54 @@ pkgs=""
 keep_stack=no
 while [ $# -gt 0 ]; do
   case "$1" in
-    --pkgs)       pkgs=$2; shift 2 ;;
+    --pkgs)
+      if [ $# -lt 2 ] || [ -z "$2" ] || [[ "$2" == --* ]]; then
+        echo "GATE=FAIL"
+        echo "ANOMALY=--pkgs requires a non-empty comma-separated value; omit --pkgs when no packages are declared"
+        exit 2
+      fi
+      pkgs=$2
+      shift 2
+      ;;
     --keep-stack) keep_stack=yes; shift ;;
     *) echo "GATE=FAIL"; echo "ANOMALY=unknown flag $1"; exit 2 ;;
   esac
 done
 [ "$gates" = "baseline" ] && gates="fmt,clippy,test"
+
+# Validate the complete request before running anything. A misspelled gate used
+# to produce SKIP and a false-green final verdict; it is now an anomaly.
+supported_gates="fmt clippy test sqlx conformance deny msrv compose integration e2e manifests images"
+if [[ "$gates" == ,* ]] || [[ "$gates" == *, ]] || [[ "$gates" == *,,* ]] \
+   || [[ "$gates" =~ [^a-z,-] ]]; then
+  echo "GATE=FAIL"
+  echo "ANOMALY=invalid comma-separated gate list $gates"
+  exit 2
+fi
+seen_gates=" "
+for gate in ${gates//,/ }; do
+  if [ -z "$gate" ] || ! [[ " $supported_gates " == *" $gate "* ]]; then
+    echo "CHECK:${gate:-<empty>}=FAIL"
+    echo "GATE=FAIL"
+    echo "ANOMALY=unknown gate name ${gate:-<empty>}"
+    exit 2
+  fi
+  if [[ "$seen_gates" == *" $gate "* ]]; then
+    echo "GATE=FAIL"
+    echo "ANOMALY=duplicate gate name $gate"
+    exit 2
+  fi
+  seen_gates+="$gate "
+done
+
+if [ -n "$pkgs" ]; then
+  if [[ "$pkgs" == ,* ]] || [[ "$pkgs" == *, ]] || [[ "$pkgs" == *,,* ]] \
+     || [[ "$pkgs" =~ [^a-z0-9,-] ]]; then
+    echo "GATE=FAIL"
+    echo "ANOMALY=invalid --pkgs value $pkgs"
+    exit 2
+  fi
+fi
 
 repo=$(git rev-parse --show-toplevel 2>/dev/null || true)
 if [ -z "$repo" ]; then
@@ -201,7 +243,8 @@ for gate in ${gates//,/ }; do
       if docker_up; then run_check images bash scripts/image-smoke.sh
       else skip images "docker daemon not running — CI covers this job"; fi ;;
 
-    *) echo "CHECK:$gate=SKIP:unknown gate name" ;;
+    # Unreachable because the request is validated before any command runs.
+    *) echo "CHECK:$gate=FAIL"; fail=1 ;;
   esac
 done
 

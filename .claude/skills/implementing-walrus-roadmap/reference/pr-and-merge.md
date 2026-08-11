@@ -138,8 +138,19 @@ mark_done.py 8.4 --pr 123 --note "ManifestId slice only"
 
 **Drift** — a ☐ row whose task file already says Done (`next_task.py` returns
 `VERDICT=DRIFT`) is a mark-done that only half landed. Fix it exactly like the
-above but on branch `chore-reconcile-roadmap`, covering every drifted task in one
-PR. Never re-implement a task that already merged.
+above but on the deterministic branch `chore-reconcile-roadmap-<first-drift-id>`,
+covering every currently drifted task in one PR. Always route it through
+`preflight.sh --reconcile <first-drift-id>` so an existing local/remote branch,
+open PR, merged PR, or human-closed PR is resumed rather than duplicated. Never
+re-implement a task that already merged.
+
+The same reconcile branch is used when both signals are still unset but the
+code and mark-done PRs already merged. That validator-consistent case is allowed
+only when reconcile-mode preflight independently proves exactly one merged PR
+for each deterministic branch and emits `CONSISTENT_UNSET_PROOF=yes`; pass its
+`MERGED_CODE_PR` to `mark_done.py`. A selector verdict alone is never merge
+proof, and a merged reconcile is complete only when the target task reports
+`BOX=checked` and `MARKER=done`.
 
 ## 6. Stop-report template
 

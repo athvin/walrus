@@ -22,7 +22,9 @@ skill, stay in the safety rails below at all times.
 | row | the task's `\| ☐ \|` line in `docs/implementation/README.md` |
 | marker | the task file's `> **Status:** ✅ Done — <url>` line |
 | done | row **and** marker both set — written together by the mark-done PR |
-| gate | the check set `run_gate.sh` runs, derived from the task's own DoD |
+| readiness | phase 9+ audit state; only `audited` is selectable (`draft` is a scaffold) |
+| outcome | author-decided `change`, `evidence`, or `superseded by PR <id>` |
+| gate | the explicit phase 9+ check set `run_gate.sh` runs (legacy phases infer it) |
 | orchestrator | this session: runs scripts and git/gh, delegates everything else |
 | implementer / fixer | fresh per-task subagents that read docs, write code, commit |
 | ledger | the `<!-- walrus-loop: … -->` line in the PR body (durable counters) |
@@ -60,6 +62,12 @@ skill, stay in the safety rails below at all times.
     touch the memory directory or files unrelated to the current task.
 13. NEVER read the design docs, task bodies, or CI logs in the orchestrator —
     delegate those to subagents and run scripts for state.
+14. NEVER select a phase 9+ task unless full-corpus validation reports all 265
+    tasks audited, linked, serially ordered, tracked, and atomically activated.
+    `draft`, a partial Rust table, or malformed explicit metadata means STOP.
+15. NEVER let an implementer change a task's predetermined outcome. A failed
+    baseline precondition blocks for re-authoring; it does not turn a `change`
+    into evidence (or vice versa).
 
 ## Scripts
 
@@ -68,40 +76,59 @@ reimplement their logic inline. Each prints `KEY=VALUE` lines and a final verdic
 
 | Script | Invocation | Output |
 |---|---|---|
-| `next_task.py` | `python3 …/next_task.py` (also `--status`, `--task <id>`) | `VERDICT=SELECTED\|ALL_DONE\|NO_ELIGIBLE\|PARSE_ERROR\|DRIFT` + task JSON (id, title, path, branch, mark_done_branch, pr_title, size, crates, depends_on_text, **gates**, test_packages) |
-| `preflight.sh` | `…/preflight.sh` (repo mode) | `PREFLIGHT=PASS\|FAIL` + BRANCH/CLEAN/SYNCED/GH_AUTH/MAIN_CI/**DOCKER**/CARGO_DENY/KUBECONFORM/SQLX_CLI |
-| `preflight.sh` | `…/preflight.sh <branch> <id>` | `ROUTE=FRESH\|CONTINUE_IMPL\|POLL_CI\|MARK_DONE\|POLL_MARK_DONE\|DONE\|STOP_AMBIGUOUS`; leaves the checkout where the route needs it |
-| `run_gate.sh` | `…/run_gate.sh <gates> [--pkgs a,b]` | `CHECK:<name>=PASS\|FAIL\|SKIP:<reason>` + `GATE=PASS\|FAIL` (40-line tail per failure) |
+| `next_task.py` | `python3 …/next_task.py` (also `--status`, `--task <id>`, `--validate-all`) | selection verdict + task JSON (`readiness`, `outcome`, explicit `gates`, `test_packages`, `gate_command`, `verification_commands` included); validation prints progress, outcome counts, `NEXT`, `LAST`, and untracked inputs |
+| `preflight.sh` | `…/preflight.sh --wait-main <seconds>` (repo mode) | bounded exact-main-SHA CI wait, then `PREFLIGHT=PASS\|DRIFT\|FAIL` + BRANCH/CLEAN/SYNCED/GH_AUTH/MAIN_CI/**DOCKER**/CARGO_DENY/KUBECONFORM/SQLX_CLI; `DRIFT` permits only step 9b |
+| `preflight.sh` | `…/preflight.sh <branch> <id>` | task route, including explicit `PUSH_CI` / `PUSH_MARK_DONE` before polling when local commits are ahead; leaves the checkout where the route needs it |
+| `preflight.sh` | `…/preflight.sh --reconcile <drift-id>` | idempotent per-drift branch/PR route: `FRESH_RECONCILE\|CONTINUE_RECONCILE\|PUSH_RECONCILE\|POLL_RECONCILE\|RECONCILE_DONE\|STOP_AMBIGUOUS` |
+| `run_gate.sh` | `…/run_gate.sh <gates> [--pkgs a,b]` | `CHECK:<name>=PASS\|FAIL\|SKIP:<reason>` + `GATE=PASS\|FAIL`; omit `--pkgs` for an empty list, while a bare flag or unknown gate is an anomaly |
 | `ci_status.sh` | `…/ci_status.sh <pr> [--wait s] [--grace s]` | `VERDICT=PASS\|FAIL\|PENDING\|NO_CHECKS\|ANOMALY` + HEAD_SHA/FAILING/**FLAKE_CANDIDATE**/RUN_ID (exit 0/1/2/3/4) |
 | `mark_done.py` | `python3 …/mark_done.py <id> --pr <url> [--note …]` | `VERDICT=MARKED\|ALREADY_DONE\|ERROR` + STATUS_LINE/DOD_TICKED/README_BOX/FILES (idempotent) |
 
 ## Session startup
 
-1. Run `preflight.sh` (repo mode). `PREFLIGHT=FAIL` → STOP with the failing keys.
-   `MAIN_CI=red` → STOP: never cut a branch from red main. Note `DOCKER=` — with
-   the daemon down, the compose / integration / e2e / images gates SKIP locally
-   and CI is the only proof; plan for a CI round trip on those tasks.
-2. Read `reference/green-gates.md` and `reference/pr-and-merge.md` once. Do not
+1. Read `reference/green-gates.md` and `reference/pr-and-merge.md` once. Do not
    read the other references — they are for subagents.
-3. Keep an in-session ledger: one line per finished task
+2. Keep an in-session ledger: one line per finished task
    (`<id> merged PR#n · mark-done PR#m`). Retain nothing else between tasks.
 
 ## The loop
 
 Repeat until `ALL_DONE`. Every step is idempotent; on any interruption,
-re-invoking this skill re-enters at step 1 and step 2 routes to the right place.
+re-invoking this skill re-enters at step 0 and step 2 routes to the right place.
+
+**0 · PREFLIGHT** — run `preflight.sh --wait-main 2700` at the start of
+**every iteration**, including the first and the iteration immediately after a
+merge. It first runs `next_task.py --validate-all --require-tracked`; require
+`RUST_ROWS=265` and `UNTRACKED_ROADMAP_FILES=0` before it probes GitHub or the
+checkout. It may switch a clean interrupted loop branch back to main and then
+revalidates the synced main tree. It polls the exact `origin/main` SHA's
+`ci.yml` push run to a bounded terminal result, so a newly merged SHA may be
+queued/running without being mistaken for green. `PREFLIGHT=PASS` → step 1.
+`PREFLIGHT=DRIFT` → step 9b and never implementation. `PREFLIGHT=FAIL` →
+STOP with the failing keys; red, absent after the wait cap, anomalous, or
+unqueryable main CI never proceeds. A push run on main may treat validator exit
+5 as green solely so this verified drift-recovery path can run; the same drift
+still fails every branch/PR workflow. Note `DOCKER=` — with the daemon down,
+compose / integration / e2e / images gates SKIP locally and CI is the proof.
 
 **1 · SELECT** — `python3 scripts/next_task.py`.
 `ALL_DONE` → final report (session ledger + `--status`), end.
 `DRIFT` → step 9b, then re-select. `NO_ELIGIBLE` / `PARSE_ERROR` → STOP (the
 authoritative state is inconsistent; never guess around it).
 `SELECTED` → keep the JSON; its fields are `{ID} {TITLE} {PATH} {BRANCH}
-{MD_BRANCH} {SIZE} {GATES} {PKGS} {PR_TITLE}` below.
+{MD_BRANCH} {SIZE} {READINESS} {OUTCOME} {GATE_COMMAND}
+{VERIFICATION_COMMANDS} {PR_TITLE}` below. A phase 9+ task with anything other
+than `READINESS=audited` is a parser failure, never work to delegate.
 
 **2 · ROUTE** — `scripts/preflight.sh {BRANCH} {ID}`.
 `FRESH` → step 3 · `CONTINUE_IMPL` → step 4 with MODE=continue ·
+`PUSH_CI` → push the checked-out branch (use `-u origin {BRANCH}` when
+`PUSH_SET_UPSTREAM=yes`), then step 7 ·
 `POLL_CI` → step 7 (re-read the ledger from the PR body first) ·
-`MARK_DONE` → step 9 · `POLL_MARK_DONE` → step 9c ·
+`MARK_DONE` → step 9 fresh · `CONTINUE_MARK_DONE` → step 9 resume ·
+`PUSH_MARK_DONE` → push (with `-u` when reported), then step 9c ·
+`POLL_MARK_DONE` → step 9c · `RECONCILE` (a merged bookkeeping PR left
+both done signals unset; half-landed signals were routed by step 0) → step 9b ·
 `DONE` / `STOP_AMBIGUOUS` → STOP (a selected task cannot already be done).
 
 **3 · BRANCH** — `git switch -c {BRANCH} && git push -u origin {BRANCH}`.
@@ -112,11 +139,17 @@ fresh subagent. On return:
 - `STATUS=blocked` → STOP with its `BLOCKED_ON`.
 - `STATUS=needs-another-round` → relaunch MODE=continue. Max **3 rounds** per
   task per session; exceeded → STOP.
-- `STATUS=complete` with `GATE=PASS` → `git push`, step 5.
+- `STATUS=complete` with `GATE=PASS`, the same reported outcome, and every JSON
+  verification label reported `PASS` → push, then step 5. Use
+  `git push -u origin {BRANCH}` when the route printed
+  `PUSH_SET_UPSTREAM=yes`; otherwise use `git push`. Missing/failed labels are
+  incomplete even if the prose says the DoD is met.
 - `GATE=FAIL` claimed complete → one continue round to fix; recurrence → STOP.
 - `SIZE=L` and the subagent reports a blast radius it cannot land green in one
-  PR → slice it per `reference/task-conventions.md` §Slicing (the PR 8.4a
-  precedent): ship slice `a` now, record the remaining slices in the task file.
+  PR → for legacy phases 0–8, slice per `reference/task-conventions.md` §Slicing.
+  For the fixed phase-9+ one-rule corpus, `STATUS=blocked`: re-author that same
+  task before selection. Never add a lettered Rust row, partially mark it done,
+  or defer an unindexed remainder.
 
 **5 · SCOPE CHECK** — only for tasks sized M or L: launch a one-shot reviewer
 subagent with ONLY `git diff main...HEAD --stat`, the diff of the key files, the
@@ -163,8 +196,48 @@ stage exactly the `FILES=` it printed → commit
 `docs: mark PR {ID} done (Status ✅, DoD ticks, README box)` → push →
 `gh pr create` per `reference/pr-and-merge.md` §5.
 
-**9b · RECONCILE (drift only)** — same flow on branch `chore-reconcile-roadmap`,
-running `mark_done.py` for each drifted task. Never re-implement. → step 1.
+On `CONTINUE_MARK_DONE`, the router has checked out the existing bookkeeping
+branch. Re-run `mark_done.py` idempotently, inspect/stage only its `FILES=`,
+commit only if changes remain, then push without force. Use
+`git push -u origin {MD_BRANCH}` when `PUSH_SET_UPSTREAM=yes`; otherwise use
+`git push`. Create the missing PR. Do not recreate or delete the branch.
+
+**9b · RECONCILE (bookkeeping repair only)** — there are exactly two
+authorized entries:
+
+1. Step 0 / selection reported `VERDICT=DRIFT`: retain its `TASK`, `BRANCH`,
+   and `MERGED_PR` fields.
+2. Step 2 reported `RECONCILE` for the currently selected `{ID}` because both
+   signals remain unset despite merged code and mark-done PRs: use `{TASK}={ID}`.
+
+Run `preflight.sh --reconcile {TASK}` in either case. For entry 2 it must print
+`CONSISTENT_UNSET_PROOF=yes`, `MERGED_CODE_PR=<n>`, and
+`MERGED_MARK_DONE_PR=<n>` after independently proving exactly one merged PR for
+both branches; any other result → STOP. The reconcile branch is deterministic:
+`chore-reconcile-roadmap-{TASK}`.
+
+- `FRESH_RECONCILE` → create that branch from the checked-out fresh main.
+- `CONTINUE_RECONCILE` → continue on the branch the router checked out.
+- `PUSH_RECONCILE` → push the checked-out local commits (use `-u` when
+  reported), then `POLL_RECONCILE`.
+- `POLL_RECONCILE` → poll and merge exactly like step 9c.
+- `RECONCILE_DONE` → the prior reconcile PR is merged; return to step 0.
+- `STOP_AMBIGUOUS` → STOP. A closed-unmerged reconcile PR is a human veto.
+
+For a fresh/continued entry-2 branch, first run `mark_done.py {TASK} --pr
+<MERGED_CODE_PR>`. Then reconcile every currently reported drift in the same
+docs-only commit. For each `VERDICT=DRIFT`, use its `MERGED_PR` when present. If
+it is `-`, query the exact reported task `BRANCH` and require exactly one merged
+code PR before passing that URL to `mark_done.py`; zero, multiple, open, or
+closed-unmerged matches → STOP. Re-run `next_task.py` after each idempotent
+mark until it no longer reports `DRIFT`, stage only the union of the printed
+`FILES=`, and commit only when a diff remains. Push with `-u` for a fresh or
+`PUSH_SET_UPSTREAM=yes` branch, otherwise push normally; create the reconcile
+PR if none exists, then follow `POLL_RECONCILE`. After merge, the router must
+explicitly prove the target is `BOX=checked` and `MARKER=done`; merely getting a
+selectable/`ALL_DONE` verdict is insufficient, and any remaining `DRIFT` means
+the reconcile PR was incomplete and STOPs. Never re-implement and never recreate
+an existing branch or PR. → step 0.
 
 **9c · MARK-DONE CI + MERGE** — `scripts/ci_status.sh <pr> --wait 900 --grace
 300`. A docs-only diff skips the eight code-gated jobs (they conclude SKIPPED,
@@ -175,9 +248,9 @@ retry, twice max.
 **10 · VERIFY + LOOP** — `git switch main && git fetch origin && git merge
 --ff-only origin/main`; confirm both squashes landed (`git log --oneline -2`);
 `python3 scripts/next_task.py --task {ID}` must print `BOX=checked` and
-`MARKER=done`. Append the session-ledger line. → step 1 (whose preflight
-re-asserts `MAIN_CI=green`; red main → STOP and open a `pr-<id>-fix-<slug>`
-follow-up before continuing).
+`MARKER=done`. Append the session-ledger line. → step 0, which waits for the
+new exact-main push run and re-asserts `MAIN_CI=green`; red main → STOP and
+open a `pr-<id>-fix-<slug>` follow-up before continuing.
 
 ## Caps
 

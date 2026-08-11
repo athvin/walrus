@@ -8,6 +8,9 @@
 
 > **Status:** 📋 Planned <!-- flip to "✅ Done — <PR url>" when it merges -->
 
+> **Readiness:** audited · **Outcome:** change
+> **Gates:** fmt,clippy,test · **Test packages:** loader
+
 > **Phase:** 9 — Rust ownership & borrowing · **Crates touched:** `loader` ·
 > **Est. size:** M · **Depends on:** PR 9.9 · **Unlocks:** PR 9.11
 
@@ -31,7 +34,7 @@ it two more, and leaves the loader with **no** mutex outside `health.rs`.
 
 ## Read first
 
-- [`own-refcell-interior`](../../.claude/skills/rust-skills/rules/own-refcell-interior.md) — take
+- [`own-refcell-interior`](../../../.claude/skills/rust-skills/rules/own-refcell-interior.md) — take
   the "mutate through `&self`" motivation and especially the **Cell for Copy types** section
   (`get`/`set`, no runtime borrow flags, cannot panic). Ignore the `Rc<RefCell<T>>` shared-handles
   pattern: `TableCtx` is owned by exactly one worker and is never shared.
@@ -45,7 +48,24 @@ it two more, and leaves the loader with **no** mutex outside `health.rs`.
 - `crates/loader/src/duck.rs:36-51` — the in-tree precedent: a `RefCell` field whose doc comment
   makes the `!Send`-single-threaded argument you are about to reuse.
 
+## Baseline contract
+
+- **Precondition:** Confirm `rule-present`, then inspect the immediate predecessor's named paths and
+  symbols with `rg`. Historical line coordinates in the audit are navigation hints only; the
+  named symbol and stated precondition are authoritative.
+- **Allowed files:** The **Files to create / modify** block is exhaustive.
+
+- Any other current-tree mismatch blocks before editing.
+
 ## Scope
+
+**Baseline precondition.** Before editing, reproduce the task's authored finding from its named
+source paths, symbols, counts, and read-only probes; run the full **Verification commands** block
+after implementation. The named sites and allowed paths are the complete task boundary.
+
+**Baseline mismatch.** If the current tree differs from that authored finding, **STOP and request
+task re-authoring before editing.** Do not choose another site, implementation, evidence conclusion,
+or outcome.
 
 **In scope**
 
@@ -149,6 +169,14 @@ assert_eq!(
 );
 ```
 
+## Verification commands
+
+```text
+rule-present = test -f .claude/skills/rust-skills/rules/own-refcell-interior.md
+focused-test = cargo test -p loader
+diff-check = git diff --check origin/main...HEAD
+```
+
 ## Definition of Done
 
 A reviewer merges this PR when **all** of the following hold:
@@ -219,8 +247,8 @@ test result: ok. 9 passed; 0 failed
 
 ## References
 
-- Rule: [`own-refcell-interior`](../../.claude/skills/rust-skills/rules/own-refcell-interior.md)
+- Rule: [`own-refcell-interior`](../../../.claude/skills/rust-skills/rules/own-refcell-interior.md)
 - Design: `docs/single-table-reload.md` H8 (watermarks + the frozen frontier a live rebuild
   imposes — what the pause latch reports) and H3 (refresh vs rebuild — the `resync` flavor the id
   cache at `phase_a.rs:46` memoises).
-- Prev: [PR 9.9](./pr-9.9-own-rc-single-thread.md) · Next: [PR 9.11](./pr-9.11-own-mutex-interior.md) · [Phase 9](./README.md) · [Roadmap](../README.md)
+- Prev: [PR 9.9](./pr-9.9-own-rc-single-thread.md) · Next: [PR 9.11](./pr-9.11-own-mutex-interior.md) · [Roadmap](../README.md)

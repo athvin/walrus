@@ -8,6 +8,9 @@
 
 > **Status:** 📋 Planned <!-- flip to "✅ Done — <PR url>" when it merges -->
 
+> **Readiness:** audited · **Outcome:** change
+> **Gates:** fmt,clippy,test · **Test packages:** common
+
 > **Phase:** 9 — Rust ownership & borrowing · **Crates touched:** `common` ·
 > **Est. size:** S · **Depends on:** PR 9.5 · **Unlocks:** PR 9.7
 
@@ -36,7 +39,7 @@ the lint so the next hand-written trait impl cannot reintroduce a name that carr
 
 ## Read first
 
-- [`own-lifetime-elision`](../../.claude/skills/rust-skills/rules/own-lifetime-elision.md) — take the
+- [`own-lifetime-elision`](../../../.claude/skills/rust-skills/rules/own-lifetime-elision.md) — take the
   three rules and the "anonymous lifetime `'_`" section; the "when explicit lifetimes ARE required"
   list is the checklist for what this PR must **not** touch.
 - `crates/common/src/ids.rs:35-67` — the whole `#[cfg(feature = "sqlx")] mod sqlx_support`: the
@@ -48,7 +51,24 @@ the lint so the next hand-written trait impl cannot reintroduce a name that carr
   compiled without it; `--all-features` is not optional for this ticket.
 - `Cargo.toml:15-21` — `[workspace.lints.clippy]`.
 
+## Baseline contract
+
+- **Precondition:** Confirm `rule-present`, then inspect the immediate predecessor's named paths and
+  symbols with `rg`. Historical line coordinates in the audit are navigation hints only; the
+  named symbol and stated precondition are authoritative.
+- **Allowed files:** The **Files to create / modify** block is exhaustive.
+
+- Any other current-tree mismatch blocks before editing.
+
 ## Scope
+
+**Baseline precondition.** Before editing, reproduce the task's authored finding from its named
+source paths, symbols, counts, and read-only probes; run the full **Verification commands** block
+after implementation. The named sites and allowed paths are the complete task boundary.
+
+**Baseline mismatch.** If the current tree differs from that authored finding, **STOP and request
+task re-authoring before editing.** Do not choose another site, implementation, evidence conclusion,
+or outcome.
 
 **In scope**
 
@@ -124,6 +144,14 @@ impl Encode<'_, Postgres> for Lsn {
 }
 ```
 
+## Verification commands
+
+```text
+rule-present = test -f .claude/skills/rust-skills/rules/own-lifetime-elision.md
+focused-test = cargo test -p common
+diff-check = git diff --check origin/main...HEAD
+```
+
 ## Definition of Done
 
 A reviewer merges this PR when **all** of the following hold:
@@ -193,7 +221,7 @@ $ cargo clippy --all-targets --all-features -- -D warnings
 
 ## References
 
-- Rule: [`own-lifetime-elision`](../../.claude/skills/rust-skills/rules/own-lifetime-elision.md)
+- Rule: [`own-lifetime-elision`](../../../.claude/skills/rust-skills/rules/own-lifetime-elision.md)
 - Design: `docs/implementation/phase-8-cleanup/pr-8.4-domain-id-newtypes.md` — the transparent-`int8`
   newtype pattern whose hand-written `Encode`/`Decode` impls this PR tidies.
-- Prev: [PR 9.5](./pr-9.5-own-cow-conditional.md) · Next: [PR 9.7](./pr-9.7-own-move-large.md) · [Phase 9](./README.md) · [Roadmap](../README.md)
+- Prev: [PR 9.5](./pr-9.5-own-cow-conditional.md) · Next: [PR 9.7](./pr-9.7-own-move-large.md) · [Roadmap](../README.md)

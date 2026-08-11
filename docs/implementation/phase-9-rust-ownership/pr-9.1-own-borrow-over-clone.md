@@ -8,6 +8,9 @@
 
 > **Status:** 📋 Planned <!-- flip to "✅ Done — <PR url>" when it merges -->
 
+> **Readiness:** audited · **Outcome:** change
+> **Gates:** fmt,clippy,test · **Test packages:** loader,pg-sink,pg-to-arrow
+
 > **Phase:** 9 — Rust ownership & borrowing · **Crates touched:** `loader`, `pg-to-arrow`, `pg-sink` ·
 > **Est. size:** S · **Depends on:** PR 8.5 · **Unlocks:** PR 9.2
 
@@ -34,7 +37,7 @@ arrow-rs's `Field::name()` hands back). Neither lint is configured anywhere in `
 
 ## Read first
 
-- [`own-borrow-over-clone`](../../.claude/skills/rust-skills/rules/own-borrow-over-clone.md) — take
+- [`own-borrow-over-clone`](../../../.claude/skills/rust-skills/rules/own-borrow-over-clone.md) — take
   the "when clone is acceptable" list from it: storing owned data, crossing a thread boundary, and
   `Copy` types are all fine. This PR only removes clones that are none of those three.
 - `crates/loader/src/duck.rs:77-124` — `ensure_tables_planned`. `keys` is built at :77, last *read*
@@ -47,7 +50,24 @@ arrow-rs's `Field::name()` hands back). Neither lint is configured anywhere in `
 - `Cargo.toml:10-21` — `[workspace.lints.rust]` / `[workspace.lints.clippy]`, and the comment at
   :17-19 explaining why lints outside `clippy::all` need no `priority` juggling.
 
+## Baseline contract
+
+- **Precondition:** Confirm `rule-present`, then inspect the immediate predecessor's named paths and
+  symbols with `rg`. Historical line coordinates in the audit are navigation hints only; the
+  named symbol and stated precondition are authoritative.
+- **Allowed files:** The **Files to create / modify** block is exhaustive.
+
+- Any other current-tree mismatch blocks before editing.
+
 ## Scope
+
+**Baseline precondition.** Before editing, reproduce the task's authored finding from its named
+source paths, symbols, counts, and read-only probes; run the full **Verification commands** block
+after implementation. The named sites and allowed paths are the complete task boundary.
+
+**Baseline mismatch.** If the current tree differs from that authored finding, **STOP and request
+task re-authoring before editing.** Do not choose another site, implementation, evidence conclusion,
+or outcome.
 
 **In scope**
 
@@ -126,6 +146,14 @@ b.push(
 );
 ```
 
+## Verification commands
+
+```text
+rule-present = test -f .claude/skills/rust-skills/rules/own-borrow-over-clone.md
+focused-test = cargo test -p loader -p pg-sink -p pg-to-arrow
+diff-check = git diff --check origin/main...HEAD
+```
+
 ## Definition of Done
 
 A reviewer merges this PR when **all** of the following hold:
@@ -194,7 +222,7 @@ $ cargo clippy --all-targets --all-features -- -D warnings
 
 ## References
 
-- Rule: [`own-borrow-over-clone`](../../.claude/skills/rust-skills/rules/own-borrow-over-clone.md)
+- Rule: [`own-borrow-over-clone`](../../../.claude/skills/rust-skills/rules/own-borrow-over-clone.md)
 - Design: `docs/architecture.md` § "Data type translation (Postgres → Arrow → Parquet)" — the
   per-value append path this PR touches.
-- Prev: [PR 8.5](../phase-8-cleanup/pr-8.5-nits-cluster.md) *(phase boundary → Phase 9 Rust ownership & borrowing)* · Next: [PR 9.2](./pr-9.2-own-slice-over-vec.md) · [Phase 9](./README.md) · [Roadmap](../README.md)
+- Prev: [PR 8.5](../phase-8-cleanup/pr-8.5-nits-cluster.md) *(phase boundary → Phase 9 Rust ownership & borrowing)* · Next: [PR 9.2](./pr-9.2-own-slice-over-vec.md) · [Roadmap](../README.md)

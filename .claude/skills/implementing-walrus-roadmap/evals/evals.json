@@ -5,27 +5,128 @@
       "name": "fresh-task-selects-next-unchecked",
       "skills": ["implementing-walrus-roadmap"],
       "query": "Do the next walrus task.",
-      "setup": "main == origin/main, clean tree, main's CI green, docker daemon down. docs/implementation/README.md has phases 0-8 all ✅ and a phase-9 table whose first row (9.1) is ☐.",
+      "setup": "main == origin/main, clean tree, main's CI green, docker daemon down. Phases 0-8 are all ✅; all 265 audited/tracked phase-9+ rows are atomically present and ☐, beginning with 9.1.",
       "expected_behavior": [
-        "Runs preflight.sh repo mode before anything else and proceeds only on PREFLIGHT=PASS; notes DOCKER=daemon-down as a gate limitation rather than a failure",
-        "Runs next_task.py and selects 9.1, taking branch/pr_title/gates verbatim from the JSON instead of composing them",
+        "Runs preflight.sh --wait-main 2700 before selection and proceeds only on PREFLIGHT=PASS with the current origin/main SHA's CI completed successfully; notes DOCKER=daemon-down as a gate limitation rather than a failure",
+        "Requires preflight's full-corpus VALIDATION=PASS with RUST_ROWS=265 and UNTRACKED_ROADMAP_FILES=0, then selects 9.1",
+        "Takes branch/pr_title/readiness/outcome/gate_command/verification_commands verbatim from JSON instead of composing or inferring them",
         "Routes FRESH via preflight.sh, cuts pr-9.1-own-borrow-over-clone, and pushes it with -u before implementation begins",
         "Delegates implementation to a subagent using reference/implementer-prompt.md; the orchestrator itself never reads architecture.md, the task body, or the rust-skills rule file",
-        "Gates with run_gate.sh using the derived gate list, not a hardcoded fmt/clippy/test trio",
+        "Gates with the JSON gate_command and reports every task verification label PASS",
         "Polls CI with ci_status.sh --wait 2700 --grace 300 and never invokes `gh pr checks`"
+      ]
+    },
+    {
+      "name": "partial-or-draft-rust-roadmap-fails-closed",
+      "skills": ["implementing-walrus-roadmap"],
+      "query": "Continue the walrus roadmap.",
+      "setup": "Either 1-264 of the 265 phase-9+ rows are present, or all rows exist but one task says Readiness: draft / has missing explicit metadata.",
+      "expected_behavior": [
+        "preflight runs next_task.py --validate-all --require-tracked before GitHub or branch mutation",
+        "Validation fails on partial activation or the draft/malformed task and names the exact task",
+        "No task is selected, no branch is cut, and no implementer is allowed to choose an outcome"
+      ]
+    },
+    {
+      "name": "rust-rule-coverage-drift-fails-closed",
+      "skills": ["implementing-walrus-roadmap"],
+      "query": "Validate the complete Rust curriculum.",
+      "setup": "Introduce one catalog inconsistency: remove/duplicate a rust-skills/SKILL.md rule link, move a task to the wrong phase directory, skip a ticket number, or make a README Design/Delivers cell disagree with its rule slug/H1.",
+      "expected_behavior": [
+        "--validate-all rejects the exact catalog inconsistency before selection",
+        "Uses the fixed phase directory/prefix/count map and numeric 1..N ticket order, not Quick Reference bullet order",
+        "Requires a 265-rule ↔ 265-link ↔ 265-task ↔ 265-row bijection"
+      ]
+    },
+    {
+      "name": "explicit-metadata-beats-negative-prose",
+      "skills": ["implementing-walrus-roadmap"],
+      "query": "Validate and select the next Rust task.",
+      "setup": "An audited phase-9+ task's prose says SQLx/e2e/Compose/images are deferred or inapplicable, while its exact Gates header is fmt,clippy,test,integration and Test packages is —.",
+      "expected_behavior": [
+        "JSON gates are exactly fmt,clippy,test,integration; prose keywords add no gates",
+        "JSON test_packages is empty and gate_command omits --pkgs entirely",
+        "The explicit integration gate is retained even if no keyword heuristic would find it"
+      ]
+    },
+    {
+      "name": "gate-runner-rejects-malformed-input",
+      "skills": ["implementing-walrus-roadmap"],
+      "query": "Exercise the roadmap gate runner's argument boundary.",
+      "setup": "Invoke run_gate.sh once with a bare --pkgs and once with an unknown gate name.",
+      "expected_behavior": [
+        "Bare/empty --pkgs returns exit 2 with GATE=FAIL and an ANOMALY explaining that the flag must be omitted for no packages",
+        "An unknown gate returns exit 2 with CHECK:<gate>=FAIL, GATE=FAIL, and ANOMALY rather than SKIP/PASS",
+        "No Cargo or Docker check runs after either malformed request"
+      ]
+    },
+    {
+      "name": "partially-registered-ci-cannot-pass",
+      "skills": ["implementing-walrus-roadmap"],
+      "query": "Poll CI for the open roadmap PR.",
+      "setup": "The head rollup currently contains only one successful implementation-roadmap check, or one successful copy of each ci.yml job; the second push/pull_request workflow copy has not registered.",
+      "expected_behavior": [
+        "classify_checks.py reads every job display name from ci.yml and requires two copies per head",
+        "ci_status.sh returns PENDING rather than PASS while any expected copy is under-registered",
+        "The loop never attempts a merge until both workflow copies are terminal and successful/neutral/skipped"
+      ]
+    },
+    {
+      "name": "early-failed-check-waits-for-terminal-workflow",
+      "skills": ["implementing-walrus-roadmap"],
+      "query": "Poll CI for the open roadmap PR.",
+      "setup": "The cheap roadmap check has already failed, but another job in the same exact-head ci.yml run is still in progress and the workflow has no terminal conclusion yet.",
+      "expected_behavior": [
+        "ci_status.sh returns PENDING with WAITING_RUN_ID instead of ANOMALY or a rerunnable FAIL",
+        "The loop keeps polling until that workflow run reaches a terminal conclusion",
+        "A terminal failure, cancellation, timeout, action-required, startup failure, or stale run then returns FAIL with its exact RUN_ID"
+      ]
+    },
+    {
+      "name": "oversized-rust-task-blocks-for-reauthoring",
+      "skills": ["implementing-walrus-roadmap"],
+      "query": "Implement the selected size-L Rust task.",
+      "setup": "The implementer proves the audited phase-9+ task cannot land green within its fixed one-rule scope.",
+      "expected_behavior": [
+        "Reports STATUS=blocked and requests re-authoring of the same task before selection",
+        "Does not create a lettered Rust task/row, partially mark the original done, or leave an unindexed remainder",
+        "Preserves the fixed 265-rule/265-task/265-row bijection"
+      ]
+    },
+    {
+      "name": "evidence-outcome-is-not-reinterpreted",
+      "skills": ["implementing-walrus-roadmap"],
+      "query": "Do the next audited Rust task.",
+      "setup": "The selected task has Outcome: evidence, names docs/implementation/notes/rust-skills/<rule>.md, and one baseline precondition no longer matches.",
+      "expected_behavior": [
+        "The implementer does not turn the task into a code change or invent a new evidence conclusion",
+        "Reports STATUS=blocked with the baseline mismatch so the task can be re-authored",
+        "The orchestrator rejects STATUS=complete unless outcome matches and every JSON verification label is PASS"
       ]
     },
     {
       "name": "resume-open-pr-with-failing-check",
       "skills": ["implementing-walrus-roadmap"],
       "query": "Continue the walrus roadmap.",
-      "setup": "A task branch exists with an open PR whose CI has one failing `gates` check; the session that created it is gone. The PR body ends with a walrus-loop ledger line with attempts_ci=1.",
+      "setup": "The checkout is still on a clean task branch with an open PR whose CI has one failing `gates` check; the session that created it is gone. The PR body ends with a walrus-loop ledger line with attempts_ci=1.",
       "expected_behavior": [
+        "Repo-mode preflight safely switches from the clean task branch to main, verifies current-main CI, and then allows branch-mode resume routing",
         "preflight.sh branch mode returns ROUTE=POLL_CI and the loop goes straight to CI polling — no re-implementation, no new branch, no duplicate PR",
         "Re-reads the ledger from the PR body before acting, so counters continue from 1 rather than resetting",
         "ci_status.sh reports VERDICT=FAIL with FAILING= and RUN_ID=; the fixer subagent receives those and fetches `gh run view --log-failed` itself",
         "On an identical failure fingerprint a second time the loop STOPs with the report template instead of thrashing",
         "The ledger is updated via `gh pr edit` on the body's marker line, not as a new comment"
+      ]
+    },
+    {
+      "name": "resume-open-pr-pushes-local-ahead-commit-first",
+      "skills": ["implementing-walrus-roadmap"],
+      "query": "Continue the walrus roadmap.",
+      "setup": "An open code PR or mark-done PR exists, but its clean local branch is one commit ahead of origin because the prior session died after commit and before push.",
+      "expected_behavior": [
+        "preflight compares the exact local and remote route branch and emits PUSH_CI or PUSH_MARK_DONE, never a direct poll route",
+        "The loop pushes the local commit before polling, using `git push -u origin <branch>` if the upstream ref is absent",
+        "Only CI for the newly pushed head can pass into merge; the old remote head is never merged while local work is omitted"
       ]
     },
     {
@@ -61,10 +162,37 @@
       "query": "Continue the walrus roadmap.",
       "setup": "A task file carries `> **Status:** ✅ Done — <url>` but its roadmap row is still ☐ (a mark-done PR that half landed).",
       "expected_behavior": [
-        "next_task.py returns VERDICT=DRIFT with the task path and the reconcile instruction; the loop does not treat it as work to implement",
-        "Opens a chore-reconcile-roadmap branch and runs mark_done.py to flip only the roadmap row",
+        "next_task.py returns VERDICT=DRIFT with the task path, deterministic task branch, and merged PR proof; the loop does not treat it as work to implement",
+        "The main-push roadmap job permits validator exit 5 only on refs/heads/main, while every branch and pull_request workflow still fails the same drift",
+        "Iteration preflight waits for the exact main SHA's other CI jobs to finish green, returns PREFLIGHT=DRIFT, and routes directly to reconciliation",
+        "Routes the deterministic chore-reconcile-roadmap-<task-id> branch through preflight.sh --reconcile <task-id> before creating, continuing, pushing, polling, or accepting a merged reconcile PR",
+        "A clean interruption after branch creation, commit, push, PR creation, or merge resumes that exact state without a duplicate branch or PR; a closed-unmerged reconcile PR is a human veto",
+        "Runs mark_done.py to flip only the inconsistent done signals and groups any other currently reported drift into the same docs-only PR",
         "Takes the reconciliation through a PR — never a direct commit to main",
         "Re-selects after the reconcile PR merges and continues the loop"
+      ]
+    },
+    {
+      "name": "every-iteration-waits-for-new-main-ci",
+      "skills": ["implementing-walrus-roadmap"],
+      "query": "Continue through the next two roadmap tasks.",
+      "setup": "The first task and its mark-done PR just merged; the exact new origin/main SHA's push workflow is queued, then completes successfully.",
+      "expected_behavior": [
+        "Step 10 returns to step 0, not directly to selection",
+        "preflight.sh --wait-main 2700 polls the exact origin/main SHA while its run is absent/queued/running and proceeds only after completed success",
+        "No second task branch is cut against unproven main; red, anomalous, unqueryable, or absent-after-cap main CI stops the loop"
+      ]
+    },
+    {
+      "name": "merged-empty-bookkeeping-pr-is-reconciled-with-proof",
+      "skills": ["implementing-walrus-roadmap"],
+      "query": "Continue the walrus roadmap.",
+      "setup": "The selected task remains BOX=unchecked/MARKER=planned even though exactly one code PR and exactly one mark-done PR for its deterministic branches are both MERGED.",
+      "expected_behavior": [
+        "Branch routing returns RECONCILE rather than implementation",
+        "preflight.sh --reconcile accepts this validator-consistent state only after independently proving both exact branch PRs are uniquely MERGED and emits CONSISTENT_UNSET_PROOF=yes",
+        "mark_done.py receives the proven MERGED_CODE_PR, and the docs-only reconcile flow is resumable like ordinary drift",
+        "A missing, open, closed-unmerged, duplicate, or unqueryable proof stops; after merge the target must explicitly be BOX=checked and MARKER=done"
       ]
     },
     {
@@ -94,7 +222,7 @@
       "name": "all-done-ends-the-loop",
       "skills": ["implementing-walrus-roadmap"],
       "query": "Continue the walrus roadmap until it's finished.",
-      "setup": "Every roadmap row in docs/implementation/README.md is ✅.",
+      "setup": "All 367 roadmap rows, including the fully audited and activated 265-row Rust curriculum, are ✅.",
       "expected_behavior": [
         "next_task.py returns VERDICT=ALL_DONE (exit 2)",
         "The loop ends with a final report: the session ledger plus `next_task.py --status` counts",

@@ -8,13 +8,18 @@
 
 > **Status:** 📋 Planned <!-- flip to "✅ Done — <PR url>" when it merges -->
 
+> **Readiness:** audited · **Outcome:** change
+> **Gates:** fmt,clippy,test · **Test packages:** loader,pg-sink,pg-to-arrow
+
 > **Phase:** 9 — Rust ownership & borrowing · **Crates touched:** `loader`, `pg-sink`, `pg-to-arrow` ·
 > **Est. size:** M · **Depends on:** PR 9.7 · **Unlocks:** PR 9.9
 
-Production has **43** `Arc<…>` occurrences but only **2** `Arc::clone(` calls in the entire tree —
-both in `crates/loader/src/duck.rs` (`:199`, `:204`). Every other shared-ownership bump hides inside a
-bare `.clone()`, so at a glance you cannot tell a 1-instruction atomic increment from a deep copy of a
-`HashMap`. At least **22** production sites are affected: `state: Arc<LoaderState>`,
+The pinned-toolchain `--all-targets` audit reports **55** `clone_on_ref_ptr` calls in 21 files
+(56 diagnostics because one library site is compiled twice), while only 2 existing `Arc::clone(`
+calls state their cost explicitly. Every audited
+shared-ownership bump currently hides inside a bare `.clone()`, so at a glance you cannot tell a
+1-instruction atomic increment from a deep copy of a `HashMap`. The affected handles include
+`state: Arc<LoaderState>`,
 `waiters: Arc<WatermarkWaiters>`, `cached: Arc<CachedRelation>`, `clock: Arc<dyn Clock>`,
 `store: Arc<dyn ObjectStore>`, `semaphore: Arc<Semaphore>`, `current_reload_id: Arc<AtomicI64>` and
 arrow's `SchemaRef`. After this PR the syntax says which one it is, and
@@ -31,7 +36,7 @@ changes; only the call syntax does.**
 
 ## Read first
 
-- [`own-arc-shared`](../../.claude/skills/rust-skills/rules/own-arc-shared.md) — take the
+- [`own-arc-shared`](../../../.claude/skills/rust-skills/rules/own-arc-shared.md) — take the
   `Arc::clone(&a)` idiom and the "clone the Arc once outside the loop, pass `&` inside" note. Its
   `Arc<RwLock<T>>` cache example is **not** a model for walrus (see PR 9.12 — walrus has no `RwLock`
   and wants none).
@@ -47,14 +52,32 @@ changes; only the call syntax does.**
   215-250,388-425` — `Arc<dyn Clock>` and `Arc<CachedRelation>` on the batcher-creation path.
 - `Cargo.toml:15-21` — the existing `restriction`-lint precedent and its comment.
 
+## Baseline contract
+
+- **Precondition:** Confirm `rule-present`, then inspect the immediate predecessor's named paths and
+  symbols with `rg`. Historical line coordinates in the audit are navigation hints only; the
+  named symbol and stated precondition are authoritative.
+- **Allowed files:** The **Files to create / modify** block is exhaustive.
+
+- Any other current-tree mismatch blocks before editing.
+
 ## Scope
+
+**Baseline precondition.** Before editing, reproduce the task's authored finding from its named
+source paths, symbols, counts, and read-only probes; run the full **Verification commands** block
+after implementation. The named sites and allowed paths are the complete task boundary.
+
+**Baseline mismatch.** If the current tree differs from that authored finding, **STOP and request
+task re-authoring before editing.** Do not choose another site, implementation, evidence conclusion,
+or outcome.
 
 **In scope**
 
 - Add `clone_on_ref_ptr = "deny"` to `[workspace.lints.clippy]`, with a comment tying it to the
   existing `unwrap_used`/`expect_used` precedent (single restriction lints, never the whole group).
-- Convert every site the lint names to `Arc::clone(&x)` (or `Arc::clone(x)` where `x` is already a
-  `&Arc<_>`). **The clippy output is the work list** — run it first, fix exactly what it reports.
+- Convert the 55 audited calls in the exact allowlist below to `Arc::clone(&x)` (or
+  `Arc::clone(x)` where `x` is already a `&Arc<_>`). A different finding set is a baseline mismatch
+  and blocks; it does not authorize another path.
 - Test files and benches count: `--all-targets` is part of the gate, and `clippy.toml`'s
   test-only escape hatches cover `unwrap`/`expect` only, not this lint.
 
@@ -74,17 +97,27 @@ changes; only the call syntax does.**
 ```
 Cargo.toml                             # + clippy::clone_on_ref_ptr = "deny"
 crates/loader/src/main.rs              # :58, :117 — state.clone() → Arc::clone(&state)
+crates/loader/tests/ddl_destructive.rs # one Arc bump in the integration fixture
 crates/pg-sink/src/main.rs             # :70 state, :145 waiters
 crates/pg-sink/src/bootstrap.rs        # :70 object_store handle
 crates/pg-sink/src/sink.rs             # :100 self.store.clone() (Arc<dyn ObjectStore>)
 crates/pg-sink/src/consume.rs          # :532 clock, :536 cached
+crates/pg-sink/src/relcache.rs         # two cached-relation Arc bumps
 crates/pg-sink/src/stream_txn.rs       # :220, :246, :393, :421 clock + cached
 crates/pg-sink/src/snapshot.rs         # :166 clock
 crates/pg-sink/src/reload.rs           # :170 waiters, :381/:513 semaphore, :418 waiters,
                                        #   :430/:446 current_reload_id
+crates/pg-sink/src/batch_test.rs       # one Arc bump in the sibling unit test
+crates/pg-sink/src/reload_test.rs      # four Arc bumps in the sibling unit test
+crates/pg-sink/src/snapshot_test.rs    # one Arc bump in the sibling unit test
+crates/pg-sink/tests/health.rs
+crates/pg-sink/tests/manifest_insert.rs
+crates/pg-sink/tests/parquet_put.rs
+crates/pg-sink/tests/reload_ddl.rs
+crates/pg-sink/tests/reload_export.rs
+crates/pg-sink/tests/reload_metrics.rs
+crates/pg-sink/tests/reload_recovery.rs
 crates/pg-to-arrow/src/batch.rs        # :199 self.schema.clone() (SchemaRef = Arc<Schema>)
-crates/*/src/*_test.rs                 # only where the lint actually fires
-crates/*/tests/*.rs                    # ditto (--all-targets is part of the gate)
 ```
 
 ## Skeleton
@@ -128,6 +161,14 @@ pub fn finish(mut self) -> Result<RecordBatch, Error> {
 # expect_used this is a single `clippy::restriction` lint — enable the lint, never the group — so it
 # is not in `clippy::all` and needs no `priority`.
 clone_on_ref_ptr = "deny"
+```
+
+## Verification commands
+
+```text
+rule-present = test -f .claude/skills/rust-skills/rules/own-arc-shared.md
+focused-test = cargo test -p loader -p pg-sink -p pg-to-arrow
+diff-check = git diff --check origin/main...HEAD
 ```
 
 ## Definition of Done
@@ -197,7 +238,7 @@ $ cargo clippy --all-targets --all-features -- -D warnings
 
 ## References
 
-- Rule: [`own-arc-shared`](../../.claude/skills/rust-skills/rules/own-arc-shared.md)
+- Rule: [`own-arc-shared`](../../../.claude/skills/rust-skills/rules/own-arc-shared.md)
 - Design: `docs/architecture.md` §1.3 (in-memory batching — the shared relation cache and clock) and
   `docs/single-table-reload.md` H1 (the waiter registry shared between the decode loop and exporters).
-- Prev: [PR 9.7](./pr-9.7-own-move-large.md) · Next: [PR 9.9](./pr-9.9-own-rc-single-thread.md) · [Phase 9](./README.md) · [Roadmap](../README.md)
+- Prev: [PR 9.7](./pr-9.7-own-move-large.md) · Next: [PR 9.9](./pr-9.9-own-rc-single-thread.md) · [Roadmap](../README.md)

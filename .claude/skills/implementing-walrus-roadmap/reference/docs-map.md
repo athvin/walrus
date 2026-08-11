@@ -21,7 +21,7 @@ this map turns those names into locations.
 | pgoutput wire format: framing, messages, streaming, xid, abort/rollback | `proto-version.md` | golden vectors in `docs/examples/proto-version/` |
 | The sink: type conversion, DDL capture, sink pod lifecycle | `walrus-pg-sink.md` | `architecture.md` §1 |
 | The loader: manifest queue, commit-gating, raw→mirror transform, guards, lifecycle | `walrus-loader.md` | `architecture.md` §2 |
-| A phase 9–13 refactor (ownership, errors, memory, unsafe, API design) | the rule file the task cites under `.claude/skills/rust-skills/rules/` | the exact source lines the task names |
+| A phase 9–34 Rust-rule task | the rule file the task cites under `.claude/skills/rust-skills/rules/` | the task's exact source paths/symbols and verification commands |
 
 The deep-dive docs **extend and sometimes correct** `architecture.md`. When they disagree, the
 component doc (`walrus-pg-sink.md` / `walrus-loader.md` / `proto-version.md`) wins for its own area.
@@ -62,10 +62,11 @@ component doc (`walrus-pg-sink.md` / `walrus-loader.md` / `proto-version.md`) wi
 
 ## Phases 9+ — the rust-skills rule files
 
-Phases 9–13 refactor the finished tree against `.claude/skills/rust-skills` (265 rules across 26
-categories). A phase-9+ task cites its rule by filename, e.g.
+Phases 9–34 audit the finished tree against `.claude/skills/rust-skills` (265 rules across 26
+categories), with exactly one task per rule. A phase-9+ task cites its rule by filename, e.g.
 `.claude/skills/rust-skills/rules/own-borrow-over-clone.md`. Read **the cited rule plus the exact
-source lines the task names** — not the whole rule set, and not other rules in the category.
+source paths/symbols the task names** — line numbers are orientation only; do not read the whole
+rule set or unrelated rules in the category.
 
 | Phase | Directory | Rule family |
 |---|---|---|
@@ -77,9 +78,29 @@ source lines the task names** — not the whole rule set, and not other rules in
 | 14 | `phase-14-rust-async/` | `async-*` — `select!` racing, cancel safety, structured `JoinSet` |
 | 15 | `phase-15-rust-concurrency/` | `conc-*` — atomic ordering, thread-locals |
 | 16 | `phase-16-rust-codegen-opt/` | `opt-*` — codegen and branch hints |
+| 17 | `phase-17-rust-numeric/` | `num-*` — overflow, casts, floats, and numeric wrappers |
+| 18 | `phase-18-rust-type-safety/` | `type-*` — newtypes, invariants, and state modeling |
+| 19 | `phase-19-rust-traits/` | `trait-*` — associated types, coherence, object safety, and dispatch |
+| 20 | `phase-20-rust-conversions/` | `conv-*` — `TryFrom`, `FromStr`, `AsRef`, and mutable conversions |
+| 21 | `phase-21-rust-const/` | `const-*` — const functions, blocks, generics, and statics |
+| 22 | `phase-22-rust-serde/` | `serde-*` — wire defaults, validation, enums, and compatibility |
+| 23 | `phase-23-rust-patterns/` | `pat-*` — matching, destructuring, and let-else idioms |
+| 24 | `phase-24-rust-macros/` | `macro-*` — function-first design, hygiene, fragments, and proc macros |
+| 25 | `phase-25-rust-closures/` | `closure-*` — capture, `Fn` bounds, returned and dynamic closures |
+| 26 | `phase-26-rust-collections/` | `coll-*` — map, set, sequence, heap, and membership choices |
+| 27 | `phase-27-rust-naming/` | `name-*` — API naming, conversions, iterators, and accessors |
+| 28 | `phase-28-rust-testing/` | `test-*` — module layout, fixtures, properties, snapshots, and doctests |
+| 29 | `phase-29-rust-documentation/` | `doc-*` — public docs, examples, links, metadata, and README coverage |
+| 30 | `phase-30-rust-observability/` | `obs-*` — tracing, fields, spans, metrics, and secret handling |
+| 31 | `phase-31-rust-performance/` | `perf-*` — profiling-led iteration, allocation, I/O, and benchmarks |
+| 32 | `phase-32-rust-project-structure/` | `proj-*` — crate layout, feature hygiene, editions, and build scripts |
+| 33 | `phase-33-rust-linting/` | `lint-*` — lint levels, workspace policy, CI, and dependency checks |
+| 34 | `phase-34-rust-anti-patterns/` | `anti-*` — residual audits for common correctness/design traps |
 
-The phase list grows as the curriculum is authored; the pattern holds — directory `phase-N-rust-<topic>/`,
-task files `pr-N.k-<prefix>-<slug>.md`, rule at `.claude/skills/rust-skills/rules/<prefix>-<slug>.md`.
+The mapping is fixed and validated: directory `phase-N-rust-<topic>/`, task file
+`pr-N.k-<rule-name>.md`, and rule `.claude/skills/rust-skills/rules/<rule-name>.md`.
 
-These tasks change **no behaviour**: the design docs above are context, not the contract. The
-contract is the cited rule, the named sites, and the tests that must stay green.
+The task—not a blanket curriculum assumption—is the contract. Most adjustments preserve runtime
+behaviour; edition, public-compatibility, documentation, metadata, and evidence outcomes use the
+task's authored acceptance criteria. In every case, follow the cited rule, named paths/symbols,
+predetermined outcome, and exact verification commands.

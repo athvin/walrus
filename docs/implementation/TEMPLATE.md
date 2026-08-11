@@ -17,6 +17,10 @@
 
 > **Status:** 📋 Planned <!-- flip to "✅ Done — <PR url>" when it merges -->
 
+> **Readiness:** draft · **Outcome:** <change | evidence | superseded by PR X.Y>
+>
+> **Gates:** fmt,clippy,test<,positive-supported-gates> · **Test packages:** <crate-a,crate-b | —>
+
 > **Phase:** <n — name> · **Crates touched:** `<crate>` … · **Est. size:** <S | M | L> ·
 > **Depends on:** PR <a.b> · **Unlocks:** PR <c.d>
 
@@ -38,6 +42,11 @@ By the end of this PR you will have practised:
 - External: <source number + title from architecture.md "Sources">, if relevant.
 
 ## Scope
+
+**Baseline precondition:** <stable paths, symbols, and read-only probes that must match before editing>.
+
+**Baseline mismatch:** STOP and request task re-authoring before editing; do not choose another
+site, implementation, or outcome.
 
 **In scope**
 
@@ -85,6 +94,19 @@ use super::*;
 fn <descriptive_test_name>() { todo!() }
 ```
 
+## Verification commands
+
+<!--
+  Machine-readable, task-specific commands. Keep labels unique and commands on
+  one line. The roadmap validator rejects placeholders and unsupported/mutating
+  verification. Baseline fmt/clippy/test commands come from **Gates** above.
+-->
+
+```text
+focused-test = cargo test -p <crate> <test-filter>
+contract = rg -n '<stable symbol or invariant>' <allowed paths>
+```
+
 ## Definition of Done
 
 A reviewer merges this PR when **all** of the following hold:
@@ -114,6 +136,10 @@ $ <command>
 
 - <senior-dev tip: an idiom, a pitfall the design doc already warns about, a
   crate-API sharp edge>.
+- Replace `Readiness: draft` with `Readiness: audited` only after every target,
+  outcome, allowed path, baseline contract, and verification command is decision-complete.
+- If the audited baseline no longer matches, stop for task re-authoring instead
+  of choosing a new site, implementation, or outcome.
 - <…>
 
 ## References

@@ -16,13 +16,14 @@ The **design is already finished** and lives one directory up:
   reproducible Docker harness and a Python decoder + golden vectors under
   [`../examples/proto-version/`](../examples/proto-version/).
 
-This curriculum turns that design into **102 PRs across 9 phases** (phases 0–4 build v1; phase 5
+This curriculum turns that design into **367 PRs across 35 phases** (phases 0–4 build v1; phase 5
 hardens it — benchmarking, hot-path cleanup, and a much faster CI; phase 6 opens post-v1 feature
 work — single-table reload through the one slot; phase 7 is a conventions-hardening hygiene pass —
 sibling test files, SQL-in-folders, no-unwrap lints, identifier audit; phase 8 is a cleanup audit —
-DRY and type-modeling refinements over the finished tree, no new behaviour). Each PR is a self-contained
-task file with an explicit *Definition of Done*. You write the code; the task tells you what "done and
-green" means.
+DRY and type-modeling refinements over the finished tree, no new behaviour; phases 9–34 apply all
+265 rules from `rust-skills` as audited tasks with a predetermined change, evidence, or superseded
+outcome). Each PR is a self-contained task file with an explicit *Definition of Done*. You write the
+code; the task tells you what "done and green" means.
 
 ---
 
@@ -41,6 +42,19 @@ green" means.
    plus, where the task says so, `docker compose up --wait` and named integration assertions.
 4. Open the PR, let CI go green, merge, tick the box in the [roadmap](#the-roadmap), move on.
 5. When you add your own follow-up tasks, copy [`TEMPLATE.md`](./TEMPLATE.md) so they stay consistent.
+
+For phases 9–34, `Readiness: audited` is a machine-checked safety boundary. `Outcome: change`
+names a fixed implementation; `evidence` records why the rule is declined or already satisfied;
+`superseded` verifies the earlier owning task still covers the rule. A baseline mismatch stops for
+re-authoring—it is never an invitation to invent a different change or outcome. Most changes
+preserve runtime behaviour; migrations, public compatibility, documentation, and metadata follow
+the task-specific acceptance contract.
+
+To execute the sequence, invoke the
+[`implementing-walrus-roadmap`](../../.claude/skills/implementing-walrus-roadmap/SKILL.md) skill.
+Its preflight validates the complete tracked corpus before selecting PR 9.1, then advances one
+green task and mark-done PR at a time. A draft, missing/untracked ticket, partial index, baseline
+mismatch, or failed labeled verification stops the loop instead of letting it improvise.
 
 The tasks give you **shapes, not solutions** — public signatures, enum variants, error types, and
 test names, with `todo!()` bodies. The thinking (and the Rust) is yours. Every task links back to the
@@ -150,7 +164,8 @@ Two deliberate structural notes:
 
 ## The roadmap
 
-102 PRs. Tick each box as you merge. Every DoD is traceable to a design section (right column).
+367 PRs. Tick each box as you merge. Every DoD is traceable to a design section or Rust rule
+(right column).
 
 ### Phase 0 — Foundations & CI  ·  [`phase-0-foundations/`](./phase-0-foundations/)
 
@@ -366,6 +381,405 @@ duplicated OID literals (Tier 2), the opt-in domain-ID newtype sweep (Tier 3), a
 | ✅ | [8.4](./phase-8-cleanup/pr-8.4-domain-id-newtypes.md) | `ManifestId` newtype (slice 1/4; `EpochNo`/`SchemaVersion`/`ReloadId` deferred) | PR 0.3 `Lsn` precedent |
 | ✅ | [8.5](./phase-8-cleanup/pr-8.5-nits-cluster.md) | nits: `pause_began` visibility, plan-tier dispatch documented, `Clock` documented-keep | Conventions / tiers |
 
+> **Rust-skills curriculum.** Phases 9–34 form one audited serial chain over the finished
+> Phase-8 tree. Every rule has exactly one task. `Outcome: evidence` and `superseded` tasks
+> still land reproducible notes; they never manufacture code merely to demonstrate a rule.
+
+### Phase 9 — Rust ownership & borrowing  ·  [`phase-9-rust-ownership/`](./phase-9-rust-ownership/)
+
+| ☐ | PR | Delivers | Rust rule |
+|---|---|---|---|
+| ☐ | [9.1](./phase-9-rust-ownership/pr-9.1-own-borrow-over-clone.md) | Delete the redundant and implicit clones the borrow checker never needed | `own-borrow-over-clone` |
+| ☐ | [9.2](./phase-9-rust-ownership/pr-9.2-own-slice-over-vec.md) | Take `Option<&str>` not `&Option<String>`, and pin the borrowed-argument lints | `own-slice-over-vec` |
+| ☐ | [9.3](./phase-9-rust-ownership/pr-9.3-own-clone-explicit.md) | Reuse the allocation with `clone_from` in the additive-DDL rename fold | `own-clone-explicit` |
+| ☐ | [9.4](./phase-9-rust-ownership/pr-9.4-own-copy-small.md) | Derive `Copy` on the small value types and gate it with `missing_copy_implementations` | `own-copy-small` |
+| ☐ | [9.5](./phase-9-rust-ownership/pr-9.5-own-cow-conditional.md) | Return `Cow<'_, str>` from `sql_literal` so the common no-quote case never allocates | `own-cow-conditional` |
+| ☐ | [9.6](./phase-9-rust-ownership/pr-9.6-own-lifetime-elision.md) | Replace the two named lifetimes that elision already covers | `own-lifetime-elision` |
+| ☐ | [9.7](./phase-9-rust-ownership/pr-9.7-own-move-large.md) | Pin compile-time size budgets on the hot decode types and deny the large-value lints | `own-move-large` |
+| ☐ | [9.8](./phase-9-rust-ownership/pr-9.8-own-arc-shared.md) | Make every refcount bump explicit with `Arc::clone` and deny `clone_on_ref_ptr` | `own-arc-shared` |
+| ☐ | [9.9](./phase-9-rust-ownership/pr-9.9-own-rc-single-thread.md) | Swap the loader's Parquet-column cache from `Arc<Vec<String>>` to `Rc<[String]>` | `own-rc-single-thread` |
+| ☐ | [9.10](./phase-9-rust-ownership/pr-9.10-own-refcell-interior.md) | Use `Cell` and `RefCell` for the per-worker latches a thread-safe `Mutex` is guarding for nothing | `own-refcell-interior` |
+| ☐ | [9.11](./phase-9-rust-ownership/pr-9.11-own-mutex-interior.md) | Drop the mutex guard before the match body in the reload watermark registry | `own-mutex-interior` |
+| ☐ | [9.12](./phase-9-rust-ownership/pr-9.12-own-rwlock-readers.md) | Record why walrus has no `RwLock` and guard the lock-choice decision | `own-rwlock-readers` |
+
+### Phase 10 — Rust error handling  ·  [`phase-10-rust-errors/`](./phase-10-rust-errors/)
+
+| ☐ | PR | Delivers | Rust rule |
+|---|---|---|---|
+| ☐ | [10.1](./phase-10-rust-errors/pr-10.1-err-from-impl.md) | Give `ControlError` a classifying `From<sqlx::Error>` | `err-from-impl` |
+| ☐ | [10.2](./phase-10-rust-errors/pr-10.2-err-question-mark.md) | Drop the redundant `map_err` boilerplate in `control` and propagate with `?` | `err-question-mark` |
+| ☐ | [10.3](./phase-10-rust-errors/pr-10.3-err-source-chain.md) | Preserve the `duckdb::Error` source chain in `LoaderError::Duck` | `err-source-chain` |
+| ☐ | [10.4](./phase-10-rust-errors/pr-10.4-err-custom-type.md) | Replace the `LoaderError::Internal` catch-all with named domain variants | `err-custom-type` |
+| ☐ | [10.5](./phase-10-rust-errors/pr-10.5-err-context-chain.md) | Add anyhow context to the contextless pg-sink await sites | `err-context-chain` |
+| ☐ | [10.6](./phase-10-rust-errors/pr-10.6-err-anyhow-app.md) | Close the exit-code downcast hole at the pg-sink app boundary | `err-anyhow-app` |
+| ☐ | [10.7](./phase-10-rust-errors/pr-10.7-err-lowercase-msg.md) | Guard the lowercase no-punctuation error-message convention | `err-lowercase-msg` |
+| ☐ | [10.8](./phase-10-rust-errors/pr-10.8-err-thiserror-lib.md) | Ban anyhow from the pure library crates via cargo-deny | `err-thiserror-lib` |
+| ☐ | [10.9](./phase-10-rust-errors/pr-10.9-err-result-over-panic.md) | Deny panic todo unimplemented and unreachable in production | `err-result-over-panic` |
+| ☐ | [10.10](./phase-10-rust-errors/pr-10.10-err-expect-bugs-only.md) | Turn the justified expect allow into an expect attribute with a reason | `err-expect-bugs-only` |
+| ☐ | [10.11](./phase-10-rust-errors/pr-10.11-err-no-unwrap-prod.md) | Gate that every workspace member inherits the unwrap and expect denies | `err-no-unwrap-prod` |
+| ☐ | [10.12](./phase-10-rust-errors/pr-10.12-err-doc-errors.md) | Document every fallible public function with an Errors section | `err-doc-errors` |
+
+### Phase 11 — Rust memory optimization  ·  [`phase-11-rust-memory/`](./phase-11-rust-memory/)
+
+| ☐ | PR | Delivers | Rust rule |
+|---|---|---|---|
+| ☐ | [11.1](./phase-11-rust-memory/pr-11.1-mem-with-capacity.md) | Pre-size the loader's per-cycle plan and bootstrap vectors | `mem-with-capacity` |
+| ☐ | [11.2](./phase-11-rust-memory/pr-11.2-mem-assert-type-size.md) | Add the remaining hot-type size assertions after PR 9.7 | `mem-assert-type-size` |
+| ☐ | [11.3](./phase-11-rust-memory/pr-11.3-mem-clone-from.md) | Reuse the remaining batch-id assignment with clone_from | `mem-clone-from` |
+| ☐ | [11.4](./phase-11-rust-memory/pr-11.4-mem-write-over-format.md) | Write DDL SQL into the buffer instead of formatting a throwaway `String` | `mem-write-over-format` |
+| ☐ | [11.5](./phase-11-rust-memory/pr-11.5-mem-avoid-format.md) | Cache the per-table metric label instead of formatting it every poll | `mem-avoid-format` |
+| ☐ | [11.6](./phase-11-rust-memory/pr-11.6-mem-reuse-collections.md) | Reuse scratch buffers in the Arrow append and commit-promotion loops | `mem-reuse-collections` |
+| ☐ | [11.7](./phase-11-rust-memory/pr-11.7-mem-take-replace.md) | Move rows out of the streamed-txn buffers with mem::take instead of cloning | `mem-take-replace` |
+| ☐ | [11.8](./phase-11-rust-memory/pr-11.8-mem-drop-order.md) | Tighten the residual loader RefCell borrow lifetime | `mem-drop-order` |
+| ☐ | [11.9](./phase-11-rust-memory/pr-11.9-mem-smaller-integers.md) | Right-size the decoder error offsets and give TypeMeta NonZero niches | `mem-smaller-integers` |
+| ☐ | [11.10](./phase-11-rust-memory/pr-11.10-mem-box-large-variant.md) | Box the oversized pg-to-arrow error variants | `mem-box-large-variant` |
+| ☐ | [11.11](./phase-11-rust-memory/pr-11.11-mem-boxed-slice.md) | Freeze the never-grown collections into Box<[T]> and Arc<[T]> | `mem-boxed-slice` |
+| ☐ | [11.12](./phase-11-rust-memory/pr-11.12-mem-zero-copy.md) | Stop copying every text cell twice in the pgoutput decoder | `mem-zero-copy` |
+| ☐ | [11.13](./phase-11-rust-memory/pr-11.13-mem-smallvec.md) | Measure and decline SmallVec for key-column scratch | `mem-smallvec` |
+| ☐ | [11.14](./phase-11-rust-memory/pr-11.14-mem-arrayvec.md) | Record why ArrayVec has no hard-capacity home in walrus | `mem-arrayvec` |
+| ☐ | [11.15](./phase-11-rust-memory/pr-11.15-mem-thinvec.md) | Measure ThinVec against the already-niche-optimised Option<Vec> | `mem-thinvec` |
+| ☐ | [11.16](./phase-11-rust-memory/pr-11.16-mem-compact-string.md) | Re-measure and re-affirm the SinkMeta string-layout defer | `mem-compact-string` |
+| ☐ | [11.17](./phase-11-rust-memory/pr-11.17-mem-arena-allocator.md) | Record why walrus has no arena-shaped allocation lifetime | `mem-arena-allocator` |
+
+### Phase 12 — Rust unsafe-code policy  ·  [`phase-12-rust-unsafe/`](./phase-12-rust-unsafe/)
+
+| ☐ | PR | Delivers | Rust rule |
+|---|---|---|---|
+| ☐ | [12.1](./phase-12-rust-unsafe/pr-12.1-unsafe-safety-comment.md) | Forbid unsafe code workspace-wide and require SAFETY comments if it ever returns | `unsafe-safety-comment` |
+| ☐ | [12.2](./phase-12-rust-unsafe/pr-12.2-unsafe-minimize-scope.md) | Deny unsafe_op_in_unsafe_fn and multiple unsafe ops per block | `unsafe-minimize-scope` |
+| ☐ | [12.3](./phase-12-rust-unsafe/pr-12.3-unsafe-extern-block.md) | Deny missing_unsafe_on_extern and document the one native FFI boundary | `unsafe-extern-block` |
+| ☐ | [12.4](./phase-12-rust-unsafe/pr-12.4-unsafe-no-mangle-unsafe.md) | Deny unsafe_attr_outside_unsafe so exported symbols stay auditable | `unsafe-no-mangle-unsafe` |
+| ☐ | [12.5](./phase-12-rust-unsafe/pr-12.5-unsafe-send-sync-manual.md) | Correct the loader's Send/Sync claims and pin them with compile-time assertions | `unsafe-send-sync-manual` |
+| ☐ | [12.6](./phase-12-rust-unsafe/pr-12.6-unsafe-maybeuninit.md) | Guard against fake initialization and record why walrus never needs MaybeUninit | `unsafe-maybeuninit` |
+| ☐ | [12.7](./phase-12-rust-unsafe/pr-12.7-unsafe-miri-ci.md) | Record the Miri decision and add a tripwire that forces it to be revisited | `unsafe-miri-ci` |
+
+### Phase 13 — Rust API design  ·  [`phase-13-rust-api-design/`](./phase-13-rust-api-design/)
+
+| ☐ | PR | Delivers | Rust rule |
+|---|---|---|---|
+| ☐ | [13.1](./phase-13-rust-api-design/pr-13.1-api-common-traits.md) | Derive Debug on every public type and deny missing_debug_implementations | `api-common-traits` |
+| ☐ | [13.2](./phase-13-rust-api-design/pr-13.2-api-must-use.md) | Annotate pure accessors with must_use and deny clippy::must_use_candidate | `api-must-use` |
+| ☐ | [13.3](./phase-13-rust-api-design/pr-13.3-api-newtype-safety.md) | Introduce the EpochNo newtype (domain-ID newtypes, slice 2 of 4) | `api-newtype-safety` |
+| ☐ | [13.4](./phase-13-rust-api-design/pr-13.4-api-from-not-into.md) | Replace LoaderError::as_common with From, and give Lsn the From impls ManifestId already has | `api-from-not-into` |
+| ☐ | [13.5](./phase-13-rust-api-design/pr-13.5-api-operator-overload.md) | Give Lsn the arithmetic operators its call sites are hand-rolling | `api-operator-overload` |
+| ☐ | [13.6](./phase-13-rust-api-design/pr-13.6-api-parse-dont-validate.md) | Parse the sink's backpressure and threshold knobs into types that cannot be invalid | `api-parse-dont-validate` |
+| ☐ | [13.7](./phase-13-rust-api-design/pr-13.7-api-default-impl.md) | Pin the shipped configuration defaults with a golden test | `api-default-impl` |
+| ☐ | [13.8](./phase-13-rust-api-design/pr-13.8-api-builder-pattern.md) | Replace the 14-argument decode-loop signature with a builder | `api-builder-pattern` |
+| ☐ | [13.9](./phase-13-rust-api-design/pr-13.9-api-builder-must-use.md) | Make ignoring a builder method a compile error | `api-builder-must-use` |
+| ☐ | [13.10](./phase-13-rust-api-design/pr-13.10-api-impl-into.md) | Accept `impl Into<String>` in the sink's owned-String constructors | `api-impl-into` |
+| ☐ | [13.11](./phase-13-rust-api-design/pr-13.11-api-impl-asref.md) | Take `impl AsRef<Path>` when opening a DuckDB table file | `api-impl-asref` |
+| ☐ | [13.12](./phase-13-rust-api-design/pr-13.12-api-extension-trait.md) | Add a DuckDB result extension trait to kill 29 hand-written `map_err` closures | `api-extension-trait` |
+| ☐ | [13.13](./phase-13-rust-api-design/pr-13.13-api-impl-fromiterator.md) | Make RelationCache a real collection: FromIterator, Extend, IntoIterator | `api-impl-fromiterator` |
+| ☐ | [13.14](./phase-13-rust-api-design/pr-13.14-api-sealed-trait.md) | Seal the Clock trait so the test seam cannot become an extension point | `api-sealed-trait` |
+| ☐ | [13.15](./phase-13-rust-api-design/pr-13.15-api-typestate.md) | Turn the snapshot-export handshake into a typestate | `api-typestate` |
+| ☐ | [13.16](./phase-13-rust-api-design/pr-13.16-api-non-exhaustive.md) | Mark the error enums non_exhaustive so a new variant is not a cross-crate break | `api-non-exhaustive` |
+| ☐ | [13.17](./phase-13-rust-api-design/pr-13.17-api-serde-optional.md) | Record why serde stays a hard dependency and gate the feature seam that already exists | `api-serde-optional` |
+
+### Phase 14 — Rust async/await  ·  [`phase-14-rust-async/`](./phase-14-rust-async/)
+
+| ☐ | PR | Delivers | Rust rule |
+|---|---|---|---|
+| ☐ | [14.1](./phase-14-rust-async/pr-14.1-async-select-racing.md) | Make shutdown win every select! race with biased | `async-select-racing` |
+| ☐ | [14.2](./phase-14-rust-async/pr-14.2-async-cancel-safety.md) | Pin the replication frame future so a dropped select branch cannot tear a feedback write | `async-cancel-safety` |
+| ☐ | [14.3](./phase-14-rust-async/pr-14.3-async-no-lock-await.md) | Complete the residual no-lock-across-await lint policy | `async-no-lock-await` |
+| ☐ | [14.4](./phase-14-rust-async/pr-14.4-async-async-fn-bounds.md) | Replace the two-generic Fn-returning-Future bounds with AsyncFnMut | `async-async-fn-bounds` |
+| ☐ | [14.5](./phase-14-rust-async/pr-14.5-async-oneshot-response.md) | Make the watermark oneshot waiter unsubscribe on drop | `async-oneshot-response` |
+| ☐ | [14.6](./phase-14-rust-async/pr-14.6-async-cancellation-token.md) | Hold a CancellationToken DropGuard so every early return drains the pod | `async-cancellation-token` |
+| ☐ | [14.7](./phase-14-rust-async/pr-14.7-async-tokio-fs.md) | Move the last blocking std::fs call to tokio::fs and ban the blocking file APIs | `async-tokio-fs` |
+| ☐ | [14.8](./phase-14-rust-async/pr-14.8-async-clone-before-await.md) | Deny non-Send futures outside the loader and document the LocalSet exception | `async-clone-before-await` |
+| ☐ | [14.9](./phase-14-rust-async/pr-14.9-async-fn-in-trait.md) | Ban a direct async-trait dependency now that AFIT is available | `async-fn-in-trait` |
+| ☐ | [14.10](./phase-14-rust-async/pr-14.10-async-tokio-runtime.md) | Size and name the tokio runtime from bounds-validated config | `async-tokio-runtime` |
+| ☐ | [14.11](./phase-14-rust-async/pr-14.11-async-try-join.md) | Race the control-DB and object-store bootstrap checks with try_join | `async-try-join` |
+| ☐ | [14.12](./phase-14-rust-async/pr-14.12-async-join-parallel.md) | Join the two independent Phase-A control reads on every poll | `async-join-parallel` |
+| ☐ | [14.13](./phase-14-rust-async/pr-14.13-async-joinset-structured.md) | Own the reload exporter tasks in a JoinSet instead of detaching them | `async-joinset-structured` |
+| ☐ | [14.14](./phase-14-rust-async/pr-14.14-async-mpsc-queue.md) | Report loader worker failures over a bounded mpsc instead of mutating shared shutdown state | `async-mpsc-queue` |
+| ☐ | [14.15](./phase-14-rust-async/pr-14.15-async-bounded-channel.md) | Forbid unbounded channels and make the last one bounded | `async-bounded-channel` |
+| ☐ | [14.16](./phase-14-rust-async/pr-14.16-async-watch-latest.md) | Broadcast the current epoch over a watch channel instead of polling it per table | `async-watch-latest` |
+| ☐ | [14.17](./phase-14-rust-async/pr-14.17-async-broadcast-pubsub.md) | Record why walrus has no broadcast channel and guard the decision | `async-broadcast-pubsub` |
+| ☐ | [14.18](./phase-14-rust-async/pr-14.18-async-spawn-blocking.md) | Document why DuckDB work cannot use spawn_blocking and assert the !Send boundary | `async-spawn-blocking` |
+
+### Phase 15 — Rust concurrency  ·  [`phase-15-rust-concurrency/`](./phase-15-rust-concurrency/)
+
+| ☐ | PR | Delivers | Rust rule |
+|---|---|---|---|
+| ☐ | [15.1](./phase-15-rust-concurrency/pr-15.1-conc-atomic-ordering.md) | Replace SeqCst with the weakest correct ordering on the health and reload atomics | `conc-atomic-ordering` |
+| ☐ | [15.2](./phase-15-rust-concurrency/pr-15.2-conc-thread-local.md) | Record why the thread-local scratch rule is superseded | `conc-thread-local` |
+| ☐ | [15.3](./phase-15-rust-concurrency/pr-15.3-conc-rayon-par-iter.md) | Ban rayon in deny.toml and record why walrus has no data-parallel hot path | `conc-rayon-par-iter` |
+| ☐ | [15.4](./phase-15-rust-concurrency/pr-15.4-conc-scoped-threads.md) | Guard the zero-OS-thread invariant and document the async structured-concurrency equivalent | `conc-scoped-threads` |
+
+### Phase 16 — Rust compiler optimization  ·  [`phase-16-rust-codegen-opt/`](./phase-16-rust-codegen-opt/)
+
+| ☐ | PR | Delivers | Rust rule |
+|---|---|---|---|
+| ☐ | [16.1](./phase-16-rust-codegen-opt/pr-16.1-opt-lto-release.md) | Gate the release LTO profile and fix the stale bench-profile note | `opt-lto-release` |
+| ☐ | [16.2](./phase-16-rust-codegen-opt/pr-16.2-opt-bounds-check.md) | Replace hot-path slice indexing with slice patterns in the decoder and Arrow builder | `opt-bounds-check` |
+| ☐ | [16.3](./phase-16-rust-codegen-opt/pr-16.3-opt-inline-small.md) | Add `#[inline]` to the cross-crate hot-path accessors | `opt-inline-small` |
+| ☐ | [16.4](./phase-16-rust-codegen-opt/pr-16.4-opt-inline-always-rare.md) | Deny `clippy::inline_always` in the workspace lints | `opt-inline-always-rare` |
+| ☐ | [16.5](./phase-16-rust-codegen-opt/pr-16.5-opt-inline-never-cold.md) | Extract the decoder's EOF error construction into a `#[cold] #[inline(never)]` helper | `opt-inline-never-cold` |
+| ☐ | [16.6](./phase-16-rust-codegen-opt/pr-16.6-opt-cold-unlikely.md) | Mark the Arrow value-parse error constructor `#[cold]` | `opt-cold-unlikely` |
+| ☐ | [16.7](./phase-16-rust-codegen-opt/pr-16.7-opt-likely-hint.md) | Mark the decoder's rare framing branches with std::hint::cold_path | `opt-likely-hint` |
+| ☐ | [16.8](./phase-16-rust-codegen-opt/pr-16.8-opt-cache-friendly.md) | Measure cache footprints and guard only the residual Emit type | `opt-cache-friendly` |
+| ☐ | [16.9](./phase-16-rust-codegen-opt/pr-16.9-opt-codegen-units.md) | Record the codegen-units rejection and guard the default | `opt-codegen-units` |
+| ☐ | [16.10](./phase-16-rust-codegen-opt/pr-16.10-opt-target-cpu.md) | Reject target-cpu=native and guard against RUSTFLAGS drift | `opt-target-cpu` |
+| ☐ | [16.11](./phase-16-rust-codegen-opt/pr-16.11-opt-pgo-profile.md) | Decline profile-guided optimization with the measured evidence | `opt-pgo-profile` |
+| ☐ | [16.12](./phase-16-rust-codegen-opt/pr-16.12-opt-simd-portable.md) | Decline portable SIMD and ban the SIMD crates | `opt-simd-portable` |
+
+### Phase 17 — Rust numeric safety  ·  [`phase-17-rust-numeric/`](./phase-17-rust-numeric/)
+
+| ☐ | PR | Delivers | Rust rule |
+|---|---|---|---|
+| ☐ | [17.1](./phase-17-rust-numeric/pr-17.1-num-overflow-explicit.md) | Make integer overflow explicit in the interval parser and the in-flight meter | `num-overflow-explicit` |
+| ☐ | [17.2](./phase-17-rust-numeric/pr-17.2-num-saturating-clamp.md) | Bound the bootstrap backoff and the lease renew interval with clamp instead of one-sided min/max | `num-saturating-clamp` |
+| ☐ | [17.3](./phase-17-rust-numeric/pr-17.3-num-cast-try-from.md) | Replace lossy as-casts with TryFrom and deny the four lossy cast lints | `num-cast-try-from` |
+| ☐ | [17.4](./phase-17-rust-numeric/pr-17.4-num-nonzero.md) | Encode must-be-positive config bounds as NonZero types | `num-nonzero` |
+| ☐ | [17.5](./phase-17-rust-numeric/pr-17.5-num-float-compare.md) | Gate float equality with clippy::float_cmp and validate the backpressure ratios as finite | `num-float-compare` |
+
+### Phase 18 — Rust type safety  ·  [`phase-18-rust-type-safety/`](./phase-18-rust-type-safety/)
+
+| ☐ | PR | Delivers | Rust rule |
+|---|---|---|---|
+| ☐ | [18.1](./phase-18-rust-type-safety/pr-18.1-type-newtype-ids.md) | Finish the residual SchemaVersionNo and ReloadId newtypes | `type-newtype-ids` |
+| ☐ | [18.2](./phase-18-rust-type-safety/pr-18.2-type-repr-transparent.md) | Make the transparent newtypes actually repr(transparent) and assert their layout | `type-repr-transparent` |
+| ☐ | [18.3](./phase-18-rust-type-safety/pr-18.3-type-numeric-fmt.md) | Give Lsn the LowerHex, UpperHex, Octal and Binary formatters | `type-numeric-fmt` |
+| ☐ | [18.4](./phase-18-rust-type-safety/pr-18.4-type-display-vs-debug.md) | Record that the Debug sweep is owned by PR 13.1 | `type-display-vs-debug` |
+| ☐ | [18.5](./phase-18-rust-type-safety/pr-18.5-type-no-stringly.md) | Replace the four stringly-typed FromStr error types in control | `type-no-stringly` |
+| ☐ | [18.6](./phase-18-rust-type-safety/pr-18.6-type-newtype-validated.md) | Add a validated SqlIdent newtype and retire the duplicated identifier quoting | `type-newtype-validated` |
+| ☐ | [18.7](./phase-18-rust-type-safety/pr-18.7-type-enum-states.md) | Model the loader health lifecycle as one enum instead of two independent bools | `type-enum-states` |
+| ☐ | [18.8](./phase-18-rust-type-safety/pr-18.8-type-option-nullable.md) | Replace the batcher's empty-string and `Lsn::ZERO` sentinels with `Option` | `type-option-nullable` |
+| ☐ | [18.9](./phase-18-rust-type-safety/pr-18.9-type-result-fallible.md) | Stop swallowing errors into `Option` and deny `let_underscore_must_use` | `type-result-fallible` |
+| ☐ | [18.10](./phase-18-rust-type-safety/pr-18.10-type-generic-bounds.md) | Add the three residual generic-bound hygiene lints | `type-generic-bounds` |
+| ☐ | [18.11](./phase-18-rust-type-safety/pr-18.11-type-phantom-marker.md) | Tag DuckDB table names with `PhantomData` so mirror and raw cannot be swapped | `type-phantom-marker` |
+| ☐ | [18.12](./phase-18-rust-type-safety/pr-18.12-type-deref-coercion.md) | Guard the domain newtypes against `Deref` inheritance | `type-deref-coercion` |
+| ☐ | [18.13](./phase-18-rust-type-safety/pr-18.13-type-never-diverge.md) | Record and guard walrus's no-diverging-function rule | `type-never-diverge` |
+
+### Phase 19 — Rust traits & generics  ·  [`phase-19-rust-traits/`](./phase-19-rust-traits/)
+
+| ☐ | PR | Delivers | Rust rule |
+|---|---|---|---|
+| ☐ | [19.1](./phase-19-rust-traits/pr-19.1-trait-associated-type-vs-generic.md) | Give ArrowNumBuilder an associated Val type instead of a generic parameter | `trait-associated-type-vs-generic` |
+| ☐ | [19.2](./phase-19-rust-traits/pr-19.2-trait-default-methods.md) | Model terminal-vs-transient as a FailureClass trait with defaulted methods | `trait-default-methods` |
+| ☐ | [19.3](./phase-19-rust-traits/pr-19.3-trait-coherence-newtype.md) | Finish the residual UtcTimestamp conversion API | `trait-coherence-newtype` |
+| ☐ | [19.4](./phase-19-rust-traits/pr-19.4-trait-blanket-impl.md) | Blanket-impl Clock for Arc<T> and &T so shared clocks satisfy a Clock bound | `trait-blanket-impl` |
+| ☐ | [19.5](./phase-19-rust-traits/pr-19.5-trait-dyn-vs-generic.md) | Dispatch the sink clock statically and document why the remaining dyn stays dyn | `trait-dyn-vs-generic` |
+| ☐ | [19.6](./phase-19-rust-traits/pr-19.6-trait-object-safety.md) | Lock in Clock's dyn compatibility with a compile-time guard and a Self: Sized gate | `trait-object-safety` |
+
+### Phase 20 — Rust conversions  ·  [`phase-20-rust-conversions/`](./phase-20-rust-conversions/)
+
+| ☐ | PR | Delivers | Rust rule |
+|---|---|---|---|
+| ☐ | [20.1](./phase-20-rust-conversions/pr-20.1-conv-tryfrom-fallible.md) | Implement TryFrom for the pgoutput wire-byte conversions | `conv-tryfrom-fallible` |
+| ☐ | [20.2](./phase-20-rust-conversions/pr-20.2-conv-fromstr-parsing.md) | Give every FromStr a concrete error type and parse UtcTimestamp through FromStr | `conv-fromstr-parsing` |
+| ☐ | [20.3](./phase-20-rust-conversions/pr-20.3-conv-asmut-mutable.md) | Record why AsMut has no write target and deny needless_pass_by_ref_mut instead | `conv-asmut-mutable` |
+
+### Phase 21 — Rust const & compile-time  ·  [`phase-21-rust-const/`](./phase-21-rust-const/)
+
+| ☐ | PR | Delivers | Rust rule |
+|---|---|---|---|
+| ☐ | [21.1](./phase-21-rust-const/pr-21.1-const-fn.md) | Make every eligible function a const fn and deny missing_const_for_fn | `const-fn` |
+| ☐ | [21.2](./phase-21-rust-const/pr-21.2-const-vs-static.md) | Gate the const-vs-static storage-class policy and hoist the Postgres epoch constant | `const-vs-static` |
+| ☐ | [21.3](./phase-21-rust-const/pr-21.3-const-block.md) | Assert walrus wire and exit-code invariants at compile time with const blocks | `const-block` |
+| ☐ | [21.4](./phase-21-rust-const/pr-21.4-const-generics.md) | Collapse the fixed-width big-endian readers with const generics | `const-generics` |
+
+### Phase 22 — Rust serde  ·  [`phase-22-rust-serde/`](./phase-22-rust-serde/)
+
+| ☐ | PR | Delivers | Rust rule |
+|---|---|---|---|
+| ☐ | [22.1](./phase-22-rust-serde/pr-22.1-serde-deny-unknown-fields.md) | Close the last config typo hole with `deny_unknown_fields` on `TelemetryConfig` | `serde-deny-unknown-fields` |
+| ☐ | [22.2](./phase-22-rust-serde/pr-22.2-serde-default-compat.md) | Make the sink-meta wire contract survive a mixed-version rollout with `serde(default)` | `serde-default-compat` |
+| ☐ | [22.3](./phase-22-rust-serde/pr-22.3-serde-skip-empty.md) | Drop the empty `unchanged_toast` array from every row's sink-meta JSON | `serde-skip-empty` |
+| ☐ | [22.4](./phase-22-rust-serde/pr-22.4-serde-rename-all.md) | Give `ReplicaIdentity` an explicit lowercase wire form with legacy aliases | `serde-rename-all` |
+| ☐ | [22.5](./phase-22-rust-serde/pr-22.5-serde-try-from-validate.md) | Replace `Tier`'s hand-written deserializer with `serde(try_from)` and `serde(into)` | `serde-try-from-validate` |
+| ☐ | [22.6](./phase-22-rust-serde/pr-22.6-serde-enum-representation.md) | Lock the scalar wire representation of every serde enum with an exhaustive-match test | `serde-enum-representation` |
+| ☐ | [22.7](./phase-22-rust-serde/pr-22.7-serde-custom-with.md) | Prove and guard the humantime duration form on every config Duration field | `serde-custom-with` |
+| ☐ | [22.8](./phase-22-rust-serde/pr-22.8-serde-flatten.md) | Record why serde flatten is rejected and guard the wire structs against it | `serde-flatten` |
+
+### Phase 23 — Rust pattern matching  ·  [`phase-23-rust-patterns/`](./phase-23-rust-patterns/)
+
+| ☐ | PR | Delivers | Rust rule |
+|---|---|---|---|
+| ☐ | [23.1](./phase-23-rust-patterns/pr-23.1-pat-let-else.md) | Replace diverging match-binds with let-else in the reload controller and DSN parser | `pat-let-else` |
+| ☐ | [23.2](./phase-23-rust-patterns/pr-23.2-pat-matches-macro.md) | Collapse boolean matches into if/matches! and deny clippy::match_bool | `pat-matches-macro` |
+| ☐ | [23.3](./phase-23-rust-patterns/pr-23.3-pat-exhaustive-enum.md) | Match TupleValue and Tier exhaustively instead of falling through a wildcard | `pat-exhaustive-enum` |
+| ☐ | [23.4](./phase-23-rust-patterns/pr-23.4-pat-at-bindings.md) | Bind the Decimal128 precision boundary with an @ range pattern | `pat-at-bindings` |
+| ☐ | [23.5](./phase-23-rust-patterns/pr-23.5-pat-if-let-chains.md) | Move the workspace to edition 2024 and collapse nested if-let into let chains | `pat-if-let-chains` |
+
+### Phase 24 — Rust macros  ·  [`phase-24-rust-macros/`](./phase-24-rust-macros/)
+
+| ☐ | PR | Delivers | Rust rule |
+|---|---|---|---|
+| ☐ | [24.1](./phase-24-rust-macros/pr-24.1-macro-prefer-functions.md) | Replace the `downcast!` macro with a generic downcast helper in pg-to-arrow | `macro-prefer-functions` |
+| ☐ | [24.2](./phase-24-rust-macros/pr-24.2-macro-export-crate-path.md) | Export a `string_enum!` macro from common and adopt it for the manifest enums | `macro-export-crate-path` |
+| ☐ | [24.3](./phase-24-rust-macros/pr-24.3-macro-fragment-specifiers.md) | Type the `string_enum!` arms with `:meta`/`:vis`/`:literal` and gate `:tt` slurping | `macro-fragment-specifiers` |
+| ☐ | [24.4](./phase-24-rust-macros/pr-24.4-macro-rules-hygiene.md) | Route the `string_enum!` error path through a `$crate::` path | `macro-rules-hygiene` |
+| ☐ | [24.5](./phase-24-rust-macros/pr-24.5-macro-private-helpers.md) | Hide the macro's runtime helper behind `#[doc(hidden)] pub mod __private` | `macro-private-helpers` |
+| ☐ | [24.6](./phase-24-rust-macros/pr-24.6-macro-proc-error-spans.md) | Give `string_enum!` a `compile_error!` fallback arm instead of a token-soup diagnostic | `macro-proc-error-spans` |
+| ☐ | [24.7](./phase-24-rust-macros/pr-24.7-macro-proc-syn-quote.md) | Record why walrus takes no direct syn/quote/proc-macro2 dependency | `macro-proc-syn-quote` |
+| ☐ | [24.8](./phase-24-rust-macros/pr-24.8-macro-proc-two-crate.md) | Guard the workspace against an unjustified proc-macro plus facade crate split | `macro-proc-two-crate` |
+
+### Phase 25 — Rust closures  ·  [`phase-25-rust-closures/`](./phase-25-rust-closures/)
+
+| ☐ | PR | Delivers | Rust rule |
+|---|---|---|---|
+| ☐ | [25.1](./phase-25-rust-closures/pr-25.1-closure-impl-fn-return.md) | Return an impl FnOnce error mapper for the loader's DuckDB map_err closures | `closure-impl-fn-return` |
+| ☐ | [25.2](./phase-25-rust-closures/pr-25.2-closure-fn-trait-bounds.md) | Add a FnOnce transaction seam to TableDb so rollback cannot be forgotten | `closure-fn-trait-bounds` |
+| ☐ | [25.3](./phase-25-rust-closures/pr-25.3-closure-disjoint-capture.md) | Narrow the streamed-txn survivor closure from &self to the aborted set | `closure-disjoint-capture` |
+| ☐ | [25.4](./phase-25-rust-closures/pr-25.4-closure-move-capture.md) | Gate the clone-before-move discipline with clippy::redundant_clone | `closure-move-capture` |
+| ☐ | [25.5](./phase-25-rust-closures/pr-25.5-closure-static-vs-dyn.md) | Replace redundant method-call closures with function paths and deny the lint | `closure-static-vs-dyn` |
+
+### Phase 26 — Rust collections  ·  [`phase-26-rust-collections/`](./phase-26-rust-collections/)
+
+| ☐ | PR | Delivers | Rust rule |
+|---|---|---|---|
+| ☐ | [26.1](./phase-26-rust-collections/pr-26.1-coll-map-choice.md) | Key the relation cache with a BTreeMap so latest-version lookup is a range query | `coll-map-choice` |
+| ☐ | [26.2](./phase-26-rust-collections/pr-26.2-coll-set-membership.md) | Index streamed-change ownership in a set instead of rescanning every open transaction | `coll-set-membership` |
+| ☐ | [26.3](./phase-26-rust-collections/pr-26.3-coll-binaryheap.md) | Pop spill candidates from a BinaryHeap instead of rescanning the meter for the max | `coll-binaryheap` |
+| ☐ | [26.4](./phase-26-rust-collections/pr-26.4-coll-seq-choice.md) | Drain pending reload signals in one pass and deny LinkedList workspace-wide | `coll-seq-choice` |
+
+### Phase 27 — Rust naming conventions  ·  [`phase-27-rust-naming/`](./phase-27-rust-naming/)
+
+| ☐ | PR | Delivers | Rust rule |
+|---|---|---|---|
+| ☐ | [27.1](./phase-27-rust-naming/pr-27.1-name-as-free.md) | Rename the allocating `LoaderError::as_common` to `to_common` | `name-as-free` |
+| ☐ | [27.2](./phase-27-rust-naming/pr-27.2-name-to-expensive.md) | Give the allocating column projections a `to_` cost signal | `name-to-expensive` |
+| ☐ | [27.3](./phase-27-rust-naming/pr-27.3-name-into-ownership.md) | Rename `BatchBuilder::finish` to `into_record_batch` to signal the move | `name-into-ownership` |
+| ☐ | [27.4](./phase-27-rust-naming/pr-27.4-name-is-has-bool.md) | Prefix the predicate methods with `is_` | `name-is-has-bool` |
+| ☐ | [27.5](./phase-27-rust-naming/pr-27.5-name-lifetime-short.md) | Elide the two nameable-but-pointless sqlx encoder lifetimes and deny `elidable_lifetime_names` | `name-lifetime-short` |
+| ☐ | [27.6](./phase-27-rust-naming/pr-27.6-name-iter-method.md) | Give `PgRelation` `iter()` and `iter_mut()` over its columns | `name-iter-method` |
+| ☐ | [27.7](./phase-27-rust-naming/pr-27.7-name-iter-convention.md) | Implement `IntoIterator` for `PgRelation` and its two reference forms | `name-iter-convention` |
+| ☐ | [27.8](./phase-27-rust-naming/pr-27.8-name-iter-type-match.md) | Name the `PgRelation` iterator types `Iter`, `IterMut`, `IntoIter` | `name-iter-type-match` |
+| ☐ | [27.9](./phase-27-rust-naming/pr-27.9-name-funcs-snake.md) | Deny `non_snake_case` explicitly and add the naming guard script | `name-funcs-snake` |
+| ☐ | [27.10](./phase-27-rust-naming/pr-27.10-name-types-camel.md) | Deny `non_camel_case_types` explicitly and guard type names | `name-types-camel` |
+| ☐ | [27.11](./phase-27-rust-naming/pr-27.11-name-variants-camel.md) | Make the enum variant the single source of truth for its SQL literal | `name-variants-camel` |
+| ☐ | [27.12](./phase-27-rust-naming/pr-27.12-name-consts-screaming.md) | Deny `non_upper_case_globals` explicitly and guard const naming | `name-consts-screaming` |
+| ☐ | [27.13](./phase-27-rust-naming/pr-27.13-name-acronym-word.md) | Turn on aggressive acronym casing in clippy.toml | `name-acronym-word` |
+| ☐ | [27.14](./phase-27-rust-naming/pr-27.14-name-no-get-prefix.md) | Guard the tree against `get_` getters | `name-no-get-prefix` |
+| ☐ | [27.15](./phase-27-rust-naming/pr-27.15-name-type-param-single.md) | Guard generic parameters to the conventional short names | `name-type-param-single` |
+| ☐ | [27.16](./phase-27-rust-naming/pr-27.16-name-crate-no-rs.md) | Guard crate and binary names against `-rs` / `-rust` suffixes | `name-crate-no-rs` |
+
+### Phase 28 — Rust testing  ·  [`phase-28-rust-testing/`](./phase-28-rust-testing/)
+
+| ☐ | PR | Delivers | Rust rule |
+|---|---|---|---|
+| ☐ | [28.1](./phase-28-rust-testing/pr-28.1-test-cfg-test-module.md) | Guard sibling unit-test module wiring | `test-cfg-test-module` |
+| ☐ | [28.2](./phase-28-rust-testing/pr-28.2-test-use-super.md) | Require `use super::*;` in sibling unit tests | `test-use-super` |
+| ☐ | [28.3](./phase-28-rust-testing/pr-28.3-test-descriptive-names.md) | Reject placeholder names in sibling unit tests | `test-descriptive-names` |
+| ☐ | [28.4](./phase-28-rust-testing/pr-28.4-test-arrange-act-assert.md) | Split and label four multi-concern unit tests | `test-arrange-act-assert` |
+| ☐ | [28.5](./phase-28-rust-testing/pr-28.5-test-integration-dir.md) | Verify crate-root integration-test placement | `test-integration-dir` |
+| ☐ | [28.6](./phase-28-rust-testing/pr-28.6-test-fixture-raii.md) | Replace fixed loader test paths with `TempDir` | `test-fixture-raii` |
+| ☐ | [28.7](./phase-28-rust-testing/pr-28.7-test-tokio-async.md) | Run the reload concurrency test on paused Tokio time | `test-tokio-async` |
+| ☐ | [28.8](./phase-28-rust-testing/pr-28.8-test-mock-traits.md) | Add hermetic object-store success and failure tests | `test-mock-traits` |
+| ☐ | [28.9](./phase-28-rust-testing/pr-28.9-test-mockall-mocking.md) | Record PR 28.8 as the owner of object-store test doubles | `test-mockall-mocking` |
+| ☐ | [28.10](./phase-28-rust-testing/pr-28.10-test-proptest-properties.md) | Property-test `Lsn` round trips and textual ordering | `test-proptest-properties` |
+| ☐ | [28.11](./phase-28-rust-testing/pr-28.11-test-should-panic.md) | Record why Walrus has no `#[should_panic]` contract | `test-should-panic` |
+| ☐ | [28.12](./phase-28-rust-testing/pr-28.12-test-doctest-examples.md) | Verify API doctests and explicit non-Rust fences | `test-doctest-examples` |
+| ☐ | [28.13](./phase-28-rust-testing/pr-28.13-test-snapshot-testing.md) | Snapshot loader transform and additive-DDL output | `test-snapshot-testing` |
+| ☐ | [28.14](./phase-28-rust-testing/pr-28.14-test-criterion-bench.md) | Add loader and comparison workflows to Criterion recipes | `test-criterion-bench` |
+| ☐ | [28.15](./phase-28-rust-testing/pr-28.15-test-loom-concurrency.md) | Guard the absence of first-party atomic mutation | `test-loom-concurrency` |
+
+### Phase 29 — Rust documentation  ·  [`phase-29-rust-documentation/`](./phase-29-rust-documentation/)
+
+| ☐ | PR | Delivers | Rust rule |
+|---|---|---|---|
+| ☐ | [29.1](./phase-29-rust-documentation/pr-29.1-doc-module-inner.md) | Document and gate production module responsibilities | `doc-module-inner` |
+| ☐ | [29.2](./phase-29-rust-documentation/pr-29.2-doc-all-public.md) | Document every reachable public API | `doc-all-public` |
+| ☐ | [29.3](./phase-29-rust-documentation/pr-29.3-doc-errors-section.md) | Document caller-facing error contracts | `doc-errors-section` |
+| ☐ | [29.4](./phase-29-rust-documentation/pr-29.4-doc-panics-section.md) | Verify no public API requires a `# Panics` contract | `doc-panics-section` |
+| ☐ | [29.5](./phase-29-rust-documentation/pr-29.5-doc-safety-section.md) | Record the zero-unsafe documentation decision | `doc-safety-section` |
+| ☐ | [29.6](./phase-29-rust-documentation/pr-29.6-doc-question-mark.md) | Verify runnable docs avoid `unwrap` and `expect` | `doc-question-mark` |
+| ☐ | [29.7](./phase-29-rust-documentation/pr-29.7-doc-intra-links.md) | Link related API items with resolvable rustdoc links | `doc-intra-links` |
+| ☐ | [29.8](./phase-29-rust-documentation/pr-29.8-doc-examples-section.md) | Add runnable examples for pure public APIs | `doc-examples-section` |
+| ☐ | [29.9](./phase-29-rust-documentation/pr-29.9-doc-hidden-setup.md) | Record why PR 29.8 examples need no hidden setup | `doc-hidden-setup` |
+| ☐ | [29.10](./phase-29-rust-documentation/pr-29.10-doc-link-types.md) | Record PR 29.7 as the owner of related-item links | `doc-link-types` |
+| ☐ | [29.11](./phase-29-rust-documentation/pr-29.11-doc-cargo-metadata.md) | Mark internal workspace crates as non-publishable | `doc-cargo-metadata` |
+| ☐ | [29.12](./phase-29-rust-documentation/pr-29.12-doc-crate-readme.md) | Record why monorepo crates must not include the root README | `doc-crate-readme` |
+
+### Phase 30 — Rust observability  ·  [`phase-30-rust-observability/`](./phase-30-rust-observability/)
+
+| ☐ | PR | Delivers | Rust rule |
+|---|---|---|---|
+| ☐ | [30.1](./phase-30-rust-observability/pr-30.1-obs-tracing-over-log.md) | Verify tracing-only diagnostics after subscriber initialization | `obs-tracing-over-log` |
+| ☐ | [30.2](./phase-30-rust-observability/pr-30.2-obs-library-facade.md) | Verify subscriber initialization stays in binary bootstrap | `obs-library-facade` |
+| ☐ | [30.3](./phase-30-rust-observability/pr-30.3-obs-structured-fields.md) | Move tracing values into stable structured fields | `obs-structured-fields` |
+| ☐ | [30.4](./phase-30-rust-observability/pr-30.4-obs-instrument-spans.md) | Record why long-lived loops use events instead of instrument spans | `obs-instrument-spans` |
+| ☐ | [30.5](./phase-30-rust-observability/pr-30.5-obs-levels-filter.md) | Verify telemetry filter precedence and safe defaults | `obs-levels-filter` |
+| ☐ | [30.6](./phase-30-rust-observability/pr-30.6-obs-error-chain.md) | Preserve error source chains in warning and error events | `obs-error-chain` |
+| ☐ | [30.7](./phase-30-rust-observability/pr-30.7-obs-no-sensitive-data.md) | Verify tracing emits only allowlisted non-secret data | `obs-no-sensitive-data` |
+
+### Phase 31 — Rust performance patterns  ·  [`phase-31-rust-performance/`](./phase-31-rust-performance/)
+
+| ☐ | PR | Delivers | Rust rule |
+|---|---|---|---|
+| ☐ | [31.1](./phase-31-rust-performance/pr-31.1-perf-iter-over-index.md) | Record why variable-step parsers retain indexed loops | `perf-iter-over-index` |
+| ☐ | [31.2](./phase-31-rust-performance/pr-31.2-perf-iter-lazy.md) | Verify collections cross ownership or reuse boundaries | `perf-iter-lazy` |
+| ☐ | [31.3](./phase-31-rust-performance/pr-31.3-perf-collect-once.md) | Verify no iterator pipeline collects an intermediate result | `perf-collect-once` |
+| ☐ | [31.4](./phase-31-rust-performance/pr-31.4-perf-entry-api.md) | Verify map updates already use the correct entry semantics | `perf-entry-api` |
+| ☐ | [31.5](./phase-31-rust-performance/pr-31.5-perf-drain-reuse.md) | Record why move-out beats drain for owned work buffers | `perf-drain-reuse` |
+| ☐ | [31.6](./phase-31-rust-performance/pr-31.6-perf-extend-batch.md) | Record why stateful builder loops do not use `extend` | `perf-extend-batch` |
+| ☐ | [31.7](./phase-31-rust-performance/pr-31.7-perf-chain-avoid.md) | Verify the remaining iterator chain is bounded and cold | `perf-chain-avoid` |
+| ☐ | [31.8](./phase-31-rust-performance/pr-31.8-perf-collect-into.md) | Record why collected destinations cannot reuse capacity | `perf-collect-into` |
+| ☐ | [31.9](./phase-31-rust-performance/pr-31.9-perf-black-box-bench.md) | Verify every Criterion target prevents dead-code elimination | `perf-black-box-bench` |
+| ☐ | [31.10](./phase-31-rust-performance/pr-31.10-perf-release-profile.md) | Verify the existing thin-LTO release-profile decision | `perf-release-profile` |
+| ☐ | [31.11](./phase-31-rust-performance/pr-31.11-perf-profile-first.md) | Record the benchmark evidence required before optimization | `perf-profile-first` |
+| ☐ | [31.12](./phase-31-rust-performance/pr-31.12-perf-ahash.md) | Record why the default hasher remains the safe baseline | `perf-ahash` |
+| ☐ | [31.13](./phase-31-rust-performance/pr-31.13-perf-io-buffering.md) | Verify existing I/O layers already provide appropriate buffering | `perf-io-buffering` |
+
+### Phase 32 — Rust project structure  ·  [`phase-32-rust-project-structure/`](./phase-32-rust-project-structure/)
+
+| ☐ | PR | Delivers | Rust rule |
+|---|---|---|---|
+| ☐ | [32.1](./phase-32-rust-project-structure/pr-32.1-proj-lib-main-split.md) | Move service orchestration out of `main.rs` | `proj-lib-main-split` |
+| ☐ | [32.2](./phase-32-rust-project-structure/pr-32.2-proj-mod-by-feature.md) | Verify top-level modules follow product capabilities | `proj-mod-by-feature` |
+| ☐ | [32.3](./phase-32-rust-project-structure/pr-32.3-proj-flat-small.md) | Record why the current per-crate module depth stays flat | `proj-flat-small` |
+| ☐ | [32.4](./phase-32-rust-project-structure/pr-32.4-proj-mod-rs-dir.md) | Verify only the multi-file decoder needs `mod.rs` | `proj-mod-rs-dir` |
+| ☐ | [32.5](./phase-32-rust-project-structure/pr-32.5-proj-pub-crate-internal.md) | Verify public visibility has external consumers | `proj-pub-crate-internal` |
+| ☐ | [32.6](./phase-32-rust-project-structure/pr-32.6-proj-pub-super-parent.md) | Record why no item qualifies for `pub(super)` | `proj-pub-super-parent` |
+| ☐ | [32.7](./phase-32-rust-project-structure/pr-32.7-proj-pub-use-reexport.md) | Verify current re-exports form the intended public facades | `proj-pub-use-reexport` |
+| ☐ | [32.8](./phase-32-rust-project-structure/pr-32.8-proj-prelude-module.md) | Record why Walrus should not add a prelude | `proj-prelude-module` |
+| ☐ | [32.9](./phase-32-rust-project-structure/pr-32.9-proj-bin-dir.md) | Verify one named binary per service package | `proj-bin-dir` |
+| ☐ | [32.10](./phase-32-rust-project-structure/pr-32.10-proj-workspace-large.md) | Verify the six-package workspace boundary | `proj-workspace-large` |
+| ☐ | [32.11](./phase-32-rust-project-structure/pr-32.11-proj-workspace-deps.md) | Verify third-party versions inherit from the workspace | `proj-workspace-deps` |
+| ☐ | [32.12](./phase-32-rust-project-structure/pr-32.12-proj-feature-additive.md) | Verify every Cargo feature is additive | `proj-feature-additive` |
+| ☐ | [32.13](./phase-32-rust-project-structure/pr-32.13-proj-msrv-declare.md) | Verify one inherited Rust 1.95 MSRV contract | `proj-msrv-declare` |
+| ☐ | [32.14](./phase-32-rust-project-structure/pr-32.14-proj-build-rs-minimal.md) | Record the absence of first-party build scripts | `proj-build-rs-minimal` |
+
+### Phase 33 — Rust linting  ·  [`phase-33-rust-linting/`](./phase-33-rust-linting/)
+
+| ☐ | PR | Delivers | Rust rule |
+|---|---|---|---|
+| ☐ | [33.1](./phase-33-rust-linting/pr-33.1-lint-deny-correctness.md) | Verify `clippy::all = deny` already enforces correctness | `lint-deny-correctness` |
+| ☐ | [33.2](./phase-33-rust-linting/pr-33.2-lint-warn-suspicious.md) | Record PR 33.1 as the owner of `clippy::suspicious` enforcement | `lint-warn-suspicious` |
+| ☐ | [33.3](./phase-33-rust-linting/pr-33.3-lint-warn-style.md) | Record PR 33.1 as the owner of `clippy::style` enforcement | `lint-warn-style` |
+| ☐ | [33.4](./phase-33-rust-linting/pr-33.4-lint-warn-complexity.md) | Record PR 33.1 as the owner of `clippy::complexity` enforcement | `lint-warn-complexity` |
+| ☐ | [33.5](./phase-33-rust-linting/pr-33.5-lint-warn-perf.md) | Record PR 33.1 as the owner of `clippy::perf` enforcement | `lint-warn-perf` |
+| ☐ | [33.6](./phase-33-rust-linting/pr-33.6-lint-pedantic-selective.md) | Record why Walrus selects lints instead of enabling all pedantic | `lint-pedantic-selective` |
+| ☐ | [33.7](./phase-33-rust-linting/pr-33.7-lint-missing-docs.md) | Deny missing docs and broken rustdoc links workspace-wide | `lint-missing-docs` |
+| ☐ | [33.8](./phase-33-rust-linting/pr-33.8-lint-unsafe-doc.md) | Record why zero-unsafe policy needs no extra doc lint | `lint-unsafe-doc` |
+| ☐ | [33.9](./phase-33-rust-linting/pr-33.9-lint-cargo-metadata.md) | Record why internal crates do not enable `clippy::cargo` | `lint-cargo-metadata` |
+| ☐ | [33.10](./phase-33-rust-linting/pr-33.10-lint-rustfmt-check.md) | Verify CI and `just fmt` enforce `cargo fmt --check` | `lint-rustfmt-check` |
+| ☐ | [33.11](./phase-33-rust-linting/pr-33.11-lint-workspace-lints.md) | Verify every workspace member inherits centralized lints | `lint-workspace-lints` |
+| ☐ | [33.12](./phase-33-rust-linting/pr-33.12-lint-cfg-check.md) | Verify denied warnings already catch unexpected cfgs | `lint-cfg-check` |
+| ☐ | [33.13](./phase-33-rust-linting/pr-33.13-lint-clippy-nursery-selected.md) | Record the selective nursery-lint decision | `lint-clippy-nursery-selected` |
+
+### Phase 34 — Rust anti-patterns  ·  [`phase-34-rust-anti-patterns/`](./phase-34-rust-anti-patterns/)
+
+| ☐ | PR | Delivers | Rust rule |
+|---|---|---|---|
+| ☐ | [34.1](./phase-34-rust-anti-patterns/pr-34.1-anti-unwrap-abuse.md) | Record PR 7.7 as the owner of production `unwrap` enforcement | `anti-unwrap-abuse` |
+| ☐ | [34.2](./phase-34-rust-anti-patterns/pr-34.2-anti-expect-lazy.md) | Record PR 7.7 as the owner of production `expect` enforcement | `anti-expect-lazy` |
+| ☐ | [34.3](./phase-34-rust-anti-patterns/pr-34.3-anti-clone-excessive.md) | Record PR 9.1 as the owner of the clone audit | `anti-clone-excessive` |
+| ☐ | [34.4](./phase-34-rust-anti-patterns/pr-34.4-anti-lock-across-await.md) | Record PR 14.3 as the owner of lock-across-await enforcement | `anti-lock-across-await` |
+| ☐ | [34.5](./phase-34-rust-anti-patterns/pr-34.5-anti-string-for-str.md) | Record PR 9.2 as the owner of borrowed string parameters | `anti-string-for-str` |
+| ☐ | [34.6](./phase-34-rust-anti-patterns/pr-34.6-anti-vec-for-slice.md) | Record PR 9.2 as the owner of borrowed slice parameters | `anti-vec-for-slice` |
+| ☐ | [34.7](./phase-34-rust-anti-patterns/pr-34.7-anti-index-over-iter.md) | Record PR 31.1 as the owner of the indexed-loop audit | `anti-index-over-iter` |
+| ☐ | [34.8](./phase-34-rust-anti-patterns/pr-34.8-anti-panic-expected.md) | Record PR 10.9 as the owner of production panic enforcement | `anti-panic-expected` |
+| ☐ | [34.9](./phase-34-rust-anti-patterns/pr-34.9-anti-empty-catch.md) | Log discarded cleanup and task-join errors | `anti-empty-catch` |
+| ☐ | [34.10](./phase-34-rust-anti-patterns/pr-34.10-anti-over-abstraction.md) | Verify first-party abstractions have concrete consumers | `anti-over-abstraction` |
+| ☐ | [34.11](./phase-34-rust-anti-patterns/pr-34.11-anti-premature-optimize.md) | Record PR 31.11 as the owner of profile-before-optimize policy | `anti-premature-optimize` |
+| ☐ | [34.12](./phase-34-rust-anti-patterns/pr-34.12-anti-type-erasure.md) | Record PR 19.5 as the owner of dynamic-dispatch decisions | `anti-type-erasure` |
+| ☐ | [34.13](./phase-34-rust-anti-patterns/pr-34.13-anti-format-hot-path.md) | Record why profiled hot paths retain required formatting | `anti-format-hot-path` |
+| ☐ | [34.14](./phase-34-rust-anti-patterns/pr-34.14-anti-collect-intermediate.md) | Record PR 31.3 as the owner of intermediate-collection audits | `anti-collect-intermediate` |
+| ☐ | [34.15](./phase-34-rust-anti-patterns/pr-34.15-anti-stringly-typed.md) | Record PR 18.5 as the owner of typed domain-state decisions | `anti-stringly-typed` |
+
 ---
 
 ## CI grows with the phases
@@ -375,6 +789,7 @@ that needs them lands:
 
 | From PR | New CI gate |
 |---|---|
+| Roadmap | `next_task.py --validate-all --require-tracked` checks the index, rule coverage, dependencies, audited task contracts, links, and verification commands before any task can be selected |
 | 0.1 | `fmt --check`, `clippy --all-targets -D warnings`, `build --workspace`, `test --workspace` |
 | 0.6 | compose job: `docker compose up --wait` → smoke → `down` |
 | 1.3 | integration job vs compose (control PG); `sqlx` offline (`cargo sqlx prepare --check`) |

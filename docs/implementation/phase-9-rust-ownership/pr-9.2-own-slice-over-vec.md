@@ -8,6 +8,9 @@
 
 > **Status:** 📋 Planned <!-- flip to "✅ Done — <PR url>" when it merges -->
 
+> **Readiness:** audited · **Outcome:** change
+> **Gates:** fmt,clippy,test · **Test packages:** pg-to-arrow
+
 > **Phase:** 9 — Rust ownership & borrowing · **Crates touched:** `pg-to-arrow` ·
 > **Est. size:** S · **Depends on:** PR 9.1 · **Unlocks:** PR 9.3
 
@@ -34,7 +37,7 @@ and (explicitly, as documentation rather than inheritance) `ptr_arg` in `[worksp
 
 ## Read first
 
-- [`own-slice-over-vec`](../../.claude/skills/rust-skills/rules/own-slice-over-vec.md) — take the
+- [`own-slice-over-vec`](../../../.claude/skills/rust-skills/rules/own-slice-over-vec.md) — take the
   Deref-coercion chain and the "when to accept owned types" carve-out from it. Note that walrus is
   already conformant for `&Vec`/`&String`; this ticket is about the `Option` corner it does not name.
 - `crates/pg-to-arrow/src/batch.rs:590-597` — `opt_text_value`, the one site.
@@ -45,7 +48,24 @@ and (explicitly, as documentation rather than inheritance) `ptr_arg` in `[worksp
   are derived, not stored.
 - `Cargo.toml:15-21` — `[workspace.lints.clippy]`, where the two lints land.
 
+## Baseline contract
+
+- **Precondition:** Confirm `rule-present`, then inspect the immediate predecessor's named paths and
+  symbols with `rg`. Historical line coordinates in the audit are navigation hints only; the
+  named symbol and stated precondition are authoritative.
+- **Allowed files:** The **Files to create / modify** block is exhaustive.
+
+- Any other current-tree mismatch blocks before editing.
+
 ## Scope
+
+**Baseline precondition.** Before editing, reproduce the task's authored finding from its named
+source paths, symbols, counts, and read-only probes; run the full **Verification commands** block
+after implementation. The named sites and allowed paths are the complete task boundary.
+
+**Baseline mismatch.** If the current tree differs from that authored finding, **STOP and request
+task re-authoring before editing.** Do not choose another site, implementation, evidence conclusion,
+or outcome.
 
 **In scope**
 
@@ -97,6 +117,14 @@ fn opt_text_value(bound: Option<&str>) -> TupleValue {
 // allocation and no clone.
 append_value(builders[0].as_mut(), &fields[0], &opt_text_value(todo!("r.lower.as_deref()")))?;
 append_value(builders[1].as_mut(), &fields[1], &opt_text_value(todo!("r.upper.as_deref()")))?;
+```
+
+## Verification commands
+
+```text
+rule-present = test -f .claude/skills/rust-skills/rules/own-slice-over-vec.md
+focused-test = cargo test -p pg-to-arrow
+diff-check = git diff --check origin/main...HEAD
 ```
 
 ## Definition of Done
@@ -160,7 +188,7 @@ $ cargo clippy --all-targets --all-features -- -D warnings
 
 ## References
 
-- Rule: [`own-slice-over-vec`](../../.claude/skills/rust-skills/rules/own-slice-over-vec.md)
+- Rule: [`own-slice-over-vec`](../../../.claude/skills/rust-skills/rules/own-slice-over-vec.md)
 - Design: `docs/architecture.md` § "Data type translation (Postgres → Arrow → Parquet)" — the Tier-2
   range fan-out (`_lower`, `_upper`, `_lower_inc`, `_upper_inc`, `_empty`).
-- Prev: [PR 9.1](./pr-9.1-own-borrow-over-clone.md) · Next: [PR 9.3](./pr-9.3-own-clone-explicit.md) · [Phase 9](./README.md) · [Roadmap](../README.md)
+- Prev: [PR 9.1](./pr-9.1-own-borrow-over-clone.md) · Next: [PR 9.3](./pr-9.3-own-clone-explicit.md) · [Roadmap](../README.md)

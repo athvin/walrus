@@ -18,7 +18,9 @@ and the recipes a script cannot encode.
 ## 1. Gate names and commands
 
 `run_gate.sh <gate>[,<gate>…] [--pkgs a,b]` — one `CHECK:<name>=…` line per
-check, a 40-line tail per failure, final `GATE=PASS|FAIL`.
+check, a 40-line tail per failure, final `GATE=PASS|FAIL`. Omit `--pkgs` when
+the task declares `Test packages: —`. A bare/empty `--pkgs`, malformed list, or
+unknown gate is `ANOMALY` (exit 2), never a passing skip.
 
 | Gate | Runs | Needs |
 |---|---|---|
@@ -77,14 +79,26 @@ hence `--wait 2700` for code PRs. Poll patiently; do not read this as a hang.
 
 ## 3. What a gate list contains
 
-`next_task.py` derives each task's `gates` from its own **Definition of Done**
-text, so the loop runs what that task claims and nothing else. `fmt`, `clippy`
-and `test` are always included; the rest appear when the DoD mentions them
-(`docker compose`, `.sqlx`, `--features conformance`, `cargo deny`, `--features
-it` / `tests/e2e`, `kubeconform`, MSRV, image smoke).
+Phase 9+ tasks declare the list in an exact header:
 
-If a DoD line names a gate the list missed, run it anyway and fix the DoD wording
-in the mark-done PR — the DoD is the contract, the derived list is a convenience.
+```text
+> **Gates:** fmt,clippy,test[,supported-extra] · **Test packages:** pkg-a,pkg-b|—
+```
+
+The first three gates are mandatory and ordered. Extras must be names from the
+table in §1; package names must exist in Cargo metadata. Prose is never scanned,
+so a negative/deferred SQLx, Compose, image, or e2e mention cannot accidentally
+enable a gate, and an explicit `integration` cannot be missed. Unknown names
+fail validation and also fail loudly in `run_gate.sh`.
+
+Phase 0–8 task files predate this contract and retain their legacy DoD inference
+for compatibility. Do not use that inference when authoring a new task.
+
+The separate `## Verification commands` block carries exact, labeled commands
+that do not map cleanly to a reusable gate (a particular benchmark, docs check,
+metadata probe, or evidence assertion). The implementer runs every entry and
+must return every label as `PASS`; neither the baseline nor a nearby command is
+a substitute.
 
 ## 4. Gates that switch on as phases land
 
@@ -102,12 +116,12 @@ Mirrors the roadmap's "CI grows with the phases" table:
 | 5.1 | docs-only diffs skip the compile-heavy jobs (`changes`) |
 | 7.7 | clippy denies `unwrap_used` / `expect_used` in production code |
 
-Phases 8+ are refactors over a finished tree, so the baseline plus whatever the
-touched crate's DoD names is usually the whole story. The exception is a task
-that *adds* a gate — PR 12.7 lands a Miri job, for instance. When a task's DoD
-names a CI job that does not exist yet, that job is part of the deliverable:
-`run_gate.sh` will report it as `SKIP:unknown gate name`, and the local proof is
-whatever command the task specifies.
+Phases 8+ operate over a finished tree, so the baseline plus explicit reusable
+gates and task-specific verification is the whole local contract. A task may add
+a CI job, but it must prove that job with its labeled verification command until
+the reusable runner explicitly supports it; inventing a gate name is an anomaly.
+The current Rust curriculum deliberately does not add generic `miri`, `loom`, or
+`bench` gates—task-specific decisions and benchmark commands stay in the task.
 
 ## 5. The fix-loop and fingerprints
 
@@ -123,6 +137,12 @@ fingerprint on two consecutive fix rounds is thrash → STOP with the run URL.
 Diagnose once, then stop: `gh run list --branch <branch> --limit 5`,
 `gh workflow list`, and check that the head commit actually pushed
 (`git rev-parse HEAD` vs `gh pr view <N> --json headRefOid`).
+
+Registration is part of the verdict. Because `ci.yml` runs on both `push` and
+`pull_request`, `classify_checks.py` reads every job name from that workflow and
+requires two copies on the PR head. One successful roadmap job—or even one
+complete copy of the whole workflow—remains `PENDING`; it cannot false-green a
+head while the second run is still registering.
 
 ## 6. Known flakes
 

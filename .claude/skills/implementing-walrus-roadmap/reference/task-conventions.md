@@ -20,6 +20,8 @@ breaking.
 ```
 # PR 9.1 — <title>                          ← the H1; the PR title is "PR <id> — <title>"
 > **Status:** 📋 Planned                     ← flipped by the mark-done PR, never by you
+> **Readiness:** audited · **Outcome:** change|evidence|superseded by PR <id>
+> **Gates:** fmt,clippy,test[,extra] · **Test packages:** crate-a,crate-b|—
 > **Phase:** … · **Crates touched:** … · **Est. size:** S|M|L ·
 > **Depends on:** PR 8.5 · **Unlocks:** PR 9.2
 
@@ -28,7 +30,9 @@ breaking.
 ## Why — learning objectives   the point of the exercise; keeps the change honest
 ## Read first                  exact files + design sections; read ALL of them
 ## Scope                       In scope / Explicitly deferred — a hard contract
+## Files to create / modify    exact file allowlist, including any new check scripts
 ## Skeleton                    signatures, enum variants, test names, todo!() bodies
+## Verification commands      fenced `text`: `lowercase-label = exact command`
 ## Definition of Done          the literal merge contract
 ## What completed looks like   the observable end state (commands + expected output)
 ## Hints & gotchas             the traps the author already hit
@@ -37,6 +41,24 @@ breaking.
 
 The **Skeleton** gives shapes, not solutions: fill the `todo!()` bodies, keep the
 public signatures and the named tests unless the DoD says otherwise.
+
+For phases 9+, both metadata lines and `Verification commands` are mandatory and
+machine parsed. `draft` is allowed only while authoring a scaffold; it can never
+be selected. Gates must start with `fmt,clippy,test`, use only names documented
+in `green-gates.md`, and list packages by Cargo package name. Use the em dash `—`
+for no package pre-check; the resulting gate command omits `--pkgs` entirely.
+
+Verification commands are one read-only command per unique lowercase/hyphen
+label. Supported forms are `cargo test/check/clippy/fmt --check/doc/bench/metadata`,
+`rg` (or `! rg` for an absence assertion), read-only `git diff/show/status/ls-files`,
+`test`, `find` without executing/deleting, named Python validators, and repo
+scripts in an explicit `--check`, `--self-test`, or `--dry-run` mode. Do not use
+redirects, command substitution, pipelines/chaining, mutating Cargo/Git commands,
+or a mutation-and-revert self-test. A script that the task will add is valid only
+when its path also appears under `Files to create / modify`.
+Because implementation is committed before the final report, diff verification
+must name the merge-base range (for example `git diff --check origin/main...HEAD`);
+a bare post-commit `git diff --check` is vacuous and rejected.
 
 ## 2. The literal-DoD-first rule
 
@@ -99,7 +121,13 @@ new or edited SQL and the stack is down, report `STATUS=blocked` with
 
 Precedent: PR 8.4 shipped as **8.4a — ManifestId newtype (slice 1 of 4)**.
 
-When a task's blast radius cannot land green in one PR:
+This mechanism is **legacy-only (phases 0–8)**. Phases 9–34 are a fixed,
+machine-checked 265-rule/265-task bijection: lettered IDs and extra rows are
+rejected. If an audited Rust task cannot land green as written, STOP and
+re-author that same task before it is selected again. Do not ship a partial
+outcome or leave remaining work outside the index.
+
+For a legacy task whose blast radius cannot land green in one PR:
 
 1. Pick the smallest slice that is independently green and useful.
 2. Branch `pr-<id><letter>-<slug>`, PR title `PR <id><letter> — <title> (slice k of n)`.
@@ -120,16 +148,28 @@ roadmap row. `next_task.py` reads both; when they disagree it returns
 
 ## 8. Phases 9+ — the Rust-skills phases
 
-Phases 9 and up (ownership, errors, memory, unsafe, API design, async,
-concurrency, codegen) are refactor phases over the finished tree. Two things
-differ from phases 0–8:
+Phases 9 and up are the one-rule/one-task Rust curriculum over the finished
+tree. They differ from phases 0–8 in these ways:
 
 - Each task's **Read first** cites a rule file under
   `.claude/skills/rust-skills/rules/<rule>.md`. Read the cited rule *and* the
-  exact source lines the task names — these tasks are precise about site counts
-  ("the exactly 4 sites clippy finds"), and a rewrite that changes more than the
-  named sites is out of scope.
-- Behaviour must not change. The proof is that the named tests stay green and, in
-  most tasks, that a lint the PR turns on reports zero diagnostics afterwards. If
-  a refactor needs a behavioural decision, that is a signal to stop and report,
-  not to decide.
+  exact source paths/symbols the task names. Line numbers are orientation only;
+  stable symbol/path probes and the task's explicit baseline precondition decide
+  whether the authored ticket still applies.
+- The author audits applicability and locks the outcome before activation:
+  `change` implements the bounded adjustment, `evidence` lands
+  `docs/implementation/notes/rust-skills/<rule>.md` plus only any explicitly
+  named non-production guard/config artifacts, and `superseded by PR <id>` proves
+  the earlier owner and lands the specified evidence note. Record the baseline
+  commit, exact commands/results, classified findings, conclusion, and the
+  condition that would reverse an evidence conclusion.
+- A baseline mismatch is an unconditional STOP for task re-authoring. The
+  implementer must not invent a new site, outcome, dependency, test, or fallback.
+  Later overlapping rules are residual audits; their earlier task owns shared
+  changes.
+- Most tasks are behaviour-preserving, but task-specific acceptance is the
+  authority. Edition migrations, public compatibility checks, metadata/docs
+  changes, and similar rules follow the compatibility and verification contract
+  written in that task rather than a blanket "no behavior change" assumption.
+- Every task-specific verification command must run exactly and be returned by
+  label as `PASS`; the baseline gate alone is insufficient.

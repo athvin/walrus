@@ -8,6 +8,9 @@
 
 > **Status:** 📋 Planned <!-- flip to "✅ Done — <PR url>" when it merges -->
 
+> **Readiness:** audited · **Outcome:** evidence
+> **Gates:** fmt,clippy,test · **Test packages:** loader,pg-sink
+
 > **Phase:** 9 — Rust ownership & borrowing · **Crates touched:** `loader`, `pg-sink` ·
 > **Est. size:** S · **Depends on:** PR 9.11 · **Unlocks:** PR 10.1
 
@@ -32,7 +35,7 @@ lock.
 
 ## Read first
 
-- [`own-rwlock-readers`](../../.claude/skills/rust-skills/rules/own-rwlock-readers.md) — read it in
+- [`own-rwlock-readers`](../../../.claude/skills/rust-skills/rules/own-rwlock-readers.md) — read it in
   full, and read the **When RwLock Hurts** table hardest: "writes >20 % of operations ⇒ `Mutex`" and
   "lock held very briefly ⇒ `Mutex`" are the two rows that decide this ticket. Note also that its
   `std::sync::RwLock` examples all end in `.unwrap()`.
@@ -48,7 +51,26 @@ lock.
   `scripts/k8s-validate.sh` for the house shell-guard style (`set -euo pipefail`,
   `cd "$(git rev-parse --show-toplevel)"`).
 
+## Baseline contract
+
+- **Precondition:** Confirm `rule-present`, then reproduce the audited non-applicability or rejected
+  tradeoff on the immediate predecessor by named path and symbol. Historical line coordinates are
+  navigation hints only.
+- **Locked outcome:** This is an evidence task. Land only the decision note and mechanical guards
+  explicitly listed in the allowlist; do not adopt the rejected optimization or API. The canonical
+  artifact is `docs/implementation/notes/rust-skills/own-rwlock-readers.md`.
+- **Allowed files:** The **Files to create / modify** block is exhaustive. Any applicable production
+  change, ambiguous mapping, or newly required path blocks; do not convert the task to `change`.
+
 ## Scope
+
+**Baseline precondition.** Before editing, reproduce the task's authored finding from its named
+source paths, symbols, counts, and read-only probes; run the full **Verification commands** block
+after implementation. The named sites and allowed paths are the complete task boundary.
+
+**Baseline mismatch.** If the current tree differs from that authored finding, **STOP and request
+task re-authoring before editing.** Do not choose another site, implementation, evidence conclusion,
+or outcome.
 
 **The conflict, and how to resolve it** — the corpus rule says *"reads significantly outnumber
 writes → `RwLock`"*. **Measured, walrus has no such structure.** Zero `RwLock`s exist and both
@@ -60,11 +82,12 @@ rejection* carrying the per-site read/write analysis, plus a mechanical guard �
 
 **In scope**
 
-- `docs/implementation/notes/lock-choice.md` — the ADR: what the rule asks, the per-site read/write
+- `docs/implementation/notes/rust-skills/own-rwlock-readers.md` — the ADR: what the rule asks, the per-site read/write
   counts for both locks, why `RwLock` loses on both, why `parking_lot::Mutex` is the workspace
   default, and the criteria that would make a future `RwLock` legitimate.
 - `scripts/check-lock-choice.sh` — fails if any `Mutex<` / `RwLock<` **field declaration** under
-  `crates/*/src` (excluding `*_test.rs`) lacks a `// LOCK-CHOICE:` line directly above it.
+  `crates/*/src` (excluding `*_test.rs`) lacks a `// LOCK-CHOICE:` line directly above it. Its
+  `--self-test` uses a disposable source root to prove both branches.
 - A step in the CI `gates` job (`.github/workflows/ci.yml:53`) running that script.
 - The two `// LOCK-CHOICE:` comments the guard requires, each naming the access pattern that picked
   `Mutex`.
@@ -82,7 +105,7 @@ rejection* carrying the per-site read/write analysis, plus a mechanical guard �
 ## Files to create / modify
 
 ```
-docs/implementation/notes/lock-choice.md    # new — the ADR (per-site analysis + rejection)
+docs/implementation/notes/rust-skills/own-rwlock-readers.md    # new — the ADR (per-site analysis + rejection)
 scripts/check-lock-choice.sh                # new — the mechanical guard
 .github/workflows/ci.yml                    # + a step in the `gates` job (after checkout)
 crates/loader/src/health.rs                 # + // LOCK-CHOICE: above :28 last_poll_completed_at
@@ -96,7 +119,7 @@ crates/pg-sink/src/reload_signal.rs         # + // LOCK-CHOICE: above :45 waiter
 # check-lock-choice.sh — PR 9.12 guard (`own-rwlock-readers`). Every `Mutex<` / `RwLock<` FIELD
 # declaration in production code must carry a `// LOCK-CHOICE:` justification on the line directly
 # above it, naming the access pattern (read/write ratio, hold time) that picked this primitive.
-# walrus deliberately has zero RwLocks — see docs/implementation/notes/lock-choice.md — and a future
+# walrus deliberately has zero RwLocks — see docs/implementation/notes/rust-skills/own-rwlock-readers.md — and a future
 # one must be argued, not assumed.
 #
 #   bash scripts/check-lock-choice.sh
@@ -128,7 +151,7 @@ exit "$fail"
     // LOCK-CHOICE: Mutex, not RwLock — write-dominated. Written by every apply worker at the end of
     // every poll cycle (`stamp_poll`); read only by the kubelet's /healthz probe (`is_live`). Both
     // hold the lock for a single expression, so reader-tracking would be pure overhead.
-    // See docs/implementation/notes/lock-choice.md.
+    // See docs/implementation/notes/rust-skills/own-rwlock-readers.md.
     last_poll_completed_at: Mutex<Option<Instant>>,
 ```
 
@@ -136,7 +159,7 @@ exit "$fail"
 // crates/pg-sink/src/reload_signal.rs — above line 45
     // LOCK-CHOICE: Mutex, not RwLock — 100 % writes. `subscribe` inserts and `resolve` removes;
     // there is no read-only access path at all. Held for exactly one map operation (PR 9.11).
-    // See docs/implementation/notes/lock-choice.md.
+    // See docs/implementation/notes/rust-skills/own-rwlock-readers.md.
     waiters: Mutex<HashMap<(i64, i64), oneshot::Sender<Echo>>>,
 ```
 
@@ -147,7 +170,7 @@ exit "$fail"
         run: bash scripts/check-lock-choice.sh
 ```
 
-The ADR at `docs/implementation/notes/lock-choice.md` follows `duckdb-lts-bump.md`: an H1
+The ADR at `docs/implementation/notes/rust-skills/own-rwlock-readers.md` follows `duckdb-lts-bump.md`: an H1
 `Lock choice: why walrus has no RwLock (PR 9.12)`, then a status blockquote —
 *"evaluated — `own-rwlock-readers` deliberately **not** adopted; two locks remain, both
 write-dominated, `parking_lot::Mutex` correct for both"* — then six H2 sections:
@@ -161,11 +184,21 @@ write-dominated, `parking_lot::Mutex` correct for both"* — then six H2 section
 | The guard | what `scripts/check-lock-choice.sh` enforces and where it runs in CI |
 | When to revisit | the concrete conditions that would make a future `RwLock` legitimate |
 
+## Verification commands
+
+```text
+rule-present = test -f .claude/skills/rust-skills/rules/own-rwlock-readers.md
+focused-test = cargo test -p loader -p pg-sink
+guard-self-test = bash scripts/check-lock-choice.sh --self-test
+evidence-note = test -s docs/implementation/notes/rust-skills/own-rwlock-readers.md
+diff-check = git diff --check origin/main...HEAD
+```
+
 ## Definition of Done
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `docs/implementation/notes/lock-choice.md` exists and contains, per lock: the field, the
+- [ ] `docs/implementation/notes/rust-skills/own-rwlock-readers.md` exists and contains, per lock: the field, the
       methods that touch it, whether each access is a read or a write, and how long the guard is
       held — plus the explicit rejection of `RwLock` and the `parking_lot`-vs-`std::sync`
       poisoning/`unwrap_used` argument.
@@ -174,8 +207,9 @@ A reviewer merges this PR when **all** of the following hold:
       revisitable rather than dogma.
 - [ ] `scripts/check-lock-choice.sh` exists, starts `set -euo pipefail`, and exits **0** on this
       branch.
-- [ ] The guard is proven to bite: delete one `// LOCK-CHOICE:` line, run the script, see it exit
-      **1** naming that `file:line`; restore the line. Paste that transcript in the PR body.
+- [ ] `bash scripts/check-lock-choice.sh --self-test` proves a clean temporary fixture passes and a
+      fixture lacking `// LOCK-CHOICE:` fails with its temporary `file:line`; tracked comments are
+      never removed.
 - [ ] `.github/workflows/ci.yml`'s `gates` job runs `bash scripts/check-lock-choice.sh`.
 - [ ] `crates/loader/src/health.rs:28` and `crates/pg-sink/src/reload_signal.rs:45` each carry a
       `// LOCK-CHOICE:` comment naming the access pattern and linking the note.
@@ -201,11 +235,11 @@ OK: every Mutex/RwLock field under crates/*/src carries a // LOCK-CHOICE: justif
 $ echo $?
 0
 
-# …and it bites. Remove the comment above reload_signal.rs:45 and rerun:
-$ bash scripts/check-lock-choice.sh
-::error file=crates/pg-sink/src/reload_signal.rs,line=45::lock field declared without a '// LOCK-CHOICE:' justification
-$ echo $?
-1
+# …and its isolated fixture proves the rejection path:
+$ bash scripts/check-lock-choice.sh --self-test
+ok: justified temporary lock field passes
+ok: unjustified temporary lock field is rejected with its file and line
+check-lock-choice self-test: PASS
 
 $ grep -rn --include='*.rs' 'RwLock' crates tests | wc -l
 0      # unchanged — this PR rejects the rule, it does not adopt it
@@ -241,8 +275,8 @@ $ grep -rn --include='*.rs' 'RwLock' crates tests | wc -l
 
 ## References
 
-- Rule: [`own-rwlock-readers`](../../.claude/skills/rust-skills/rules/own-rwlock-readers.md)
-- Design: `docs/implementation/notes/lock-choice.md` (this PR's ADR) and `docs/architecture.md`
+- Rule: [`own-rwlock-readers`](../../../.claude/skills/rust-skills/rules/own-rwlock-readers.md)
+- Design: `docs/implementation/notes/rust-skills/own-rwlock-readers.md` (this PR's ADR) and `docs/architecture.md`
   §1.9 / "Kubernetes wiring" — the probe cadence that makes `/healthz` the *only* reader of
   `last_poll_completed_at`.
-- Prev: [PR 9.11](./pr-9.11-own-mutex-interior.md) · Next: [PR 10.1](../phase-10-rust-errors/pr-10.1-err-from-impl.md) *(phase boundary → Phase 10 Rust error handling)* · [Phase 9](./README.md) · [Roadmap](../README.md)
+- Prev: [PR 9.11](./pr-9.11-own-mutex-interior.md) · Next: [PR 10.1](../phase-10-rust-errors/pr-10.1-err-from-impl.md) *(phase boundary → Phase 10 Rust error handling)* · [Roadmap](../README.md)

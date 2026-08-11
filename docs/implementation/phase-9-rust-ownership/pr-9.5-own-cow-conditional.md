@@ -8,6 +8,9 @@
 
 > **Status:** 📋 Planned <!-- flip to "✅ Done — <PR url>" when it merges -->
 
+> **Readiness:** audited · **Outcome:** change
+> **Gates:** fmt,clippy,test · **Test packages:** common,loader,pg-sink
+
 > **Phase:** 9 — Rust ownership & borrowing · **Crates touched:** `common`, `loader`, `pg-sink` ·
 > **Est. size:** M · **Depends on:** PR 9.4 · **Unlocks:** PR 9.6
 
@@ -43,7 +46,7 @@ take — `anti-premature-optimize` and `perf-profile-first` are rules from this 
 
 ## Read first
 
-- [`own-cow-conditional`](../../.claude/skills/rust-skills/rules/own-cow-conditional.md) — take the
+- [`own-cow-conditional`](../../../.claude/skills/rust-skills/rules/own-cow-conditional.md) — take the
   `normalize_path` example (the exact shape of this refactor) and the "when to use `Cow`" table.
 - `crates/common/src/sql.rs` — all 21 lines: the doc comment, the doctest at :9-13, the one-line body
   at :14-16, and the sibling-test wiring at :18-20.
@@ -58,7 +61,24 @@ take — `anti-premature-optimize` and `perf-profile-first` are rules from this 
 - `docs/implementation/phase-8-cleanup/pr-8.1-sql-literal-helper.md` — why this helper exists at all,
   and its explicit "the caller supplies the surrounding quotes" contract.
 
+## Baseline contract
+
+- **Precondition:** Confirm `rule-present`, then inspect the immediate predecessor's named paths and
+  symbols with `rg`. Historical line coordinates in the audit are navigation hints only; the
+  named symbol and stated precondition are authoritative.
+- **Allowed files:** The **Files to create / modify** block is exhaustive.
+
+- Any other current-tree mismatch blocks before editing.
+
 ## Scope
+
+**Baseline precondition.** Before editing, reproduce the task's authored finding from its named
+source paths, symbols, counts, and read-only probes; run the full **Verification commands** block
+after implementation. The named sites and allowed paths are the complete task boundary.
+
+**Baseline mismatch.** If the current tree differs from that authored finding, **STOP and request
+task re-authoring before editing.** Do not choose another site, implementation, evidence conclusion,
+or outcome.
 
 **In scope**
 
@@ -69,8 +89,9 @@ take — `anti-premature-optimize` and `perf-profile-first` are rules from this 
 - Add two cases to `crates/common/src/sql_test.rs` asserting the *variant*, not just the value:
   `matches!(sql_literal("plain"), Cow::Borrowed(_))` and `matches!(sql_literal("O'Brien"),
   Cow::Owned(_))`.
-- Touch call sites **only** where the compiler demands it. All six are expected to compile unchanged
-  via `Deref`/`Display`; if one does not, add the minimal `&` or `.as_ref()`, never a `.to_string()`.
+- Keep all six call sites byte-identical. The audited receiver contexts compile through
+  `Deref`/`Display`; if a predecessor changes one so that a call-site edit is required, stop as a
+  baseline mismatch rather than expanding this task's allowlist.
 
 **Explicitly deferred** (do *not* build these here)
 
@@ -87,10 +108,6 @@ take — `anti-premature-optimize` and `perf-profile-first` are rules from this 
 ```
 crates/common/src/sql.rs        # signature → Cow<'_, str>; two-arm body; doc comment updated
 crates/common/src/sql_test.rs   # + two variant assertions (Borrowed vs Owned)
-crates/loader/src/duck.rs       # only if a call site needs an explicit borrow (expected: no change)
-crates/loader/src/ddl.rs        # "
-crates/pg-sink/src/reload_export.rs  # "
-crates/pg-sink/src/preflight.rs      # "
 ```
 
 ## Skeleton
@@ -149,6 +166,14 @@ fn quoted_input_is_owned() {
 //                            :171   self.columns_for(&uri, schema_version)?  // &Cow<str> → &str
 //   crates/loader/src/duck.rs:180   format!("'{}'", common::sql::sql_literal(lsn))   // Display
 //   crates/pg-sink/src/preflight.rs:438  format!("'{}'", common::sql::sql_literal(s)) // Display
+```
+
+## Verification commands
+
+```text
+rule-present = test -f .claude/skills/rust-skills/rules/own-cow-conditional.md
+focused-test = cargo test -p common -p loader -p pg-sink
+diff-check = git diff --check origin/main...HEAD
 ```
 
 ## Definition of Done
@@ -229,7 +254,7 @@ test result: ok. 0 failed
 
 ## References
 
-- Rule: [`own-cow-conditional`](../../.claude/skills/rust-skills/rules/own-cow-conditional.md)
+- Rule: [`own-cow-conditional`](../../../.claude/skills/rust-skills/rules/own-cow-conditional.md)
 - Design: `docs/implementation/phase-8-cleanup/pr-8.1-sql-literal-helper.md` — the helper's original
   contract ("the caller supplies the surrounding quotes"; literal escaping is not identifier quoting).
-- Prev: [PR 9.4](./pr-9.4-own-copy-small.md) · Next: [PR 9.6](./pr-9.6-own-lifetime-elision.md) · [Phase 9](./README.md) · [Roadmap](../README.md)
+- Prev: [PR 9.4](./pr-9.4-own-copy-small.md) · Next: [PR 9.6](./pr-9.6-own-lifetime-elision.md) · [Roadmap](../README.md)
