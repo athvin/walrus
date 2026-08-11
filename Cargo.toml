@@ -14,6 +14,10 @@ warnings = "deny"
 
 [workspace.lints.clippy]
 all = "deny"
+# `ptr_arg` already arrives via `all = "deny"`; pin it explicitly so the borrowed-argument family is
+# documented together. `ref_option` is pedantic (outside `all`), so no priority juggling is needed.
+ptr_arg = "deny"
+ref_option = "deny"
 # No `unwrap`/`expect` in production (PR 7.6 cleaned the tree). Both are `clippy::restriction` lints
 # (not in `all`), so no `priority` juggling is needed. `clippy.toml` re-allows them under `#[cfg(test)]`
 # and integration `tests/`; benches (`harness = false`) and the e2e harness lib carry a file-level allow.
