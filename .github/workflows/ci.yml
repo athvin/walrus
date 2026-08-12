@@ -608,9 +608,9 @@ jobs:
         run: |
           KUSTOMIZE_VERSION=v5.4.3
           KUBECONFORM_VERSION=v0.6.7
-          curl -sSfL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" \
+          curl -sSfL --retry 5 --retry-all-errors --retry-delay 2 "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" \
             | sudo tar -xz -C /usr/local/bin kustomize
-          curl -sSfL "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
+          curl -sSfL --retry 5 --retry-all-errors --retry-delay 2 "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
             | sudo tar -xz -C /usr/local/bin kubeconform
           kustomize version
           kubeconform -v
