@@ -6,7 +6,7 @@
 
 # PR 9.2 — Take `Option<&str>` not `&Option<String>`, and pin the borrowed-argument lints
 
-> **Status:** 📋 Planned <!-- flip to "✅ Done — <PR url>" when it merges -->
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/130
 
 > **Readiness:** audited · **Outcome:** change
 > **Gates:** fmt,clippy,test · **Test packages:** pg-to-arrow
@@ -131,19 +131,19 @@ diff-check = git diff --check origin/main...HEAD
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `opt_text_value` takes `Option<&str>`; `grep -rn --include='*.rs' --exclude='*_test.rs'
+- [x] `opt_text_value` takes `Option<&str>`; `grep -rn --include='*.rs' --exclude='*_test.rs'
       '&Option<' crates/*/src` returns **no** hits.
-- [ ] Both callers in `append_range` use `.as_deref()`; no `.clone()` or `.to_string()` was added to
+- [x] Both callers in `append_range` use `.as_deref()`; no `.clone()` or `.to_string()` was added to
       compensate anywhere in `append_range`.
-- [ ] `[workspace.lints.clippy]` in `Cargo.toml` contains `ref_option = "deny"` and an explicit
+- [x] `[workspace.lints.clippy]` in `Cargo.toml` contains `ref_option = "deny"` and an explicit
       `ptr_arg = "deny"` with the "inherited from `all`, pinned for documentation" comment.
-- [ ] Range behaviour is unchanged: a whole-column NULL, an unbounded bound, and a real bound still
+- [x] Range behaviour is unchanged: a whole-column NULL, an unbounded bound, and a real bound still
       produce the same three Arrow outcomes — `cargo test -p pg-to-arrow` (including the range
       conformance vectors under `crates/pg-to-arrow/tests/`) is green with no test edits.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-to-arrow` (and `--workspace` stays green)
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-to-arrow` (and `--workspace` stays green)
 
 ## What completed looks like
 
