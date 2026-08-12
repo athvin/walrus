@@ -116,6 +116,43 @@ fn add_column_mirror_and_raw_nullable_old_rows_null() {
     );
 }
 
+// ---- RENAME TABLE carries the new name through the rest of the fold. ----
+#[test]
+fn rename_table_carries_current_name_through_the_fold() {
+    let db = mem(&rel("orders", vec![col("id", 23, true)]));
+    apply_additive(
+        db.conn(),
+        "orders",
+        &[
+            AdditiveChange::RenameTable {
+                from: "orders".into(),
+                to: "purchases".into(),
+            },
+            // Applied after the rename: must land on `purchases`, not `orders`.
+            AdditiveChange::AddColumn(col("note", 25, false)),
+        ],
+    )
+    .unwrap();
+
+    for table in ["purchases", "purchases_raw"] {
+        let columns = columns_of(db.conn(), table);
+        assert!(
+            columns.iter().any(|column| column == "note"),
+            "follow-on column landed on {table}: {columns:?}"
+        );
+    }
+
+    let current_columns = columns_of(db.conn(), "purchases_current");
+    assert!(
+        !current_columns.is_empty(),
+        "the user view was recreated under the final table name"
+    );
+    assert!(
+        columns_of(db.conn(), "orders_current").is_empty(),
+        "the stale user view was dropped"
+    );
+}
+
 // ---- RENAME COLUMN resolved by ATTNUM (position), never name — the RENAME-then-ADD trap. ----
 #[test]
 fn rename_column_tracked_by_attnum_not_name() {
