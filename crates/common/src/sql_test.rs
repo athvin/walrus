@@ -1,4 +1,5 @@
 use super::*;
+use std::borrow::Cow;
 
 #[test]
 fn doubles_single_quotes() {
@@ -18,4 +19,14 @@ fn leaves_clean_strings_untouched() {
 #[test]
 fn empty_string_is_empty() {
     assert_eq!(sql_literal(""), "");
+}
+
+#[test]
+fn clean_input_is_borrowed_not_allocated() {
+    assert!(matches!(sql_literal("plain"), Cow::Borrowed(_)));
+}
+
+#[test]
+fn quoted_input_is_owned() {
+    assert!(matches!(sql_literal("O'Brien"), Cow::Owned(_)));
 }
