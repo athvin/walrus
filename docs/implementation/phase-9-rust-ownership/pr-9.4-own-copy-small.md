@@ -6,7 +6,7 @@
 
 # PR 9.4 — Derive `Copy` on the small value types and gate it with `missing_copy_implementations`
 
-> **Status:** 📋 Planned <!-- flip to "✅ Done — <PR url>" when it merges -->
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/134
 
 > **Readiness:** audited · **Outcome:** change
 > **Gates:** fmt,clippy,test · **Test packages:** pg-sink
@@ -186,23 +186,23 @@ diff-check = git diff --check origin/main...HEAD
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `[workspace.lints.rust]` contains `missing_copy_implementations = "deny"`, with a comment
+- [x] `[workspace.lints.rust]` contains `missing_copy_implementations = "deny"`, with a comment
       recording that it is allow-by-default and therefore was *not* covered by `warnings = "deny"`.
-- [ ] `[workspace.lints.clippy]` contains `trivially_copy_pass_by_ref = "deny"`.
-- [ ] The nine immutable audited types derive `Copy`; `DurabilityCheckpoint` and `Backpressure`
+- [x] `[workspace.lints.clippy]` contains `trivially_copy_pass_by_ref = "deny"`.
+- [x] The nine immutable audited types derive `Copy`; `DurabilityCheckpoint` and `Backpressure`
       remain non-`Copy` with the two specified reasoned allows — no implementation-time triage.
-- [ ] The baseline remains exactly the audited 11 paths. Any extra or missing finding blocks rather
+- [x] The baseline remains exactly the audited 11 paths. Any extra or missing finding blocks rather
       than expanding the allowlist or changing the decision.
-- [ ] The production `Copy`-derive count is **≥ 32** (28 today), and no type holding a `String`,
+- [x] The production `Copy`-derive count is **≥ 32** (28 today), and no type holding a `String`,
       `Vec` or `Bytes` gained `Copy`.
-- [ ] Any `trivially_copy_pass_by_ref` site created by the new derives is fixed by taking the value,
+- [x] Any `trivially_copy_pass_by_ref` site created by the new derives is fixed by taking the value,
       not by an `#[allow]`.
-- [ ] Behaviour is unchanged: `cargo test -p pg-sink` is green with no test edits beyond those the
+- [x] Behaviour is unchanged: `cargo test -p pg-sink` is green with no test edits beyond those the
       compiler forces.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p pg-sink` (and `--workspace` stays green)
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p pg-sink` (and `--workspace` stays green)
 
 ## What completed looks like
 
