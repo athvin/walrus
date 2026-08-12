@@ -223,7 +223,7 @@ pub fn apply_additive(
                      ALTER TABLE \"{cur}_raw\" RENAME TO \"{to}_raw\"; \
                      DROP VIEW IF EXISTS \"{from}_current\";"
                 ));
-                cur = to.clone();
+                cur.clone_from(to);
                 structural = true;
             }
             AdditiveChange::Comment { target, text } => {
