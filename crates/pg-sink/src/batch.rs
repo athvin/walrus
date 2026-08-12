@@ -24,7 +24,7 @@ pub trait Clock: Send + Sync {
 }
 
 /// The wall clock.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct SystemClock;
 
 impl Clock for SystemClock {

@@ -16,6 +16,10 @@ use crate::replication::{ReplicationStream, StandbyStatus};
 use common::Lsn;
 
 /// Owns the slot-advancing `confirmed_flush_lsn`. Distinct from the stream's received LSN.
+#[allow(
+    missing_copy_implementations,
+    reason = "copying this mutable durability state could silently detach checkpoint advances"
+)]
 #[derive(Debug, Clone)]
 pub struct DurabilityCheckpoint {
     confirmed_flush: Lsn,

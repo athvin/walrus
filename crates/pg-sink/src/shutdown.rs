@@ -30,7 +30,7 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::sync::CancellationToken;
 
 /// Outcome of a drain attempt (the caller maps this to an `ExitCode` — a completed drain is `Success`).
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrainOutcome {
     /// Committed batch(es) flushed + manifested, final feedback sent, connection closed — slot left
     /// in place. `confirmed_flush` is the durable LSN a replacement pod resumes from.

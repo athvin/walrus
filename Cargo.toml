@@ -11,6 +11,8 @@ rust-version = "1.95" # MSRV — keep in sync with rust-toolchain.toml; CI `msrv
 # NOTE: these only take effect in a member once it declares `[lints] workspace = true`.
 [workspace.lints.rust]
 warnings = "deny"
+# This rustc lint is allow-by-default, so `warnings = "deny"` does not enable it.
+missing_copy_implementations = "deny"
 
 [workspace.lints.clippy]
 all = "deny"
@@ -20,6 +22,8 @@ ptr_arg = "deny"
 ref_option = "deny"
 # `assigning_clones` is pedantic (outside `all`), so no priority juggling is needed.
 assigning_clones = "deny"
+# Pedantic: keep small `Copy` values passed by value once the rustc lint above finds them.
+trivially_copy_pass_by_ref = "deny"
 # No `unwrap`/`expect` in production (PR 7.6 cleaned the tree). Both are `clippy::restriction` lints
 # (not in `all`), so no `priority` juggling is needed. `clippy.toml` re-allows them under `#[cfg(test)]`
 # and integration `tests/`; benches (`harness = false`) and the e2e harness lib carry a file-level allow.

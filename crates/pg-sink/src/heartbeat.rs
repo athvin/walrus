@@ -22,7 +22,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 /// Bounds-validated in `config.rs`: both `> 0` and `idle_after < roundtrip_deadline`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct HeartbeatConfig {
     /// Fire a beat only after the published tables have been idle this long (monotonic).
     pub idle_after: Duration,
