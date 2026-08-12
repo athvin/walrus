@@ -6,7 +6,7 @@
 
 # PR 9.3 — Reuse the allocation with `clone_from` in the additive-DDL rename fold
 
-> **Status:** 📋 Planned <!-- flip to "✅ Done — <PR url>" when it merges -->
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/132
 
 > **Readiness:** audited · **Outcome:** change
 > **Gates:** fmt,clippy,test · **Test packages:** loader
@@ -155,19 +155,19 @@ diff-check = git diff --check origin/main...HEAD
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `crates/loader/src/ddl.rs` uses `cur.clone_from(to)` in the `RenameTable` arm; no other
+- [x] `crates/loader/src/ddl.rs` uses `cur.clone_from(to)` in the `RenameTable` arm; no other
       assignment in the file was rewritten.
-- [ ] `[workspace.lints.clippy]` in `Cargo.toml` contains `assigning_clones = "deny"`, with a comment
+- [x] `[workspace.lints.clippy]` in `Cargo.toml` contains `assigning_clones = "deny"`, with a comment
       saying it is pedantic (outside `clippy::all`) and therefore needs no `priority`.
-- [ ] `crates/loader/tests/ddl_additive.rs` gains a hermetic (`:memory:`, no compose, no `#[ignore]`)
+- [x] `crates/loader/tests/ddl_additive.rs` gains a hermetic (`:memory:`, no compose, no `#[ignore]`)
       test that applies `RenameTable` **and then** a second change in the same batch, asserting the
       second change landed on the renamed table and that `<new>_current` exists while `orders_current`
       is gone.
-- [ ] No `impl Clone` was hand-written; every `Clone` in `loader` is still derived.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p loader` (and `--workspace` stays green)
+- [x] No `impl Clone` was hand-written; every `Clone` in `loader` is still derived.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p loader` (and `--workspace` stays green)
 
 ## What completed looks like
 

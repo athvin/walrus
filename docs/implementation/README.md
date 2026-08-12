@@ -391,7 +391,7 @@ duplicated OID literals (Tier 2), the opt-in domain-ID newtype sweep (Tier 3), a
 |---|---|---|---|
 | ✅ | [9.1](./phase-9-rust-ownership/pr-9.1-own-borrow-over-clone.md) | Delete the redundant and implicit clones the borrow checker never needed | `own-borrow-over-clone` |
 | ✅ | [9.2](./phase-9-rust-ownership/pr-9.2-own-slice-over-vec.md) | Take `Option<&str>` not `&Option<String>`, and pin the borrowed-argument lints | `own-slice-over-vec` |
-| ☐ | [9.3](./phase-9-rust-ownership/pr-9.3-own-clone-explicit.md) | Reuse the allocation with `clone_from` in the additive-DDL rename fold | `own-clone-explicit` |
+| ✅ | [9.3](./phase-9-rust-ownership/pr-9.3-own-clone-explicit.md) | Reuse the allocation with `clone_from` in the additive-DDL rename fold | `own-clone-explicit` |
 | ☐ | [9.4](./phase-9-rust-ownership/pr-9.4-own-copy-small.md) | Derive `Copy` on the small value types and gate it with `missing_copy_implementations` | `own-copy-small` |
 | ☐ | [9.5](./phase-9-rust-ownership/pr-9.5-own-cow-conditional.md) | Return `Cow<'_, str>` from `sql_literal` so the common no-quote case never allocates | `own-cow-conditional` |
 | ☐ | [9.6](./phase-9-rust-ownership/pr-9.6-own-lifetime-elision.md) | Replace the two named lifetimes that elision already covers | `own-lifetime-elision` |
