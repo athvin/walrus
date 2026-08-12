@@ -94,7 +94,7 @@ where
 }
 
 /// The outcome of a mid-export DDL restart (PR 6.8 / H9).
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum RestartDecision {
     /// A fresh successor at the new schema; keep exporting under this `reload_id`.
     Restarted(i64),

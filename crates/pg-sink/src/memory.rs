@@ -71,7 +71,7 @@ impl InflightMeter {
 }
 
 /// What to do when the ceiling is crossed — cheapest correctness-free move first.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShedAction {
     /// Normal path: frees memory AND may advance the slot (to the open-txn floor).
     FlushCommitted,
@@ -98,6 +98,10 @@ pub fn decide(meter: &InflightMeter, has_committed: bool) -> Option<ShedAction> 
 
 /// Hysteresis so the pause-poll backstop doesn't flap around the ceiling: pause at the high `activate`
 /// ratio, resume only at the lower `resume` ratio.
+#[allow(
+    missing_copy_implementations,
+    reason = "copying this mutable hysteresis state could silently detach pause transitions"
+)]
 #[derive(Debug)]
 pub struct Backpressure {
     activate_ratio: f64,

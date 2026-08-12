@@ -15,7 +15,7 @@ use common::Lsn;
 
 /// Result of inspecting the slot on a source connection. Only `Absent` / `Invalidated` — observed on a
 /// **successful** connection — are slot loss; `Unreachable` is a hiccup (retry, never total-restart).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotStatus {
     /// Present and usable — resume from `confirmed_flush`.
     Healthy { confirmed_flush: Lsn },
@@ -28,7 +28,7 @@ pub enum SlotStatus {
 }
 
 /// The bootstrap action a classified slot implies — the whole false-positive guard, as a pure function.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotAction {
     /// Slot healthy → resume streaming from `confirmed_flush`.
     Resume { confirmed_flush: Lsn },

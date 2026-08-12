@@ -11,6 +11,7 @@ use pg_sink::pgoutput::{
 };
 
 /// A ported row of `VECTORS`: bytes in, the golden render line out.
+#[derive(Clone, Copy)]
 pub struct Vector {
     pub name: &'static str,
     /// Message bytes, hex-encoded (lowercase, as captured).
