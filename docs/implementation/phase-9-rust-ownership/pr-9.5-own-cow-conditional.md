@@ -6,7 +6,7 @@
 
 # PR 9.5 — Return `Cow<'_, str>` from `sql_literal` so the common no-quote case never allocates
 
-> **Status:** 📋 Planned <!-- flip to "✅ Done — <PR url>" when it merges -->
+> **Status:** ✅ Done — https://github.com/athvin/walrus/pull/136
 
 > **Readiness:** audited · **Outcome:** change
 > **Gates:** fmt,clippy,test · **Test packages:** common,loader,pg-sink
@@ -180,20 +180,20 @@ diff-check = git diff --check origin/main...HEAD
 
 A reviewer merges this PR when **all** of the following hold:
 
-- [ ] `common::sql::sql_literal` returns `Cow<'_, str>`, with an elided (not named) lifetime, and its
+- [x] `common::sql::sql_literal` returns `Cow<'_, str>`, with an elided (not named) lifetime, and its
       doc comment states which input yields which variant.
-- [ ] The PR 8.1 doctest at `crates/common/src/sql.rs` is **unchanged and still passing** — no
+- [x] The PR 8.1 doctest at `crates/common/src/sql.rs` is **unchanged and still passing** — no
       `.to_string()`, `.into_owned()` or `&*` was bolted onto it to make it compile.
-- [ ] `crates/common/src/sql_test.rs` gains two cases asserting the **variant**
+- [x] `crates/common/src/sql_test.rs` gains two cases asserting the **variant**
       (`Cow::Borrowed` for clean input, `Cow::Owned` for input containing `'`); the three existing
       cases still pass untouched.
-- [ ] All six production call sites still compile; any that needed an edit got a borrow, not an
+- [x] All six production call sites still compile; any that needed an edit got a borrow, not an
       allocation. No `.to_string()` was added anywhere in the diff.
-- [ ] No `.sql` file and no entry in the `.sqlx` offline cache changed.
-- [ ] **Green locally and in CI:**
-  - [ ] `cargo fmt --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] `cargo test -p common` (and `--workspace` stays green)
+- [x] No `.sql` file and no entry in the `.sqlx` offline cache changed.
+- [x] **Green locally and in CI:**
+  - [x] `cargo fmt --check`
+  - [x] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [x] `cargo test -p common` (and `--workspace` stays green)
 
 ## What completed looks like
 
