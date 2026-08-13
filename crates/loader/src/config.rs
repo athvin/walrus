@@ -16,6 +16,10 @@ pub struct LoaderConfig {
     /// S3/MinIO staging bucket the sink writes and the loader reads.
     pub object_store: ObjectStoreConfig,
     pub telemetry: TelemetryConfig,
+    /// Tokio worker threads. `None` uses `available_parallelism()`; configured values must be
+    /// within 1..=64. A loader pod wants a small value because every apply loop shares one
+    /// `LocalSet` thread; `WALRUS_WORKER_THREADS=2` is plenty for the remaining async work.
+    pub worker_threads: Option<usize>,
     /// This pod's identity — the lease `owner_pod`.
     pub instance: String,
     /// Local directory holding the `<table>.duckdb` files (an RWO PVC in production).
@@ -50,6 +54,7 @@ impl Default for LoaderConfig {
             control_db_url: String::new(),
             object_store: ObjectStoreConfig::default(),
             telemetry: TelemetryConfig::default(),
+            worker_threads: None,
             instance: String::new(),
             duckdb_dir: String::new(),
             lease_ttl: Duration::from_secs(30),
@@ -103,8 +108,8 @@ impl LoaderConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError`] when a required value is empty or `lease_ttl` is zero. These are
-    /// terminal configuration failures.
+    /// Returns [`ConfigError`] when a required value is empty, `lease_ttl` is zero, or the runtime
+    /// worker count is outside its documented bound. These are terminal configuration failures.
     pub fn validate(&self) -> Result<(), ConfigError> {
         for (field, v) in [
             ("control_db_url", &self.control_db_url),
@@ -119,6 +124,8 @@ impl LoaderConfig {
         if self.lease_ttl.is_zero() {
             return Err(ConfigError("lease_ttl must be > 0".into()));
         }
+        common::runtime::validate_worker_threads(self.worker_threads)
+            .map_err(|detail| ConfigError(format!("worker_threads: {detail}")))?;
         Ok(())
     }
 }

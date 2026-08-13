@@ -37,6 +37,9 @@ pub struct SinkConfig {
     pub object_store: ObjectStoreConfig,
     /// Logging setup.
     pub telemetry: TelemetryConfig,
+    /// Tokio worker threads. `None` uses `available_parallelism()`; configured values must be
+    /// within the inclusive 1..=64 bound.
+    pub worker_threads: Option<usize>,
     /// Human tag for this process instance, e.g. `"walrus-pg-sink-0"`.
     pub instance: String,
     /// The single replication slot this sink owns.
@@ -111,6 +114,7 @@ impl Default for SinkConfig {
             source_db_url: String::new(),
             object_store: ObjectStoreConfig::default(),
             telemetry: TelemetryConfig::default(),
+            worker_threads: None,
             instance: String::new(),
             slot_name: String::new(),
             publication_name: String::new(),
@@ -253,6 +257,12 @@ impl SinkConfig {
                 return Err(ConfigError::Missing(field));
             }
         }
+        common::runtime::validate_worker_threads(self.worker_threads).map_err(|detail| {
+            ConfigError::OutOfBounds {
+                field: "worker_threads",
+                detail,
+            }
+        })?;
         duration_bound("max_fill", self.max_fill)?;
         duration_bound("startup_deadline", self.startup_deadline)?;
         duration_bound("heartbeat_idle_after", self.heartbeat_idle_after)?;

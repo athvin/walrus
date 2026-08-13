@@ -30,6 +30,9 @@ fn main() -> ExitCode {
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .thread_name("walrus-sink")
+        .worker_threads(common::runtime::resolve_worker_threads(cfg.worker_threads))
+        .max_blocking_threads(common::runtime::MAX_BLOCKING_THREADS)
         .build()
     {
         Ok(rt) => rt,
