@@ -56,6 +56,7 @@ pub struct DecodeLoop<'a> {
 /// let builder = pg_sink::consume::DecodeLoop::builder();
 /// builder.epoch(common::EpochNo(7));
 /// ```
+#[must_use = "a builder does nothing until you call build()"]
 #[derive(Debug, Default)]
 pub struct DecodeLoopBuilder<'a> {
     stream: Option<&'a mut ReplicationStream>,
@@ -74,10 +75,6 @@ pub struct DecodeLoopBuilder<'a> {
 }
 
 impl<'a> DecodeLoop<'a> {
-    #[allow(
-        clippy::must_use_candidate,
-        reason = "PR 13.9 adds the builder must-use contract"
-    )]
     pub fn builder() -> DecodeLoopBuilder<'a> {
         DecodeLoopBuilder::default()
     }
@@ -373,36 +370,38 @@ impl<'a> DecodeLoop<'a> {
     }
 }
 
-#[allow(
-    clippy::must_use_candidate,
-    reason = "PR 13.9 adds the builder must-use contract"
-)]
 impl<'a> DecodeLoopBuilder<'a> {
+    #[must_use = "builder methods return the modified builder — chain or assign"]
     pub fn stream(mut self, stream: &'a mut ReplicationStream) -> Self {
         self.stream = Some(stream);
         self
     }
 
+    #[must_use = "builder methods return the modified builder — chain or assign"]
     pub fn token(mut self, token: CancellationToken) -> Self {
         self.token = Some(token);
         self
     }
 
+    #[must_use = "builder methods return the modified builder — chain or assign"]
     pub fn cache(mut self, cache: &'a mut RelationCache) -> Self {
         self.cache = Some(cache);
         self
     }
 
+    #[must_use = "builder methods return the modified builder — chain or assign"]
     pub fn router(mut self, router: &'a mut BatchRouter) -> Self {
         self.router = Some(router);
         self
     }
 
+    #[must_use = "builder methods return the modified builder — chain or assign"]
     pub fn sink(mut self, sink: &'a crate::sink::ParquetSink) -> Self {
         self.sink = Some(sink);
         self
     }
 
+    #[must_use = "builder methods return the modified builder — chain or assign"]
     pub fn checkpoint(
         mut self,
         checkpoint: &'a mut crate::checkpoint::DurabilityCheckpoint,
@@ -411,36 +410,43 @@ impl<'a> DecodeLoopBuilder<'a> {
         self
     }
 
+    #[must_use = "builder methods return the modified builder — chain or assign"]
     pub fn demux(mut self, demux: &'a mut crate::stream_txn::StreamDemux) -> Self {
         self.demux = Some(demux);
         self
     }
 
+    #[must_use = "builder methods return the modified builder — chain or assign"]
     pub fn ddl(mut self, ddl: &'a mut crate::ddl::DdlConsumer) -> Self {
         self.ddl = Some(ddl);
         self
     }
 
+    #[must_use = "builder methods return the modified builder — chain or assign"]
     pub fn heartbeat(mut self, heartbeat: &'a mut Heartbeat) -> Self {
         self.heartbeat = Some(heartbeat);
         self
     }
 
+    #[must_use = "builder methods return the modified builder — chain or assign"]
     pub fn health(mut self, health: &'a HealthState) -> Self {
         self.health = Some(health);
         self
     }
 
+    #[must_use = "builder methods return the modified builder — chain or assign"]
     pub fn pool(mut self, pool: &'a sqlx::PgPool) -> Self {
         self.pool = Some(pool);
         self
     }
 
+    #[must_use = "builder methods return the modified builder — chain or assign"]
     pub fn epoch(mut self, epoch: EpochNo) -> Self {
         self.epoch = Some(epoch);
         self
     }
 
+    #[must_use = "builder methods return the modified builder — chain or assign"]
     pub fn waiters(mut self, waiters: &'a crate::reload_signal::WatermarkWaiters) -> Self {
         self.waiters = Some(waiters);
         self
