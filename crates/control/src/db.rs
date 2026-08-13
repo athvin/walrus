@@ -61,6 +61,8 @@ impl ControlError {
 
     /// Classify a `sqlx::Error`: a CHECK violation (SQLSTATE `23514`) becomes the terminal
     /// [`ControlError::CheckViolation`]; everything else is a (possibly transient) [`Connect`].
+    ///
+    /// Reached through [`From<sqlx::Error>`] on every `?`; call sites do not choose a variant.
     pub(crate) fn from_sqlx(e: sqlx::Error) -> Self {
         if let sqlx::Error::Database(db) = &e {
             if db.code().as_deref() == Some("23514") {
@@ -71,17 +73,24 @@ impl ControlError {
     }
 }
 
+/// Classify every propagated sqlx error rather than blindly treating invariant failures as
+/// transient connection errors. This is hand-written because the conversion chooses a variant.
+impl From<sqlx::Error> for ControlError {
+    fn from(e: sqlx::Error) -> Self {
+        ControlError::from_sqlx(e)
+    }
+}
+
 /// The default control-pool ceiling. Bounds-checked, config-driven sizing arrives with the bin
 /// bootstraps (PR 3.1); a small pool is right for the low-volume control traffic until then.
 const DEFAULT_MAX_CONNECTIONS: u32 = 5;
 
 /// Connect to the control Postgres, returning a ready connection pool.
 pub async fn connect(dsn: &str) -> Result<PgPool, ControlError> {
-    PgPoolOptions::new()
+    Ok(PgPoolOptions::new()
         .max_connections(DEFAULT_MAX_CONNECTIONS)
         .connect(dsn)
-        .await
-        .map_err(ControlError::Connect)
+        .await?)
 }
 
 /// Apply every migration in `migrations/control/` idempotently — sqlx records applied versions in

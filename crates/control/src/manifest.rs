@@ -141,8 +141,7 @@ pub async fn insert_ready(
         f.reload_id,
     )
     .fetch_one(executor)
-    .await
-    .map_err(ControlError::Connect)?;
+    .await?;
     Ok(ManifestId(rec.id))
 }
 
@@ -180,8 +179,7 @@ pub async fn claim_ready(
         limit,
     )
     .fetch_all(executor)
-    .await
-    .map_err(ControlError::Connect)?;
+    .await?;
     rows.into_iter()
         .map(|r| {
             Ok(ManifestRow {
@@ -218,8 +216,7 @@ pub async fn max_ready_lsn_end(
         source_table,
     )
     .fetch_one(executor)
-    .await
-    .map_err(ControlError::Connect)?;
+    .await?;
     Ok(row.max_lsn_end)
 }
 
@@ -232,8 +229,7 @@ pub async fn delete_claimed(
     let raw: Vec<i64> = ids.iter().map(|id| id.0).collect();
     let result = sqlx::query_file!("sql/postgres/queries/delete_claimed.sql", raw.as_slice())
         .execute(executor)
-        .await
-        .map_err(ControlError::Connect)?;
+        .await?;
     Ok(result.rows_affected())
 }
 
@@ -272,8 +268,7 @@ pub async fn mark_failed(
     // against the column's concrete `i64`, so a scalar bind passes the inner value.
     sqlx::query_file!("sql/postgres/queries/mark_failed.sql", id.0)
         .execute(executor)
-        .await
-        .map_err(ControlError::Connect)?;
+        .await?;
     Ok(())
 }
 
