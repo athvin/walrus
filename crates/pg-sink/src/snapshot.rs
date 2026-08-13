@@ -40,6 +40,16 @@ pub struct ExportedSnapshot {
 
 /// Holds the slot-creating replication connection, which **must stay open + idle** so the exported
 /// snapshot remains valid until every backfill session has attached to it.
+///
+/// Streaming before slot creation is forbidden:
+///
+/// ```compile_fail
+/// # async fn demo(dsn: &str) -> anyhow::Result<()> {
+/// let conn = pg_sink::snapshot::SnapshotConn::connect(dsn).await?;
+/// let _stream = conn.into_stream("walrus_slot", "walrus_pub").await?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug)]
 pub struct SnapshotConn {
     stream: ReplicationStream,
