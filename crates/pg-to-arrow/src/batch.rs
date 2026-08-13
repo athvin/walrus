@@ -617,18 +617,20 @@ fn append_struct_bound(
         DataType::Int32 => {
             let b = struct_field::<Int32Builder>(sb, idx, col)?;
             match bound {
-                Some(s) => {
-                    b.append_value(s.parse::<i32>().map_err(|_| value_err(col, s, "Int32"))?)
-                }
+                Some(s) => b.append_value(
+                    s.parse::<i32>()
+                        .map_err(|_| Error::value_parse(col, s, "Int32"))?,
+                ),
                 None => b.append_null(),
             }
         }
         DataType::Int64 => {
             let b = struct_field::<Int64Builder>(sb, idx, col)?;
             match bound {
-                Some(s) => {
-                    b.append_value(s.parse::<i64>().map_err(|_| value_err(col, s, "Int64"))?)
-                }
+                Some(s) => b.append_value(
+                    s.parse::<i64>()
+                        .map_err(|_| Error::value_parse(col, s, "Int64"))?,
+                ),
                 None => b.append_null(),
             }
         }
@@ -941,17 +943,13 @@ fn rfc3339_micros(s: &str) -> Option<i64> {
         .map(|t| t.as_microsecond())
 }
 
-fn value_err(col: &str, s: &str, dt: &str) -> Error {
-    Error::value_parse(col, s, dt)
-}
-
 /// `"2024-01-02"` → days since 1970-01-01, using a cleared and reused RFC-3339 scratch buffer.
 fn parse_date_days(s: &str, col: &str, scratch: &mut String) -> Result<i32, Error> {
     scratch.clear();
     scratch.push_str(s);
     scratch.push_str("T00:00:00Z");
-    let micros = rfc3339_micros(scratch).ok_or_else(|| value_err(col, s, "Date32"))?;
-    i32::try_from(micros / 86_400_000_000).map_err(|_| value_err(col, s, "Date32"))
+    let micros = rfc3339_micros(scratch).ok_or_else(|| Error::value_parse(col, s, "Date32"))?;
+    i32::try_from(micros / 86_400_000_000).map_err(|_| Error::value_parse(col, s, "Date32"))
 }
 
 /// `"03:04:05.678901"` → micros since midnight.
@@ -960,7 +958,7 @@ fn parse_time_micros(s: &str, col: &str, scratch: &mut String) -> Result<i64, Er
     scratch.push_str("1970-01-01T");
     scratch.push_str(s);
     scratch.push('Z');
-    rfc3339_micros(scratch).ok_or_else(|| value_err(col, s, "Time64"))
+    rfc3339_micros(scratch).ok_or_else(|| Error::value_parse(col, s, "Time64"))
 }
 
 /// `"2024-01-02 03:04:05.678901"` (no offset) → micros since epoch, treated as UTC.
@@ -971,7 +969,7 @@ fn parse_timestamp_micros(s: &str, col: &str, scratch: &mut String) -> Result<i6
         scratch.replace_range(i..i + 1, "T");
     }
     scratch.push('Z');
-    rfc3339_micros(scratch).ok_or_else(|| value_err(col, s, "Timestamp"))
+    rfc3339_micros(scratch).ok_or_else(|| Error::value_parse(col, s, "Timestamp"))
 }
 
 /// Canonical Postgres `timestamptz` (`"…+00"`, already UTC upstream) → micros since epoch.
@@ -988,7 +986,7 @@ fn parse_timestamptz_micros(s: &str, col: &str) -> Result<i64, Error> {
             }
         }
     }
-    rfc3339_micros(&n).ok_or_else(|| value_err(col, s, "TimestampTz"))
+    rfc3339_micros(&n).ok_or_else(|| Error::value_parse(col, s, "TimestampTz"))
 }
 
 #[cfg(test)]

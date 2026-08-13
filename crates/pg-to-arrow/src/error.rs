@@ -46,6 +46,9 @@ impl From<parquet::errors::ParquetError> for Error {
 
 impl Error {
     /// Build a boxed parse error without exposing its storage choice to call sites.
+    ///
+    /// Cold because a well-formed cell never constructs this diagnostic payload.
+    #[cold]
     pub fn value_parse(
         column: impl Into<String>,
         value: impl Into<String>,
