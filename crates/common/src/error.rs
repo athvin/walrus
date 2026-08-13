@@ -60,6 +60,13 @@ pub enum Error {
     Internal(String),
 }
 
+/// Move-cost budget for the error value propagated through every service hot path.
+///
+/// Measured with `size_of::<Error>()` on PR 9.7. If this trips, shrink or box the growing variant
+/// in the Phase 11 layout work, or raise the measured budget deliberately in review.
+const ERROR_MAX_BYTES: usize = 32;
+const _: () = assert!(size_of::<Error>() <= ERROR_MAX_BYTES);
+
 impl Error {
     /// True when retrying under the startup deadline can never help — die now, non-zero.
     ///

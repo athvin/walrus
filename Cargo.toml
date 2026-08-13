@@ -29,6 +29,13 @@ trivially_copy_pass_by_ref = "deny"
 # and integration `tests/`; benches (`harness = false`) and the e2e harness lib carry a file-level allow.
 unwrap_used = "deny"
 expect_used = "deny"
+# Large-value gates (PR 9.7, `own-move-large`). All four measured 0 sites across the 51-lint
+# pedantic+nursery sweep, so they only stop regressions on the per-WAL-message move path. They are
+# outside `clippy::all`, so no `priority` field is needed.
+large_types_passed_by_value = "deny"
+large_stack_arrays = "deny"
+large_stack_frames = "deny"
+large_futures = "deny"
 # `redundant_clone` is nursery and `implicit_clone` is pedantic; neither is in `all`, so no priority juggling is needed.
 redundant_clone = "deny"
 implicit_clone = "deny"

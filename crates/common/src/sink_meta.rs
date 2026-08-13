@@ -139,6 +139,13 @@ pub struct SinkMeta {
     pub sink_processed_at: UtcTimestamp,
 }
 
+/// Move-cost budget for the per-row provenance hot path (`own-move-large`).
+///
+/// Measured with `size_of::<SinkMeta>()` on PR 9.7. If this trips, shrink the type, box the
+/// offending field in the Phase 11 layout work, or raise the measured budget deliberately.
+const SINK_META_MAX_BYTES: usize = 192;
+const _: () = assert!(size_of::<SinkMeta>() <= SINK_META_MAX_BYTES);
+
 // --- amortized serialization (PR 5.7) -------------------------------------------------------------
 //
 // The meta column dominates `append_row` (PR 5.4: `serde_json::to_string(SinkMeta)` ≈ 576 ns/row,

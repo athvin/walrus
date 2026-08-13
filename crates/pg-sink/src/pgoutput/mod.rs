@@ -180,6 +180,13 @@ pub enum Message {
     },
 }
 
+/// Move-cost budget for the one-message-per-decoded-WAL-record hot path (`own-move-large`).
+///
+/// Measured with `size_of::<Message>()` on PR 9.7. If this trips, shrink the type, box the growing
+/// variant in Phase 11, or raise the measured budget deliberately in review.
+const MESSAGE_MAX_BYTES: usize = 88;
+const _: () = assert!(size_of::<Message>() <= MESSAGE_MAX_BYTES);
+
 impl Message {
     /// For a [`Message::StreamAbort`]: `Some(true)` when the WHOLE transaction aborted (`top == sub`,
     /// §9a — drop everything), `Some(false)` for a rolled-back savepoint inside a committing txn

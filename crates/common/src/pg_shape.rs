@@ -110,6 +110,13 @@ pub enum TupleValue {
     Binary(Bytes),
 }
 
+/// Move-cost budget for the per-column decode hot path (`own-move-large`).
+///
+/// Measured with `size_of::<TupleValue>()` on PR 9.7. If this trips, shrink the type, box the
+/// offending variant in Phase 11, or raise the measured budget deliberately in review.
+const TUPLE_VALUE_MAX_BYTES: usize = 40;
+const _: () = assert!(size_of::<TupleValue>() <= TUPLE_VALUE_MAX_BYTES);
+
 #[cfg(test)]
 #[path = "pg_shape_test.rs"]
 mod tests;
