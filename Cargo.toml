@@ -79,6 +79,10 @@ panic_in_result_fn = "deny" # a function that can return failure must not panic 
 # lints are outside `clippy::all`, so no priority is needed.
 significant_drop_in_scrutinee = "deny"
 significant_drop_tightening = "deny"
+# Async guards and RefCell borrows must never remain live across a suspension point (PR 14.3).
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+await_holding_invalid_type = "deny"
 # Shared-ownership bumps must say they are bumps (PR 9.8, `own-arc-shared`). Like `unwrap_used` /
 # `expect_used`, this is one `clippy::restriction` lint rather than the whole group; it is outside
 # `clippy::all`, so no `priority` is needed.
