@@ -8,9 +8,26 @@
 use crate::error::LoaderError;
 use crate::phase_a::{run_phase_a, TableCtx};
 use crate::phase_b::run_phase_b;
-use common::Lsn;
+use common::{EpochNo, Lsn};
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
+
+/// Return the terminal total-restart error when a running worker observes a newer generation than
+/// its loop-start baseline.
+pub(crate) fn epoch_guard(
+    observed: EpochNo,
+    baseline: EpochNo,
+    started_at: EpochNo,
+) -> Result<(), LoaderError> {
+    if observed > baseline {
+        Err(LoaderError::EpochBumped {
+            from: started_at,
+            to: observed,
+        })
+    } else {
+        Ok(())
+    }
+}
 
 /// Drive one owned table until `shutdown`. Phase A + Phase B share one poll cadence in v1 (two txns);
 /// compaction runs on its own slower cadence on this thread.
@@ -29,11 +46,7 @@ pub async fn apply_loop(ctx: TableCtx, shutdown: CancellationToken) -> Result<()
     // In production this equals `ctx.epoch` (bootstrap read the MAX), so the guard fires on ANY later
     // bump; using the observed MAX (not `ctx.epoch`) means a shared test control-plane carrying unrelated
     // higher epochs doesn't trip it — only a genuine bump *while this loader runs* does.
-    let baseline_epoch = control::read_current_epoch(&ctx.pool)
-        .await?
-        .map(|s| s.epoch)
-        .unwrap_or(ctx.epoch)
-        .max(ctx.epoch);
+    let baseline_epoch = (*ctx.epoch_rx.borrow()).max(ctx.epoch);
     loop {
         tokio::select! {
             biased;
@@ -44,14 +57,8 @@ pub async fn apply_loop(ctx: TableCtx, shutdown: CancellationToken) -> Result<()
         // started on, this loader is now running a RETIRED epoch. Exit loudly (→ `main` cancels the token
         // and the process restarts) so bootstrap wipes + rebuilds every `.duckdb` under the new epoch —
         // never rebuild in place mid-run.
-        if let Some(state) = control::read_current_epoch(&ctx.pool).await? {
-            if state.epoch > baseline_epoch {
-                return Err(LoaderError::EpochBumped {
-                    from: ctx.epoch,
-                    to: state.epoch,
-                });
-            }
-        }
+        let observed = *ctx.epoch_rx.borrow();
+        epoch_guard(observed, baseline_epoch, ctx.epoch)?;
         // Drain step 2+3: `run_phase_a`/`run_phase_b` are never interrupted mid-flight, so the in-flight
         // cycle FINISHES atomically (append + the control-DB `raw_appended_lsn`+DELETE txn, then the
         // transform + `transformed_lsn`) even if SIGTERM arrives now — no new crash window. A crash

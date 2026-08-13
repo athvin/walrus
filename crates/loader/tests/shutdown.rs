@@ -141,6 +141,7 @@ fn ctx_on(
     TableCtx {
         pool,
         epoch,
+        epoch_rx: loader::epoch::fixed_epoch_watch(epoch),
         schema: "public".into(),
         table: "orders".into(),
         series: "public.orders".into(),

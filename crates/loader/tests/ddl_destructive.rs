@@ -333,6 +333,7 @@ async fn lossy_cast_failure_quarantines_the_table_and_alerts() {
     let ctx = TableCtx {
         pool,
         epoch,
+        epoch_rx: loader::epoch::fixed_epoch_watch(epoch),
         schema: "public".into(),
         table: "orders".into(),
         series: "public.orders".into(),

@@ -24,6 +24,8 @@ use std::time::Duration;
 pub struct TableCtx {
     pub pool: sqlx::PgPool,
     pub epoch: EpochNo,
+    /// Latest global control-plane epoch, broadcast by the loader's one shared poller.
+    pub epoch_rx: tokio::sync::watch::Receiver<EpochNo>,
     pub schema: String,
     pub table: String,
     /// The `table` metric label (`"<schema>.<table>"`), precomputed at construction. Cardinality is

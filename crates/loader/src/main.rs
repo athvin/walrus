@@ -125,6 +125,8 @@ async fn pipeline(
         cfg.lease_ttl,
         token.clone(),
     );
+    let (epoch_rx, epoch_watch) =
+        loader::epoch::spawn_epoch_watch(pool.clone(), epoch, cfg.poll_interval, token.clone());
 
     // Configure DuckDB's httpfs on every owned file so `read_parquet('s3://…')` (Phase A) has the
     // staging-bucket credentials — the binary's equivalent of what the compose tests set up by hand.
@@ -147,6 +149,7 @@ async fn pipeline(
             let ctx = loader::phase_a::TableCtx {
                 pool: pool.clone(),
                 epoch,
+                epoch_rx: epoch_rx.clone(),
                 schema: o.schema.clone(),
                 table: o.table.clone(),
                 series: format!("{}.{}", o.schema, o.table),
@@ -176,6 +179,8 @@ async fn pipeline(
             })
         })
         .collect();
+    // Only workers own receivers now; with zero workers, this also stops the poller immediately.
+    drop(epoch_rx);
     // The receiver closes when the final worker exits; main must not keep an extra sender alive.
     drop(failures_tx);
     let first_failure = local
@@ -191,6 +196,9 @@ async fn pipeline(
         .await;
 
     tracing::info!("SIGTERM: releasing leases and draining");
+    if let Err(error) = epoch_watch.await {
+        tracing::error!(%error, "epoch watch task panicked");
+    }
     renewer.abort();
     lease::release_all(&pool, epoch, &keys, &cfg.instance).await;
     if let Some(failure) = first_failure {

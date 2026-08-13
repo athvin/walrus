@@ -516,6 +516,7 @@ async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
     let ctx = TableCtx {
         pool,
         epoch,
+        epoch_rx: loader::epoch::fixed_epoch_watch(epoch),
         schema: "public".into(),
         table: "orders".into(),
         series: "public.orders".into(),
