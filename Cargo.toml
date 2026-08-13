@@ -58,6 +58,10 @@ trivially_copy_pass_by_ref = "deny"
 # and integration `tests/`; benches (`harness = false`) and the e2e harness lib carry a file-level allow.
 unwrap_used = "deny"
 expect_used = "deny"
+# Forced inlining must cite a measured win (PR 16.4). This pedantic lint is outside `clippy::all`,
+# so it needs no priority. The escape hatch is a site-local Clippy allow with a reason citing its
+# `docs/benchmarks.md` delta.
+inline_always = "deny"
 # Belt-and-braces if a future crate deliberately stops inheriting the rustc forbid above: every
 # unsafe block must carry a `// SAFETY:` comment. This is a restriction lint outside `clippy::all`,
 # so no group-vs-lint priority is needed.
