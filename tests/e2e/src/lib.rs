@@ -266,7 +266,8 @@ impl Harness {
             .bind(table)
             .fetch_one(&self.control)
             .await?;
-            let cp = control::read_checkpoint(&self.control, self.epoch, "public", table).await?;
+            let cp =
+                control::read_checkpoint(&self.control, self.epoch.into(), "public", table).await?;
             if let Some(cp) = cp {
                 if pending == 0
                     && cp.transformed_lsn > target
@@ -384,7 +385,7 @@ impl Harness {
         let start = Instant::now();
         loop {
             if let Some(cp) =
-                control::read_checkpoint(&self.control, self.epoch, "public", table).await?
+                control::read_checkpoint(&self.control, self.epoch.into(), "public", table).await?
             {
                 if cp.raw_appended_lsn > target {
                     return Ok(());
@@ -621,7 +622,7 @@ impl Harness {
     pub async fn current_epoch(&self) -> Result<i64> {
         Ok(control::read_current_epoch(&self.control)
             .await?
-            .map(|s| s.epoch)
+            .map(|s| i64::from(s.epoch))
             .unwrap_or(1))
     }
 

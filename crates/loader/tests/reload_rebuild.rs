@@ -12,7 +12,7 @@
 //!
 //!   cargo test -p loader --test reload_rebuild -- --ignored --test-threads=1
 
-use common::{Lsn, PgColumn, PgRelation, ReplicaIdentity};
+use common::{EpochNo, Lsn, PgColumn, PgRelation, ReplicaIdentity};
 use control::reload::{self, ReloadFlavor};
 use loader::duck::{S3Access, TableDb};
 use loader::health::LoaderState;
@@ -63,7 +63,7 @@ fn tmpdir(name: &str) -> std::path::PathBuf {
 
 /// Write a `(id, status, op, commit_lsn, lsn)` Parquet to MinIO. Ops use the wire values
 /// (`i`/`u`/`d`); LSNs are the sortable 16-hex text the sink emits.
-fn write_rows(epoch: i64, name: &str, rows: &[(i32, &str, &str, &str, &str)]) -> String {
+fn write_rows(epoch: EpochNo, name: &str, rows: &[(i32, &str, &str, &str, &str)]) -> String {
     let w = duckdb::Connection::open_in_memory().unwrap();
     let a = s3();
     w.execute_batch(&format!(
@@ -90,7 +90,7 @@ fn write_rows(epoch: i64, name: &str, rows: &[(i32, &str, &str, &str, &str)]) ->
 
 async fn seed_file(
     pool: &sqlx::PgPool,
-    epoch: i64,
+    epoch: EpochNo,
     uri: &str,
     kind: &str,
     lsn_end: &str,
@@ -103,7 +103,7 @@ async fn seed_file(
 /// loader's would trigger a reconcile (PR 6.12's skip path).
 async fn seed_file_v(
     pool: &sqlx::PgPool,
-    epoch: i64,
+    epoch: EpochNo,
     uri: &str,
     kind: &str,
     lsn_end: &str,
@@ -131,7 +131,7 @@ async fn seed_file_v(
 }
 
 /// Fresh control state + an owned `TableCtx` (DuckDB in a temp dir).
-async fn setup(epoch: i64) -> (TableCtx, std::path::PathBuf) {
+async fn setup(epoch: EpochNo) -> (TableCtx, std::path::PathBuf) {
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     for tbl in [
@@ -187,7 +187,7 @@ async fn setup(epoch: i64) -> (TableCtx, std::path::PathBuf) {
 /// is lifted and chunks are claimable; a resync never paused anything).
 async fn drained_reload(
     pool: &sqlx::PgPool,
-    epoch: i64,
+    epoch: EpochNo,
     l1: &str,
     h: &str,
     flavor: ReloadFlavor,
@@ -232,7 +232,7 @@ fn mirror_count(ctx: &TableCtx) -> i64 {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn rebuild_converges_mirror_to_source_and_kills_phantoms() {
     let _g = LOCK.lock().await;
-    let epoch = 670_001;
+    let epoch = EpochNo(670_001);
     let (ctx, dir) = setup(epoch).await;
 
     // The OLD world: ids 1,2 streamed normally; then a phantom drifts into the mirror directly.
@@ -322,7 +322,7 @@ async fn rebuild_converges_mirror_to_source_and_kills_phantoms() {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn superseded_rows_are_purged_and_their_content_discarded() {
     let _g = LOCK.lock().await;
-    let epoch = 670_002;
+    let epoch = EpochNo(670_002);
     let (ctx, dir) = setup(epoch).await;
 
     // One claim batch holds the whole story: a pre-`W` stream file (sorts first), the chunk, a
@@ -390,7 +390,7 @@ async fn superseded_rows_are_purged_and_their_content_discarded() {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn delete_superseded_prunes_by_kind_and_lsn() {
     let _g = LOCK.lock().await;
-    let epoch = 670_005;
+    let epoch = EpochNo(670_005);
     let (ctx, dir) = setup(epoch).await;
 
     // The contract itself (the loop's safety net for LATE-arriving superseded rows too): every
@@ -442,7 +442,7 @@ async fn delete_superseded_prunes_by_kind_and_lsn() {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn stale_reload_file_is_skipped_and_retired() {
     let _g = LOCK.lock().await;
-    let epoch = 670_003;
+    let epoch = EpochNo(670_003);
     let (ctx, dir) = setup(epoch).await;
 
     // The .duckdb already rebuilt for a NEWER attempt (PR 6.8's restart hygiene, simulated).
@@ -481,7 +481,7 @@ async fn stale_reload_file_is_skipped_and_retired() {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn rebuild_clears_the_lossy_cast_quarantine() {
     let _g = LOCK.lock().await;
-    let epoch = 670_004;
+    let epoch = EpochNo(670_004);
     let (ctx, dir) = setup(epoch).await;
 
     // The PR 3.9 terminal state: a lossy ALTER COLUMN TYPE cast failed; /ready is degraded. (The
@@ -513,7 +513,7 @@ async fn rebuild_clears_the_lossy_cast_quarantine() {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn resync_flavor_never_rebuilds_and_merges_over_the_live_mirror() {
     let _g = LOCK.lock().await;
-    let epoch = 670_006;
+    let epoch = EpochNo(670_006);
     let (ctx, dir) = setup(epoch).await;
 
     // A LIVE mirror the resync must NOT clear: ids 1,2 already streamed in. And — to prove the
@@ -605,7 +605,7 @@ async fn resync_flavor_never_rebuilds_and_merges_over_the_live_mirror() {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn superseded_version_crossing_file_is_skipped_not_reconciled() {
     let _g = LOCK.lock().await;
-    let epoch = 670_007;
+    let epoch = EpochNo(670_007);
     let (ctx, dir) = setup(epoch).await;
 
     // A live mirror {1} at the loader's current schema_version (1).

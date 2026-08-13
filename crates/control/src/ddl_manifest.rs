@@ -7,7 +7,7 @@
 //! ordering.
 
 use crate::ControlError;
-use common::Lsn;
+use common::{EpochNo, Lsn};
 use sqlx::PgExecutor;
 
 /// A decoded schema-change event. (`c_columns` / `c_dropped` gain typed fields in PRs 3.8/3.9; they
@@ -16,7 +16,7 @@ use sqlx::PgExecutor;
 pub struct DdlRow {
     /// Assigned by the DB on insert; ignored by [`insert_ddl`].
     pub id: i64,
-    pub epoch: i64,
+    pub epoch: EpochNo,
     pub source_schema: String,
     pub source_table: String,
     /// Commit LSN of the DDL — orders it relative to DML.
@@ -46,7 +46,7 @@ pub async fn insert_ddl(
     let c_rel_oid = c_rel_oid.map(sqlx::postgres::types::Oid);
     let rec = sqlx::query_file!(
         "sql/postgres/queries/insert_ddl.sql",
-        row.epoch,
+        row.epoch.0,
         row.source_schema,
         row.source_table,
         row.c_lsn as Lsn,
@@ -69,7 +69,7 @@ pub async fn insert_ddl(
 /// Returns [`ControlError::Connect`] if control Postgres cannot execute or decode the query.
 pub async fn read_pending_ddl(
     ex: impl PgExecutor<'_>,
-    epoch: i64,
+    epoch: EpochNo,
     schema: &str,
     table: &str,
     after_lsn: Lsn,
@@ -77,7 +77,7 @@ pub async fn read_pending_ddl(
     Ok(sqlx::query_file_as!(
         DdlRow,
         "sql/postgres/queries/read_pending_ddl.sql",
-        epoch,
+        epoch.0,
         schema,
         table,
         after_lsn as Lsn,

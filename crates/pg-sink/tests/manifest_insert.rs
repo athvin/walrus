@@ -10,7 +10,8 @@
 //!   cargo test -p pg-sink --test manifest_insert -- --ignored
 
 use common::{
-    Kind, Lsn, Op, PgColumn, PgRelation, ReplicaIdentity, SinkMeta, TupleValue, UtcTimestamp,
+    EpochNo, Kind, Lsn, Op, PgColumn, PgRelation, ReplicaIdentity, SinkMeta, TupleValue,
+    UtcTimestamp,
 };
 use control::{connect, run_migrations};
 use object_store::aws::AmazonS3Builder;
@@ -74,7 +75,7 @@ fn meta() -> SinkMeta {
         commit_lsn: "0/10".parse().unwrap(),
         commit_ts: UtcTimestamp::parse_rfc3339("2026-07-07T12:00:00Z").unwrap(),
         xid: 1,
-        epoch: 1,
+        epoch: EpochNo(1),
         batch_id: "b".to_string(),
         schema_version: 1,
         source_schema: "public".to_string(),
@@ -111,7 +112,7 @@ async fn object_and_manifest_row_both_exist_after_flush() {
     let store = minio_store();
     let pool = control_pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let epoch = 2_250_001;
+    let epoch = EpochNo(2_250_001);
     let sink = ParquetSink::new(Arc::clone(&store), "walrus".to_string(), epoch);
 
     let obj = flush_batch(&sink, &mut *tx, epoch, sealed("0/A100"))
@@ -140,7 +141,7 @@ async fn manifest_lsn_end_equals_commit_lsn_not_row_lsn() {
     let store = minio_store();
     let pool = control_pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let epoch = 2_250_002;
+    let epoch = EpochNo(2_250_002);
     let sink = ParquetSink::new(Arc::clone(&store), "walrus".to_string(), epoch);
 
     // Commit LSN 0/A100; the batch's rows carry row LSN 0/10.
@@ -169,7 +170,7 @@ async fn row_is_ready_kind_stream_and_epoch_stamped() {
     let store = minio_store();
     let pool = control_pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let epoch = 2_250_003;
+    let epoch = EpochNo(2_250_003);
     let sink = ParquetSink::new(Arc::clone(&store), "walrus".to_string(), epoch);
 
     let obj = flush_batch(&sink, &mut *tx, epoch, sealed("0/B200"))

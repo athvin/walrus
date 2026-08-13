@@ -15,8 +15,8 @@ fn maps_written_object_to_a_stream_ready_row() {
         schema_version: 3,
         kind: FileKind::Stream,
     };
-    let row = to_ready_row(9, &obj, None);
-    assert_eq!(row.epoch, 9);
+    let row = to_ready_row(common::EpochNo(9), &obj, None);
+    assert_eq!(row.epoch, common::EpochNo(9));
     assert_eq!(
         row.reload_id, None,
         "stream objects never carry a reload_id"

@@ -2,8 +2,8 @@
 //!
 //! `ManifestId` extends the [`Lsn`](crate::Lsn) newtype pattern to a `file_manifest` row's id, so it
 //! can't be silently swapped for another bare `i64` (a manifest id vs an epoch vs a schema version).
-//! PR 8.4a lands `ManifestId` alone; `EpochNo`/`SchemaVersion`/`ReloadId` stay bare `i64` for now —
-//! the same transparent-`int8` pattern below applies verbatim when they follow (deferred).
+//! PR 8.4a lands `ManifestId` alone; `SchemaVersion`/`ReloadId` stay bare `i64` for now — the same
+//! transparent-`int8` pattern below applies verbatim when they follow (deferred).
 
 /// A `file_manifest` row's primary key (`id`): returned by `insert_ready`, claimed as
 /// `ManifestRow::id`, and retired through the loader's Phase-A lifecycle (`delete_claimed` /
@@ -29,6 +29,34 @@ impl From<ManifestId> for i64 {
     }
 }
 
+/// The control plane's **generation counter** (`replication_state.epoch`): bumped when the lifelong
+/// replication slot is lost and a total restart opens a new generation (§1.8). It namespaces every
+/// control-plane row and every S3 key prefix — it is *not* a row id, and it must never be confused
+/// with a [`ManifestId`], a schema version, or a table OID.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(transparent)]
+pub struct EpochNo(pub i64);
+
+impl std::fmt::Display for EpochNo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<i64> for EpochNo {
+    fn from(v: i64) -> Self {
+        EpochNo(v)
+    }
+}
+
+impl From<EpochNo> for i64 {
+    fn from(value: EpochNo) -> Self {
+        value.0
+    }
+}
+
 /// Postgres `int8` support (feature `sqlx`): `ManifestId` binds and decodes exactly as its inner
 /// `i64` — the transparent-newtype trick — so a `bigint` column round-trips with no SQL cast. Mirrors
 /// [`Lsn`](crate::Lsn)'s `sqlx_support`; hand-written rather than derived so `common`'s `sqlx` dep
@@ -36,7 +64,7 @@ impl From<ManifestId> for i64 {
 /// site — a manual `Type` impl carries no `PgHasArrayType`.
 #[cfg(feature = "sqlx")]
 mod sqlx_support {
-    use super::ManifestId;
+    use super::{EpochNo, ManifestId};
     use sqlx::postgres::{PgArgumentBuffer, PgTypeInfo, PgValueRef};
     use sqlx::{Decode, Encode, Postgres, Type};
 
@@ -61,6 +89,30 @@ mod sqlx_support {
     impl<'r> Decode<'r, Postgres> for ManifestId {
         fn decode(value: PgValueRef<'r>) -> Result<Self, sqlx::error::BoxDynError> {
             Ok(ManifestId(<i64 as Decode<Postgres>>::decode(value)?))
+        }
+    }
+
+    impl Type<Postgres> for EpochNo {
+        fn type_info() -> PgTypeInfo {
+            <i64 as Type<Postgres>>::type_info()
+        }
+        fn compatible(ty: &PgTypeInfo) -> bool {
+            <i64 as Type<Postgres>>::compatible(ty)
+        }
+    }
+
+    impl Encode<'_, Postgres> for EpochNo {
+        fn encode_by_ref(
+            &self,
+            buf: &mut PgArgumentBuffer,
+        ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+            <i64 as Encode<Postgres>>::encode_by_ref(&self.0, buf)
+        }
+    }
+
+    impl<'r> Decode<'r, Postgres> for EpochNo {
+        fn decode(value: PgValueRef<'r>) -> Result<Self, sqlx::error::BoxDynError> {
+            Ok(EpochNo(<i64 as Decode<Postgres>>::decode(value)?))
         }
     }
 }

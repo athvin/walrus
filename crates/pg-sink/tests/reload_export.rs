@@ -16,7 +16,7 @@
 //!   cargo test -p pg-sink --test reload_export -- --ignored --test-threads=1
 
 use bytes::Bytes;
-use common::Lsn;
+use common::{EpochNo, Lsn};
 use object_store::path::Path;
 use object_store::ObjectStore;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -82,7 +82,7 @@ async fn drop_slot(admin: &tokio_postgres::Client, slot: &str) {
 }
 
 /// Seed the target table with `n` rows and register its shape at the test epoch.
-async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: i64, n: i64) {
+async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: EpochNo, n: i64) {
     admin
         .batch_execute(&format!(
             "DROP TABLE IF EXISTS public.{TABLE};
@@ -110,7 +110,7 @@ async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: i64, n
 }
 
 /// Control-side hygiene for a test epoch (safe to run before and after).
-async fn scrub(pool: &sqlx::PgPool, epoch: i64) {
+async fn scrub(pool: &sqlx::PgPool, epoch: EpochNo) {
     for tbl in ["file_manifest", "table_reload", "schema_registry"] {
         sqlx::query(&format!("DELETE FROM walrus.{tbl} WHERE epoch = $1"))
             .bind(epoch)
@@ -197,12 +197,12 @@ fn spawn_echo_resolver(
 async fn await_resolver_ready(
     admin: &tokio_postgres::Client,
     waiters: &Arc<WatermarkWaiters>,
-    epoch: i64,
+    epoch: EpochNo,
 ) {
-    let sentinel = -epoch; // never collides with real (bigserial, positive) reload ids
-                           // Retry the sentinel until the resolver answers: a signal committed BEFORE the resolver's
-                           // slot exists is never streamed, so each attempt re-signals fresh (DELETE + INSERT in one
-                           // implicit txn — the engine's own re-signal shape; only an INSERT echoes).
+    let sentinel = -epoch.0; // never collides with real (bigserial, positive) reload ids
+                             // Retry the sentinel until the resolver answers: a signal committed BEFORE the resolver's
+                             // slot exists is never streamed, so each attempt re-signals fresh (DELETE + INSERT in one
+                             // implicit txn — the engine's own re-signal shape; only an INSERT echoes).
     let mut ready = false;
     for _ in 0..20 {
         let rx = waiters.subscribe(sentinel, 1);
@@ -231,7 +231,7 @@ async fn await_resolver_ready(
         .unwrap();
 }
 
-fn export_cfg(epoch: i64, chunk_rows: u64, echo_timeout: Duration) -> ChunkExportConfig {
+fn export_cfg(epoch: EpochNo, chunk_rows: u64, echo_timeout: Duration) -> ChunkExportConfig {
     ChunkExportConfig {
         chunk_rows,
         echo_timeout,
@@ -241,7 +241,7 @@ fn export_cfg(epoch: i64, chunk_rows: u64, echo_timeout: Duration) -> ChunkExpor
 }
 
 /// Claim the single requested reload and return its row.
-async fn request_and_claim(pool: &sqlx::PgPool, epoch: i64) -> control::ReloadRow {
+async fn request_and_claim(pool: &sqlx::PgPool, epoch: EpochNo) -> control::ReloadRow {
     control::reload::request(
         pool,
         epoch,
@@ -258,7 +258,10 @@ async fn request_and_claim(pool: &sqlx::PgPool, epoch: i64) -> control::ReloadRo
 }
 
 /// Manifest rows for the test table's reload files, in claim order.
-async fn reload_manifest_rows(pool: &sqlx::PgPool, epoch: i64) -> Vec<(String, i64, String, i64)> {
+async fn reload_manifest_rows(
+    pool: &sqlx::PgPool,
+    epoch: EpochNo,
+) -> Vec<(String, i64, String, i64)> {
     sqlx::query_as::<_, (String, i64, String, i64)>(
         "SELECT s3_uri, row_count, lsn_end::text, reload_id
          FROM walrus.file_manifest
@@ -320,7 +323,7 @@ async fn read_chunk_file(uri: &str) -> (Vec<i32>, Vec<(String, String)>) {
 #[ignore = "requires docker compose up --wait (source + control PG + MinIO)"]
 async fn chunks_cover_the_table_exactly_with_per_chunk_stamps() {
     let _g = SOURCE_LOCK.lock().await;
-    let epoch = 650_001;
+    let epoch = EpochNo(650_001);
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
@@ -448,7 +451,7 @@ async fn chunks_cover_the_table_exactly_with_per_chunk_stamps() {
 #[ignore = "requires docker compose up --wait (source + control PG + MinIO)"]
 async fn resume_from_cursor_never_reexports_completed_chunks() {
     let _g = SOURCE_LOCK.lock().await;
-    let epoch = 650_002;
+    let epoch = EpochNo(650_002);
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
@@ -571,7 +574,7 @@ async fn resume_from_cursor_never_reexports_completed_chunks() {
 #[ignore = "requires docker compose up --wait (source + control PG + MinIO)"]
 async fn echo_timeout_fails_the_reload_with_publication_hint() {
     let _g = SOURCE_LOCK.lock().await;
-    let epoch = 650_003;
+    let epoch = EpochNo(650_003);
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();

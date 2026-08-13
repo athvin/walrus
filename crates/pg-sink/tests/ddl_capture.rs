@@ -12,7 +12,7 @@
 //!
 //!   cargo test -p pg-sink --test ddl_capture -- --ignored
 
-use common::Lsn;
+use common::{EpochNo, Lsn};
 use pg_sink::batch::{BatchTriggers, SystemClock};
 use pg_sink::consume::{flush_batch, on_frame, on_relation, BatchRouter};
 use pg_sink::ddl::{DdlConsumer, DdlEvent};
@@ -77,7 +77,7 @@ async fn drop_slot(admin: &tokio_postgres::Client, slot: &str) {
 async fn alter_add_column_bumps_version_and_cuts_file() {
     let _g = SOURCE_LOCK.lock().await;
     let slot = "walrus_ddl";
-    let epoch = 2_330_001;
+    let epoch = EpochNo(2_330_001);
     let admin = source().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0002).await.unwrap();

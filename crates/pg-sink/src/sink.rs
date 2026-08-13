@@ -10,7 +10,7 @@
 //! with `lsn_end` as zero-padded 16-hex ([`common::Lsn`]'s `Display`) so keys sort in commit order.
 
 use crate::batch::SealedBatch;
-use common::Lsn;
+use common::{EpochNo, Lsn};
 use object_store::buffered::BufWriter;
 use object_store::path::Path;
 use object_store::ObjectStore;
@@ -48,11 +48,11 @@ pub struct WrittenObject {
 pub struct ParquetSink {
     store: Arc<dyn ObjectStore>,
     bucket: String,
-    epoch: i64,
+    epoch: EpochNo,
 }
 
 impl ParquetSink {
-    pub fn new(store: Arc<dyn ObjectStore>, bucket: String, epoch: i64) -> Self {
+    pub fn new(store: Arc<dyn ObjectStore>, bucket: String, epoch: EpochNo) -> Self {
         ParquetSink {
             store,
             bucket,

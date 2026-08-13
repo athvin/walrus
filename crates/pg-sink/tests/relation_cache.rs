@@ -11,7 +11,7 @@
 //! Each test runs inside a rolled-back transaction under a unique epoch, so it is isolated.
 
 use arrow::datatypes::DataType;
-use common::{PgColumn, PgRelation, ReplicaIdentity};
+use common::{EpochNo, PgColumn, PgRelation, ReplicaIdentity};
 use control::{connect, read_all_latest_registry, read_registry, run_migrations};
 use pg_sink::consume::on_relation;
 use pg_sink::relcache::RelationCache;
@@ -62,7 +62,7 @@ fn orders_relation(oid: u32) -> PgRelation {
 async fn first_relation_writes_a_schema_registry_row() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let epoch = 2_220_001;
+    let epoch = EpochNo(2_220_001);
     let mut cache = RelationCache::default();
 
     on_relation(&mut cache, &mut *tx, epoch, orders_relation(50001), 1)
@@ -114,7 +114,7 @@ async fn cached_arrow_schema_matches_expected_orders_shape() {
 async fn hydrate_reconstructs_cache_from_registry() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let epoch = 2_220_002;
+    let epoch = EpochNo(2_220_002);
 
     // Persist via on_relation, then hydrate a FRESH cache from what was written.
     let mut writer = RelationCache::default();
@@ -140,7 +140,7 @@ async fn hydrate_reconstructs_cache_from_registry() {
 async fn internal_tables_are_never_registered() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let epoch = 2_220_003;
+    let epoch = EpochNo(2_220_003);
     let mut cache = RelationCache::default();
 
     let heartbeat = PgRelation {

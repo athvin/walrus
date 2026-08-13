@@ -25,7 +25,7 @@
 use crate::reload_signal::WatermarkWaiters;
 use crate::sink::{FileKind, ParquetSink};
 use anyhow::Context;
-use common::{Kind, Lsn, Op, PgRelation, SinkMeta, TupleValue, UtcTimestamp};
+use common::{EpochNo, Kind, Lsn, Op, PgRelation, SinkMeta, TupleValue, UtcTimestamp};
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
@@ -74,7 +74,7 @@ pub struct ChunkExportConfig {
     pub chunk_rows: u64,
     pub echo_timeout: Duration,
     pub instance: String,
-    pub epoch: i64,
+    pub epoch: EpochNo,
 }
 
 /// One table's chunked export (reload §5.3). Owns a side SQL connection; talks to the consume

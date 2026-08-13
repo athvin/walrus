@@ -59,7 +59,7 @@ async fn schema_registry_roundtrips_a_type_descriptor() {
     assert_eq!(descriptors.len(), 3);
 
     let row = RegistryRow {
-        epoch: 2_170_017,
+        epoch: common::EpochNo(2_170_017),
         source_schema: "public".to_string(),
         source_table: "widgets".to_string(),
         schema_version: 1,

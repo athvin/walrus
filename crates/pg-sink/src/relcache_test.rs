@@ -47,7 +47,7 @@ fn hydrate_round_trips_through_a_registry_row() {
     let relation = orders();
     let descriptors = pg_to_arrow::descriptor::describe_relation(&relation);
     let row = control::RegistryRow {
-        epoch: 1,
+        epoch: common::EpochNo(1),
         source_schema: "public".to_string(),
         source_table: "orders".to_string(),
         schema_version: 3,

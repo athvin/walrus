@@ -12,7 +12,7 @@
 //!
 //!   cargo test -p pg-sink --test graceful_shutdown -- --ignored
 
-use common::{Lsn, TupleValue};
+use common::{EpochNo, Lsn, TupleValue};
 use object_store::path::Path;
 use object_store::ObjectStore;
 use pg_sink::batch::{BatchTriggers, SystemClock};
@@ -109,7 +109,7 @@ fn orders_id(new: &[TupleValue]) -> Option<i32> {
 async fn sigterm_mid_stream_drains_commits_and_resumes() {
     let _g = SOURCE_LOCK.lock().await;
     let slot = "walrus_drain";
-    let epoch = 2_280_001;
+    let epoch = EpochNo(2_280_001);
     let admin = source().await;
     admin.batch_execute(SOURCE_MIGRATION).await.unwrap();
     admin

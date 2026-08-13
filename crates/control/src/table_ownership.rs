@@ -7,6 +7,7 @@
 //! side never needs a timestamp type.
 
 use crate::ControlError;
+use common::EpochNo;
 use sqlx::PgExecutor;
 
 /// A held lease. The `fencing_token` bumps only when ownership changes hands (dormant at `replicas=1`).
@@ -26,7 +27,7 @@ pub struct Lease {
 /// [`ControlError::CheckViolation`] if a lease invariant is violated.
 pub async fn acquire_lease(
     ex: impl PgExecutor<'_>,
-    epoch: i64,
+    epoch: EpochNo,
     schema: &str,
     table: &str,
     self_pod: &str,
@@ -69,7 +70,7 @@ pub async fn acquire_lease(
 /// Returns [`ControlError::Connect`] if the guarded renewal update cannot execute.
 pub async fn renew_lease(
     ex: impl PgExecutor<'_>,
-    epoch: i64,
+    epoch: EpochNo,
     schema: &str,
     table: &str,
     self_pod: &str,
@@ -100,7 +101,7 @@ pub async fn renew_lease(
 /// Returns [`ControlError::Connect`] if the guarded expiry update cannot execute.
 pub async fn release_lease(
     ex: impl PgExecutor<'_>,
-    epoch: i64,
+    epoch: EpochNo,
     schema: &str,
     table: &str,
     self_pod: &str,

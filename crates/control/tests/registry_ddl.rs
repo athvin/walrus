@@ -9,7 +9,7 @@
 //! `integration` feature (needs the PR 0.6 control PG).
 #![cfg(feature = "integration")]
 
-use common::{Lsn, Tier, TypeDescriptor, TypeMeta};
+use common::{EpochNo, Lsn, Tier, TypeDescriptor, TypeMeta};
 use control::{
     connect, insert_ddl, read_latest_version, read_pending_ddl, read_registry, run_migrations,
     upsert_registry, DdlRow, RegistryRow,
@@ -61,7 +61,7 @@ fn descriptors() -> Vec<TypeDescriptor> {
     ]
 }
 
-fn registry_row(epoch: i64, version: i64) -> RegistryRow {
+fn registry_row(epoch: EpochNo, version: i64) -> RegistryRow {
     RegistryRow {
         epoch,
         source_schema: "public".to_string(),
@@ -75,7 +75,7 @@ fn registry_row(epoch: i64, version: i64) -> RegistryRow {
     }
 }
 
-fn ddl(epoch: i64, c_lsn: &str, version: i64) -> DdlRow {
+fn ddl(epoch: EpochNo, c_lsn: &str, version: i64) -> DdlRow {
     DdlRow {
         id: 0, // ignored on insert
         epoch,
@@ -92,7 +92,7 @@ fn ddl(epoch: i64, c_lsn: &str, version: i64) -> DdlRow {
 async fn registry_round_trips_a_type_descriptor_set() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let epoch = 800_001;
+    let epoch = EpochNo(800_001);
 
     let row = registry_row(epoch, 3);
     upsert_registry(&mut *tx, &row).await.unwrap();
@@ -119,7 +119,7 @@ async fn registry_round_trips_a_type_descriptor_set() {
 async fn upsert_registry_is_idempotent_per_version() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let epoch = 800_002;
+    let epoch = EpochNo(800_002);
 
     let row = registry_row(epoch, 1);
     upsert_registry(&mut *tx, &row).await.unwrap();
@@ -161,7 +161,7 @@ async fn upsert_registry_is_idempotent_per_version() {
 async fn ddl_row_round_trips_with_commit_lsn() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let epoch = 800_003;
+    let epoch = EpochNo(800_003);
 
     let id = insert_ddl(&mut *tx, &ddl(epoch, "0/500", 5), None, None)
         .await
@@ -190,7 +190,7 @@ async fn ddl_row_round_trips_with_commit_lsn() {
 async fn read_pending_ddl_orders_by_c_lsn() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let epoch = 800_004;
+    let epoch = EpochNo(800_004);
 
     // Insert out of LSN order.
     insert_ddl(&mut *tx, &ddl(epoch, "0/300", 3), None, None)

@@ -85,7 +85,7 @@ async fn run(cfg: LoaderConfig) -> Result<(), LoaderError> {
     let epoch = control::read_current_epoch(&pool)
         .await?
         .map(|s| s.epoch)
-        .unwrap_or(1);
+        .unwrap_or(common::EpochNo(1));
     tracing::info!(
         tables = keys.len(),
         "bootstrap complete; starting apply loops"

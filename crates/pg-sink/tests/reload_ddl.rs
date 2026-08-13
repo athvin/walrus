@@ -19,7 +19,7 @@
 //!   cargo test -p pg-sink --test reload_ddl -- --ignored --test-threads=1
 
 use bytes::Bytes;
-use common::Lsn;
+use common::{EpochNo, Lsn};
 use object_store::path::Path;
 use object_store::ObjectStore;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -85,7 +85,7 @@ async fn drop_slot(admin: &tokio_postgres::Client, slot: &str) {
 }
 
 /// Seed the target table (a plain 2-column table) with `n` rows and register its shape at v1.
-async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: i64, n: i64) {
+async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: EpochNo, n: i64) {
     admin
         .batch_execute(&format!(
             "DROP TABLE IF EXISTS public.{TABLE};
@@ -99,7 +99,12 @@ async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: i64, n
 
 /// (Re)register the table's CURRENT source shape at `version` — the sink's decode loop does this on
 /// a Relation message; here the test does it directly to simulate DDL bumping the structural version.
-async fn register(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: i64, version: i64) {
+async fn register(
+    admin: &tokio_postgres::Client,
+    pool: &sqlx::PgPool,
+    epoch: EpochNo,
+    version: i64,
+) {
     let rel = pg_sink::snapshot::describe_source_relation(admin, "public", TABLE)
         .await
         .unwrap();
@@ -118,7 +123,7 @@ async fn register(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: i6
     .unwrap();
 }
 
-async fn scrub(pool: &sqlx::PgPool, epoch: i64) {
+async fn scrub(pool: &sqlx::PgPool, epoch: EpochNo) {
     for tbl in ["file_manifest", "table_reload", "schema_registry"] {
         sqlx::query(&format!("DELETE FROM walrus.{tbl} WHERE epoch = $1"))
             .bind(epoch)
@@ -179,9 +184,9 @@ fn spawn_echo_resolver(
 async fn await_resolver_ready(
     admin: &tokio_postgres::Client,
     waiters: &Arc<WatermarkWaiters>,
-    epoch: i64,
+    epoch: EpochNo,
 ) {
-    let sentinel = -epoch;
+    let sentinel = -epoch.0;
     let mut ready = false;
     for _ in 0..20 {
         let rx = waiters.subscribe(sentinel, 1);
@@ -210,7 +215,7 @@ async fn await_resolver_ready(
         .unwrap();
 }
 
-fn export_cfg(epoch: i64, chunk_rows: u64) -> ChunkExportConfig {
+fn export_cfg(epoch: EpochNo, chunk_rows: u64) -> ChunkExportConfig {
     ChunkExportConfig {
         chunk_rows,
         echo_timeout: Duration::from_secs(20),
@@ -219,7 +224,7 @@ fn export_cfg(epoch: i64, chunk_rows: u64) -> ChunkExportConfig {
     }
 }
 
-async fn request_and_claim(pool: &sqlx::PgPool, epoch: i64) -> control::ReloadRow {
+async fn request_and_claim(pool: &sqlx::PgPool, epoch: EpochNo) -> control::ReloadRow {
     control::reload::request(
         pool,
         epoch,
@@ -236,7 +241,7 @@ async fn request_and_claim(pool: &sqlx::PgPool, epoch: i64) -> control::ReloadRo
         .unwrap()
 }
 
-async fn reload_rows(pool: &sqlx::PgPool, epoch: i64) -> Vec<control::ReloadRow> {
+async fn reload_rows(pool: &sqlx::PgPool, epoch: EpochNo) -> Vec<control::ReloadRow> {
     let ids: Vec<i64> = sqlx::query_scalar(
         "SELECT reload_id FROM walrus.table_reload
          WHERE epoch = $1 AND source_table = $2 ORDER BY reload_id",
@@ -253,7 +258,7 @@ async fn reload_rows(pool: &sqlx::PgPool, epoch: i64) -> Vec<control::ReloadRow>
     out
 }
 
-async fn manifest_count(pool: &sqlx::PgPool, epoch: i64, reload_id: i64) -> i64 {
+async fn manifest_count(pool: &sqlx::PgPool, epoch: EpochNo, reload_id: i64) -> i64 {
     sqlx::query_scalar(
         "SELECT count(*) FROM walrus.file_manifest WHERE epoch = $1 AND reload_id = $2",
     )
@@ -265,7 +270,7 @@ async fn manifest_count(pool: &sqlx::PgPool, epoch: i64, reload_id: i64) -> i64 
 }
 
 /// The (uri, schema_version) of a reload's chunk files, in claim order.
-async fn reload_files(pool: &sqlx::PgPool, epoch: i64, reload_id: i64) -> Vec<(String, i64)> {
+async fn reload_files(pool: &sqlx::PgPool, epoch: EpochNo, reload_id: i64) -> Vec<(String, i64)> {
     sqlx::query_as::<_, (String, i64)>(
         "SELECT s3_uri, schema_version FROM walrus.file_manifest
          WHERE epoch = $1 AND reload_id = $2 ORDER BY lsn_end, id",
@@ -322,7 +327,7 @@ fn counter_value(name: &str) -> f64 {
 async fn mid_export_ddl_restarts_fresh_attempt_at_new_schema() {
     let _g = SOURCE_LOCK.lock().await;
     common::metrics::init();
-    let epoch = 680_001;
+    let epoch = EpochNo(680_001);
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
@@ -453,7 +458,7 @@ async fn mid_export_ddl_restarts_fresh_attempt_at_new_schema() {
 async fn restart_cap_exhaustion_fails_loudly() {
     let _g = SOURCE_LOCK.lock().await;
     common::metrics::init();
-    let epoch = 680_002;
+    let epoch = EpochNo(680_002);
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();

@@ -18,6 +18,7 @@
 //!
 //!   cargo test -p pg-sink --test reload_pickup -- --ignored
 
+use common::EpochNo;
 use control::reload::{self, ReloadFlavor, ReloadStatus};
 use pg_sink::consume::on_frame;
 use pg_sink::pgoutput::{Message, StreamCtx};
@@ -53,7 +54,7 @@ async fn admin() -> tokio_postgres::Client {
     c
 }
 
-async fn pool_for(epoch: i64) -> sqlx::PgPool {
+async fn pool_for(epoch: EpochNo) -> sqlx::PgPool {
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     // Leftover non-terminal rows from a crashed prior run would trip the one_live index.
@@ -65,7 +66,7 @@ async fn pool_for(epoch: i64) -> sqlx::PgPool {
     pool
 }
 
-fn controller_cfg(epoch: i64, cap: usize) -> ReloadControllerConfig {
+fn controller_cfg(epoch: EpochNo, cap: usize) -> ReloadControllerConfig {
     ReloadControllerConfig {
         poll_interval: Duration::from_millis(200), // fast cadence for the test
         max_concurrent_reloads: cap,
@@ -82,7 +83,7 @@ fn controller_cfg(epoch: i64, cap: usize) -> ReloadControllerConfig {
     }
 }
 
-fn minio(epoch: i64) -> ParquetSink {
+fn minio(epoch: EpochNo) -> ParquetSink {
     ParquetSink::new(
         std::sync::Arc::new(
             object_store::aws::AmazonS3Builder::new()
@@ -105,7 +106,7 @@ fn minio(epoch: i64) -> ParquetSink {
 async fn seed_registry(
     admin: &tokio_postgres::Client,
     pool: &sqlx::PgPool,
-    epoch: i64,
+    epoch: EpochNo,
     tables: &[&str],
 ) {
     for table in tables {
@@ -190,7 +191,7 @@ async fn lease_expiry_epoch(pool: &sqlx::PgPool, reload_id: i64) -> f64 {
 #[ignore = "requires docker compose up --wait (source + control PG)"]
 async fn pickup_flips_to_exporting_with_a_live_advancing_lease() {
     let _g = SOURCE_LOCK.lock().await;
-    let epoch = 640_001;
+    let epoch = EpochNo(640_001);
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
@@ -250,7 +251,7 @@ async fn pickup_flips_to_exporting_with_a_live_advancing_lease() {
 #[ignore = "requires docker compose up --wait (source + control PG)"]
 async fn preflight_failures_land_in_failed_with_reasons() {
     let _g = SOURCE_LOCK.lock().await;
-    let epoch = 640_002;
+    let epoch = EpochNo(640_002);
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
@@ -330,7 +331,7 @@ async fn preflight_failures_land_in_failed_with_reasons() {
 #[ignore = "requires docker compose up --wait (source + control PG)"]
 async fn cap_of_two_holds_and_the_stream_keeps_flowing() {
     let _g = SOURCE_LOCK.lock().await;
-    let epoch = 640_003;
+    let epoch = EpochNo(640_003);
     let slot = "walrus_reload_pickup";
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();

@@ -117,7 +117,7 @@ async fn loader_killed_mid_merge_is_idempotent() {
         .expect("delete converges");
 
     // A fresh batch (300..700) to give the loader Phase-A work to be killed in the middle of.
-    let raw_before = control::read_checkpoint(h.control_pool(), h.epoch, "public", "orders")
+    let raw_before = control::read_checkpoint(h.control_pool(), h.epoch.into(), "public", "orders")
         .await
         .unwrap()
         .unwrap()

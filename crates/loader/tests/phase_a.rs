@@ -10,7 +10,7 @@
 //!
 //!   cargo test -p loader --test phase_a -- --ignored
 
-use common::{Lsn, PgColumn, PgRelation, ReplicaIdentity};
+use common::{EpochNo, Lsn, PgColumn, PgRelation, ReplicaIdentity};
 use loader::duck::{S3Access, TableDb};
 use loader::health::LoaderState;
 use loader::phase_a::{run_phase_a, TableCtx};
@@ -57,7 +57,7 @@ fn tmpdir(name: &str) -> std::path::PathBuf {
     d
 }
 
-fn write_fixture(epoch: i64) -> String {
+fn write_fixture(epoch: EpochNo) -> String {
     let w = duckdb::Connection::open_in_memory().unwrap();
     let a = s3();
     w.execute_batch(&format!(
@@ -80,7 +80,7 @@ fn write_fixture(epoch: i64) -> String {
     uri
 }
 
-async fn seed_manifest(pool: &sqlx::PgPool, epoch: i64, uri: &str) {
+async fn seed_manifest(pool: &sqlx::PgPool, epoch: EpochNo, uri: &str) {
     control::insert_ready(
         pool,
         &control::NewManifestFile {
@@ -101,7 +101,7 @@ async fn seed_manifest(pool: &sqlx::PgPool, epoch: i64, uri: &str) {
 }
 
 /// Fresh control state + an owned `TableCtx` (DuckDB in a temp dir).
-async fn setup(epoch: i64) -> (TableCtx, std::path::PathBuf) {
+async fn setup(epoch: EpochNo) -> (TableCtx, std::path::PathBuf) {
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     for tbl in ["file_manifest", "loader_checkpoint", "replication_state"] {
@@ -158,7 +158,7 @@ fn raw_count(ctx: &TableCtx) -> i64 {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn appends_rows_verbatim_with_promoted_columns_and_meta_intact() {
     let _g = LOCK.lock().await;
-    let epoch = 3_200_001;
+    let epoch = EpochNo(3_200_001);
     let uri = write_fixture(epoch);
     let (ctx, dir) = setup(epoch).await;
     seed_manifest(&ctx.pool, epoch, &uri).await;
@@ -193,7 +193,7 @@ async fn appends_rows_verbatim_with_promoted_columns_and_meta_intact() {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn advances_raw_watermark_and_deletes_the_claimed_manifest_rows() {
     let _g = LOCK.lock().await;
-    let epoch = 3_200_002;
+    let epoch = EpochNo(3_200_002);
     let uri = write_fixture(epoch);
     let (ctx, dir) = setup(epoch).await;
     seed_manifest(&ctx.pool, epoch, &uri).await;
@@ -230,7 +230,7 @@ async fn advances_raw_watermark_and_deletes_the_claimed_manifest_rows() {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn re_running_the_same_file_appends_zero_rows() {
     let _g = LOCK.lock().await;
-    let epoch = 3_200_003;
+    let epoch = EpochNo(3_200_003);
     let uri = write_fixture(epoch);
     let (ctx, dir) = setup(epoch).await;
 
@@ -253,7 +253,7 @@ async fn re_running_the_same_file_appends_zero_rows() {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn pause_withholds_claims_and_lifts_on_failed() {
     let _g = LOCK.lock().await;
-    let epoch = 3_200_004;
+    let epoch = EpochNo(3_200_004);
     let uri = write_fixture(epoch);
     let (ctx, dir) = setup(epoch).await;
     seed_manifest(&ctx.pool, epoch, &uri).await;

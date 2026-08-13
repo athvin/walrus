@@ -12,7 +12,7 @@
 use crate::duck::TableDb;
 use crate::error::LoaderError;
 use crate::health::LoaderState;
-use common::{Lsn, PgRelation};
+use common::{EpochNo, Lsn, PgRelation};
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -23,7 +23,7 @@ use std::time::Duration;
 #[derive(Debug)]
 pub struct TableCtx {
     pub pool: sqlx::PgPool,
-    pub epoch: i64,
+    pub epoch: EpochNo,
     pub schema: String,
     pub table: String,
     /// The `table` metric label (`"<schema>.<table>"`), precomputed at construction. Cardinality is

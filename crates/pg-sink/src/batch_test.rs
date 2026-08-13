@@ -61,7 +61,7 @@ fn meta(lsn: &str) -> SinkMeta {
         commit_lsn: Lsn::ZERO, // patched at on_commit
         commit_ts: UtcTimestamp::parse_rfc3339("2026-07-07T12:00:00Z").unwrap(),
         xid: 7,
-        epoch: 1,
+        epoch: common::EpochNo(1),
         batch_id: "b1".into(),
         schema_version: 1,
         source_schema: "public".into(),

@@ -25,7 +25,7 @@ use crate::consume::{flush_batch, BatchRouter};
 use crate::replication::ReplicationStream;
 use crate::sink::ParquetSink;
 use anyhow::Context;
-use common::Lsn;
+use common::{EpochNo, Lsn};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::sync::CancellationToken;
 
@@ -57,7 +57,7 @@ pub async fn drain(
     sink: &ParquetSink,
     checkpoint: &mut DurabilityCheckpoint,
     pool: &sqlx::PgPool,
-    epoch: i64,
+    epoch: EpochNo,
 ) -> anyhow::Result<DrainOutcome> {
     // (2) Seal + flush the committed batches; open speculative buffers are dropped (they re-stream).
     let sealed = router

@@ -11,7 +11,7 @@
 //!
 //!   cargo test -p pg-sink --test streaming_large_txn -- --ignored
 
-use common::Lsn;
+use common::{EpochNo, Lsn};
 use pg_sink::batch::{BatchTriggers, SystemClock};
 use pg_sink::checkpoint::DurabilityCheckpoint;
 use pg_sink::consume::on_frame;
@@ -70,7 +70,7 @@ async fn drop_slot(admin: &tokio_postgres::Client, slot: &str) {
         .await;
 }
 
-async fn ready_count(pool: &sqlx::PgPool, epoch: i64) -> i64 {
+async fn ready_count(pool: &sqlx::PgPool, epoch: EpochNo) -> i64 {
     sqlx::query_scalar(
         "SELECT count(*) FROM walrus.file_manifest WHERE epoch = $1 AND status = 'ready'",
     )
@@ -80,7 +80,7 @@ async fn ready_count(pool: &sqlx::PgPool, epoch: i64) -> i64 {
     .unwrap()
 }
 
-async fn cleanup(pool: &sqlx::PgPool, admin: &tokio_postgres::Client, epoch: i64, slot: &str) {
+async fn cleanup(pool: &sqlx::PgPool, admin: &tokio_postgres::Client, epoch: EpochNo, slot: &str) {
     let uris: Vec<String> =
         sqlx::query_scalar("SELECT s3_uri FROM walrus.file_manifest WHERE epoch = $1")
             .bind(epoch)
@@ -111,7 +111,7 @@ async fn cleanup(pool: &sqlx::PgPool, admin: &tokio_postgres::Client, epoch: i64
 async fn large_txn_single_ready_file_only_after_stream_commit() {
     let _g = SOURCE_LOCK.lock().await;
     let slot = "walrus_stream";
-    let epoch = 2_300_001;
+    let epoch = EpochNo(2_300_001);
     let admin = source().await;
     admin.batch_execute(SOURCE_MIGRATION).await.unwrap();
     admin
@@ -272,7 +272,7 @@ async fn large_txn_single_ready_file_only_after_stream_commit() {
 async fn whole_txn_abort_writes_no_ready_row() {
     let _g = SOURCE_LOCK.lock().await;
     let slot = "walrus_stream_abort";
-    let epoch = 2_300_002;
+    let epoch = EpochNo(2_300_002);
     let admin = source().await;
     admin.batch_execute(SOURCE_MIGRATION).await.unwrap();
     admin

@@ -4,7 +4,7 @@ fn sink() -> ParquetSink {
     ParquetSink::new(
         Arc::new(object_store::memory::InMemory::new()),
         "walrus".into(),
-        5,
+        common::EpochNo(5),
     )
 }
 

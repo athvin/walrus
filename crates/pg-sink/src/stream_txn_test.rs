@@ -49,7 +49,7 @@ fn demux(ceiling: u64) -> StreamDemux {
             max_fill: Duration::from_secs(3600),
         },
         Arc::new(SystemClock),
-        1,
+        common::EpochNo(1),
         "test".into(),
         ceiling,
     )
@@ -59,7 +59,7 @@ fn mem_sink() -> ParquetSink {
     ParquetSink::new(
         Arc::new(object_store::memory::InMemory::new()),
         "walrus".into(),
-        1,
+        common::EpochNo(1),
     )
 }
 

@@ -9,7 +9,7 @@
 //!
 //!   cargo test -p loader --test shutdown -- --ignored
 
-use common::{Lsn, PgColumn, PgRelation, ReplicaIdentity};
+use common::{EpochNo, Lsn, PgColumn, PgRelation, ReplicaIdentity};
 use loader::apply_loop::apply_loop;
 use loader::compaction::full_rebuild_abortable;
 use loader::duck::{S3Access, TableDb};
@@ -68,7 +68,7 @@ fn meta(op: &str, commit_hex: &str, l: u64) -> String {
 }
 
 fn write_row(
-    epoch: i64,
+    epoch: EpochNo,
     tag: &str,
     id: i64,
     status: &str,
@@ -100,7 +100,7 @@ fn write_row(
     uri
 }
 
-async fn clean(pool: &sqlx::PgPool, epoch: i64) {
+async fn clean(pool: &sqlx::PgPool, epoch: EpochNo) {
     for tbl in [
         "file_manifest",
         "loader_checkpoint",
@@ -130,7 +130,7 @@ async fn clean(pool: &sqlx::PgPool, epoch: i64) {
 
 fn ctx_on(
     pool: sqlx::PgPool,
-    epoch: i64,
+    epoch: EpochNo,
     path: &std::path::Path,
     poll: Duration,
     compaction: Duration,
@@ -167,7 +167,7 @@ async fn run_until_drain(ctx: TableCtx, cancel_after: Duration) {
     apply_loop(ctx, token).await.unwrap();
 }
 
-async fn lease_is_live(pool: &sqlx::PgPool, epoch: i64) -> bool {
+async fn lease_is_live(pool: &sqlx::PgPool, epoch: EpochNo) -> bool {
     sqlx::query_scalar::<_, bool>(
         "SELECT lease_expiry > now() FROM walrus.table_ownership \
          WHERE epoch = $1 AND source_table = 'orders'",
@@ -184,7 +184,7 @@ async fn lease_is_live(pool: &sqlx::PgPool, epoch: i64) -> bool {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn sigterm_mid_apply_commits_both_watermarks_and_releases_lease() {
     let _g = LOCK.lock().await;
-    let epoch = 3_120_001;
+    let epoch = EpochNo(3_120_001);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     clean(&pool, epoch).await;
@@ -321,7 +321,7 @@ async fn in_flight_full_rebuild_is_aborted_on_sigterm() {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn a_replacement_loader_resumes_from_the_two_watermarks() {
     let _g = LOCK.lock().await;
-    let epoch = 3_120_003;
+    let epoch = EpochNo(3_120_003);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     clean(&pool, epoch).await;

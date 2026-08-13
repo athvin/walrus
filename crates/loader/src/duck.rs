@@ -9,7 +9,7 @@ use common::oids::{
     BOOL, BYTEA, DATE, FLOAT4, FLOAT8, INT2, INT4, INT8, JSON, JSONB, NUMERIC, TIMESTAMP,
     TIMESTAMPTZ, UUID,
 };
-use common::PgRelation;
+use common::{EpochNo, PgRelation};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
@@ -321,7 +321,7 @@ impl TableDb {
     /// # Errors
     ///
     /// Returns [`LoaderError::Duck`] if the metadata table probe or epoch read fails.
-    pub fn built_epoch(&self) -> Result<Option<i64>, LoaderError> {
+    pub fn built_epoch(&self) -> Result<Option<EpochNo>, LoaderError> {
         // A brand-new file has no `_walrus_meta` yet — probe first so this never errors on it.
         let has_meta: i64 = self
             .conn
@@ -349,7 +349,7 @@ impl TableDb {
                 op: "read built epoch".to_string(),
                 source,
             })?;
-        Ok(v)
+        Ok(v.map(EpochNo))
     }
 
     /// Stamp the generation this `.duckdb` is now built for (`_walrus_meta['epoch']`). Upserts, so it both
@@ -358,12 +358,12 @@ impl TableDb {
     /// # Errors
     ///
     /// Returns [`LoaderError::Duck`] if the epoch upsert fails.
-    pub fn set_built_epoch(&self, epoch: i64) -> Result<(), LoaderError> {
+    pub fn set_built_epoch(&self, epoch: EpochNo) -> Result<(), LoaderError> {
         self.conn
             .execute(
                 "INSERT INTO \"_walrus_meta\" (k, v) VALUES ('epoch', ?) \
                  ON CONFLICT (k) DO UPDATE SET v = excluded.v",
-                duckdb::params![epoch],
+                duckdb::params![epoch.0],
             )
             .map_err(|source| LoaderError::Duck {
                 op: "set built epoch".to_string(),

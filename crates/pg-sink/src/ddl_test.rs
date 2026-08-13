@@ -103,7 +103,7 @@ fn alter_table_is_structural_comment_is_metadata_only() {
 
 #[test]
 fn structural_ddl_bumps_version_metadata_does_not() {
-    let mut c = DdlConsumer::new(1);
+    let mut c = DdlConsumer::new(common::EpochNo(1));
     assert_eq!(c.version_of("public", "orders"), 1);
     // Simulate the version bookkeeping consume() performs (no DB).
     assert!(c.versions.is_empty());

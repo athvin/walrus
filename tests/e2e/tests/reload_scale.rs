@@ -58,7 +58,7 @@ async fn n_table_reloads_respect_the_cap_on_one_slot() {
     for t in TABLES {
         let id = control::reload::request(
             &pool,
-            epoch,
+            epoch.into(),
             "public",
             t,
             control::reload::ReloadFlavor::Reload,

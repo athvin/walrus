@@ -11,7 +11,7 @@
 //! savepoint, because a failed statement aborts the enclosing Postgres transaction.
 #![cfg(feature = "integration")]
 
-use common::Lsn;
+use common::{EpochNo, Lsn};
 use control::reload::{self, ReloadFlavor, ReloadStatus};
 use control::{claim_ready, connect, insert_ready, run_migrations, ControlError, NewManifestFile};
 use sqlx::postgres::PgPool;
@@ -32,7 +32,7 @@ async fn pool() -> PgPool {
 }
 
 /// A staged reload chunk file: `kind='reload'` carrying its `reload_id` (stamped `lsn = L_i`).
-fn chunk_file(epoch: i64, table: &str, reload_id: i64, lsn_end: &str) -> NewManifestFile {
+fn chunk_file(epoch: EpochNo, table: &str, reload_id: i64, lsn_end: &str) -> NewManifestFile {
     let lsn: Lsn = lsn_end.parse().unwrap();
     NewManifestFile {
         epoch,
@@ -62,7 +62,7 @@ async fn expiry_epoch(ex: impl sqlx::PgExecutor<'_>, reload_id: i64) -> f64 {
 }
 
 /// An ordinary stream file — `reload_id` stays NULL, exactly like every pre-6.1 row.
-fn stream_file(epoch: i64, table: &str, lsn_end: &str) -> NewManifestFile {
+fn stream_file(epoch: EpochNo, table: &str, lsn_end: &str) -> NewManifestFile {
     let lsn: Lsn = lsn_end.parse().unwrap();
     NewManifestFile {
         epoch,
@@ -82,7 +82,7 @@ fn stream_file(epoch: i64, table: &str, lsn_end: &str) -> NewManifestFile {
 async fn full_status_walk_and_duplicate_request_rejected() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let epoch = 910_001;
+    let epoch = EpochNo(910_001);
 
     let id = reload::request(&mut *tx, epoch, "public", "orders", ReloadFlavor::Reload)
         .await
@@ -261,7 +261,7 @@ async fn full_status_walk_and_duplicate_request_rejected() {
 async fn wrong_state_transition_changes_zero_rows() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let epoch = 910_002;
+    let epoch = EpochNo(910_002);
 
     let id = reload::request(&mut *tx, epoch, "public", "t", ReloadFlavor::Reload)
         .await
@@ -317,7 +317,7 @@ async fn wrong_state_transition_changes_zero_rows() {
 async fn release_claim_returns_the_row_to_the_queue() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let epoch = 910_005;
+    let epoch = EpochNo(910_005);
 
     let id = reload::request(&mut *tx, epoch, "public", "orders", ReloadFlavor::Reload)
         .await
@@ -355,7 +355,7 @@ async fn release_claim_returns_the_row_to_the_queue() {
 async fn fail_purges_this_reloads_manifest_rows_only() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let epoch = 910_003;
+    let epoch = EpochNo(910_003);
 
     // Two live reloads on different tables, both exporting.
     let r1 = reload::request(&mut *tx, epoch, "public", "orders", ReloadFlavor::Reload)
@@ -436,7 +436,7 @@ async fn fail_purges_this_reloads_manifest_rows_only() {
 #[tokio::test]
 async fn concurrent_claimers_partition_the_queue_via_skip_locked() {
     let pool = pool().await;
-    let epoch = 910_004;
+    let epoch = EpochNo(910_004);
 
     // SKIP LOCKED is only observable ACROSS transactions, so this test needs committed fixtures
     // (unlike the rolled-back-txn discipline above). Clean up leftovers from any crashed prior

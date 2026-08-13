@@ -17,7 +17,7 @@
 //!
 //!   cargo test -p pg-sink --test reload_recovery -- --ignored --test-threads=1
 
-use common::Lsn;
+use common::{EpochNo, Lsn};
 use pg_sink::consume::on_frame;
 use pg_sink::heartbeat::InternalTables;
 use pg_sink::pgoutput::{Message, StreamCtx};
@@ -81,7 +81,7 @@ async fn drop_slot(admin: &tokio_postgres::Client, slot: &str) {
         .await;
 }
 
-async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: i64, n: i64) {
+async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: EpochNo, n: i64) {
     admin
         .batch_execute(&format!(
             "DROP TABLE IF EXISTS public.{TABLE};
@@ -108,7 +108,7 @@ async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: i64, n
     .unwrap();
 }
 
-async fn scrub(pool: &sqlx::PgPool, epoch: i64) {
+async fn scrub(pool: &sqlx::PgPool, epoch: EpochNo) {
     for tbl in [
         "file_manifest",
         "table_reload",
@@ -171,9 +171,9 @@ fn spawn_echo_resolver(
 async fn await_resolver_ready(
     admin: &tokio_postgres::Client,
     waiters: &Arc<WatermarkWaiters>,
-    epoch: i64,
+    epoch: EpochNo,
 ) {
-    let sentinel = -epoch;
+    let sentinel = -epoch.0;
     let mut ready = false;
     for _ in 0..20 {
         let rx = waiters.subscribe(sentinel, 1);
@@ -202,7 +202,7 @@ async fn await_resolver_ready(
         .unwrap();
 }
 
-fn export_cfg(epoch: i64, chunk_rows: u64) -> ChunkExportConfig {
+fn export_cfg(epoch: EpochNo, chunk_rows: u64) -> ChunkExportConfig {
     ChunkExportConfig {
         chunk_rows,
         echo_timeout: Duration::from_secs(20),
@@ -211,7 +211,11 @@ fn export_cfg(epoch: i64, chunk_rows: u64) -> ChunkExportConfig {
     }
 }
 
-async fn request_and_claim(pool: &sqlx::PgPool, epoch: i64, holder: &str) -> control::ReloadRow {
+async fn request_and_claim(
+    pool: &sqlx::PgPool,
+    epoch: EpochNo,
+    holder: &str,
+) -> control::ReloadRow {
     control::reload::request(pool, epoch, "public", TABLE, ReloadFlavor::Reload)
         .await
         .unwrap();
@@ -222,7 +226,7 @@ async fn request_and_claim(pool: &sqlx::PgPool, epoch: i64, holder: &str) -> con
         .unwrap()
 }
 
-async fn reload_file_count(pool: &sqlx::PgPool, epoch: i64, reload_id: i64) -> i64 {
+async fn reload_file_count(pool: &sqlx::PgPool, epoch: EpochNo, reload_id: i64) -> i64 {
     sqlx::query_scalar(
         "SELECT count(*) FROM walrus.file_manifest WHERE epoch = $1 AND reload_id = $2",
     )
@@ -236,7 +240,7 @@ async fn reload_file_count(pool: &sqlx::PgPool, epoch: i64, reload_id: i64) -> i
 /// Simulate the loader reaching a watermark: seed the checkpoint and advance both frontiers (the
 /// `raw >= transformed` CHECK needs raw first). Never applies a file — this exercises the
 /// completion PREDICATE, not the mirror content (that is the loader's own suites).
-async fn set_transformed(pool: &sqlx::PgPool, epoch: i64, lsn: Lsn) {
+async fn set_transformed(pool: &sqlx::PgPool, epoch: EpochNo, lsn: Lsn) {
     control::ensure_checkpoint(pool, epoch, "public", TABLE)
         .await
         .unwrap();
@@ -260,7 +264,7 @@ async fn status(pool: &sqlx::PgPool, reload_id: i64) -> ReloadStatus {
 #[ignore = "requires docker compose up --wait (source + control PG + MinIO)"]
 async fn kill_mid_export_resumes_from_cursor_and_completes() {
     let _g = SOURCE_LOCK.lock().await;
-    let epoch = 690_001;
+    let epoch = EpochNo(690_001);
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
@@ -370,7 +374,7 @@ async fn kill_mid_export_resumes_from_cursor_and_completes() {
 #[ignore = "requires docker compose up --wait (source + control PG + MinIO)"]
 async fn complete_waits_for_transformed_lsn_to_reach_h() {
     let _g = SOURCE_LOCK.lock().await;
-    let epoch = 690_002;
+    let epoch = EpochNo(690_002);
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
@@ -447,7 +451,7 @@ async fn complete_waits_for_transformed_lsn_to_reach_h() {
 #[ignore = "requires docker compose up --wait (control PG)"]
 async fn adoption_respects_live_leases_but_takes_expired_ones() {
     let _g = SOURCE_LOCK.lock().await;
-    let epoch = 690_003;
+    let epoch = EpochNo(690_003);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     scrub(&pool, epoch).await;

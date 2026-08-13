@@ -15,7 +15,7 @@ use crate::pgoutput::{self, Message, Reader, StreamCtx};
 use crate::relcache::{is_internal_table, RelationCache};
 use crate::replication::{ReplicationMessage, ReplicationStream};
 use anyhow::Context;
-use common::{Kind, Lsn, Op, SinkMeta, TupleValue, UtcTimestamp};
+use common::{EpochNo, Kind, Lsn, Op, SinkMeta, TupleValue, UtcTimestamp};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -49,7 +49,7 @@ pub async fn run_decode_loop(
     heartbeat: &mut Heartbeat,
     health: &HealthState,
     pool: &sqlx::PgPool,
-    epoch: i64,
+    epoch: EpochNo,
     _schema_version: i64, // structural version now rides the DDL consumer / cached shape (PR 2.33)
     waiters: &crate::reload_signal::WatermarkWaiters,
 ) -> anyhow::Result<()> {
@@ -323,7 +323,7 @@ async fn flush_sealed(
     sink: &crate::sink::ParquetSink,
     checkpoint: &mut crate::checkpoint::DurabilityCheckpoint,
     pool: &sqlx::PgPool,
-    epoch: i64,
+    epoch: EpochNo,
 ) -> anyhow::Result<()> {
     for batch in sealed {
         // Durability steps (a) PUT then (b) commit the manifest row — pumping unconditional keepalive
@@ -358,7 +358,7 @@ async fn flush_batch_keepalive(
     stream: &mut ReplicationStream,
     sink: &crate::sink::ParquetSink,
     ex: &sqlx::PgPool,
-    epoch: i64,
+    epoch: EpochNo,
     batch: SealedBatch,
 ) -> anyhow::Result<crate::sink::WrittenObject> {
     let flush = flush_batch(sink, ex, epoch, batch);
@@ -388,7 +388,7 @@ async fn flush_batch_keepalive(
 pub async fn flush_batch(
     sink: &crate::sink::ParquetSink,
     ex: impl sqlx::PgExecutor<'_>,
-    epoch: i64,
+    epoch: EpochNo,
     batch: crate::batch::SealedBatch,
 ) -> anyhow::Result<crate::sink::WrittenObject> {
     flush_batch_kind(sink, ex, epoch, batch, crate::sink::FileKind::Stream).await
@@ -404,7 +404,7 @@ pub async fn flush_batch(
 pub async fn flush_batch_kind(
     sink: &crate::sink::ParquetSink,
     ex: impl sqlx::PgExecutor<'_>,
-    epoch: i64,
+    epoch: EpochNo,
     batch: crate::batch::SealedBatch,
     kind: crate::sink::FileKind,
 ) -> anyhow::Result<crate::sink::WrittenObject> {
@@ -427,7 +427,7 @@ pub struct BatchRouter {
     batchers: HashMap<u32, TableBatcher>,
     triggers: BatchTriggers,
     clock: Arc<dyn Clock>,
-    epoch: i64,
+    epoch: EpochNo,
     sink_instance: String,
     /// The current transaction's top-level xid (from `Begin`), used when a change carries no xid
     /// (non-streamed txns).
@@ -438,7 +438,7 @@ impl BatchRouter {
     pub fn new(
         triggers: BatchTriggers,
         clock: Arc<dyn Clock>,
-        epoch: i64,
+        epoch: EpochNo,
         sink_instance: String,
     ) -> Self {
         BatchRouter {
@@ -667,7 +667,7 @@ impl BatchRouter {
 pub async fn on_relation(
     cache: &mut RelationCache,
     ex: impl sqlx::PgExecutor<'_>,
-    epoch: i64,
+    epoch: EpochNo,
     relation: common::PgRelation,
     schema_version: i64,
 ) -> anyhow::Result<()> {

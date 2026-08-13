@@ -14,7 +14,7 @@
 //!
 //!   cargo test -p loader --test snapshot_boundary -- --ignored
 
-use common::{PgColumn, PgRelation, ReplicaIdentity};
+use common::{EpochNo, PgColumn, PgRelation, ReplicaIdentity};
 use loader::duck::{S3Access, TableDb};
 use loader::health::LoaderState;
 use loader::phase_a::{run_phase_a, TableCtx};
@@ -71,7 +71,7 @@ fn meta(op: &str, commit_hex: &str, l: u64) -> String {
 
 /// Write a single-row (id, status, walrus_pg_sink_meta) Parquet fixture to S3.
 fn write_row(
-    epoch: i64,
+    epoch: EpochNo,
     tag: &str,
     id: i64,
     status: &str,
@@ -103,7 +103,7 @@ fn write_row(
     uri
 }
 
-async fn insert_file(pool: &sqlx::PgPool, epoch: i64, uri: String, kind: &str, lsn_end: &str) {
+async fn insert_file(pool: &sqlx::PgPool, epoch: EpochNo, uri: String, kind: &str, lsn_end: &str) {
     control::insert_ready(
         pool,
         &control::NewManifestFile {
@@ -123,7 +123,7 @@ async fn insert_file(pool: &sqlx::PgPool, epoch: i64, uri: String, kind: &str, l
     .unwrap();
 }
 
-async fn setup(epoch: i64, max_files: i64) -> (TableCtx, std::path::PathBuf) {
+async fn setup(epoch: EpochNo, max_files: i64) -> (TableCtx, std::path::PathBuf) {
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     for tbl in ["file_manifest", "loader_checkpoint", "replication_state"] {
@@ -185,7 +185,7 @@ fn mirror(ctx: &TableCtx) -> Vec<(i64, String)> {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn snapshot_then_overlapping_stream_yields_stream_value() {
     let _g = LOCK.lock().await;
-    let epoch = 3_105_001;
+    let epoch = EpochNo(3_105_001);
     let (ctx, dir) = setup(epoch, 100).await;
 
     // Snapshot file (commit_lsn = consistent_point 0x64) then an overlapping stream update (0xC8).
@@ -212,7 +212,7 @@ async fn snapshot_then_overlapping_stream_yields_stream_value() {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn equal_lsn_end_snapshot_files_split_across_batches_all_applied() {
     let _g = LOCK.lock().await;
-    let epoch = 3_105_002;
+    let epoch = EpochNo(3_105_002);
     let (ctx, dir) = setup(epoch, 1).await; // max_files=1 forces the split across batches
 
     // Two snapshot files at the SAME lsn_end (= consistent_point 0/64), distinct keys.

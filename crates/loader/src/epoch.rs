@@ -12,6 +12,7 @@
 
 use crate::duck::TableDb;
 use crate::error::LoaderError;
+use common::EpochNo;
 
 /// If `db` was built for an older generation than `control_epoch`, wipe its mirror + raw so the caller's
 /// subsequent `ensure_tables*` recreates them empty and the new-epoch snapshot rebuilds the file. Returns
@@ -25,14 +26,14 @@ use crate::error::LoaderError;
 pub fn rebuild_for_new_epoch(
     db: &TableDb,
     table: &str,
-    control_epoch: i64,
+    control_epoch: EpochNo,
 ) -> Result<bool, LoaderError> {
     match db.built_epoch()? {
         Some(built) if built < control_epoch => {
             tracing::error!(
                 table,
-                old_epoch = built,
-                new_epoch = control_epoch,
+                old_epoch = %built,
+                new_epoch = %control_epoch,
                 "TOTAL-RESTART: .duckdb was built for a retired generation — wiping mirror + raw to \
                  rebuild under the new epoch (both watermarks reset from the fresh checkpoint)"
             );

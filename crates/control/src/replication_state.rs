@@ -1,14 +1,14 @@
 //! `replication_state` models: the epoch generation that namespaces all control-plane state.
 
 use crate::ControlError;
-use common::Lsn;
+use common::{EpochNo, Lsn};
 use sqlx::PgExecutor;
 
 /// One row per slot lifetime; a new slot = a new epoch (architecture §1.8). The `epoch` namespaces
 /// **all** other state (manifest, checkpoints, registry).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicationState {
-    pub epoch: i64,
+    pub epoch: EpochNo,
     pub slot_name: String,
     /// The consistent snapshot LSN at slot creation.
     pub created_lsn: Lsn,
@@ -44,7 +44,7 @@ pub async fn insert_epoch(
 ) -> Result<(), ControlError> {
     sqlx::query_file!(
         "sql/postgres/queries/insert_epoch.sql",
-        s.epoch,
+        s.epoch.0,
         s.slot_name,
         s.created_lsn as Lsn,
         s.status,
@@ -70,7 +70,7 @@ pub async fn bump_epoch(
     slot_name: &str,
     created_lsn: Lsn,
     status: &str,
-) -> Result<i64, ControlError> {
+) -> Result<EpochNo, ControlError> {
     let rec = sqlx::query_file!(
         "sql/postgres/queries/bump_epoch.sql",
         slot_name,
@@ -79,5 +79,5 @@ pub async fn bump_epoch(
     )
     .fetch_one(ex)
     .await?;
-    Ok(rec.epoch)
+    Ok(EpochNo(rec.epoch))
 }

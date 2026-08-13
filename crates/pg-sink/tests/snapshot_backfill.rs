@@ -11,7 +11,7 @@
 //!
 //!   cargo test -p pg-sink --test snapshot_backfill -- --ignored
 
-use common::{Lsn, TupleValue};
+use common::{EpochNo, Lsn, TupleValue};
 use object_store::path::Path;
 use object_store::ObjectStore;
 use pg_sink::batch::BatchTriggers;
@@ -80,7 +80,7 @@ fn orders_id(new: &[TupleValue]) -> Option<i32> {
 async fn backfill_preloaded_rows_then_streams_post_consistent_point() {
     let _g = SOURCE_LOCK.lock().await;
     let slot = "walrus_snapshot";
-    let epoch = 2_290_001;
+    let epoch = EpochNo(2_290_001);
     let admin = source().await;
     admin.batch_execute(SOURCE_MIGRATION).await.unwrap();
     admin

@@ -32,7 +32,7 @@ fn rebuild_wipes_a_stale_generation_and_is_idempotent() {
     let db = open_fresh(&dir);
 
     // A file built for epoch 1 with a row in raw + mirror.
-    db.set_built_epoch(1).unwrap();
+    db.set_built_epoch(common::EpochNo(1)).unwrap();
     db.conn()
         .execute_batch(
             "INSERT INTO orders VALUES (1, 'x', '0', '0'); \
@@ -43,10 +43,10 @@ fn rebuild_wipes_a_stale_generation_and_is_idempotent() {
         .unwrap();
 
     // Control epoch bumped to 2 → the file is stale → rebuild wipes it (raw + mirror gone).
-    assert!(rebuild_for_new_epoch(&db, "orders", 2).unwrap());
+    assert!(rebuild_for_new_epoch(&db, "orders", common::EpochNo(2)).unwrap());
     // Recreate empty (as bootstrap does) and confirm the stale rows are gone.
     db.ensure_tables(&orders(), 1).unwrap();
-    db.set_built_epoch(2).unwrap();
+    db.set_built_epoch(common::EpochNo(2)).unwrap();
     let mirror: i64 = db
         .conn()
         .query_row("SELECT count(*) FROM orders", [], |r| r.get(0))
@@ -58,7 +58,7 @@ fn rebuild_wipes_a_stale_generation_and_is_idempotent() {
     assert_eq!((mirror, raw), (0, 0), "the retired generation was wiped");
 
     // Idempotent: already at epoch 2 → no rebuild.
-    assert!(!rebuild_for_new_epoch(&db, "orders", 2).unwrap());
+    assert!(!rebuild_for_new_epoch(&db, "orders", common::EpochNo(2)).unwrap());
 }
 
 #[test]
@@ -68,6 +68,6 @@ fn fresh_file_is_not_rebuilt() {
     std::fs::create_dir_all(&dir).unwrap();
     let db = open_fresh(&dir);
     // Never stamped (built_epoch = None) → a fresh bootstrap, never a rebuild.
-    assert!(!rebuild_for_new_epoch(&db, "orders", 1).unwrap());
-    assert!(!rebuild_for_new_epoch(&db, "orders", 5).unwrap());
+    assert!(!rebuild_for_new_epoch(&db, "orders", common::EpochNo(1)).unwrap());
+    assert!(!rebuild_for_new_epoch(&db, "orders", common::EpochNo(5)).unwrap());
 }

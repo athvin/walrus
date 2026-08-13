@@ -10,7 +10,7 @@
 //!   cargo test -p loader --test ddl_additive              # hermetic
 //!   cargo test -p loader --test ddl_additive -- --ignored # + compose
 
-use common::{PgColumn, PgRelation, ReplicaIdentity};
+use common::{EpochNo, PgColumn, PgRelation, ReplicaIdentity};
 use loader::ddl::{apply_additive, diff_additive, AdditiveChange, CommentTarget, SchemaVersion};
 use loader::duck::{S3Access, TableDb};
 use loader::health::LoaderState;
@@ -368,7 +368,7 @@ fn meta(op: &str, commit_hex: &str, l: u64) -> String {
 
 /// Write a homogeneous Parquet fixture to S3. `with_note` = the v2 shape (adds the `note` column).
 fn write_fixture(
-    epoch: i64,
+    epoch: EpochNo,
     tag: &str,
     with_note: bool,
     rows: &[(i64, &str, &str, &str, u64)],
@@ -428,7 +428,7 @@ fn mirror3(ctx: &TableCtx) -> Vec<(i64, String, Option<String>)> {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
     let _g = LOCK.lock().await;
-    let epoch = 3_800_001;
+    let epoch = EpochNo(3_800_001);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     for tbl in [

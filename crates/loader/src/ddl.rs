@@ -21,7 +21,7 @@
 use crate::duck::{duck_type, user_view_sql, TableDb};
 use crate::error::LoaderError;
 use common::oids::{FLOAT4, FLOAT8, INT2, INT4, INT8};
-use common::{PgColumn, PgRelation};
+use common::{EpochNo, PgColumn, PgRelation};
 use std::fmt::Write as _;
 
 /// One `schema_version` of a table's shape — the `schema_registry` `columns` snapshot for that version.
@@ -379,7 +379,7 @@ pub fn retire_file(path: &std::path::Path) -> Result<(), LoaderError> {
 pub async fn reconcile_to_version(
     db: &TableDb,
     pool: &sqlx::PgPool,
-    epoch: i64,
+    epoch: EpochNo,
     schema: &str,
     table: &str,
     target: i64,
@@ -408,7 +408,7 @@ pub async fn reconcile_to_version(
 /// Load one `schema_version`'s relation from `schema_registry` (`None` if that version has no row).
 async fn load_version(
     pool: &sqlx::PgPool,
-    epoch: i64,
+    epoch: EpochNo,
     schema: &str,
     table: &str,
     version: i64,

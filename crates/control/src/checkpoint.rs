@@ -8,13 +8,13 @@
 //! the log, an invariant the DB enforces via `CHECK (transformed_lsn <= raw_appended_lsn)`.
 
 use crate::ControlError;
-use common::Lsn;
+use common::{EpochNo, Lsn};
 use sqlx::PgExecutor;
 
 /// Per-table, per-epoch progress. **Invariant (DB-enforced):** `transformed_lsn <= raw_appended_lsn`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Checkpoint {
-    pub epoch: i64,
+    pub epoch: EpochNo,
     pub source_schema: String,
     pub source_table: String,
     /// Phase A frontier — the CDC log is durable up to this commit LSN.
@@ -30,14 +30,14 @@ pub struct Checkpoint {
 /// Returns [`ControlError::Connect`] if the checkpoint query cannot reach or read control Postgres.
 pub async fn read_checkpoint(
     ex: impl PgExecutor<'_>,
-    epoch: i64,
+    epoch: EpochNo,
     schema: &str,
     table: &str,
 ) -> Result<Option<Checkpoint>, ControlError> {
     Ok(sqlx::query_file_as!(
         Checkpoint,
         "sql/postgres/queries/read_checkpoint.sql",
-        epoch,
+        epoch.0,
         schema,
         table,
     )
@@ -55,13 +55,13 @@ pub async fn read_checkpoint(
 /// the seed would violate a control-plane invariant.
 pub async fn ensure_checkpoint(
     ex: impl PgExecutor<'_>,
-    epoch: i64,
+    epoch: EpochNo,
     schema: &str,
     table: &str,
 ) -> Result<(), ControlError> {
     sqlx::query_file!(
         "sql/postgres/queries/ensure_checkpoint.sql",
-        epoch,
+        epoch.0,
         schema,
         table,
     )
@@ -80,14 +80,14 @@ pub async fn ensure_checkpoint(
 /// the resulting checkpoint violates its ordering constraint.
 pub async fn advance_raw_appended(
     ex: impl PgExecutor<'_>,
-    epoch: i64,
+    epoch: EpochNo,
     schema: &str,
     table: &str,
     lsn: Lsn,
 ) -> Result<(), ControlError> {
     sqlx::query_file!(
         "sql/postgres/queries/advance_raw_appended.sql",
-        epoch,
+        epoch.0,
         schema,
         table,
         lsn as Lsn,
@@ -108,14 +108,14 @@ pub async fn advance_raw_appended(
 /// `raw_appended_lsn`; other database failures become the transient [`ControlError::Connect`].
 pub async fn advance_transformed(
     ex: impl PgExecutor<'_>,
-    epoch: i64,
+    epoch: EpochNo,
     schema: &str,
     table: &str,
     lsn: Lsn,
 ) -> Result<(), ControlError> {
     sqlx::query_file!(
         "sql/postgres/queries/advance_transformed.sql",
-        epoch,
+        epoch.0,
         schema,
         table,
         lsn as Lsn,

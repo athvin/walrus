@@ -10,7 +10,7 @@
 //!
 //!   cargo test -p loader --test bootstrap -- --ignored
 
-use common::{PgColumn, PgRelation, ReplicaIdentity};
+use common::{EpochNo, PgColumn, PgRelation, ReplicaIdentity};
 use loader::bootstrap::bootstrap;
 use loader::config::LoaderConfig;
 use loader::error::LoaderError;
@@ -74,7 +74,7 @@ fn cfg(pod: &str, dir: &std::path::Path, ttl: Duration) -> LoaderConfig {
 }
 
 /// Seed a fresh epoch as the current one + register `orders`, cleaning any prior control state.
-async fn seed(pool: &sqlx::PgPool, epoch: i64) {
+async fn seed(pool: &sqlx::PgPool, epoch: EpochNo) {
     for tbl in [
         "table_ownership",
         "loader_checkpoint",
@@ -136,7 +136,7 @@ async fn table_exists(db: &loader::duck::TableDb, name: &str) -> bool {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn bootstrap_creates_duckdb_with_both_tables_and_takes_the_lease() {
     let _g = LOCK.lock().await;
-    let epoch = 3_100_101;
+    let epoch = EpochNo(3_100_101);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     seed(&pool, epoch).await;
@@ -187,7 +187,7 @@ async fn bootstrap_creates_duckdb_with_both_tables_and_takes_the_lease() {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn second_instance_with_live_lease_exits_terminal() {
     let _g = LOCK.lock().await;
-    let epoch = 3_100_102;
+    let epoch = EpochNo(3_100_102);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     seed(&pool, epoch).await;
@@ -228,7 +228,7 @@ async fn second_instance_with_live_lease_exits_terminal() {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn stale_lock_expired_lease_is_reclaimed_and_opened() {
     let _g = LOCK.lock().await;
-    let epoch = 3_100_103;
+    let epoch = EpochNo(3_100_103);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     seed(&pool, epoch).await;

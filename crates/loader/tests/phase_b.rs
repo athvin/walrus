@@ -10,7 +10,7 @@
 //!
 //!   cargo test -p loader --test phase_b -- --ignored
 
-use common::{Lsn, PgColumn, PgRelation, ReplicaIdentity};
+use common::{EpochNo, Lsn, PgColumn, PgRelation, ReplicaIdentity};
 use loader::duck::{S3Access, TableDb};
 use loader::health::LoaderState;
 use loader::phase_a::{run_phase_a, TableCtx};
@@ -66,7 +66,7 @@ fn meta(op: &str, l: u64) -> String {
 }
 
 /// Fixture with intra-batch churn: key 1 (i→i final), key 2 (lone i), key 3 (i→d, deleted).
-fn write_fixture(epoch: i64) -> String {
+fn write_fixture(epoch: EpochNo) -> String {
     let w = duckdb::Connection::open_in_memory().unwrap();
     let a = s3();
     w.execute_batch(&format!(
@@ -99,7 +99,7 @@ fn write_fixture(epoch: i64) -> String {
     uri
 }
 
-async fn setup(epoch: i64) -> (TableCtx, std::path::PathBuf) {
+async fn setup(epoch: EpochNo) -> (TableCtx, std::path::PathBuf) {
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     for tbl in ["file_manifest", "loader_checkpoint", "replication_state"] {
@@ -177,7 +177,7 @@ fn mirror(ctx: &TableCtx) -> Vec<(i64, String)> {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn mirror_equals_current_source_after_transform() {
     let _g = LOCK.lock().await;
-    let epoch = 3_400_001;
+    let epoch = EpochNo(3_400_001);
     let (ctx, dir) = setup(epoch).await;
 
     run_phase_a(&ctx).await.unwrap();
@@ -195,7 +195,7 @@ async fn mirror_equals_current_source_after_transform() {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn transformed_lsn_advances_to_max_applied_commit_lsn() {
     let _g = LOCK.lock().await;
-    let epoch = 3_400_002;
+    let epoch = EpochNo(3_400_002);
     let (ctx, dir) = setup(epoch).await;
 
     run_phase_a(&ctx).await.unwrap();
@@ -222,7 +222,7 @@ async fn transformed_lsn_advances_to_max_applied_commit_lsn() {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn re_running_phase_b_is_idempotent() {
     let _g = LOCK.lock().await;
-    let epoch = 3_400_003;
+    let epoch = EpochNo(3_400_003);
     let (ctx, dir) = setup(epoch).await;
 
     run_phase_a(&ctx).await.unwrap();

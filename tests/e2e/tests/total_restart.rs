@@ -87,7 +87,7 @@ async fn dropping_the_slot_triggers_epoch_bump_and_full_rebuild() {
 
     // Both watermarks reset then advanced under the NEW epoch — the epoch-2 checkpoint is a fresh row that
     // has moved off `0/0` (its predecessor was epoch 1, untouched).
-    let cp = control::read_checkpoint(h.control_pool(), 2, "public", "orders")
+    let cp = control::read_checkpoint(h.control_pool(), 2_i64.into(), "public", "orders")
         .await
         .unwrap()
         .expect("epoch-2 checkpoint exists");

@@ -20,6 +20,7 @@
 
 use crate::reload_signal::WatermarkWaiters;
 use anyhow::Context as _;
+use common::EpochNo;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -229,7 +230,7 @@ pub struct ReloadControllerConfig {
     /// `lease_holder` — the same identity the heartbeat/ownership machinery uses (never a second one).
     pub instance: String,
     pub publication_name: String,
-    pub epoch: i64,
+    pub epoch: EpochNo,
     /// Rows per chunk SELECT (PR 6.5).
     pub chunk_rows: u64,
     /// How long a chunk waits for its watermark echo before failing loudly (PR 6.5 / H11).

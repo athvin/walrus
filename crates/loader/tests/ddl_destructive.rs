@@ -10,7 +10,7 @@
 //!   cargo test -p loader --test ddl_destructive              # hermetic
 //!   cargo test -p loader --test ddl_destructive -- --ignored # + compose (quarantine)
 
-use common::{PgColumn, PgRelation, ReplicaIdentity};
+use common::{EpochNo, PgColumn, PgRelation, ReplicaIdentity};
 use loader::ddl::{apply_destructive, retire_file, DestructiveChange};
 use loader::duck::{S3Access, TableDb};
 use loader::error::LoaderError;
@@ -235,7 +235,7 @@ fn meta(commit_hex: &str, l: u64) -> String {
 }
 
 /// Write an (id, n, walrus_pg_sink_meta) Parquet fixture to S3.
-fn write_fixture(epoch: i64, tag: &str, id: i64, n: i64, commit_hex: &str, l: u64) -> String {
+fn write_fixture(epoch: EpochNo, tag: &str, id: i64, n: i64, commit_hex: &str, l: u64) -> String {
     let w = duckdb::Connection::open_in_memory().unwrap();
     let a = s3();
     w.execute_batch(&format!(
@@ -262,7 +262,7 @@ fn write_fixture(epoch: i64, tag: &str, id: i64, n: i64, commit_hex: &str, l: u6
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn lossy_cast_failure_quarantines_the_table_and_alerts() {
     let _g = LOCK.lock().await;
-    let epoch = 3_900_001;
+    let epoch = EpochNo(3_900_001);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     for tbl in [

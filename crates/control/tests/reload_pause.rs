@@ -12,7 +12,7 @@
 //! never pauses. Rolled-back transactions + unique epochs, like the manifest tests.
 #![cfg(feature = "integration")]
 
-use common::Lsn;
+use common::{EpochNo, Lsn};
 use control::reload::{self, ReloadFlavor};
 use control::{claim_ready, connect, insert_ready, max_ready_lsn_end, run_migrations};
 use control::{ManifestRow, NewManifestFile};
@@ -32,7 +32,7 @@ async fn pool() -> PgPool {
     pool
 }
 
-fn stream_file(epoch: i64, table: &str, lsn_end: &str) -> NewManifestFile {
+fn stream_file(epoch: EpochNo, table: &str, lsn_end: &str) -> NewManifestFile {
     let lsn: Lsn = lsn_end.parse().unwrap();
     NewManifestFile {
         epoch,
@@ -56,7 +56,7 @@ fn ids(rows: &[ManifestRow]) -> Vec<common::ManifestId> {
 async fn live_rebuild_pauses_claims_for_that_table_only() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let epoch = 920_001;
+    let epoch = EpochNo(920_001);
 
     insert_ready(&mut *tx, &stream_file(epoch, "orders", "0/10"))
         .await
@@ -111,7 +111,7 @@ async fn live_rebuild_pauses_claims_for_that_table_only() {
 async fn export_complete_and_terminal_states_lift_the_pause() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let epoch = 920_002;
+    let epoch = EpochNo(920_002);
 
     // Backlog inserted OUT of order, so the lift must return it in (lsn_end, id) order.
     let c = insert_ready(&mut *tx, &stream_file(epoch, "orders", "0/30"))
@@ -186,7 +186,7 @@ async fn export_complete_and_terminal_states_lift_the_pause() {
 async fn resync_flavor_never_pauses() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let epoch = 920_003;
+    let epoch = EpochNo(920_003);
 
     let id = insert_ready(&mut *tx, &stream_file(epoch, "orders", "0/10"))
         .await

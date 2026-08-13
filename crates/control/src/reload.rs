@@ -17,7 +17,7 @@
 //! rule here.
 
 use crate::ControlError;
-use common::Lsn;
+use common::{EpochNo, Lsn};
 use sqlx::{Connection, PgConnection, PgExecutor};
 
 /// `reload` rebuilds (clear + re-export — the quarantine-recovery flavor); `resync` merges chunks
@@ -99,7 +99,7 @@ impl std::str::FromStr for ReloadStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReloadRow {
     pub reload_id: i64,
-    pub epoch: i64,
+    pub epoch: EpochNo,
     pub source_schema: String,
     pub source_table: String,
     pub flavor: ReloadFlavor,
@@ -134,14 +134,14 @@ pub struct ReloadRow {
 /// [`ControlError::Connect`] when the request cannot reach control Postgres.
 pub async fn request(
     ex: impl PgExecutor<'_>,
-    epoch: i64,
+    epoch: EpochNo,
     source_schema: &str,
     source_table: &str,
     flavor: ReloadFlavor,
 ) -> Result<i64, ControlError> {
     let rec = sqlx::query_file!(
         "sql/postgres/queries/request_reload.sql",
-        epoch,
+        epoch.0,
         source_schema,
         source_table,
         flavor.as_str(),
@@ -175,7 +175,7 @@ pub async fn request(
 /// decoded.
 pub async fn claim_requested(
     ex: impl PgExecutor<'_>,
-    epoch: i64,
+    epoch: EpochNo,
     holder: &str,
     lease_ttl_secs: i64,
     limit: i64,
@@ -183,7 +183,7 @@ pub async fn claim_requested(
     Ok(sqlx::query_file_as!(
         ReloadRow,
         "sql/postgres/queries/claim_requested.sql",
-        epoch,
+        epoch.0,
         holder,
         lease_ttl_secs as f64,
         limit,
@@ -450,13 +450,13 @@ pub async fn restart_for_ddl(
 /// Returns [`ControlError::Connect`] if the checkpoint-joined completion update cannot execute.
 pub async fn complete_reached(
     ex: impl PgExecutor<'_>,
-    epoch: i64,
+    epoch: EpochNo,
     source_schema: &str,
     source_table: &str,
 ) -> Result<Vec<i64>, ControlError> {
     let rows = sqlx::query_file!(
         "sql/postgres/queries/complete_reached.sql",
-        epoch,
+        epoch.0,
         source_schema,
         source_table,
     )
@@ -482,13 +482,13 @@ pub async fn complete_reached(
 /// Returns [`ControlError::Connect`] if the pending-rebuild lookup cannot execute or decode.
 pub async fn reload_supersede_floor(
     ex: impl PgExecutor<'_>,
-    epoch: i64,
+    epoch: EpochNo,
     source_schema: &str,
     source_table: &str,
 ) -> Result<Option<Lsn>, ControlError> {
     let rec = sqlx::query_file!(
         "sql/postgres/queries/reload_supersede_floor.sql",
-        epoch,
+        epoch.0,
         source_schema,
         source_table,
     )
@@ -514,7 +514,7 @@ pub async fn reload_supersede_floor(
 /// decoded.
 pub async fn adopt_resumable(
     ex: impl PgExecutor<'_>,
-    epoch: i64,
+    epoch: EpochNo,
     holder: &str,
     lease_ttl_secs: i64,
     limit: i64,
@@ -522,7 +522,7 @@ pub async fn adopt_resumable(
     Ok(sqlx::query_file_as!(
         ReloadRow,
         "sql/postgres/queries/adopt_resumable.sql",
-        epoch,
+        epoch.0,
         holder,
         lease_ttl_secs as f64,
         limit,
@@ -541,9 +541,9 @@ pub async fn adopt_resumable(
 /// Returns [`ControlError::Connect`] if expired exporters cannot be queried or decoded.
 pub async fn stuck_exporting(
     ex: impl PgExecutor<'_>,
-    epoch: i64,
+    epoch: EpochNo,
 ) -> Result<Vec<(i64, Option<String>)>, ControlError> {
-    let rows = sqlx::query_file!("sql/postgres/queries/stuck_exporting.sql", epoch,)
+    let rows = sqlx::query_file!("sql/postgres/queries/stuck_exporting.sql", epoch.0,)
         .fetch_all(ex)
         .await?;
     Ok(rows
@@ -564,13 +564,15 @@ pub async fn stuck_exporting(
 /// Returns [`ControlError::Connect`] if active rebuild rows cannot be queried or decoded.
 pub async fn active_rebuilds(
     ex: impl PgExecutor<'_>,
-    epoch: i64,
+    epoch: EpochNo,
 ) -> Result<Vec<ReloadRow>, ControlError> {
-    Ok(
-        sqlx::query_file_as!(ReloadRow, "sql/postgres/queries/active_rebuilds.sql", epoch,)
-            .fetch_all(ex)
-            .await?,
+    Ok(sqlx::query_file_as!(
+        ReloadRow,
+        "sql/postgres/queries/active_rebuilds.sql",
+        epoch.0,
     )
+    .fetch_all(ex)
+    .await?)
 }
 
 /// Read one reload attempt, if it exists.

@@ -10,7 +10,7 @@
 //! `integration` feature (needs the PR 0.6 control Postgres).
 #![cfg(feature = "integration")]
 
-use common::Lsn;
+use common::{EpochNo, Lsn};
 use control::NewManifestFile;
 use control::{claim_ready, connect, delete_claimed, insert_ready, mark_failed, run_migrations};
 use sqlx::postgres::PgPool;
@@ -29,7 +29,7 @@ async fn pool() -> PgPool {
     pool
 }
 
-fn file(epoch: i64, table: &str, lsn_end: &str) -> NewManifestFile {
+fn file(epoch: EpochNo, table: &str, lsn_end: &str) -> NewManifestFile {
     let lsn: Lsn = lsn_end.parse().unwrap();
     NewManifestFile {
         epoch,
@@ -49,7 +49,7 @@ fn file(epoch: i64, table: &str, lsn_end: &str) -> NewManifestFile {
 async fn claim_orders_by_lsn_end_then_id() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let epoch = 900_001;
+    let epoch = EpochNo(900_001);
 
     // Insert with lsn_ends out of order, plus two files that SHARE one lsn_end (0/20).
     let a = insert_ready(&mut *tx, &file(epoch, "t", "0/30"))
@@ -84,7 +84,7 @@ async fn claim_orders_by_lsn_end_then_id() {
 async fn claim_does_not_skip_equal_lsn_end_snapshot_files() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let epoch = 900_002;
+    let epoch = EpochNo(900_002);
 
     // Many snapshot files sharing one lsn_end (the exported snapshot's consistent_point).
     let mut ids = Vec::new();
@@ -110,7 +110,7 @@ async fn claim_does_not_skip_equal_lsn_end_snapshot_files() {
 async fn delete_claimed_retires_exactly_the_given_ids() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let epoch = 900_003;
+    let epoch = EpochNo(900_003);
 
     let id1 = insert_ready(&mut *tx, &file(epoch, "d", "0/10"))
         .await
@@ -140,7 +140,7 @@ async fn delete_claimed_retires_exactly_the_given_ids() {
 async fn mark_failed_removes_row_from_ready_claims() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let epoch = 900_004;
+    let epoch = EpochNo(900_004);
 
     let good = insert_ready(&mut *tx, &file(epoch, "f", "0/10"))
         .await

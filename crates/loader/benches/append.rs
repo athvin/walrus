@@ -13,7 +13,8 @@
 //! Run: `cargo bench -p loader --bench append` (or `just bench`).
 
 use common::{
-    Kind, Lsn, Op, PgColumn, PgRelation, ReplicaIdentity, SinkMeta, TupleValue, UtcTimestamp,
+    EpochNo, Kind, Lsn, Op, PgColumn, PgRelation, ReplicaIdentity, SinkMeta, TupleValue,
+    UtcTimestamp,
 };
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use loader::duck::TableDb;
@@ -84,7 +85,7 @@ fn meta(i: usize) -> SinkMeta {
         commit_lsn: Lsn::new(i as u64 + 1),
         commit_ts: UtcTimestamp::parse_rfc3339("2026-07-04T12:00:00Z").unwrap(),
         xid: 1,
-        epoch: 7,
+        epoch: EpochNo(7),
         batch_id: "3f2a0000-0000-0000-0000-000000000001".to_string(),
         schema_version: 1,
         source_schema: "public".to_string(),

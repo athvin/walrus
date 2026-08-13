@@ -13,7 +13,7 @@
 //!
 //!   cargo test -p loader --test reload_resync -- --ignored --test-threads=1
 
-use common::{Lsn, PgColumn, PgRelation, ReplicaIdentity};
+use common::{EpochNo, Lsn, PgColumn, PgRelation, ReplicaIdentity};
 use control::reload::{self, ReloadFlavor};
 use loader::duck::{S3Access, TableDb};
 use loader::health::LoaderState;
@@ -62,7 +62,7 @@ fn tmpdir(name: &str) -> std::path::PathBuf {
     d
 }
 
-fn write_rows(epoch: i64, name: &str, rows: &[(i32, &str, &str, &str, &str)]) -> String {
+fn write_rows(epoch: EpochNo, name: &str, rows: &[(i32, &str, &str, &str, &str)]) -> String {
     let w = duckdb::Connection::open_in_memory().unwrap();
     let a = s3();
     w.execute_batch(&format!(
@@ -89,7 +89,7 @@ fn write_rows(epoch: i64, name: &str, rows: &[(i32, &str, &str, &str, &str)]) ->
 
 async fn seed_file(
     pool: &sqlx::PgPool,
-    epoch: i64,
+    epoch: EpochNo,
     uri: &str,
     kind: &str,
     lsn_end: &str,
@@ -115,7 +115,7 @@ async fn seed_file(
     .0
 }
 
-async fn setup(epoch: i64) -> (TableCtx, std::path::PathBuf) {
+async fn setup(epoch: EpochNo) -> (TableCtx, std::path::PathBuf) {
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     for tbl in [
@@ -167,7 +167,7 @@ async fn setup(epoch: i64) -> (TableCtx, std::path::PathBuf) {
 }
 
 /// Walk a `resync` reload through the real transitions to `export_complete` at `first_lsn = l1`.
-async fn drained_resync(pool: &sqlx::PgPool, epoch: i64, l1: &str, h: &str) -> i64 {
+async fn drained_resync(pool: &sqlx::PgPool, epoch: EpochNo, l1: &str, h: &str) -> i64 {
     let id = reload::request(pool, epoch, "public", "orders", ReloadFlavor::Resync)
         .await
         .unwrap();
@@ -216,7 +216,7 @@ fn raw_has(ctx: &TableCtx, id: i32) -> bool {
 }
 
 /// Establish a live mirror {1,2,3} via a stream file at 0/50, then update id 2 nowhere yet.
-async fn seed_live_mirror(ctx: &TableCtx, epoch: i64) {
+async fn seed_live_mirror(ctx: &TableCtx, epoch: EpochNo) {
     let live = write_rows(
         epoch,
         "live",
@@ -236,7 +236,7 @@ async fn seed_live_mirror(ctx: &TableCtx, epoch: i64) {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn resync_repairs_drift_but_phantoms_survive() {
     let _g = LOCK.lock().await;
-    let epoch = 660_001;
+    let epoch = EpochNo(660_001);
     let (ctx, dir) = setup(epoch).await;
     seed_live_mirror(&ctx, epoch).await;
 
@@ -309,7 +309,7 @@ async fn resync_repairs_drift_but_phantoms_survive() {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn resync_never_pauses_the_table() {
     let _g = LOCK.lock().await;
-    let epoch = 660_002;
+    let epoch = EpochNo(660_002);
     let (ctx, dir) = setup(epoch).await;
     seed_live_mirror(&ctx, epoch).await;
 
@@ -357,7 +357,7 @@ async fn resync_never_pauses_the_table() {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn resync_chunks_flow_through_raw() {
     let _g = LOCK.lock().await;
-    let epoch = 660_003;
+    let epoch = EpochNo(660_003);
     let (ctx, dir) = setup(epoch).await;
     seed_live_mirror(&ctx, epoch).await;
 
@@ -392,7 +392,7 @@ async fn resync_chunks_flow_through_raw() {
 #[ignore = "requires docker compose up --wait (control PG)"]
 async fn resync_ddl_restart_preserves_the_resync_flavor() {
     let _g = LOCK.lock().await;
-    let epoch = 660_004;
+    let epoch = EpochNo(660_004);
     let (ctx, dir) = setup(epoch).await;
 
     // A mid-resync DDL restart (PR 6.8) reissues the attempt — the successor must stay `resync`

@@ -26,7 +26,7 @@ fn meta() -> SinkMeta {
         commit_lsn: "0/20".parse().unwrap(),
         commit_ts: UtcTimestamp::parse_rfc3339("2026-07-04T12:00:00Z").unwrap(),
         xid: 1,
-        epoch: 7,
+        epoch: common::EpochNo(7),
         batch_id: "b1".to_string(),
         schema_version: 1,
         source_schema: "public".to_string(),

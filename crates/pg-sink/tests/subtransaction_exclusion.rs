@@ -13,7 +13,7 @@
 //!
 //!   cargo test -p pg-sink --test subtransaction_exclusion -- --ignored
 
-use common::Lsn;
+use common::{EpochNo, Lsn};
 use pg_sink::batch::{BatchTriggers, SystemClock};
 use pg_sink::consume::on_frame;
 use pg_sink::pgoutput::{Message, StreamCtx};
@@ -76,7 +76,7 @@ async fn drop_slot(admin: &tokio_postgres::Client, slot: &str) {
 async fn savepoint_rollback_ready_file_has_exactly_6000_rows() {
     let _g = SOURCE_LOCK.lock().await;
     let slot = "walrus_subtxn";
-    let epoch = 2_310_001;
+    let epoch = EpochNo(2_310_001);
     let admin = source().await;
     admin.batch_execute(SOURCE_MIGRATION).await.unwrap();
     admin

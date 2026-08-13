@@ -4,6 +4,7 @@
 //! let the lease lapse and admit a phantom second writer.
 
 use crate::error::LoaderError;
+use common::EpochNo;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -17,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 /// [`LoaderError::LeaseContended`] when another live pod owns the table.
 pub async fn acquire(
     pool: &sqlx::PgPool,
-    epoch: i64,
+    epoch: EpochNo,
     schema: &str,
     table: &str,
     self_pod: &str,
@@ -37,7 +38,7 @@ pub async fn acquire(
 #[must_use]
 pub fn spawn_renewer(
     pool: sqlx::PgPool,
-    epoch: i64,
+    epoch: EpochNo,
     keys: Vec<(String, String)>,
     self_pod: String,
     ttl: Duration,
@@ -65,7 +66,7 @@ pub fn spawn_renewer(
 /// Release every owned table's lease on graceful shutdown (best-effort).
 pub async fn release_all(
     pool: &sqlx::PgPool,
-    epoch: i64,
+    epoch: EpochNo,
     keys: &[(String, String)],
     self_pod: &str,
 ) {

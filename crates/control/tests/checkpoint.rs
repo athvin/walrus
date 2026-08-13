@@ -9,7 +9,7 @@
 //! and idempotent across runs. Gated behind the `integration` feature (needs the PR 0.6 control PG).
 #![cfg(feature = "integration")]
 
-use common::Lsn;
+use common::{EpochNo, Lsn};
 use control::{
     advance_raw_appended, advance_transformed, connect, ensure_checkpoint, insert_epoch,
     read_checkpoint, read_current_epoch, run_migrations, ControlError, ReplicationState,
@@ -38,7 +38,7 @@ fn lsn(s: &str) -> Lsn {
 async fn ensure_then_advance_raw_then_transformed() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let (e, s, t) = (700_001, "public", "c1");
+    let (e, s, t) = (EpochNo(700_001), "public", "c1");
 
     // Absent before ensure.
     assert!(read_checkpoint(&mut *tx, e, s, t).await.unwrap().is_none());
@@ -67,7 +67,7 @@ async fn ensure_then_advance_raw_then_transformed() {
 async fn check_rejects_transformed_ahead_of_raw() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let (e, s, t) = (700_002, "public", "c2");
+    let (e, s, t) = (EpochNo(700_002), "public", "c2");
 
     ensure_checkpoint(&mut *tx, e, s, t).await.unwrap();
     advance_raw_appended(&mut *tx, e, s, t, lsn("0/100"))
@@ -91,7 +91,7 @@ async fn check_rejects_transformed_ahead_of_raw() {
 async fn advances_are_idempotent_and_monotonic() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let (e, s, t) = (700_003, "public", "c3");
+    let (e, s, t) = (EpochNo(700_003), "public", "c3");
 
     ensure_checkpoint(&mut *tx, e, s, t).await.unwrap();
     advance_raw_appended(&mut *tx, e, s, t, lsn("0/100"))
@@ -125,7 +125,7 @@ async fn read_current_epoch_returns_highest_generation() {
     insert_epoch(
         &mut *tx,
         &ReplicationState {
-            epoch: 700_010,
+            epoch: EpochNo(700_010),
             slot_name: "walrus_slot".to_string(),
             created_lsn: lsn("0/10"),
             status: "bootstrapping".to_string(),
@@ -136,7 +136,7 @@ async fn read_current_epoch_returns_highest_generation() {
     insert_epoch(
         &mut *tx,
         &ReplicationState {
-            epoch: 700_011,
+            epoch: EpochNo(700_011),
             slot_name: "walrus_slot".to_string(),
             created_lsn: lsn("0/20"),
             status: "streaming".to_string(),
@@ -147,7 +147,8 @@ async fn read_current_epoch_returns_highest_generation() {
 
     let current = read_current_epoch(&mut *tx).await.unwrap().unwrap();
     assert_eq!(
-        current.epoch, 700_011,
+        current.epoch,
+        EpochNo(700_011),
         "highest epoch is the current generation"
     );
     assert_eq!(current.status, "streaming");

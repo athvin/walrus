@@ -26,6 +26,7 @@ use std::time::Duration;
 use tokio_postgres::NoTls;
 use tokio_util::sync::CancellationToken;
 
+use common::EpochNo;
 use control::reload::{self, ReloadFlavor, ReloadStatus};
 
 static SOURCE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -51,7 +52,7 @@ async fn admin() -> tokio_postgres::Client {
     c
 }
 
-fn minio(epoch: i64) -> ParquetSink {
+fn minio(epoch: EpochNo) -> ParquetSink {
     ParquetSink::new(
         Arc::new(
             object_store::aws::AmazonS3Builder::new()
@@ -79,7 +80,7 @@ async fn drop_slot(admin: &tokio_postgres::Client, slot: &str) {
         .await;
 }
 
-async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: i64, n: i64) {
+async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: EpochNo, n: i64) {
     admin
         .batch_execute(&format!(
             "DROP TABLE IF EXISTS public.{TABLE};
@@ -106,7 +107,7 @@ async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: i64, n
     .unwrap();
 }
 
-async fn scrub(pool: &sqlx::PgPool, epoch: i64) {
+async fn scrub(pool: &sqlx::PgPool, epoch: EpochNo) {
     for tbl in ["file_manifest", "table_reload", "schema_registry"] {
         sqlx::query(&format!("DELETE FROM walrus.{tbl} WHERE epoch = $1"))
             .bind(epoch)
@@ -164,9 +165,9 @@ fn spawn_echo_resolver(
 async fn await_resolver_ready(
     admin: &tokio_postgres::Client,
     waiters: &Arc<WatermarkWaiters>,
-    epoch: i64,
+    epoch: EpochNo,
 ) {
-    let sentinel = -epoch;
+    let sentinel = -epoch.0;
     let mut ready = false;
     for _ in 0..20 {
         let rx = waiters.subscribe(sentinel, 1);
@@ -195,7 +196,7 @@ async fn await_resolver_ready(
         .unwrap();
 }
 
-fn export_cfg(epoch: i64, chunk_rows: u64, echo_timeout: Duration) -> ChunkExportConfig {
+fn export_cfg(epoch: EpochNo, chunk_rows: u64, echo_timeout: Duration) -> ChunkExportConfig {
     ChunkExportConfig {
         chunk_rows,
         echo_timeout,
@@ -204,7 +205,7 @@ fn export_cfg(epoch: i64, chunk_rows: u64, echo_timeout: Duration) -> ChunkExpor
     }
 }
 
-async fn request_and_claim(pool: &sqlx::PgPool, epoch: i64) -> control::ReloadRow {
+async fn request_and_claim(pool: &sqlx::PgPool, epoch: EpochNo) -> control::ReloadRow {
     reload::request(pool, epoch, "public", TABLE, ReloadFlavor::Reload)
         .await
         .unwrap();
@@ -239,7 +240,7 @@ fn metric_sum(name: &str) -> f64 {
 async fn chunk_export_moves_chunk_row_and_echo_metrics() {
     let _g = SOURCE_LOCK.lock().await;
     common::metrics::init();
-    let epoch = 700_001;
+    let epoch = EpochNo(700_001);
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
@@ -306,7 +307,7 @@ async fn chunk_export_moves_chunk_row_and_echo_metrics() {
 async fn echo_timeout_moves_the_failed_metric() {
     let _g = SOURCE_LOCK.lock().await;
     common::metrics::init();
-    let epoch = 700_002;
+    let epoch = EpochNo(700_002);
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
@@ -358,7 +359,7 @@ async fn echo_timeout_moves_the_failed_metric() {
 async fn active_gauge_rises_and_returns_to_zero() {
     let _g = SOURCE_LOCK.lock().await;
     common::metrics::init();
-    let epoch = 700_003;
+    let epoch = EpochNo(700_003);
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();

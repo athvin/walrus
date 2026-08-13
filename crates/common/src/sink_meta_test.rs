@@ -41,7 +41,7 @@ fn meta_round_trips_exact_keys() {
     let meta: SinkMeta = serde_json::from_str(DOCS_EXAMPLE).unwrap();
     assert_eq!(meta.op, Op::Update);
     assert_eq!(meta.kind, Kind::Stream);
-    assert_eq!(meta.epoch, 7);
+    assert_eq!(meta.epoch, EpochNo(7));
     assert_eq!(meta.xid, 918273);
     assert_eq!(meta.unchanged_toast.as_ref(), ["blob_col"]);
 

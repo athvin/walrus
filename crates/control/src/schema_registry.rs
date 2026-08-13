@@ -6,14 +6,14 @@
 //! file's `schema_version`. A `DELETE` here would make old-version Parquet files un-reconstructable.
 
 use crate::ControlError;
-use common::TypeDescriptor;
+use common::{EpochNo, TypeDescriptor};
 use sqlx::types::Json;
 use sqlx::{PgExecutor, Row};
 
 /// One `schema_version` of a table's type mapping.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistryRow {
-    pub epoch: i64,
+    pub epoch: EpochNo,
     pub source_schema: String,
     pub source_table: String,
     pub schema_version: i64,
@@ -37,7 +37,7 @@ pub async fn upsert_registry(
 ) -> Result<(), ControlError> {
     sqlx::query_file!(
         "sql/postgres/queries/upsert_registry.sql",
-        row.epoch,
+        row.epoch.0,
         row.source_schema,
         row.source_table,
         row.schema_version,
@@ -56,14 +56,14 @@ pub async fn upsert_registry(
 /// Returns [`ControlError::Connect`] if the registry row cannot be queried or decoded.
 pub async fn read_registry(
     ex: impl PgExecutor<'_>,
-    epoch: i64,
+    epoch: EpochNo,
     schema: &str,
     table: &str,
     version: i64,
 ) -> Result<Option<RegistryRow>, ControlError> {
     let rec = sqlx::query_file!(
         "sql/postgres/queries/read_registry.sql",
-        epoch,
+        epoch.0,
         schema,
         table,
         version,
@@ -72,7 +72,7 @@ pub async fn read_registry(
     .await?;
 
     Ok(rec.map(|r| RegistryRow {
-        epoch: r.epoch,
+        epoch: r.epoch.into(),
         source_schema: r.source_schema,
         source_table: r.source_table,
         schema_version: r.schema_version,
@@ -88,13 +88,13 @@ pub async fn read_registry(
 /// Returns [`ControlError::Connect`] if the version query cannot reach or read control Postgres.
 pub async fn read_latest_version(
     ex: impl PgExecutor<'_>,
-    epoch: i64,
+    epoch: EpochNo,
     schema: &str,
     table: &str,
 ) -> Result<Option<i64>, ControlError> {
     let rec = sqlx::query_file!(
         "sql/postgres/queries/read_latest_version.sql",
-        epoch,
+        epoch.0,
         schema,
         table,
     )
@@ -113,7 +113,7 @@ pub async fn read_latest_version(
 /// decoded from control Postgres.
 pub async fn read_all_latest_registry(
     ex: impl PgExecutor<'_>,
-    epoch: i64,
+    epoch: EpochNo,
 ) -> Result<Vec<RegistryRow>, ControlError> {
     let rows = sqlx::query(
         r#"
@@ -139,7 +139,7 @@ pub async fn read_all_latest_registry(
     rows.into_iter()
         .map(|row| {
             Ok(RegistryRow {
-                epoch: row.try_get("epoch")?,
+                epoch: row.try_get::<i64, _>("epoch")?.into(),
                 source_schema: row.try_get("source_schema")?,
                 source_table: row.try_get("source_table")?,
                 schema_version: row.try_get("schema_version")?,

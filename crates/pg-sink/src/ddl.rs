@@ -16,7 +16,7 @@
 //! (globals fire nothing; `TRUNCATE` is a native pgoutput message) — the Relation-message drift backstop
 //! (TODO: full handling is the loader's, PR 3.8/3.9) covers the rest.
 
-use common::{Lsn, PgRelation, TupleValue};
+use common::{EpochNo, Lsn, PgRelation, TupleValue};
 use std::collections::HashMap;
 
 /// A decoded `walrus.ddl_audit` INSERT — the sink's only signal that the schema changed.
@@ -80,13 +80,13 @@ impl DdlEvent {
 /// current **structural** `schema_version` (starts at 1; every structural DDL bumps it by one).
 #[derive(Debug)]
 pub struct DdlConsumer {
-    epoch: i64,
+    epoch: EpochNo,
     versions: HashMap<(String, String), i64>,
 }
 
 impl DdlConsumer {
     #[must_use]
-    pub fn new(epoch: i64) -> Self {
+    pub fn new(epoch: EpochNo) -> Self {
         DdlConsumer {
             epoch,
             versions: HashMap::new(),

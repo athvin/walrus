@@ -75,7 +75,7 @@ fn write_v2_file(epoch: i64, uri_key: &str) -> String {
 }
 
 async fn transformed(h: &Harness, table: &str) -> Lsn {
-    control::read_checkpoint(h.control_pool(), h.epoch, "public", table)
+    control::read_checkpoint(h.control_pool(), h.epoch.into(), "public", table)
         .await
         .unwrap()
         .map(|c| c.transformed_lsn)
@@ -147,7 +147,7 @@ async fn quarantined_table_recovers_via_reload_without_stalling_others() {
     control::upsert_registry(
         &pool,
         &control::RegistryRow {
-            epoch,
+            epoch: epoch.into(),
             source_schema: "public".into(),
             source_table: "q_target".into(),
             schema_version: 2,
@@ -161,7 +161,7 @@ async fn quarantined_table_recovers_via_reload_without_stalling_others() {
     control::insert_ready(
         &pool,
         &control::NewManifestFile {
-            epoch,
+            epoch: epoch.into(),
             source_schema: "public".into(),
             source_table: "q_target".into(),
             s3_uri: uri,
@@ -196,7 +196,7 @@ async fn quarantined_table_recovers_via_reload_without_stalling_others() {
         .unwrap();
     let reload_id = control::reload::request(
         &pool,
-        epoch,
+        epoch.into(),
         "public",
         "q_target",
         control::reload::ReloadFlavor::Reload,

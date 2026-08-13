@@ -11,7 +11,7 @@
 //!
 //!   cargo test -p pg-sink --test max_inflight_bytes -- --ignored
 
-use common::Lsn;
+use common::{EpochNo, Lsn};
 use pg_sink::batch::{BatchTriggers, SystemClock};
 use pg_sink::checkpoint::DurabilityCheckpoint;
 use pg_sink::consume::on_frame;
@@ -75,7 +75,7 @@ async fn drop_slot(admin: &tokio_postgres::Client, slot: &str) {
 async fn large_txn_low_ceiling_spills_and_stays_bounded() {
     let _g = SOURCE_LOCK.lock().await;
     let slot = "walrus_inflight";
-    let epoch = 2_320_001;
+    let epoch = EpochNo(2_320_001);
     let admin = source().await;
     admin.batch_execute(SOURCE_MIGRATION).await.unwrap();
     admin

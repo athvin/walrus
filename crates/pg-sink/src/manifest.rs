@@ -12,6 +12,7 @@
 //! the loader's row-level `ON CONFLICT` (append idempotency) absorbs it.
 
 use crate::sink::WrittenObject;
+use common::EpochNo;
 
 /// Record a durable object as a `ready` work-queue row. **Call ONLY after the PUT is durable.** Returns
 /// the manifest `id`.
@@ -21,7 +22,7 @@ use crate::sink::WrittenObject;
 /// Returns [`ManifestError::Control`] if control Postgres cannot insert the ready manifest row.
 pub async fn record_ready(
     ex: impl sqlx::PgExecutor<'_>,
-    epoch: i64,
+    epoch: EpochNo,
     obj: &WrittenObject,
 ) -> Result<common::ManifestId, ManifestError> {
     record_ready_with_reload(ex, epoch, obj, None).await
@@ -36,7 +37,7 @@ pub async fn record_ready(
 /// be committed.
 pub async fn record_ready_with_reload(
     ex: impl sqlx::PgExecutor<'_>,
-    epoch: i64,
+    epoch: EpochNo,
     obj: &WrittenObject,
     reload_id: Option<i64>,
 ) -> Result<common::ManifestId, ManifestError> {
@@ -45,7 +46,7 @@ pub async fn record_ready_with_reload(
 
 /// `WrittenObject` → the `ready` row (`kind` from the object, `lsn_end` = commit LSN).
 fn to_ready_row(
-    epoch: i64,
+    epoch: EpochNo,
     obj: &WrittenObject,
     reload_id: Option<i64>,
 ) -> control::NewManifestFile {

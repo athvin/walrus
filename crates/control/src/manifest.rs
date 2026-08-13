@@ -9,7 +9,7 @@
 //! is a `DELETE`, not a status flip — the queue's frontier advances by removal.
 
 use crate::ControlError;
-use common::{Lsn, ManifestId};
+use common::{EpochNo, Lsn, ManifestId};
 use sqlx::PgExecutor;
 
 /// The kind of a `file_manifest` row — the canonical enum for the `kind` text column, shared by the
@@ -94,7 +94,7 @@ impl std::str::FromStr for ManifestStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestRow {
     pub id: ManifestId,
-    pub epoch: i64,
+    pub epoch: EpochNo,
     pub source_schema: String,
     pub source_table: String,
     pub s3_uri: String,
@@ -111,7 +111,7 @@ pub struct ManifestRow {
 /// What the sink inserts after its Parquet is durable in S3 (PR 2.25).
 #[derive(Debug, Clone)]
 pub struct NewManifestFile {
-    pub epoch: i64,
+    pub epoch: EpochNo,
     pub source_schema: String,
     pub source_table: String,
     pub s3_uri: String,
@@ -136,7 +136,7 @@ pub async fn insert_ready(
 ) -> Result<ManifestId, ControlError> {
     let rec = sqlx::query_file!(
         "sql/postgres/queries/insert_ready.sql",
-        f.epoch,
+        f.epoch.0,
         f.source_schema,
         f.source_table,
         f.s3_uri,
@@ -174,7 +174,7 @@ pub async fn insert_ready(
 /// a stored manifest kind or status is outside its checked enum set.
 pub async fn claim_ready(
     executor: impl PgExecutor<'_>,
-    epoch: i64,
+    epoch: EpochNo,
     source_schema: &str,
     source_table: &str,
     limit: i64,
@@ -185,7 +185,7 @@ pub async fn claim_ready(
     // offline cache stays valid without a regenerate.
     let rows = sqlx::query_file!(
         "sql/postgres/queries/claim_ready.sql",
-        epoch,
+        epoch.0,
         source_schema,
         source_table,
         limit,
@@ -196,7 +196,7 @@ pub async fn claim_ready(
         .map(|r| {
             Ok(ManifestRow {
                 id: ManifestId(r.id),
-                epoch: r.epoch,
+                epoch: r.epoch.into(),
                 source_schema: r.source_schema,
                 source_table: r.source_table,
                 s3_uri: r.s3_uri,
@@ -221,13 +221,13 @@ pub async fn claim_ready(
 /// Returns [`ControlError::Connect`] if the backlog query cannot reach or read control Postgres.
 pub async fn max_ready_lsn_end(
     executor: impl PgExecutor<'_>,
-    epoch: i64,
+    epoch: EpochNo,
     source_schema: &str,
     source_table: &str,
 ) -> Result<Option<Lsn>, ControlError> {
     let row = sqlx::query_file!(
         "sql/postgres/queries/max_ready_lsn_end.sql",
-        epoch,
+        epoch.0,
         source_schema,
         source_table,
     )
@@ -265,14 +265,14 @@ pub async fn delete_claimed(
 /// Returns [`ControlError::Connect`] if the superseded-row delete cannot be executed.
 pub async fn delete_superseded(
     executor: impl PgExecutor<'_>,
-    epoch: i64,
+    epoch: EpochNo,
     source_schema: &str,
     source_table: &str,
     first_lsn: Lsn,
 ) -> Result<u64, ControlError> {
     let done = sqlx::query_file!(
         "sql/postgres/queries/delete_superseded.sql",
-        epoch,
+        epoch.0,
         source_schema,
         source_table,
         first_lsn as Lsn,

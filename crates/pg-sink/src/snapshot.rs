@@ -24,7 +24,8 @@ use crate::replication::ReplicationStream;
 use crate::sink::{FileKind, ParquetSink};
 use anyhow::Context;
 use common::{
-    Kind, Lsn, Op, PgColumn, PgRelation, ReplicaIdentity, SinkMeta, TupleValue, UtcTimestamp,
+    EpochNo, Kind, Lsn, Op, PgColumn, PgRelation, ReplicaIdentity, SinkMeta, TupleValue,
+    UtcTimestamp,
 };
 use std::sync::Arc;
 use tokio_postgres::NoTls;
@@ -121,7 +122,7 @@ pub struct Backfill {
     client: tokio_postgres::Client,
     triggers: BatchTriggers,
     clock: Arc<dyn Clock>,
-    epoch: i64,
+    epoch: EpochNo,
     instance: String,
 }
 
@@ -133,7 +134,7 @@ impl Backfill {
     /// Returns [`anyhow::Error`] if the source connection or optional statement-timeout setup fails.
     pub async fn connect(
         dsn: &str,
-        epoch: i64,
+        epoch: EpochNo,
         instance: String,
         triggers: BatchTriggers,
         statement_timeout: std::time::Duration,
@@ -263,7 +264,7 @@ impl Backfill {
 async fn flush_snapshot(
     sink: &ParquetSink,
     pool: &sqlx::PgPool,
-    epoch: i64,
+    epoch: EpochNo,
     batcher: &mut TableBatcher,
 ) -> anyhow::Result<()> {
     let sealed = batcher.seal().context("seal snapshot batch")?;

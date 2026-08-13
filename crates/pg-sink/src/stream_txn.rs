@@ -28,7 +28,7 @@ use crate::pgoutput::Message;
 use crate::relcache::RelationCache;
 use crate::sink::{FileKind, ParquetSink, WrittenObject};
 use anyhow::Context;
-use common::{Kind, Lsn, Op, SinkMeta, TupleValue, UtcTimestamp};
+use common::{EpochNo, Kind, Lsn, Op, SinkMeta, TupleValue, UtcTimestamp};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -106,7 +106,7 @@ pub struct StreamDemux {
     current_top: Option<u32>,
     triggers: BatchTriggers,
     clock: Arc<dyn Clock>,
-    epoch: i64,
+    epoch: EpochNo,
     sink_instance: String,
     meter: InflightMeter,
     spill_count: u64,
@@ -116,7 +116,7 @@ impl StreamDemux {
     pub fn new(
         triggers: BatchTriggers,
         clock: Arc<dyn Clock>,
-        epoch: i64,
+        epoch: EpochNo,
         sink_instance: String,
         max_inflight_bytes: u64,
     ) -> Self {

@@ -15,7 +15,7 @@
 //!
 //!   cargo test -p pg-sink --test reload_echo -- --ignored
 
-use common::Lsn;
+use common::{EpochNo, Lsn};
 use pg_sink::batch::{BatchTriggers, SealedBatch, SystemClock};
 use pg_sink::checkpoint::DurabilityCheckpoint;
 use pg_sink::consume::{on_frame, on_relation, BatchRouter};
@@ -67,7 +67,7 @@ async fn signal_insert_resolves_waiter_and_never_reaches_parquet() {
     let _g = SOURCE_LOCK.lock().await;
     let slot = "walrus_reload_echo";
     let reload_id = 990_042i64;
-    let epoch = 990_042i64;
+    let epoch = EpochNo(990_042);
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();

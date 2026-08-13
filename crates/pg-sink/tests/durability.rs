@@ -10,7 +10,7 @@
 //!
 //!   cargo test -p pg-sink --test durability -- --ignored
 
-use common::Lsn;
+use common::{EpochNo, Lsn};
 use pg_sink::batch::{BatchTriggers, SystemClock};
 use pg_sink::checkpoint::DurabilityCheckpoint;
 use pg_sink::consume::{flush_batch, on_frame, BatchRouter};
@@ -104,7 +104,7 @@ async fn slot_advances_only_after_s3_and_manifest_durable() {
         ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
             .await
             .unwrap();
-    let epoch = 2_260_001;
+    let epoch = EpochNo(2_260_001);
     let sink = ParquetSink::new(minio(), "walrus".to_string(), epoch);
     let pool = control_pool().await;
     let mut tx = pool.begin().await.unwrap();
@@ -197,7 +197,7 @@ async fn crash_between_put_and_standby_restreams_without_loss() {
     drop_slot(&admin, slot).await;
     let resume = verify_or_create_slot(&admin, slot).await.unwrap();
 
-    let epoch = 2_260_002;
+    let epoch = EpochNo(2_260_002);
     let sink = ParquetSink::new(minio(), "walrus".to_string(), epoch);
     let pool = control_pool().await;
     let mut cache = RelationCache::default();

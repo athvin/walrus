@@ -11,7 +11,7 @@
 //! timestamp silently breaks the loader. Field names match the documented keys 1:1; `Op`/`Kind`
 //! serialize to the documented scalars; and every datetime is UTC RFC-3339 with a `Z` suffix.
 
-use crate::{Error, Lsn, Result};
+use crate::{EpochNo, Error, Lsn, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// The change operation. Serializes to a single lowercase char: `i` | `u` | `d` | `t`.
@@ -131,7 +131,7 @@ pub struct SinkMeta {
     /// Source transaction id.
     pub xid: u32,
     /// Generation counter that namespaces all control-plane state (Postgres `bigint`).
-    pub epoch: i64,
+    pub epoch: EpochNo,
     /// UUID of the Parquet batch this row belongs to.
     pub batch_id: String,
     /// Structural schema version of the source relation (Postgres `bigint`).
@@ -171,7 +171,7 @@ const _: () = assert!(size_of::<SinkMeta>() <= SINK_META_MAX_BYTES);
 /// The batch-constant subset of [`SinkMeta`] — the same for every row of one sealed file.
 #[derive(Serialize)]
 struct MetaConst<'a> {
-    epoch: i64,
+    epoch: EpochNo,
     batch_id: &'a str,
     schema_version: i64,
     source_schema: &'a str,

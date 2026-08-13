@@ -6,6 +6,7 @@
 //! `anyhow::Result<_>`; the application boundary recovers each typed failure's distinct exit code.
 
 use anyhow::Context;
+use common::EpochNo;
 use pg_sink::config::SinkConfig;
 use pg_sink::replication::ReplicationStream;
 use pg_sink::{bootstrap, consume, health, shutdown};
@@ -100,7 +101,7 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
         start_lsn,
         sink,
     } = establish_stream(&cfg, &ctx, &mut cache, triggers, SCHEMA_VERSION).await?;
-    tracing::info!(slot = %cfg.slot_name, start_lsn = %start_lsn, epoch, "streaming logical replication");
+    tracing::info!(slot = %cfg.slot_name, start_lsn = %start_lsn, epoch = %epoch, "streaming logical replication");
 
     let mut router = consume::BatchRouter::new(
         triggers,
@@ -192,7 +193,7 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
 /// The established streaming state after the bootstrap decision.
 struct Bootstrapped {
     stream: ReplicationStream,
-    epoch: i64,
+    epoch: EpochNo,
     start_lsn: common::Lsn,
     sink: pg_sink::sink::ParquetSink,
 }
@@ -236,7 +237,7 @@ async fn establish_stream(
                 .context("read schema_registry for hydration")?;
             cache.hydrate(rows).context("hydrate relation cache")?;
             tracing::info!(
-                epoch,
+                epoch = %epoch,
                 cached_relations = cache.len(),
                 "relation cache hydrated (resume)"
             );
@@ -283,14 +284,14 @@ async fn establish_stream(
     .context("open new epoch")?;
     match &prior {
         Some(p) => tracing::error!(
-            old_epoch = p.epoch,
-            new_epoch = epoch,
+            old_epoch = %p.epoch,
+            new_epoch = %epoch,
             slot = %cfg.slot_name,
             slot_status = ?status,
             "TOTAL-RESTART: the replication slot was lost/absent — bumping the epoch and re-snapshotting \
              ALL tables under the new generation; old-epoch S3 is left to its lifecycle TTL"
         ),
-        None => tracing::info!(epoch, "first bootstrap: created slot + established epoch"),
+        None => tracing::info!(epoch = %epoch, "first bootstrap: created slot + established epoch"),
     }
     let sink = make_sink(epoch);
 
@@ -323,7 +324,7 @@ async fn establish_stream(
             .with_context(|| format!("backfill {schema}.{table}"))?;
     }
     tracing::info!(
-        epoch,
+        epoch = %epoch,
         tables = tables.len(),
         rows = total,
         consistent_point = %snapshot.consistent_point,
@@ -349,7 +350,7 @@ async fn current_or_new_epoch(
     pool: &sqlx::PgPool,
     slot_name: &str,
     created_lsn: common::Lsn,
-) -> anyhow::Result<i64> {
+) -> anyhow::Result<EpochNo> {
     if let Some(state) = control::read_current_epoch(pool)
         .await
         .context("read current epoch")?
@@ -357,7 +358,7 @@ async fn current_or_new_epoch(
         return Ok(state.epoch);
     }
     let state = control::ReplicationState {
-        epoch: 1,
+        epoch: 1_i64.into(),
         slot_name: slot_name.to_string(),
         created_lsn,
         status: "streaming".to_string(),
@@ -366,5 +367,5 @@ async fn current_or_new_epoch(
         .await
         .context("insert first epoch")?;
     tracing::info!(epoch = 1, "established first epoch");
-    Ok(1)
+    Ok(EpochNo(1))
 }
