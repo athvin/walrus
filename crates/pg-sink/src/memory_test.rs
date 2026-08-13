@@ -52,7 +52,7 @@ fn shed_prefers_committed_then_spill_then_pause() {
 
 #[test]
 fn hysteresis_pauses_at_activate_resumes_at_lower_ratio() {
-    let mut bp = Backpressure::new(0.85, 0.75);
+    let mut bp = Backpressure::new(HysteresisBand::DEFAULT);
     let c = 1000;
     assert!(!bp.tick(800, c), "0.80 < activate 0.85 → not paused");
     assert!(bp.tick(860, c), "0.86 >= activate → paused");

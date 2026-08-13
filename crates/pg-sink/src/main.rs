@@ -87,8 +87,8 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
     const SCHEMA_VERSION: i64 = 1;
     let triggers = pg_sink::batch::BatchTriggers {
         max_fill: cfg.max_fill,
-        max_rows: cfg.max_rows,
-        max_bytes: cfg.max_bytes,
+        max_rows: cfg.max_rows.get(),
+        max_bytes: cfg.max_bytes.get(),
     };
     let mut cache = pg_sink::relcache::RelationCache::default();
 
@@ -116,7 +116,7 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
         std::sync::Arc::new(pg_sink::batch::SystemClock),
         epoch,
         cfg.instance.clone(),
-        cfg.max_inflight_bytes,
+        cfg.max_inflight_bytes.get(),
     );
 
     // The idle heartbeat rides a SEPARATE ordinary SQL connection (distinct from replication); its
@@ -146,12 +146,13 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
         sink.clone(),
         pg_sink::reload::ReloadControllerConfig {
             poll_interval: cfg.heartbeat_idle_after,
-            max_concurrent_reloads: cfg.max_concurrent_reloads as usize,
+            max_concurrent_reloads: usize::try_from(cfg.max_concurrent_reloads.get())
+                .context("max_concurrent_reloads does not fit usize")?,
             lease_ttl: cfg.reload_lease_ttl,
             instance: cfg.instance.clone(),
             publication_name: cfg.publication_name.clone(),
             epoch,
-            chunk_rows: cfg.reload_chunk_rows,
+            chunk_rows: cfg.reload_chunk_rows.get(),
             echo_timeout: cfg.reload_echo_timeout,
             reload_max_restarts: cfg.reload_max_restarts,
         },

@@ -6,14 +6,24 @@
 //! [`ConfigError`] at the edge and maps to [`common::ExitCode::Config`] in `main`, never a panic
 //! three modules later. Connectivity (control PG, S3) is a *separate, transient* bootstrap check.
 
+use crate::memory::{HysteresisBand, Ratio};
 use common::config::ObjectStoreConfig;
 use common::TelemetryConfig;
 use serde::Deserialize;
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::time::Duration;
 
 /// A cadence/deadline longer than an hour is almost certainly a misconfig, not an intent.
 const MAX_DURATION: Duration = Duration::from_secs(60 * 60);
+
+/// Construct a non-zero shipped default without using runtime-only unwrap/expect APIs.
+const fn nz(value: u64) -> NonZeroU64 {
+    match NonZeroU64::new(value) {
+        Some(value) => value,
+        None => NonZeroU64::MIN,
+    }
+}
 
 /// Fully-typed, bounds-validated sink configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -48,17 +58,17 @@ pub struct SinkConfig {
     #[serde(with = "humantime_serde")]
     pub backfill_statement_timeout: Duration,
     /// Row-count flush threshold.
-    pub max_rows: u64,
+    pub max_rows: NonZeroU64,
     /// Byte-size flush threshold.
-    pub max_bytes: u64,
+    pub max_bytes: NonZeroU64,
     /// Back-pressure ceiling on aggregate in-flight buffered bytes (§1.3) — process-wide, distinct from
     /// the per-batch `max_bytes`. Must sit **below** the pod memory limit so a graceful spill beats a
     /// cgroup OOM-kill; `logical_decoding_work_mem` does NOT bound this.
-    pub max_inflight_bytes: u64,
+    pub max_inflight_bytes: NonZeroU64,
     /// Pause-poll backstop **activate** ratio of `max_inflight_bytes` (high band).
-    pub backpressure_activate_ratio: f64,
+    pub backpressure_activate_ratio: Ratio,
     /// Pause-poll backstop **resume** ratio (low band) — must be `< activate` so intake doesn't flap.
-    pub backpressure_resume_ratio: f64,
+    pub backpressure_resume_ratio: Ratio,
     /// Bootstrap retry budget: transient deps are retried until this elapses, then terminal.
     #[serde(with = "humantime_serde")]
     pub startup_deadline: Duration,
@@ -66,7 +76,7 @@ pub struct SinkConfig {
     pub health_addr: SocketAddr,
     /// Concurrent single-table reload exports (PR 6.4 / reload H6). "Reload N tables" drains a
     /// queue this wide — a polite cap, never N simultaneous load spikes on the source. ≥ 1.
-    pub max_concurrent_reloads: u64,
+    pub max_concurrent_reloads: NonZeroU64,
     /// Reload lease TTL (PR 6.4 / reload H7): a live exporter renews at TTL/3, so a died-mid-export
     /// sink is detectable within one TTL. Bounds-checked so the renewal cadence fits inside it.
     #[serde(with = "humantime_serde")]
@@ -74,7 +84,7 @@ pub struct SinkConfig {
     /// Rows per reload chunk (PR 6.5 / reload H2): each chunk is one short PK-ordered SELECT — no
     /// hours-long transaction pinning xmin. Bounds each statement; `max_concurrent_reloads` bounds
     /// tables. ≥ 1.
-    pub reload_chunk_rows: u64,
+    pub reload_chunk_rows: NonZeroU64,
     /// How long a chunk waits for its watermark echo before the reload fails loudly (PR 6.5 /
     /// reload H11): an unpublished signal table never echoes — this timeout turns that silent
     /// failure into a `failed` row naming the fix.
@@ -109,16 +119,16 @@ impl Default for SinkConfig {
             heartbeat_roundtrip_deadline: Duration::from_secs(30),
             backfill_statement_timeout: Duration::ZERO, // disabled — never kill a big table's copy
 
-            max_rows: 100_000,
-            max_bytes: 128 * 1024 * 1024,
-            max_inflight_bytes: 512 * 1024 * 1024,
-            backpressure_activate_ratio: 0.85,
-            backpressure_resume_ratio: 0.75,
+            max_rows: nz(100_000),
+            max_bytes: nz(128 * 1024 * 1024),
+            max_inflight_bytes: nz(512 * 1024 * 1024),
+            backpressure_activate_ratio: HysteresisBand::DEFAULT.activate(),
+            backpressure_resume_ratio: HysteresisBand::DEFAULT.resume(),
             startup_deadline: Duration::from_secs(60),
             health_addr: SocketAddr::from(([0, 0, 0, 0], 8080)),
-            max_concurrent_reloads: 2,
+            max_concurrent_reloads: nz(2),
             reload_lease_ttl: Duration::from_secs(60),
-            reload_chunk_rows: 10_000,
+            reload_chunk_rows: nz(10_000),
             reload_echo_timeout: Duration::from_secs(30),
             reload_max_restarts: 3,
             manage_publication: false,
@@ -181,13 +191,25 @@ impl SinkConfig {
         Ok(cfg)
     }
 
-    /// The validated backpressure hysteresis gate (PR 2.32).
-    #[must_use]
-    pub fn backpressure(&self) -> crate::memory::Backpressure {
-        crate::memory::Backpressure::new(
+    /// The parsed hysteresis band — the single gate for the cross-field invariant.
+    fn hysteresis_band(&self) -> Result<HysteresisBand, ConfigError> {
+        HysteresisBand::new(
             self.backpressure_activate_ratio,
             self.backpressure_resume_ratio,
         )
+        .map_err(|e| ConfigError::OutOfBounds {
+            field: "backpressure_activate_ratio",
+            detail: e.to_string(),
+        })
+    }
+
+    /// The validated backpressure hysteresis gate (PR 2.32).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::OutOfBounds`] if the resume threshold is not below activation.
+    pub fn backpressure(&self) -> Result<crate::memory::Backpressure, ConfigError> {
+        Ok(crate::memory::Backpressure::new(self.hysteresis_band()?))
     }
 
     /// The validated idle-heartbeat settings (PR 2.27).
@@ -245,11 +267,6 @@ impl SinkConfig {
                 ),
             });
         }
-        positive("max_rows", self.max_rows)?;
-        positive("max_bytes", self.max_bytes)?;
-        positive("max_inflight_bytes", self.max_inflight_bytes)?;
-        positive("max_concurrent_reloads", self.max_concurrent_reloads)?;
-        positive("reload_chunk_rows", self.reload_chunk_rows)?;
         duration_bound("reload_echo_timeout", self.reload_echo_timeout)?;
         duration_bound("reload_lease_ttl", self.reload_lease_ttl)?;
         // 0 is legal (fail on first mid-export DDL); only a negative cap is a misconfig.
@@ -282,19 +299,7 @@ impl SinkConfig {
                 ),
             });
         }
-        // Hysteresis band: 0 < resume < activate < 1.0 so the backstop never flaps.
-        if !(0.0 < self.backpressure_resume_ratio
-            && self.backpressure_resume_ratio < self.backpressure_activate_ratio
-            && self.backpressure_activate_ratio < 1.0)
-        {
-            return Err(ConfigError::OutOfBounds {
-                field: "backpressure_activate_ratio",
-                detail: format!(
-                    "require 0 < resume ({}) < activate ({}) < 1.0",
-                    self.backpressure_resume_ratio, self.backpressure_activate_ratio
-                ),
-            });
-        }
+        self.hysteresis_band()?;
         Ok(())
     }
 }
@@ -310,16 +315,6 @@ fn duration_bound(field: &'static str, d: Duration) -> Result<(), ConfigError> {
         return Err(ConfigError::OutOfBounds {
             field,
             detail: format!("{d:?} exceeds the {MAX_DURATION:?} ceiling"),
-        });
-    }
-    Ok(())
-}
-
-fn positive(field: &'static str, v: u64) -> Result<(), ConfigError> {
-    if v == 0 {
-        return Err(ConfigError::OutOfBounds {
-            field,
-            detail: "must be greater than zero".to_string(),
         });
     }
     Ok(())

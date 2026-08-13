@@ -102,6 +102,102 @@ pub fn decide(meter: &InflightMeter, has_committed: bool) -> Option<ShedAction> 
     }
 }
 
+/// A ratio in the open unit interval `(0.0, 1.0)`. Constructed only through [`Ratio::new`], so a
+/// `Ratio` in hand is always in range — the check happens once, at the edge.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct Ratio(f64);
+
+/// Why a raw `f64` was rejected as a [`Ratio`].
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[error("ratio {0} is out of range — require 0.0 < r < 1.0")]
+pub struct RatioError(f64);
+
+impl Ratio {
+    /// Parse a raw ratio. `NaN`, `0.0`, `1.0` and anything outside the open interval are rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RatioError`] unless `raw` is strictly between zero and one.
+    pub fn new(raw: f64) -> Result<Self, RatioError> {
+        if 0.0 < raw && raw < 1.0 {
+            Ok(Ratio(raw))
+        } else {
+            Err(RatioError(raw))
+        }
+    }
+
+    #[must_use]
+    pub const fn as_f64(self) -> f64 {
+        self.0
+    }
+}
+
+impl TryFrom<f64> for Ratio {
+    type Error = RatioError;
+
+    fn try_from(raw: f64) -> Result<Self, RatioError> {
+        Ratio::new(raw)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Ratio {
+    /// Read a bare JSON/TOML/environment float and parse it; the wire shape remains a number.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = <f64 as serde::Deserialize>::deserialize(d)?;
+        Ratio::try_from(raw).map_err(serde::de::Error::custom)
+    }
+}
+
+/// The pause/resume band for the pause-poll backstop: pause at `activate`, resume only at the lower
+/// `resume`. The gap is what stops intake flapping around the ceiling.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HysteresisBand {
+    activate: Ratio,
+    resume: Ratio,
+}
+
+/// Why two in-range ratios still did not form a band.
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[error("require 0 < resume ({resume}) < activate ({activate}) < 1.0")]
+pub struct BandError {
+    pub activate: f64,
+    pub resume: f64,
+}
+
+impl HysteresisBand {
+    /// The shipped default band. Its private fields cannot bypass the constructor elsewhere.
+    pub const DEFAULT: HysteresisBand = HysteresisBand {
+        activate: Ratio(0.85),
+        resume: Ratio(0.75),
+    };
+
+    /// Build a band whose resume threshold is strictly below its activation threshold.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BandError`] when `resume` is greater than or equal to `activate`.
+    pub fn new(activate: Ratio, resume: Ratio) -> Result<Self, BandError> {
+        if resume < activate {
+            Ok(HysteresisBand { activate, resume })
+        } else {
+            Err(BandError {
+                activate: activate.as_f64(),
+                resume: resume.as_f64(),
+            })
+        }
+    }
+
+    #[must_use]
+    pub const fn activate(self) -> Ratio {
+        self.activate
+    }
+
+    #[must_use]
+    pub const fn resume(self) -> Ratio {
+        self.resume
+    }
+}
+
 /// Hysteresis so the pause-poll backstop doesn't flap around the ceiling: pause at the high `activate`
 /// ratio, resume only at the lower `resume` ratio.
 #[allow(
@@ -110,17 +206,15 @@ pub fn decide(meter: &InflightMeter, has_committed: bool) -> Option<ShedAction> 
 )]
 #[derive(Debug)]
 pub struct Backpressure {
-    activate_ratio: f64,
-    resume_ratio: f64,
+    band: HysteresisBand,
     paused: bool,
 }
 
 impl Backpressure {
     #[must_use]
-    pub fn new(activate_ratio: f64, resume_ratio: f64) -> Self {
+    pub const fn new(band: HysteresisBand) -> Self {
         Backpressure {
-            activate_ratio,
-            resume_ratio,
+            band,
             paused: false,
         }
     }
@@ -133,10 +227,10 @@ impl Backpressure {
             total as f64 / ceiling as f64
         };
         if self.paused {
-            if ratio <= self.resume_ratio {
+            if ratio <= self.band.resume().as_f64() {
                 self.paused = false;
             }
-        } else if ratio >= self.activate_ratio {
+        } else if ratio >= self.band.activate().as_f64() {
             self.paused = true;
         }
         self.paused
