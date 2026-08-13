@@ -97,3 +97,25 @@ fn spill_override_stamps_lsn_end_but_verbatim_otherwise() {
         "two v1 files → one cached introspection, not per-file"
     );
 }
+
+#[test]
+fn parquet_column_cache_hit_then_mutation_capable_miss() {
+    assert!(include_str!("duck.rs")
+        .contains("let cached = { self.parquet_cols.borrow().get(&schema_version).cloned() };"));
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = TableDb::open(&dir.path().join("cache.duckdb")).unwrap();
+    let parquet = write_local_fixture(dir.path(), "columns.parquet", (1, 2), "0");
+
+    let initial = db.columns_for(&parquet, 1).unwrap();
+    let hit = db.columns_for("not-read-on-cache-hit.parquet", 1).unwrap();
+    assert!(Rc::ptr_eq(&initial, &hit), "cache hit reuses the same Rc");
+
+    let miss = db.columns_for(&parquet, 2).unwrap();
+    assert_eq!(&*miss, &*initial);
+    assert_eq!(
+        db.cached_schema_versions(),
+        2,
+        "the miss can mutably insert after the hit borrow ends"
+    );
+}
