@@ -163,7 +163,7 @@ impl Backfill {
         let cached = RelationCache::default()
             .upsert_from_relation(rel.clone(), schema_version)
             .context("build Arrow schema for backfill")?;
-        let mut batcher = TableBatcher::new(cached, self.triggers, self.clock.clone())
+        let mut batcher = TableBatcher::new(cached, self.triggers, Arc::clone(&self.clock))
             .context("create backfill batcher")?;
 
         // Every column cast ::text gives the type's output form — identical to pgoutput's text tuples,

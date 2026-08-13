@@ -11,6 +11,7 @@ use pg_sink::config::SinkConfig;
 use pg_sink::replication::ReplicationStream;
 use pg_sink::{bootstrap, consume, health, shutdown};
 use std::process::ExitCode;
+use std::sync::Arc;
 use tokio::time::Instant;
 
 fn main() -> ExitCode {
@@ -67,7 +68,11 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
         .with_context(|| format!("bind health endpoints on {}", cfg.health_addr))?;
     let bound = listener.local_addr().context("read health bind address")?;
     tracing::info!(%bound, "health endpoints listening; bootstrapping");
-    let server = tokio::spawn(health::serve_on(listener, state.clone(), token.clone()));
+    let server = tokio::spawn(health::serve_on(
+        listener,
+        Arc::clone(&state),
+        token.clone(),
+    ));
 
     // Shared bootstrap steps 2–4. On failure, tear the health server down before propagating the
     // classified error (whose exit code `main` surfaces).
@@ -142,7 +147,7 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
     let reload_controller = pg_sink::reload::ReloadController::spawn(
         ctx.control_pool.clone(),
         &cfg.source_db_url,
-        waiters.clone(),
+        Arc::clone(&waiters),
         sink.clone(),
         pg_sink::reload::ReloadControllerConfig {
             poll_interval: cfg.heartbeat_idle_after,
@@ -209,7 +214,7 @@ async fn establish_stream(
 ) -> anyhow::Result<Bootstrapped> {
     let make_sink = |epoch| {
         pg_sink::sink::ParquetSink::new(
-            ctx.object_store.clone(),
+            Arc::clone(&ctx.object_store),
             cfg.object_store.bucket.clone(),
             epoch,
         )

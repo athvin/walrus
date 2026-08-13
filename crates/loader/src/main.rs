@@ -55,7 +55,11 @@ async fn run(cfg: LoaderConfig) -> Result<(), LoaderError> {
         .await
         .map_err(|e| LoaderError::Internal(format!("bind health {}: {e}", cfg.health_addr)))?;
     tracing::info!(addr = %cfg.health_addr, "health endpoints listening; bootstrapping");
-    let server = tokio::spawn(health::serve_on(listener, state.clone(), token.clone()));
+    let server = tokio::spawn(health::serve_on(
+        listener,
+        Arc::clone(&state),
+        token.clone(),
+    ));
 
     let pool = control::connect(&cfg.control_db_url).await?;
     let store: Arc<dyn ObjectStore> = build_store(&cfg)?;
@@ -114,7 +118,7 @@ async fn run(cfg: LoaderConfig) -> Result<(), LoaderError> {
                 table: o.table.clone(),
                 rel: o.relation,
                 db: o.db,
-                state: state.clone(),
+                state: Arc::clone(&state),
                 max_files: cfg.max_files_per_cycle,
                 poll_interval: cfg.poll_interval,
                 compaction_interval: cfg.compaction_interval,

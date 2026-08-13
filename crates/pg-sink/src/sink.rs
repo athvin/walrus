@@ -97,7 +97,7 @@ impl ParquetSink {
         let rows = batch.record_batch.num_rows() as u64;
 
         // Multipart streaming writer — no local temp file, no whole-batch buffering.
-        let buf_writer = BufWriter::new(self.store.clone(), key.clone());
+        let buf_writer = BufWriter::new(Arc::clone(&self.store), key.clone());
         let props = pg_to_arrow::default_writer_properties();
         let mut writer =
             AsyncArrowWriter::try_new(buf_writer, batch.record_batch.schema(), Some(props))

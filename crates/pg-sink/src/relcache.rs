@@ -48,7 +48,7 @@ impl RelationCache {
             .iter()
             .filter(|((o, _), _)| *o == oid)
             .max_by_key(|((_, v), _)| *v)
-            .map(|(_, r)| r.clone())
+            .map(|(_, r)| Arc::clone(r))
     }
 
     /// The OID of a cached `schema.table` (any version) — the DDL-capture cut (PR 2.33) needs it to find
@@ -78,7 +78,7 @@ impl RelationCache {
         let cached = build_cached(relation, schema_version)?;
         let key = (cached.relation.oid, schema_version);
         let entry = Arc::new(cached);
-        self.by_key.insert(key, entry.clone());
+        self.by_key.insert(key, Arc::clone(&entry));
         Ok(entry)
     }
 

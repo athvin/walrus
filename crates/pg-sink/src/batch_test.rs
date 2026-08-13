@@ -123,7 +123,7 @@ fn flushes_on_max_fill_via_fake_clock() {
     let mut b = TableBatcher::new(
         cached(),
         triggers(u64::MAX, u64::MAX, Duration::from_millis(100)),
-        clock.clone(),
+        Arc::<FakeClock>::clone(&clock),
     )
     .unwrap();
     b.push(meta("0/10"), &row("1"));

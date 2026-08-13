@@ -13,6 +13,7 @@ use loader::error::LoaderError;
 use loader::health::LoaderState;
 use loader::phase_a::{run_phase_a, TableCtx};
 use loader::phase_b::run_phase_b;
+use std::sync::Arc;
 use std::time::Duration;
 
 fn col(name: &str, oid: u32, is_key: bool) -> PgColumn {
@@ -332,7 +333,7 @@ async fn lossy_cast_failure_quarantines_the_table_and_alerts() {
         table: "orders".into(),
         rel: orders_v1,
         db,
-        state: state.clone(),
+        state: Arc::clone(&state),
         max_files: 100,
         poll_interval: Duration::from_secs(5),
         compaction_interval: Duration::from_secs(3600),

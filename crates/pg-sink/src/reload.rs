@@ -167,7 +167,7 @@ async fn export_with_ddl_restarts(
         let mut exporter = ChunkExporter::connect(
             &deps.source_db_url,
             pool.clone(),
-            deps.waiters.clone(),
+            Arc::clone(&deps.waiters),
             deps.sink.clone(),
             deps.export_cfg.clone(),
             &req,
@@ -378,7 +378,7 @@ impl ReloadController {
                 }
             }
             // The permit is held INSIDE the spawned task — dropping it on task exit frees the slot.
-            let permit = match self.semaphore.clone().try_acquire_owned() {
+            let permit = match Arc::clone(&self.semaphore).try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
                     // All permits raced away within this tick (can't happen while this controller
@@ -415,7 +415,7 @@ impl ReloadController {
             epoch: self.cfg.epoch,
         };
         let source_db_url = self.source_db_url.clone();
-        let waiters = self.waiters.clone();
+        let waiters = Arc::clone(&self.waiters);
         let sink = self.sink.clone();
         // The reload-active gauge (PR 6.11): +1 for this exporter task's flavor now, -1 when it
         // ends (any exit path). The flavor is stable across DDL-restarts, so one task = one count.
@@ -427,7 +427,7 @@ impl ReloadController {
             // renewal follows the lease onto each successor row (PR 6.8).
             let current_reload_id = Arc::new(AtomicI64::new(req.reload_id));
             let renew_pool = pool.clone();
-            let renew_id = current_reload_id.clone();
+            let renew_id = Arc::clone(&current_reload_id);
             // The chunk engine (PR 6.5) under DDL-restart (PR 6.8): dial the side connection,
             // resume from the cursor, export until drained — restarting at the new schema if DDL
             // bumps the version mid-export, then flipping export_complete (PR 6.9). Echo timeout
@@ -443,7 +443,7 @@ impl ReloadController {
                 },
                 req,
                 max_restarts,
-                current_reload_id.clone(),
+                Arc::clone(&current_reload_id),
             );
             let end = lease_guarded_export(
                 child,
@@ -510,7 +510,7 @@ impl ReloadController {
             }
         };
         for req in adopted {
-            let permit = match self.semaphore.clone().try_acquire_owned() {
+            let permit = match Arc::clone(&self.semaphore).try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
                     tracing::warn!(

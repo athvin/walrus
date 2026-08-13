@@ -196,7 +196,7 @@ impl BatchBuilder {
             arrays.push(builder.finish());
         }
         arrays.push(Arc::new(self.meta.finish()));
-        Ok(RecordBatch::try_new(self.schema.clone(), arrays)?)
+        Ok(RecordBatch::try_new(Arc::clone(&self.schema), arrays)?)
     }
 }
 

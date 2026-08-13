@@ -327,8 +327,12 @@ async fn chunks_cover_the_table_exactly_with_per_chunk_stamps() {
 
     let waiters = Arc::new(WatermarkWaiters::default());
     let token = CancellationToken::new();
-    let (resolver, mut watch_rx) =
-        spawn_echo_resolver("walrus_re_cover", waiters.clone(), TABLE, token.clone());
+    let (resolver, mut watch_rx) = spawn_echo_resolver(
+        "walrus_re_cover",
+        Arc::clone(&waiters),
+        TABLE,
+        token.clone(),
+    );
     await_resolver_ready(&admin, &waiters, epoch).await;
 
     let req = request_and_claim(&pool, epoch).await;
@@ -336,7 +340,7 @@ async fn chunks_cover_the_table_exactly_with_per_chunk_stamps() {
     let mut exporter = ChunkExporter::connect(
         &source_url(),
         pool.clone(),
-        waiters.clone(),
+        Arc::clone(&waiters),
         ParquetSink::new(store(), "walrus".to_string(), epoch),
         export_cfg(epoch, 1000, Duration::from_secs(20)),
         &req,
@@ -451,8 +455,12 @@ async fn resume_from_cursor_never_reexports_completed_chunks() {
 
     let waiters = Arc::new(WatermarkWaiters::default());
     let token = CancellationToken::new();
-    let (resolver, _watch) =
-        spawn_echo_resolver("walrus_re_resume", waiters.clone(), TABLE, token.clone());
+    let (resolver, _watch) = spawn_echo_resolver(
+        "walrus_re_resume",
+        Arc::clone(&waiters),
+        TABLE,
+        token.clone(),
+    );
     await_resolver_ready(&admin, &waiters, epoch).await;
 
     let req = request_and_claim(&pool, epoch).await;
@@ -463,7 +471,7 @@ async fn resume_from_cursor_never_reexports_completed_chunks() {
     let mut first = ChunkExporter::connect(
         &source_url(),
         pool.clone(),
-        waiters.clone(),
+        Arc::clone(&waiters),
         sink.clone(),
         export_cfg(epoch, 1000, Duration::from_secs(20)),
         &req,
@@ -488,7 +496,7 @@ async fn resume_from_cursor_never_reexports_completed_chunks() {
     let mut stale = ChunkExporter::connect(
         &source_url(),
         pool.clone(),
-        waiters.clone(),
+        Arc::clone(&waiters),
         sink.clone(),
         export_cfg(epoch, 1000, Duration::from_secs(20)),
         &req,
@@ -514,7 +522,7 @@ async fn resume_from_cursor_never_reexports_completed_chunks() {
     let mut resumed = ChunkExporter::connect(
         &source_url(),
         pool.clone(),
-        waiters.clone(),
+        Arc::clone(&waiters),
         sink,
         export_cfg(epoch, 1000, Duration::from_secs(20)),
         &mid,

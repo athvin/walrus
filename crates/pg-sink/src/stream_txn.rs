@@ -217,7 +217,7 @@ impl StreamDemux {
             };
             let (triggers, clock, epoch, instance) = (
                 self.triggers,
-                self.clock.clone(),
+                Arc::clone(&self.clock),
                 self.epoch,
                 self.sink_instance.clone(),
             );
@@ -242,8 +242,8 @@ impl StreamDemux {
             let Some(cached) = cache.latest_for(oid) else {
                 continue; // shape not cached (shouldn't happen mid-stream) — nothing to spill
             };
-            let mut batcher =
-                TableBatcher::new(cached.clone(), triggers, clock).context("open spill batcher")?;
+            let mut batcher = TableBatcher::new(Arc::clone(&cached), triggers, clock)
+                .context("open spill batcher")?;
             for c in &rows {
                 let meta = SinkMeta {
                     op: c.op,
@@ -390,7 +390,7 @@ impl StreamDemux {
         // Materialise the still-in-memory survivors.
         let (triggers, clock, epoch, instance) = (
             self.triggers,
-            self.clock.clone(),
+            Arc::clone(&self.clock),
             self.epoch,
             self.sink_instance.clone(),
         );
@@ -418,7 +418,7 @@ impl StreamDemux {
             let batcher = match batchers.entry(c.oid) {
                 Entry::Occupied(e) => e.into_mut(),
                 Entry::Vacant(e) => e.insert(
-                    TableBatcher::new(cached.clone(), triggers, clock.clone())
+                    TableBatcher::new(Arc::clone(&cached), triggers, Arc::clone(&clock))
                         .context("open streamed materialise batcher")?,
                 ),
             };

@@ -38,7 +38,7 @@ async fn spawn_server() -> (
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let token = CancellationToken::new();
-    let handle = tokio::spawn(serve_on(listener, state.clone(), token.clone()));
+    let handle = tokio::spawn(serve_on(listener, Arc::clone(&state), token.clone()));
     (addr, state, token, handle)
 }
 

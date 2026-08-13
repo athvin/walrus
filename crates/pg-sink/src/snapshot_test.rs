@@ -121,7 +121,7 @@ fn all_snapshot_manifest_files_share_lsn_end() {
     let mut lsn_ends = Vec::new();
     for _file in 0..2 {
         let mut b = TableBatcher::new(
-            cached.clone(),
+            Arc::clone(&cached),
             BatchTriggers {
                 max_rows: 1,
                 max_bytes: u64::MAX,

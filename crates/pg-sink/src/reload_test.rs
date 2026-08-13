@@ -19,7 +19,7 @@ async fn lost_lease_cancels_the_exporter() {
     let token = CancellationToken::new();
     // First renewal succeeds, second reports the lease gone.
     let calls = Arc::new(AtomicUsize::new(0));
-    let calls_in = calls.clone();
+    let calls_in = Arc::clone(&calls);
     let end = lease_guarded_export(
         token,
         Duration::from_secs(20),
@@ -42,7 +42,7 @@ async fn transient_renewal_errors_do_not_cancel() {
     let token = CancellationToken::new();
     let cancel = token.clone();
     let calls = Arc::new(AtomicUsize::new(0));
-    let calls_in = calls.clone();
+    let calls_in = Arc::clone(&calls);
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(70)).await;
         cancel.cancel();
@@ -74,8 +74,8 @@ async fn cap_of_two_schedules_third_request_only_after_a_permit_frees() {
     let mut releases = Vec::new();
     let mut handles = Vec::new();
     for flag in &started {
-        let sem = semaphore.clone();
-        let flag = flag.clone();
+        let sem = Arc::clone(&semaphore);
+        let flag = Arc::clone(flag);
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         releases.push(Some(tx));
         handles.push(tokio::spawn(async move {

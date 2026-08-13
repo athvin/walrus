@@ -267,7 +267,7 @@ async fn kill_mid_export_resumes_from_cursor_and_completes() {
 
     let waiters = Arc::new(WatermarkWaiters::default());
     let token = CancellationToken::new();
-    let resolver = spawn_echo_resolver("walrus_rec_resume", waiters.clone(), token.clone());
+    let resolver = spawn_echo_resolver("walrus_rec_resume", Arc::clone(&waiters), token.clone());
     await_resolver_ready(&admin, &waiters, epoch).await;
 
     // requested → exporting, chunk 1 (2 of 5 rows), then "crash": drop the exporter mid-flight.
@@ -277,7 +277,7 @@ async fn kill_mid_export_resumes_from_cursor_and_completes() {
     let mut crashed = ChunkExporter::connect(
         &source_url(),
         pool.clone(),
-        waiters.clone(),
+        Arc::clone(&waiters),
         ParquetSink::new(store(), "walrus".to_string(), epoch),
         export_cfg(epoch, 2),
         &req,
@@ -304,7 +304,7 @@ async fn kill_mid_export_resumes_from_cursor_and_completes() {
     let mut resumed = ChunkExporter::connect(
         &source_url(),
         pool.clone(),
-        waiters.clone(),
+        Arc::clone(&waiters),
         ParquetSink::new(store(), "walrus".to_string(), epoch),
         export_cfg(epoch, 2),
         &row,
@@ -377,7 +377,7 @@ async fn complete_waits_for_transformed_lsn_to_reach_h() {
 
     let waiters = Arc::new(WatermarkWaiters::default());
     let token = CancellationToken::new();
-    let resolver = spawn_echo_resolver("walrus_rec_wait", waiters.clone(), token.clone());
+    let resolver = spawn_echo_resolver("walrus_rec_wait", Arc::clone(&waiters), token.clone());
     await_resolver_ready(&admin, &waiters, epoch).await;
 
     // A clean full export to export_complete(H).
@@ -386,7 +386,7 @@ async fn complete_waits_for_transformed_lsn_to_reach_h() {
     let mut exporter = ChunkExporter::connect(
         &source_url(),
         pool.clone(),
-        waiters.clone(),
+        Arc::clone(&waiters),
         ParquetSink::new(store(), "walrus".to_string(), epoch),
         export_cfg(epoch, 10),
         &req,

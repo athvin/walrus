@@ -246,7 +246,7 @@ async fn chunk_export_moves_chunk_row_and_echo_metrics() {
 
     let waiters = Arc::new(WatermarkWaiters::default());
     let token = CancellationToken::new();
-    let resolver = spawn_echo_resolver("walrus_met_export", waiters.clone(), token.clone());
+    let resolver = spawn_echo_resolver("walrus_met_export", Arc::clone(&waiters), token.clone());
     await_resolver_ready(&admin, &waiters, epoch).await;
 
     let chunks_before = metric_sum(common::metrics::names::RELOAD_CHUNKS_TOTAL);
@@ -259,7 +259,7 @@ async fn chunk_export_moves_chunk_row_and_echo_metrics() {
     let mut exporter = ChunkExporter::connect(
         &source_url(),
         pool.clone(),
-        waiters.clone(),
+        Arc::clone(&waiters),
         minio(epoch),
         export_cfg(epoch, 2, Duration::from_secs(20)),
         &req,

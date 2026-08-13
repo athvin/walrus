@@ -67,7 +67,7 @@ pub async fn run_shared(cfg: &SinkConfig, deadline: Instant) -> Result<Bootstrap
     let object_store = build_object_store(&cfg.object_store)
         .map_err(|e| Error::ObjectStore(format!("build object store: {e}")))?;
     retry_transient(deadline, "object store", || {
-        let store = object_store.clone();
+        let store = Arc::clone(&object_store);
         let instance = cfg.instance.clone();
         async move {
             object_store_canary(store.as_ref(), &instance)

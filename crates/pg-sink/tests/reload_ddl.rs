@@ -329,7 +329,7 @@ async fn mid_export_ddl_restarts_fresh_attempt_at_new_schema() {
 
     let waiters = Arc::new(WatermarkWaiters::default());
     let token = CancellationToken::new();
-    let resolver = spawn_echo_resolver("walrus_ddl_restart", waiters.clone(), token.clone());
+    let resolver = spawn_echo_resolver("walrus_ddl_restart", Arc::clone(&waiters), token.clone());
     await_resolver_ready(&admin, &waiters, epoch).await;
 
     // Chunk 1 at v1 (freezes schema_version=1), then DDL lands: ALTER + re-register at v2.
@@ -338,7 +338,7 @@ async fn mid_export_ddl_restarts_fresh_attempt_at_new_schema() {
     let mut exporter = ChunkExporter::connect(
         &source_url(),
         pool.clone(),
-        waiters.clone(),
+        Arc::clone(&waiters),
         ParquetSink::new(store(), "walrus".to_string(), epoch),
         export_cfg(epoch, 2),
         &req,
@@ -409,7 +409,7 @@ async fn mid_export_ddl_restarts_fresh_attempt_at_new_schema() {
     let mut resumed = ChunkExporter::connect(
         &source_url(),
         pool.clone(),
-        waiters.clone(),
+        Arc::clone(&waiters),
         ParquetSink::new(store(), "walrus".to_string(), epoch),
         export_cfg(epoch, 2),
         &new,
@@ -460,7 +460,7 @@ async fn restart_cap_exhaustion_fails_loudly() {
 
     let waiters = Arc::new(WatermarkWaiters::default());
     let token = CancellationToken::new();
-    let resolver = spawn_echo_resolver("walrus_ddl_cap", waiters.clone(), token.clone());
+    let resolver = spawn_echo_resolver("walrus_ddl_cap", Arc::clone(&waiters), token.clone());
     await_resolver_ready(&admin, &waiters, epoch).await;
 
     let req = request_and_claim(&pool, epoch).await;
@@ -468,7 +468,7 @@ async fn restart_cap_exhaustion_fails_loudly() {
     let mut exporter = ChunkExporter::connect(
         &source_url(),
         pool.clone(),
-        waiters.clone(),
+        Arc::clone(&waiters),
         ParquetSink::new(store(), "walrus".to_string(), epoch),
         export_cfg(epoch, 2),
         &req,

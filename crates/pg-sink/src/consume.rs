@@ -529,11 +529,11 @@ impl BatchRouter {
             return Ok(());
         };
         let triggers = self.triggers;
-        let clock = self.clock.clone();
+        let clock = Arc::clone(&self.clock);
         let batcher = match self.batchers.entry(oid) {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => e.insert(
-                TableBatcher::new(cached.clone(), triggers, clock)
+                TableBatcher::new(Arc::clone(&cached), triggers, clock)
                     .context("create table batcher")?,
             ),
         };
