@@ -39,7 +39,7 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!("walrus-loader exiting: {e}");
-            e.exit_code().into()
+            common::Error::from(&e).exit_code().into()
         }
     }
 }

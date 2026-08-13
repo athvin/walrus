@@ -33,10 +33,12 @@ unsafe_attr_outside_unsafe = "deny"
 missing_copy_implementations = "deny"
 
 [workspace.lints.clippy]
-all = "deny"
+all = { level = "deny", priority = -1 }
 # Pure public computations must warn when their returned value is discarded. This pedantic lint is
 # outside `clippy::all`, so it needs no group priority adjustment (PR 13.2).
 must_use_candidate = "deny"
+# Named explicitly (PR 13.4) so the rule survives a future regrouping of `clippy::all`.
+from_over_into = "deny"
 # `ptr_arg` already arrives via `all = "deny"`; pin it explicitly so the borrowed-argument family is
 # documented together. `ref_option` is pedantic (outside `all`), so no priority juggling is needed.
 ptr_arg = "deny"

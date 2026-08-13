@@ -35,6 +35,20 @@ impl Lsn {
     }
 }
 
+impl From<u64> for Lsn {
+    /// Wrap a raw `u64` WAL position. [`Lsn::new`] stays for `const` contexts ([`Lsn::ZERO`]).
+    fn from(raw: u64) -> Self {
+        Lsn(raw)
+    }
+}
+
+impl From<Lsn> for u64 {
+    /// The raw `u64` WAL position. [`Lsn::as_u64`] stays for `const` contexts.
+    fn from(lsn: Lsn) -> Self {
+        lsn.0
+    }
+}
+
 /// Failure to parse either the `X/Y` or the 16-hex form of an [`Lsn`].
 #[derive(Debug, thiserror::Error)]
 #[error("invalid LSN {input:?}: {reason}")]

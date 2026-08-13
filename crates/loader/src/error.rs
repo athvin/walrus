@@ -71,11 +71,13 @@ pub enum LoaderError {
     Internal(String),
 }
 
-impl LoaderError {
-    /// The classified terminal error `main` surfaces as an exit code.
-    #[must_use]
-    pub fn as_common(&self) -> common::Error {
-        match self {
+/// The classified terminal error `main` surfaces as an exit code.
+///
+/// Takes `&LoaderError` because the caller keeps its error for logging; the standard blanket impl
+/// then also provides `Into<common::Error>` for `&LoaderError`.
+impl From<&LoaderError> for common::Error {
+    fn from(e: &LoaderError) -> Self {
+        match e {
             LoaderError::Config(e) => common::Error::Config(e.0.clone()),
             LoaderError::Control(e) => common::Error::ControlDb(e.to_string()),
             LoaderError::Duck { op, source } => {
@@ -114,10 +116,12 @@ impl LoaderError {
             LoaderError::Internal(m) => common::Error::Internal(m.clone()),
         }
     }
+}
 
-    #[must_use]
+impl LoaderError {
+    #[must_use = "the exit code must reach `main` — dropping it loses the failure class"]
     pub fn exit_code(&self) -> common::ExitCode {
-        self.as_common().exit_code()
+        common::Error::from(self).exit_code()
     }
 }
 
