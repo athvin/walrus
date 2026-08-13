@@ -501,3 +501,7 @@ pub fn parse_stream(data: &[u8], ctx: &mut StreamCtx) -> Result<Vec<Message>, De
     }
     Ok(out)
 }
+
+#[cfg(test)]
+#[path = "mod_test.rs"]
+mod tests;
