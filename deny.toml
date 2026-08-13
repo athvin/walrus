@@ -73,6 +73,12 @@ deny = [
   { crate = "async-trait", wrappers = ["axum", "axum-core", "object_store", "tokio-postgres"] },
   { crate = "rayon" },
   { crate = "rayon-core" },
+  # PR 16.12: no arithmetic-dense float-vector workload; see docs/implementation/notes/rust-skills/opt-simd-portable.md.
+  { crate = "wide", reason = "SIMD declined (PR 16.12): no float-vector workload; see docs/implementation/notes/rust-skills/opt-simd-portable.md" },
+  # PR 16.12: nightly-oriented SIMD is outside the pinned stable toolchain; same ADR and re-open trigger.
+  { crate = "packed_simd_2", reason = "SIMD declined (PR 16.12): nightly-oriented SIMD is outside the stable toolchain; see docs/implementation/notes/rust-skills/opt-simd-portable.md" },
+  # PR 16.12: an intrinsics wrapper conflicts with the workspace unsafe-code ban; same ADR and re-open trigger.
+  { crate = "simdeez", reason = "SIMD declined (PR 16.12): intrinsics conflict with the unsafe-code ban; see docs/implementation/notes/rust-skills/opt-simd-portable.md" },
 ]
 
 [sources]
