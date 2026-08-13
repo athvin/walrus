@@ -96,3 +96,14 @@ fn tuple_value_null_and_unchanged_toast_are_distinct() {
         TupleValue::Null
     );
 }
+
+#[test]
+fn tuple_value_size_budget() {
+    // The const assert in `pg_shape` is the real gate; this exists so a breach prints the number.
+    assert!(
+        size_of::<TupleValue>() <= super::TUPLE_VALUE_MAX_BYTES,
+        "TupleValue grew to {} bytes (budget {}) — see own-move-large",
+        size_of::<TupleValue>(),
+        super::TUPLE_VALUE_MAX_BYTES,
+    );
+}
