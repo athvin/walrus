@@ -104,3 +104,23 @@ async fn retry_accepts_a_borrowing_async_closure() {
     assert_eq!(out.unwrap(), 6);
     assert_eq!(attempts, 2);
 }
+
+#[test]
+fn backoff_doubles_then_saturates_at_the_ceiling() {
+    assert_eq!(
+        next_backoff(Duration::from_millis(200)),
+        Duration::from_millis(400)
+    );
+    assert_eq!(next_backoff(Duration::from_secs(4)), MAX_BACKOFF);
+    assert_eq!(next_backoff(MAX_BACKOFF), MAX_BACKOFF);
+}
+
+#[test]
+fn backoff_from_duration_max_does_not_panic() {
+    assert_eq!(next_backoff(Duration::MAX), MAX_BACKOFF);
+}
+
+#[test]
+fn backoff_never_drops_below_the_floor() {
+    assert_eq!(next_backoff(Duration::ZERO), INITIAL_BACKOFF);
+}

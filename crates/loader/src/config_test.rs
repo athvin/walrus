@@ -59,3 +59,26 @@ fn worker_threads_above_the_ceiling_is_rejected_as_terminal_config() {
         common::ExitCode::Config
     );
 }
+
+#[test]
+fn default_lease_ttl_is_accepted() {
+    let cfg = valid();
+    assert_eq!(cfg.lease_ttl, Duration::from_secs(30));
+    assert!(cfg.validate().is_ok());
+}
+
+#[test]
+fn lease_ttl_below_three_seconds_is_a_terminal_config_error() {
+    let mut cfg = valid();
+    cfg.lease_ttl = Duration::from_secs(1);
+    let err = cfg.validate().expect_err("1s TTL must be rejected");
+    assert!(err.to_string().contains("lease_ttl"), "{err}");
+    assert!(common::Error::from(err).is_terminal());
+}
+
+#[test]
+fn zero_lease_ttl_is_still_rejected() {
+    let mut cfg = valid();
+    cfg.lease_ttl = Duration::ZERO;
+    assert!(cfg.validate().is_err());
+}

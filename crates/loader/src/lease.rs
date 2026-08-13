@@ -77,3 +77,7 @@ pub async fn release_all(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "lease_test.rs"]
+mod tests;
