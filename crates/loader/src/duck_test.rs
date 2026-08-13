@@ -1,6 +1,18 @@
 use super::*;
 use common::{PgColumn, PgRelation, ReplicaIdentity};
 
+fn requires_send<T: Send>() {}
+
+/// The exact closure and result bounds imposed by `tokio::task::spawn_blocking`. This is
+/// intentionally instantiated only with an owned legal closure: current DuckDB work borrows a
+/// `TableDb`, whose negative shared-reference bounds are guarded by `TableDb`'s compile-fail docs.
+fn requires_spawn_blocking_bounds<F, R>(_f: F)
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+}
+
 fn orders() -> PgRelation {
     let col = |name: &str, oid: u32, is_key: bool| PgColumn {
         name: name.into(),

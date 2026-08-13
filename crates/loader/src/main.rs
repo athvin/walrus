@@ -138,7 +138,9 @@ async fn pipeline(
     // One apply loop per owned table. DuckDB's `Connection` is `Send + !Sync` because it holds
     // an interior `RefCell`, so a future holding `&TableCtx` is not `Send` and cannot go to
     // `tokio::spawn`. The loops run on a `LocalSet` (this thread), the whole parallelism model being
-    // one worker per `.duckdb` file. Asserted in `duck.rs` (PR 12.5).
+    // one worker task per `.duckdb` file. Those tasks all share this one driver thread, so a long
+    // compaction stalls its siblings; see
+    // docs/implementation/notes/rust-skills/async-spawn-blocking.md.
     let local = tokio::task::LocalSet::new();
     let (failures_tx, failures_rx) = loader::supervisor::failure_channel(keys.len());
     let handles: Vec<_> = owned

@@ -7,8 +7,10 @@
 //! (via [`TransformSql::render_rebuild`]) so the two paths can't drift, and the mirror baseline
 //! guarantees a value whose last real write was already pruned is **never lost**.
 //!
-//! It runs on the table's **own worker thread**, serialized after an apply cycle (no separate connection,
-//! no quiescing dance), holds the exclusive writer, and needs ~2× transient space for the rewrite.
+//! It runs inside this table's worker **task** on the shared `LocalSet` driver thread, serialized after
+//! an apply cycle (no separate connection, no quiescing dance), holds the exclusive writer, and needs
+//! ~2× transient space for the rewrite. The cross-table stall is an open finding recorded in
+//! `docs/implementation/notes/rust-skills/async-spawn-blocking.md`.
 
 use crate::duck_ext::{duck_err, DuckResultExt};
 use crate::error::LoaderError;
@@ -62,8 +64,8 @@ pub fn full_rebuild(
 }
 
 /// [`full_rebuild`] wrapped so an in-flight rewrite is **aborted** the instant `cancel` fires (PR 3.12).
-/// The blocking `CREATE OR REPLACE` runs on this worker thread; a watcher task on the runtime pool holds
-/// the connection's [`InterruptHandle`](duckdb) (`Send + Sync`, asserted in [`crate::duck`] by PR
+/// The blocking `CREATE OR REPLACE` runs inside this worker task on the shared `LocalSet` driver
+/// thread; a watcher task on the runtime pool holds the connection's [`InterruptHandle`](duckdb) (`Send + Sync`, asserted in [`crate::duck`] by PR
 /// 12.5) and calls `interrupt()` on cancellation, which makes the running query error →
 /// `full_rebuild` rolls back and returns `Ok`. The watcher is aborted once the rewrite returns
 /// (whether it completed or was interrupted).

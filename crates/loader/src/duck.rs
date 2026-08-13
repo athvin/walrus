@@ -30,6 +30,20 @@ const RELOAD_REBUILD_DROP: &str = include_str!("../sql/duckdb/templates/reload_r
 const WIPE_GENERATION: &str = include_str!("../sql/duckdb/templates/wipe_generation.sql");
 
 /// Owns one table's `.duckdb` connection (mirror `<table>` + CDC log `<table>_raw`).
+///
+/// The owned handles are `Send`, but their shared references are not: `&T: Send` requires `T: Sync`,
+/// while both types contain a `RefCell`. These compile-fail guards pin the boundary that prevents the
+/// current borrowed connection API from satisfying `spawn_blocking`'s closure bound.
+///
+/// ```compile_fail,E0277
+/// fn requires_send<T: Send>() {}
+/// requires_send::<&'static duckdb::Connection>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// fn requires_send<T: Send>() {}
+/// requires_send::<&'static loader::duck::TableDb>();
+/// ```
 #[derive(Debug)]
 pub struct TableDb {
     conn: duckdb::Connection,
@@ -40,7 +54,9 @@ pub struct TableDb {
     /// `RefCell` provides interior mutability behind `&self`. `TableDb` is `Send + !Sync`:
     /// duckdb-rs declares `Connection: Send`, but the connection's `RefCell<InnerConnection>` and
     /// this cache's `RefCell` prevent shared access. That `!Sync` makes a future holding `&TableCtx`
-    /// non-`Send`, hence one apply worker per `.duckdb` file on a `LocalSet`. Asserted below (PR 12.5).
+    /// non-`Send`, hence one apply worker per `.duckdb` file on a `LocalSet`. See the bound analysis
+    /// and shared-thread open finding in
+    /// `docs/implementation/notes/rust-skills/async-spawn-blocking.md`.
     /// `Arc<[String]>` keeps reads to one indirection while preserving `TableDb: Send`.
     parquet_cols: RefCell<HashMap<i64, Arc<[String]>>>,
 }
