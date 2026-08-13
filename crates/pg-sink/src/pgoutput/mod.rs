@@ -187,6 +187,12 @@ pub enum Message {
 const MESSAGE_MAX_BYTES: usize = 88;
 const _: () = assert!(size_of::<Message>() <= MESSAGE_MAX_BYTES);
 
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+    size_of::<Option<Vec<TupleValue>>>() == size_of::<Vec<TupleValue>>(),
+    "Option<Vec<TupleValue>> lost its niche; revisit docs/implementation/notes/rust-skills/mem-thinvec.md"
+);
+
 impl Message {
     /// For a [`Message::StreamAbort`]: `Some(true)` when the WHOLE transaction aborted (`top == sub`,
     /// §9a — drop everything), `Some(false)` for a rolled-back savepoint inside a committing txn
