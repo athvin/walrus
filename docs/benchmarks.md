@@ -208,6 +208,24 @@ taking. Net: **5.8 for throughput, 5.7 for a low-risk per-row win.**
 Before/after deltas from PR 5.7 (sink) and PR 5.8 (loader) land here, each citing the baseline row it
 improves and the commit that made the change.
 
+### PR 11.16 — `SinkMeta` compact strings deferred
+
+The unchanged `pg-to-arrow` batch suite was re-run after PR 11.3 made the repeated `batch_id`
+assignment reuse its existing `String` allocation with `clone_from` (median, 1,000 rows per
+iteration, Apple M2, macOS 26.5.2, rustc 1.95.0, Criterion defaults):
+
+| `arrow/append_row` shape | median | ns/row |
+|---|---:|---:|
+| `narrow_int4` | 757.89 µs | 757.89 |
+| `wide30` | 1.4492 ms | 1,449.2 |
+| `text_heavy` | 1.1449 ms | 1,144.9 |
+| `tier2_fanout` | 1.3677 ms | 1,367.7 |
+
+These are fresh absolute medians, not evidence for a compact-string change: the benchmark contains
+no candidate implementation, and the committed PR 5.6 system profile still shows the loader
+saturating while sink inflight stays at zero. `Arc<str>` and compact-string crates remain deferred
+until allocation profiling identifies `SinkMeta` strings as an end-to-end sink limiter.
+
 ### PR 11.13 — key-column scratch (`SmallVec` declined)
 
 `PgRelation::key_columns()` was measured in isolation for the common one-key shape and a composite
