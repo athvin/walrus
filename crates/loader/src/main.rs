@@ -108,8 +108,10 @@ async fn run(cfg: LoaderConfig) -> Result<(), LoaderError> {
         o.db.configure_s3(&s3)?;
     }
 
-    // One apply loop per owned table. DuckDB's `Connection` is `!Send`, so the loops run on a
-    // `LocalSet` (this thread), the whole parallelism model being one worker per `.duckdb` file.
+    // One apply loop per owned table. DuckDB's `Connection` is `Send + !Sync` because it holds
+    // an interior `RefCell`, so a future holding `&TableCtx` is not `Send` and cannot go to
+    // `tokio::spawn`. The loops run on a `LocalSet` (this thread), the whole parallelism model being
+    // one worker per `.duckdb` file. Asserted in `duck.rs` (PR 12.5).
     let local = tokio::task::LocalSet::new();
     let handles: Vec<_> = owned
         .into_iter()

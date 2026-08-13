@@ -72,9 +72,10 @@ pub fn full_rebuild(
 
 /// [`full_rebuild`] wrapped so an in-flight rewrite is **aborted** the instant `cancel` fires (PR 3.12).
 /// The blocking `CREATE OR REPLACE` runs on this worker thread; a watcher task on the runtime pool holds
-/// the connection's [`InterruptHandle`](duckdb) (Send + Sync) and calls `interrupt()` on cancellation,
-/// which makes the running query error → `full_rebuild` rolls back and returns `Ok`. The watcher is
-/// aborted once the rewrite returns (whether it completed or was interrupted).
+/// the connection's [`InterruptHandle`](duckdb) (`Send + Sync`, asserted in [`crate::duck`] by PR
+/// 12.5) and calls `interrupt()` on cancellation, which makes the running query error →
+/// `full_rebuild` rolls back and returns `Ok`. The watcher is aborted once the rewrite returns
+/// (whether it completed or was interrupted).
 ///
 /// # Errors
 ///

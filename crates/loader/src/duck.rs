@@ -13,7 +13,7 @@ use common::PgRelation;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
-use std::rc::Rc;
+use std::sync::Arc;
 
 // DuckDB DDL templates (see `sql/duckdb/templates/`). Fixed structure with `{placeholder}` holes,
 // rendered by `.replace(...)`; per-table column lists stay interpolated in Rust (they can't be
@@ -35,11 +35,12 @@ pub struct TableDb {
     /// sink's homogeneous-file rule (walrus-pg-sink §3.5) cuts a fresh file at every DDL bump, so all
     /// files at one version share their columns and a DDL bump is a *new* key. So this cache never
     /// invalidates, and a Phase-A cycle claiming N same-version files runs one `DESCRIBE`, not N.
-    /// `RefCell` provides interior mutability behind `&self`; non-atomic `Rc` records that `TableDb`
-    /// is single-threaded by construction instead of suggesting thread-safe sharing (DuckDB
-    /// `Connection` is `!Send`, one per apply worker on a `LocalSet`). `Rc<[String]>` also keeps
-    /// reads to one indirection rather than `Rc<Vec<_>>`'s two (`clippy::rc_buffer`).
-    parquet_cols: RefCell<HashMap<i64, Rc<[String]>>>,
+    /// `RefCell` provides interior mutability behind `&self`. `TableDb` is `Send + !Sync`:
+    /// duckdb-rs declares `Connection: Send`, but the connection's `RefCell<InnerConnection>` and
+    /// this cache's `RefCell` prevent shared access. That `!Sync` makes a future holding `&TableCtx`
+    /// non-`Send`, hence one apply worker per `.duckdb` file on a `LocalSet`. Asserted below (PR 12.5).
+    /// `Arc<[String]>` keeps reads to one indirection while preserving `TableDb: Send`.
+    parquet_cols: RefCell<HashMap<i64, Arc<[String]>>>,
 }
 
 impl TableDb {
@@ -228,15 +229,15 @@ impl TableDb {
 
     /// The Parquet column list for `schema_version`, introspecting `uri` **once** per version and
     /// caching it (PR 5.8; sound by the homogeneous-file rule — see [`TableDb::parquet_cols`]).
-    fn columns_for(&self, uri: &str, schema_version: i64) -> Result<Rc<[String]>, LoaderError> {
+    fn columns_for(&self, uri: &str, schema_version: i64) -> Result<Arc<[String]>, LoaderError> {
         let cached = { self.parquet_cols.borrow().get(&schema_version).cloned() };
         if let Some(columns) = cached {
             return Ok(columns);
         }
-        let cols: Rc<[String]> = self.parquet_columns(uri)?.into();
+        let cols: Arc<[String]> = self.parquet_columns(uri)?.into();
         self.parquet_cols
             .borrow_mut()
-            .insert(schema_version, Rc::clone(&cols));
+            .insert(schema_version, Arc::clone(&cols));
         Ok(cols)
     }
 
@@ -503,6 +504,41 @@ pub(crate) fn duck_type(oid: u32) -> &'static str {
         _ => "VARCHAR", // text, varchar, enums, and everything else
     }
 }
+
+// Compile-time proof of the loader's threading model. This closure is type-checked but never run or
+// code-generated. The compiler derives every bound; no manual auto-trait implementation is needed.
+const _: fn() = || {
+    fn assert_send<T: Send + ?Sized>() {}
+    fn assert_sync<T: Sync + ?Sized>() {}
+
+    // Moves into `TableCtx` and then into the worker future.
+    assert_send::<TableDb>();
+    // The one value handed from a local worker to `tokio::spawn` during compaction drain.
+    assert_send::<duckdb::InterruptHandle>();
+    assert_sync::<duckdb::InterruptHandle>();
+    // Shared by the health server and every worker.
+    assert_send::<Arc<crate::health::LoaderState>>();
+    assert_sync::<Arc<crate::health::LoaderState>>();
+
+    // Pin walrus's own source of `!Sync`; DuckDB independently keeps the overall type `!Sync`.
+    fn cache_refcell(db: &TableDb) -> &RefCell<HashMap<i64, Arc<[String]>>> {
+        &db.parquet_cols
+    }
+    let _ = cache_refcell;
+};
+
+// Negative assertion: while the overall `TableDb` is not `Sync`, only the `()` impl applies and `_`
+// resolves. If every source of `!Sync` is removed, both impls apply and this line is ambiguous. This
+// is `static_assertions::assert_not_impl_all!` hand-rolled to avoid a direct dependency.
+const _: fn() = || {
+    trait AmbiguousIfSync<A> {
+        fn some_item() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+    impl<T: ?Sized + Sync> AmbiguousIfSync<u8> for T {}
+
+    let _ = <TableDb as AmbiguousIfSync<_>>::some_item;
+};
 
 #[cfg(test)]
 #[path = "duck_test.rs"]

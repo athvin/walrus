@@ -42,7 +42,7 @@ pub struct TableCtx {
     pub retention_lsn_lag: u64,
     /// The reload_id whose claim pause was already logged (PR 6.6) — a paused table says *why* it
     /// is idle once per pause, not once per poll. Per-table by construction (one `TableCtx` per
-    /// worker and `!Send` through its DuckDB connection), so this needs interior mutability behind
+    /// worker, with `!Sync` interior state), so this needs interior mutability behind
     /// `run_phase_a(&ctx)`, not synchronisation. `Option<i64>` is `Copy`, so `Cell` has no borrow
     /// flag or runtime panic path.
     pub pause_logged: Cell<Option<i64>>,

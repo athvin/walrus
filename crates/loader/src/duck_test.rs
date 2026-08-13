@@ -122,7 +122,7 @@ fn parquet_column_cache_hit_then_mutation_capable_miss() {
 
     let initial = db.columns_for(&parquet, 1).unwrap();
     let hit = db.columns_for("not-read-on-cache-hit.parquet", 1).unwrap();
-    assert!(Rc::ptr_eq(&initial, &hit), "cache hit reuses the same Rc");
+    assert!(Arc::ptr_eq(&initial, &hit), "cache hit reuses the same Arc");
 
     let miss = db.columns_for(&parquet, 2).unwrap();
     assert_eq!(&*miss, &*initial);
