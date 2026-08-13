@@ -135,10 +135,11 @@ impl Backfill {
     pub async fn connect(
         dsn: &str,
         epoch: EpochNo,
-        instance: String,
+        instance: impl Into<String>,
         triggers: BatchTriggers,
         statement_timeout: std::time::Duration,
     ) -> anyhow::Result<Self> {
+        let instance = instance.into();
         let (client, connection) = tokio_postgres::connect(dsn, NoTls)
             .await
             .context("open backfill SQL connection")?;

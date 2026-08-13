@@ -50,7 +50,7 @@ fn demux(ceiling: u64) -> StreamDemux {
         },
         Arc::new(SystemClock),
         common::EpochNo(1),
-        "test".into(),
+        "test",
         ceiling,
     )
 }

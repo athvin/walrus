@@ -84,12 +84,7 @@ async fn a_stream_of_inserts_forms_and_seals_a_batch() {
         max_bytes: u64::MAX,
         max_fill: Duration::from_secs(3600),
     };
-    let mut router = BatchRouter::new(
-        triggers,
-        Arc::new(SystemClock),
-        common::EpochNo(1),
-        "test".to_string(),
-    );
+    let mut router = BatchRouter::new(triggers, Arc::new(SystemClock), common::EpochNo(1), "test");
     let mut cache = RelationCache::default();
     let mut ctx = StreamCtx::default();
     let mut sealed_total = 0u64;

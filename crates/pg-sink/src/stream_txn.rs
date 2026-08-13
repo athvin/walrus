@@ -117,9 +117,10 @@ impl StreamDemux {
         triggers: BatchTriggers,
         clock: Arc<dyn Clock>,
         epoch: EpochNo,
-        sink_instance: String,
+        sink_instance: impl Into<String>,
         max_inflight_bytes: u64,
     ) -> Self {
+        let sink_instance = sink_instance.into();
         StreamDemux {
             open: HashMap::new(),
             current_top: None,

@@ -107,7 +107,7 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
         triggers,
         std::sync::Arc::new(pg_sink::batch::SystemClock),
         epoch,
-        cfg.instance.clone(),
+        &cfg.instance,
     );
     let mut checkpoint = pg_sink::checkpoint::DurabilityCheckpoint::new(start_lsn);
     // Large-transaction demux (§1.6): a txn over logical_decoding_work_mem streams before its commit.
@@ -115,7 +115,7 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
         triggers,
         std::sync::Arc::new(pg_sink::batch::SystemClock),
         epoch,
-        cfg.instance.clone(),
+        &cfg.instance,
         cfg.max_inflight_bytes.get(),
     );
 
@@ -124,7 +124,7 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
     // slot on an otherwise-idle publication (§1.9).
     let mut heartbeat = pg_sink::heartbeat::Heartbeat::connect(
         &cfg.source_db_url,
-        cfg.instance.clone(),
+        &cfg.instance,
         cfg.heartbeat_config(),
     )
     .await
@@ -306,7 +306,7 @@ async fn establish_stream(
     let mut backfill = pg_sink::snapshot::Backfill::connect(
         &cfg.source_db_url,
         epoch,
-        cfg.instance.clone(),
+        &cfg.instance,
         triggers,
         cfg.backfill_statement_timeout,
     )

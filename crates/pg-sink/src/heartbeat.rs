@@ -197,9 +197,10 @@ impl Heartbeat {
     /// Returns [`HeartbeatError::Connect`] if the source SQL connection or startup handshake fails.
     pub async fn connect(
         dsn: &str,
-        instance: String,
+        instance: impl Into<String>,
         cfg: HeartbeatConfig,
     ) -> Result<Self, HeartbeatError> {
+        let instance = instance.into();
         let (sql, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
             .await
             .map_err(HeartbeatError::Connect)?;

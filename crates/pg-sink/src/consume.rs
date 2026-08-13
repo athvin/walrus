@@ -609,8 +609,9 @@ impl BatchRouter {
         triggers: BatchTriggers,
         clock: Arc<dyn Clock>,
         epoch: EpochNo,
-        sink_instance: String,
+        sink_instance: impl Into<String>,
     ) -> Self {
+        let sink_instance = sink_instance.into();
         BatchRouter {
             batchers: HashMap::new(),
             triggers,
