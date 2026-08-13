@@ -9,6 +9,7 @@ pub mod compaction;
 pub mod config;
 pub mod ddl;
 pub mod duck;
+pub mod duck_ext;
 pub mod epoch;
 pub mod error;
 pub mod health;
