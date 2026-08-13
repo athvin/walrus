@@ -119,3 +119,7 @@ async fn compact(ctx: &TableCtx, shutdown: &CancellationToken) -> Result<(), Loa
     );
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "apply_loop_test.rs"]
+mod tests;

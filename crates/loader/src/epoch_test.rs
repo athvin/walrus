@@ -71,3 +71,24 @@ fn fresh_file_is_not_rebuilt() {
     assert!(!rebuild_for_new_epoch(&db, "orders", common::EpochNo(1)).unwrap());
     assert!(!rebuild_for_new_epoch(&db, "orders", common::EpochNo(5)).unwrap());
 }
+
+#[test]
+fn advance_only_publishes_a_forward_move() {
+    let (tx, rx) = tokio::sync::watch::channel(common::EpochNo(3));
+
+    assert!(!advance(&tx, Some(common::EpochNo(3))));
+    assert_eq!(*rx.borrow(), common::EpochNo(3));
+
+    assert!(advance(&tx, Some(common::EpochNo(5))));
+    assert_eq!(*rx.borrow(), common::EpochNo(5));
+
+    assert!(!advance(&tx, None));
+    assert_eq!(*rx.borrow(), common::EpochNo(5));
+}
+
+#[test]
+fn a_pinned_receiver_still_borrows_after_its_sender_is_gone() {
+    let rx = fixed_epoch_watch(common::EpochNo(11));
+
+    assert_eq!(*rx.borrow(), common::EpochNo(11));
+}
