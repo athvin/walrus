@@ -46,7 +46,16 @@ pub struct DecodeLoop<'a> {
     waiters: &'a crate::reload_signal::WatermarkWaiters,
 }
 
-/// Consuming configurator for [`DecodeLoop`]. Every field is required at [`Self::build`] time.
+/// Wires a [`DecodeLoop`]. Every setter consumes and returns the builder, so the chain must be kept:
+/// a dropped intermediate silently discards that field.
+///
+/// Ignoring a setter's return value is a compile error:
+///
+/// ```compile_fail
+/// #![deny(unused_must_use)]
+/// let builder = pg_sink::consume::DecodeLoop::builder();
+/// builder.epoch(common::EpochNo(7));
+/// ```
 #[derive(Debug, Default)]
 pub struct DecodeLoopBuilder<'a> {
     stream: Option<&'a mut ReplicationStream>,
