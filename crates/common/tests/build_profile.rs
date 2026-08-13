@@ -1,9 +1,27 @@
 //! Guards PR 5.7's workspace release-profile decision against silent drift.
 
+use std::path::Path;
+
 const WORKSPACE_MANIFEST: &str = include_str!("../../../Cargo.toml");
 const CODEGEN_UNITS_ADR: &str = "docs/implementation/notes/rust-skills/opt-codegen-units.md";
 const CODEGEN_UNITS_NOTE: &str =
     include_str!("../../../docs/implementation/notes/rust-skills/opt-codegen-units.md");
+const TARGET_CPU_ADR: &str = "docs/implementation/notes/rust-skills/opt-target-cpu.md";
+const BUILD_SURFACES: &[(&str, &str)] = &[
+    ("Cargo.toml", WORKSPACE_MANIFEST),
+    (
+        ".github/workflows/ci.yml",
+        include_str!("../../../.github/workflows/ci.yml"),
+    ),
+    (
+        "deploy/docker/Dockerfile.pg-sink",
+        include_str!("../../../deploy/docker/Dockerfile.pg-sink"),
+    ),
+    (
+        "deploy/docker/Dockerfile.loader",
+        include_str!("../../../deploy/docker/Dockerfile.loader"),
+    ),
+];
 
 fn table_body<'a>(manifest: &'a str, header: &str) -> Option<&'a str> {
     let mut offset = 0;
@@ -59,6 +77,32 @@ fn codegen_units_policy(manifest: &str) -> Result<(), &'static str> {
         Err("codegen-units declared")
     } else if !manifest.contains(CODEGEN_UNITS_ADR) {
         Err("missing codegen-units ADR link")
+    } else {
+        Ok(())
+    }
+}
+
+fn target_cpu_policy(body: &str) -> Result<(), &'static str> {
+    for (needle, diagnostic) in [
+        ("target-cpu", "target-cpu is set"),
+        ("RUSTFLAGS", "RUSTFLAGS is set"),
+        ("rustflags", "rustflags is set"),
+    ] {
+        if body.contains(needle) {
+            return Err(diagnostic);
+        }
+    }
+    Ok(())
+}
+
+fn cargo_config_policy(
+    config_toml_exists: bool,
+    legacy_config_exists: bool,
+) -> Result<(), &'static str> {
+    if config_toml_exists {
+        Err(".cargo/config.toml exists")
+    } else if legacy_config_exists {
+        Err(".cargo/config exists")
     } else {
         Ok(())
     }
@@ -133,4 +177,68 @@ fn codegen_units_policy_rejects_fabricated_input() {
             "manifest:\n{manifest}"
         );
     }
+}
+
+#[test]
+fn no_build_surface_sets_a_target_cpu() {
+    for (name, body) in BUILD_SURFACES {
+        assert_eq!(
+            target_cpu_policy(body),
+            Ok(()),
+            "{name} must remain portable; see {TARGET_CPU_ADR}"
+        );
+    }
+}
+
+#[test]
+fn no_cargo_config_exists() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    assert_eq!(
+        cargo_config_policy(
+            root.join(".cargo/config.toml").exists(),
+            root.join(".cargo/config").exists(),
+        ),
+        Ok(()),
+        "workspace Cargo config must remain absent; see {TARGET_CPU_ADR}"
+    );
+}
+
+#[test]
+fn target_cpu_policy_rejects_fabricated_input() {
+    let surface_cases = [
+        ("RUN cargo build --release", Ok(())),
+        (
+            "ENV RUSTFLAGS=\"-C target-cpu=native\"",
+            Err("target-cpu is set"),
+        ),
+        ("ENV RUSTFLAGS=-Copt-level=3", Err("RUSTFLAGS is set")),
+        (
+            "rustflags = [\"-C\", \"target-feature=+avx2\"]",
+            Err("rustflags is set"),
+        ),
+    ];
+    for (body, expected) in surface_cases {
+        assert_eq!(target_cpu_policy(body), expected, "surface:\n{body}");
+    }
+
+    let config_cases = [
+        ((false, false), Ok(())),
+        ((true, false), Err(".cargo/config.toml exists")),
+        ((false, true), Err(".cargo/config exists")),
+    ];
+    for ((config_toml_exists, legacy_config_exists), expected) in config_cases {
+        assert_eq!(
+            cargo_config_policy(config_toml_exists, legacy_config_exists),
+            expected
+        );
+    }
+}
+
+#[test]
+fn target_cpu_rejection_is_recorded() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    assert!(
+        root.join(TARGET_CPU_ADR).is_file(),
+        "missing target-CPU decision at {TARGET_CPU_ADR}"
+    );
 }
