@@ -1,3 +1,5 @@
+#![deny(clippy::indexing_slicing)] // PR 16.2: every hot-path access must carry a bounds proof.
+
 //! The [`Reader`] cursor: big-endian primitives over a bounds-checked byte slice. Every read is a
 //! `Result` — running off the end is a modelled [`DecodeError::UnexpectedEof`], never a panic.
 
@@ -36,17 +38,18 @@ impl<'a> Reader<'a> {
         self.buf.get(self.pos).copied()
     }
 
-    /// Error unless at least `n` bytes remain.
-    fn need(&self, n: usize) -> Result<(), DecodeError> {
-        if self.remaining() < n {
-            Err(DecodeError::UnexpectedEof {
-                needed: u32c(n),
-                offset: u32c(self.pos),
-                remaining: u32c(self.remaining()),
-            })
-        } else {
-            Ok(())
-        }
+    /// The unread tail. Successful reads are the only way `pos` advances, so the fallback is dead.
+    fn rest(&self) -> &'a [u8] {
+        self.buf.get(self.pos..).unwrap_or_default()
+    }
+
+    /// Error unless at least `n` bytes remain, returning exactly the checked head.
+    fn need(&self, n: usize) -> Result<&'a [u8], DecodeError> {
+        self.rest().get(..n).ok_or(DecodeError::UnexpectedEof {
+            needed: u32c(n),
+            offset: u32c(self.pos),
+            remaining: u32c(self.remaining()),
+        })
     }
 
     /// One byte (a `Byte1` type tag or an `Int8`).
@@ -55,8 +58,8 @@ impl<'a> Reader<'a> {
     ///
     /// Returns [`DecodeError::UnexpectedEof`] when no byte remains.
     pub fn byte1(&mut self) -> Result<u8, DecodeError> {
-        self.need(1)?;
-        let b = self.buf[self.pos];
+        // `need(1)` returns exactly one byte, so the total fallback cannot be reached.
+        let b = self.need(1)?.first().copied().unwrap_or_default();
         self.pos += 1;
         Ok(b)
     }
@@ -67,14 +70,13 @@ impl<'a> Reader<'a> {
     ///
     /// Returns [`DecodeError::UnexpectedEof`] when fewer than two bytes remain.
     pub fn int16(&mut self) -> Result<u16, DecodeError> {
-        self.need(2)?;
-        let arr: [u8; 2] = self.buf[self.pos..self.pos + 2].try_into().map_err(|_| {
-            DecodeError::UnexpectedEof {
+        let Some(&arr) = self.rest().first_chunk::<2>() else {
+            return Err(DecodeError::UnexpectedEof {
                 needed: 2,
                 offset: u32c(self.pos),
                 remaining: u32c(self.remaining()),
-            }
-        })?;
+            });
+        };
         self.pos += 2;
         Ok(u16::from_be_bytes(arr))
     }
@@ -85,14 +87,13 @@ impl<'a> Reader<'a> {
     ///
     /// Returns [`DecodeError::UnexpectedEof`] when fewer than four bytes remain.
     pub fn int32(&mut self) -> Result<u32, DecodeError> {
-        self.need(4)?;
-        let arr: [u8; 4] = self.buf[self.pos..self.pos + 4].try_into().map_err(|_| {
-            DecodeError::UnexpectedEof {
+        let Some(&arr) = self.rest().first_chunk::<4>() else {
+            return Err(DecodeError::UnexpectedEof {
                 needed: 4,
                 offset: u32c(self.pos),
                 remaining: u32c(self.remaining()),
-            }
-        })?;
+            });
+        };
         self.pos += 4;
         Ok(u32::from_be_bytes(arr))
     }
@@ -104,14 +105,13 @@ impl<'a> Reader<'a> {
     ///
     /// Returns [`DecodeError::UnexpectedEof`] when fewer than eight bytes remain.
     pub fn int64(&mut self) -> Result<i64, DecodeError> {
-        self.need(8)?;
-        let arr: [u8; 8] = self.buf[self.pos..self.pos + 8].try_into().map_err(|_| {
-            DecodeError::UnexpectedEof {
+        let Some(&arr) = self.rest().first_chunk::<8>() else {
+            return Err(DecodeError::UnexpectedEof {
                 needed: 8,
                 offset: u32c(self.pos),
                 remaining: u32c(self.remaining()),
-            }
-        })?;
+            });
+        };
         self.pos += 8;
         Ok(i64::from_be_bytes(arr))
     }
@@ -124,18 +124,19 @@ impl<'a> Reader<'a> {
     /// [`DecodeError::Utf8`] if the bytes before it are not valid UTF-8.
     pub fn string(&mut self) -> Result<String, DecodeError> {
         let start = self.pos;
-        match self.buf[start..].iter().position(|&b| b == 0) {
-            Some(rel) => {
-                let s = std::str::from_utf8(&self.buf[start..start + rel])?.to_string();
-                self.pos = start + rel + 1; // consume the NUL terminator
-                Ok(s)
-            }
-            None => Err(DecodeError::UnexpectedEof {
+        let tail = self.rest();
+        let Some(rel) = tail.iter().position(|&b| b == 0) else {
+            return Err(DecodeError::UnexpectedEof {
                 needed: 1,
                 offset: u32c(start),
                 remaining: u32c(self.remaining()),
-            }),
-        }
+            });
+        };
+        // `position` proved the split point; the total fallback is unreachable.
+        let (text, _) = tail.split_at_checked(rel).unwrap_or_default();
+        let s = std::str::from_utf8(text)?.to_string();
+        self.pos = start + rel + 1; // consume the NUL terminator
+        Ok(s)
     }
 
     /// Borrow the next `n` bytes without copying, advancing the cursor.
@@ -144,8 +145,7 @@ impl<'a> Reader<'a> {
     ///
     /// Returns [`DecodeError::UnexpectedEof`] when fewer than `n` bytes remain.
     pub fn slice(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
-        self.need(n)?;
-        let out = &self.buf[self.pos..self.pos + n];
+        let out = self.need(n)?;
         self.pos += n;
         Ok(out)
     }

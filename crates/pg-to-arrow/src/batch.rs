@@ -1,3 +1,5 @@
+#![deny(clippy::indexing_slicing)] // PR 16.2: the 460 ns/row append path carries width proofs.
+
 //! `BatchBuilder`: decoded `TupleValue`s + a `SinkMeta` → an Arrow `RecordBatch`.
 //!
 //! pgoutput ships values as canonical **text**; this builder parses each into its Tier-1 Arrow
@@ -35,6 +37,18 @@ enum Emit {
     Range,              // 5 builders: _lower, _upper, _lower_inc, _upper_inc, _empty
     Multirange,         // 1 builder: ListBuilder<StructBuilder>
     Geometric(GeoKind), // 1 builder: a nested STRUCT / LIST<STRUCT> of doubles
+}
+
+impl Emit {
+    /// Number of flat builders consumed by this source-column shape.
+    const fn width(&self) -> usize {
+        match self {
+            Self::Scalar | Self::Multirange | Self::Geometric(_) => 1,
+            Self::Interval => 3,
+            Self::Timetz => 2,
+            Self::Range => 5,
+        }
+    }
 }
 
 /// Arrow's erased builders do not implement [`Debug`](fmt::Debug); report only their arity so the
@@ -146,49 +160,60 @@ impl BatchBuilder {
         }
         // Clone the Fields (Arc) so we can read the field types while mutably borrowing `builders`.
         let fields = self.schema.fields().clone();
-        let mut bi = 0; // flat builder index; advances by each column's emit width
+        let mut builders: &mut [Box<dyn ArrayBuilder>] = &mut self.builders.0;
+        let mut remaining_fields: &[FieldRef] = &fields;
         for (emit, value) in self.plan.iter().zip(values) {
+            let width = emit.width();
+            let column = remaining_fields
+                .first()
+                .map_or("<unknown>", |field| field.name());
+            let (current_builders, rest) = std::mem::take(&mut builders)
+                .split_at_mut_checked(width)
+                .ok_or_else(|| Error::Downcast {
+                    column: column.to_string(),
+                })?;
+            let (current_fields, fields_rest) = remaining_fields
+                .split_at_checked(width)
+                .ok_or_else(|| Error::Downcast {
+                    column: column.to_string(),
+                })?;
             match emit {
                 Emit::Scalar => {
-                    append_value(
-                        self.builders.0[bi].as_mut(),
-                        &fields[bi],
-                        value,
-                        &mut self.ts_buf,
-                    )?;
-                    bi += 1;
+                    let ([builder], [field]) = (current_builders, current_fields) else {
+                        return Err(Error::Downcast {
+                            column: column.to_string(),
+                        });
+                    };
+                    append_value(builder.as_mut(), field, value, &mut self.ts_buf)?;
                 }
                 Emit::Interval => {
-                    append_interval(&mut self.builders.0[bi..bi + 3], fields[bi].name(), value)?;
-                    bi += 3;
+                    append_interval(current_builders, column, value)?;
                 }
                 Emit::Timetz => {
-                    append_timetz(&mut self.builders.0[bi..bi + 2], fields[bi].name(), value)?;
-                    bi += 2;
+                    append_timetz(current_builders, column, value)?;
                 }
                 Emit::Range => {
-                    append_range(
-                        &mut self.builders.0[bi..bi + 5],
-                        &fields[bi..bi + 5],
-                        value,
-                        &mut self.ts_buf,
-                    )?;
-                    bi += 5;
+                    append_range(current_builders, current_fields, value, &mut self.ts_buf)?;
                 }
                 Emit::Multirange => {
-                    append_multirange(
-                        self.builders.0[bi].as_mut(),
-                        &fields[bi],
-                        value,
-                        &mut self.ts_buf,
-                    )?;
-                    bi += 1;
+                    let ([builder], [field]) = (current_builders, current_fields) else {
+                        return Err(Error::Downcast {
+                            column: column.to_string(),
+                        });
+                    };
+                    append_multirange(builder.as_mut(), field, value, &mut self.ts_buf)?;
                 }
                 Emit::Geometric(kind) => {
-                    append_geometric(self.builders.0[bi].as_mut(), &fields[bi], value, *kind)?;
-                    bi += 1;
+                    let ([builder], [field]) = (current_builders, current_fields) else {
+                        return Err(Error::Downcast {
+                            column: column.to_string(),
+                        });
+                    };
+                    append_geometric(builder.as_mut(), field, value, *kind)?;
                 }
             }
+            builders = rest;
+            remaining_fields = fields_rest;
         }
         self.append_meta(meta)?;
         self.rows += 1;
@@ -410,6 +435,11 @@ fn append_interval(
     col: &str,
     value: &TupleValue,
 ) -> Result<(), Error> {
+    let [months_builder, days_builder, micros_builder] = builders else {
+        return Err(Error::Downcast {
+            column: col.to_string(),
+        });
+    };
     let parts = match value {
         TupleValue::Null | TupleValue::UnchangedToast => None,
         _ => Some(crate::tier2::parse_interval(text(
@@ -418,17 +448,17 @@ fn append_interval(
             &DataType::Int64,
         )?)?),
     };
-    let months = downcast!(builders[0], Int32Builder, col);
+    let months = downcast!(months_builder.as_mut(), Int32Builder, col);
     match parts {
         Some((m, _, _)) => months.append_value(m),
         None => months.append_null(),
     }
-    let days = downcast!(builders[1], Int32Builder, col);
+    let days = downcast!(days_builder.as_mut(), Int32Builder, col);
     match parts {
         Some((_, d, _)) => days.append_value(d),
         None => days.append_null(),
     }
-    let micros = downcast!(builders[2], Int64Builder, col);
+    let micros = downcast!(micros_builder.as_mut(), Int64Builder, col);
     match parts {
         Some((_, _, us)) => micros.append_value(us),
         None => micros.append_null(),
@@ -442,6 +472,11 @@ fn append_timetz(
     col: &str,
     value: &TupleValue,
 ) -> Result<(), Error> {
+    let [micros_builder, offset_builder] = builders else {
+        return Err(Error::Downcast {
+            column: col.to_string(),
+        });
+    };
     let parts = match value {
         TupleValue::Null | TupleValue::UnchangedToast => None,
         _ => Some(crate::tier2::parse_timetz(text(
@@ -450,12 +485,12 @@ fn append_timetz(
             &DataType::Int64,
         )?)?),
     };
-    let micros = downcast!(builders[0], Int64Builder, col);
+    let micros = downcast!(micros_builder.as_mut(), Int64Builder, col);
     match parts {
         Some((us, _)) => micros.append_value(us),
         None => micros.append_null(),
     }
-    let offset = downcast!(builders[1], Int32Builder, col);
+    let offset = downcast!(offset_builder.as_mut(), Int32Builder, col);
     match parts {
         Some((_, off)) => offset.append_value(off),
         None => offset.append_null(),
@@ -472,33 +507,55 @@ fn append_range(
     value: &TupleValue,
     scratch: &mut String,
 ) -> Result<(), Error> {
-    let col = fields[0].name();
+    let col = fields.first().map_or("<unknown>", |field| field.name());
+    let [lower_builder, upper_builder, lower_inc_builder, upper_inc_builder, empty_builder] =
+        builders
+    else {
+        return Err(Error::Downcast {
+            column: col.to_string(),
+        });
+    };
+    let [lower_field, upper_field, _, _, _] = fields else {
+        return Err(Error::Downcast {
+            column: col.to_string(),
+        });
+    };
     if matches!(value, TupleValue::Null | TupleValue::UnchangedToast) {
         // Whole-column NULL → every sibling null (bounds via append_value, flags via BooleanBuilder).
-        append_value(builders[0].as_mut(), &fields[0], &TupleValue::Null, scratch)?;
-        append_value(builders[1].as_mut(), &fields[1], &TupleValue::Null, scratch)?;
-        for b in builders[2..5].iter_mut() {
-            bool_builder(b.as_mut(), col)?.append_null();
+        append_value(
+            lower_builder.as_mut(),
+            lower_field,
+            &TupleValue::Null,
+            scratch,
+        )?;
+        append_value(
+            upper_builder.as_mut(),
+            upper_field,
+            &TupleValue::Null,
+            scratch,
+        )?;
+        for builder in [lower_inc_builder, upper_inc_builder, empty_builder] {
+            bool_builder(builder.as_mut(), col)?.append_null();
         }
         return Ok(());
     }
-    let r = crate::range::parse_range(text(value, col, fields[0].data_type())?)?;
+    let r = crate::range::parse_range(text(value, col, lower_field.data_type())?)?;
     // Bounds reuse the Tier-1 text parsing; a `None` (unbounded) bound appends null.
     append_value(
-        builders[0].as_mut(),
-        &fields[0],
+        lower_builder.as_mut(),
+        lower_field,
         &opt_text_value(r.lower.as_deref()),
         scratch,
     )?;
     append_value(
-        builders[1].as_mut(),
-        &fields[1],
+        upper_builder.as_mut(),
+        upper_field,
         &opt_text_value(r.upper.as_deref()),
         scratch,
     )?;
-    bool_builder(builders[2].as_mut(), col)?.append_value(r.lower_inc);
-    bool_builder(builders[3].as_mut(), col)?.append_value(r.upper_inc);
-    bool_builder(builders[4].as_mut(), col)?.append_value(r.empty);
+    bool_builder(lower_inc_builder.as_mut(), col)?.append_value(r.lower_inc);
+    bool_builder(upper_inc_builder.as_mut(), col)?.append_value(r.upper_inc);
+    bool_builder(empty_builder.as_mut(), col)?.append_value(r.empty);
     Ok(())
 }
 
@@ -537,7 +594,9 @@ fn append_multirange(
 fn multirange_elem_type(field: &Field) -> Result<DataType, Error> {
     if let DataType::List(item) = field.data_type() {
         if let DataType::Struct(fs) = item.data_type() {
-            return Ok(fs[0].data_type().clone());
+            if let Some(bound) = fs.first() {
+                return Ok(bound.data_type().clone());
+            }
         }
     }
     Err(Error::Downcast {
@@ -920,8 +979,11 @@ fn parse_timestamptz_micros(s: &str, col: &str) -> Result<i64, Error> {
     let mut n = s.replacen(' ', "T", 1);
     // Postgres prints whole-hour offsets as `+HH`; jiff wants `+HH:MM`.
     if let Some(t) = n.find('T') {
-        if let Some(sign) = n[t..].rfind(['+', '-']) {
-            if n[t + sign..].len() == 3 {
+        if let Some(sign) = n.get(t..).and_then(|suffix| suffix.rfind(['+', '-'])) {
+            if t.checked_add(sign)
+                .and_then(|start| n.get(start..))
+                .is_some_and(|offset| offset.len() == 3)
+            {
                 n.push_str(":00");
             }
         }
