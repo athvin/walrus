@@ -19,6 +19,7 @@
 //! it only ever adds / widens — it never destructively drops or re-casts history.
 
 use crate::duck::{duck_type, user_view_sql, TableDb};
+use crate::duck_ext::DuckResultExt;
 use crate::error::LoaderError;
 use common::oids::{FLOAT4, FLOAT8, INT2, INT4, INT8};
 use common::{EpochNo, PgColumn, PgRelation};
@@ -275,10 +276,7 @@ pub fn apply_additive(
         return Ok(());
     }
     conn.execute_batch(&sql)
-        .map_err(|source| LoaderError::Duck {
-            op: format!("apply additive DDL to {table}"),
-            source,
-        })
+        .duck_with(|| format!("apply additive DDL to {table}"))
 }
 
 /// Apply destructive changes (PR 3.9) — the mirror-vs-raw asymmetry is the whole point: the mirror
@@ -307,10 +305,7 @@ pub fn apply_destructive(
                     user_view_sql(table)
                 );
                 conn.execute_batch(&sql)
-                    .map_err(|source| LoaderError::Duck {
-                        op: format!("drop column {name} on {table}"),
-                        source,
-                    })?;
+                    .duck_with(|| format!("drop column {name} on {table}"))?;
             }
             DestructiveChange::LossyType { name, new } => {
                 let ty = duck_type(new.type_oid);
@@ -319,10 +314,7 @@ pub fn apply_destructive(
                 conn.execute_batch(&format!(
                     "ALTER TABLE \"{table}_raw\" ALTER COLUMN \"{name}\" TYPE VARCHAR;"
                 ))
-                .map_err(|source| LoaderError::Duck {
-                    op: format!("widen raw {name} on {table}"),
-                    source,
-                })?;
+                .duck_with(|| format!("widen raw {name} on {table}"))?;
                 // Mirror: attempt the in-place cast. DuckDB validates before applying, so a failure
                 // leaves the mirror unchanged → QUARANTINE (loud, terminal). Never silent data loss.
                 if let Err(e) = conn.execute_batch(&format!(
@@ -339,10 +331,7 @@ pub fn apply_destructive(
                     "DROP VIEW IF EXISTS \"{name}_current\"; \
                      DROP TABLE IF EXISTS \"{name}\"; DROP TABLE IF EXISTS \"{name}_raw\";"
                 ))
-                .map_err(|source| LoaderError::Duck {
-                    op: format!("drop table {name}"),
-                    source,
-                })?;
+                .duck_with(|| format!("drop table {name}"))?;
             }
         }
     }

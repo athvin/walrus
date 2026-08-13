@@ -3,6 +3,7 @@
 //! file: if a still-live owner held it we'd fail opaquely here, which is why the ordered bootstrap
 //! proves the lease is reclaimable *before* calling [`TableDb::open`].
 
+use crate::duck_ext::DuckResultExt;
 use crate::error::LoaderError;
 use crate::plan::TablePlan;
 use common::oids::{
@@ -53,10 +54,8 @@ impl TableDb {
     /// Returns [`LoaderError::Duck`] if DuckDB cannot open the file or acquire its writer lock.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LoaderError> {
         let path = path.as_ref();
-        let conn = duckdb::Connection::open(path).map_err(|source| LoaderError::Duck {
-            op: format!("open {}", path.display()),
-            source,
-        })?;
+        let conn =
+            duckdb::Connection::open(path).duck_with(|| format!("open {}", path.display()))?;
         Ok(TableDb {
             conn,
             parquet_cols: RefCell::new(HashMap::new()),
@@ -144,10 +143,7 @@ impl TableDb {
 
         self.conn
             .execute_batch(&format!("{mirror} {applied_cols} {raw} {user_view} {meta}"))
-            .map_err(|source| LoaderError::Duck {
-                op: format!("ensure tables for {table}"),
-                source,
-            })?;
+            .duck_with(|| format!("ensure tables for {table}"))?;
         Ok(())
     }
 
@@ -167,12 +163,7 @@ impl TableDb {
             .replace("{use_ssl}", use_ssl)
             .replace("{access_key}", &esc(&s3.access_key_id))
             .replace("{secret_key}", &esc(&s3.secret_access_key));
-        self.conn
-            .execute_batch(&sql)
-            .map_err(|source| LoaderError::Duck {
-                op: "configure S3".to_string(),
-                source,
-            })
+        self.conn.execute_batch(&sql).duck("configure S3")
     }
 
     /// Phase A (PR 3.2): append one Parquet file **verbatim** into `<table>_raw`, promoting
@@ -222,10 +213,7 @@ impl TableDb {
         let n = self
             .conn
             .execute(&sql, [])
-            .map_err(|source| LoaderError::Duck {
-                op: format!("append {s3_uri} → {table}_raw"),
-                source,
-            })?;
+            .duck_with(|| format!("append {s3_uri} → {table}_raw"))?;
         Ok(n as u64)
     }
 
@@ -254,21 +242,12 @@ impl TableDb {
         let mut stmt = self
             .conn
             .prepare(&format!("DESCRIBE SELECT * FROM read_parquet('{uri}')"))
-            .map_err(|source| LoaderError::Duck {
-                op: format!("describe {uri}"),
-                source,
-            })?;
+            .duck_with(|| format!("describe {uri}"))?;
         let cols = stmt
             .query_map([], |r| r.get::<_, String>(0))
-            .map_err(|source| LoaderError::Duck {
-                op: format!("describe {uri}"),
-                source,
-            })?
+            .duck_with(|| format!("describe {uri}"))?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|source| LoaderError::Duck {
-                op: format!("describe {uri}"),
-                source,
-            })?;
+            .duck_with(|| format!("describe {uri}"))?;
         Ok(cols)
     }
 
@@ -290,10 +269,7 @@ impl TableDb {
                 [],
                 |r| r.get(0),
             )
-            .map_err(|source| LoaderError::Duck {
-                op: "read schema_version".to_string(),
-                source,
-            })
+            .duck("read schema_version")
     }
 
     /// Advance the reconcile watermark after the additive DDL for `v` has been applied to both tables.
@@ -307,10 +283,7 @@ impl TableDb {
                 "UPDATE \"_walrus_meta\" SET v = ? WHERE k = 'schema_version'",
                 duckdb::params![v],
             )
-            .map_err(|source| LoaderError::Duck {
-                op: "set schema_version".to_string(),
-                source,
-            })?;
+            .duck("set schema_version")?;
         Ok(())
     }
 
@@ -331,10 +304,7 @@ impl TableDb {
                 [],
                 |r| r.get(0),
             )
-            .map_err(|source| LoaderError::Duck {
-                op: "probe _walrus_meta".to_string(),
-                source,
-            })?;
+            .duck("probe _walrus_meta")?;
         if has_meta == 0 {
             return Ok(None);
         }
@@ -346,10 +316,7 @@ impl TableDb {
                 [],
                 |r| r.get(0),
             )
-            .map_err(|source| LoaderError::Duck {
-                op: "read built epoch".to_string(),
-                source,
-            })?;
+            .duck("read built epoch")?;
         Ok(v.map(EpochNo))
     }
 
@@ -366,10 +333,7 @@ impl TableDb {
                  ON CONFLICT (k) DO UPDATE SET v = excluded.v",
                 duckdb::params![epoch.0],
             )
-            .map_err(|source| LoaderError::Duck {
-                op: "set built epoch".to_string(),
-                source,
-            })?;
+            .duck("set built epoch")?;
         Ok(())
     }
 
@@ -388,10 +352,7 @@ impl TableDb {
                 [],
                 |r| r.get(0),
             )
-            .map_err(|source| LoaderError::Duck {
-                op: "read recorded reload_id".to_string(),
-                source,
-            })?;
+            .duck("read recorded reload_id")?;
         Ok(v.unwrap_or(0))
     }
 
@@ -408,10 +369,7 @@ impl TableDb {
                  ON CONFLICT (k) DO UPDATE SET v = excluded.v",
                 duckdb::params![reload_id],
             )
-            .map_err(|source| LoaderError::Duck {
-                op: "set recorded reload_id".to_string(),
-                source,
-            })?;
+            .duck("set recorded reload_id")?;
         Ok(())
     }
 
@@ -441,10 +399,7 @@ impl TableDb {
         let table = &plan.table;
         self.conn
             .execute_batch(&RELOAD_REBUILD_DROP.replace("{table}", table))
-            .map_err(|source| LoaderError::Duck {
-                op: format!("reload rebuild drop for {table}"),
-                source,
-            })?;
+            .duck_with(|| format!("reload rebuild drop for {table}"))?;
         self.ensure_tables_planned(plan, schema_version)?;
         self.set_schema_version(schema_version)?;
         Ok(())
@@ -461,10 +416,7 @@ impl TableDb {
     pub fn wipe_generation(&self, table: &str) -> Result<(), LoaderError> {
         self.conn
             .execute_batch(&WIPE_GENERATION.replace("{table}", table))
-            .map_err(|source| LoaderError::Duck {
-                op: format!("wipe generation for {table}"),
-                source,
-            })?;
+            .duck_with(|| format!("wipe generation for {table}"))?;
         Ok(())
     }
 }

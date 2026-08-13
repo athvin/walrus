@@ -7,6 +7,7 @@
 //! so re-running over the same tail produces a byte-identical mirror. A crash between the DuckDB commit
 //! and the control advance just re-runs Phase B — no bespoke recovery.
 
+use crate::duck_ext::DuckResultExt;
 use crate::error::LoaderError;
 use crate::phase_a::TableCtx;
 use crate::plan::TablePlan;
@@ -79,10 +80,7 @@ pub async fn run_phase_b(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
             [after.to_string()],
             |r| r.get(0),
         )
-        .map_err(|source| LoaderError::Duck {
-            op: "scan un-transformed tail".to_string(),
-            source,
-        })?;
+        .duck("scan un-transformed tail")?;
     let Some(max_hex) = max_hex else {
         return Ok(None); // <table>_raw is empty — nothing to transform yet
     };
@@ -96,19 +94,12 @@ pub async fn run_phase_b(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     // bootstrap shape (and, PR 4.2, with the Tier-2 emit/recombine from the descriptors).
     let t = current_transform(ctx).await?;
     conn.execute_batch("BEGIN TRANSACTION;")
-        .map_err(|source| LoaderError::Duck {
-            op: "begin transform txn".to_string(),
-            source,
-        })?;
+        .duck("begin transform txn")?;
     if let Err(e) = apply_transform(conn, &t, &after) {
         let _ = conn.execute_batch("ROLLBACK;");
         return Err(e);
     }
-    conn.execute_batch("COMMIT;")
-        .map_err(|source| LoaderError::Duck {
-            op: "commit transform txn".to_string(),
-            source,
-        })?;
+    conn.execute_batch("COMMIT;").duck("commit transform txn")?;
 
     // Advance the watermark AFTER the DuckDB commit. The CHECK (transformed_lsn <= raw_appended_lsn)
     // holds because Phase A ran first this cycle. `max_lsn` can equal the prior `transformed_lsn` (a

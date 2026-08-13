@@ -10,6 +10,7 @@
 //! It runs on the table's **own worker thread**, serialized after an apply cycle (no separate connection,
 //! no quiescing dance), holds the exclusive writer, and needs ~2× transient space for the rewrite.
 
+use crate::duck_ext::{duck_err, DuckResultExt};
 use crate::error::LoaderError;
 use crate::transform::TransformSql;
 use common::Lsn;
@@ -42,10 +43,7 @@ pub fn full_rebuild(
     // from the retained tail exactly as the incremental path resolves it.
     let boundary = t.latest_truncate(conn, &Lsn::ZERO)?;
     conn.execute_batch("BEGIN TRANSACTION;")
-        .map_err(|source| LoaderError::Duck {
-            op: "begin rebuild txn".to_string(),
-            source,
-        })?;
+        .duck("begin rebuild txn")?;
     if let Err(source) = conn.execute_batch(&t.render_rebuild(&boundary)) {
         let _ = conn.execute_batch("ROLLBACK;");
         if cancel.is_cancelled() {
@@ -57,16 +55,9 @@ pub fn full_rebuild(
             );
             return Ok(());
         }
-        return Err(LoaderError::Duck {
-            op: format!("full rebuild {}", t.table()),
-            source,
-        });
+        return Err(duck_err(format!("full rebuild {}", t.table()), source));
     }
-    conn.execute_batch("COMMIT;")
-        .map_err(|source| LoaderError::Duck {
-            op: "commit rebuild txn".to_string(),
-            source,
-        })?;
+    conn.execute_batch("COMMIT;").duck("commit rebuild txn")?;
     Ok(())
 }
 
@@ -119,15 +110,9 @@ pub fn prune_raw(
             ),
             duckdb::params![floor.to_string()],
         )
-        .map_err(|source| LoaderError::Duck {
-            op: format!("prune {}_raw", t.table()),
-            source,
-        })?;
+        .duck_with(|| format!("prune {}_raw", t.table()))?;
     conn.execute_batch("CHECKPOINT;")
-        .map_err(|source| LoaderError::Duck {
-            op: format!("checkpoint after prune {}", t.table()),
-            source,
-        })?;
+        .duck_with(|| format!("checkpoint after prune {}", t.table()))?;
     Ok(n as u64)
 }
 

@@ -11,6 +11,7 @@
 //! the mirror idempotent (the guard makes a re-applied boundary row a no-op). The full-rebuild (PR 3.11)
 //! remains the safety net regardless; this makes the *incremental* path self-correcting.
 
+use crate::duck_ext::DuckResultExt;
 use crate::error::LoaderError;
 use common::{Lsn, PgRelation};
 
@@ -381,8 +382,5 @@ pub fn apply_transform(
 ) -> Result<(), LoaderError> {
     let boundary = t.latest_truncate(conn, after_lsn)?;
     conn.execute_batch(&t.render(after_lsn, &boundary))
-        .map_err(|source| LoaderError::Duck {
-            op: format!("transform {}", t.table),
-            source,
-        })
+        .duck_with(|| format!("transform {}", t.table))
 }
