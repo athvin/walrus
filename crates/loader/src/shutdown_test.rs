@@ -1,3 +1,4 @@
+use super::cancel_on_exit;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 

@@ -69,17 +69,26 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
         token.clone(),
     ));
 
-    // Shared bootstrap steps 2–4. On failure, tear the health server down before propagating the
-    // classified error (whose exit code `main` surfaces).
+    let result = shutdown::cancel_on_exit(&token, pipeline(&cfg, &token, &state)).await;
+    tracing::info!("draining health server");
+    server
+        .await
+        .context("health server task join")?
+        .context("health server")?;
+    result
+}
+
+/// The fallible middle of the sink lifecycle. The caller holds a cancellation drop guard for this
+/// future's entire lifetime, so every early return winds down token-driven side tasks.
+async fn pipeline(
+    cfg: &SinkConfig,
+    token: &tokio_util::sync::CancellationToken,
+    state: &health::HealthState,
+) -> anyhow::Result<()> {
+    // Shared bootstrap steps 2–4. The enclosing drop guard tears down token-driven tasks before a
+    // classified error reaches `main`.
     let deadline = Instant::now() + cfg.startup_deadline;
-    let ctx = match bootstrap::run_shared(&cfg, deadline).await {
-        Ok(ctx) => ctx,
-        Err(e) => {
-            token.cancel();
-            let _ = server.await;
-            return Err(e.into());
-        }
-    };
+    let ctx = bootstrap::run_shared(cfg, deadline).await?;
 
     state.mark_ready();
     tracing::info!("bootstrap complete; ready");
@@ -100,7 +109,7 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
         epoch,
         start_lsn,
         sink,
-    } = establish_stream(&cfg, &ctx, &mut cache, triggers, SCHEMA_VERSION).await?;
+    } = establish_stream(cfg, &ctx, &mut cache, triggers, SCHEMA_VERSION).await?;
     tracing::info!(slot = %cfg.slot_name, start_lsn = %start_lsn, epoch = %epoch, "streaming logical replication");
 
     let mut router = consume::BatchRouter::new(
@@ -169,7 +178,7 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
         .demux(&mut demux)
         .ddl(&mut ddl)
         .heartbeat(&mut heartbeat)
-        .health(&state)
+        .health(state)
         .pool(&ctx.control_pool)
         .epoch(epoch)
         .waiters(&waiters)
@@ -184,11 +193,6 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
     reload_controller
         .await
         .context("reload controller task join")?;
-    tracing::info!("draining health server");
-    server
-        .await
-        .context("health server task join")?
-        .context("health server")?;
     result
 }
 

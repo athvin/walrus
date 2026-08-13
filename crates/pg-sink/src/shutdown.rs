@@ -29,6 +29,17 @@ use common::{EpochNo, Lsn};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::sync::CancellationToken;
 
+/// Run `body` while holding a [`CancellationToken`] drop guard. Whether the body succeeds,
+/// returns early with an error, or unwinds, the token is cancelled before this function returns.
+/// This scope must end before callers join tasks whose shutdown waits on the token.
+pub async fn cancel_on_exit<F>(token: &CancellationToken, body: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    let _guard = token.clone().drop_guard();
+    body.await
+}
+
 /// Outcome of a drain attempt (the caller maps this to an `ExitCode` — a completed drain is `Success`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrainOutcome {

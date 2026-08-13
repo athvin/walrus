@@ -12,6 +12,7 @@ use object_store::aws::AmazonS3Builder;
 use object_store::ObjectStore;
 use std::process::ExitCode;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 fn main() -> ExitCode {
     let cfg = match LoaderConfig::load() {
@@ -64,17 +65,31 @@ async fn run(cfg: LoaderConfig) -> Result<(), LoaderError> {
         token.clone(),
     ));
 
-    let pool = control::connect(&cfg.control_db_url).await?;
-    let store: Arc<dyn ObjectStore> = build_store(&cfg)?;
+    let result = loader::shutdown::cancel_on_exit(&token, pipeline(&cfg, &token, &state)).await;
+    server
+        .await
+        .map_err(|source| LoaderError::Health {
+            op: "join",
+            source: Box::new(source),
+        })?
+        .map_err(|source| LoaderError::Health {
+            op: "serve",
+            source: source.into(),
+        })?;
+    result
+}
 
-    let owned = match bootstrap::bootstrap(&cfg, &pool, store.as_ref(), &state).await {
-        Ok(owned) => owned,
-        Err(e) => {
-            token.cancel();
-            let _ = server.await;
-            return Err(e);
-        }
-    };
+/// The fallible middle of the loader lifecycle. The caller holds a cancellation drop guard for
+/// this future's entire lifetime, so every early return winds down token-driven side tasks.
+async fn pipeline(
+    cfg: &LoaderConfig,
+    token: &CancellationToken,
+    state: &Arc<LoaderState>,
+) -> Result<(), LoaderError> {
+    let pool = control::connect(&cfg.control_db_url).await?;
+    let store: Arc<dyn ObjectStore> = build_store(cfg)?;
+
+    let owned = bootstrap::bootstrap(cfg, &pool, store.as_ref(), state).await?;
     state.mark_ready();
     let keys: Vec<(String, String)> = owned.iter().map(|t| t.key()).collect();
     // Zero-init every per-table loader series so /metrics lists the owned tables from the first scrape,
@@ -103,7 +118,7 @@ async fn run(cfg: LoaderConfig) -> Result<(), LoaderError> {
 
     // Configure DuckDB's httpfs on every owned file so `read_parquet('s3://…')` (Phase A) has the
     // staging-bucket credentials — the binary's equivalent of what the compose tests set up by hand.
-    let s3 = duck_s3_access(&cfg);
+    let s3 = duck_s3_access(cfg);
     for o in &owned {
         o.db.configure_s3(&s3)?;
     }
@@ -124,7 +139,7 @@ async fn run(cfg: LoaderConfig) -> Result<(), LoaderError> {
                 series: format!("{}.{}", o.schema, o.table),
                 rel: o.relation,
                 db: o.db,
-                state: Arc::clone(&state),
+                state: Arc::clone(state),
                 max_files: cfg.max_files_per_cycle,
                 poll_interval: cfg.poll_interval,
                 compaction_interval: cfg.compaction_interval,
@@ -164,16 +179,6 @@ async fn run(cfg: LoaderConfig) -> Result<(), LoaderError> {
     tracing::info!("SIGTERM: releasing leases and draining");
     renewer.abort();
     lease::release_all(&pool, epoch, &keys, &cfg.instance).await;
-    server
-        .await
-        .map_err(|source| LoaderError::Health {
-            op: "join",
-            source: Box::new(source),
-        })?
-        .map_err(|source| LoaderError::Health {
-            op: "serve",
-            source: source.into(),
-        })?;
     Ok(())
 }
 
