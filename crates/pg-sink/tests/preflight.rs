@@ -16,6 +16,7 @@ use pg_sink::preflight::{connect_source, PkMode, PreflightError, SourcePreflight
 use tokio_postgres::NoTls;
 
 const SOURCE_MIGRATION: &str = include_str!("../../../migrations/source/0001_publication.sql");
+const SOURCE_DDL_MIGRATION: &str = include_str!("../../../migrations/source/0002_ddl_triggers.sql");
 const SOURCE_MIGRATION_0003: &str =
     include_str!("../../../migrations/source/0003_reload_signal.sql");
 
@@ -183,6 +184,9 @@ async fn publication_missing_heartbeat_is_terminal() {
     }
     assert!(common::Error::from(err).is_terminal());
 
-    // Restore the internal tables for the other tests (idempotent).
+    // Restore the internal tables and the audit table's full shape for the other tests
+    // (idempotent). The event triggers survive dropping the tables, so restoring only the
+    // 0001 stub leaves them targeting columns that no longer exist.
     setup.batch_execute(SOURCE_MIGRATION).await.unwrap();
+    setup.batch_execute(SOURCE_DDL_MIGRATION).await.unwrap();
 }

@@ -153,10 +153,16 @@ async fn just_reload_recipe_sql_selects_current_epoch_and_parses_table() {
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     let mut tx = pool.begin().await.unwrap();
+    let seeded_epoch: i64 =
+        sqlx::query_scalar("SELECT COALESCE(MAX(epoch), 0) + 1 FROM walrus.replication_state")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
     sqlx::query(
         "INSERT INTO walrus.replication_state (epoch, slot_name, created_lsn, status)
-         VALUES (640004, 'walrus_recipe_test', '0/0', 'streaming')",
+         VALUES ($1, 'walrus_recipe_test', '0/0', 'streaming')",
     )
+    .bind(seeded_epoch)
     .execute(&mut *tx)
     .await
     .unwrap();
@@ -170,7 +176,10 @@ async fn just_reload_recipe_sql_selects_current_epoch_and_parses_table() {
     .fetch_one(&mut *tx)
     .await
     .unwrap();
-    assert_eq!(epoch, 640_004, "the recipe targets the CURRENT (max) epoch");
+    assert_eq!(
+        epoch, seeded_epoch,
+        "the recipe targets the CURRENT (max) epoch"
+    );
     assert_eq!((schema.as_str(), table.as_str()), ("public", "orders"));
     assert_eq!(flavor, "reload");
     tx.rollback().await.unwrap();
