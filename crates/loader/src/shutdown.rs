@@ -54,14 +54,18 @@ pub fn install_signal_handlers() -> CancellationToken {
             }
         };
         tokio::select! {
+            biased;
+            // Cancelled elsewhere (for example, a bootstrap failure): stop without claiming a
+            // signal arrived.
+            _ = child.cancelled() => {}
             _ = term.recv() => tracing::info!("SIGTERM received — draining"),
             _ = int.recv() => tracing::info!("SIGINT received — draining"),
-            _ = child.cancelled() => {}
         }
         child.cancel();
         // Keep the streams alive and swallow any further signals so a second SIGTERM mid-drain cannot
         // restore the default action and kill the process before the ordered drain completes.
         loop {
+            // Deliberately leave this select unbiased: both arms swallow an equivalent signal.
             tokio::select! {
                 _ = term.recv() => tracing::warn!("SIGTERM during drain — ignored, drain already in progress"),
                 _ = int.recv() => tracing::warn!("SIGINT during drain — ignored, drain already in progress"),

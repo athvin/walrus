@@ -114,6 +114,10 @@ pub fn install_signal_handlers() -> CancellationToken {
             }
         };
         tokio::select! {
+            biased;
+            // Cancelled elsewhere (for example, a bootstrap failure): stop without claiming a
+            // signal arrived or leaking the task.
+            _ = child.cancelled() => {}
             _ = sigterm.recv() => {
                 tracing::info!("SIGTERM received; cancelling");
                 child.cancel();
@@ -122,8 +126,6 @@ pub fn install_signal_handlers() -> CancellationToken {
                 tracing::info!("SIGINT received; cancelling");
                 child.cancel();
             }
-            // Cancelled elsewhere (e.g. a bootstrap failure) — stop listening; don't leak the task.
-            _ = child.cancelled() => {}
         }
     });
     token

@@ -36,6 +36,7 @@ pub async fn apply_loop(ctx: TableCtx, shutdown: CancellationToken) -> Result<()
         .max(ctx.epoch);
     loop {
         tokio::select! {
+            biased;
             _ = shutdown.cancelled() => return drain(&ctx),
             _ = tick.tick() => {}
         }

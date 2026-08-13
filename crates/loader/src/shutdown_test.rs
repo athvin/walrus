@@ -12,6 +12,7 @@ async fn biased_select_prefers_cancellation() {
     let mut cancels = 0_u32;
     for _ in 0..100 {
         tokio::select! {
+            biased;
             () = token.cancelled() => cancels += 1,
             _ = tick.tick() => {}
         }

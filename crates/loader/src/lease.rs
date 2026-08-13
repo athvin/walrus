@@ -48,6 +48,7 @@ pub fn spawn_renewer(
         let mut tick = tokio::time::interval((ttl / 3).max(Duration::from_secs(1)));
         loop {
             tokio::select! {
+                biased;
                 _ = token.cancelled() => return,
                 _ = tick.tick() => {
                     for (schema, table) in &keys {

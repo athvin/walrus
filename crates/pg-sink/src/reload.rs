@@ -82,6 +82,7 @@ where
     renew_tick.tick().await; // the immediate first tick — the claim just set the lease
     loop {
         tokio::select! {
+            biased;
             _ = token.cancelled() => return ExporterEnd::Cancelled,
             res = &mut export => return ExporterEnd::Finished(res),
             _ = renew_tick.tick() => {
@@ -290,6 +291,7 @@ impl ReloadController {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
+                    biased;
                     _ = token.cancelled() => {
                         // Graceful shutdown: exporters see the same token and end Cancelled —
                         // their rows stay `exporting` for PR 6.9's startup scan to resume.
@@ -302,6 +304,7 @@ impl ReloadController {
                         // leave rows `exporting` with a dying lease — expiry + PR 6.9's adoption
                         // is the designed net for exactly that.
                         tokio::select! {
+                            biased;
                             _ = token.cancelled() => {
                                 tracing::info!("reload controller cancelled mid-tick");
                                 return;

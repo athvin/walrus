@@ -123,6 +123,7 @@ impl<'a> DecodeLoop<'a> {
         beat_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
+                biased;
                 _ = token.cancelled() => {
                     // SIGTERM/SIGINT: the loop has stopped consuming — now run the ordered drain (NOT
                     // cancellable; the caller bounds it by the K8s grace period). The slot is never dropped.
