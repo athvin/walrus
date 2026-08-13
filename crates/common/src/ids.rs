@@ -49,7 +49,7 @@ mod sqlx_support {
         }
     }
 
-    impl<'q> Encode<'q, Postgres> for ManifestId {
+    impl Encode<'_, Postgres> for ManifestId {
         fn encode_by_ref(
             &self,
             buf: &mut PgArgumentBuffer,

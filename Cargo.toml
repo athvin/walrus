@@ -32,6 +32,9 @@ expect_used = "deny"
 # `redundant_clone` is nursery and `implicit_clone` is pedantic; neither is in `all`, so no priority juggling is needed.
 redundant_clone = "deny"
 implicit_clone = "deny"
+# Nursery (outside `clippy::all`, so no `priority` juggling): flags a lifetime that must exist but
+# need not be named. Its coarser sibling `needless_lifetimes` already arrives through `all`.
+elidable_lifetime_names = "deny"
 
 [workspace.dependencies]
 # Shared version pins land here as later PRs add deps (tracing, sqlx, arrow, …).

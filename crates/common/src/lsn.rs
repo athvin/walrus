@@ -135,7 +135,7 @@ mod sqlx_support {
         }
     }
 
-    impl<'q> Encode<'q, Postgres> for Lsn {
+    impl Encode<'_, Postgres> for Lsn {
         fn encode_by_ref(
             &self,
             buf: &mut PgArgumentBuffer,
