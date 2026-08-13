@@ -210,6 +210,9 @@ impl Message {
 fn expect_n(reader: &mut Reader<'_>) -> Result<(), DecodeError> {
     let b = reader.byte1()?;
     if b != b'N' {
+        // A well-formed walsender stream never leaves the protocol's closed framing set.
+        // `cold_path` is stable on the Rust 1.95.0 toolchain pinned by this workspace.
+        std::hint::cold_path();
         return Err(DecodeError::BadTupleFormat { byte: b });
     }
     Ok(())
@@ -243,7 +246,10 @@ pub fn parse_tuple(reader: &mut Reader<'_>) -> Result<Vec<TupleValue>, DecodeErr
                 let len = reader.int32()? as usize;
                 TupleValue::Binary(reader.take(len)?)
             }
-            other => return Err(DecodeError::BadTupleFormat { byte: other }),
+            other => {
+                std::hint::cold_path();
+                return Err(DecodeError::BadTupleFormat { byte: other });
+            }
         };
         cols.push(value);
     }
@@ -322,6 +328,7 @@ fn parse_one(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Message, De
             // A fixed `'N'` marker precedes the new tuple; a mismatch is an upstream framing error.
             let marker = reader.byte1()?;
             if marker != b'N' {
+                std::hint::cold_path();
                 return Err(DecodeError::BadTupleFormat { byte: marker });
             }
             Ok(Message::Insert {
@@ -346,7 +353,10 @@ fn parse_one(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Message, De
                     (Some(OldTupleKind::Full), Some(old))
                 }
                 b'N' => (None, None),
-                other => return Err(DecodeError::BadTupleFormat { byte: other }),
+                other => {
+                    std::hint::cold_path();
+                    return Err(DecodeError::BadTupleFormat { byte: other });
+                }
             };
             Ok(Message::Update {
                 xid,
@@ -361,7 +371,10 @@ fn parse_one(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Message, De
             let old_kind = match reader.byte1()? {
                 b'K' => OldTupleKind::Key,
                 b'O' => OldTupleKind::Full,
-                other => return Err(DecodeError::BadTupleFormat { byte: other }),
+                other => {
+                    std::hint::cold_path();
+                    return Err(DecodeError::BadTupleFormat { byte: other });
+                }
             };
             Ok(Message::Delete {
                 xid,
