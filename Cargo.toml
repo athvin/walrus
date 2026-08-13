@@ -165,5 +165,7 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 # link time, measured on the PR 5.4 suite. `codegen-units` is left at the default: cgu=1 buys only a
 # few percent more for ~2× the release build — a bad trade for a project whose Phase-5 north star is
 # *cutting* CI/Docker build time (PRs 5.1-5.3), and the bench inherits `release` so the numbers count.
+# Rejection recorded in full (with the re-open trigger) in
+# docs/implementation/notes/rust-skills/opt-codegen-units.md — guarded by crates/common/tests/build_profile.rs.
 [profile.release]
 lto = "thin"

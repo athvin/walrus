@@ -2,6 +2,8 @@
 
 const WORKSPACE_MANIFEST: &str = include_str!("../../../Cargo.toml");
 const CODEGEN_UNITS_ADR: &str = "docs/implementation/notes/rust-skills/opt-codegen-units.md";
+const CODEGEN_UNITS_NOTE: &str =
+    include_str!("../../../docs/implementation/notes/rust-skills/opt-codegen-units.md");
 
 fn table_body<'a>(manifest: &'a str, header: &str) -> Option<&'a str> {
     let mut offset = 0;
@@ -97,6 +99,10 @@ fn profile_comment_does_not_declare_codegen_units() {
 #[test]
 fn codegen_units_rejection_rationale_is_still_recorded() {
     assert_eq!(codegen_units_policy(WORKSPACE_MANIFEST), Ok(()));
+    assert!(
+        !CODEGEN_UNITS_NOTE.trim().is_empty(),
+        "{CODEGEN_UNITS_ADR} must contain the recorded decision"
+    );
 }
 
 #[test]
