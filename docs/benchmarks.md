@@ -208,6 +208,21 @@ taking. Net: **5.8 for throughput, 5.7 for a low-risk per-row win.**
 Before/after deltas from PR 5.7 (sink) and PR 5.8 (loader) land here, each citing the baseline row it
 improves and the commit that made the change.
 
+### PR 11.13 — key-column scratch (`SmallVec` declined)
+
+`PgRelation::key_columns()` was measured in isolation for the common one-key shape and a composite
+three-key shape (median, Apple M2, macOS 26.5.2, rustc 1.95.0):
+
+| `loader/keycols` shape | median | fastest committed transform cycle | share of cycle |
+|---|---:|---:|---:|
+| one key | 41.554 ns | 25.1 ms | 0.00017 % |
+| three keys | 45.635 ns | 25.1 ms | 0.00018 % |
+
+An initial run measured 43.083 ns / 43.061 ns; Criterion found no performance change between runs.
+Both shapes are within noise of each other, and even the faster 25.1 ms transform baseline is over
+550,000× larger. `SmallVec` is therefore declined: its dependency/API/branching cost cannot move
+the loader's DuckDB-dominated end-to-end profile.
+
 ### PR 11.12 — decoder text cells
 
 **Single-copy `'t'` cells (landed; measured regression).** `Reader::str` validates UTF-8 directly on
