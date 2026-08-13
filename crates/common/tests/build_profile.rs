@@ -10,6 +10,8 @@ const TARGET_CPU_ADR: &str = "docs/implementation/notes/rust-skills/opt-target-c
 const TARGET_CPU_NOTE: &str =
     include_str!("../../../docs/implementation/notes/rust-skills/opt-target-cpu.md");
 const PGO_ADR: &str = "docs/implementation/notes/rust-skills/opt-pgo-profile.md";
+const PGO_NOTE: &str =
+    include_str!("../../../docs/implementation/notes/rust-skills/opt-pgo-profile.md");
 const BUILD_SURFACES: &[(&str, &str)] = &[
     ("Cargo.toml", WORKSPACE_MANIFEST),
     (
@@ -323,5 +325,9 @@ fn pgo_decision_is_still_recorded() {
     assert!(
         root.join(PGO_ADR).is_file(),
         "missing PGO decision at {PGO_ADR}"
+    );
+    assert!(
+        !PGO_NOTE.trim().is_empty(),
+        "{PGO_ADR} must contain the recorded decision and re-open trigger"
     );
 }
