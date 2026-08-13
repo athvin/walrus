@@ -123,6 +123,11 @@ pub struct NewManifestFile {
 }
 
 /// Insert a `status='ready'` row with `lsn_end` set to the commit LSN; returns the new `id`.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] when the insert fails, or [`ControlError::CheckViolation`] if
+/// the manifest values violate a database invariant.
 pub async fn insert_ready(
     executor: impl PgExecutor<'_>,
     f: &NewManifestFile,
@@ -160,6 +165,11 @@ pub async fn insert_ready(
 /// `export_complete` would deadlock the reload. `resync` never pauses (H3). The `NOT EXISTS`
 /// probe is served by the `table_reload_one_live` partial index (its predicate
 /// `status NOT IN ('complete','failed')` covers `requested|exporting`).
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the atomic claim query fails, or [`ControlError::Decode`] if
+/// a stored manifest kind or status is outside its checked enum set.
 pub async fn claim_ready(
     executor: impl PgExecutor<'_>,
     epoch: i64,
@@ -203,6 +213,10 @@ pub async fn claim_ready(
 /// The newest `ready` file's commit LSN for a table — the head of the Phase-A backlog — or `None`
 /// when the queue is empty. Powers the `walrus_loader_raw_append_lag_bytes` gauge (PR 5.6): the lag
 /// is this minus `raw_appended_lsn`. `MAX` over an empty set is SQL `NULL` → `None`.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the backlog query cannot reach or read control Postgres.
 pub async fn max_ready_lsn_end(
     executor: impl PgExecutor<'_>,
     epoch: i64,
@@ -221,6 +235,10 @@ pub async fn max_ready_lsn_end(
 }
 
 /// Retire claimed rows — the queue's "done" is a `DELETE`, not a status flip. Returns the count.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the claimed-row delete cannot be executed.
 pub async fn delete_claimed(
     executor: impl PgExecutor<'_>,
     ids: &[ManifestId],
@@ -239,6 +257,10 @@ pub async fn delete_claimed(
 /// the clear just replaced. Chunk 1 itself has `lsn_end = first_lsn` — the `kind` filter is what
 /// lets it survive its own purge. No status filter: a dead-lettered (`failed`) pre-`W` file is
 /// equally superseded. Idempotent (a re-run deletes nothing). Returns rows purged.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the superseded-row delete cannot be executed.
 pub async fn delete_superseded(
     executor: impl PgExecutor<'_>,
     epoch: i64,
@@ -259,6 +281,11 @@ pub async fn delete_superseded(
 }
 
 /// Dead-letter a repeatedly-failing file (`status='failed'`) so a poison file can't block the queue.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the status update fails, or
+/// [`ControlError::CheckViolation`] if it would violate a manifest invariant.
 pub async fn mark_failed(
     executor: impl PgExecutor<'_>,
     id: ManifestId,

@@ -3,7 +3,7 @@
 //!
 //! Both services run an ordered, fail-fast bootstrap: on Kubernetes a non-zero exit becomes
 //! `CrashLoopBackOff`, so a broken deploy must be *loud and immediate*. This module gives that
-//! vocabulary — [`Error`] models each precondition failure as data, [`Error::is_terminal`]
+//! vocabulary — [`enum@Error`] models each precondition failure as data, [`Error::is_terminal`]
 //! decides whether retrying under the startup deadline could ever help, and [`ExitCode`] gives
 //! each terminal class a distinct, greppable process exit status.
 

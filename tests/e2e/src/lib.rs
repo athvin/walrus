@@ -1,7 +1,9 @@
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
-    reason = "e2e harness lib (not test-cfg)"
+    clippy::missing_errors_doc,
+    reason = "compose-gated e2e harness, not a published API; unwrap/expect are test setup and \
+              anyhow failure is the test failure"
 )]
 //! The walrus end-to-end harness (`architecture.md` "Local harness"). It brings up **both binaries** —
 //! `walrus-pg-sink` and `walrus-loader` — as child processes against the already-running compose stack
@@ -396,7 +398,8 @@ impl Harness {
     }
 
     /// Assert the loader's DuckDB mirror `<table>_current` equals the current source `public.<table>`
-    /// **row-by-row** (id + status), the effectively-once convergence check. Call after [`stop_loader`]
+    /// **row-by-row** (id + status), the effectively-once convergence check. Call after
+    /// [`Self::stop_loader`]
     /// (DuckDB is single-writer, so the mirror is read only once the loader has exited).
     pub async fn assert_mirror_equals_source(&self, table: &str) -> Result<()> {
         let src: Vec<(i32, Option<String>)> = sqlx::query_as(&format!(

@@ -46,6 +46,11 @@ pub enum DrainOutcome {
 /// `confirmed_flush_lsn` (the checkpoint clamps it to the open-txn floor; `None` until PR 2.30) →
 /// **(4)** `CopyDone` + clean close → **(5)** return, leaving the slot in place. **Never** issues
 /// `DROP_REPLICATION_SLOT`.
+///
+/// # Errors
+///
+/// Returns [`anyhow::Error`] if sealing a committed batch, S3/manifest durability, the final standby
+/// status, or `CopyDone` fails. Open uncommitted rows are intentionally discarded, not errors.
 pub async fn drain(
     stream: &mut ReplicationStream,
     router: &mut BatchRouter,

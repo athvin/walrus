@@ -41,7 +41,7 @@ pub struct TelemetryConfig {
     /// Emit newline-delimited JSON (one object per event) instead of the pretty formatter.
     pub json: bool,
     /// `EnvFilter` directive, e.g. `"info,walrus=debug"`. Empty → fall back to `RUST_LOG`, then
-    /// [`DEFAULT_FILTER`].
+    /// `DEFAULT_FILTER`.
     pub filter: String,
 }
 
@@ -71,6 +71,12 @@ fn build_env_filter(cfg: &TelemetryConfig) -> EnvFilter {
 /// Idempotent: a global subscriber can only be installed once per process, so a second call is a
 /// **handled outcome** — it logs at `debug` and returns `Ok(())` rather than panicking, keeping
 /// tests and re-entrant bootstraps safe.
+///
+/// # Errors
+///
+/// This function currently produces no [`crate::Error`] variant: malformed filters fall back to
+/// `DEFAULT_FILTER`, and an already-installed global subscriber is treated as an idempotent
+/// success. The `Result` return preserves the bootstrap API contract for future fallible layers.
 pub fn init_tracing(cfg: &TelemetryConfig) -> crate::Result<()> {
     let filter = build_env_filter(cfg);
     let registry = tracing_subscriber::registry().with(filter);

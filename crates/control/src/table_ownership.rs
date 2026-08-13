@@ -19,6 +19,11 @@ pub struct Lease {
 /// Conditionally acquire (or renew) the lease for `ttl_secs`: succeeds iff the lease is **free**
 /// (expired) or **already ours**. Returns `Ok(None)` when a *live* owner holds it — the caller maps
 /// that to the terminal [`common::ExitCode::LeaseContended`]. On a change of owner the token bumps by 1.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the conditional lease upsert cannot execute, or
+/// [`ControlError::CheckViolation`] if a lease invariant is violated.
 pub async fn acquire_lease(
     ex: impl PgExecutor<'_>,
     epoch: i64,
@@ -58,6 +63,10 @@ pub async fn acquire_lease(
 
 /// Renew our lease (extend `lease_expiry`), off the apply-loop thread and well under the TTL. Fails to
 /// affect any row if we are no longer the owner (a phantom writer must not renew).
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the guarded renewal update cannot execute.
 pub async fn renew_lease(
     ex: impl PgExecutor<'_>,
     epoch: i64,
@@ -85,6 +94,10 @@ pub async fn renew_lease(
 
 /// Release our lease on graceful shutdown (expire it immediately) so a replacement pod need not wait
 /// out the TTL. A no-op if we no longer own it.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the guarded expiry update cannot execute.
 pub async fn release_lease(
     ex: impl PgExecutor<'_>,
     epoch: i64,

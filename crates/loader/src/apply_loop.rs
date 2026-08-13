@@ -14,6 +14,12 @@ use tokio_util::sync::CancellationToken;
 
 /// Drive one owned table until `shutdown`. Phase A + Phase B share one poll cadence in v1 (two txns);
 /// compaction runs on its own slower cadence on this thread.
+///
+/// # Errors
+///
+/// Returns [`LoaderError::EpochBumped`] when the control generation advances while this worker is
+/// running. Control-plane, DuckDB, registry, quarantine, and watermark failures from the two phases
+/// or compaction propagate through their corresponding [`LoaderError`] variants and are terminal.
 pub async fn apply_loop(ctx: TableCtx, shutdown: CancellationToken) -> Result<(), LoaderError> {
     let mut tick = tokio::time::interval(ctx.poll_interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

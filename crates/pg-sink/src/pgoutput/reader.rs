@@ -42,6 +42,10 @@ impl<'a> Reader<'a> {
     }
 
     /// One byte (a `Byte1` type tag or an `Int8`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError::UnexpectedEof`] when no byte remains.
     pub fn byte1(&mut self) -> Result<u8, DecodeError> {
         self.need(1)?;
         let b = self.buf[self.pos];
@@ -50,6 +54,10 @@ impl<'a> Reader<'a> {
     }
 
     /// Big-endian `Int16`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError::UnexpectedEof`] when fewer than two bytes remain.
     pub fn int16(&mut self) -> Result<u16, DecodeError> {
         self.need(2)?;
         let arr: [u8; 2] = self.buf[self.pos..self.pos + 2].try_into().map_err(|_| {
@@ -64,6 +72,10 @@ impl<'a> Reader<'a> {
     }
 
     /// Big-endian `Int32` (OID / xid).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError::UnexpectedEof`] when fewer than four bytes remain.
     pub fn int32(&mut self) -> Result<u32, DecodeError> {
         self.need(4)?;
         let arr: [u8; 4] = self.buf[self.pos..self.pos + 4].try_into().map_err(|_| {
@@ -79,6 +91,10 @@ impl<'a> Reader<'a> {
 
     /// Big-endian `Int64` (the raw 8-byte field; LSN reads it as unsigned via [`Reader::lsn`],
     /// commit timestamps keep it as signed µs).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError::UnexpectedEof`] when fewer than eight bytes remain.
     pub fn int64(&mut self) -> Result<i64, DecodeError> {
         self.need(8)?;
         let arr: [u8; 8] = self.buf[self.pos..self.pos + 8].try_into().map_err(|_| {
@@ -93,6 +109,11 @@ impl<'a> Reader<'a> {
     }
 
     /// A null-terminated UTF-8 `String`. A missing terminator is `UnexpectedEof`, not a panic.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError::UnexpectedEof`] if no NUL terminator remains, or
+    /// [`DecodeError::Utf8`] if the bytes before it are not valid UTF-8.
     pub fn string(&mut self) -> Result<String, DecodeError> {
         let start = self.pos;
         match self.buf[start..].iter().position(|&b| b == 0) {
@@ -110,6 +131,10 @@ impl<'a> Reader<'a> {
     }
 
     /// Copy `n` bytes, advancing the cursor (for TOAST-safe value copies from PR 2.4).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError::UnexpectedEof`] when fewer than `n` bytes remain.
     pub fn take(&mut self, n: usize) -> Result<Bytes, DecodeError> {
         self.need(n)?;
         let out = Bytes::copy_from_slice(&self.buf[self.pos..self.pos + n]);
@@ -118,6 +143,10 @@ impl<'a> Reader<'a> {
     }
 
     /// An LSN: an unsigned 8-byte value, wrapped into the `common::Lsn` newtype.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError::UnexpectedEof`] when the eight-byte LSN is truncated.
     pub fn lsn(&mut self) -> Result<Lsn, DecodeError> {
         Ok(Lsn::new(self.int64()? as u64))
     }

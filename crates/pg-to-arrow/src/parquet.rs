@@ -21,6 +21,11 @@ pub fn default_writer_properties() -> WriterProperties {
 }
 
 /// Stream one batch to Parquet using the walrus writer properties.
+///
+/// # Errors
+///
+/// Returns [`Error::Parquet`] if the writer cannot be created, the batch cannot be encoded, or the
+/// Parquet footer cannot be closed into `sink`.
 pub fn write_parquet<W: std::io::Write + Send>(batch: &RecordBatch, sink: W) -> Result<(), Error> {
     let mut writer = ArrowWriter::try_new(sink, batch.schema(), Some(default_writer_properties()))?;
     writer.write(batch)?;
@@ -29,6 +34,11 @@ pub fn write_parquet<W: std::io::Write + Send>(batch: &RecordBatch, sink: W) -> 
 }
 
 /// Convenience: write one batch to an in-memory Parquet buffer.
+///
+/// # Errors
+///
+/// Returns [`Error::Parquet`] for any encoding or writer-finalization failure reported by
+/// [`write_parquet`].
 pub fn write_parquet_bytes(batch: &RecordBatch) -> Result<Vec<u8>, Error> {
     let mut buf = Vec::new();
     write_parquet(batch, &mut buf)?;

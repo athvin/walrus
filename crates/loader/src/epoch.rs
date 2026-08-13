@@ -17,6 +17,11 @@ use crate::error::LoaderError;
 /// subsequent `ensure_tables*` recreates them empty and the new-epoch snapshot rebuilds the file. Returns
 /// `true` iff a rebuild happened. A no-op (returns `false`) when the file is brand-new (never stamped) or
 /// already at `control_epoch` — so first-bootstrap and steady resume are untouched.
+///
+/// # Errors
+///
+/// Returns [`LoaderError::Duck`] if the stored epoch cannot be read or a retired generation cannot
+/// be wiped.
 pub fn rebuild_for_new_epoch(
     db: &TableDb,
     table: &str,

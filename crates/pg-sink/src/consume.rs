@@ -25,6 +25,12 @@ use tokio_util::sync::CancellationToken;
 /// Drive the stream: decode each `XLogData`, register each `Relation` (cache + schema_registry), route
 /// I/U/D into per-table batchers (sealing at commit boundaries), PUT sealed batches to S3, keep
 /// keepalives answered (inside `ReplicationStream`), and exit cleanly on cancel or stream end.
+///
+/// # Errors
+///
+/// Returns [`anyhow::Error`] when replication I/O or decoding fails, a relation/DDL/reload invariant
+/// is invalid, Arrow batching or S3/manifest durability fails, or a control-plane operation cannot
+/// complete. Context on the returned chain identifies the failed pipeline stage.
 // The loop driver wires together the full pipeline (cache, router, sink, control pool); its arity is
 // intrinsic, not a code smell.
 #[allow(
@@ -374,6 +380,11 @@ async fn flush_batch_keepalive(
 /// `file_manifest` `ready` row — never the other way round (§1.5). Step (c) — advancing the slot to
 /// `obj.lsn_end` — is PR 2.26. A crash between (a) and (b) is safe: the batch re-streams (no `ready`
 /// row was committed), at-least-once.
+///
+/// # Errors
+///
+/// Returns [`anyhow::Error`] if Parquet encoding/S3 durability or the subsequent manifest insert
+/// fails. The manifest is never written before the object is durable.
 pub async fn flush_batch(
     sink: &crate::sink::ParquetSink,
     ex: impl sqlx::PgExecutor<'_>,
@@ -385,6 +396,11 @@ pub async fn flush_batch(
 
 /// As [`flush_batch`], stamping the object + manifest `kind` — the backfill (PR 2.29) flushes with
 /// [`crate::sink::FileKind::Snapshot`].
+///
+/// # Errors
+///
+/// Returns [`anyhow::Error`] if [`crate::sink::SinkError`] prevents the durable object write or a
+/// [`control::ControlError`] prevents recording its ready manifest row.
 pub async fn flush_batch_kind(
     sink: &crate::sink::ParquetSink,
     ex: impl sqlx::PgExecutor<'_>,
@@ -437,6 +453,11 @@ impl BatchRouter {
     /// Route one decoded message. `Begin` sets the txn context; `I/U/D` buffer against the open txn;
     /// `Commit` promotes them and returns any batches that a trigger sealed. Streamed large txns
     /// (`Stream*`) and `Truncate`/`Message` are deferred (PR 2.30 / 2.27 / 2.33).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if a commit timestamp is invalid, a relation cannot create a batcher,
+    /// or buffered rows cannot be promoted and sealed through [`crate::batch::BatchError`].
     pub fn route(
         &mut self,
         cache: &RelationCache,
@@ -566,6 +587,11 @@ impl BatchRouter {
     /// Cut the current file for `schema.table` (PR 2.33): force-seal its batcher so the pre-DDL rows
     /// flush at the old `schema_version`, and drop the batcher so the next change rebuilds it from the
     /// new-version shape. Returns the sealed old-version batch, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if committed rows cannot be sealed through
+    /// [`crate::batch::BatchError`].
     pub fn cut_table(
         &mut self,
         cache: &RelationCache,
@@ -613,6 +639,10 @@ impl BatchRouter {
     /// Graceful-drain seal (PR 2.28): seal every table's in-flight **committed** batch, dropping any
     /// open speculative buffers. The returned batches are flushed with the usual PUT → manifest → slot
     /// ordering before the final standby update.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if any table's committed Arrow batch cannot be sealed.
     pub fn drain_committed(&mut self) -> anyhow::Result<Vec<SealedBatch>> {
         let mut sealed = Vec::new();
         for batcher in self.batchers.values_mut() {
@@ -628,6 +658,11 @@ impl BatchRouter {
 /// `(oid, schema_version)`, and **persist** the `schema_registry` row (idempotent on
 /// `(epoch, schema, table, version)`). Internal walrus tables are never registered. The persist is a
 /// control-DB write, so this is `async`; the order is build → cache → persist.
+///
+/// # Errors
+///
+/// Returns [`anyhow::Error`] if the relation cannot be mapped to Arrow, its snapshot cannot be
+/// serialized, or [`control::ControlError`] prevents the registry upsert.
 pub async fn on_relation(
     cache: &mut RelationCache,
     ex: impl sqlx::PgExecutor<'_>,
@@ -663,6 +698,11 @@ pub async fn on_relation(
 /// Route one live frame. A keepalive is a no-op here (its feedback is sent inside the stream); an
 /// `XLogData` payload is decoded by the **existing** `pgoutput::parse_message`, which updates `ctx`
 /// on `Stream Start`/`Stop`. A decode error on a real message is a bug — fail loud.
+///
+/// # Errors
+///
+/// Returns [`anyhow::Error`] wrapping [`crate::pgoutput::DecodeError`] when an `XLogData` payload is
+/// malformed or violates pgoutput protocol state.
 pub fn on_frame(ctx: &mut StreamCtx, frame: ReplicationMessage) -> anyhow::Result<Option<Message>> {
     match frame {
         ReplicationMessage::Keepalive { .. } => Ok(None),

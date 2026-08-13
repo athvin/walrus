@@ -12,7 +12,7 @@
 //!   no range type — it is the 5 flat `_lower/_upper/_lower_inc/_upper_inc/_empty` siblings).
 //!
 //! A plan built from a bare [`PgRelation`] ([`TablePlan::tier1`]) reproduces the pre-descriptor scalar
-//! behaviour exactly (emit == source column via [`crate::duck::duck_type`]), so the hermetic/compose
+//! behaviour exactly (emit == source column via `crate::duck::duck_type`), so the hermetic/compose
 //! tests that pass a `PgRelation` are unchanged; the registry path ([`TablePlan::from_registry`]) adds
 //! the Tier-2 shapes.
 
@@ -56,7 +56,7 @@ pub struct TablePlan {
 
 impl TablePlan {
     /// The Tier-1 (scalar-only) plan from a bare relation — one emit column == source column via
-    /// [`crate::duck::duck_type`], mirror = same. Reproduces the pre-descriptor behaviour exactly.
+    /// `crate::duck::duck_type`, mirror = same. Reproduces the pre-descriptor behaviour exactly.
     pub fn tier1(rel: &PgRelation) -> Self {
         let mut raw_cols = Vec::new();
         let mut mirror_cols = Vec::new();

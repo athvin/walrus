@@ -17,6 +17,11 @@ pub const SINK_META_COLUMN: &str = "walrus_pg_sink_meta";
 
 /// Full Arrow schema for `rel`: one field per Tier-1 column, then `walrus_pg_sink_meta` (Utf8,
 /// non-null). Data fields are `nullable`; the meta column is not.
+///
+/// # Errors
+///
+/// Returns [`Error::EmptyRelation`] when `rel` has no columns, or [`Error::NotTier1`] when a column
+/// has no supported native, expanded, or canonical-text representation.
 pub fn build_schema(rel: &PgRelation) -> Result<Schema, Error> {
     if rel.columns.is_empty() {
         return Err(Error::EmptyRelation {
@@ -39,6 +44,10 @@ pub fn build_schema(rel: &PgRelation) -> Result<Schema, Error> {
 /// (§2.4). **Data fields stay `nullable(true)`**: delete old-images and unchanged-TOAST placeholders
 /// arrive partial, so even a PK column can be absent on the wire; the mirror's PK-not-null is enforced
 /// downstream in the loader, not here.
+///
+/// # Errors
+///
+/// Returns [`Error::NotTier1`] when the column OID and typmod do not map to any supported tier.
 pub fn emit_fields(col: &PgColumn) -> Result<Vec<Field>, Error> {
     if let Some(dt) = tier1_data_type(col.type_oid, col.type_modifier) {
         return Ok(vec![Field::new(col.name.clone(), dt, true)]);

@@ -116,6 +116,11 @@ fn signed_time_to_micros(tok: &str) -> Option<i64> {
 /// Handles the server-default `postgres` IntervalStyle: word units (`year`/`mon`/`day` and, for
 /// robustness, `hour`/`min`/`sec`) plus a trailing signed `HH:MM:SS[.f]` clock. The three fields stay
 /// independent — `'1 mon'`→`(1,0,0)`, `'30 days'`→`(0,30,0)`, `'720:00:00'`→`(0,0,2_592_000_000_000)`.
+///
+/// # Errors
+///
+/// Returns [`Error::ValueParse`] for an unknown unit, malformed number or clock, a missing unit, or
+/// a month/day total outside the emitted `i32` range.
 pub fn parse_interval(text: &str) -> Result<(i32, i32, i64), Error> {
     let err = || parse_err("interval", text);
     let mut months: i64 = 0;
@@ -171,6 +176,11 @@ pub fn parse_interval(text: &str) -> Result<(i32, i32, i64), Error> {
 ///
 /// The time part has no sign, so the first `+`/`-` in the string marks the offset. `offset_seconds`
 /// keeps the printed sign (`+05:30` → `+19800`) — the loader's TIMETZ rebuild depends on it.
+///
+/// # Errors
+///
+/// Returns [`Error::ValueParse`] if the clock, UTC-offset separator, or offset components are
+/// missing or malformed.
 pub fn parse_timetz(text: &str) -> Result<(i64, i32), Error> {
     let err = || parse_err("timetz", text);
     let idx = text.find(['+', '-']).ok_or_else(err)?;

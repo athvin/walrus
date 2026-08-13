@@ -143,6 +143,11 @@ fn extract_points(text: &str) -> Result<Vec<Pt>, Error> {
 }
 
 /// `"(x,y)"` → `Pt`.
+///
+/// # Errors
+///
+/// Returns [`Error::ValueParse`] unless the input contains exactly one point with finite-format
+/// numeric coordinates.
 pub fn parse_point(text: &str) -> Result<Pt, Error> {
     match extract_points(text)?.as_slice() {
         [p] => Ok(*p),
@@ -151,6 +156,10 @@ pub fn parse_point(text: &str) -> Result<Pt, Error> {
 }
 
 /// `"(x1,y1),(x2,y2)"` (box) or `"[(x1,y1),(x2,y2)]"` (lseg) → two points.
+///
+/// # Errors
+///
+/// Returns [`Error::ValueParse`] unless the input contains exactly two parseable coordinate pairs.
 pub fn parse_box(text: &str) -> Result<(Pt, Pt), Error> {
     match extract_points(text)?.as_slice() {
         [a, b] => Ok((*a, *b)),
@@ -159,6 +168,10 @@ pub fn parse_box(text: &str) -> Result<(Pt, Pt), Error> {
 }
 
 /// `"<(x,y),r>"` → center point + radius.
+///
+/// # Errors
+///
+/// Returns [`Error::ValueParse`] if the center is not one point or the radius is not an `f64`.
 pub fn parse_circle(text: &str) -> Result<(Pt, f64), Error> {
     let t = text.trim();
     let t = t.strip_prefix('<').unwrap_or(t);
@@ -173,6 +186,10 @@ pub fn parse_circle(text: &str) -> Result<(Pt, f64), Error> {
 }
 
 /// `"{A,B,C}"` (line as `Ax + By + C = 0`) → `(a, b, c)`.
+///
+/// # Errors
+///
+/// Returns [`Error::ValueParse`] unless the input contains exactly three parseable coefficients.
 pub fn parse_line(text: &str) -> Result<(f64, f64, f64), Error> {
     let t = text.trim();
     let t = t.strip_prefix('{').unwrap_or(t);
@@ -190,6 +207,10 @@ pub fn parse_line(text: &str) -> Result<(f64, f64, f64), Error> {
 
 /// Returns `(is_closed, points)`: `[(…)]` = open, `((…))` = closed — the flag is **mandatory**
 /// (dropping it makes the two indistinguishable on read-back).
+///
+/// # Errors
+///
+/// Returns [`Error::ValueParse`] if any coordinate is invalid or the path contains no points.
 pub fn parse_path(text: &str) -> Result<(bool, Vec<Pt>), Error> {
     let t = text.trim();
     let is_closed = t.starts_with('(');
@@ -201,6 +222,10 @@ pub fn parse_path(text: &str) -> Result<(bool, Vec<Pt>), Error> {
 }
 
 /// `"((x,y),…)"` → the polygon's vertices.
+///
+/// # Errors
+///
+/// Returns [`Error::ValueParse`] if any coordinate is invalid or the polygon has no vertices.
 pub fn parse_polygon(text: &str) -> Result<Vec<Pt>, Error> {
     let pts = extract_points(text)?;
     if pts.is_empty() {

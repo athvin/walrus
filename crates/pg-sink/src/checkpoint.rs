@@ -68,6 +68,10 @@ impl DurabilityCheckpoint {
 
     /// Send a standby status carrying the durable `confirmed_flush`, and sync it onto the stream so the
     /// stream's own periodic keepalive reports the same `flush` (never a stale one).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if the replication socket cannot write or flush the standby status.
     pub async fn send(
         &self,
         stream: &mut ReplicationStream,

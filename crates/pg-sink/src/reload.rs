@@ -106,6 +106,11 @@ pub enum RestartDecision {
 /// Run [`control::reload::restart_for_ddl`] and emit the matching metric (PR 6.8). Split from the
 /// export loop so a compose test drives this exact path — metric increment included — without
 /// standing up the whole controller.
+///
+/// # Errors
+///
+/// Returns [`anyhow::Error`] if a control-pool connection cannot be acquired or
+/// [`control::ControlError`] prevents atomically failing and restarting the attempt.
 pub async fn handle_ddl_restart(
     pool: &sqlx::PgPool,
     old: &control::ReloadRow,

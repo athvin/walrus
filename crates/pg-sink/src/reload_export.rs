@@ -103,6 +103,11 @@ impl ChunkExporter {
     /// Dial the side connection and resolve the export's fixed shape: the relation from the source
     /// catalog and the schema version from the registry (frozen on the reload row when resuming —
     /// every attempt is single-schema by construction; PR 6.8 enforces it across DDL).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if the source SQL connection, relation description, registry lookup,
+    /// frozen schema resolution, or primary-key discovery fails.
     pub async fn connect(
         source_db_url: &str,
         pool: sqlx::PgPool,
@@ -210,6 +215,11 @@ impl ChunkExporter {
     /// chunks straddle versions and reconciling in the rebuild — was rejected: its failure mode is
     /// silent mis-reconciliation, not visible waste. Revisit only if restart churn on DDL-heavy
     /// tables becomes a *measured* problem (`single-table-reload.md` H9).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if schema checks, chunk export, echo handling, control transitions,
+    /// or final export completion fails.
     pub async fn run(&mut self) -> anyhow::Result<RunOutcome> {
         loop {
             if let Some(new_version) = self.check_schema_still_current().await? {
@@ -332,6 +342,11 @@ impl ChunkExporter {
     /// One chunk: subscribe → signal → echo ⇒ `L_n` → SELECT the next PK slice → stamped Parquet
     /// → one control-pg txn { manifest row + cursor advance }. Returns the outcome; a chunk
     /// shorter than `chunk_rows` means the table is drained.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] when the watermark echo times out, the source slice cannot be read,
+    /// Arrow/Parquet/S3 export fails, or the manifest-plus-cursor control transaction cannot commit.
     pub async fn export_next_chunk(&mut self) -> anyhow::Result<ChunkOutcome> {
         let chunk_no = self.chunk_no + 1;
         let echo = self.await_echo(chunk_no).await?;

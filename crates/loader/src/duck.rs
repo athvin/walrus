@@ -45,6 +45,10 @@ pub struct TableDb {
 impl TableDb {
     /// Open (or create) the file read-write, taking DuckDB's file lock. A stale lock behind an expired
     /// lease has already been reclaimed by the caller; a *live* owner would make this fail.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] if DuckDB cannot open the file or acquire its writer lock.
     pub fn open(path: &Path) -> Result<Self, LoaderError> {
         let conn = duckdb::Connection::open(path).map_err(|source| LoaderError::Duck {
             op: format!("open {}", path.display()),
@@ -61,6 +65,10 @@ impl TableDb {
     /// `_walrus_meta` row seeding this table's `schema_version` (PR 3.8's DDL-reconcile watermark).
     /// The seed is `ON CONFLICT DO NOTHING`, so an EXISTING `.duckdb` keeps its persisted, already-
     /// reconciled version across restarts — the additive DDL applier ([`crate::ddl`]) advances it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] if DuckDB cannot create or reconcile the planned tables and view.
     pub fn ensure_tables(&self, rel: &PgRelation, schema_version: i64) -> Result<(), LoaderError> {
         self.ensure_tables_planned(&crate::plan::TablePlan::tier1(rel), schema_version)
     }
@@ -68,6 +76,10 @@ impl TableDb {
     /// As [`TableDb::ensure_tables`], but from a full [`TablePlan`] — the mirror carries the recombined
     /// target types and `<table>_raw` the verbatim emit columns (Tier-2 decomposition, PR 4.2). The
     /// Tier-1 plan produces exactly the scalar shape `ensure_tables` always built.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] if any mirror, raw-table, view, or metadata DDL statement fails.
     pub fn ensure_tables_planned(
         &self,
         plan: &TablePlan,
@@ -139,6 +151,10 @@ impl TableDb {
     /// Configure DuckDB's bundled httpfs for the S3/MinIO staging bucket — **once per connection**, so
     /// `read_parquet('s3://…')` then needs no per-call credentials. For MinIO the endpoint is
     /// `host:port` (no scheme), path-style, TLS off.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] when DuckDB rejects the httpfs/S3 configuration statements.
     pub fn configure_s3(&self, s3: &S3Access) -> Result<(), LoaderError> {
         let esc = common::sql::sql_literal;
         let use_ssl = if s3.use_ssl { "true" } else { "false" };
@@ -166,6 +182,11 @@ impl TableDb {
     /// the file's `lsn_end` (stamped on the manifest at `Stream Commit`); passing `Some(lsn_end)` here
     /// stamps every appended row with it, so a concurrently-committed neighbour txn is never dropped by
     /// the transform's commit-LSN window (architecture.md §1.6). `None` keeps the verbatim per-row value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] if the Parquet schema cannot be inspected or its rows cannot be
+    /// appended into the raw table.
     pub fn append_parquet(
         &self,
         table: &str,
@@ -254,6 +275,10 @@ impl TableDb {
 
     /// This table's currently-reconciled `schema_version` (the `_walrus_meta` watermark). Persisted in
     /// the `.duckdb` file, so a restart resumes at the exact version its columns are already at.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] if the metadata watermark cannot be read.
     pub fn schema_version(&self) -> Result<i64, LoaderError> {
         self.conn
             .query_row(
@@ -268,6 +293,10 @@ impl TableDb {
     }
 
     /// Advance the reconcile watermark after the additive DDL for `v` has been applied to both tables.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] if updating the persisted schema watermark fails.
     pub fn set_schema_version(&self, v: i64) -> Result<(), LoaderError> {
         self.conn
             .execute(
@@ -285,6 +314,10 @@ impl TableDb {
     /// if never stamped (a brand-new file — no `_walrus_meta` yet — or a pre-4.6 file). A value below the
     /// control-plane epoch means the mirror + raw hold a **retired generation** (total-restart, §1.8) and
     /// must be wiped before the new-epoch snapshot reloads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] if the metadata table probe or epoch read fails.
     pub fn built_epoch(&self) -> Result<Option<i64>, LoaderError> {
         // A brand-new file has no `_walrus_meta` yet — probe first so this never errors on it.
         let has_meta: i64 = self
@@ -318,6 +351,10 @@ impl TableDb {
 
     /// Stamp the generation this `.duckdb` is now built for (`_walrus_meta['epoch']`). Upserts, so it both
     /// records a fresh file's epoch and re-stamps a rebuilt file's new epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] if the epoch upsert fails.
     pub fn set_built_epoch(&self, epoch: i64) -> Result<(), LoaderError> {
         self.conn
             .execute(
@@ -335,6 +372,10 @@ impl TableDb {
     /// The highest `reload_id` this `.duckdb` has rebuilt for — the H8 idempotency latch (PR 6.7).
     /// Absent ⇒ 0, so any real (bigserial ≥ 1) reload triggers. `max(v)` yields NULL (→ 0) when
     /// the key is missing, mirroring [`TableDb::built_epoch`]'s probe-free read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] if the reload latch cannot be read.
     pub fn recorded_reload_id(&self) -> Result<i64, LoaderError> {
         let v: Option<i64> = self
             .conn
@@ -352,6 +393,10 @@ impl TableDb {
 
     /// Latch the reload generation this `.duckdb` is now rebuilt for. With a monotonic bigserial
     /// id, "latest wins" (H9) is this upsert plus a numeric compare at the trigger.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] if the reload-id upsert fails.
     pub fn set_recorded_reload_id(&self, reload_id: i64) -> Result<(), LoaderError> {
         self.conn
             .execute(
@@ -380,6 +425,10 @@ impl TableDb {
     /// `_walrus_meta` survives (the epoch + reload_id latches live there); the schema_version
     /// watermark is set to the FILE's version explicitly — `ensure_tables_planned`'s seed is
     /// `ON CONFLICT DO NOTHING` and the pre-rebuild watermark may differ in either direction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] if dropping, recreating, or stamping either table fails.
     pub fn rebuild_for_reload(
         &self,
         plan: &TablePlan,
@@ -401,6 +450,10 @@ impl TableDb {
     /// the CDC log, and `_walrus_meta`. The caller then re-runs `ensure_tables*` to recreate them empty, so
     /// the fresh new-epoch snapshot re-appends into `<table>_raw` and the transform re-derives `<table>`
     /// from scratch (both watermarks reset — the new epoch's `loader_checkpoint` is a fresh `0/0`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] if DuckDB cannot drop the retired generation's objects.
     pub fn wipe_generation(&self, table: &str) -> Result<(), LoaderError> {
         self.conn
             .execute_batch(&WIPE_GENERATION.replace("{table}", table))

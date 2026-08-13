@@ -48,7 +48,7 @@ struct MirrorCol {
 }
 
 /// A table's mirror-column layout for rendering the transform (order preserved). Built from a
-/// [`TablePlan`] — the Tier-1 plan reproduces the pre-descriptor scalar SQL exactly.
+/// [`crate::plan::TablePlan`] — the Tier-1 plan reproduces the pre-descriptor scalar SQL exactly.
 pub struct TransformSql {
     table: String,
     mirror: Vec<MirrorCol>,
@@ -60,7 +60,7 @@ impl TransformSql {
         Self::from_plan(&crate::plan::TablePlan::tier1(rel))
     }
 
-    /// The full transform from a schema [`TablePlan`]: each mirror column's value is precomputed as SQL
+    /// The full transform from a schema [`crate::plan::TablePlan`]: each mirror column's value is precomputed as SQL
     /// over the winner `s` — a recombine expression (Tier-2), an unchanged-TOAST-resolved back-scan
     /// (Tier-1 non-key, §5.6), or a plain `s."col"` (keys / flat siblings).
     pub fn from_plan(plan: &crate::plan::TablePlan) -> Self {
@@ -142,6 +142,11 @@ impl TransformSql {
 
     /// The latest `TRUNCATE` `(Ct, Lt)` in the tail (`op='t'`, `commit_lsn > after_lsn`), ordered by the
     /// tuple. `(None, None)` if the tail holds no truncate — every downstream predicate is NULL-safe.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::LsnParse`] if a stored truncate commit or row LSN is malformed. A
+    /// missing row (including a failed optional lookup) is treated as no truncate boundary.
     pub fn latest_truncate(
         &self,
         conn: &duckdb::Connection,
@@ -355,6 +360,11 @@ impl TransformSql {
 /// Run the transform against `<table>_raw`, reading only `commit_lsn > after_lsn`: resolve the latest
 /// truncate `(Ct, Lt)`, wipe the mirror if present, then dedup + MERGE the post-boundary tail. Phase B
 /// (PR 3.4) calls this inside a DuckDB transaction so the wipe + repopulation are atomic.
+///
+/// # Errors
+///
+/// Returns [`LoaderError::LsnParse`] for a malformed truncate boundary, or [`LoaderError::Duck`] if
+/// DuckDB rejects the rendered transform batch.
 pub fn apply_transform(
     conn: &duckdb::Connection,
     t: &TransformSql,

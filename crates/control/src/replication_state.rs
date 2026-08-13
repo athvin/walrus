@@ -17,6 +17,10 @@ pub struct ReplicationState {
 }
 
 /// The highest-epoch (current) generation, if bootstrap has run.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the current generation cannot be queried or decoded.
 pub async fn read_current_epoch(
     ex: impl PgExecutor<'_>,
 ) -> Result<Option<ReplicationState>, ControlError> {
@@ -29,6 +33,11 @@ pub async fn read_current_epoch(
 }
 
 /// Insert a new generation row (a new slot). Epoch bump / total-restart lands in PR 4.6.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] for an insert failure, or [`ControlError::CheckViolation`] if
+/// the proposed generation violates a database invariant.
 pub async fn insert_epoch(
     ex: impl PgExecutor<'_>,
     s: &ReplicationState,
@@ -51,6 +60,11 @@ pub async fn insert_epoch(
 /// re-namespaces all state (S3 prefix, manifest, checkpoints, registry). On an empty table it yields
 /// `1`, so first-bootstrap and total-restart share this one path; the caller distinguishes them (a prior
 /// epoch present ⇒ a *loud* total-restart) only to decide whether to alert.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the atomic generation insert fails, or
+/// [`ControlError::CheckViolation`] if the new row violates a control-plane invariant.
 pub async fn bump_epoch(
     ex: impl PgExecutor<'_>,
     slot_name: &str,

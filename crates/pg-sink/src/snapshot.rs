@@ -46,6 +46,10 @@ pub struct SnapshotConn {
 
 impl SnapshotConn {
     /// Open a replication connection and complete startup (no `START_REPLICATION` yet).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if the replication DSN, TCP connection, or startup handshake fails.
     pub async fn connect(dsn: &str) -> anyhow::Result<Self> {
         Ok(SnapshotConn {
             stream: ReplicationStream::connect(dsn)
@@ -57,6 +61,11 @@ impl SnapshotConn {
 
     /// `CREATE_REPLICATION_SLOT <slot> LOGICAL pgoutput (SNAPSHOT 'export')`. The connection now holds
     /// the exported snapshot — do **not** run anything else on it until backfill is done.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if PostgreSQL rejects slot creation or its exported snapshot response
+    /// is missing or malformed.
     pub async fn create_slot_with_snapshot(
         &mut self,
         slot: &str,
@@ -84,6 +93,11 @@ impl SnapshotConn {
 
     /// Hand off to streaming: `START_REPLICATION` from `consistent_point` (this ends the exported
     /// snapshot, which is safe once every backfill session has attached). Consumes the connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if no snapshot was created first or starting replication from its
+    /// consistent point fails.
     pub async fn into_stream(
         mut self,
         slot: &str,
@@ -110,6 +124,11 @@ pub struct Backfill {
 }
 
 impl Backfill {
+    /// Open and configure an ordinary SQL connection for snapshot reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if the source connection or optional statement-timeout setup fails.
     pub async fn connect(
         dsn: &str,
         epoch: i64,
@@ -145,6 +164,11 @@ impl Backfill {
     /// Copy one table under the exported snapshot into `kind='snapshot'` Parquet + manifest rows, all
     /// sharing `lsn_end = consistent_point`. Returns the row count copied. Output is chunked by the same
     /// `max_rows`/`max_bytes` caps as streamed batches (so a large table becomes many files).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if attaching the exported snapshot, mapping/reading rows, Arrow
+    /// batching, S3 durability, manifest persistence, or transaction completion fails.
     pub async fn copy_table(
         &mut self,
         rel: &PgRelation,
@@ -282,6 +306,10 @@ fn row_to_tuple(row: &tokio_postgres::Row, ncols: usize) -> Vec<TupleValue> {
 
 /// Every published **user** table (`schema ≠ walrus`) — the walrus-internal `heartbeat`/`ddl_audit`
 /// tables are control-plane and are never snapshotted.
+///
+/// # Errors
+///
+/// Returns [`anyhow::Error`] if publication membership cannot be queried or decoded.
 pub async fn published_user_tables(
     client: &tokio_postgres::Client,
     publication: &str,
@@ -303,6 +331,11 @@ pub async fn published_user_tables(
 
 /// Build a [`PgRelation`] shape from the source catalog (`pg_class`/`pg_attribute`/`pg_index`) — the
 /// snapshot path needs the shape *before* any streamed `Relation` message arrives.
+///
+/// # Errors
+///
+/// Returns [`anyhow::Error`] when the relation is absent, catalog queries/decoding fail, an OID is
+/// outside the supported integer range, or `relreplident` is invalid.
 pub async fn describe_source_relation(
     client: &tokio_postgres::Client,
     schema: &str,

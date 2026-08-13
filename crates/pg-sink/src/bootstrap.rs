@@ -43,6 +43,13 @@ fn attempt_budget(deadline: Instant) -> Duration {
 }
 
 /// Run shared steps 2–4's preconditions, retrying transient deps until `deadline`.
+///
+/// # Errors
+///
+/// Returns [`Error::ControlDb`], [`Error::ObjectStore`], or [`Error::SourceDb`] after a transient
+/// dependency remains unavailable through the deadline. Terminal source checks return
+/// [`Error::Preflight`] or [`Error::KeylessTable`], and invalid object-store construction returns
+/// [`Error::ObjectStore`] immediately.
 pub async fn run_shared(cfg: &SinkConfig, deadline: Instant) -> Result<BootstrapCtx, Error> {
     // Step 2: control Postgres reachable (transient) + migrations current (idempotent). Each connect
     // attempt is bounded so sqlx's own pool-acquire timeout can't blow past our `startup_deadline`.

@@ -124,6 +124,12 @@ pub struct ReloadRow {
 /// partial unique index and maps to the typed [`ControlError::ReloadInProgress`] — matched by
 /// SQLSTATE + constraint *name*, never by message text. After `complete`/`failed` the row leaves
 /// the index and a new request succeeds.
+///
+/// # Errors
+///
+/// Returns [`ControlError::ReloadInProgress`] when the table already has a live attempt,
+/// [`ControlError::CheckViolation`] for another rejected invariant, or
+/// [`ControlError::Connect`] when the request cannot reach control Postgres.
 pub async fn request(
     ex: impl PgExecutor<'_>,
     epoch: i64,
@@ -160,6 +166,11 @@ pub async fn request(
 ///
 /// `FOR UPDATE SKIP LOCKED` under the guarded UPDATE makes concurrent claimers partition the
 /// queue instead of double-exporting; a fully-raced claimer just gets an empty `Vec`.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the atomic claim/update query fails or its rows cannot be
+/// decoded.
 pub async fn claim_requested(
     ex: impl PgExecutor<'_>,
     epoch: i64,
@@ -186,6 +197,10 @@ pub async fn claim_requested(
 /// neither terminally `fail` a valid request nor leave it `exporting` unowned; back in
 /// `requested`, the next tick re-claims and retries. Holder-guarded (only the claimant un-claims)
 /// and `exporting`-guarded, so it can never clobber a row someone else adopted.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the guarded release update cannot execute.
 pub async fn release_claim(
     ex: impl PgExecutor<'_>,
     reload_id: i64,
@@ -199,6 +214,10 @@ pub async fn release_claim(
 
 /// Renew this holder's lease on a live export. Affects zero rows — returning `false` — if we no
 /// longer hold it or the export left `exporting` (a phantom exporter must not renew).
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the guarded lease update cannot execute.
 pub async fn renew_lease(
     ex: impl PgExecutor<'_>,
     reload_id: i64,
@@ -227,6 +246,12 @@ pub async fn renew_lease(
 /// `chunk_no = $new - 1` guard makes the cursor strictly in-order: a duplicate or out-of-order
 /// advance changes zero rows and errors. (PR 6.8 restarts with a *fresh* row rather than ever
 /// mutating the frozen fields.)
+///
+/// # Errors
+///
+/// Returns [`ControlError::ReloadTransition`] for an out-of-order chunk, stale status, or changed
+/// schema version; database failures become [`ControlError::Connect`] or
+/// [`ControlError::CheckViolation`].
 pub async fn advance_cursor(
     ex: impl PgExecutor<'_>,
     reload_id: i64,
@@ -256,6 +281,11 @@ pub async fn advance_cursor(
 
 /// `exporting → export_complete`, recording the final watermark `H`. The sink's last act; from
 /// here the LOADER finishes the walk (PR 6.9: `complete` once `transformed_lsn >= H`).
+///
+/// # Errors
+///
+/// Returns [`ControlError::ReloadTransition`] unless the attempt is still `exporting`; database
+/// failures become [`ControlError::Connect`] or [`ControlError::CheckViolation`].
 pub async fn complete_export(
     ex: impl PgExecutor<'_>,
     reload_id: i64,
@@ -280,6 +310,11 @@ pub async fn complete_export(
 /// `export_complete → complete` — the loader calls this once `transformed_lsn >= final_lsn`
 /// (PR 6.9). Terminal: the row leaves the `table_reload_one_live` index and the table can be
 /// reloaded again.
+///
+/// # Errors
+///
+/// Returns [`ControlError::ReloadTransition`] unless the attempt is `export_complete`, or
+/// [`ControlError::Connect`] if the guarded update fails.
 pub async fn complete(ex: impl PgExecutor<'_>, reload_id: i64) -> Result<(), ControlError> {
     let done = sqlx::query_file!("sql/postgres/queries/complete.sql", reload_id,)
         .execute(ex)
@@ -301,6 +336,12 @@ pub async fn complete(ex: impl PgExecutor<'_>, reload_id: i64) -> Result<(), Con
 /// inside an outer transaction it nests as a savepoint, so callers like PR 6.8's
 /// fail-and-reissue can wrap it with the successor INSERT atomically. The purge needs no `kind`
 /// filter — only reload files carry a `reload_id` (that is the point of the nullable column).
+///
+/// # Errors
+///
+/// Returns [`ControlError::ReloadTransition`] unless the attempt is in a failable live status;
+/// transaction, update, purge, or commit failures become [`ControlError::Connect`] or
+/// [`ControlError::CheckViolation`].
 pub async fn fail(
     conn: &mut PgConnection,
     reload_id: i64,
@@ -345,6 +386,12 @@ pub fn restart_would_exceed_cap(restart_count: i32, max_restarts: i32) -> bool {
 /// Returns the successor `reload_id`, or `None` when `restart_count + 1 > max_restarts`: then the
 /// attempt is failed-only (the cap named in the reason) and no successor is written — visible
 /// waste, never silent mis-reconciliation (the design's H9 choice).
+///
+/// # Errors
+///
+/// Returns [`ControlError::ReloadTransition`] if the predecessor can no longer be failed, or
+/// [`ControlError::Connect`] / [`ControlError::CheckViolation`] if the transaction, purge, successor
+/// insert, or commit fails.
 pub async fn restart_for_ddl(
     conn: &mut PgConnection,
     old: &ReloadRow,
@@ -394,6 +441,10 @@ pub async fn restart_for_ddl(
 /// so the loader can call it every cycle. Returns the reload_ids it completed (for the log). The
 /// LOADER owns this flip; the sink never writes `complete` (H10 — no service gets a write path into
 /// another's state row).
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the checkpoint-joined completion update cannot execute.
 pub async fn complete_reached(
     ex: impl PgExecutor<'_>,
     epoch: i64,
@@ -422,6 +473,10 @@ pub async fn complete_reached(
 /// This is what closes the quarantine-recovery loop: without it, a lossy-`ALTER` stream file
 /// (lower `lsn_end` than the reload's `first_lsn`) re-quarantines the loader on every restart before
 /// it can reach the reload chunk file that would clear the quarantine.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the pending-rebuild lookup cannot execute or decode.
 pub async fn reload_supersede_floor(
     ex: impl PgExecutor<'_>,
     epoch: i64,
@@ -449,6 +504,11 @@ pub async fn reload_supersede_floor(
 /// Recovery reads from control-pg, NOT from WAL redelivery (H7): by restart time the signals' LSNs
 /// are behind `confirmed_flush`, acked and gone — the chunk cursor on the returned row is the only
 /// thing a resume needs.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the guarded adoption query fails or its rows cannot be
+/// decoded.
 pub async fn adopt_resumable(
     ex: impl PgExecutor<'_>,
     epoch: i64,
@@ -472,6 +532,10 @@ pub async fn adopt_resumable(
 /// renewing — a dead exporter no startup scan adopted. Surfaced as a per-tick warn (the alert rule
 /// is PR 6.11's). `export_complete` rows with an expired lease are NOT stuck — they are waiting on
 /// the loader, by design — so the filter is `exporting` only.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if expired exporters cannot be queried or decoded.
 pub async fn stuck_exporting(
     ex: impl PgExecutor<'_>,
     epoch: i64,
@@ -491,6 +555,10 @@ pub async fn stuck_exporting(
 /// `requested | exporting` only: the pause MUST lift at `export_complete`, because the rebuild is
 /// *triggered by the loader claiming the chunk files* — pausing through `export_complete` would
 /// deadlock the reload forever (PR 6.6's gotcha, baked in here so no caller re-derives it).
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if active rebuild rows cannot be queried or decoded.
 pub async fn active_rebuilds(
     ex: impl PgExecutor<'_>,
     epoch: i64,
@@ -503,6 +571,10 @@ pub async fn active_rebuilds(
 }
 
 /// Read one reload attempt, if it exists.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the reload row cannot be queried or decoded.
 pub async fn get(
     ex: impl PgExecutor<'_>,
     reload_id: i64,

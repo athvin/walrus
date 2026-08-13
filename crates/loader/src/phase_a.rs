@@ -69,6 +69,13 @@ pub(crate) fn pause_began(logged: &Cell<Option<i64>>, live: Option<i64>) -> Opti
 }
 
 /// One Phase-A pass. Returns the max `lsn_end` appended, or `None` if the queue was empty.
+///
+/// # Errors
+///
+/// Returns [`LoaderError::Control`] or [`LoaderError::ControlTxn`] for control-plane reads and the
+/// advance/delete transaction, [`LoaderError::Duck`] for local append/reconcile failures,
+/// [`LoaderError::RegistryDecode`] for an invalid stored shape, [`LoaderError::Quarantine`] for an
+/// unsafe DDL cast, or [`LoaderError::Internal`] for an inconsistent reload manifest.
 pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     // Observability (PR 5.6): set the Phase-A backlog gauge every poll (0 when caught up) —
     // `max(lsn_end over ready files) − raw_appended_lsn`. Both operands are cheap indexed control-DB

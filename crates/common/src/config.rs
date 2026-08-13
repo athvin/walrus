@@ -68,6 +68,12 @@ impl CommonConfig {
     /// Load config: an optional file at `WALRUS_CONFIG` (TOML or YAML by extension) underneath,
     /// `WALRUS_`-prefixed environment on top (`__` marks nesting), then [`validate`](Self::validate).
     /// An invalid config can never escape as `Ok`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] — always terminal — when the configured file is unreadable or
+    /// invalid, an environment value cannot be deserialized (including unknown fields), or the
+    /// merged configuration fails [`Self::validate`].
     pub fn load() -> Result<Self> {
         use figment::providers::{Env, Format, Toml, Yaml};
         use figment::Figment;
@@ -105,6 +111,11 @@ impl CommonConfig {
 
     /// Bounds-check every field. Pure and offline — no sockets. Any violation is a terminal
     /// [`Error::Config`]; connectivity is a separate *transient* bootstrap check in the bins.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] when a required string is empty, `startup_deadline` is zero, or
+    /// that deadline exceeds the supported ceiling. All such failures are terminal.
     pub fn validate(&self) -> Result<()> {
         if self.control_db_url.trim().is_empty() {
             return Err(Error::Config(

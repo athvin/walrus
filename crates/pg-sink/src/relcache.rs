@@ -70,6 +70,11 @@ impl RelationCache {
 
     /// Build the Arrow schema + descriptors from a decoded `Relation`, cache under
     /// `(oid, schema_version)`, and return the entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RelationError::Schema`] when the relation contains an unsupported or invalid Arrow
+    /// mapping.
     pub fn upsert_from_relation(
         &mut self,
         relation: PgRelation,
@@ -85,6 +90,11 @@ impl RelationCache {
     /// Rebuild cache entries at bootstrap from persisted `schema_registry` rows (step 7). Each row's
     /// `columns` snapshot is the serialized `PgRelation`; the Arrow schema is recomputed from it, and
     /// the stored descriptors are used verbatim.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RelationError::Hydrate`] when a persisted snapshot is not a `PgRelation`, or
+    /// [`RelationError::Schema`] when its shape cannot be mapped to Arrow.
     pub fn hydrate(&mut self, rows: Vec<control::RegistryRow>) -> Result<(), RelationError> {
         for row in rows {
             let relation: PgRelation = serde_json::from_value(row.columns).map_err(|e| {

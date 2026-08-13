@@ -62,6 +62,10 @@ impl ParquetSink {
 
     /// Best-effort delete of a staged object — used to clean up an aborted streamed txn's speculative
     /// files (PR 2.30), which have no manifest row pointing at them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SinkError::Store`] if the object store cannot delete `key`.
     pub async fn delete(&self, key: &Path) -> Result<(), SinkError> {
         self.store.delete(key).await?;
         Ok(())
@@ -79,12 +83,22 @@ impl ParquetSink {
     /// Encode `batch` to Parquet (MICROS temporals + Snappy, inherited from the Arrow schema and the
     /// walrus writer properties) and stream it to S3 via multipart. Returns **only once durable**.
     /// Streamed WAL rows; the backfill (PR 2.29) uses [`Self::put_with_kind`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SinkError::Encode`] if Parquet encoding or multipart finalization fails, or
+    /// [`SinkError::Store`] for an object-store transport failure.
     pub async fn put(&self, batch: SealedBatch) -> Result<WrittenObject, SinkError> {
         self.put_with_kind(batch, FileKind::Stream).await
     }
 
     /// As [`Self::put`], stamping the object's provenance (`stream` vs `snapshot`) — the manifest row's
     /// `kind` (PR 2.25). Snapshot files all share `lsn_end = consistent_point`, `id`-disambiguated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SinkError::Encode`] if the Arrow batch cannot be encoded/finalized as Parquet, or
+    /// [`SinkError::Store`] if multipart upload to the object store fails.
     pub async fn put_with_kind(
         &self,
         batch: SealedBatch,

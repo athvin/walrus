@@ -40,6 +40,13 @@ impl OwnedTable {
 /// Run the ordered bootstrap for the current epoch's registered tables. Returns the owned tables (with
 /// their open DuckDB connections and lease tokens). Any terminal step returns a classified
 /// [`LoaderError`] that `main` maps to an exit code.
+///
+/// # Errors
+///
+/// Returns [`LoaderError::Internal`] when no epoch exists, [`LoaderError::RegistryDecode`] for an
+/// invalid stored relation, [`LoaderError::LeaseContended`] for a live competing owner, or the
+/// classified [`LoaderError::Control`], [`LoaderError::Duck`], [`LoaderError::ObjectStore`], and
+/// [`LoaderError::CorruptCheckpoint`] variants from the ordered dependency and invariant checks.
 pub async fn bootstrap(
     cfg: &LoaderConfig,
     pool: &sqlx::PgPool,

@@ -101,6 +101,11 @@ pub struct SchemaDiff {
 /// (PR 3.9). The homogeneous-file rule means one DDL per version, so a length change is unambiguous:
 /// a drop shrinks the column count (never a rename, which keeps it), and an empty new column set is a
 /// `DROP TABLE`. A type change is a lossless widen (additive) or a lossy/narrowing one (destructive).
+///
+/// # Errors
+///
+/// This classifier currently produces no [`LoaderError`] variant: every pair of relation shapes has
+/// a deterministic [`SchemaDiff`]. The `Result` keeps the version-step API aligned with its appliers.
 pub fn diff(old: &SchemaVersion, new: &SchemaVersion) -> Result<SchemaDiff, LoaderError> {
     let mut d = SchemaDiff::default();
 
@@ -165,6 +170,10 @@ pub fn diff(old: &SchemaVersion, new: &SchemaVersion) -> Result<SchemaDiff, Load
 
 /// The additive-only view of [`diff`] — errors if the step is destructive (use [`diff`] +
 /// [`apply_destructive`] for those, PR 3.9). Kept so the additive path stays a total function.
+///
+/// # Errors
+///
+/// Returns [`LoaderError::Internal`] when the version step contains any destructive change.
 pub fn diff_additive(
     old: &SchemaVersion,
     new: &SchemaVersion,
@@ -182,6 +191,10 @@ pub fn diff_additive(
 /// Apply the derived changes to the DuckDB tables per the taxonomy: mirror = exact shape, `<table>_raw`
 /// = additive superset (nullable adds), `COMMENT` = mirror only. A `SELECT *` view binds its columns at
 /// creation, so the user view is recreated after any structural change.
+///
+/// # Errors
+///
+/// Returns [`LoaderError::Duck`] if DuckDB rejects the assembled additive DDL transaction batch.
 pub fn apply_additive(
     conn: &duckdb::Connection,
     table: &str,
@@ -263,6 +276,11 @@ pub fn apply_additive(
 /// fails on the mirror returns [`LoaderError::Quarantine`] — a terminal, alerting v1 outcome (single-
 /// table reload out of quarantine is **out of scope in v1**). `DROP TABLE` retires both DuckDB tables
 /// idempotently (`IF EXISTS`); the `.duckdb` file is retired separately by [`retire_file`].
+///
+/// # Errors
+///
+/// Returns [`LoaderError::Duck`] for a failed drop or raw-table widening, and
+/// [`LoaderError::Quarantine`] when a lossy mirror cast cannot be applied without data loss.
 pub fn apply_destructive(
     conn: &duckdb::Connection,
     table: &str,
@@ -322,6 +340,11 @@ pub fn apply_destructive(
 
 /// Retire a dropped table's `.duckdb` file (call after its owning connection is closed). Idempotent —
 /// a missing file (a crash mid-retire re-run) is success.
+///
+/// # Errors
+///
+/// Returns [`LoaderError::Internal`] if removing an existing file fails for any reason other than
+/// `NotFound`.
 pub fn retire_file(path: &std::path::Path) -> Result<(), LoaderError> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -336,6 +359,12 @@ pub fn retire_file(path: &std::path::Path) -> Result<(), LoaderError> {
 /// Bring both DuckDB tables up to `target` by applying each version step's additive diff, advancing the
 /// `_walrus_meta` watermark after each — **before** any file at that version is appended/transformed.
 /// Idempotent: the watermark is persisted in the `.duckdb`, so a re-run resumes from where it left off.
+///
+/// # Errors
+///
+/// Returns [`LoaderError::Control`] for registry reads, [`LoaderError::RegistryDecode`] for invalid
+/// stored shapes, [`LoaderError::Duck`] for local DDL/watermark failures, or
+/// [`LoaderError::Quarantine`] when a destructive cast is unsafe.
 pub async fn reconcile_to_version(
     db: &TableDb,
     pool: &sqlx::PgPool,

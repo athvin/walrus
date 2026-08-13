@@ -156,6 +156,10 @@ pub fn router(state: Arc<HealthState>) -> Router {
 }
 
 /// Serve the probes on an already-bound listener until `shutdown` is cancelled (graceful).
+///
+/// # Errors
+///
+/// Returns [`anyhow::Error`] if Axum fails while accepting or serving a connection on `listener`.
 pub async fn serve_on(
     listener: tokio::net::TcpListener,
     state: Arc<HealthState>,
@@ -169,6 +173,10 @@ pub async fn serve_on(
 }
 
 /// Bind `addr` and serve the probes (see [`serve_on`]).
+///
+/// # Errors
+///
+/// Returns [`anyhow::Error`] if the address cannot be bound or [`serve_on`] fails while serving.
 pub async fn serve(
     addr: SocketAddr,
     state: Arc<HealthState>,

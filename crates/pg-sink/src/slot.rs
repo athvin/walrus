@@ -52,6 +52,11 @@ fn parse_lsn(s: &str) -> anyhow::Result<Lsn> {
 
 /// Read a slot's resume position **without** creating it — `None` if it does not exist. The bootstrap
 /// (PR 2.29) uses this to decide between resuming (`Some`) and a first-time snapshot+backfill (`None`).
+///
+/// # Errors
+///
+/// Returns [`anyhow::Error`] if `pg_replication_slots` cannot be queried or either stored LSN is
+/// malformed.
 pub async fn read_slot(
     client: &tokio_postgres::Client,
     slot: &str,
@@ -84,6 +89,10 @@ pub async fn read_slot(
 }
 
 /// Verify the slot (reading `restart_lsn` / `confirmed_flush_lsn`), or create it via SQL.
+///
+/// # Errors
+///
+/// Returns [`anyhow::Error`] if slot inspection/creation fails or a returned LSN cannot be parsed.
 pub async fn verify_or_create_slot(
     client: &tokio_postgres::Client,
     slot: &str,

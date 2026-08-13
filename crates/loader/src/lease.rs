@@ -10,6 +10,11 @@ use tokio_util::sync::CancellationToken;
 
 /// Acquire (or reclaim) the lease for one table. `Ok` only when the lease is free or already ours;
 /// a live owner is terminal.
+///
+/// # Errors
+///
+/// Returns [`LoaderError::Control`] if the lease query fails, or
+/// [`LoaderError::LeaseContended`] when another live pod owns the table.
 pub async fn acquire(
     pool: &sqlx::PgPool,
     epoch: i64,

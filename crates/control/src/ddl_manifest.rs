@@ -32,6 +32,11 @@ pub struct DdlRow {
 /// Record a decoded schema-change event (sink, PR 2.33). `c_rel_oid` + `c_columns` are the structured
 /// schema-diff payload (the source's post-change column snapshot) the loader applies in PR 3.8/3.9 —
 /// schema-DIFF, not a replay of the DDL text. Returns the assigned `id`.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the event cannot be inserted, or
+/// [`ControlError::CheckViolation`] if its values violate a control-plane invariant.
 pub async fn insert_ddl(
     ex: impl PgExecutor<'_>,
     row: &DdlRow,
@@ -58,6 +63,10 @@ pub async fn insert_ddl(
 
 /// DDL the loader must apply before transforming past `after_lsn`, in `c_lsn` order (`id` breaks
 /// ties) — the events with `c_lsn > after_lsn`.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if control Postgres cannot execute or decode the query.
 pub async fn read_pending_ddl(
     ex: impl PgExecutor<'_>,
     epoch: i64,

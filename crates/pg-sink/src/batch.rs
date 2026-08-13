@@ -76,6 +76,12 @@ pub struct TableBatcher {
 }
 
 impl TableBatcher {
+    /// Create an empty batcher for one cached relation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BatchError::Arrow`] if the relation cannot produce a supported Arrow schema or
+    /// typed builder set.
     pub fn new(
         rel: Arc<CachedRelation>,
         triggers: BatchTriggers,
@@ -118,6 +124,11 @@ impl TableBatcher {
     /// flush-eligible. `commit_lsn` and `commit_ts` are known only at Commit, so per-row metas were
     /// pushed with placeholders and get the real transaction values stamped here (PR 5.9). A commit
     /// with no rows for this table is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BatchError::Arrow`] if a buffered value or its provenance cannot be appended to the
+    /// relation's Arrow builders.
     pub fn on_commit(
         &mut self,
         commit_lsn: Lsn,
@@ -155,6 +166,12 @@ impl TableBatcher {
     }
 
     /// Finish the Arrow builders into a `SealedBatch` and reset. Errors if an open txn would be split.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BatchError::OpenTransaction`] if uncommitted rows remain,
+    /// [`BatchError::Empty`] if no committed rows exist, or [`BatchError::Arrow`] if finishing or
+    /// rebuilding the typed Arrow batch fails.
     pub fn seal(&mut self) -> Result<SealedBatch, BatchError> {
         if self.has_open_txn() {
             return Err(BatchError::OpenTransaction);
@@ -206,6 +223,11 @@ impl TableBatcher {
 
     /// Seal the in-flight **committed** batch on drain: drop any open speculative buffer first, then
     /// seal iff there are committed rows. `None` when nothing committed is in flight.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`BatchError::Arrow`] produced while sealing committed rows. The open transaction
+    /// is deliberately discarded first, so [`BatchError::OpenTransaction`] is not expected here.
     pub fn drain_committed(&mut self) -> Result<Option<SealedBatch>, BatchError> {
         self.drop_open_txn();
         if self.committed_rows == 0 {

@@ -24,6 +24,10 @@ pub struct Checkpoint {
 }
 
 /// Read the checkpoint for a table, if one exists yet.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the checkpoint query cannot reach or read control Postgres.
 pub async fn read_checkpoint(
     ex: impl PgExecutor<'_>,
     epoch: i64,
@@ -44,6 +48,11 @@ pub async fn read_checkpoint(
 /// Create the row at `(0/0, 0/0)` if missing; a no-op if present. Called once at loader bootstrap
 /// (PR 3.1), kept separate from `advance_*` so a fresh table starts at zero without a spurious
 /// "advance to zero".
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] for a database failure, or [`ControlError::CheckViolation`] if
+/// the seed would violate a control-plane invariant.
 pub async fn ensure_checkpoint(
     ex: impl PgExecutor<'_>,
     epoch: i64,
@@ -64,6 +73,11 @@ pub async fn ensure_checkpoint(
 /// Phase A: advance `raw_appended_lsn` (UPSERT). The caller passes the executor so this can share
 /// the control-DB transaction that also deletes claimed manifest rows (PR 3.2). `GREATEST` makes
 /// the advance **monotonic** — a re-run after a crash never moves the frontier backward.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] for a database failure, or [`ControlError::CheckViolation`] if
+/// the resulting checkpoint violates its ordering constraint.
 pub async fn advance_raw_appended(
     ex: impl PgExecutor<'_>,
     epoch: i64,
@@ -87,6 +101,11 @@ pub async fn advance_raw_appended(
 /// above the current `raw_appended_lsn` fails as a terminal [`ControlError::CheckViolation`]. (The
 /// INSERT fallback seeds `raw_appended_lsn` equal so the CHECK holds; in practice
 /// `ensure_checkpoint` has already created the row.)
+///
+/// # Errors
+///
+/// Returns [`ControlError::CheckViolation`] when the requested frontier exceeds
+/// `raw_appended_lsn`; other database failures become the transient [`ControlError::Connect`].
 pub async fn advance_transformed(
     ex: impl PgExecutor<'_>,
     epoch: i64,

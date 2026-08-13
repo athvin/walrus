@@ -24,6 +24,12 @@ use tokio_util::sync::CancellationToken;
 /// [`full_rebuild_abortable`], which interrupts the running DuckDB query — an in-flight rewrite that is
 /// interrupted rolls back and returns `Ok(())` (an intentional drain abort; the idempotent rebuild
 /// re-runs next cycle). Only a genuine (non-cancel) failure is an error.
+///
+/// # Errors
+///
+/// Returns [`LoaderError::LsnParse`] if a retained truncate boundary is corrupt, or
+/// [`LoaderError::Duck`] if beginning, executing, or committing the atomic rebuild fails for a reason
+/// other than cancellation.
 pub fn full_rebuild(
     conn: &duckdb::Connection,
     t: &TransformSql,
@@ -69,6 +75,11 @@ pub fn full_rebuild(
 /// the connection's [`InterruptHandle`](duckdb) (Send + Sync) and calls `interrupt()` on cancellation,
 /// which makes the running query error → `full_rebuild` rolls back and returns `Ok`. The watcher is
 /// aborted once the rewrite returns (whether it completed or was interrupted).
+///
+/// # Errors
+///
+/// Returns the [`LoaderError::LsnParse`] or [`LoaderError::Duck`] produced by [`full_rebuild`]; a
+/// cancellation-triggered DuckDB interrupt is deliberately converted to `Ok(())`.
 pub async fn full_rebuild_abortable(
     conn: &duckdb::Connection,
     t: &TransformSql,
@@ -90,6 +101,10 @@ pub async fn full_rebuild_abortable(
 /// it still needs — and the rebuild's mirror baseline preserves any current value whose raw was pruned.
 /// Returns the rows deleted. (The `DELETE` only tombstones; the space itself is reclaimed by the rebuild
 /// above — assert reclamation before/after `full_rebuild`, not after `prune_raw`.)
+///
+/// # Errors
+///
+/// Returns [`LoaderError::Duck`] if deleting the retained tail or checkpointing the database fails.
 pub fn prune_raw(
     conn: &duckdb::Connection,
     t: &TransformSql,

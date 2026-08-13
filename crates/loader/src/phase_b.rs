@@ -16,6 +16,12 @@ use common::{Lsn, PgRelation};
 /// Build the transform for a table at its CURRENT reconciled `schema_version` (PR 3.8): read the registry
 /// (columns + type descriptors) into a [`TablePlan`] (Tier-2 emit/recombine, PR 4.2); fall back to the
 /// bootstrap relation's scalar shape when there is no registry row (single-version / hermetic setups).
+///
+/// # Errors
+///
+/// Returns [`LoaderError::Duck`] if the local schema watermark cannot be read,
+/// [`LoaderError::Control`] if the registry lookup fails, or [`LoaderError::RegistryDecode`] if the
+/// stored relation shape is invalid.
 pub async fn current_transform(ctx: &TableCtx) -> Result<TransformSql, LoaderError> {
     let ver = ctx.db.schema_version()?;
     match control::read_registry(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table, ver).await? {
@@ -38,6 +44,12 @@ pub async fn current_transform(ctx: &TableCtx) -> Result<TransformSql, LoaderErr
 }
 
 /// One Phase-B pass. Returns the max `commit_lsn` applied, or `None` if the tail was empty.
+///
+/// # Errors
+///
+/// Returns [`LoaderError::Control`] for checkpoint/registry/watermark operations,
+/// [`LoaderError::Duck`] for local scan or transaction failures, [`LoaderError::LsnParse`] for an
+/// invalid stored watermark, or [`LoaderError::RegistryDecode`] for an invalid relation shape.
 pub async fn run_phase_b(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     let cp = control::read_checkpoint(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table)
         .await?

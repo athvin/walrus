@@ -147,6 +147,11 @@ impl From<ConfigError> for common::Error {
 impl SinkConfig {
     /// Load config: an optional `WALRUS_CONFIG` file underneath, `WALRUS_`-prefixed env on top (`__`
     /// marks nesting), then [`validate`](Self::validate). An invalid config can never escape as `Ok`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Load`] when file or environment values cannot be deserialized, or the
+    /// [`ConfigError::Missing`] / [`ConfigError::OutOfBounds`] produced by [`Self::validate`].
     pub fn load() -> Result<Self, ConfigError> {
         use figment::providers::{Env, Format, Toml, Yaml};
         use figment::Figment;
@@ -202,6 +207,12 @@ impl SinkConfig {
     }
 
     /// Bounds-check every field. Pure and offline — no sockets. Any violation is terminal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Missing`] for an empty required string, or
+    /// [`ConfigError::OutOfBounds`] when a duration, count, ratio, or reload setting violates its
+    /// documented bound. All configuration failures are terminal.
     pub fn validate(&self) -> Result<(), ConfigError> {
         for (field, value) in [
             ("control_db_url", &self.control_db_url),

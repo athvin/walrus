@@ -87,6 +87,11 @@ impl From<sqlx::Error> for ControlError {
 const DEFAULT_MAX_CONNECTIONS: u32 = 5;
 
 /// Connect to the control Postgres, returning a ready connection pool.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the DSN cannot be parsed or the initial connection fails.
+/// This dependency failure is transient during startup and may be retried under the deadline.
 pub async fn connect(dsn: &str) -> Result<PgPool, ControlError> {
     Ok(PgPoolOptions::new()
         .max_connections(DEFAULT_MAX_CONNECTIONS)
@@ -96,6 +101,11 @@ pub async fn connect(dsn: &str) -> Result<PgPool, ControlError> {
 
 /// Apply every migration in `migrations/control/` idempotently — sqlx records applied versions in
 /// `_sqlx_migrations`, so a second run is a no-op. The path is relative to this crate's `Cargo.toml`.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Migrate`] when a migration cannot be read or applied, or its recorded
+/// checksum differs. Migration failures are terminal.
 pub async fn run_migrations(pool: &PgPool) -> Result<(), ControlError> {
     sqlx::migrate!("../../migrations/control").run(pool).await?;
     Ok(())

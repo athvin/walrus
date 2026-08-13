@@ -214,6 +214,11 @@ fn expect_n(reader: &mut Reader<'_>) -> Result<(), DecodeError> {
 /// wire), `'t'` → [`TupleValue::Text`] (Int32 length + UTF-8 bytes), `'b'` →
 /// [`TupleValue::Binary`] (Int32 length + bytes). An unexpected tag means the cursor misaligned →
 /// [`DecodeError::BadTupleFormat`] (fail loud, never guess). Shared by Insert/Update/Delete.
+///
+/// # Errors
+///
+/// Returns [`DecodeError::UnexpectedEof`] for truncated data, [`DecodeError::BadTupleFormat`] for an
+/// invalid marker, or [`DecodeError::Utf8`] for invalid textual values.
 pub fn parse_tuple(reader: &mut Reader<'_>) -> Result<Vec<TupleValue>, DecodeError> {
     let ncols = reader.int16()?;
     let mut cols = Vec::with_capacity(ncols as usize);
@@ -459,6 +464,11 @@ fn parse_one(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Message, De
 
 /// Decode exactly one **complete** message from `reader`: parse one message, then reject any
 /// trailing unconsumed bytes (a truncated or misaligned message).
+///
+/// # Errors
+///
+/// Returns the concrete [`DecodeError`] for a malformed message, or
+/// [`DecodeError::TrailingBytes`] when a valid message does not consume the full payload.
 pub fn parse_message(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Message, DecodeError> {
     let msg = parse_one(reader, ctx)?;
     let unconsumed = reader.remaining();
@@ -470,6 +480,11 @@ pub fn parse_message(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Mes
 
 /// Split a raw walsender byte stream into messages, skipping the single `0x0a` that
 /// `pg_recvlogical` inserts between self-delimiting messages, threading `ctx` across them.
+///
+/// # Errors
+///
+/// Returns the first [`DecodeError`] produced by a truncated, unknown, misframed, or state-invalid
+/// message in the stream.
 pub fn parse_stream(data: &[u8], ctx: &mut StreamCtx) -> Result<Vec<Message>, DecodeError> {
     let mut reader = Reader::new(data);
     let mut out = Vec::new();

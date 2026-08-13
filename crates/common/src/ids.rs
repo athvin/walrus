@@ -5,9 +5,9 @@
 //! PR 8.4a lands `ManifestId` alone; `EpochNo`/`SchemaVersion`/`ReloadId` stay bare `i64` for now —
 //! the same transparent-`int8` pattern below applies verbatim when they follow (deferred).
 
-/// A `file_manifest` row's primary key (`id`): returned by [`insert_ready`](crate::insert_ready),
-/// claimed as [`ManifestRow::id`](crate::ManifestRow), and retired through the loader's Phase-A
-/// lifecycle ([`delete_claimed`](crate::delete_claimed) / [`mark_failed`](crate::mark_failed)).
+/// A `file_manifest` row's primary key (`id`): returned by `insert_ready`, claimed as
+/// `ManifestRow::id`, and retired through the loader's Phase-A lifecycle (`delete_claimed` /
+/// `mark_failed`). Those APIs live in downstream crates, so `common` cannot link to them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ManifestId(pub i64);
 

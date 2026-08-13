@@ -15,6 +15,10 @@ use crate::sink::WrittenObject;
 
 /// Record a durable object as a `ready` work-queue row. **Call ONLY after the PUT is durable.** Returns
 /// the manifest `id`.
+///
+/// # Errors
+///
+/// Returns [`ManifestError::Control`] if control Postgres cannot insert the ready manifest row.
 pub async fn record_ready(
     ex: impl sqlx::PgExecutor<'_>,
     epoch: i64,
@@ -25,6 +29,11 @@ pub async fn record_ready(
 
 /// As [`record_ready`], carrying the `reload_id` a `kind='reload'` chunk file belongs to (PR 6.5)
 /// — the loader's routing/purge key. Stream/snapshot/spill objects pass `None`.
+///
+/// # Errors
+///
+/// Returns [`ManifestError::Control`] if the ready row violates a control-plane invariant or cannot
+/// be committed.
 pub async fn record_ready_with_reload(
     ex: impl sqlx::PgExecutor<'_>,
     epoch: i64,

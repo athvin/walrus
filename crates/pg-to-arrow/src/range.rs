@@ -92,6 +92,11 @@ fn range_err(text: &str) -> Error {
 /// Parse `[1,10)` / `empty` / `(,5]` / `[2024-01-01,)` into a `ParsedRange`. An inclusivity marker on
 /// an unbounded side is forced to `false` (an infinite bound is never inclusive — matches Postgres'
 /// `lower_inc`/`upper_inc`).
+///
+/// # Errors
+///
+/// Returns [`Error::ValueParse`] when delimiters are invalid or the two bounds are not separated by
+/// one top-level comma.
 pub fn parse_range(text: &str) -> Result<ParsedRange, Error> {
     let t = text.trim();
     if t.eq_ignore_ascii_case("empty") {
@@ -132,6 +137,10 @@ pub fn parse_range(text: &str) -> Result<ParsedRange, Error> {
 
 /// Parse `{[1,4),[7,9)}` (and `{}`) into member ranges. Members are non-empty and non-null (Postgres
 /// guarantees this); an empty multirange yields an empty `Vec` — distinct from a NULL column.
+///
+/// # Errors
+///
+/// Returns [`Error::ValueParse`] if the outer braces are missing or any member is not a valid range.
 pub fn parse_multirange(text: &str) -> Result<Vec<ParsedRange>, Error> {
     let t = text.trim();
     if !t.starts_with('{') || !t.ends_with('}') {

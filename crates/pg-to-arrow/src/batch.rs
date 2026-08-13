@@ -84,6 +84,11 @@ pub struct BatchBuilder {
 
 impl BatchBuilder {
     /// Build empty typed builders from the relation's Arrow schema (PR 2.9; Tier-2 fan-out, PR 2.12).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::EmptyRelation`] for a relation without columns, [`Error::NotTier1`] for an
+    /// unsupported source type, or [`Error::Arrow`] if Arrow rejects a typed builder configuration.
     pub fn new(rel: &PgRelation) -> Result<Self, Error> {
         let schema = Arc::new(build_schema(rel)?);
         // One flat builder per data field (every field except the trailing meta column).
@@ -110,6 +115,12 @@ impl BatchBuilder {
 
     /// Append one decoded tuple + its provenance. `values.len()` must equal the source column count
     /// (one `TupleValue` per source column — Tier-2 values fan out to several builders internally).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::RowLenMismatch`] when the tuple width differs from the relation, and
+    /// [`Error::ValueParse`], [`Error::Downcast`], or [`Error::Arrow`] when a value cannot be
+    /// converted into its planned Arrow builder or its provenance cannot be serialized.
     pub fn append_row(&mut self, values: &[TupleValue], meta: &SinkMeta) -> Result<(), Error> {
         if values.len() != self.plan.len() {
             return Err(Error::RowLenMismatch {
@@ -190,6 +201,10 @@ impl BatchBuilder {
     }
 
     /// Finish all builders into arrays and assemble the schema-checked `RecordBatch`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Arrow`] if the finished arrays do not match the planned schema or row count.
     pub fn finish(mut self) -> Result<RecordBatch, Error> {
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(self.builders.len() + 1);
         for builder in &mut self.builders {

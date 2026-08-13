@@ -26,6 +26,11 @@ pub enum ReplicaIdentity {
 
 impl ReplicaIdentity {
     /// Parse the Relation message's `relreplident` byte; error on any other value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Internal`] if `c` is not one of `b'd'`, `b'n'`, `b'f'`, or `b'i'`, the
+    /// four bytes PostgreSQL emits for `pg_class.relreplident`. This protocol mismatch is terminal.
     pub fn from_wire(c: u8) -> Result<Self, Error> {
         match c {
             b'd' => Ok(ReplicaIdentity::Default),

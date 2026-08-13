@@ -48,6 +48,10 @@ pub fn is_enum_oid(type_oid: u32) -> bool {
 
 /// Parse canonical UUID text (`"550e8400-e29b-41d4-a716-446655440000"`) into 16 bytes. Rejects
 /// malformed input with `ValueParse` (no silent zero-padding).
+///
+/// # Errors
+///
+/// Returns [`Error::ValueParse`] when `text` is not a canonical UUID accepted by `uuid::Uuid`.
 pub fn parse_uuid_bytes(text: &str) -> Result<[u8; 16], Error> {
     uuid::Uuid::parse_str(text)
         .map(|u| u.into_bytes())

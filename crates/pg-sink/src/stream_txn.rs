@@ -3,7 +3,7 @@
 //! **before its commit**, chopped into interleaved `Stream Start … Stream Stop` blocks that finish with
 //! `Stream Commit` or `Stream Abort`. This module makes the sink correct under that:
 //!
-//! 1. **Demultiplex per top-level `xid`** — a [`StreamDemux`] of per-xid [`StreamedTxn`] buffers,
+//! 1. **Demultiplex per top-level `xid`** — a [`StreamDemux`] of per-xid `StreamedTxn` buffers,
 //!    reassembling non-contiguous segments via the `Stream Start` first-segment flag.
 //! 2. **Commit-gate visibility** — a txn's rows become a `ready` manifest file **only on `Stream
 //!    Commit`**; nothing is visible before it.
@@ -144,6 +144,11 @@ impl StreamDemux {
     /// A streamed change: buffer it against the current top-level xid, tagged with its sub-xid, and
     /// meter its bytes. If the aggregate ceiling is crossed, spill the largest open `(table, sub-xid)`
     /// buffer speculatively (no manifest row, slot not advanced).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if no stream block is active, the relation is unknown, batching fails,
+    /// or a speculative Parquet spill cannot be written.
     pub async fn on_change(
         &mut self,
         cache: &RelationCache,
@@ -351,6 +356,11 @@ impl StreamDemux {
 
     /// `Stream Commit`: publish the (non-aborted) speculative spills stamped with the real `commit_lsn`,
     /// and materialise the in-memory survivors, returning every object for the caller to `record_ready`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if survivor batching, commit timestamp propagation, or durable
+    /// Parquet publication of an in-memory group fails.
     pub async fn on_stream_commit(
         &mut self,
         top_xid: u32,

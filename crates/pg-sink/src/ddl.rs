@@ -36,6 +36,11 @@ pub struct DdlEvent {
 
 impl DdlEvent {
     /// Extract from a decoded `ddl_audit` tuple by column name (text/pgoutput format).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DdlError::MissingColumn`] when the required LSN is absent or invalid, and
+    /// [`DdlError::Json`] when the optional structured column snapshot is malformed.
     pub fn from_tuple(rel: &PgRelation, values: &[TupleValue]) -> Result<Self, DdlError> {
         let text = |name: &str| -> Option<String> {
             let idx = rel.columns.iter().position(|c| c.name == name)?;
@@ -96,6 +101,10 @@ impl DdlConsumer {
     /// **(1)** write a `ddl_manifest` row stamped with `c_lsn`; **(2)** for a *structural* event, bump the
     /// table's `schema_version`. Returns `Some(new_version)` iff structural (the caller cuts a fresh
     /// file), `None` for metadata-only.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DdlError::Control`] if the DDL history row cannot be persisted in control Postgres.
     pub async fn consume(
         &mut self,
         ex: impl sqlx::PgExecutor<'_>,

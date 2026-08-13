@@ -55,6 +55,11 @@ impl UtcTimestamp {
     /// Parse an RFC-3339 string, **rejecting** anything not already normalized to UTC `Z` — a
     /// numeric offset (e.g. `+02:00`) is refused rather than silently converted, so the wire form
     /// is always UTC (architecture.md §1.4).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Internal`] when `s` lacks a `Z` suffix or cannot be parsed as an RFC-3339
+    /// UTC timestamp. Invalid persisted provenance is terminal.
     pub fn parse_rfc3339(s: &str) -> Result<Self> {
         if !(s.ends_with('Z') || s.ends_with('z')) {
             return Err(Error::Internal(format!(
@@ -71,6 +76,11 @@ impl UtcTimestamp {
     /// the Postgres epoch, NOT the Unix epoch. Offsets by the fixed 946_684_800 s (2000-01-01 −
     /// 1970-01-01; Unix time has no leap seconds) and defers to jiff's range check, so a corrupt or
     /// overflowing frame is a decode error — **never a panic** (PR 5.9; retires the `commit_ts` TODO).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Internal`] when adding the Postgres epoch offset overflows or the resulting
+    /// instant is outside jiff's supported range. Either condition indicates a corrupt wire value.
     pub fn from_pg_micros(pg_micros: i64) -> Result<Self> {
         // 2000-01-01T00:00:00Z expressed as microseconds since the Unix epoch.
         const PG_EPOCH_OFFSET_MICROS: i64 = 946_684_800_000_000;
@@ -189,6 +199,10 @@ fn object_inner(s: &str) -> &str {
 impl SinkMeta {
     /// The batch-constant fields as a brace-less JSON fragment (e.g. `"epoch":7,"batch_id":"…",…`),
     /// serialized once per sealed batch and cached by the batcher.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`serde_json::Error`] if a batch-constant provenance field cannot be serialized.
     pub fn const_json_inner(&self) -> std::result::Result<String, serde_json::Error> {
         let s = serde_json::to_string(&MetaConst {
             epoch: self.epoch,
@@ -203,6 +217,11 @@ impl SinkMeta {
     }
 
     /// Append the per-row fields (brace-less) to `buf`; the batcher wraps `{const,row}` around them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`serde_json::Error`] if a row-varying provenance field cannot be serialized. `buf`
+    /// is left unchanged until serialization succeeds.
     pub fn write_row_json_inner(
         &self,
         buf: &mut String,

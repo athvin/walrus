@@ -115,6 +115,11 @@ pub fn router(state: Arc<LoaderState>) -> Router {
         .with_state(state)
 }
 
+/// Serve loader health and metrics routes until `shutdown` is cancelled.
+///
+/// # Errors
+///
+/// Returns [`anyhow::Error`] if Axum fails while accepting or serving a connection on `listener`.
 pub async fn serve_on(
     listener: tokio::net::TcpListener,
     state: Arc<LoaderState>,

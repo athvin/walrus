@@ -64,6 +64,12 @@ impl Default for LoaderConfig {
 }
 
 impl LoaderConfig {
+    /// Load the optional config file under `WALRUS_` environment overrides, then validate it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] when a file or environment value cannot be deserialized, an unknown
+    /// field is present, or the merged configuration fails [`Self::validate`].
     pub fn load() -> Result<Self, ConfigError> {
         use figment::providers::{Env, Format, Toml, Yaml};
         use figment::Figment;
@@ -93,6 +99,12 @@ impl LoaderConfig {
         Ok(cfg)
     }
 
+    /// Validate required strings and the ownership-lease duration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] when a required value is empty or `lease_ttl` is zero. These are
+    /// terminal configuration failures.
     pub fn validate(&self) -> Result<(), ConfigError> {
         for (field, v) in [
             ("control_db_url", &self.control_db_url),

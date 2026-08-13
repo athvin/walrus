@@ -77,6 +77,11 @@ impl ReplicationStream {
     /// Connect, hand-shake, and issue `START_REPLICATION SLOT … LOGICAL <lsn> (proto_version '2',
     /// streaming 'on', publication_names '<publication>')`. `dsn` is parsed for host/port/user/db
     /// (its auth is `trust` in the dev harness).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if the DSN is invalid, TCP/startup negotiation fails, or PostgreSQL
+    /// rejects `START_REPLICATION`.
     pub async fn start(
         dsn: &str,
         slot: &str,
@@ -92,6 +97,11 @@ impl ReplicationStream {
     /// issuing `START_REPLICATION` — the idle state a snapshot export needs (PR 2.29). The caller then
     /// either [`create_replication_slot_export`](Self::create_replication_slot_export) or
     /// [`start_streaming`](Self::start_streaming).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if the DSN is invalid, the TCP connection fails, or the replication
+    /// startup handshake is rejected or malformed.
     pub async fn connect(dsn: &str) -> anyhow::Result<Self> {
         let (host, port, user, database) = parse_dsn(dsn)?;
         let stream = TcpStream::connect((host.as_str(), port))
@@ -111,6 +121,11 @@ impl ReplicationStream {
 
     /// Issue `START_REPLICATION` from `start_lsn`, seeding the received/durable baselines. On its own
     /// (after [`connect`](Self::connect)) this is the snapshot handoff: stream from `consistent_point`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if PostgreSQL rejects the replication command or the CopyBoth
+    /// response cannot be written, read, or decoded.
     pub async fn start_streaming(
         &mut self,
         slot: &str,
@@ -129,6 +144,11 @@ impl ReplicationStream {
     /// command on it (e.g. `START_REPLICATION`) ends the snapshot. Unlike
     /// `pg_create_logical_replication_slot()` (the SQL helper), the replication command is the *only*
     /// way to export a `snapshot_name`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] for socket/protocol failures, a PostgreSQL error response, a missing
+    /// result column, or an invalid `consistent_point` LSN.
     pub async fn create_replication_slot_export(
         &mut self,
         slot: &str,
@@ -185,6 +205,11 @@ impl ReplicationStream {
 
     /// Read one frame. Sends unconditional feedback whenever the interval elapses (so an idle stream
     /// stays alive), and answers a `reply_requested` keepalive immediately. `None` on stream end.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if reading or parsing a backend frame fails, PostgreSQL reports an
+    /// error, an unexpected CopyBoth message arrives, or periodic feedback cannot be sent.
     pub async fn next(&mut self) -> anyhow::Result<Option<ReplicationMessage>> {
         loop {
             let budget = self
@@ -218,6 +243,10 @@ impl ReplicationStream {
 
     /// Send an `'r'` standby status update. Callers (PR 2.26) use this to advance `flush`/`apply` on
     /// durability; the keepalive path uses [`Self::send_received_feedback`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if writing or flushing the status frame to PostgreSQL fails.
     pub async fn send_standby_status(&mut self, s: StandbyStatus) -> anyhow::Result<()> {
         self.stream
             .write_all(&build_standby_status(s))
@@ -231,6 +260,10 @@ impl ReplicationStream {
     /// Send `CopyDone` and flush — end our side of the CopyBoth stream on a graceful drain (PR 2.28).
     /// The replication **slot is untouched** (never `DROP_REPLICATION_SLOT`); a replacement pod
     /// resumes from `confirmed_flush_lsn`. `CopyDone` is a bare frame: tag `'c'`, Int32 length `4`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if writing or flushing the `CopyDone` frame fails.
     pub async fn copy_done(&mut self) -> anyhow::Result<()> {
         self.stream
             .write_all(&[b'c', 0, 0, 0, 4])
@@ -307,6 +340,10 @@ impl ReplicationStream {
     /// Public so the flush path can pump keepalive while a slow S3 PUT blocks the read loop — the PUT
     /// touches the object store, not this socket, so feedback rides concurrently (§1.9: keepalive is
     /// unconditional, never gated on durability). Resets the feedback deadline on each send.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if [`Self::send_standby_status`] cannot write or flush the feedback.
     pub async fn send_received_feedback(&mut self, reply_requested: bool) -> anyhow::Result<()> {
         self.send_standby_status(StandbyStatus {
             write: self.last_received,

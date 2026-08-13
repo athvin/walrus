@@ -26,6 +26,11 @@ pub struct RegistryRow {
 
 /// Write the descriptor set for one `schema_version`, idempotently: a repeated write of the same
 /// version updates in place rather than duplicating (the `(epoch, schema, table, version)` PK).
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] when the upsert fails, or [`ControlError::CheckViolation`] if
+/// the registry row violates a database invariant.
 pub async fn upsert_registry(
     ex: impl PgExecutor<'_>,
     row: &RegistryRow,
@@ -45,6 +50,10 @@ pub async fn upsert_registry(
 }
 
 /// Read the descriptors for an **exact** `schema_version` — the loader rebuilds types from this.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the registry row cannot be queried or decoded.
 pub async fn read_registry(
     ex: impl PgExecutor<'_>,
     epoch: i64,
@@ -73,6 +82,10 @@ pub async fn read_registry(
 }
 
 /// The current (max) `schema_version` for a table, or `None` if it has no registry rows yet.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the version query cannot reach or read control Postgres.
 pub async fn read_latest_version(
     ex: impl PgExecutor<'_>,
     epoch: i64,
@@ -93,6 +106,11 @@ pub async fn read_latest_version(
 /// The **latest** registry row for every `(source_schema, source_table)` under `epoch` — what the
 /// sink hydrates its relation cache from at bootstrap (step 7). A runtime query (not `query!`) so it
 /// needs no offline cache entry; the `jsonb` columns decode via `Json<_>` / `serde_json::Value`.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the latest-row query fails or any typed column cannot be
+/// decoded from control Postgres.
 pub async fn read_all_latest_registry(
     ex: impl PgExecutor<'_>,
     epoch: i64,

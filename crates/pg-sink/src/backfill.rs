@@ -11,8 +11,8 @@
 //! concurrent `COPY` under the existing snapshot — which is why it is the cheapest of the three
 //! deferred goals to pick up first.
 //!
-//! This module is the marked seam, not an implementation: [`plan_ctid_ranges`] is where a future
-//! contributor produces the per-table range plan that [`snapshot::SourceBackfill::copy_table`] would
+//! This module is the marked seam, not an implementation: `plan_ctid_ranges` is where a future
+//! contributor produces the per-table range plan that [`snapshot::Backfill::copy_table`](crate::snapshot::Backfill::copy_table) would
 //! then be fanned out over (each range still emits `snapshot` files at `lsn_end = consistent_point`,
 //! disambiguated by `manifest_id`, so the watermark handoff is unchanged — a throughput optimisation
 //! only). See `docs/deferred-goals.md`.

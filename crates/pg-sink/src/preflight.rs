@@ -101,6 +101,12 @@ impl From<PreflightError> for common::Error {
 /// up) is a *transient* [`common::Error::SourceDb`]; a server-side rejection (auth/config) is a
 /// *terminal* [`common::Error::Preflight`]. The `REPLICATION` privilege itself is asserted from the
 /// catalog by [`SourcePreflight::assert_server_prereqs`], not inferred from the connect succeeding.
+///
+/// # Errors
+///
+/// Returns [`common::Error::SourceDb`] for a transport-level connection failure (transient), or
+/// [`common::Error::Preflight`] when the server responds with a terminal authentication/configuration
+/// rejection.
 pub async fn connect_source(url: &str) -> Result<Client, common::Error> {
     let (client, connection) = tokio_postgres::connect(url, NoTls).await.map_err(|e| {
         if e.as_db_error().is_some() {
@@ -133,6 +139,11 @@ impl<'a> SourcePreflight<'a> {
 
     /// The DDL-capture tap is installed (PR 2.33): the `walrus.ddl_audit` table has the sink's columns
     /// and **both** event triggers exist. Missing → terminal (schema changes would silently drift).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PreflightError::DdlCaptureMissing`] when the audit shape or either trigger is absent,
+    /// or [`PreflightError::Query`] when a catalog query fails.
     pub async fn assert_ddl_capture(&self) -> Result<(), PreflightError> {
         if self
             .first_text(
@@ -168,6 +179,12 @@ impl<'a> SourcePreflight<'a> {
 
     /// The role has `REPLICATION`, `wal_level = logical`, `server_version_num ≥ 140000`, and free
     /// slot / wal-sender headroom.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PreflightError::NoReplicationPriv`], [`PreflightError::WalLevel`],
+    /// [`PreflightError::ServerTooOld`], or [`PreflightError::NoHeadroom`] for a terminal prerequisite
+    /// mismatch; catalog failures return [`PreflightError::Query`].
     pub async fn assert_server_prereqs(&self) -> Result<ServerInfo, PreflightError> {
         // The role must be able to start a WAL sender (rolreplication, or a superuser).
         let can_replicate = self
@@ -211,6 +228,11 @@ impl<'a> SourcePreflight<'a> {
     /// `manage_publication`) by [`Self::assert_publication_covers`], which treats `reload_signal`
     /// as the third walrus-internal table; this existence check runs FIRST so a missing table gets
     /// the migration-naming error, not a failed `ALTER PUBLICATION`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PreflightError::ReloadSignalMissing`] when the table or primary key is absent, or
+    /// [`PreflightError::Query`] when a catalog query fails.
     pub async fn assert_reload_signal(&self) -> Result<(), PreflightError> {
         if self
             .first_text(
@@ -249,6 +271,12 @@ impl<'a> SourcePreflight<'a> {
     /// and `reload_signal` (create/extend when `manage_publication`, else a gap is terminal, with
     /// the exact `ALTER PUBLICATION` fix in the error). `pg_publication_tables` already expands
     /// `FOR ALL TABLES` and partition roots, so we read it directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PreflightError::PublicationMissing`] or [`PreflightError::PublicationGap`] when
+    /// automatic publication management is disabled, and [`PreflightError::Query`] when inspection
+    /// or an authorized create/alter statement fails.
     pub async fn assert_publication_covers(&self) -> Result<(), PreflightError> {
         let pubname = &self.cfg.publication_name;
         let exists = self
@@ -307,6 +335,11 @@ impl<'a> SourcePreflight<'a> {
     /// Every published **user** table (schema ≠ `walrus`) has a usable replica identity: `DEFAULT`
     /// requires a PRIMARY KEY; `FULL`/`INDEX` are fine; `NOTHING` is never usable. Strict → terminal on
     /// the first offender; lenient → quarantine + alert + continue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PreflightError::NoPrimaryKey`] for the first unusable table in strict mode, or
+    /// [`PreflightError::Query`] when publication/catalog rows cannot be read.
     pub async fn assert_tables_have_pk(&self, mode: PkMode) -> Result<PkReport, PreflightError> {
         let sql = format!(
             r#"SELECT pt.schemaname, pt.tablename, c.relreplident::text AS relreplident,

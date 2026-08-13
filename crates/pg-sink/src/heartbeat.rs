@@ -173,7 +173,7 @@ impl BeatState {
 }
 
 /// Owns a *separate* ordinary SQL connection to the source (distinct from the read-only replication
-/// connection) plus the pure [`BeatState`]. The beat **must** ride the published `walrus.heartbeat`
+/// connection) plus the pure `BeatState`. The beat **must** ride the published `walrus.heartbeat`
 /// table or `pgoutput` filters it out and there is no round-trip.
 pub struct Heartbeat {
     sql: tokio_postgres::Client,
@@ -184,6 +184,10 @@ pub struct Heartbeat {
 impl Heartbeat {
     /// Open the ordinary SQL connection and drive it in the background (`NoTls` — the dev/source auth
     /// is `trust`; TLS is the operator's network concern, not this control path).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HeartbeatError::Connect`] if the source SQL connection or startup handshake fails.
     pub async fn connect(
         dsn: &str,
         instance: String,
@@ -211,6 +215,10 @@ impl Heartbeat {
 
     /// Fire exactly one beat iff idle on both clocks; returns the seq written, or `None` (suppressed).
     /// The `UPDATE` rides the **published** `walrus.heartbeat` so it decodes back to us.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HeartbeatError::Beat`] if the heartbeat update or returned sequence read fails.
     pub async fn maybe_beat(
         &mut self,
         now: Instant,
@@ -239,7 +247,7 @@ impl Heartbeat {
         self.state.observe_return(beat_seq, now);
     }
 
-    /// Non-gating health signal (see [`BeatState::degraded`]).
+    /// Non-gating health signal (see `BeatState::degraded`).
     pub fn degraded(&self, now: Instant) -> bool {
         self.state.degraded(now)
     }

@@ -31,6 +31,8 @@ unwrap_used = "deny"
 expect_used = "deny"
 # A suppression must say why. This restriction lint is outside `clippy::all`, so no priority is needed.
 allow_attributes_without_reason = "deny"
+# Promoting exactly this pedantic lint keeps every fallible public API's contract explicit.
+missing_errors_doc = "deny"
 panic = "deny"              # a service returns a classified error instead of aborting the pod
 todo = "deny"               # unfinished code must not reach main
 unimplemented = "deny"      # the one deferred stub carries a scoped, fulfilled expectation
