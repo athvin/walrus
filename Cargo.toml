@@ -83,6 +83,9 @@ significant_drop_tightening = "deny"
 await_holding_lock = "deny"
 await_holding_refcell_ref = "deny"
 await_holding_invalid_type = "deny"
+# Non-Send futures cannot be spawned onto Tokio's multi-thread scheduler. The loader is the
+# documented exception: DuckDB-backed workers are intentionally driven on a LocalSet (PR 14.8).
+future_not_send = "deny"
 # Shared-ownership bumps must say they are bumps (PR 9.8, `own-arc-shared`). Like `unwrap_used` /
 # `expect_used`, this is one `clippy::restriction` lint rather than the whole group; it is outside
 # `clippy::all`, so no `priority` is needed.

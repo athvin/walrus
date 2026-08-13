@@ -216,6 +216,10 @@ fn raw_has(ctx: &TableCtx, id: i32) -> bool {
 }
 
 /// Establish a live mirror {1,2,3} via a stream file at 0/50, then update id 2 nowhere yet.
+#[allow(
+    clippy::future_not_send,
+    reason = "this helper borrows a TableCtx containing a Send + !Sync TableDb across awaits"
+)]
 async fn seed_live_mirror(ctx: &TableCtx, epoch: EpochNo) {
     let live = write_rows(
         epoch,

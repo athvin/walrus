@@ -157,6 +157,10 @@ fn ctx_on(
 }
 
 /// Run one worker until it drains: cancel the token after `cancel_after` (SIGTERM), then await the loop.
+#[allow(
+    clippy::future_not_send,
+    reason = "apply_loop borrows a Send + !Sync TableDb across awaits and this loader test drives it locally"
+)]
 async fn run_until_drain(ctx: TableCtx, cancel_after: Duration) {
     let token = CancellationToken::new();
     let tc = token.clone();

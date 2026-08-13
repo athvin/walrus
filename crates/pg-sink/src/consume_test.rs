@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 #[test]
@@ -15,16 +15,16 @@ fn build_names_the_first_missing_field() {
 }
 
 /// Stands in for a frame future that makes partial progress before completing.
-async fn stepwise(progress: &Cell<u32>, steps: u32) {
+async fn stepwise(progress: &AtomicU32, steps: u32) {
     for _ in 0..steps {
         tokio::time::sleep(Duration::from_millis(10)).await;
-        progress.set(progress.get() + 1);
+        progress.fetch_add(1, Ordering::Relaxed);
     }
 }
 
 #[tokio::test(start_paused = true)]
 async fn pinned_branch_survives_other_arm_firing() {
-    let progress = Cell::new(0);
+    let progress = AtomicU32::new(0);
     let frame = stepwise(&progress, 5);
     tokio::pin!(frame);
     let mut ticker = tokio::time::interval(Duration::from_millis(3));
@@ -36,12 +36,16 @@ async fn pinned_branch_survives_other_arm_firing() {
         }
     }
     assert!(interruptions > 0, "the sibling arm must win at least once");
-    assert_eq!(progress.get(), 5, "partial progress must survive");
+    assert_eq!(
+        progress.load(Ordering::Relaxed),
+        5,
+        "partial progress must survive"
+    );
 }
 
 #[tokio::test(start_paused = true)]
 async fn recreated_branch_loses_progress() {
-    let progress = Cell::new(0);
+    let progress = AtomicU32::new(0);
     let mut ticker = tokio::time::interval(Duration::from_millis(3));
     let mut interruptions = 0_u32;
     for _ in 0..10 {
@@ -51,5 +55,9 @@ async fn recreated_branch_loses_progress() {
         }
     }
     assert_eq!(interruptions, 10, "the sibling arm must keep interrupting");
-    assert_eq!(progress.get(), 0, "recreating the future loses progress");
+    assert_eq!(
+        progress.load(Ordering::Relaxed),
+        0,
+        "recreating the future loses progress"
+    );
 }

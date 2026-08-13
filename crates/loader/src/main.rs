@@ -1,3 +1,10 @@
+// The loader runs one worker per `.duckdb` file on a `LocalSet`. The pipeline owns that LocalSet
+// and drives futures borrowing Send + !Sync `TableDb` values, so it is intentionally !Send.
+#![allow(
+    clippy::future_not_send,
+    reason = "the loader pipeline owns a LocalSet for futures borrowing Send + !Sync TableDb values"
+)]
+
 //! The `walrus-loader` binary — the pod lifecycle shell. `main` stays tiny: load+validate config, init
 //! tracing, build the runtime, and do the **only** error → `ExitCode` mapping (context in the loop,
 //! exit code at `main`). Everything below returns [`LoaderError`], whose distinct exit code `main`

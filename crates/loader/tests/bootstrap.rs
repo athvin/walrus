@@ -120,7 +120,7 @@ fn tmpdir(name: &str) -> std::path::PathBuf {
     d
 }
 
-async fn table_exists(db: &loader::duck::TableDb, name: &str) -> bool {
+fn table_exists(db: &loader::duck::TableDb, name: &str) -> bool {
     let conn = db.conn();
     let n: i64 = conn
         .query_row(
@@ -149,12 +149,9 @@ async fn bootstrap_creates_duckdb_with_both_tables_and_takes_the_lease() {
         .unwrap();
     assert_eq!(owned.len(), 1, "owns the one registered table");
     let orders = &owned[0];
+    assert!(table_exists(&orders.db, "orders"), "mirror table exists");
     assert!(
-        table_exists(&orders.db, "orders").await,
-        "mirror table exists"
-    );
-    assert!(
-        table_exists(&orders.db, "orders_raw").await,
+        table_exists(&orders.db, "orders_raw"),
         "CDC log table exists"
     );
     assert!(
@@ -263,7 +260,7 @@ async fn stale_lock_expired_lease_is_reclaimed_and_opened() {
         owned_b[0].fencing_token, 2,
         "reclaim by a new owner bumps the fencing token"
     );
-    assert!(table_exists(&owned_b[0].db, "orders").await);
+    assert!(table_exists(&owned_b[0].db, "orders"));
 
     let _ = std::fs::remove_dir_all(&dir);
 }
