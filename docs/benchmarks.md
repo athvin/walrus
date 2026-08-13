@@ -208,6 +208,25 @@ taking. Net: **5.8 for throughput, 5.7 for a low-risk per-row win.**
 Before/after deltas from PR 5.7 (sink) and PR 5.8 (loader) land here, each citing the baseline row it
 improves and the commit that made the change.
 
+### PR 11.12 — decoder text cells
+
+**Single-copy `'t'` cells (landed; measured regression).** `Reader::str` validates UTF-8 directly on
+the borrowed frame, so a text cell is copied once into `TupleValue::Text` instead of first copying
+into an intermediate `Bytes`. The allocation/copy removal is mechanically covered by the Reader
+tests and source probe, but it did not improve this short micro-benchmark run (median ns/row, Apple
+M2, macOS 26.5.2, rustc 1.95.0, `--warm-up-time 1 --measurement-time 3`):
+
+| bench | shape | before (5.4) | after (11.12) | Δ |
+|---|---|---:|---:|---:|
+| `parse_tuple` | `narrow_int4` | 236 | 295 | **+25.0 %** |
+| `parse_tuple` | `wide30` | 1 822 | 1 878 | +3.1 % |
+| `parse_tuple` | `text_heavy` | 710 | 759 | +6.9 % |
+
+This is an honest negative result rather than evidence of a throughput win. The absolute historical
+baseline predates intervening decoder changes, and the largest regression is on the smallest cells;
+the change is retained for its single-allocation invariant and simpler one-primitive cursor, not on
+the strength of this timing sample.
+
 ### PR 5.7 — sink hot path
 
 **1. Meta-JSON amortization (landed).** `BatchBuilder` now serializes the batch-constant `SinkMeta`

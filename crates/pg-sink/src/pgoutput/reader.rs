@@ -135,16 +135,35 @@ impl<'a> Reader<'a> {
         }
     }
 
-    /// Copy `n` bytes, advancing the cursor (for TOAST-safe value copies from PR 2.4).
+    /// Borrow the next `n` bytes without copying, advancing the cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError::UnexpectedEof`] when fewer than `n` bytes remain.
+    pub fn slice(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
+        self.need(n)?;
+        let out = &self.buf[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(out)
+    }
+
+    /// Borrow the next `n` bytes as validated UTF-8 without copying.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError::UnexpectedEof`] for a short read or [`DecodeError::Utf8`] for invalid
+    /// UTF-8.
+    pub fn str(&mut self, n: usize) -> Result<&'a str, DecodeError> {
+        Ok(std::str::from_utf8(self.slice(n)?)?)
+    }
+
+    /// Copy `n` bytes into an owned [`Bytes`], advancing the cursor.
     ///
     /// # Errors
     ///
     /// Returns [`DecodeError::UnexpectedEof`] when fewer than `n` bytes remain.
     pub fn take(&mut self, n: usize) -> Result<Bytes, DecodeError> {
-        self.need(n)?;
-        let out = Bytes::copy_from_slice(&self.buf[self.pos..self.pos + n]);
-        self.pos += n;
-        Ok(out)
+        Ok(Bytes::from(self.slice(n)?.to_vec()))
     }
 
     /// An LSN: an unsigned 8-byte value, wrapped into the `common::Lsn` newtype.

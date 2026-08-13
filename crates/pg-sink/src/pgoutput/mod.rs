@@ -228,10 +228,10 @@ pub fn parse_tuple(reader: &mut Reader<'_>) -> Result<Vec<TupleValue>, DecodeErr
             b'u' => TupleValue::UnchangedToast, // one byte total — no length, no value
             b't' => {
                 let len = reader.int32()? as usize;
-                let bytes = reader.take(len)?;
                 // `t` is the value's *text* representation; interpreting it (numeric? enum label?)
-                // is the type layer's job (pg-to-arrow). Here we only require valid UTF-8.
-                TupleValue::Text(std::str::from_utf8(&bytes)?.to_string())
+                // is the type layer's job (pg-to-arrow). Validate UTF-8 on the borrowed frame, then
+                // allocate only the owned String that must outlive it.
+                TupleValue::Text(reader.str(len)?.to_string())
             }
             b'b' => {
                 let len = reader.int32()? as usize;
