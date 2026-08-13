@@ -13,7 +13,7 @@ use common::PgRelation;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::rc::Rc;
 
 // DuckDB DDL templates (see `sql/duckdb/templates/`). Fixed structure with `{placeholder}` holes,
 // rendered by `.replace(...)`; per-table column lists stay interpolated in Rust (they can't be
@@ -35,9 +35,11 @@ pub struct TableDb {
     /// sink's homogeneous-file rule (walrus-pg-sink §3.5) cuts a fresh file at every DDL bump, so all
     /// files at one version share their columns and a DDL bump is a *new* key. So this cache never
     /// invalidates, and a Phase-A cycle claiming N same-version files runs one `DESCRIBE`, not N.
-    /// `RefCell` for interior mutability: `TableDb` is used single-threaded (DuckDB `Connection` is
-    /// `!Send`, one per apply worker on a `LocalSet`).
-    parquet_cols: RefCell<HashMap<i64, Arc<Vec<String>>>>,
+    /// `RefCell` provides interior mutability behind `&self`; non-atomic `Rc` records that `TableDb`
+    /// is single-threaded by construction instead of suggesting thread-safe sharing (DuckDB
+    /// `Connection` is `!Send`, one per apply worker on a `LocalSet`). `Rc<[String]>` also keeps
+    /// reads to one indirection rather than `Rc<Vec<_>>`'s two (`clippy::rc_buffer`).
+    parquet_cols: RefCell<HashMap<i64, Rc<[String]>>>,
 }
 
 impl TableDb {
@@ -194,14 +196,14 @@ impl TableDb {
 
     /// The Parquet column list for `schema_version`, introspecting `uri` **once** per version and
     /// caching it (PR 5.8; sound by the homogeneous-file rule — see [`TableDb::parquet_cols`]).
-    fn columns_for(&self, uri: &str, schema_version: i64) -> Result<Arc<Vec<String>>, LoaderError> {
+    fn columns_for(&self, uri: &str, schema_version: i64) -> Result<Rc<[String]>, LoaderError> {
         if let Some(cols) = self.parquet_cols.borrow().get(&schema_version) {
-            return Ok(Arc::clone(cols));
+            return Ok(Rc::clone(cols));
         }
-        let cols = Arc::new(self.parquet_columns(uri)?);
+        let cols: Rc<[String]> = self.parquet_columns(uri)?.into();
         self.parquet_cols
             .borrow_mut()
-            .insert(schema_version, Arc::clone(&cols));
+            .insert(schema_version, Rc::clone(&cols));
         Ok(cols)
     }
 

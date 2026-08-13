@@ -33,6 +33,10 @@ expect_used = "deny"
 # `expect_used`, this is one `clippy::restriction` lint rather than the whole group; it is outside
 # `clippy::all`, so no `priority` is needed.
 clone_on_ref_ptr = "deny"
+# No refcounted pointer to a growable buffer (PR 9.9, `own-rc-single-thread`): `Rc<Vec<T>>` /
+# `Arc<String>` add an indirection where `Rc<[T]>` / `Arc<str>` are one. Like `unwrap_used` and
+# `expect_used`, this is one `clippy::restriction` lint outside `clippy::all`, so no priority.
+rc_buffer = "deny"
 # Large-value gates (PR 9.7, `own-move-large`). All four measured 0 sites across the 51-lint
 # pedantic+nursery sweep, so they only stop regressions on the per-WAL-message move path. They are
 # outside `clippy::all`, so no `priority` field is needed.
