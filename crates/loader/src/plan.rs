@@ -58,8 +58,9 @@ impl TablePlan {
     /// The Tier-1 (scalar-only) plan from a bare relation — one emit column == source column via
     /// `crate::duck::duck_type`, mirror = same. Reproduces the pre-descriptor behaviour exactly.
     pub fn tier1(rel: &PgRelation) -> Self {
-        let mut raw_cols = Vec::new();
-        let mut mirror_cols = Vec::new();
+        // Tier-1 exact one raw + one mirror per source column.
+        let mut raw_cols = Vec::with_capacity(rel.columns.len());
+        let mut mirror_cols = Vec::with_capacity(rel.columns.len());
         for c in &rel.columns {
             let ty = crate::duck::duck_type(c.type_oid).to_string();
             raw_cols.push(RawCol {
@@ -87,8 +88,9 @@ impl TablePlan {
     pub fn from_registry(rel: &PgRelation, descriptors: &[TypeDescriptor]) -> Self {
         let by_name: std::collections::HashMap<&str, &TypeDescriptor> =
             descriptors.iter().map(|d| (d.column.as_str(), d)).collect();
-        let mut raw_cols = Vec::new();
-        let mut mirror_cols = Vec::new();
+        // Lower bound because a Tier-2 range fans out to five raw columns.
+        let mut raw_cols = Vec::with_capacity(rel.columns.len());
+        let mut mirror_cols = Vec::with_capacity(rel.columns.len());
         for c in &rel.columns {
             match by_name.get(c.name.as_str()) {
                 None => {

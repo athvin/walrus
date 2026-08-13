@@ -62,7 +62,7 @@ pub async fn bootstrap(
         .epoch;
 
     let registry = control::read_all_latest_registry(pool, epoch).await?;
-    let mut owned = Vec::new();
+    let mut owned = Vec::with_capacity(registry.len());
     for row in registry {
         let version = row.schema_version;
         let table = format!("{}.{}", row.source_schema, row.source_table);
