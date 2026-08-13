@@ -21,6 +21,7 @@
 use crate::reload_signal::WatermarkWaiters;
 use anyhow::Context as _;
 use common::EpochNo;
+use std::ops::AsyncFnMut;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -65,15 +66,14 @@ pub enum ExporterEnd {
 /// Drive `export` while renewing its lease every `renew_every`; the first failed renewal cancels
 /// the export. Pure orchestration — the lease action and the export are injected, so the
 /// cancel-on-lost-lease contract is unit-tested without a database.
-pub async fn lease_guarded_export<R, RFut, E>(
+pub async fn lease_guarded_export<R, E>(
     token: CancellationToken,
     renew_every: Duration,
     mut renew: R,
     export: E,
 ) -> ExporterEnd
 where
-    R: FnMut() -> RFut,
-    RFut: std::future::Future<Output = anyhow::Result<bool>>,
+    R: AsyncFnMut() -> anyhow::Result<bool>,
     E: std::future::Future<Output = anyhow::Result<()>>,
 {
     tokio::pin!(export);

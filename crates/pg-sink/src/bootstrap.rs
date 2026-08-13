@@ -19,6 +19,7 @@ use common::Error;
 use object_store::path::Path;
 use object_store::{ObjectStore, PutPayload};
 use sqlx::PgPool;
+use std::ops::AsyncFnMut;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -54,7 +55,7 @@ fn attempt_budget(deadline: Instant) -> Duration {
 pub async fn run_shared(cfg: &SinkConfig, deadline: Instant) -> Result<BootstrapCtx, Error> {
     // Step 2: control Postgres reachable (transient) + migrations current (idempotent). Each connect
     // attempt is bounded so sqlx's own pool-acquire timeout can't blow past our `startup_deadline`.
-    let control_pool = retry_transient(deadline, "control database", || async {
+    let control_pool = retry_transient(deadline, "control database", async || {
         let budget = attempt_budget(deadline);
         match tokio::time::timeout(budget, control::connect(&cfg.control_db_url)).await {
             Ok(Ok(pool)) => Ok(pool),
@@ -74,23 +75,18 @@ pub async fn run_shared(cfg: &SinkConfig, deadline: Instant) -> Result<Bootstrap
     // put/get/delete a tiny key until it succeeds or the deadline passes.
     let object_store = build_object_store(&cfg.object_store)
         .map_err(|e| Error::ObjectStore(format!("build object store: {e}")))?;
-    retry_transient(deadline, "object store", || {
-        let store = Arc::clone(&object_store);
-        let instance = cfg.instance.clone();
-        async move {
-            object_store_canary(store.as_ref(), &instance)
-                .await
-                .map_err(|e| Error::ObjectStore(e.to_string()))
-        }
+    retry_transient(deadline, "object store", async || {
+        object_store_canary(object_store.as_ref(), &cfg.instance)
+            .await
+            .map_err(|e| Error::ObjectStore(e.to_string()))
     })
     .await?;
     tracing::info!("object-store canary (put/get/delete) passed");
 
     // Step 6: source-side preflight. The connect is transient (server may be coming up); every
     // assertion is terminal — a wrong wal_level / missing publication / keyless table can't self-heal.
-    let source_client = retry_transient(deadline, "source database", || {
-        let url = cfg.source_db_url.clone();
-        async move { preflight::connect_source(&url).await }
+    let source_client = retry_transient(deadline, "source database", async || {
+        preflight::connect_source(&cfg.source_db_url).await
     })
     .await?;
     let pf = SourcePreflight::new(&source_client, cfg);
@@ -153,10 +149,9 @@ async fn object_store_canary(
 /// Retry `op` while it returns a *transient* error, backing off up to `deadline`. Returns
 /// immediately on success or a *terminal* error; after the deadline, returns the last transient
 /// error (whose distinct exit code `main` surfaces).
-async fn retry_transient<T, F, Fut>(deadline: Instant, what: &str, mut op: F) -> Result<T, Error>
+async fn retry_transient<T, F>(deadline: Instant, what: &str, mut op: F) -> Result<T, Error>
 where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, Error>>,
+    F: AsyncFnMut() -> Result<T, Error>,
 {
     let mut backoff = Duration::from_millis(200);
     loop {
