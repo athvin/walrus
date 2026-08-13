@@ -1,5 +1,18 @@
 use super::*;
 
+fn valid() -> LoaderConfig {
+    LoaderConfig {
+        control_db_url: "postgres://localhost/walrus_control".to_string(),
+        object_store: ObjectStoreConfig {
+            bucket: "walrus".to_string(),
+            ..ObjectStoreConfig::default()
+        },
+        instance: "walrus-loader-0".to_string(),
+        duckdb_dir: "/var/lib/walrus".to_string(),
+        ..LoaderConfig::default()
+    }
+}
+
 /// `#[serde(default)]` makes these the shipped values for omitted fields; changing one is a
 /// deliberate product configuration change, not a test-maintenance detail.
 #[test]
@@ -20,4 +33,29 @@ fn defaults_are_the_shipped_contract() {
     assert_eq!(cfg.max_files_per_cycle, 32);
     assert_eq!(cfg.startup_deadline, Duration::from_secs(60));
     assert_eq!(cfg.health_addr, SocketAddr::from(([0, 0, 0, 0], 8080)));
+    assert_eq!(cfg.worker_threads, None);
+}
+
+#[test]
+fn zero_worker_threads_is_rejected_as_terminal_config() {
+    let mut cfg = valid();
+    cfg.worker_threads = Some(0);
+    let err = cfg.validate().unwrap_err();
+    assert!(err.to_string().contains("worker_threads"));
+    assert_eq!(
+        common::Error::from(err).exit_code(),
+        common::ExitCode::Config
+    );
+}
+
+#[test]
+fn worker_threads_above_the_ceiling_is_rejected_as_terminal_config() {
+    let mut cfg = valid();
+    cfg.worker_threads = Some(65);
+    let err = cfg.validate().unwrap_err();
+    assert!(err.to_string().contains("worker_threads"));
+    assert_eq!(
+        common::Error::from(err).exit_code(),
+        common::ExitCode::Config
+    );
 }

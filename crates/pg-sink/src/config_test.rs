@@ -49,6 +49,7 @@ fn defaults_are_the_shipped_contract() {
     assert_eq!(cfg.reload_max_restarts, 3);
     assert!(!cfg.manage_publication);
     assert!(cfg.strict_keys);
+    assert_eq!(cfg.worker_threads, None);
 }
 
 #[test]
@@ -133,6 +134,50 @@ fn reload_knobs_are_bounds_checked() {
 fn config_error_maps_to_config_exit_code() {
     let e = common::Error::from(ConfigError::Missing("control_db_url"));
     assert_eq!(e.exit_code(), common::ExitCode::Config);
+}
+
+#[test]
+fn zero_worker_threads_is_rejected_as_terminal_config() {
+    let mut cfg = valid();
+    cfg.worker_threads = Some(0);
+    let err = cfg.validate().unwrap_err();
+    assert!(matches!(
+        err,
+        ConfigError::OutOfBounds {
+            field: "worker_threads",
+            ..
+        }
+    ));
+
+    let mut cfg = valid();
+    cfg.worker_threads = Some(0);
+    let err = cfg.validate().unwrap_err();
+    assert_eq!(
+        common::Error::from(err).exit_code(),
+        common::ExitCode::Config
+    );
+}
+
+#[test]
+fn worker_threads_above_the_ceiling_is_rejected_as_terminal_config() {
+    let mut cfg = valid();
+    cfg.worker_threads = Some(65);
+    let err = cfg.validate().unwrap_err();
+    assert!(matches!(
+        err,
+        ConfigError::OutOfBounds {
+            field: "worker_threads",
+            ..
+        }
+    ));
+
+    let mut cfg = valid();
+    cfg.worker_threads = Some(65);
+    let err = cfg.validate().unwrap_err();
+    assert_eq!(
+        common::Error::from(err).exit_code(),
+        common::ExitCode::Config
+    );
 }
 
 #[test]
