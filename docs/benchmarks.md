@@ -208,6 +208,21 @@ taking. Net: **5.8 for throughput, 5.7 for a low-risk per-row win.**
 Before/after deltas from PR 5.7 (sink) and PR 5.8 (loader) land here, each citing the baseline row it
 improves and the commit that made the change.
 
+### PR 16.8 — merged cache footprints
+
+Measured with `std::mem::size_of` on the pinned Rust 1.95.0 64-bit toolchain after the Phase 11
+boxing work. The cache-line column uses an ideal aligned 64-byte span, `ceil(total bytes / 64)`:
+
+| type | size | multiplicity | `narrow_int4` (4 cols) | `wide30` (30 cols) | `text_heavy` (10 cols) |
+|---|---:|---|---:|---:|---:|
+| `Emit` | 1 B | once per source column in the shared batch plan | 4 B → 1 line | 30 B → 1 line | 10 B → 1 line |
+| `TupleValue` | 40 B | once per decoded cell | 160 B → 3 lines | 1,200 B → 19 lines | 400 B → 7 lines |
+| `Message` | 88 B | once per decoded WAL record | 88 B → 2 lines | 88 B → 2 lines | 88 B → 2 lines |
+
+These are inline container footprints: heap storage owned by `Vec`, `String`, and `Bytes` is not
+included. The existing `TupleValue` and `Message` guards remain the owners of those layouts; this
+change adds only the missing exact 64-bit guard for the one-byte `Emit` plan element.
+
 ### PR 16.3 — `#[inline]` on the cross-crate accessors
 
 `common::Lsn::{new, as_u64}` and the eight mechanically small `Reader` accessors now carry

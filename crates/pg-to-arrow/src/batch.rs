@@ -29,6 +29,7 @@ use std::sync::Arc;
 /// builder (the existing `append_value` path); Tier-2 spreads a single value across several sibling
 /// builders (PR 2.12). Ordering here MUST match `emit_fields` / `build_schema` (§2.4, PR 2.17's
 /// descriptor `emit[]` lists the same suffixes in the same order).
+/// The batch plan stores one compact `Emit` per source column, independent of its row count.
 #[derive(Debug)]
 enum Emit {
     Scalar,             // 1 builder
@@ -38,6 +39,12 @@ enum Emit {
     Multirange,         // 1 builder: ListBuilder<StructBuilder>
     Geometric(GeoKind), // 1 builder: a nested STRUCT / LIST<STRUCT> of doubles
 }
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+    std::mem::size_of::<Emit>() == 1,
+    "Emit is stored once per source column"
+);
 
 impl Emit {
     /// Number of flat builders consumed by this source-column shape.
