@@ -25,6 +25,7 @@ pub struct LoaderState {
     /// so the failed cast no longer applies and the latch clears.
     quarantined: AtomicBool,
     /// The end of the last poll cycle — liveness proof, NOT a lag metric. `None` until bootstrap ends.
+    // LOCK-CHOICE: parking_lot::Mutex — poll-cycle writes dominate the one-expression kubelet read; see docs/implementation/notes/rust-skills/own-rwlock-readers.md.
     last_poll_completed_at: Mutex<Option<Instant>>,
 }
 

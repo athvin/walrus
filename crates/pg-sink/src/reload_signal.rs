@@ -42,6 +42,7 @@ pub struct Echo {
 /// `resolve` on a closed channel is a quiet no-op.
 #[derive(Debug, Default)]
 pub struct WatermarkWaiters {
+    // LOCK-CHOICE: parking_lot::Mutex — subscribe and resolve are both one-operation writes; see docs/implementation/notes/rust-skills/own-rwlock-readers.md.
     waiters: Mutex<HashMap<(i64, i64), oneshot::Sender<Echo>>>,
     /// Cross-check violations observed (mirrors the Prometheus counter so unit tests — which run
     /// without a recorder — can assert the count).

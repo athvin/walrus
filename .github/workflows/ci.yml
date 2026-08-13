@@ -94,6 +94,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Seconds, no toolchain needed — fail before paying for the DuckDB build (PR 9.12).
+      - name: Lock-choice guard
+        run: bash scripts/check-lock-choice.sh
+
       # Reclaim disk for the bundled-DuckDB test build (composite action; must follow checkout).
       - uses: ./.github/actions/free-disk-space
 
