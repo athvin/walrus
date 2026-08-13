@@ -70,3 +70,7 @@ pub fn install_signal_handlers() -> CancellationToken {
     });
     token
 }
+
+#[cfg(test)]
+#[path = "shutdown_test.rs"]
+mod tests;
