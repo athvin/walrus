@@ -138,9 +138,12 @@ async fn pipeline(
     // `tokio::spawn`. The loops run on a `LocalSet` (this thread), the whole parallelism model being
     // one worker per `.duckdb` file. Asserted in `duck.rs` (PR 12.5).
     let local = tokio::task::LocalSet::new();
+    let (failures_tx, failures_rx) = loader::supervisor::failure_channel(keys.len());
     let handles: Vec<_> = owned
         .into_iter()
         .map(|o| {
+            let schema = o.schema.clone();
+            let table = o.table.clone();
             let ctx = loader::phase_a::TableCtx {
                 pool: pool.clone(),
                 epoch,
@@ -157,38 +160,42 @@ async fn pipeline(
                 pause_logged: Default::default(),
                 resync_ids: Default::default(),
             };
-            // A worker that fails (e.g. a lossy-cast QUARANTINE, PR 3.9) cancels the shutdown token
-            // **itself**, so every OTHER worker sees the cancel and drains and the whole loader
-            // exits promptly (→ `main` restarts the process). Without this, the sequential
-            // `h.await` below would block on a healthy worker that never returns until cancelled —
-            // an unobserved error on a non-first table would deadlock the loader instead of taking
-            // it down (the exact multi-table quarantine the reload feature must recover from).
             let worker_token = token.clone();
+            let failures_tx = failures_tx.clone();
             local.spawn_local(async move {
-                let result = loader::apply_loop::apply_loop(ctx, worker_token.clone()).await;
-                if result.is_err() {
-                    worker_token.cancel();
+                if let Err(error) = loader::apply_loop::apply_loop(ctx, worker_token).await {
+                    loader::supervisor::report(
+                        &failures_tx,
+                        loader::supervisor::WorkerFailure {
+                            schema,
+                            table,
+                            error,
+                        },
+                    );
                 }
-                result
             })
         })
         .collect();
-    // Drive the loops until they all exit — each returns on the shutdown token, and a failed worker
-    // cancelled it (above), so this sequential drain always makes progress.
-    local
-        .run_until(async {
+    // The receiver closes when the final worker exits; main must not keep an extra sender alive.
+    drop(failures_tx);
+    let first_failure = local
+        .run_until(loader::supervisor::supervise(failures_rx, token, async {
+            // Once the supervisor sees a failure it cancels `token`, so healthy workers leave
+            // their loops and this deliberately sequential drain always makes progress.
             for h in handles {
-                if let Ok(Err(e)) = h.await {
-                    tracing::error!(error = %e, "apply loop failed");
-                    token.cancel();
+                if let Err(error) = h.await {
+                    tracing::error!(%error, "apply worker panicked");
                 }
             }
-        })
+        }))
         .await;
 
     tracing::info!("SIGTERM: releasing leases and draining");
     renewer.abort();
     lease::release_all(&pool, epoch, &keys, &cfg.instance).await;
+    if let Some(failure) = first_failure {
+        return Err(failure.error);
+    }
     Ok(())
 }
 

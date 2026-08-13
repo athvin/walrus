@@ -27,7 +27,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 figment = { workspace = true, features = ["env", "toml", "yaml"] }
 humantime-serde = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "net", "time", "fs"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "net", "time", "fs", "sync"] }
 tokio-util = { workspace = true }
 axum = { workspace = true }
 object_store = { workspace = true, features = ["aws"] }
