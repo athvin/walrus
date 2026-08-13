@@ -131,6 +131,13 @@ jobs:
       - name: cargo clippy --all-targets --all-features -- -D warnings
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      # PR 15.4: production concurrency is Tokio task topology scoped by CancellationToken. Direct
+      # std::thread::available_parallelism queries and test/bench thread assertions remain allowed; creating an
+      # OS thread in non-test production requires the explicit ownership redesign recorded in the
+      # rationale: docs/implementation/notes/rust-skills/conc-scoped-threads.md.
+      - name: No OS threads in production sources
+        run: bash scripts/check-no-os-threads.sh
+
       - name: cargo test --workspace
         run: cargo test --workspace
 
