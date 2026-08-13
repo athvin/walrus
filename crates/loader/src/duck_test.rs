@@ -67,6 +67,13 @@ fn table_db_moves_across_a_thread() {
     assert_eq!(version, 7, "the schema version survives the thread move");
 }
 
+#[test]
+fn owned_duckdb_handles_meet_the_blocking_pool_send_bound() {
+    requires_send::<duckdb::Connection>();
+    requires_send::<TableDb>();
+    requires_spawn_blocking_bounds(|| 1_i64);
+}
+
 /// PR 4.3 fix: a `spill` file's per-row `commit_lsn` placeholder is overridden by the file's `lsn_end`
 /// (the real commit LSN), while a non-spill file appends the per-row value verbatim.
 #[test]
