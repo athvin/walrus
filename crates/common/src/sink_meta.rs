@@ -141,8 +141,9 @@ pub struct SinkMeta {
     pub source_table: String,
     /// Whether the row came from the exported snapshot or the live stream.
     pub kind: Kind,
-    /// Columns delivered as unchanged-TOAST placeholders (values absent from the wire).
-    pub unchanged_toast: Vec<String>,
+    /// Columns delivered as unchanged-TOAST placeholders (values absent from the wire). Fixed at
+    /// row construction and never grown afterwards.
+    pub unchanged_toast: Box<[String]>,
     /// Stable identity of the sink pod that produced this row.
     pub sink_instance: String,
     /// When the sink processed this row (UTC `Z`) — promoted to a typed `<table>_raw` column.

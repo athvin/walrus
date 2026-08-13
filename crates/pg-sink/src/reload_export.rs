@@ -475,7 +475,7 @@ impl ChunkExporter {
             source_schema: self.rel.schema.clone(),
             source_table: self.rel.name.clone(),
             kind: Kind::Reload,
-            unchanged_toast: vec![],
+            unchanged_toast: Box::default(),
             sink_instance: self.cfg.instance.clone(),
             sink_processed_at: UtcTimestamp::now(),
         }

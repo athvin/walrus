@@ -43,7 +43,7 @@ fn meta(unchanged_toast: Vec<String>) -> SinkMeta {
         source_schema: "public".to_string(),
         source_table: "orders".to_string(),
         kind: Kind::Stream,
-        unchanged_toast,
+        unchanged_toast: unchanged_toast.into_boxed_slice(),
         sink_instance: "walrus-pg-sink-0".to_string(),
         sink_processed_at: UtcTimestamp::parse_rfc3339("2026-07-04T12:00:00.123Z").unwrap(),
     }

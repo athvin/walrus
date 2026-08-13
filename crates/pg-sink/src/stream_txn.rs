@@ -270,7 +270,7 @@ impl StreamDemux {
                     source_schema: cached.relation.schema.clone(),
                     source_table: cached.relation.name.clone(),
                     kind: Kind::Stream,
-                    unchanged_toast: vec![],
+                    unchanged_toast: Box::default(),
                     sink_instance: instance.clone(),
                     sink_processed_at: UtcTimestamp::now(),
                 };
@@ -425,7 +425,7 @@ impl StreamDemux {
                 source_schema: cached.relation.schema.clone(),
                 source_table: cached.relation.name.clone(),
                 kind: Kind::Stream,
-                unchanged_toast: vec![],
+                unchanged_toast: Box::default(),
                 sink_instance: instance.clone(),
                 sink_processed_at: UtcTimestamp::now(),
             };

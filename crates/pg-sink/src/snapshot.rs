@@ -251,7 +251,7 @@ impl Backfill {
             source_schema: rel.schema.clone(),
             source_table: rel.name.clone(),
             kind: Kind::Snapshot,
-            unchanged_toast: vec![],
+            unchanged_toast: Box::default(),
             sink_instance: self.instance.clone(),
             sink_processed_at: UtcTimestamp::now(),
         }

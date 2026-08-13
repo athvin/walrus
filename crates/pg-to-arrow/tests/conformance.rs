@@ -32,7 +32,7 @@ fn meta() -> SinkMeta {
         source_schema: "public".to_string(),
         source_table: "t".to_string(),
         kind: Kind::Stream,
-        unchanged_toast: vec![],
+        unchanged_toast: Box::default(),
         sink_instance: "walrus-pg-sink-0".to_string(),
         sink_processed_at: UtcTimestamp::parse_rfc3339("2026-07-04T12:00:00Z").unwrap(),
     }

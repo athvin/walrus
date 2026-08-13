@@ -43,7 +43,7 @@ fn meta_round_trips_exact_keys() {
     assert_eq!(meta.kind, Kind::Stream);
     assert_eq!(meta.epoch, 7);
     assert_eq!(meta.xid, 918273);
-    assert_eq!(meta.unchanged_toast, vec!["blob_col".to_string()]);
+    assert_eq!(meta.unchanged_toast.as_ref(), ["blob_col"]);
 
     // Re-serialize and confirm every key/value matches the docs block (order-independent).
     let reserialized: serde_json::Value =
@@ -113,7 +113,7 @@ fn amortized_meta_matches_full() {
     let base: SinkMeta = serde_json::from_str(DOCS_EXAMPLE).unwrap();
     for toast in [vec!["blob_col".to_string()], Vec::new()] {
         let meta = SinkMeta {
-            unchanged_toast: toast,
+            unchanged_toast: toast.into_boxed_slice(),
             ..base.clone()
         };
         let mut buf = String::from("{");

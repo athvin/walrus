@@ -49,10 +49,16 @@ pub struct MirrorCol {
 /// The full plan for one table: the raw emit columns and the mirror columns.
 #[derive(Debug, Clone)]
 pub struct TablePlan {
-    pub table: String,
-    pub raw_cols: Vec<RawCol>,
-    pub mirror_cols: Vec<MirrorCol>,
+    pub table: Box<str>,
+    pub raw_cols: Box<[RawCol]>,
+    pub mirror_cols: Box<[MirrorCol]>,
 }
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+    std::mem::size_of::<TablePlan>() == 48,
+    "TablePlan is rebuilt every Phase-B poll; keep its lists frozen"
+);
 
 impl TablePlan {
     /// The Tier-1 (scalar-only) plan from a bare relation — one emit column == source column via
@@ -77,9 +83,9 @@ impl TablePlan {
             });
         }
         TablePlan {
-            table: rel.name.clone(),
-            raw_cols,
-            mirror_cols,
+            table: rel.name.as_str().into(),
+            raw_cols: raw_cols.into_boxed_slice(),
+            mirror_cols: mirror_cols.into_boxed_slice(),
         }
     }
 
@@ -119,9 +125,9 @@ impl TablePlan {
             }
         }
         TablePlan {
-            table: rel.name.clone(),
-            raw_cols,
-            mirror_cols,
+            table: rel.name.as_str().into(),
+            raw_cols: raw_cols.into_boxed_slice(),
+            mirror_cols: mirror_cols.into_boxed_slice(),
         }
     }
 }

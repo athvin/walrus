@@ -64,7 +64,7 @@ fn snapshot_rows_carry_kind_snapshot_and_consistent_point_commit_lsn() {
         source_schema: "public".into(),
         source_table: "orders".into(),
         kind: Kind::Snapshot,
-        unchanged_toast: vec![],
+        unchanged_toast: Box::default(),
         sink_instance: "t".into(),
         sink_processed_at: UtcTimestamp::now(),
     };
@@ -114,7 +114,7 @@ fn all_snapshot_manifest_files_share_lsn_end() {
         source_schema: "public".into(),
         source_table: "orders".into(),
         kind: Kind::Snapshot,
-        unchanged_toast: vec![],
+        unchanged_toast: Box::default(),
         sink_instance: "t".into(),
         sink_processed_at: UtcTimestamp::now(),
     };

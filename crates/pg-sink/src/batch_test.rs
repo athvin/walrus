@@ -66,7 +66,7 @@ fn meta(lsn: &str) -> SinkMeta {
         source_schema: "public".into(),
         source_table: "widgets".into(),
         kind: Kind::Stream,
-        unchanged_toast: vec![],
+        unchanged_toast: Box::default(),
         sink_instance: "walrus-pg-sink-0".into(),
         sink_processed_at: UtcTimestamp::parse_rfc3339("2026-07-07T12:00:00Z").unwrap(),
     }

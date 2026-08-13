@@ -120,7 +120,7 @@ impl TransformSql {
             })
             .collect();
         TransformSql {
-            table: plan.table.clone(),
+            table: plan.table.to_string(),
             mirror,
         }
     }
