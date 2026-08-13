@@ -132,3 +132,7 @@ impl From<ConfigError> for common::Error {
         common::Error::Config(e.0)
     }
 }
+
+#[cfg(test)]
+#[path = "config_test.rs"]
+mod tests;

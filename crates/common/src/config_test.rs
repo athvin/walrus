@@ -16,6 +16,30 @@ fn valid_config() -> CommonConfig {
     }
 }
 
+/// `#[serde(default)]` makes these the shipped values for omitted fields; changing one is a
+/// deliberate product configuration change, not a test-maintenance detail.
+#[test]
+fn defaults_are_the_shipped_contract() {
+    let cfg = CommonConfig::default();
+    assert_eq!(cfg.control_db_url, "");
+    assert_eq!(cfg.object_store.bucket, "");
+    assert_eq!(cfg.object_store.endpoint, None);
+    assert_eq!(cfg.object_store.region, "us-east-1");
+    assert!(!cfg.telemetry.json);
+    assert_eq!(cfg.telemetry.filter, "info");
+    assert_eq!(cfg.startup_deadline, Duration::from_secs(60));
+    assert_eq!(cfg.instance, "");
+
+    let object_store = ObjectStoreConfig::default();
+    assert_eq!(object_store.bucket, "");
+    assert_eq!(object_store.endpoint, None);
+    assert_eq!(object_store.region, "us-east-1");
+
+    let telemetry = TelemetryConfig::default();
+    assert!(!telemetry.json);
+    assert_eq!(telemetry.filter, "info");
+}
+
 /// Run `body` inside a hermetic `figment::Jail` (fresh temp CWD + scoped env), so config tests
 /// don't leak env across the shared test process. The one `#[allow]` lives here: `Jail`'s
 /// closure must return `Result<(), figment::Error>`, and that error type is large — a

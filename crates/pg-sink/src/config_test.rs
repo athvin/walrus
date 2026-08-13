@@ -16,6 +16,41 @@ fn valid() -> SinkConfig {
     }
 }
 
+/// `#[serde(default)]` makes these the shipped values for omitted fields; changing one is a
+/// deliberate product configuration change, not a test-maintenance detail.
+#[test]
+fn defaults_are_the_shipped_contract() {
+    let cfg = SinkConfig::default();
+    assert_eq!(cfg.control_db_url, "");
+    assert_eq!(cfg.source_db_url, "");
+    assert_eq!(cfg.object_store.bucket, "");
+    assert_eq!(cfg.object_store.endpoint, None);
+    assert_eq!(cfg.object_store.region, "us-east-1");
+    assert!(!cfg.telemetry.json);
+    assert_eq!(cfg.telemetry.filter, "info");
+    assert_eq!(cfg.instance, "");
+    assert_eq!(cfg.slot_name, "");
+    assert_eq!(cfg.publication_name, "");
+    assert_eq!(cfg.max_fill, Duration::from_secs(5));
+    assert_eq!(cfg.heartbeat_idle_after, Duration::from_secs(10));
+    assert_eq!(cfg.heartbeat_roundtrip_deadline, Duration::from_secs(30));
+    assert_eq!(cfg.backfill_statement_timeout, Duration::ZERO);
+    assert_eq!(cfg.max_rows.get(), 100_000);
+    assert_eq!(cfg.max_bytes.get(), 128 * 1024 * 1024);
+    assert_eq!(cfg.max_inflight_bytes.get(), 512 * 1024 * 1024);
+    assert!((cfg.backpressure_activate_ratio.as_f64() - 0.85).abs() < f64::EPSILON);
+    assert!((cfg.backpressure_resume_ratio.as_f64() - 0.75).abs() < f64::EPSILON);
+    assert_eq!(cfg.startup_deadline, Duration::from_secs(60));
+    assert_eq!(cfg.health_addr, SocketAddr::from(([0, 0, 0, 0], 8080)));
+    assert_eq!(cfg.max_concurrent_reloads.get(), 2);
+    assert_eq!(cfg.reload_lease_ttl, Duration::from_secs(60));
+    assert_eq!(cfg.reload_chunk_rows.get(), 10_000);
+    assert_eq!(cfg.reload_echo_timeout, Duration::from_secs(30));
+    assert_eq!(cfg.reload_max_restarts, 3);
+    assert!(!cfg.manage_publication);
+    assert!(cfg.strict_keys);
+}
+
 #[test]
 fn a_fully_valid_config_passes() {
     assert!(valid().validate().is_ok());
