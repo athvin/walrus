@@ -18,6 +18,7 @@ use common::{ReplicaIdentity, TupleValue};
 use pg_sink::pgoutput::{
     parse_message, parse_stream, parse_tuple, DecodeError, Message, OldTupleKind, Reader, StreamCtx,
 };
+use std::fmt::Write as _;
 
 /// A ported row of `VECTORS`: bytes in, the golden render line out.
 #[derive(Clone, Copy)]
@@ -629,7 +630,9 @@ fn fmt_bytes(b: &[u8]) -> String {
             b'\r' => s.push_str("\\r"),
             b'\t' => s.push_str("\\t"),
             0x20..=0x7e => s.push(byte as char),
-            _ => s.push_str(&format!("\\x{byte:02x}")),
+            _ => {
+                let _ = write!(&mut s, "\\x{byte:02x}");
+            }
         }
     }
     s.push('\'');

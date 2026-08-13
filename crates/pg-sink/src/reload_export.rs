@@ -26,6 +26,7 @@ use crate::reload_signal::WatermarkWaiters;
 use crate::sink::{FileKind, ParquetSink};
 use anyhow::Context;
 use common::{Kind, Lsn, Op, PgRelation, SinkMeta, TupleValue, UtcTimestamp};
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_postgres::NoTls;
@@ -540,13 +541,14 @@ fn continuation_sql(
                 other => sql_lit(&other.to_string()),
             })
             .collect();
-        sql.push_str(&format!(
+        let _ = write!(
+            &mut sql,
             " WHERE ({}) > ({})",
             key_cols.join(", "),
             literals.join(", ")
-        ));
+        );
     }
-    sql.push_str(&format!(" ORDER BY {} LIMIT {limit}", key_cols.join(", ")));
+    let _ = write!(&mut sql, " ORDER BY {} LIMIT {limit}", key_cols.join(", "));
     sql
 }
 

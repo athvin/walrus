@@ -22,6 +22,9 @@ ptr_arg = "deny"
 ref_option = "deny"
 # `assigning_clones` is pedantic (outside `all`), so no priority juggling is needed.
 assigning_clones = "deny"
+# `push_str(&format!(..))` allocates a temporary just to copy it into an existing buffer. This is a
+# restriction lint (outside `all`), so no priority juggling is needed.
+format_push_string = "deny"
 # Pedantic: keep small `Copy` values passed by value once the rustc lint above finds them.
 trivially_copy_pass_by_ref = "deny"
 # No `unwrap`/`expect` in production (PR 7.6 cleaned the tree). Both are `clippy::restriction` lints

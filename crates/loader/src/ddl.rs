@@ -22,6 +22,7 @@ use crate::duck::{duck_type, user_view_sql, TableDb};
 use crate::error::LoaderError;
 use common::oids::{FLOAT4, FLOAT8, INT2, INT4, INT8};
 use common::{PgColumn, PgRelation};
+use std::fmt::Write as _;
 
 /// One `schema_version` of a table's shape — the `schema_registry` `columns` snapshot for that version.
 pub struct SchemaVersion {
@@ -200,7 +201,8 @@ pub fn apply_additive(
     table: &str,
     changes: &[AdditiveChange],
 ) -> Result<(), LoaderError> {
-    let mut sql = String::new();
+    // Each change emits a mirror + a _raw statement, roughly 120 bytes together.
+    let mut sql = String::with_capacity(changes.len() * 128);
     let mut cur = table.to_string();
     let mut structural = false;
     for ch in changes {
@@ -209,33 +211,38 @@ pub fn apply_additive(
                 let ty = duck_type(c.type_oid);
                 let name = &c.name;
                 // Nullable on both (no NOT NULL): pre-change rows read NULL; old raw rows stay valid.
-                sql.push_str(&format!(
+                // `String`'s `fmt::Write` implementation is infallible.
+                let _ = write!(
+                    &mut sql,
                     "ALTER TABLE \"{cur}\" ADD COLUMN IF NOT EXISTS \"{name}\" {ty}; \
                      ALTER TABLE \"{cur}_raw\" ADD COLUMN IF NOT EXISTS \"{name}\" {ty};"
-                ));
+                );
                 structural = true;
             }
             AdditiveChange::RenameColumn { from, to, .. } => {
-                sql.push_str(&format!(
+                let _ = write!(
+                    &mut sql,
                     "ALTER TABLE \"{cur}\" RENAME COLUMN \"{from}\" TO \"{to}\"; \
                      ALTER TABLE \"{cur}_raw\" RENAME COLUMN \"{from}\" TO \"{to}\";"
-                ));
+                );
                 structural = true;
             }
             AdditiveChange::WidenColumn { name, new, .. } => {
                 let ty = duck_type(new.type_oid);
-                sql.push_str(&format!(
+                let _ = write!(
+                    &mut sql,
                     "ALTER TABLE \"{cur}\" ALTER COLUMN \"{name}\" TYPE {ty}; \
                      ALTER TABLE \"{cur}_raw\" ALTER COLUMN \"{name}\" TYPE {ty};"
-                ));
+                );
                 structural = true;
             }
             AdditiveChange::RenameTable { from, to } => {
-                sql.push_str(&format!(
+                let _ = write!(
+                    &mut sql,
                     "ALTER TABLE \"{cur}\" RENAME TO \"{to}\"; \
                      ALTER TABLE \"{cur}_raw\" RENAME TO \"{to}_raw\"; \
                      DROP VIEW IF EXISTS \"{from}_current\";"
-                ));
+                );
                 cur.clone_from(to);
                 structural = true;
             }
@@ -248,10 +255,10 @@ pub fn apply_additive(
                 };
                 match target {
                     CommentTarget::Table => {
-                        sql.push_str(&format!("COMMENT ON TABLE \"{cur}\" IS {lit};"))
+                        let _ = write!(&mut sql, "COMMENT ON TABLE \"{cur}\" IS {lit};");
                     }
                     CommentTarget::Column(col) => {
-                        sql.push_str(&format!("COMMENT ON COLUMN \"{cur}\".\"{col}\" IS {lit};"))
+                        let _ = write!(&mut sql, "COMMENT ON COLUMN \"{cur}\".\"{col}\" IS {lit};");
                     }
                 }
             }
