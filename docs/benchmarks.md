@@ -9,8 +9,8 @@ Run them yourself on a quiet machine with `just bench`.
 
 - **Harness**: [criterion.rs] 0.5 (`harness = false` targets, `criterion_main!`). `default-features`
   off (no plotters/rayon/html_reports) — we read the stdout stats, and keep the dev-dep tree lean.
-- **Profile**: the `bench` profile (inherits `release`: opt-level 3, LTO off). `black_box` guards every
-  measured input/output so the optimiser can't hoist or elide the work.
+- **Profile**: the `bench` profile (inherits `release`: opt-level 3, LTO thin (inherited from release,
+  PR 5.7)). `black_box` guards every measured input/output so the optimiser can't hoist or elide the work.
 - **Throughput**: `Throughput::Elements(rows)`, so results read directly as **rows/s** (`Melem/s`).
 - **Inputs**: generated *outside* the timed loop. Decoder benches synthesize valid pgoutput byte
   streams (`Begin/Relation/Insert/Commit`, and a streamed `StreamStart/…/StreamStop` variant) from the
