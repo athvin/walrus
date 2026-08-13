@@ -229,8 +229,9 @@ impl TableDb {
     /// The Parquet column list for `schema_version`, introspecting `uri` **once** per version and
     /// caching it (PR 5.8; sound by the homogeneous-file rule — see [`TableDb::parquet_cols`]).
     fn columns_for(&self, uri: &str, schema_version: i64) -> Result<Rc<[String]>, LoaderError> {
-        if let Some(cols) = self.parquet_cols.borrow().get(&schema_version) {
-            return Ok(Rc::clone(cols));
+        let cached = { self.parquet_cols.borrow().get(&schema_version).cloned() };
+        if let Some(columns) = cached {
+            return Ok(columns);
         }
         let cols: Rc<[String]> = self.parquet_columns(uri)?.into();
         self.parquet_cols
