@@ -58,41 +58,45 @@ impl HealthState {
 
     /// Bootstrap finished → `/startup` and `/ready` may now answer 200.
     pub fn mark_ready(&self) {
-        self.phase.store(PHASE_READY, Ordering::SeqCst);
+        self.phase.store(PHASE_READY, Ordering::Release); // publishes bootstrap completion
     }
 
     /// SIGTERM received → drop out of rotation (`/ready` 503) while the loop drains.
     pub fn mark_terminating(&self) {
-        self.terminating.store(true, Ordering::SeqCst);
+        // Release publishes that SIGTERM was observed and the replication loop is draining.
+        self.terminating.store(true, Ordering::Release);
     }
 
     /// High lag / stale heartbeat → surfaced on readiness+health, **never** a liveness kill.
     pub fn set_degraded(&self, degraded: bool) {
-        self.degraded.store(degraded, Ordering::SeqCst);
+        // Relaxed: report-only flag; no payload is published and no behavior is gated on it.
+        self.degraded.store(degraded, Ordering::Relaxed);
     }
 
     /// The replication loop's deadlock detector flips this; `/healthz` reflects it.
     pub fn set_live(&self, live: bool) {
-        self.live.store(live, Ordering::SeqCst);
+        self.live.store(live, Ordering::Relaxed); // independent deadlock latch; no payload
     }
 
     pub fn phase(&self) -> Phase {
-        match self.phase.load(Ordering::SeqCst) {
+        match self.phase.load(Ordering::Acquire) {
+            // The Acquire load pairs with mark_ready's Release store.
             PHASE_READY => Phase::Ready,
             _ => Phase::Bootstrapping,
         }
     }
 
     pub fn is_ready(&self) -> bool {
-        self.phase() == Phase::Ready && !self.terminating.load(Ordering::SeqCst)
+        // Acquire pairs with mark_terminating; phase and termination are independent probe latches.
+        self.phase() == Phase::Ready && !self.terminating.load(Ordering::Acquire)
     }
 
     pub fn is_live(&self) -> bool {
-        self.live.load(Ordering::SeqCst)
+        self.live.load(Ordering::Relaxed) // independent deadlock latch; no payload
     }
 
     pub fn is_degraded(&self) -> bool {
-        self.degraded.load(Ordering::SeqCst)
+        self.degraded.load(Ordering::Relaxed) // report-only; no payload is observed
     }
 }
 

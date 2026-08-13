@@ -37,17 +37,19 @@ impl LoaderState {
 
     /// Bootstrap finished: leases held + files open → `/startup` and `/ready` answer 200.
     pub fn mark_ready(&self) {
-        self.ready.store(true, Ordering::SeqCst);
+        // Release publishes bootstrap's leases, open files, and initial progress stamp.
+        self.ready.store(true, Ordering::Release);
     }
 
     /// `/startup` gate: bootstrap finished. Independent of a later quarantine (startup stays satisfied).
     pub fn is_started(&self) -> bool {
-        self.ready.load(Ordering::SeqCst)
+        self.ready.load(Ordering::Acquire) // pairs with mark_ready's Release store
     }
 
     /// `/ready` answers 200 iff bootstrap finished AND we are not quarantined (degraded).
     pub fn is_ready(&self) -> bool {
-        self.ready.load(Ordering::SeqCst) && !self.is_quarantined()
+        // Acquire pairs with mark_ready; quarantine is an independent probe latch, not a protocol.
+        self.ready.load(Ordering::Acquire) && !self.is_quarantined()
     }
 
     /// Latch the quarantine flag — a failed lossy DDL cast (PR 3.9). `/ready` degrades and stays
@@ -55,18 +57,20 @@ impl LoaderState {
     /// exactly one exit: a single-table-reload rebuild, which REPLACES the data instead of
     /// retrying the cast on it ([`LoaderState::clear_quarantine`]).
     pub fn quarantine(&self) {
-        self.quarantined.store(true, Ordering::SeqCst);
+        // Release publishes the failed-cast quarantine before a probe observes the latch.
+        self.quarantined.store(true, Ordering::Release);
     }
 
     /// The one legitimate quarantine exit (PR 6.7): a reload rebuild just recreated the table at
     /// the attempt's schema_version, so the lossy cast the latch recorded no longer applies to
     /// anything — `/ready` recovers.
     pub fn clear_quarantine(&self) {
-        self.quarantined.store(false, Ordering::SeqCst);
+        // Release publishes completion of the rebuild that made the failed cast irrelevant.
+        self.quarantined.store(false, Ordering::Release);
     }
 
     pub fn is_quarantined(&self) -> bool {
-        self.quarantined.load(Ordering::SeqCst)
+        self.quarantined.load(Ordering::Acquire) // pairs with both quarantine stores
     }
 
     /// Stamp progress — called at the end of **every** poll cycle (and once at bootstrap end so an

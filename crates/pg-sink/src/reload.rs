@@ -273,7 +273,10 @@ async fn export_with_ddl_restarts(
             RunOutcome::SchemaChanged { new_version } => {
                 match handle_ddl_restart(&pool, &req, new_version, max_restarts).await? {
                     RestartDecision::Restarted(new_id) => {
-                        current_reload_id.store(new_id, Ordering::SeqCst);
+                        // Release publishes the lease-carrying successor before the next await. The
+                        // renewal currently shares this task; this documents the intended handoff if
+                        // it later moves to its own task and pairs with the Acquire loads below.
+                        current_reload_id.store(new_id, Ordering::Release);
                         req = control::reload::get(&pool, new_id).await?.ok_or_else(|| {
                             anyhow::anyhow!("successor reload {new_id} vanished after restart")
                         })?;
@@ -574,7 +577,8 @@ impl ReloadController {
                 move || {
                     let pool = renew_pool.clone();
                     let holder = holder.clone();
-                    let reload_id = renew_id.load(Ordering::SeqCst);
+                    // Acquire pairs with the DDL-restart Release that repoints lease renewal.
+                    let reload_id = renew_id.load(Ordering::Acquire);
                     async move {
                         control::reload::renew_lease(
                             &pool,
@@ -589,7 +593,8 @@ impl ReloadController {
                 export,
             )
             .await;
-            let reload_id = current_reload_id.load(Ordering::SeqCst);
+            // Acquire pairs with the DDL-restart Release for the final successor-aware log.
+            let reload_id = current_reload_id.load(Ordering::Acquire);
             match &end {
                 ExporterEnd::Cancelled => tracing::info!(
                     reload_id,
