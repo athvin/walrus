@@ -58,8 +58,15 @@ skip = []
 # while the `loader`, `pg-sink`, and `e2e` applications may erase them with anyhow. If a fourth
 # application legitimately needs anyhow, add it to `wrappers` in the same PR as the dependency so
 # the boundary receives explicit review.
+# `async-trait` boxes trait futures and adds a proc macro for a language gap closed by AFIT in Rust
+# 1.75; walrus's MSRV is 1.95. Its reusable traits (`DuckResultExt`, `Clock`, `ArrowNumBuilder`) are
+# synchronous and it needs no dyn async trait. If that changes, review `trait-variant` or an explicit
+# `-> impl Future<Output = ...> + Send` bound instead of adding `#[async_trait]`.
+# The wrappers are the four direct dependents in Cargo.lock. A new path should fail for review rather
+# than being added reflexively.
 deny = [
   { crate = "anyhow", wrappers = ["loader", "pg-sink", "e2e"] },
+  { crate = "async-trait", wrappers = ["axum", "axum-core", "object_store", "tokio-postgres"] },
 ]
 
 [sources]
