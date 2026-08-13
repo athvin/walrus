@@ -17,6 +17,11 @@ unsafe_code = "forbid"
 # This compatibility lint is allow-by-default in edition 2021 and warn-by-default in edition 2024;
 # the workspace warning deny would then make it an error. Deny it now as a staged migration step.
 unsafe_op_in_unsafe_fn = "deny"
+# walrus authors no extern blocks. Its configured native engine is dependency-owned: `duckdb` with
+# `bundled` (crates/loader/Cargo.toml:23; crates/pg-to-arrow/Cargo.toml:30) compiles C++ and generated
+# declarations in pinned `libduckdb-sys`. Other dependency FFI is likewise not first-party. This
+# lint is allow-by-default here, so deny it explicitly to reject pre-2024 extern-block spelling.
+missing_unsafe_on_extern = "deny"
 # This rustc lint is allow-by-default, so `warnings = "deny"` does not enable it.
 missing_copy_implementations = "deny"
 
