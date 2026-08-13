@@ -54,6 +54,15 @@ fn round_trips_through_display_and_from_str() {
 }
 
 #[test]
+fn u64_round_trips_through_from() {
+    let lsn = Lsn::from(0x0000_0000_019A_2B3C_u64);
+    assert_eq!(lsn, Lsn::new(0x0000_0000_019A_2B3C));
+    assert_eq!(u64::from(lsn), 0x0000_0000_019A_2B3C);
+    // `From` and the const constructors agree — neither is the "real" one.
+    assert_eq!(u64::from(Lsn::ZERO), Lsn::ZERO.as_u64());
+}
+
+#[test]
 fn serde_round_trips_as_padded_string() {
     let lsn = Lsn::new(0x19A2B3C);
     let json = serde_json::to_string(&lsn).unwrap();
