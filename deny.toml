@@ -64,9 +64,15 @@ skip = []
 # `-> impl Future<Output = ...> + Send` bound instead of adding `#[async_trait]`.
 # The wrappers are the four direct dependents in Cargo.lock. A new path should fail for review rather
 # than being added reflexively.
+# PR 15.3: pgoutput decode is a stateful ordered stream whose downstream contract uses
+# `(commit_lsn, lsn)`; the loader's CPU-heavy transform is SQL run by DuckDB's own thread pool, not
+# an order-independent Rust iterator. Keep both the public crate and its pool implementation out.
+# Full rationale: docs/implementation/notes/rust-skills/conc-rayon-par-iter.md.
 deny = [
   { crate = "anyhow", wrappers = ["loader", "pg-sink", "e2e"] },
   { crate = "async-trait", wrappers = ["axum", "axum-core", "object_store", "tokio-postgres"] },
+  { crate = "rayon" },
+  { crate = "rayon-core" },
 ]
 
 [sources]
