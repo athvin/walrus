@@ -108,8 +108,8 @@ impl LoaderConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError`] when a required value is empty, `lease_ttl` is zero, or the runtime
-    /// worker count is outside its documented bound. These are terminal configuration failures.
+    /// Returns [`ConfigError`] when a required value is empty, `lease_ttl` is too short for renewal,
+    /// or the runtime worker count is outside its documented bound. These are terminal failures.
     pub fn validate(&self) -> Result<(), ConfigError> {
         for (field, v) in [
             ("control_db_url", &self.control_db_url),
@@ -121,8 +121,13 @@ impl LoaderConfig {
                 return Err(ConfigError(format!("missing required field: {field}")));
             }
         }
-        if self.lease_ttl.is_zero() {
-            return Err(ConfigError("lease_ttl must be > 0".into()));
+        const MIN_LEASE_TTL: Duration = Duration::from_secs(3);
+        if self.lease_ttl < MIN_LEASE_TTL {
+            return Err(ConfigError(format!(
+                "lease_ttl {:?} is too short — renewal runs at TTL/3 and must land inside the TTL; \
+                 use >= {MIN_LEASE_TTL:?}",
+                self.lease_ttl
+            )));
         }
         common::runtime::validate_worker_threads(self.worker_threads)
             .map_err(|detail| ConfigError(format!("worker_threads: {detail}")))?;

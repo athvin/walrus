@@ -36,6 +36,19 @@ pub struct BootstrapCtx {
 
 const CANARY_PAYLOAD: &[u8] = b"walrus bootstrap canary";
 
+/// First retry pause, and the floor [`next_backoff`] clamps up to.
+const INITIAL_BACKOFF: Duration = Duration::from_millis(200);
+/// Ceiling for the exponential retry pause. `INITIAL_BACKOFF <= MAX_BACKOFF` is the `clamp`
+/// precondition; keep the bounds adjacent so an edit cannot silently invert them.
+const MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Double the retry pause without overflow, then bound it between the fixed retry limits.
+fn next_backoff(current: Duration) -> Duration {
+    current
+        .saturating_mul(2)
+        .clamp(INITIAL_BACKOFF, MAX_BACKOFF)
+}
+
 /// Time budget for a single dependency attempt: at most 5s, and never more than the deadline leaves
 /// (with a small floor so a nearly-elapsed deadline still gets one real attempt).
 fn attempt_budget(deadline: Instant) -> Duration {
@@ -173,7 +186,7 @@ async fn retry_transient<T, F>(deadline: Instant, what: &str, mut op: F) -> Resu
 where
     F: AsyncFnMut() -> Result<T, Error>,
 {
-    let mut backoff = Duration::from_millis(200);
+    let mut backoff = INITIAL_BACKOFF;
     loop {
         match op().await {
             Ok(value) => return Ok(value),
@@ -187,7 +200,7 @@ where
                 let wait = backoff.min(deadline.saturating_duration_since(now));
                 tracing::warn!("{what} unavailable (transient), retrying in {wait:?}: {e}");
                 tokio::time::sleep(wait).await;
-                backoff = (backoff * 2).min(Duration::from_secs(5));
+                backoff = next_backoff(backoff);
             }
         }
     }

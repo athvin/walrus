@@ -9,6 +9,22 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+/// Floor for the renew cadence: never tick sub-second, however small the admitted TTL.
+pub(crate) const MIN_RENEW_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Return one third of `ttl`, bounded into `[MIN_RENEW_INTERVAL, ttl]`.
+///
+/// The upper bound is a correctness fence: renewal at or after expiry could admit a second writer.
+/// [`crate::config::LoaderConfig::validate`] establishes `MIN_RENEW_INTERVAL <= ttl`, which is the
+/// `clamp` precondition, before the renewer is spawned.
+fn renew_interval(ttl: Duration) -> Duration {
+    debug_assert!(
+        ttl >= MIN_RENEW_INTERVAL,
+        "config must reject lease_ttl < 3s (clamp precondition)"
+    );
+    (ttl / 3).clamp(MIN_RENEW_INTERVAL, ttl)
+}
+
 /// Acquire (or reclaim) the lease for one table. `Ok` only when the lease is free or already ours;
 /// a live owner is terminal.
 ///
@@ -45,7 +61,7 @@ pub fn spawn_renewer(
     token: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval((ttl / 3).max(Duration::from_secs(1)));
+        let mut tick = tokio::time::interval(renew_interval(ttl));
         loop {
             tokio::select! {
                 biased;
