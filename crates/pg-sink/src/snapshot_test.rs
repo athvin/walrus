@@ -143,3 +143,14 @@ fn all_snapshot_manifest_files_share_lsn_end() {
         "every snapshot file shares lsn_end = consistent_point"
     );
 }
+
+#[test]
+fn out_of_range_catalog_oid_is_reported_not_wrapped() {
+    let raw = i64::from(u32::MAX) + 1;
+    let err = catalog_oid(raw).unwrap_err();
+    let message = format!("{err:#}");
+    assert!(
+        message.contains(&raw.to_string()),
+        "error includes {raw}: {message}"
+    );
+}

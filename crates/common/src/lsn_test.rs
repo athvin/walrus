@@ -63,6 +63,17 @@ fn u64_round_trips_through_from() {
 }
 
 #[test]
+fn bit_pattern_roundtrips_above_i64_max() {
+    let lsn = Lsn::new(u64::MAX - 7);
+    let encoded = lsn.to_sqlx_i64_bits();
+    assert!(
+        encoded < 0,
+        "the high unsigned bit is preserved in the signed wire value"
+    );
+    assert_eq!(Lsn::from_sqlx_i64_bits(encoded), lsn);
+}
+
+#[test]
 #[allow(clippy::op_ref, reason = "exercise the explicit borrowed Sub impl")]
 fn subtraction_is_the_byte_distance() {
     assert_eq!(Lsn::new(500) - Lsn::new(200), 300);
