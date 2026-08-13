@@ -14,4 +14,5 @@ disallowed-methods = [
   { path = "std::fs::File::open", reason = "blocking in async; use tokio::fs::File::open" },
   { path = "std::fs::File::create", reason = "blocking in async; use tokio::fs::File::create" },
   { path = "tokio::sync::mpsc::unbounded_channel", reason = "use mpsc::channel(N) with an explicit capacity and full-channel policy" },
+  { path = "tokio::sync::broadcast::channel", reason = "no multi-consumer event stream exists; see docs/implementation/notes/rust-skills/async-broadcast-pubsub.md" },
 ]
