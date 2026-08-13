@@ -20,6 +20,22 @@ use std::time::{Duration, Instant};
 /// Injectable clock so `max_fill` is testable without sleeping. Production uses [`SystemClock`]; the
 /// single production impl is deliberate — the trait exists **for that test seam**, not as dead
 /// generality (audited PR 8.5, kept by design).
+///
+/// This trait is sealed: it can be called and stored from anywhere, but only `pg-sink` can implement
+/// it.
+///
+/// ```compile_fail
+/// use std::time::Instant;
+///
+/// #[derive(Debug)]
+/// struct WallClock;
+///
+/// impl pg_sink::batch::Clock for WallClock {
+///     fn now(&self) -> Instant {
+///         Instant::now()
+///     }
+/// }
+/// ```
 pub trait Clock: Send + Sync + fmt::Debug {
     fn now(&self) -> Instant;
 }
