@@ -1,6 +1,7 @@
 //! Guards PR 5.7's workspace release-profile decision against silent drift.
 
 const WORKSPACE_MANIFEST: &str = include_str!("../../../Cargo.toml");
+const CODEGEN_UNITS_ADR: &str = "docs/implementation/notes/rust-skills/opt-codegen-units.md";
 
 fn table_body<'a>(manifest: &'a str, header: &str) -> Option<&'a str> {
     let mut offset = 0;
@@ -49,6 +50,18 @@ fn release_lto(manifest: &str) -> Result<&str, &'static str> {
     }
 }
 
+fn codegen_units_policy(manifest: &str) -> Result<(), &'static str> {
+    let release = table_body(manifest, "[profile.release]").ok_or("missing [profile.release]")?;
+
+    if assignment_value(release, "codegen-units").is_some() {
+        Err("codegen-units declared")
+    } else if !manifest.contains(CODEGEN_UNITS_ADR) {
+        Err("missing codegen-units ADR link")
+    } else {
+        Ok(())
+    }
+}
+
 #[test]
 fn workspace_release_profile_keeps_thin_lto() {
     assert_eq!(release_lto(WORKSPACE_MANIFEST), Ok("thin"));
@@ -79,4 +92,39 @@ fn lto_policy_rejects_disabled_missing_and_comment_only_values() {
 fn profile_comment_does_not_declare_codegen_units() {
     let release = table_body(WORKSPACE_MANIFEST, "[profile.release]").expect("release profile");
     assert_eq!(assignment_value(release, "codegen-units"), None);
+}
+
+#[test]
+fn codegen_units_rejection_rationale_is_still_recorded() {
+    assert_eq!(codegen_units_policy(WORKSPACE_MANIFEST), Ok(()));
+}
+
+#[test]
+fn codegen_units_policy_rejects_fabricated_input() {
+    let linked_default = concat!(
+        "# docs/implementation/notes/rust-skills/opt-codegen-units.md\n",
+        "[profile.release]\n",
+        "lto = \"thin\"\n",
+    );
+    let linked_override = concat!(
+        "# docs/implementation/notes/rust-skills/opt-codegen-units.md\n",
+        "[profile.release]\n",
+        "lto = \"thin\"\n",
+        "codegen-units = 1\n",
+    );
+    let missing_link = "[profile.release]\nlto = \"thin\"\n";
+
+    let cases = [
+        (linked_default, Ok(())),
+        (linked_override, Err("codegen-units declared")),
+        (missing_link, Err("missing codegen-units ADR link")),
+    ];
+
+    for (manifest, expected) in cases {
+        assert_eq!(
+            codegen_units_policy(manifest),
+            expected,
+            "manifest:\n{manifest}"
+        );
+    }
 }
