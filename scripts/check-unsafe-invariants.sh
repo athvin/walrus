@@ -36,8 +36,66 @@ scan_uninit() {
   echo "   0 sites"
 }
 
+fail() {
+  echo "FAIL: $*" >&2
+  return 1
+}
+
+has_workspace_unsafe_forbid() {
+  awk '
+    /^[[:space:]]*\[workspace\.lints\.rust\][[:space:]]*$/ { inside = 1; next }
+    /^[[:space:]]*\[/ { inside = 0 }
+    inside && /^[[:space:]]*unsafe_code[[:space:]]*=[[:space:]]*"forbid"([[:space:]]*(#.*)?)?$/ {
+      found = 1
+    }
+    END { exit(found ? 0 : 1) }
+  ' "$1"
+}
+
+member_inherits_workspace_lints() {
+  awk '
+    /^[[:space:]]*\[lints\][[:space:]]*$/ { inside = 1; next }
+    /^[[:space:]]*\[/ { inside = 0 }
+    inside && /^[[:space:]]*workspace[[:space:]]*=[[:space:]]*true([[:space:]]*(#.*)?)?$/ {
+      found = 1
+    }
+    END { exit(found ? 0 : 1) }
+  ' "$1"
+}
+
+workspace_members() {
+  sed -nE 's/^[[:space:]]*members[[:space:]]*=[[:space:]]*\[([^]]*)\].*/\1/p' "$1" \
+    | tr ',' '\n' \
+    | tr -d '" '
+}
+
 check_unsafe_policy() {
+  local root="${1%/}"
+  local workspace_manifest="$root/Cargo.toml"
   echo "== unsafe policy still in force (PR 12.1 forbid + per-member inheritance) =="
+
+  if ! has_workspace_unsafe_forbid "$workspace_manifest"; then
+    fail "$workspace_manifest lost \`unsafe_code = \"forbid\"\` (PR 12.1). Read $ADR before removing it."
+    return 1
+  fi
+
+  local members
+  members="$(workspace_members "$workspace_manifest")"
+  if [[ -z "$members" ]]; then
+    fail "$workspace_manifest has no parseable one-line workspace members list. See $ADR."
+    return 1
+  fi
+
+  local member
+  while IFS= read -r member; do
+    [[ -n "$member" ]] || continue
+    local member_manifest="$root/$member/Cargo.toml"
+    if ! member_inherits_workspace_lints "$member_manifest"; then
+      fail "$member_manifest no longer inherits \`[lints] workspace = true\`; the workspace forbid does not reach it. See $ADR."
+      return 1
+    fi
+    echo "   ok: $member inherits [lints] workspace = true"
+  done < <(printf '%s\n' "$members")
 }
 
 write_policy_fixture() {
