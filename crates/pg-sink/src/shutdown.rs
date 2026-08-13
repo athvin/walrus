@@ -47,6 +47,12 @@ pub enum DrainOutcome {
 /// **(4)** `CopyDone` + clean close → **(5)** return, leaving the slot in place. **Never** issues
 /// `DROP_REPLICATION_SLOT`.
 ///
+/// ## Cancel safety
+///
+/// **Not cancel-safe.** Dropping the drain can interrupt its ordered durability and wire-close
+/// steps. The decode loop awaits it inside the already-selected cancellation branch, which Tokio
+/// runs to completion; only the process's external grace-period deadline can end it early.
+///
 /// # Errors
 ///
 /// Returns [`anyhow::Error`] if sealing a committed batch, S3/manifest durability, the final standby

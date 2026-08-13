@@ -27,6 +27,12 @@ use tokio_util::sync::CancellationToken;
 #[error("decode loop builder: missing required field `{0}`")]
 pub struct DecodeLoopError(&'static str);
 
+/// The outcome carried beyond the pinned frame future's borrow of the replication stream.
+enum FrameEvent {
+    Cancelled,
+    Frame(anyhow::Result<Option<ReplicationMessage>>),
+}
+
 /// The fully wired decode loop. Construct it with [`DecodeLoop::builder`]; [`DecodeLoop::run`]
 /// consumes the wiring so its mutable borrows cannot escape or be reused concurrently.
 #[derive(Debug)]
@@ -122,31 +128,48 @@ impl<'a> DecodeLoop<'a> {
         let mut beat_check = tokio::time::interval(heartbeat.idle_after());
         beat_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            tokio::select! {
-                biased;
-                _ = token.cancelled() => {
+            let event = {
+                // Keep one frame future alive across heartbeat ticks. `next()` may be parked in a
+                // feedback write, where dropping it would leave a partial CopyBoth frame.
+                let frame = stream.next();
+                tokio::pin!(frame);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = token.cancelled() => break FrameEvent::Cancelled,
+                        _ = beat_check.tick() => {
+                            // The beat fires over a SEPARATE SQL connection only when idle on both clocks; a
+                            // failure is logged and surfaced as `degraded`, never fatal (liveness never self-harms).
+                            let now = Instant::now();
+                            match heartbeat.maybe_beat(now, last_activity).await {
+                                Ok(Some(seq)) => tracing::info!(beat_seq = seq, "fired idle heartbeat"),
+                                Ok(None) => {}
+                                Err(e) => tracing::warn!(error = %e, "heartbeat beat failed"),
+                            }
+                            health.set_degraded(heartbeat.degraded(now));
+                        }
+                        res = &mut frame => break FrameEvent::Frame(res),
+                    }
+                }
+            };
+
+            match event {
+                FrameEvent::Cancelled => {
                     // SIGTERM/SIGINT: the loop has stopped consuming — now run the ordered drain (NOT
                     // cancellable; the caller bounds it by the K8s grace period). The slot is never dropped.
                     tracing::info!("decode loop cancelled; draining");
                     health.mark_terminating();
-                    let outcome = crate::shutdown::drain(stream, router, sink, checkpoint, pool, epoch)
-                        .await
-                        .context("graceful drain")?;
-                    tracing::info!(?outcome, "drain complete; slot left in place, resume on restart");
+                    let outcome =
+                        crate::shutdown::drain(stream, router, sink, checkpoint, pool, epoch)
+                            .await
+                            .context("graceful drain")?;
+                    tracing::info!(
+                        ?outcome,
+                        "drain complete; slot left in place, resume on restart"
+                    );
                     return Ok(());
                 }
-                _ = beat_check.tick() => {
-                    // The beat fires over a SEPARATE SQL connection only when idle on both clocks; a
-                    // failure is logged and surfaced as `degraded`, never fatal (liveness never self-harms).
-                    let now = Instant::now();
-                    match heartbeat.maybe_beat(now, last_activity).await {
-                        Ok(Some(seq)) => tracing::info!(beat_seq = seq, "fired idle heartbeat"),
-                        Ok(None) => {}
-                        Err(e) => tracing::warn!(error = %e, "heartbeat beat failed"),
-                    }
-                    health.set_degraded(heartbeat.degraded(now));
-                }
-                frame = stream.next() => {
+                FrameEvent::Frame(frame) => {
                     match frame.context("read replication frame")? {
                         None => {
                             tracing::info!("replication stream ended");
@@ -168,15 +191,17 @@ impl<'a> DecodeLoop<'a> {
                                         internal.note_relation(relation);
                                         // Register user tables at their CURRENT structural version (bumped by
                                         // DDL capture, PR 2.33) so the new-shape file carries the new version.
-                                        let version = ddl.version_of(&relation.schema, &relation.name);
-                                        on_relation(cache, pool, epoch, relation.clone(), version).await?;
+                                        let version =
+                                            ddl.version_of(&relation.schema, &relation.name);
+                                        on_relation(cache, pool, epoch, relation.clone(), version)
+                                            .await?;
                                     }
                                     // The DDL signal: a walrus.ddl_audit INSERT. Write a ddl_manifest row,
                                     // bump the affected table's structural schema_version, and cut a fresh
                                     // file. NEVER materialised as user data.
-                                    Message::Insert { relation_oid, new, .. }
-                                        if internal.is_ddl_audit(*relation_oid) =>
-                                    {
+                                    Message::Insert {
+                                        relation_oid, new, ..
+                                    } if internal.is_ddl_audit(*relation_oid) => {
                                         if let Some(rel) = internal.ddl_audit_rel() {
                                             let ev = crate::ddl::DdlEvent::from_tuple(rel, new)
                                                 .context("parse ddl_audit tuple")?;
@@ -186,8 +211,15 @@ impl<'a> DecodeLoop<'a> {
                                                 .context("consume ddl event")?;
                                             if let Some(new_version) = structural {
                                                 // Cut the old-version file for that table, then flush it.
-                                                let sealed = router.cut_table(cache, &ev.source_schema, &ev.source_table)?;
-                                                flush_sealed(sealed, stream, sink, checkpoint, pool, epoch).await?;
+                                                let sealed = router.cut_table(
+                                                    cache,
+                                                    &ev.source_schema,
+                                                    &ev.source_table,
+                                                )?;
+                                                flush_sealed(
+                                                    sealed, stream, sink, checkpoint, pool, epoch,
+                                                )
+                                                .await?;
                                                 tracing::info!(
                                                     source_table = %format_args!("{}.{}", ev.source_schema, ev.source_table),
                                                     c_tag = %ev.c_tag,
@@ -204,11 +236,15 @@ impl<'a> DecodeLoop<'a> {
                                     // through the stream. Buffered here; the waiter resolves at the
                                     // transaction's Commit with its commit LSN (= the chunk watermark
                                     // L_i). NEVER batched, never a Parquet file or manifest row.
-                                    Message::Insert { relation_oid, new, xid }
-                                        if internal.is_reload_signal(*relation_oid) =>
-                                    {
+                                    Message::Insert {
+                                        relation_oid,
+                                        new,
+                                        xid,
+                                    } if internal.is_reload_signal(*relation_oid) => {
                                         if let Some(rel) = internal.reload_signal_rel() {
-                                            match crate::reload_signal::PendingSignal::from_tuple(rel, new, *xid) {
+                                            match crate::reload_signal::PendingSignal::from_tuple(
+                                                rel, new, *xid,
+                                            ) {
                                                 Some(sig) => pending_signals.push(sig),
                                                 None => tracing::warn!(
                                                     "malformed walrus.reload_signal tuple; ignoring"
@@ -221,14 +257,19 @@ impl<'a> DecodeLoop<'a> {
                                     // internal tables' non-signal ops (a ddl_audit UPDATE, a reload_signal
                                     // UPDATE — neither should happen) are consumed-and-ignored here: only
                                     // the heartbeat's tuple carries a beat_seq.
-                                    Message::Insert { relation_oid, new, .. }
-                                    | Message::Update { relation_oid, new, .. }
-                                        if internal.is_internal(*relation_oid) =>
-                                    {
+                                    Message::Insert {
+                                        relation_oid, new, ..
+                                    }
+                                    | Message::Update {
+                                        relation_oid, new, ..
+                                    } if internal.is_internal(*relation_oid) => {
                                         if internal.is_heartbeat(*relation_oid) {
                                             if let Some(seq) = internal.beat_seq_of(new) {
                                                 heartbeat.observe_return(seq, Instant::now());
-                                                tracing::info!(beat_seq = seq, "heartbeat round-trip observed");
+                                                tracing::info!(
+                                                    beat_seq = seq,
+                                                    "heartbeat round-trip observed"
+                                                );
                                             }
                                             txn_has_heartbeat = true;
                                         }
@@ -242,7 +283,11 @@ impl<'a> DecodeLoop<'a> {
                                         // First seal/flush any user batch this commit made eligible.
                                         flush_sealed(
                                             router.route(cache, &msg, frame_lsn, schema_version)?,
-                                            stream, sink, checkpoint, pool, epoch,
+                                            stream,
+                                            sink,
+                                            checkpoint,
+                                            pool,
+                                            epoch,
                                         )
                                         .await?;
                                         // Resolve any signal echoes this transaction carried: its commit
@@ -304,7 +349,11 @@ impl<'a> DecodeLoop<'a> {
                                         // `on_batch_durable` below, so draining early never advances past it.)
                                         flush_sealed(
                                             router.drain_committed()?,
-                                            stream, sink, checkpoint, pool, epoch,
+                                            stream,
+                                            sink,
+                                            checkpoint,
+                                            pool,
+                                            epoch,
                                         )
                                         .await?;
                                         // Materialise the survivors (aborted sub-xids excluded) to `ready`
@@ -352,12 +401,26 @@ impl<'a> DecodeLoop<'a> {
                                     }
                                     other => {
                                         // A user change is activity — it suppresses the idle beat.
-                                        if matches!(other, Message::Insert { .. } | Message::Update { .. } | Message::Delete { .. }) {
+                                        if matches!(
+                                            other,
+                                            Message::Insert { .. }
+                                                | Message::Update { .. }
+                                                | Message::Delete { .. }
+                                        ) {
                                             last_activity = Instant::now();
                                         }
                                         flush_sealed(
-                                            router.route(cache, other, frame_lsn, schema_version)?,
-                                            stream, sink, checkpoint, pool, epoch,
+                                            router.route(
+                                                cache,
+                                                other,
+                                                frame_lsn,
+                                                schema_version,
+                                            )?,
+                                            stream,
+                                            sink,
+                                            checkpoint,
+                                            pool,
+                                            epoch,
                                         )
                                         .await?;
                                     }
@@ -543,6 +606,13 @@ async fn flush_batch_keepalive(
 /// `obj.lsn_end` — is PR 2.26. A crash between (a) and (b) is safe: the batch re-streams (no `ready`
 /// row was committed), at-least-once.
 ///
+/// ## Cancel safety
+///
+/// **Not cancel-safe as a composite durability operation.** The object PUT may finish before the
+/// manifest insert, so dropping this future can leave an unreferenced object. The keepalive path
+/// pins this future and polls it by mutable reference; other callers await it directly. A retry is
+/// safe because a manifest is never recorded before its object is durable.
+///
 /// # Errors
 ///
 /// Returns [`anyhow::Error`] if Parquet encoding/S3 durability or the subsequent manifest insert
@@ -558,6 +628,12 @@ pub async fn flush_batch(
 
 /// As [`flush_batch`], stamping the object + manifest `kind` — the backfill (PR 2.29) flushes with
 /// [`crate::sink::FileKind::Snapshot`].
+///
+/// ## Cancel safety
+///
+/// **Not cancel-safe as a composite durability operation.** Cancellation after the PUT but before
+/// the manifest commit can orphan an object. Callers either pin the enclosing [`flush_batch`]
+/// future or await this operation outside a `select!` race; replay safely regenerates the row.
 ///
 /// # Errors
 ///

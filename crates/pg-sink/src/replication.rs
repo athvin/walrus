@@ -207,6 +207,19 @@ impl ReplicationStream {
     /// Read one frame. Sends unconditional feedback whenever the interval elapses (so an idle stream
     /// stays alive), and answers a `reply_requested` keepalive immediately. `None` on stream end.
     ///
+    /// ## Cancel safety
+    ///
+    /// **Not cancel-safe.** Buffered reads retain partial bytes in `self.rbuf`, but this operation
+    /// also calls [`Self::send_received_feedback`], whose direct socket write can be left as a
+    /// partial standby-status frame if the future is dropped. Callers must pin one `next()` future
+    /// and poll it by mutable reference across sibling `select!` branches.
+    ///
+    /// The remaining drop point is decode-loop cancellation. If it tears a frame, the connection
+    /// may remain unrecoverable until disconnect/reconnect: after flushing committed data, the drain
+    /// attempts a standby-status frame and `CopyDone`, but those writes are best-effort and cannot
+    /// repair framing. Fully eliminating the residual requires resumable outbound staging in a
+    /// `wbuf` field mirroring `rbuf`, which is deferred.
+    ///
     /// # Errors
     ///
     /// Returns [`anyhow::Error`] if reading or parsing a backend frame fails, PostgreSQL reports an
@@ -244,6 +257,12 @@ impl ReplicationStream {
 
     /// Send an `'r'` standby status update. Callers (PR 2.26) use this to advance `flush`/`apply` on
     /// durability; the keepalive path uses [`Self::send_received_feedback`].
+    ///
+    /// ## Cancel safety
+    ///
+    /// **Not cancel-safe.** Dropping during `write_all` or `flush` can leave a partial frame on the
+    /// CopyBoth socket. Callers await it to completion inside a selected branch body, or through a
+    /// pinned [`Self::next`] future, so a sibling branch cannot tear the write.
     ///
     /// # Errors
     ///
@@ -341,6 +360,12 @@ impl ReplicationStream {
     /// Public so the flush path can pump keepalive while a slow S3 PUT blocks the read loop — the PUT
     /// touches the object store, not this socket, so feedback rides concurrently (§1.9: keepalive is
     /// unconditional, never gated on durability). Resets the feedback deadline on each send.
+    ///
+    /// ## Cancel safety
+    ///
+    /// **Not cancel-safe.** It delegates to [`Self::send_standby_status`], whose socket write must
+    /// finish once started. The decode loop preserves the enclosing [`Self::next`] future across
+    /// heartbeat ticks, and the flush keepalive branch awaits this method to completion.
     ///
     /// # Errors
     ///

@@ -25,11 +25,13 @@ async fn stepwise(progress: &Cell<u32>, steps: u32) {
 #[tokio::test(start_paused = true)]
 async fn pinned_branch_survives_other_arm_firing() {
     let progress = Cell::new(0);
+    let frame = stepwise(&progress, 5);
+    tokio::pin!(frame);
     let mut ticker = tokio::time::interval(Duration::from_millis(3));
     let mut interruptions = 0_u32;
-    for _ in 0..10 {
+    loop {
         tokio::select! {
-            () = stepwise(&progress, 5) => break,
+            () = &mut frame => break,
             _ = ticker.tick() => interruptions += 1,
         }
     }

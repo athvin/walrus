@@ -225,6 +225,13 @@ impl Heartbeat {
     /// Fire exactly one beat iff idle on both clocks; returns the seq written, or `None` (suppressed).
     /// The `UPDATE` rides the **published** `walrus.heartbeat` so it decodes back to us.
     ///
+    /// ## Cancel safety
+    ///
+    /// **Not cancel-safe as a logical beat.** PostgreSQL may commit the update before a dropped query
+    /// future returns, leaving the local sent-sequence state unchanged. The decode loop awaits this
+    /// inside the selected heartbeat arm, so sibling frame readiness cannot cancel it; a retry would
+    /// only advance the monotonic beat sequence again.
+    ///
     /// # Errors
     ///
     /// Returns [`HeartbeatError::Beat`] if the heartbeat update or returned sequence read fails.
