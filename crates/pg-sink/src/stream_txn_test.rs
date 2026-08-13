@@ -220,3 +220,43 @@ async fn low_ceiling_spills_yet_still_excludes_the_aborted_subxid() {
         "every file carries the real commit LSN in lsn_end"
     );
 }
+
+#[tokio::test]
+async fn spill_preserves_commit_order_of_the_surviving_rows() {
+    assert!(include_str!("stream_txn.rs").contains("std::mem::take(&mut txn.changes)"));
+
+    let (cache, sink) = (cache(), mem_sink());
+    let mut d = demux(250);
+    let top = 857;
+    d.on_stream_start(top, true, "0/100".parse().unwrap());
+
+    for (id, sub_xid, lsn) in [
+        (1, 858, "0/101"),
+        (2, 857, "0/102"),
+        (3, 859, "0/103"),
+        (4, 857, "0/104"),
+        (5, 857, "0/105"),
+    ] {
+        let values = vec![
+            TupleValue::Text(id.to_string()),
+            TupleValue::Text("n".into()),
+        ];
+        d.meter.add((42, sub_xid), estimate_change_bytes(&values));
+        d.open.get_mut(&top).unwrap().push_change(StreamedChange {
+            sub_xid,
+            oid: 42,
+            op: Op::Insert,
+            values,
+            lsn: lsn.parse().unwrap(),
+        });
+    }
+
+    d.spill_if_over_ceiling(&cache, &sink).await.unwrap();
+
+    let surviving_lsns: Vec<Lsn> = d.open[&top].changes.iter().map(|c| c.lsn).collect();
+    assert_eq!(
+        surviving_lsns,
+        vec!["0/101".parse().unwrap(), "0/103".parse().unwrap()],
+        "partitioning the spill candidate must preserve survivor commit order"
+    );
+}
