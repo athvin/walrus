@@ -334,7 +334,7 @@ async fn resync_never_pauses_the_table() {
         Some("streamed"),
         "the stream kept flowing over the live table during the resync"
     );
-    assert_eq!(*ctx.pause_logged.lock(), None, "no pause was ever latched");
+    assert_eq!(ctx.pause_logged.get(), None, "no pause was ever latched");
     let cp = control::read_checkpoint(&ctx.pool, epoch, "public", "orders")
         .await
         .unwrap()
