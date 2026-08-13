@@ -21,3 +21,9 @@ pub enum DecodeError {
     #[error("{unconsumed} trailing bytes after a complete message")]
     TrailingBytes { unconsumed: usize },
 }
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+    std::mem::size_of::<DecodeError>() == 32,
+    "DecodeError crosses the pgoutput frame decode path"
+);

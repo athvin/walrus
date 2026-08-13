@@ -43,6 +43,12 @@ struct StreamedChange {
     lsn: Lsn,
 }
 
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+    std::mem::size_of::<StreamedChange>() == 48,
+    "StreamedChange buffers every row of an open streamed transaction"
+);
+
 /// A speculatively-spilled S3 object for one `(sub_xid)` of an open txn — no manifest row until commit.
 struct StagedSpill {
     sub_xid: u32,

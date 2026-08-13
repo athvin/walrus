@@ -56,6 +56,12 @@ pub struct PgColumn {
     pub is_key: bool,
 }
 
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+    std::mem::size_of::<PgColumn>() == 40,
+    "PgColumn is stored once per source column"
+);
+
 impl PgColumn {
     /// Decode `numeric(p, s)` from `type_modifier` when this column is a `numeric`; `None` for a
     /// non-numeric column or an unconstrained `numeric` (`type_modifier == -1`).
@@ -82,6 +88,12 @@ pub struct PgRelation {
     pub replica_identity: ReplicaIdentity,
     pub columns: Vec<PgColumn>,
 }
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+    std::mem::size_of::<PgRelation>() == 80,
+    "PgRelation is cached for every source table"
+);
 
 impl PgRelation {
     /// The key-column names (`is_key`) **in relation order** — the loader's MERGE/dedup key list.

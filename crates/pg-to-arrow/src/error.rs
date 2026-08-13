@@ -25,3 +25,9 @@ pub enum Error {
     #[error("parquet error: {0}")]
     Parquet(#[from] parquet::errors::ParquetError),
 }
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+    std::mem::size_of::<Error>() == 72,
+    "Error is constructed on failed per-cell Arrow conversion"
+);
