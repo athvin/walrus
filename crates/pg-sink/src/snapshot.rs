@@ -39,6 +39,7 @@ pub struct ExportedSnapshot {
 
 /// Holds the slot-creating replication connection, which **must stay open + idle** so the exported
 /// snapshot remains valid until every backfill session has attached to it.
+#[derive(Debug)]
 pub struct SnapshotConn {
     stream: ReplicationStream,
     exported: Option<ExportedSnapshot>,
@@ -115,6 +116,7 @@ impl SnapshotConn {
 }
 
 /// One serial per-table backfill over an ordinary SQL connection (distinct from the replication one).
+#[derive(Debug)]
 pub struct Backfill {
     client: tokio_postgres::Client,
     triggers: BatchTriggers,

@@ -6,6 +6,7 @@ use pg_to_arrow::oids;
 use std::sync::Mutex;
 
 /// A hand-advanced clock for the `max_fill` test.
+#[derive(Debug)]
 struct FakeClock {
     base: Instant,
     offset: Mutex<Duration>,

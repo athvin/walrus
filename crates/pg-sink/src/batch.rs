@@ -13,13 +13,14 @@ use crate::relcache::CachedRelation;
 use arrow::record_batch::RecordBatch;
 use common::{Lsn, SinkMeta, TupleValue, UtcTimestamp};
 use pg_to_arrow::BatchBuilder;
+use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Injectable clock so `max_fill` is testable without sleeping. Production uses [`SystemClock`]; the
 /// single production impl is deliberate — the trait exists **for that test seam**, not as dead
 /// generality (audited PR 8.5, kept by design).
-pub trait Clock: Send + Sync {
+pub trait Clock: Send + Sync + fmt::Debug {
     fn now(&self) -> Instant;
 }
 
@@ -54,6 +55,7 @@ pub struct SealedBatch {
 }
 
 /// Accumulates one table's committed changes into an Arrow builder until a trigger trips.
+#[derive(Debug)]
 pub struct TableBatcher {
     rel: Arc<CachedRelation>,
     triggers: BatchTriggers,

@@ -20,6 +20,7 @@ use std::time::Duration;
 
 /// Everything one owned table's apply worker needs — **owned** (one `TableDb`/DuckDB connection per
 /// table, never shared), so it can move into a `spawn_local`'d [`crate::apply_loop::apply_loop`].
+#[derive(Debug)]
 pub struct TableCtx {
     pub pool: sqlx::PgPool,
     pub epoch: i64,

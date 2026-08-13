@@ -29,6 +29,7 @@ const RELOAD_REBUILD_DROP: &str = include_str!("../sql/duckdb/templates/reload_r
 const WIPE_GENERATION: &str = include_str!("../sql/duckdb/templates/wipe_generation.sql");
 
 /// Owns one table's `.duckdb` connection (mirror `<table>` + CDC log `<table>_raw`).
+#[derive(Debug)]
 pub struct TableDb {
     conn: duckdb::Connection,
     /// Parquet column lists by `schema_version` (PR 5.8). A version's file shape is immutable — the

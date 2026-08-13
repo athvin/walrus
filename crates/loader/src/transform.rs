@@ -37,6 +37,7 @@ impl TruncateBoundary {
 /// One mirror column and the SQL producing its value from the winning raw row `s` (and, for a
 /// TOAST-resolvable scalar, the current mirror `t`). PR 4.2: a Tier-2 column recombines/flattens from
 /// its emit columns; a Tier-1 scalar is the same TOAST-resolved passthrough the transform always used.
+#[derive(Debug)]
 struct MirrorCol {
     name: String,
     is_key: bool,
@@ -49,6 +50,7 @@ struct MirrorCol {
 
 /// A table's mirror-column layout for rendering the transform (order preserved). Built from a
 /// [`crate::plan::TablePlan`] — the Tier-1 plan reproduces the pre-descriptor scalar SQL exactly.
+#[derive(Debug)]
 pub struct TransformSql {
     table: String,
     mirror: Vec<MirrorCol>,

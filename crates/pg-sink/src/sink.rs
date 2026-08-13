@@ -44,7 +44,7 @@ pub struct WrittenObject {
 
 /// Encodes sealed batches to Parquet and PUTs them to S3, epoch-namespaced. Cheap to clone (the
 /// store is an `Arc`) — reload exporters (PR 6.5) each carry their own handle.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ParquetSink {
     store: Arc<dyn ObjectStore>,
     bucket: String,

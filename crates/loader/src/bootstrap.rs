@@ -22,6 +22,7 @@ pub struct Checkpoints {
 }
 
 /// One table this loader instance owns after bootstrap.
+#[derive(Debug)]
 pub struct OwnedTable {
     pub schema: String,
     pub table: String,

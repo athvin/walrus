@@ -220,7 +220,7 @@ async fn export_with_ddl_restarts(
 }
 
 /// Everything the controller needs, cut from `SinkConfig` + bootstrap state.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ReloadControllerConfig {
     /// Poll cadence — the heartbeat cadence (`heartbeat_idle_after`), per the task's contract.
     pub poll_interval: Duration,
@@ -241,6 +241,7 @@ pub struct ReloadControllerConfig {
 /// Sink-owned reload orchestration (H6). Never on the replication loop's path — it holds a
 /// cloned handle of the control-pg pool and dials its OWN source connections; the only shared
 /// state is the waiter registry.
+#[derive(Debug)]
 pub struct ReloadController {
     pool: sqlx::PgPool,
     /// Catalog preflight dials a FRESH ordinary source connection per non-empty tick: reloads are

@@ -29,6 +29,7 @@ const MINIO: &str = "walrus-minio-1";
 /// A running walrus stack: the compose services (assumed up) plus a live `pg-sink` and `loader` spawned
 /// as child processes. `Drop` kills both — a leaked sink holds the replication slot and blocks the next
 /// run's bootstrap.
+#[derive(Debug)]
 pub struct Harness {
     sink: Child,
     loader: Child,

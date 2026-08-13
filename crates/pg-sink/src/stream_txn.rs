@@ -34,7 +34,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// One streamed change, tagged with **its** sub-transaction xid (proto §7).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct StreamedChange {
     sub_xid: u32,
     oid: u32,
@@ -50,12 +50,14 @@ const _: () = assert!(
 );
 
 /// A speculatively-spilled S3 object for one `(sub_xid)` of an open txn — no manifest row until commit.
+#[derive(Debug)]
 struct StagedSpill {
     sub_xid: u32,
     written: WrittenObject,
 }
 
 /// Per top-level xid buffer for an in-progress streamed transaction.
+#[derive(Debug)]
 struct StreamedTxn {
     /// The floor `confirmed_flush` must not pass while this txn is open (its first-segment LSN).
     begin_lsn: Lsn,
@@ -97,6 +99,7 @@ impl StreamedTxn {
 
 /// Demultiplexes interleaved streamed transactions, commit-gates visibility, and spills under memory
 /// pressure. **DB-free** — `on_stream_commit` returns the objects to `record_ready`.
+#[derive(Debug)]
 pub struct StreamDemux {
     open: HashMap<u32, StreamedTxn>,
     /// The top-level xid of the currently-open `Stream Start … Stream Stop` block; changes route here.

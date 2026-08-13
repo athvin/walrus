@@ -21,7 +21,7 @@ use pg_sink::pgoutput::{
 use std::fmt::Write as _;
 
 /// A ported row of `VECTORS`: bytes in, the golden render line out.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Vector {
     pub name: &'static str,
     /// Message bytes, hex-encoded (lowercase, as captured).

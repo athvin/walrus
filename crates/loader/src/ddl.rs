@@ -25,18 +25,21 @@ use common::{PgColumn, PgRelation};
 use std::fmt::Write as _;
 
 /// One `schema_version` of a table's shape — the `schema_registry` `columns` snapshot for that version.
+#[derive(Debug)]
 pub struct SchemaVersion {
     pub version: i64,
     pub relation: PgRelation,
 }
 
 /// What a `COMMENT` targets. `COMMENT` is metadata: mirror only, never a data gate.
+#[derive(Debug)]
 pub enum CommentTarget {
     Table,
     Column(String),
 }
 
 /// One additive/lossless structural (or metadata) change, derived by [`diff_additive`].
+#[derive(Debug)]
 pub enum AdditiveChange {
     /// A column appended at the end (a higher attnum). Nullable on BOTH tables so pre-change rows read
     /// NULL and old verbatim `<table>_raw` rows stay valid.
@@ -64,6 +67,7 @@ pub enum AdditiveChange {
 
 /// One destructive change (PR 3.9) — where mirror and raw **diverge**: the mirror follows the exact
 /// current shape (physical drop / in-place cast), the raw log preserves history (retain / widen-only).
+#[derive(Debug)]
 pub enum DestructiveChange {
     /// `DROP COLUMN` — physically dropped from `<table>`; **retained nullable** in `<table>_raw`.
     DropColumn { name: String },
@@ -92,7 +96,7 @@ fn is_lossless_widen(old: &PgColumn, new: &PgColumn) -> bool {
 
 /// The full classification of one version step: additive/lossless changes plus destructive ones
 /// (PR 3.9). The sink cuts one file per structural change, so a step usually yields a single change.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct SchemaDiff {
     pub additive: Vec<AdditiveChange>,
     pub destructive: Vec<DestructiveChange>,

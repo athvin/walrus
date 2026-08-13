@@ -422,6 +422,7 @@ pub async fn flush_batch_kind(
 
 /// Routes decoded changes into per-table [`TableBatcher`]s and seals at commit boundaries. Owns the
 /// per-table batchers + the sink context stamped into each row's `walrus_pg_sink_meta`.
+#[derive(Debug)]
 pub struct BatchRouter {
     batchers: HashMap<u32, TableBatcher>,
     triggers: BatchTriggers,

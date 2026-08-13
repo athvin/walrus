@@ -11,6 +11,9 @@ rust-version = "1.95" # MSRV — keep in sync with rust-toolchain.toml; CI `msrv
 # NOTE: these only take effect in a member once it declares `[lints] workspace = true`.
 [workspace.lints.rust]
 warnings = "deny"
+# Every public type must format under `{:?}` for diagnostics and tracing. This rustc lint is
+# allow-by-default, so the warnings group does not enable it (PR 13.1).
+missing_debug_implementations = "deny"
 # The rustc `unsafe-code` lint is allow-by-default, so `warnings = "deny"` never reaches it.
 # `forbid` prevents a member from reopening the door with an allow attribute; walrus has no sites.
 unsafe_code = "forbid"

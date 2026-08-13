@@ -213,7 +213,7 @@ async fn second_instance_with_live_lease_exits_terminal() {
         &LoaderState::new(),
     )
     .await;
-    let err = res.err().expect("a live lease must be terminal");
+    let err = res.expect_err("a live lease must be terminal");
     assert!(
         matches!(err, LoaderError::LeaseContended { .. }),
         "a live lease is terminal: {err:?}"

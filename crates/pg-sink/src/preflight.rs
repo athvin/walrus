@@ -127,6 +127,7 @@ pub async fn connect_source(url: &str) -> Result<Client, common::Error> {
 }
 
 /// The catalog assertions the sink runs over the source connection before reading WAL.
+#[derive(Debug)]
 pub struct SourcePreflight<'a> {
     client: &'a Client,
     cfg: &'a SinkConfig,

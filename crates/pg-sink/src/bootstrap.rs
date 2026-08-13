@@ -26,6 +26,7 @@ use tokio::time::Instant;
 /// What the shared bootstrap hands the (future) replication loop: the control-plane pool, a live
 /// canary-verified object store, and the preflighted source connection (PR 2.20 opens the actual
 /// streaming replication connection).
+#[derive(Debug)]
 pub struct BootstrapCtx {
     pub control_pool: PgPool,
     pub object_store: Arc<dyn ObjectStore>,

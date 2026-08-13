@@ -20,12 +20,14 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, FieldRef, SchemaRef, TimeUnit};
 use common::{PgColumn, PgRelation, SinkMeta, TupleValue};
+use std::fmt;
 use std::sync::Arc;
 
 /// How one source column's `TupleValue` fans out onto the flat builder list. Tier-1 consumes one
 /// builder (the existing `append_value` path); Tier-2 spreads a single value across several sibling
 /// builders (PR 2.12). Ordering here MUST match `emit_fields` / `build_schema` (§2.4, PR 2.17's
 /// descriptor `emit[]` lists the same suffixes in the same order).
+#[derive(Debug)]
 enum Emit {
     Scalar,             // 1 builder
     Interval,           // 3 builders: _months(i32), _days(i32), _micros(i64)
@@ -33,6 +35,16 @@ enum Emit {
     Range,              // 5 builders: _lower, _upper, _lower_inc, _upper_inc, _empty
     Multirange,         // 1 builder: ListBuilder<StructBuilder>
     Geometric(GeoKind), // 1 builder: a nested STRUCT / LIST<STRUCT> of doubles
+}
+
+/// Arrow's erased builders do not implement [`Debug`](fmt::Debug); report only their arity so the
+/// public [`BatchBuilder`] can derive `Debug` without inspecting foreign trait-object contents.
+struct Builders(Vec<Box<dyn ArrayBuilder>>);
+
+impl fmt::Debug for Builders {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[{} column builders]", self.0.len())
+    }
 }
 
 /// Classify a source column into its fan-out shape. MUST stay in lockstep with `emit_fields` — the
@@ -70,11 +82,12 @@ fn emit_kind(col: &PgColumn) -> Result<Emit, Error> {
 }
 
 /// Accumulates decoded rows for ONE relation into a single Arrow `RecordBatch`.
+#[derive(Debug)]
 pub struct BatchBuilder {
     schema: SchemaRef,
-    builders: Vec<Box<dyn ArrayBuilder>>, // one per EMITTED field, flat, in schema order
-    plan: Vec<Emit>,                      // one per SOURCE column: how its value fans out
-    meta: StringBuilder,                  // the trailing walrus_pg_sink_meta column
+    builders: Builders,  // one per EMITTED field, flat, in schema order
+    plan: Vec<Emit>,     // one per SOURCE column: how its value fans out
+    meta: StringBuilder, // the trailing walrus_pg_sink_meta column
     rows: usize,
     /// The batch-constant meta JSON fragment, serialized once from the first row (PR 5.7).
     meta_const: Option<String>,
@@ -106,7 +119,7 @@ impl BatchBuilder {
         }
         Ok(BatchBuilder {
             schema,
-            builders,
+            builders: Builders(builders),
             plan,
             meta: StringBuilder::new(),
             rows: 0,
@@ -138,7 +151,7 @@ impl BatchBuilder {
             match emit {
                 Emit::Scalar => {
                     append_value(
-                        self.builders[bi].as_mut(),
+                        self.builders.0[bi].as_mut(),
                         &fields[bi],
                         value,
                         &mut self.ts_buf,
@@ -146,16 +159,16 @@ impl BatchBuilder {
                     bi += 1;
                 }
                 Emit::Interval => {
-                    append_interval(&mut self.builders[bi..bi + 3], fields[bi].name(), value)?;
+                    append_interval(&mut self.builders.0[bi..bi + 3], fields[bi].name(), value)?;
                     bi += 3;
                 }
                 Emit::Timetz => {
-                    append_timetz(&mut self.builders[bi..bi + 2], fields[bi].name(), value)?;
+                    append_timetz(&mut self.builders.0[bi..bi + 2], fields[bi].name(), value)?;
                     bi += 2;
                 }
                 Emit::Range => {
                     append_range(
-                        &mut self.builders[bi..bi + 5],
+                        &mut self.builders.0[bi..bi + 5],
                         &fields[bi..bi + 5],
                         value,
                         &mut self.ts_buf,
@@ -164,7 +177,7 @@ impl BatchBuilder {
                 }
                 Emit::Multirange => {
                     append_multirange(
-                        self.builders[bi].as_mut(),
+                        self.builders.0[bi].as_mut(),
                         &fields[bi],
                         value,
                         &mut self.ts_buf,
@@ -172,7 +185,7 @@ impl BatchBuilder {
                     bi += 1;
                 }
                 Emit::Geometric(kind) => {
-                    append_geometric(self.builders[bi].as_mut(), &fields[bi], value, *kind)?;
+                    append_geometric(self.builders.0[bi].as_mut(), &fields[bi], value, *kind)?;
                     bi += 1;
                 }
             }
@@ -221,8 +234,8 @@ impl BatchBuilder {
     ///
     /// Returns [`Error::Arrow`] if the finished arrays do not match the planned schema or row count.
     pub fn finish(mut self) -> Result<RecordBatch, Error> {
-        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(self.builders.len() + 1);
-        for builder in &mut self.builders {
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(self.builders.0.len() + 1);
+        for builder in &mut self.builders.0 {
             arrays.push(builder.finish());
         }
         arrays.push(Arc::new(self.meta.finish()));

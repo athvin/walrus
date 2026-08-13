@@ -77,6 +77,7 @@ impl DdlEvent {
 
 /// Consumes decoded `ddl_audit` events: writes the `ddl_manifest` history and tracks each table's
 /// current **structural** `schema_version` (starts at 1; every structural DDL bumps it by one).
+#[derive(Debug)]
 pub struct DdlConsumer {
     epoch: i64,
     versions: HashMap<(String, String), i64>,

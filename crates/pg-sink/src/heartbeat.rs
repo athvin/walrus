@@ -175,6 +175,7 @@ impl BeatState {
 /// Owns a *separate* ordinary SQL connection to the source (distinct from the read-only replication
 /// connection) plus the pure `BeatState`. The beat **must** ride the published `walrus.heartbeat`
 /// table or `pgoutput` filters it out and there is no round-trip.
+#[derive(Debug)]
 pub struct Heartbeat {
     sql: tokio_postgres::Client,
     instance: String,

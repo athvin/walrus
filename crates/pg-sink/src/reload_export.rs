@@ -69,7 +69,7 @@ fn version_changed(frozen: i64, latest: Option<i64>) -> Option<i64> {
 }
 
 /// Everything the exporter needs beyond the reload row itself.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ChunkExportConfig {
     pub chunk_rows: u64,
     pub echo_timeout: Duration,
@@ -79,6 +79,7 @@ pub struct ChunkExportConfig {
 
 /// One table's chunked export (reload §5.3). Owns a side SQL connection; talks to the consume
 /// loop only through [`WatermarkWaiters`]; never touches the replication connection.
+#[derive(Debug)]
 pub struct ChunkExporter {
     client: tokio_postgres::Client,
     waiters: Arc<WatermarkWaiters>,

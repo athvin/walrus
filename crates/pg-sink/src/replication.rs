@@ -60,6 +60,7 @@ pub struct StandbyStatus {
 }
 
 /// A live `START_REPLICATION` CopyBoth stream over a hand-rolled connection.
+#[derive(Debug)]
 pub struct ReplicationStream {
     stream: TcpStream,
     rbuf: BytesMut,
