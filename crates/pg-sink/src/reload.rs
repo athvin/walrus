@@ -26,7 +26,13 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
+use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
+
+/// How long shutdown waits for exporters before aborting them. This is deliberately a fixed slice
+/// of the Kubernetes termination grace period; a straggler remains recoverable through lease expiry
+/// and PR 6.9 startup adoption.
+const EXPORTER_DRAIN_BUDGET: Duration = Duration::from_secs(5);
 
 /// A preflight either genuinely REJECTS the request (typed, terminal, operator-facing) or fails
 /// for INFRA reasons (dead connection, timeout) — in which case the claim is released and retried
@@ -61,6 +67,62 @@ pub enum ExporterEnd {
     LostLease,
     /// The export future itself finished (PR 6.5 gives it real completion semantics).
     Finished(anyhow::Result<()>),
+}
+
+/// How an exporter task itself left the controller-owned set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExporterExit {
+    /// The exporter body returned; it already logged its domain outcome.
+    Completed,
+    /// The exporter panicked.
+    Panicked,
+    /// The task was aborted during bounded shutdown.
+    Aborted,
+}
+
+/// Observe and classify one exporter task completion.
+pub(crate) fn observe_exporter_end(joined: Result<(), JoinError>) -> ExporterExit {
+    match joined {
+        Ok(()) => {
+            tracing::debug!("reload exporter task joined");
+            ExporterExit::Completed
+        }
+        Err(error) if error.is_panic() => {
+            tracing::error!(
+                %error,
+                "reload exporter panicked; its lease will expire and PR 6.9 startup adoption will resume it"
+            );
+            ExporterExit::Panicked
+        }
+        Err(error) => {
+            tracing::info!(
+                %error,
+                "reload exporter aborted after drain budget; lease expiry and PR 6.9 startup adoption will resume it"
+            );
+            ExporterExit::Aborted
+        }
+    }
+}
+
+/// Drain all exporters within `budget`, then abort and join any stragglers.
+pub(crate) async fn drain_exporters(set: &mut JoinSet<()>, budget: Duration) {
+    let drained = tokio::time::timeout(budget, async {
+        while let Some(joined) = set.join_next().await {
+            observe_exporter_end(joined);
+        }
+    })
+    .await;
+    if drained.is_err() {
+        tracing::warn!(
+            exporters = set.len(),
+            ?budget,
+            "reload exporter drain budget exhausted; aborting stragglers"
+        );
+        set.abort_all();
+        while let Some(joined) = set.join_next().await {
+            observe_exporter_end(joined);
+        }
+    }
 }
 
 /// Drive `export` while renewing its lease every `renew_every`; the first failed renewal cancels
@@ -261,6 +323,15 @@ pub struct ReloadController {
     token: CancellationToken,
 }
 
+/// What woke the controller loop. Handling the event after `select!` releases `JoinSet`'s mutable
+/// borrow before a tick can add more tasks.
+#[derive(Debug)]
+enum ControllerEvent {
+    Cancelled,
+    Joined(Result<(), JoinError>),
+    Tick,
+}
+
 impl ReloadController {
     /// Spawn the controller task next to the heartbeat. Failures inside the task are logged and
     /// retried next tick — the controller can degrade, never take the sink down.
@@ -282,23 +353,39 @@ impl ReloadController {
             cfg,
         };
         tokio::spawn(async move {
+            let mut exporters = JoinSet::new();
             // Startup crash-recovery (PR 6.9): adopt + resume our own / orphaned exporting reloads
             // ONCE, before the tick loop, unless we're already shutting down.
             if !token.is_cancelled() {
-                controller.adopt_and_resume().await;
+                controller.adopt_and_resume(&mut exporters).await;
             }
             let mut tick = tokio::time::interval(controller.cfg.poll_interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                tokio::select! {
+                let event = tokio::select! {
                     biased;
-                    _ = token.cancelled() => {
-                        // Graceful shutdown: exporters see the same token and end Cancelled —
-                        // their rows stay `exporting` for PR 6.9's startup scan to resume.
-                        tracing::info!("reload controller cancelled");
+                    _ = token.cancelled() => ControllerEvent::Cancelled,
+                    Some(joined) = exporters.join_next(), if !exporters.is_empty() => {
+                        ControllerEvent::Joined(joined)
+                    }
+                    _ = tick.tick() => ControllerEvent::Tick,
+                };
+
+                match event {
+                    ControllerEvent::Cancelled => {
+                        // Graceful shutdown: exporters see the same token and end Cancelled. Bound
+                        // the join so a wedged dependency cannot consume the pod's whole grace period.
+                        tracing::info!(
+                            exporters = exporters.len(),
+                            "reload controller cancelled; draining exporters"
+                        );
+                        drain_exporters(&mut exporters, EXPORTER_DRAIN_BUDGET).await;
                         return;
                     }
-                    _ = tick.tick() => {
+                    ControllerEvent::Joined(joined) => {
+                        observe_exporter_end(joined);
+                    }
+                    ControllerEvent::Tick => {
                         // The tick itself races the token too: a wedged claim/preflight must
                         // never block `handle.await` in the shutdown path. A mid-claim drop can
                         // leave rows `exporting` with a dying lease — expiry + PR 6.9's adoption
@@ -306,10 +393,14 @@ impl ReloadController {
                         tokio::select! {
                             biased;
                             _ = token.cancelled() => {
-                                tracing::info!("reload controller cancelled mid-tick");
+                                tracing::info!(
+                                    exporters = exporters.len(),
+                                    "reload controller cancelled mid-tick; draining exporters"
+                                );
+                                drain_exporters(&mut exporters, EXPORTER_DRAIN_BUDGET).await;
                                 return;
                             }
-                            res = controller.tick() => {
+                            res = controller.tick(&mut exporters) => {
                                 if let Err(e) = res {
                                     tracing::warn!(error = %e, "reload controller tick failed; retrying next tick");
                                 }
@@ -331,7 +422,7 @@ impl ReloadController {
     /// A typed rejection `fail`s its row; an INFRA error (dead source connection, control-pg
     /// blip) `release_claim`s it back to `requested` for the next tick — an infra failure must
     /// never be recorded as a terminal, operator-misleading preflight rejection.
-    async fn tick(&self) -> anyhow::Result<()> {
+    async fn tick(&self, exporters: &mut JoinSet<()>) -> anyhow::Result<()> {
         // Surface genuinely stuck exports every tick (PR 6.9) — independent of free permits, and
         // best-effort so a transient control-pg blip on this read never skips the claim below.
         if let Err(e) = self.warn_stuck().await {
@@ -421,7 +512,7 @@ impl ReloadController {
                 flavor = req.flavor.as_str(),
                 "reload claimed → exporting; exporter scheduled"
             );
-            self.spawn_exporter(req, permit);
+            self.spawn_exporter(exporters, req, permit);
         }
         Ok(())
     }
@@ -429,7 +520,12 @@ impl ReloadController {
     /// Spawn the lease-guarded exporter for a claimed or adopted reload, holding `permit` inside the
     /// task so the slot frees on exit. Shared by ordinary pickup ([`tick`]) and crash-recovery
     /// ([`adopt_and_resume`]) — both hand it a row already `exporting` with a fresh lease.
-    fn spawn_exporter(&self, req: control::ReloadRow, permit: tokio::sync::OwnedSemaphorePermit) {
+    fn spawn_exporter(
+        &self,
+        exporters: &mut JoinSet<()>,
+        req: control::ReloadRow,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
         let pool = self.pool.clone();
         let holder = self.cfg.instance.clone();
         let ttl = self.cfg.lease_ttl;
@@ -448,7 +544,7 @@ impl ReloadController {
         // ends (any exit path). The flavor is stable across DDL-restarts, so one task = one count.
         let flavor = req.flavor.as_str();
         common::metrics::inc_reload_active(flavor);
-        tokio::spawn(async move {
+        exporters.spawn(async move {
             let _permit = permit;
             // The lease-renewal target: the export loop repoints this on every DDL-restart, so
             // renewal follows the lease onto each successor row (PR 6.8).
@@ -517,7 +613,7 @@ impl ReloadController {
     /// — NOT from WAL redelivery, which is long gone. Runs ONCE before the tick loop: `adopt_resumable`'s
     /// `lease_holder = me` clause is only safe before any exporter of ours is live (afterwards a live
     /// row would be re-adopted into a duplicate). Bounded by the free permits, so it never oversubscribes.
-    async fn adopt_and_resume(&self) {
+    async fn adopt_and_resume(&self, exporters: &mut JoinSet<()>) {
         let free = self.semaphore.available_permits();
         if free == 0 {
             return;
@@ -555,7 +651,7 @@ impl ReloadController {
                 cursor_chunk = req.chunk_no,
                 "adopting reload (crash recovery); resuming from the cursor"
             );
-            self.spawn_exporter(req, permit);
+            self.spawn_exporter(exporters, req, permit);
         }
     }
 
