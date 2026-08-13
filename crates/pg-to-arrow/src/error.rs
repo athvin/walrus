@@ -1,5 +1,13 @@
 //! `pg-to-arrow` error taxonomy.
 
+/// Cold parse-error detail boxed inside [`Error`] so successful per-cell conversions stay compact.
+#[derive(Debug)]
+pub struct ValueParseDetail {
+    pub column: String,
+    pub value: String,
+    pub data_type: String,
+}
+
 /// Everything that can go wrong mapping a Postgres relation to Arrow.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -10,24 +18,47 @@ pub enum Error {
     NotTier1 { oid: u32, typmod: i32 },
     #[error("relation {relation} has no columns")]
     EmptyRelation { relation: String },
-    #[error("column {column}: cannot parse {value:?} as {data_type}")]
-    ValueParse {
-        column: String,
-        value: String,
-        data_type: String,
-    },
+    #[error("column {}: cannot parse {:?} as {}", .0.column, .0.value, .0.data_type)]
+    ValueParse(Box<ValueParseDetail>),
     #[error("row has {got} values, relation has {expected} columns")]
     RowLenMismatch { expected: usize, got: usize },
     #[error("internal: builder downcast failed for column {column}")]
     Downcast { column: String },
     #[error("arrow error: {0}")]
-    Arrow(#[from] arrow::error::ArrowError),
+    Arrow(#[source] Box<arrow::error::ArrowError>),
     #[error("parquet error: {0}")]
-    Parquet(#[from] parquet::errors::ParquetError),
+    Parquet(#[source] Box<parquet::errors::ParquetError>),
+}
+
+impl From<arrow::error::ArrowError> for Error {
+    fn from(error: arrow::error::ArrowError) -> Self {
+        Self::Arrow(Box::new(error))
+    }
+}
+
+impl From<parquet::errors::ParquetError> for Error {
+    fn from(error: parquet::errors::ParquetError) -> Self {
+        Self::Parquet(Box::new(error))
+    }
+}
+
+impl Error {
+    /// Build a boxed parse error without exposing its storage choice to call sites.
+    pub fn value_parse(
+        column: impl Into<String>,
+        value: impl Into<String>,
+        data_type: impl Into<String>,
+    ) -> Self {
+        Self::ValueParse(Box::new(ValueParseDetail {
+            column: column.into(),
+            value: value.into(),
+            data_type: data_type.into(),
+        }))
+    }
 }
 
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(
-    std::mem::size_of::<Error>() == 72,
-    "Error is constructed on failed per-cell Arrow conversion"
+    std::mem::size_of::<Error>() == 32,
+    "pg_to_arrow::Error rides the per-row append_row Result; keep the cold payload boxed"
 );

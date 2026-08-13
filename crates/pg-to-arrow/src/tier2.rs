@@ -79,11 +79,7 @@ pub fn multirange_field(name: &str, family: RangeFamily, atttypmod: i32) -> Fiel
 }
 
 fn parse_err(kind: &str, text: &str) -> Error {
-    Error::ValueParse {
-        column: kind.to_string(),
-        value: text.to_string(),
-        data_type: kind.to_string(),
-    }
+    Error::value_parse(kind, text, kind)
 }
 
 /// Parse a `HH:MM:SS[.ffffff]` clock (no sign) into microseconds. Fractional seconds are padded /

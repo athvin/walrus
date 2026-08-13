@@ -187,11 +187,8 @@ impl BatchBuilder {
     /// buffer. Byte-equivalent to `serde_json::to_string(meta)` (key order aside) — see
     /// `common::sink_meta`'s `amortized_meta_matches_full` test.
     fn append_meta(&mut self, meta: &SinkMeta) -> Result<(), Error> {
-        let meta_err = |e: serde_json::Error| Error::ValueParse {
-            column: SINK_META_COLUMN.to_string(),
-            value: e.to_string(),
-            data_type: "json".to_string(),
-        };
+        let meta_err =
+            |e: serde_json::Error| Error::value_parse(SINK_META_COLUMN, e.to_string(), "json");
         if self.meta_const.is_none() {
             self.meta_const = Some(meta.const_json_inner().map_err(meta_err)?);
         }
@@ -776,11 +773,9 @@ where
         b.append_null_val();
     } else {
         let s = text(value, col, dt)?;
-        let parsed = s.parse::<T>().map_err(|_| Error::ValueParse {
-            column: col.to_string(),
-            value: s.to_string(),
-            data_type: dt.to_string(),
-        })?;
+        let parsed = s
+            .parse::<T>()
+            .map_err(|_| Error::value_parse(col, s, dt.to_string()))?;
         b.append_val(parsed);
     }
     Ok(())
@@ -813,11 +808,11 @@ num_builder!(Float64Builder, f64);
 fn text<'a>(value: &'a TupleValue, col: &str, dt: &DataType) -> Result<&'a str, Error> {
     match value {
         TupleValue::Text(s) => Ok(s),
-        other => Err(Error::ValueParse {
-            column: col.to_string(),
-            value: format!("{other:?}"),
-            data_type: dt.to_string(),
-        }),
+        other => Err(Error::value_parse(
+            col,
+            format!("{other:?}"),
+            dt.to_string(),
+        )),
     }
 }
 
@@ -825,22 +820,14 @@ fn parse_bool(s: &str, col: &str) -> Result<bool, Error> {
     match s {
         "t" | "true" => Ok(true),
         "f" | "false" => Ok(false),
-        _ => Err(Error::ValueParse {
-            column: col.to_string(),
-            value: s.to_string(),
-            data_type: "Boolean".to_string(),
-        }),
+        _ => Err(Error::value_parse(col, s, "Boolean")),
     }
 }
 
 /// Parse `"19.99"` at the field's scale into the unscaled `i128`. Rejects a value carrying more
 /// fractional digits than the declared scale (rounding is out of scope).
 fn parse_decimal(s: &str, scale: i8, col: &str) -> Result<i128, Error> {
-    let err = || Error::ValueParse {
-        column: col.to_string(),
-        value: s.to_string(),
-        data_type: format!("Decimal128(scale {scale})"),
-    };
+    let err = || Error::value_parse(col, s, format!("Decimal128(scale {scale})"));
     if scale < 0 {
         return Err(err());
     }
@@ -867,16 +854,10 @@ fn parse_decimal(s: &str, scale: i8, col: &str) -> Result<i128, Error> {
 }
 
 fn parse_bytea(s: &str, col: &str) -> Result<Vec<u8>, Error> {
-    let hex = s.strip_prefix("\\x").ok_or_else(|| Error::ValueParse {
-        column: col.to_string(),
-        value: s.to_string(),
-        data_type: "Binary".to_string(),
-    })?;
-    hex::decode(hex).map_err(|_| Error::ValueParse {
-        column: col.to_string(),
-        value: s.to_string(),
-        data_type: "Binary".to_string(),
-    })
+    let hex = s
+        .strip_prefix("\\x")
+        .ok_or_else(|| Error::value_parse(col, s, "Binary"))?;
+    hex::decode(hex).map_err(|_| Error::value_parse(col, s, "Binary"))
 }
 
 /// Micros since the Unix epoch for an RFC-3339 string.
@@ -887,11 +868,7 @@ fn rfc3339_micros(s: &str) -> Option<i64> {
 }
 
 fn value_err(col: &str, s: &str, dt: &str) -> Error {
-    Error::ValueParse {
-        column: col.to_string(),
-        value: s.to_string(),
-        data_type: dt.to_string(),
-    }
+    Error::value_parse(col, s, dt)
 }
 
 /// `"2024-01-02"` → days since 1970-01-01, using a cleared and reused RFC-3339 scratch buffer.

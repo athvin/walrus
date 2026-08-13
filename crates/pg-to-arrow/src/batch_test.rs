@@ -204,7 +204,7 @@ fn bad_int_text_reports_the_column_name() {
         )
         .unwrap_err();
     match err {
-        Error::ValueParse { column, .. } => assert_eq!(column, "id"),
+        Error::ValueParse(detail) => assert_eq!(detail.column, "id"),
         other => panic!("expected ValueParse, got {other:?}"),
     }
 }

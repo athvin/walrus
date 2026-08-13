@@ -99,11 +99,7 @@ pub struct Pt {
 }
 
 fn geo_err(text: &str) -> Error {
-    Error::ValueParse {
-        column: "geometric".to_string(),
-        value: text.to_string(),
-        data_type: "geometric".to_string(),
-    }
+    Error::value_parse("geometric", text, "geometric")
 }
 
 fn parse_f64(s: &str, text: &str) -> Result<f64, Error> {

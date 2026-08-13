@@ -82,11 +82,7 @@ pub struct ParsedRange {
 }
 
 fn range_err(text: &str) -> Error {
-    Error::ValueParse {
-        column: "range".to_string(),
-        value: text.to_string(),
-        data_type: "range".to_string(),
-    }
+    Error::value_parse("range", text, "range")
 }
 
 /// Parse `[1,10)` / `empty` / `(,5]` / `[2024-01-01,)` into a `ParsedRange`. An inclusivity marker on

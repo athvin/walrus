@@ -55,11 +55,7 @@ pub fn is_enum_oid(type_oid: u32) -> bool {
 pub fn parse_uuid_bytes(text: &str) -> Result<[u8; 16], Error> {
     uuid::Uuid::parse_str(text)
         .map(|u| u.into_bytes())
-        .map_err(|_| Error::ValueParse {
-            column: "uuid".to_string(),
-            value: text.to_string(),
-            data_type: "uuid".to_string(),
-        })
+        .map_err(|_| Error::value_parse("uuid", text, "uuid"))
 }
 
 #[cfg(test)]
