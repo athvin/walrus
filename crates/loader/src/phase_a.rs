@@ -209,12 +209,18 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
         .pool
         .begin()
         .await
-        .map_err(|e| LoaderError::Internal(format!("begin advance+delete txn: {e}")))?;
+        .map_err(|source| LoaderError::ControlTxn {
+            op: "begin advance+delete txn",
+            source,
+        })?;
     control::advance_raw_appended(&mut *tx, ctx.epoch, &ctx.schema, &ctx.table, max_lsn).await?;
     control::delete_claimed(&mut *tx, &ids).await?;
     tx.commit()
         .await
-        .map_err(|e| LoaderError::Internal(format!("commit advance+delete txn: {e}")))?;
+        .map_err(|source| LoaderError::ControlTxn {
+            op: "commit advance+delete txn",
+            source,
+        })?;
 
     tracing::info!(
         table = %format_args!("{}.{}", ctx.schema, ctx.table),
@@ -314,8 +320,14 @@ async fn plan_at_version(
 ) -> Result<crate::plan::TablePlan, LoaderError> {
     match control::read_registry(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table, version).await? {
         Some(r) => {
-            let rel: PgRelation = serde_json::from_value(r.columns)
-                .map_err(|e| LoaderError::Internal(format!("decode registry columns: {e}")))?;
+            let table = format!("{}.{}", ctx.schema, ctx.table);
+            let rel: PgRelation = serde_json::from_value(r.columns).map_err(|source| {
+                LoaderError::RegistryDecode {
+                    table,
+                    version,
+                    source,
+                }
+            })?;
             Ok(crate::plan::TablePlan::from_registry(&rel, &r.descriptors))
         }
         None => Ok(crate::plan::TablePlan::tier1(&ctx.rel)),

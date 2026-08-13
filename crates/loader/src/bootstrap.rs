@@ -58,8 +58,13 @@ pub async fn bootstrap(
     let mut owned = Vec::new();
     for row in registry {
         let version = row.schema_version;
-        let rel: PgRelation = serde_json::from_value(row.columns)
-            .map_err(|e| LoaderError::Internal(format!("decode registry columns: {e}")))?;
+        let table = format!("{}.{}", row.source_schema, row.source_table);
+        let rel: PgRelation =
+            serde_json::from_value(row.columns).map_err(|source| LoaderError::RegistryDecode {
+                table,
+                version,
+                source,
+            })?;
 
         // (1) FIRST FENCE: the ownership lease — before we ever touch the file.
         let lease = lease::acquire(
@@ -98,17 +103,23 @@ pub async fn bootstrap(
                 .is_some();
         if pending_rebuild {
             let cur = db.schema_version().unwrap_or(version);
-            let cur_plan = match control::read_registry(pool, epoch, &rel.schema, &rel.name, cur)
-                .await?
-            {
-                Some(r) => {
-                    let rel_cur: PgRelation = serde_json::from_value(r.columns).map_err(|e| {
-                        LoaderError::Internal(format!("decode registry columns: {e}"))
-                    })?;
-                    crate::plan::TablePlan::from_registry(&rel_cur, &r.descriptors)
-                }
-                None => crate::plan::TablePlan::from_registry(&rel, &row.descriptors),
-            };
+            let cur_plan =
+                match control::read_registry(pool, epoch, &rel.schema, &rel.name, cur).await? {
+                    Some(r) => {
+                        let decode_table = format!("{}.{}", r.source_schema, r.source_table);
+                        let decode_version = r.schema_version;
+                        let rel_cur: PgRelation =
+                            serde_json::from_value(r.columns).map_err(|source| {
+                                LoaderError::RegistryDecode {
+                                    table: decode_table,
+                                    version: decode_version,
+                                    source,
+                                }
+                            })?;
+                        crate::plan::TablePlan::from_registry(&rel_cur, &r.descriptors)
+                    }
+                    None => crate::plan::TablePlan::from_registry(&rel, &row.descriptors),
+                };
             db.ensure_tables_planned(&cur_plan, cur)?;
             db.set_built_epoch(epoch)?;
             tracing::warn!(

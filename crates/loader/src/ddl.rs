@@ -376,7 +376,12 @@ async fn load_version(
     let Some(row) = control::read_registry(pool, epoch, schema, table, version).await? else {
         return Ok(None);
     };
-    let relation: PgRelation = serde_json::from_value(row.columns)
-        .map_err(|e| LoaderError::Internal(format!("decode registry v{version} columns: {e}")))?;
+    let table = format!("{schema}.{table}");
+    let relation: PgRelation =
+        serde_json::from_value(row.columns).map_err(|source| LoaderError::RegistryDecode {
+            table,
+            version,
+            source,
+        })?;
     Ok(Some(SchemaVersion { version, relation }))
 }

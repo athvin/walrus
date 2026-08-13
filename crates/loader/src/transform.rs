@@ -159,14 +159,14 @@ impl TransformSql {
         match row {
             None => Ok(TruncateBoundary::none()),
             Some((ct, lt)) => Ok(TruncateBoundary {
-                ct: Some(
-                    ct.parse()
-                        .map_err(|e| LoaderError::Internal(format!("parse Ct {ct:?}: {e:?}")))?,
-                ),
-                lt: Some(
-                    lt.parse()
-                        .map_err(|e| LoaderError::Internal(format!("parse Lt {lt:?}: {e:?}")))?,
-                ),
+                ct: Some(ct.parse().map_err(|source| LoaderError::LsnParse {
+                    field: "Ct",
+                    source,
+                })?),
+                lt: Some(lt.parse().map_err(|source| LoaderError::LsnParse {
+                    field: "Lt",
+                    source,
+                })?),
             }),
         }
     }

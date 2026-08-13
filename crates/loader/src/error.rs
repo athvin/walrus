@@ -36,6 +36,36 @@ pub enum LoaderError {
     /// never rebuild a running generation in place.
     #[error("epoch bumped {from} → {to}: control-plane opened a new generation (total-restart) — restarting to rebuild")]
     EpochBumped { from: i64, to: i64 },
+    /// A schema-registry column snapshot did not decode into the relation shape the sink wrote.
+    #[error("decode registry columns for {table} v{version}")]
+    RegistryDecode {
+        table: String,
+        version: i64,
+        #[source]
+        source: serde_json::Error,
+    },
+    /// A stored watermark string failed to parse as a Postgres LSN.
+    #[error("parse {field} as an LSN")]
+    LsnParse {
+        field: &'static str,
+        #[source]
+        source: common::lsn::LsnParseError,
+    },
+    /// A control-DB transaction could not be begun or committed.
+    #[error("control transaction: {op}")]
+    ControlTxn {
+        op: &'static str,
+        #[source]
+        source: sqlx::Error,
+    },
+    /// The health/metrics server failed to bind, join, or serve.
+    #[error("health server: {op}")]
+    Health {
+        op: &'static str,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+    /// An asserted invariant does not hold and no more specific typed cause exists.
     #[error("{0}")]
     Internal(String),
 }
@@ -61,6 +91,23 @@ impl LoaderError {
             }
             LoaderError::EpochBumped { from, to } => {
                 common::Error::Internal(format!("epoch bumped {from} → {to} (total-restart)"))
+            }
+            LoaderError::RegistryDecode {
+                table,
+                version,
+                source,
+            } => common::Error::Internal(format!(
+                "decode registry columns for {table} v{version}: {source}"
+            )),
+            LoaderError::LsnParse { field, source } => {
+                common::Error::Internal(format!("parse {field} as an LSN: {source}"))
+            }
+            // Deliberate remap: a control-pg failure is ExitCode::ControlDb (11), not Internal (70).
+            LoaderError::ControlTxn { op, source } => {
+                common::Error::ControlDb(format!("control transaction {op}: {source}"))
+            }
+            LoaderError::Health { op, source } => {
+                common::Error::Internal(format!("health server {op}: {source}"))
             }
             LoaderError::Internal(m) => common::Error::Internal(m.clone()),
         }

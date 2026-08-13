@@ -20,8 +20,14 @@ pub async fn current_transform(ctx: &TableCtx) -> Result<TransformSql, LoaderErr
     let ver = ctx.db.schema_version()?;
     match control::read_registry(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table, ver).await? {
         Some(r) => {
-            let rel: PgRelation = serde_json::from_value(r.columns)
-                .map_err(|e| LoaderError::Internal(format!("decode registry columns: {e}")))?;
+            let table = format!("{}.{}", ctx.schema, ctx.table);
+            let rel: PgRelation = serde_json::from_value(r.columns).map_err(|source| {
+                LoaderError::RegistryDecode {
+                    table,
+                    version: ver,
+                    source,
+                }
+            })?;
             Ok(TransformSql::from_plan(&TablePlan::from_registry(
                 &rel,
                 &r.descriptors,
@@ -73,9 +79,10 @@ pub async fn run_phase_b(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     let Some(max_hex) = max_hex else {
         return Ok(None); // <table>_raw is empty — nothing to transform yet
     };
-    let max_lsn: Lsn = max_hex
-        .parse()
-        .map_err(|e| LoaderError::Internal(format!("parse max commit_lsn {max_hex:?}: {e:?}")))?;
+    let max_lsn: Lsn = max_hex.parse().map_err(|source| LoaderError::LsnParse {
+        field: "max commit_lsn",
+        source,
+    })?;
 
     // The transform must reference exactly the columns the reconciled tables now have — i.e. the shape at
     // the DuckDB tables' CURRENT reconciled `schema_version` (Phase A advanced it, PR 3.8), NOT the stale

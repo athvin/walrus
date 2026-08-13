@@ -53,7 +53,10 @@ async fn run(cfg: LoaderConfig) -> Result<(), LoaderError> {
     // Bind health *before* bootstrap so `/startup` answers 503 while the lease + DuckDB open proceed.
     let listener = tokio::net::TcpListener::bind(cfg.health_addr)
         .await
-        .map_err(|e| LoaderError::Internal(format!("bind health {}: {e}", cfg.health_addr)))?;
+        .map_err(|source| LoaderError::Health {
+            op: "bind",
+            source: Box::new(source),
+        })?;
     tracing::info!(addr = %cfg.health_addr, "health endpoints listening; bootstrapping");
     let server = tokio::spawn(health::serve_on(
         listener,
@@ -160,8 +163,14 @@ async fn run(cfg: LoaderConfig) -> Result<(), LoaderError> {
     lease::release_all(&pool, epoch, &keys, &cfg.instance).await;
     server
         .await
-        .map_err(|e| LoaderError::Internal(format!("health server join: {e}")))?
-        .map_err(|e| LoaderError::Internal(format!("health server: {e}")))?;
+        .map_err(|source| LoaderError::Health {
+            op: "join",
+            source: Box::new(source),
+        })?
+        .map_err(|source| LoaderError::Health {
+            op: "serve",
+            source: source.into(),
+        })?;
     Ok(())
 }
 
