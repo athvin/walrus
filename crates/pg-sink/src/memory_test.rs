@@ -63,3 +63,24 @@ fn hysteresis_pauses_at_activate_resumes_at_lower_ratio() {
     assert!(!bp.tick(740, c), "0.74 <= resume → resumes");
     assert!(!bp.tick(800, c), "0.80 < activate again → stays running");
 }
+
+#[test]
+fn hysteresis_band_rejects_resume_at_or_above_activate() {
+    let activate = Ratio::new(0.85).unwrap();
+    let resume = Ratio::new(0.9).unwrap();
+    assert!(HysteresisBand::new(activate, resume).is_err());
+}
+
+#[test]
+fn ratio_rejects_the_closed_ends_and_nan() {
+    assert!(Ratio::new(0.0).is_err());
+    assert!(Ratio::new(1.0).is_err());
+    assert!(Ratio::new(f64::NAN).is_err());
+    assert!(Ratio::new(0.5).is_ok());
+}
+
+#[test]
+fn default_band_is_valid() {
+    let band = HysteresisBand::DEFAULT;
+    assert!(HysteresisBand::new(band.activate(), band.resume()).is_ok());
+}

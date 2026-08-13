@@ -133,3 +133,15 @@ fn config_error_maps_to_config_exit_code() {
     let e = common::Error::from(ConfigError::Missing("control_db_url"));
     assert_eq!(e.exit_code(), common::ExitCode::Config);
 }
+
+#[test]
+fn zero_thresholds_are_rejected_during_deserialization() {
+    use figment::providers::{Format, Toml};
+
+    for source in ["max_rows = 0", "max_concurrent_reloads = 0"] {
+        let result = figment::Figment::new()
+            .merge(Toml::string(source))
+            .extract::<SinkConfig>();
+        assert!(result.is_err(), "zero parsed successfully from {source:?}");
+    }
+}
