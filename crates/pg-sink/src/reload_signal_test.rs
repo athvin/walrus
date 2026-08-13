@@ -107,6 +107,65 @@ fn dropped_receiver_then_resolve_is_fine_and_entry_is_evicted() {
     assert!(rx2.try_recv().is_err(), "fresh channel, nothing delivered");
 }
 
+/// The exporter subscribes before inserting the signal. If that insert fails, dropping the
+/// subscription must remove the registry entry even though no echo can arrive.
+#[test]
+fn subscribe_then_failed_insert_leaves_no_waiter() {
+    let waiters = WatermarkWaiters::default();
+    {
+        let _guard = waiters.subscribe(42, 7);
+        assert_eq!(waiters.waiter_count(), 1);
+    }
+    assert_eq!(
+        waiters.waiter_count(),
+        0,
+        "the guard must unsubscribe on drop"
+    );
+}
+
+#[test]
+fn stale_guard_drop_does_not_evict_the_live_waiter() {
+    let waiters = WatermarkWaiters::default();
+    let stale = waiters.subscribe(42, 7);
+    let mut live = waiters.subscribe(42, 7);
+
+    drop(stale);
+    assert_eq!(waiters.waiter_count(), 1, "the live subscription survives");
+
+    waiters.resolve(
+        42,
+        7,
+        Echo {
+            commit_lsn: lsn("0/200"),
+            embedded_lsn: lsn("0/100"),
+        },
+    );
+    assert_eq!(
+        live.try_recv().expect("live waiter resolves").commit_lsn,
+        lsn("0/200")
+    );
+}
+
+#[test]
+fn resolve_then_drop_is_a_no_op() {
+    let waiters = WatermarkWaiters::default();
+    let guard = waiters.subscribe(42, 7);
+    assert_eq!(waiters.waiter_count(), 1);
+
+    waiters.resolve(
+        42,
+        7,
+        Echo {
+            commit_lsn: lsn("0/200"),
+            embedded_lsn: lsn("0/100"),
+        },
+    );
+    assert_eq!(waiters.waiter_count(), 0);
+
+    drop(guard);
+    assert_eq!(waiters.waiter_count(), 0);
+}
+
 #[test]
 fn resolve_evicts_so_the_same_chunk_can_resubscribe() {
     let waiters = WatermarkWaiters::default();
