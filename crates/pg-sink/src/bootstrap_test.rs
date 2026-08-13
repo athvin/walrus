@@ -1,5 +1,41 @@
 use super::*;
 
+#[tokio::test(start_paused = true)]
+async fn joined_dependency_checks_cost_the_max_not_the_sum() {
+    async fn fake_dependency(delay: Duration) -> Result<u8, Error> {
+        tokio::time::sleep(delay).await;
+        Ok(7)
+    }
+
+    let start = Instant::now();
+    let delay = Duration::from_millis(200);
+    let (control, object_store) =
+        tokio::try_join!(fake_dependency(delay), fake_dependency(delay)).unwrap();
+    let elapsed = start.elapsed();
+
+    assert_eq!((control, object_store), (7, 7));
+    assert!(
+        elapsed < Duration::from_millis(350),
+        "sequential awaits would take about 400ms; got {elapsed:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn try_join_fails_fast_on_a_terminal_error() {
+    let start = Instant::now();
+    let out: Result<(u8, u8), Error> =
+        tokio::try_join!(async { Err(Error::Config("bad bucket".into())) }, async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok(1)
+        },);
+
+    assert!(matches!(out, Err(Error::Config(_))));
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "the slow branch must be dropped, not awaited"
+    );
+}
+
 #[tokio::test]
 async fn retry_returns_immediately_on_terminal() {
     let deadline = Instant::now() + Duration::from_secs(3600);
