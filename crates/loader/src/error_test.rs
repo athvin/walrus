@@ -32,3 +32,51 @@ fn duck_preserves_the_engine_error_as_source() {
 fn duck_still_exits_internal() {
     assert_eq!(duck_error().exit_code(), common::ExitCode::Internal);
 }
+
+#[test]
+fn registry_decode_preserves_source_and_exits_internal() {
+    let source = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+    let error = LoaderError::RegistryDecode {
+        table: "public.orders".to_string(),
+        version: 7,
+        source,
+    };
+
+    assert!(error.source().is_some());
+    assert_eq!(error.exit_code(), common::ExitCode::Internal);
+}
+
+#[test]
+fn lsn_parse_keeps_the_offending_input_in_the_chain() {
+    let source = "zz/1".parse::<common::Lsn>().unwrap_err();
+    let error = LoaderError::LsnParse {
+        field: "max commit_lsn",
+        source,
+    };
+
+    let cause = error.source().expect("LSN parse source");
+    assert!(cause.to_string().contains("zz/1"));
+    assert_eq!(error.exit_code(), common::ExitCode::Internal);
+}
+
+#[test]
+fn control_txn_failure_preserves_source_and_exits_control_db() {
+    let error = LoaderError::ControlTxn {
+        op: "begin advance+delete txn",
+        source: sqlx::Error::PoolClosed,
+    };
+
+    assert!(error.source().is_some());
+    assert_eq!(error.exit_code(), common::ExitCode::ControlDb);
+}
+
+#[test]
+fn health_failure_preserves_source_and_exits_internal() {
+    let error = LoaderError::Health {
+        op: "bind",
+        source: Box::new(std::io::Error::other("address unavailable")),
+    };
+
+    assert!(error.source().is_some());
+    assert_eq!(error.exit_code(), common::ExitCode::Internal);
+}
