@@ -1,4 +1,4 @@
-//! The ordered, fail-fast bootstrap scaffold — shared steps 2–4 (§4.2, architecture "Shared
+//! The fail-fast bootstrap scaffold — shared steps 2–4 (§4.2, architecture "Shared
 //! bootstrap"). Step 1 (config load/validate) is `SinkConfig::load`; step 4 (bind health) is in
 //! `main::run`. This module does the two dependency checks between them:
 //!
@@ -53,35 +53,14 @@ fn attempt_budget(deadline: Instant) -> Duration {
 /// [`Error::Preflight`] or [`Error::KeylessTable`], and invalid object-store construction returns
 /// [`Error::ObjectStore`] immediately.
 pub async fn run_shared(cfg: &SinkConfig, deadline: Instant) -> Result<BootstrapCtx, Error> {
-    // Step 2: control Postgres reachable (transient) + migrations current (idempotent). Each connect
-    // attempt is bounded so sqlx's own pool-acquire timeout can't blow past our `startup_deadline`.
-    let control_pool = retry_transient(deadline, "control database", async || {
-        let budget = attempt_budget(deadline);
-        match tokio::time::timeout(budget, control::connect(&cfg.control_db_url)).await {
-            Ok(Ok(pool)) => Ok(pool),
-            Ok(Err(e)) => Err(Error::ControlDb(e.to_string())),
-            Err(_) => Err(Error::ControlDb(format!(
-                "connect attempt did not complete within {budget:?}"
-            ))),
-        }
-    })
-    .await?;
-    control::run_migrations(&control_pool)
-        .await
-        .map_err(|e| Error::ControlDb(format!("ensure control migrations current: {e}")))?;
-    tracing::info!("control database reachable and migrations current");
-
-    // Step 3: object-store canary (transient). Build once (config-derived, not retried), then
-    // put/get/delete a tiny key until it succeeds or the deadline passes.
-    let object_store = build_object_store(&cfg.object_store)
-        .map_err(|e| Error::ObjectStore(format!("build object store: {e}")))?;
-    retry_transient(deadline, "object store", async || {
-        object_store_canary(object_store.as_ref(), &cfg.instance)
-            .await
-            .map_err(|e| Error::ObjectStore(e.to_string()))
-    })
-    .await?;
-    tracing::info!("object-store canary (put/get/delete) passed");
+    // Steps 2 and 3 are independent. Running them together keeps `/startup` at 503 for the maximum
+    // of their durations instead of their sum, and drops the other branch when either fails. Their
+    // success logs may appear in either order; if both fail, the first error determines the exit
+    // class (`ControlDb` or `ObjectStore`).
+    let (control_pool, object_store) = tokio::try_join!(
+        bootstrap_control(cfg, deadline),
+        bootstrap_object_store(cfg, deadline),
+    )?;
 
     // Step 6: source-side preflight. The connect is transient (server may be coming up); every
     // assertion is terminal — a wrong wal_level / missing publication / keyless table can't self-heal.
@@ -109,6 +88,47 @@ pub async fn run_shared(cfg: &SinkConfig, deadline: Instant) -> Result<Bootstrap
         object_store,
         source_client,
     })
+}
+
+/// Step 2: connect to control Postgres and ensure its migrations are current.
+async fn bootstrap_control(cfg: &SinkConfig, deadline: Instant) -> Result<PgPool, Error> {
+    // Each connect attempt is bounded so sqlx's own pool-acquire timeout cannot exceed the shared
+    // startup deadline.
+    let control_pool = retry_transient(deadline, "control database", async || {
+        let budget = attempt_budget(deadline);
+        match tokio::time::timeout(budget, control::connect(&cfg.control_db_url)).await {
+            Ok(Ok(pool)) => Ok(pool),
+            Ok(Err(e)) => Err(Error::ControlDb(e.to_string())),
+            Err(_) => Err(Error::ControlDb(format!(
+                "connect attempt did not complete within {budget:?}"
+            ))),
+        }
+    })
+    .await?;
+    control::run_migrations(&control_pool)
+        .await
+        .map_err(|e| Error::ControlDb(format!("ensure control migrations current: {e}")))?;
+    tracing::info!("control database reachable and migrations current");
+    Ok(control_pool)
+}
+
+/// Step 3: build the object store and verify it with a put/get/delete canary.
+async fn bootstrap_object_store(
+    cfg: &SinkConfig,
+    deadline: Instant,
+) -> Result<Arc<dyn ObjectStore>, Error> {
+    // Build once (config-derived, not retried), then run the canary until it succeeds or the shared
+    // deadline passes.
+    let object_store = build_object_store(&cfg.object_store)
+        .map_err(|e| Error::ObjectStore(format!("build object store: {e}")))?;
+    retry_transient(deadline, "object store", async || {
+        object_store_canary(object_store.as_ref(), &cfg.instance)
+            .await
+            .map_err(|e| Error::ObjectStore(e.to_string()))
+    })
+    .await?;
+    tracing::info!("object-store canary (put/get/delete) passed");
+    Ok(object_store)
 }
 
 /// Build the S3/MinIO client from config. Credentials come from the environment
