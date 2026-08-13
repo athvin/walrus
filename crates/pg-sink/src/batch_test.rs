@@ -1,5 +1,6 @@
 use super::*;
 use crate::relcache::RelationCache;
+use arrow::array::StringArray;
 use common::{Kind, Op, PgColumn, PgRelation, ReplicaIdentity, UtcTimestamp};
 use pg_to_arrow::oids;
 use std::sync::Mutex;
@@ -100,6 +101,33 @@ fn flushes_on_row_count_at_commit_boundary() {
     let sealed = b.seal().unwrap();
     assert_eq!(sealed.row_count, 2);
     assert!(!b.should_flush(), "reset after seal");
+}
+
+#[test]
+fn committed_rows_keep_byte_identical_batch_id_with_clone_from() {
+    assert!(include_str!("batch.rs").contains("meta.batch_id.clone_from(&self.batch_id);"));
+
+    let mut b = TableBatcher::new(
+        cached(),
+        triggers(u64::MAX, u64::MAX, Duration::from_secs(3600)),
+        Arc::new(SystemClock),
+    )
+    .unwrap();
+    b.push(meta("0/10"), &row("1"));
+    let expected = b.batch_id.clone();
+
+    b.on_commit("0/20".parse().unwrap(), UtcTimestamp::now())
+        .unwrap();
+    let sealed = b.seal().unwrap();
+    let meta_column = sealed
+        .record_batch
+        .column(sealed.record_batch.num_columns() - 1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let committed: SinkMeta = serde_json::from_str(meta_column.value(0)).unwrap();
+
+    assert_eq!(committed.batch_id.as_bytes(), expected.as_bytes());
 }
 
 #[test]
