@@ -6,6 +6,31 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[tokio::test]
+async fn a_panicking_exporter_is_observed_not_swallowed() {
+    let mut set = tokio::task::JoinSet::new();
+    set.spawn(async { panic!("exporter blew up mid-PUT") });
+    let joined = set.join_next().await.expect("one task was spawned");
+    assert_eq!(observe_exporter_end(joined), ExporterExit::Panicked);
+
+    set.spawn(async {});
+    let joined = set.join_next().await.expect("one task was spawned");
+    assert_eq!(observe_exporter_end(joined), ExporterExit::Completed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn drain_is_bounded_and_aborts_a_wedged_exporter() {
+    let mut set = tokio::task::JoinSet::new();
+    set.spawn(std::future::pending::<()>());
+    let budget = Duration::from_secs(5);
+    let started = tokio::time::Instant::now();
+
+    drain_exporters(&mut set, budget).await;
+
+    assert!(set.is_empty(), "the aborted task must be joined");
+    assert_eq!(started.elapsed(), budget);
+}
+
 #[test]
 fn preflight_rejections_read_as_operator_reasons() {
     // These strings land verbatim in table_reload.error — they ARE the operator UX.
