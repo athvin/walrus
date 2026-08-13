@@ -26,6 +26,7 @@ pub enum GeoKind {
 }
 
 /// The geometric `GeoKind` for an OID, or `None` for a non-geometric (incl. PostGIS) type.
+#[must_use]
 pub fn geo_kind(type_oid: u32) -> Option<GeoKind> {
     Some(match type_oid {
         oids::POINT => GeoKind::Point,
@@ -63,6 +64,7 @@ fn point_list() -> DataType {
 /// The single emitted Arrow field for a geometric column (a `STRUCT` or a `LIST<STRUCT>` of doubles),
 /// or `None` for a non-geometric OID. Leaf fields are nullable so a whole-column NULL can null every
 /// leaf (`StructBuilder` requires each child appended for every row).
+#[must_use]
 pub fn geometric_field(name: &str, type_oid: u32) -> Option<Field> {
     let dt = match type_oid {
         oids::POINT => point_struct(),

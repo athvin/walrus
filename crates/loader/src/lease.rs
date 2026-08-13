@@ -34,6 +34,7 @@ pub async fn acquire(
 }
 
 /// Renew every owned table's lease every `ttl/3`, off the apply-loop thread, until cancelled.
+#[must_use]
 pub fn spawn_renewer(
     pool: sqlx::PgPool,
     epoch: i64,

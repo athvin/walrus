@@ -26,6 +26,7 @@ pub enum RangeFamily {
 }
 
 impl RangeFamily {
+    #[must_use]
     pub fn from_range_oid(oid: u32) -> Option<Self> {
         Some(match oid {
             oids::INT4RANGE => Self::Int4,
@@ -38,6 +39,7 @@ impl RangeFamily {
         })
     }
 
+    #[must_use]
     pub fn from_multirange_oid(oid: u32) -> Option<Self> {
         Some(match oid {
             oids::INT4MULTIRANGE => Self::Int4,
@@ -53,6 +55,7 @@ impl RangeFamily {
     /// Arrow element type for `_lower`/`_upper`. Unconstrained `numrange` falls back to `Utf8` — the
     /// Tier-3 VARCHAR carrier wired here and *proven* in PR 2.15 (a range column carries no element
     /// typmod, so in practice `Num` is always `Utf8` today).
+    #[must_use]
     pub fn elem_data_type(self, atttypmod: i32) -> DataType {
         match self {
             Self::Int4 => DataType::Int32,

@@ -19,16 +19,19 @@ pub struct Reader<'a> {
 
 impl<'a> Reader<'a> {
     /// Wrap a byte slice at position 0.
+    #[must_use]
     pub fn new(buf: &'a [u8]) -> Self {
         Reader { buf, pos: 0 }
     }
 
     /// Bytes left to read.
+    #[must_use]
     pub fn remaining(&self) -> usize {
         self.buf.len() - self.pos
     }
 
     /// The next byte without consuming it (`None` at end of buffer).
+    #[must_use]
     pub fn peek(&self) -> Option<u8> {
         self.buf.get(self.pos).copied()
     }

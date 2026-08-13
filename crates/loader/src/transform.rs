@@ -26,9 +26,11 @@ pub struct TruncateBoundary {
 }
 
 impl TruncateBoundary {
+    #[must_use]
     pub fn none() -> Self {
         TruncateBoundary::default()
     }
+    #[must_use]
     pub fn is_some(&self) -> bool {
         self.ct.is_some()
     }
@@ -58,6 +60,7 @@ pub struct TransformSql {
 
 impl TransformSql {
     /// Tier-1 (scalar) transform from a bare relation — unchanged from the pre-descriptor path.
+    #[must_use]
     pub fn from_relation(rel: &PgRelation) -> Self {
         Self::from_plan(&crate::plan::TablePlan::tier1(rel))
     }
@@ -65,6 +68,7 @@ impl TransformSql {
     /// The full transform from a schema [`crate::plan::TablePlan`]: each mirror column's value is precomputed as SQL
     /// over the winner `s` — a recombine expression (Tier-2), an unchanged-TOAST-resolved back-scan
     /// (Tier-1 non-key, §5.6), or a plain `s."col"` (keys / flat siblings).
+    #[must_use]
     pub fn from_plan(plan: &crate::plan::TablePlan) -> Self {
         use crate::plan::MirrorValue;
         let q = |c: &str| format!("\"{c}\"");
@@ -182,6 +186,7 @@ impl TransformSql {
     /// INTO`), reading the un-transformed tail (`commit_lsn >= after_lsn` — the `>=` re-examines the
     /// equal-`commit_lsn` snapshot straddle, §7 break face A; and — if the tail has a truncate — only
     /// rows STRICTLY after the `(Ct, Lt)` tuple). Composite-PK-aware.
+    #[must_use]
     pub fn render(&self, after_lsn: &Lsn, boundary: &TruncateBoundary) -> String {
         let q = |c: &str| format!("\"{c}\"");
         let pk = self.pk_names();
@@ -257,6 +262,7 @@ impl TransformSql {
     }
 
     /// The table name (for compaction / prune SQL that lives outside the template).
+    #[must_use]
     pub fn table(&self) -> &str {
         &self.table
     }
@@ -273,6 +279,7 @@ impl TransformSql {
     /// recombine happens in the raw arm (the mirror baseline can't be decomposed back into emit columns);
     /// the final resolve then only TOAST-resolves the Tier-1 columns and passes the recombined Tier-2 ones
     /// through.
+    #[must_use]
     pub fn render_rebuild(&self, boundary: &TruncateBoundary) -> String {
         let q = |c: &str| format!("\"{c}\"");
         let t = &self.table;

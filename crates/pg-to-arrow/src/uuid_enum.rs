@@ -22,6 +22,7 @@ pub const ARROW_UUID_EXTENSION: &str = "arrow.uuid";
 
 /// `FixedSizeBinary(16)` carrying the `arrow.uuid` canonical extension → Parquet UUID → DuckDB `UUID`.
 /// The extension metadata is the *only* thing that makes DuckDB see `UUID` rather than `BLOB`.
+#[must_use]
 pub fn uuid_field(name: &str) -> Field {
     Field::new(name, DataType::FixedSizeBinary(16), true).with_metadata(HashMap::from([(
         "ARROW:extension:name".to_string(),
@@ -31,17 +32,20 @@ pub fn uuid_field(name: &str) -> Field {
 
 /// Fallback if a pinned arrow-rs release ever drops the UUID annotation on the normal column path:
 /// carry the canonical text as `Utf8` and `CAST(x AS UUID)` on load.
+#[must_use]
 pub fn uuid_as_varchar(name: &str) -> Field {
     Field::new(name, DataType::Utf8, true)
 }
 
 /// `enum` → nullable `Utf8`; the ordered label set is carried by the descriptor (PR 2.17), not here.
+#[must_use]
 pub fn enum_field(name: &str) -> Field {
     Field::new(name, DataType::Utf8, true)
 }
 
 /// Interim enum detection: a non-builtin OID (≥ `FIRST_NORMAL_OID`) is treated as an enum carrier.
 /// PR 2.22 replaces this with a catalog-derived marker (the decoder's `Type` message).
+#[must_use]
 pub fn is_enum_oid(type_oid: u32) -> bool {
     type_oid >= oids::FIRST_NORMAL_OID
 }

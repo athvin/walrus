@@ -29,6 +29,7 @@ pub struct DurabilityCheckpoint {
 }
 
 impl DurabilityCheckpoint {
+    #[must_use]
     pub fn new(resume_lsn: Lsn) -> Self {
         DurabilityCheckpoint {
             confirmed_flush: resume_lsn,
@@ -36,6 +37,7 @@ impl DurabilityCheckpoint {
         }
     }
 
+    #[must_use]
     pub fn confirmed_flush(&self) -> Lsn {
         self.confirmed_flush
     }
@@ -57,6 +59,7 @@ impl DurabilityCheckpoint {
 
     /// The standby reply: `write` = the stream's received/keepalive LSN (unconditional), `flush`/`apply`
     /// = `confirmed_flush` (durable). A stalled flush advances `write` (via the stream) but not these.
+    #[must_use]
     pub fn standby_status(&self, received: Lsn, reply_requested: bool) -> StandbyStatus {
         StandbyStatus {
             write: received,

@@ -29,6 +29,7 @@ pub enum ManifestKind {
 
 impl ManifestKind {
     /// The exact `file_manifest.kind` string persisted in the control DB.
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             ManifestKind::Snapshot => "snapshot",
@@ -64,6 +65,7 @@ pub enum ManifestStatus {
 
 impl ManifestStatus {
     /// The exact `file_manifest.status` string persisted in the control DB.
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             ManifestStatus::Ready => "ready",

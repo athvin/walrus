@@ -27,6 +27,7 @@ pub struct CachedRelation {
 /// The three walrus-internal source tables: control-plane, never registered or schematised as user
 /// data. `reload_signal` (PR 6.3) is consumed for its echo — the chunk watermark — exactly as
 /// `ddl_audit` is consumed for DDL events: never batched, never a Parquet file, never a manifest row.
+#[must_use]
 pub fn is_internal_table(schema: &str, table: &str) -> bool {
     schema == "walrus" && (table == "ddl_audit" || table == "heartbeat" || table == "reload_signal")
 }
@@ -37,12 +38,14 @@ pub struct RelationCache {
 }
 
 impl RelationCache {
+    #[must_use]
     pub fn get(&self, oid: u32, schema_version: i64) -> Option<Arc<CachedRelation>> {
         self.by_key.get(&(oid, schema_version)).cloned()
     }
 
     /// The cached shape for `oid` at its **highest** `schema_version` — used to stamp streamed changes
     /// after a DDL bump (PR 2.33), so a change always lands in the latest-shape file.
+    #[must_use]
     pub fn latest_for(&self, oid: u32) -> Option<Arc<CachedRelation>> {
         self.by_key
             .iter()
@@ -53,6 +56,7 @@ impl RelationCache {
 
     /// The OID of a cached `schema.table` (any version) — the DDL-capture cut (PR 2.33) needs it to find
     /// the affected table's batcher.
+    #[must_use]
     pub fn oid_for(&self, schema: &str, table: &str) -> Option<u32> {
         self.by_key
             .values()
@@ -60,10 +64,12 @@ impl RelationCache {
             .map(|r| r.relation.oid)
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.by_key.len()
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.by_key.is_empty()
     }

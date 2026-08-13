@@ -21,6 +21,7 @@ use std::sync::Arc;
 /// with `to_months + to_days + to_microseconds`; it must never key on these columns (§2.4 caveat).
 /// The three fields share one logical NULL — all three NULL ⇔ the source value was NULL — so a real
 /// zero interval `(0,0,0)` stays distinct from absence.
+#[must_use]
 pub fn interval_fields(name: &str) -> Vec<Field> {
     vec![
         Field::new(format!("{name}_months"), DataType::Int32, true),
@@ -33,6 +34,7 @@ pub fn interval_fields(name: &str) -> Vec<Field> {
 /// Arrow has no tz-aware time type, so we carry the zone as a sibling column rather than dropping it
 /// the way AWS DMS does (§2.4). Sign convention (pinned by the conformance test): `offset_seconds`
 /// is the offset *as printed* — east of UTC positive, so `+05:30` → `+19800`, `-08` → `-28800`.
+#[must_use]
 pub fn timetz_fields(name: &str) -> Vec<Field> {
     vec![
         Field::new(format!("{name}_micros"), DataType::Int64, true),
@@ -43,6 +45,7 @@ pub fn timetz_fields(name: &str) -> Vec<Field> {
 /// The five flat sibling columns a `range` decomposes into (§2.4). Element type per family; all five
 /// share the whole-column NULL, so `_empty=false` + a NULL bound is a genuine *unbounded* side (which
 /// `lower_inf`/`upper_inf` derive from) — kept distinct from both `empty` and a NULL column.
+#[must_use]
 pub fn range_fields(name: &str, family: RangeFamily, atttypmod: i32) -> Vec<Field> {
     let elem = family.elem_data_type(atttypmod);
     vec![
@@ -57,6 +60,7 @@ pub fn range_fields(name: &str, family: RangeFamily, atttypmod: i32) -> Vec<Fiel
 /// The 4-field struct a multirange member carries: `lower`/`upper` (nullable — a member may be
 /// unbounded) and the always-present `lower_inc`/`upper_inc`. Shared by the schema field and the
 /// builder so `RecordBatch::try_new` sees identical types.
+#[must_use]
 pub fn multirange_struct_fields(family: RangeFamily, atttypmod: i32) -> Fields {
     let elem = family.elem_data_type(atttypmod);
     vec![
@@ -70,6 +74,7 @@ pub fn multirange_struct_fields(family: RangeFamily, atttypmod: i32) -> Fields {
 
 /// A `multirange` → one `LIST(STRUCT(lower, upper, lower_inc, upper_inc))` field (§2.4). Empty
 /// multirange = empty list; SQL NULL = NULL list — the two stay distinct via the outer list validity.
+#[must_use]
 pub fn multirange_field(name: &str, family: RangeFamily, atttypmod: i32) -> Field {
     let item = Field::new_list_field(
         DataType::Struct(multirange_struct_fields(family, atttypmod)),

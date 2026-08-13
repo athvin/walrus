@@ -54,6 +54,7 @@ impl InternalTables {
     /// Is this relation OID one of walrus's own control tables (never staged as user data)?
     /// `walrus.heartbeat`, `walrus.ddl_audit`, and `walrus.reload_signal` are all consumed
     /// specially, never materialised.
+    #[must_use]
     pub fn is_internal(&self, rel_oid: u32) -> bool {
         self.heartbeat_oid == Some(rel_oid)
             || self.ddl_audit_oid == Some(rel_oid)
@@ -61,16 +62,19 @@ impl InternalTables {
     }
 
     /// Whether this OID is the DDL-audit table (its INSERTs drive [`crate::ddl::DdlConsumer`]).
+    #[must_use]
     pub fn is_ddl_audit(&self, rel_oid: u32) -> bool {
         self.ddl_audit_oid == Some(rel_oid)
     }
 
     /// Whether this OID is the heartbeat table (only its tuples carry a `beat_seq`).
+    #[must_use]
     pub fn is_heartbeat(&self, rel_oid: u32) -> bool {
         self.heartbeat_oid == Some(rel_oid)
     }
 
     /// Whether this OID is the reload signal table (its INSERTs resolve watermark waiters).
+    #[must_use]
     pub fn is_reload_signal(&self, rel_oid: u32) -> bool {
         self.reload_signal_oid == Some(rel_oid)
     }
@@ -95,11 +99,13 @@ impl InternalTables {
     }
 
     /// The `ddl_audit` relation shape, once its `Relation` message has been seen.
+    #[must_use]
     pub fn ddl_audit_rel(&self) -> Option<&common::PgRelation> {
         self.ddl_audit_rel.as_ref()
     }
 
     /// The `reload_signal` relation shape, once its `Relation` message has been seen.
+    #[must_use]
     pub fn reload_signal_rel(&self) -> Option<&common::PgRelation> {
         self.reload_signal_rel.as_ref()
     }
@@ -210,6 +216,7 @@ impl Heartbeat {
     }
 
     /// The idle window — the decode loop uses it to pace its beat check.
+    #[must_use]
     pub fn idle_after(&self) -> Duration {
         self.state.cfg.idle_after
     }
@@ -249,6 +256,7 @@ impl Heartbeat {
     }
 
     /// Non-gating health signal (see `BeatState::degraded`).
+    #[must_use]
     pub fn degraded(&self, now: Instant) -> bool {
         self.state.degraded(now)
     }

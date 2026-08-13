@@ -28,6 +28,7 @@ pub struct InflightMeter {
 }
 
 impl InflightMeter {
+    #[must_use]
     pub fn new(ceiling_bytes: u64) -> Self {
         InflightMeter {
             ceiling_bytes,
@@ -49,19 +50,23 @@ impl InflightMeter {
         }
     }
 
+    #[must_use]
     pub fn total(&self) -> u64 {
         self.total
     }
 
+    #[must_use]
     pub fn ceiling(&self) -> u64 {
         self.ceiling_bytes
     }
 
+    #[must_use = "the ceiling check drives shedding — ignoring it silently disables backpressure"]
     pub fn over_ceiling(&self) -> bool {
         self.total > self.ceiling_bytes
     }
 
     /// The largest in-flight `(table, xid)` stream — the best spill candidate.
+    #[must_use]
     pub fn largest_open(&self) -> Option<(TableId, u32)> {
         self.by_stream
             .iter()
@@ -83,6 +88,7 @@ pub enum ShedAction {
 
 /// Decide the shed action when over the ceiling: committed first (if any), then spill the largest open
 /// stream, then pause. `None` when under the ceiling.
+#[must_use]
 pub fn decide(meter: &InflightMeter, has_committed: bool) -> Option<ShedAction> {
     if !meter.over_ceiling() {
         return None;
@@ -110,6 +116,7 @@ pub struct Backpressure {
 }
 
 impl Backpressure {
+    #[must_use]
     pub fn new(activate_ratio: f64, resume_ratio: f64) -> Self {
         Backpressure {
             activate_ratio,
@@ -135,6 +142,7 @@ impl Backpressure {
         self.paused
     }
 
+    #[must_use]
     pub fn is_paused(&self) -> bool {
         self.paused
     }

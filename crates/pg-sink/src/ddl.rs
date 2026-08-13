@@ -70,6 +70,7 @@ impl DdlEvent {
 
     /// Structural (gates data + cuts a file) vs metadata-only. A `COMMENT` mirrors documentation but
     /// never changes the row shape, so it must NOT bump the structural version or cut a file.
+    #[must_use]
     pub fn is_structural(&self) -> bool {
         !self.c_tag.eq_ignore_ascii_case("COMMENT")
     }
@@ -84,6 +85,7 @@ pub struct DdlConsumer {
 }
 
 impl DdlConsumer {
+    #[must_use]
     pub fn new(epoch: i64) -> Self {
         DdlConsumer {
             epoch,
@@ -92,6 +94,7 @@ impl DdlConsumer {
     }
 
     /// The current structural version for a table (1 until its first structural DDL).
+    #[must_use]
     pub fn version_of(&self, schema: &str, table: &str) -> i64 {
         *self
             .versions

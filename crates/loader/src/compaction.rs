@@ -133,6 +133,7 @@ pub fn prune_raw(
 
 /// The retention floor for a table: `transformed_lsn - retention_lsn_lag`, saturating at 0. Always `<=
 /// transformed_lsn`, so pruning below it can never drop a row the incremental transform still reads.
+#[must_use = "returns the computed floor; it does not prune anything by itself"]
 pub fn retention_floor(transformed_lsn: Lsn, retention_lsn_lag: u64) -> Lsn {
     Lsn::new(transformed_lsn.as_u64().saturating_sub(retention_lsn_lag))
 }

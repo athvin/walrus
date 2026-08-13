@@ -16,6 +16,7 @@ use std::borrow::Cow;
 /// assert_eq!(sql_literal("O'Brien"), "O''Brien");
 /// assert_eq!(sql_literal("plain"), "plain");
 /// ```
+#[must_use]
 pub fn sql_literal(s: &str) -> Cow<'_, str> {
     if s.contains('\'') {
         Cow::Owned(s.replace('\'', "''"))

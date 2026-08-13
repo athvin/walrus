@@ -35,6 +35,7 @@ impl SlotResume {
     /// The LSN to hand `START_REPLICATION`. Resuming an existing slot means its
     /// `confirmed_flush_lsn`; a fresh slot means its creation point. (The server clamps up to its own
     /// value regardless.)
+    #[must_use]
     pub fn start_lsn(&self) -> Lsn {
         match self {
             SlotResume::Existing(info) => info.confirmed_flush_lsn,

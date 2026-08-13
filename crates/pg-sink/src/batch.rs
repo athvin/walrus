@@ -118,6 +118,7 @@ impl TableBatcher {
     }
 
     /// Whether an open transaction's rows are buffered (not a commit boundary).
+    #[must_use]
     pub fn has_open_txn(&self) -> bool {
         !self.pending.is_empty()
     }
@@ -157,6 +158,7 @@ impl TableBatcher {
     }
 
     /// True iff a trigger trips **and** we're at a commit boundary (no open txn, ≥1 committed row).
+    #[must_use]
     pub fn should_flush(&self) -> bool {
         if self.has_open_txn() || self.committed_rows == 0 {
             return false;
@@ -202,6 +204,7 @@ impl TableBatcher {
         Ok(sealed)
     }
 
+    #[must_use]
     pub fn committed_rows(&self) -> u64 {
         self.committed_rows
     }
@@ -210,6 +213,7 @@ impl TableBatcher {
     /// The durability floor an idle heartbeat must not advance `confirmed_flush` past (PR 2.27): those
     /// rows are not yet in S3, so a slot advance beyond them would lose them on crash. Open-txn
     /// (uncommitted) rows do **not** count — their future commit LSN re-streams regardless.
+    #[must_use]
     pub fn undurable_floor(&self) -> Option<Lsn> {
         (self.committed_rows > 0)
             .then_some(self.first_commit_lsn)

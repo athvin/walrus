@@ -48,6 +48,7 @@ pub struct UtcTimestamp(jiff::Timestamp);
 
 impl UtcTimestamp {
     /// The current instant, in UTC.
+    #[must_use]
     pub fn now() -> Self {
         UtcTimestamp(jiff::Timestamp::now())
     }

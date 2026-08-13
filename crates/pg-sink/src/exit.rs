@@ -7,6 +7,7 @@ use common::ExitCode;
 /// Tries the classified [`common::Error`] first, then each typed pg-sink error that can escape the
 /// run loop, and finally the control crate's error. Anything unrecognised keeps the historical
 /// [`ExitCode::Internal`] fallback.
+#[must_use]
 pub fn code_for(err: &anyhow::Error) -> ExitCode {
     if let Some(e) = err.downcast_ref::<common::Error>() {
         return e.exit_code();

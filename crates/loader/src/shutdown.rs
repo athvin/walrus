@@ -30,6 +30,7 @@ use tokio_util::sync::CancellationToken;
 /// Install `SIGTERM`/`SIGINT` → cancel **one** shared token. Idempotent: the token is cancelled once, and
 /// the signal streams stay registered so a **double**-`SIGTERM` during the drain is swallowed (never the
 /// default terminate) — the drain can't be cut short and skip a step.
+#[must_use]
 pub fn install_signal_handlers() -> CancellationToken {
     let token = CancellationToken::new();
     let child = token.clone();

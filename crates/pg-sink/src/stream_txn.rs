@@ -133,6 +133,7 @@ impl StreamDemux {
     }
 
     /// Total speculative spills so far (metric; PR 4.10 exports it).
+    #[must_use]
     pub fn spill_count(&self) -> u64 {
         self.spill_count
     }
@@ -465,6 +466,7 @@ impl StreamDemux {
 
     /// The oldest open txn's begin LSN — `confirmed_flush` must never pass this (§1.6). `None` when no
     /// streamed txn is open.
+    #[must_use]
     pub fn open_floor(&self) -> Option<Lsn> {
         self.open.values().map(|t| t.begin_lsn).min()
     }

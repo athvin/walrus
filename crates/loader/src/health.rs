@@ -30,6 +30,7 @@ pub struct LoaderState {
 }
 
 impl LoaderState {
+    #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(LoaderState::default())
     }

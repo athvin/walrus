@@ -43,6 +43,7 @@ pub enum ControlError {
 impl ControlError {
     /// True when retrying can never help — a broken migration or a violated invariant is a bug, not
     /// a cold dependency.
+    #[must_use]
     pub fn is_terminal(&self) -> bool {
         match self {
             ControlError::Migrate(_)
@@ -55,6 +56,7 @@ impl ControlError {
     }
 
     /// The complement of [`ControlError::is_terminal`] — a dependency that may still be coming up.
+    #[must_use]
     pub fn is_transient(&self) -> bool {
         !self.is_terminal()
     }

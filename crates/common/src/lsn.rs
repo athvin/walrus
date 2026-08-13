@@ -23,11 +23,13 @@ impl Lsn {
     pub const ZERO: Lsn = Lsn(0);
 
     /// Wrap a raw `u64` WAL position.
+    #[must_use]
     pub const fn new(raw: u64) -> Self {
         Lsn(raw)
     }
 
     /// The raw `u64` WAL position.
+    #[must_use]
     pub const fn as_u64(self) -> u64 {
         self.0
     }

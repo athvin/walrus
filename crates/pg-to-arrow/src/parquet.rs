@@ -14,6 +14,7 @@ use parquet::file::properties::WriterProperties;
 
 /// The walrus writer settings: Snappy compression + arrow-rs's native MICROS temporal encoding
 /// (no NANOS/MILLIS coercion).
+#[must_use]
 pub fn default_writer_properties() -> WriterProperties {
     WriterProperties::builder()
         .set_compression(Compression::SNAPPY)

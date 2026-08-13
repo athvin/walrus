@@ -63,6 +63,7 @@ const _: () = assert!(
 impl TablePlan {
     /// The Tier-1 (scalar-only) plan from a bare relation — one emit column == source column via
     /// `crate::duck::duck_type`, mirror = same. Reproduces the pre-descriptor behaviour exactly.
+    #[must_use]
     pub fn tier1(rel: &PgRelation) -> Self {
         // Tier-1 exact one raw + one mirror per source column.
         let mut raw_cols = Vec::with_capacity(rel.columns.len());
@@ -91,6 +92,7 @@ impl TablePlan {
 
     /// The full plan from the registry: descriptors (Tier-1/2/3) aligned with the relation's columns (for
     /// the key flags). Falls back to the Tier-1 shape for any column without a descriptor.
+    #[must_use]
     pub fn from_registry(rel: &PgRelation, descriptors: &[TypeDescriptor]) -> Self {
         let by_name: std::collections::HashMap<&str, &TypeDescriptor> =
             descriptors.iter().map(|d| (d.column.as_str(), d)).collect();

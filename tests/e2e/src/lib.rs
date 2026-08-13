@@ -2,8 +2,9 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::missing_errors_doc,
+    clippy::must_use_candidate,
     reason = "compose-gated e2e harness, not a published API; unwrap/expect are test setup and \
-              anyhow failure is the test failure"
+              anyhow failure is the test failure; its black-box helpers are not API contracts"
 )]
 //! The walrus end-to-end harness (`architecture.md` "Local harness"). It brings up **both binaries** —
 //! `walrus-pg-sink` and `walrus-loader` — as child processes against the already-running compose stack

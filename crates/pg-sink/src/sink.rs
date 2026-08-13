@@ -73,6 +73,7 @@ impl ParquetSink {
 
     /// `<epoch>/<schema>/<table>/<lsn_end>-<uuid>.parquet`. `lsn_end` is zero-padded 16-hex so keys
     /// sort by commit LSN; `uuid` matches the batch's `batch_id`-style file identity.
+    #[must_use]
     pub fn object_key(&self, schema: &str, table: &str, lsn_end: Lsn, uuid: &str) -> Path {
         Path::from(format!(
             "{}/{}/{}/{}-{}.parquet",

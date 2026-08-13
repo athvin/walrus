@@ -73,6 +73,7 @@ impl Error {
     /// The `match` has **no `_ =>` arm on purpose**: adding a future variant is a compile error
     /// until it is explicitly classified here. That is the whole point of modelling the property
     /// as data rather than a comment.
+    #[must_use = "classification is the whole point — calling this for effect does nothing"]
     pub fn is_terminal(&self) -> bool {
         match self {
             // Misconfiguration / unrecoverable preconditions — no retry can fix these.
@@ -89,11 +90,13 @@ impl Error {
 
     /// The complement of [`Error::is_terminal`] — a dependency that may still be coming up, so the
     /// bootstrap retries it with backoff up to the startup deadline.
+    #[must_use = "classification is the whole point — calling this for effect does nothing"]
     pub fn is_transient(&self) -> bool {
         !self.is_terminal()
     }
 
     /// The distinct process exit code for this failure (greppable in `kubectl logs`).
+    #[must_use = "the exit code must reach main — dropping it loses the failure class"]
     pub fn exit_code(&self) -> ExitCode {
         match self {
             Error::Config(_) => ExitCode::Config,

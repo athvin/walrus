@@ -17,11 +17,13 @@ use std::num::NonZeroU32;
 
 /// Derive the per-column mapping descriptor (§2.6). Enum `enum_labels` are caller-supplied (the sink
 /// hydrates them from the catalog in PR 2.22); use [`describe_column_with_labels`] to pass them.
+#[must_use]
 pub fn describe_column(col: &PgColumn) -> TypeDescriptor {
     describe_column_with_labels(col, None)
 }
 
 /// [`describe_column`] plus the ordered enum label set (only used when the column is an enum).
+#[must_use]
 pub fn describe_column_with_labels(
     col: &PgColumn,
     enum_labels: Option<Vec<String>>,

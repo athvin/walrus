@@ -46,6 +46,7 @@ impl HealthState {
         clippy::new_ret_no_self,
         reason = "intentionally returns the shared handle used by probes and the loop"
     )]
+    #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(HealthState {
             phase: AtomicU8::new(PHASE_BOOTSTRAPPING),

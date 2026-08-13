@@ -92,6 +92,7 @@ pub async fn drain(
 
 /// Install SIGTERM/SIGINT handlers and return the token they cancel. Also returns early (without
 /// cancelling) if the token is cancelled by another source, so the task can't leak.
+#[must_use]
 pub fn install_signal_handlers() -> CancellationToken {
     let token = CancellationToken::new();
     let child = token.clone();

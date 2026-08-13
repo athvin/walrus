@@ -68,6 +68,7 @@ impl PgColumn {
     ///
     /// The packing (the exact math PR 2.3 relies on): `precision = ((mod - 4) >> 16) & 0xFFFF`,
     /// `scale = (mod - 4) & 0xFFFF`.
+    #[must_use]
     pub fn numeric_precision_scale(&self) -> Option<(u16, u16)> {
         if self.type_oid != crate::oids::NUMERIC || self.type_modifier < 0 {
             return None;
@@ -98,6 +99,7 @@ const _: () = assert!(
 impl PgRelation {
     /// The key-column names (`is_key`) **in relation order** — the loader's MERGE/dedup key list.
     /// Order matters for composite PKs, so this preserves column order rather than sorting.
+    #[must_use]
     pub fn key_columns(&self) -> Vec<&str> {
         self.columns
             .iter()

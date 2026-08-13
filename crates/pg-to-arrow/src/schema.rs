@@ -94,6 +94,7 @@ pub fn emit_fields(col: &PgColumn) -> Result<Vec<Field>, Error> {
 }
 
 /// Arrow `DataType` for a Tier-1 OID+typmod, or `None` if the type is not (yet) Tier-1.
+#[must_use]
 pub fn tier1_data_type(type_oid: u32, atttypmod: i32) -> Option<DataType> {
     Some(match type_oid {
         oids::BOOL => DataType::Boolean,
@@ -126,6 +127,7 @@ pub fn tier1_data_type(type_oid: u32, atttypmod: i32) -> Option<DataType> {
 
 /// Decode a `numeric` `atttypmod` into `(precision, scale)`, or `None` for unconstrained (`-1`).
 /// `numeric(p,s)` packs `((p << 16) | s) + VARHDRSZ`; subtract `VARHDRSZ` (4) before unpacking.
+#[must_use]
 pub fn numeric_precision_scale(atttypmod: i32) -> Option<(u8, i8)> {
     if atttypmod < 4 {
         return None; // -1 (unconstrained) or an invalid value

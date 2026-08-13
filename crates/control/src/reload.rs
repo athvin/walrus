@@ -32,6 +32,7 @@ pub enum ReloadFlavor {
 
 impl ReloadFlavor {
     /// The exact string the migration's CHECK constraint admits (second line of defense).
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             ReloadFlavor::Reload => "reload",
@@ -66,6 +67,7 @@ pub enum ReloadStatus {
 
 impl ReloadStatus {
     /// The exact string the migration's CHECK constraint admits.
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             ReloadStatus::Requested => "requested",
@@ -368,6 +370,7 @@ pub async fn fail(
 /// Would restarting an attempt with `restart_count` push it past `max_restarts` (PR 6.8)? The next
 /// attempt would carry `restart_count + 1`, so the cap is exceeded when that exceeds the max — a
 /// `max_restarts` of 0 fails the very first mid-export DDL. Pure so it unit-tests without a DB.
+#[must_use]
 pub fn restart_would_exceed_cap(restart_count: i32, max_restarts: i32) -> bool {
     restart_count + 1 > max_restarts
 }

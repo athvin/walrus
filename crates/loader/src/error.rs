@@ -72,6 +72,7 @@ pub enum LoaderError {
 
 impl LoaderError {
     /// The classified terminal error `main` surfaces as an exit code.
+    #[must_use]
     pub fn as_common(&self) -> common::Error {
         match self {
             LoaderError::Config(e) => common::Error::Config(e.0.clone()),
@@ -113,6 +114,7 @@ impl LoaderError {
         }
     }
 
+    #[must_use]
     pub fn exit_code(&self) -> common::ExitCode {
         self.as_common().exit_code()
     }
