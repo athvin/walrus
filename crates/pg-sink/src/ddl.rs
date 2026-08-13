@@ -138,7 +138,9 @@ impl DdlConsumer {
     }
 }
 
+/// This taxonomy is still growing; new variants must remain additive for downstream crates.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum DdlError {
     #[error("ddl_audit tuple missing/invalid column: {0}")]
     MissingColumn(&'static str),

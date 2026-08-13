@@ -138,7 +138,9 @@ impl Default for SinkConfig {
 }
 
 /// A terminal configuration failure. `main` maps this to [`common::ExitCode::Config`].
+/// This taxonomy is still growing; new variants must remain additive for downstream crates.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ConfigError {
     #[error("config load/parse failed: {0}")]
     Load(String),

@@ -3,7 +3,9 @@
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
 /// Errors from the control-DB entrypoint, classified terminal-vs-transient like [`common::Error`].
+/// This taxonomy is still growing; new variants must remain additive for downstream crates.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ControlError {
     /// Could not connect to / query the control Postgres. May be transient during a rollout.
     #[error("control database unavailable: {0}")]

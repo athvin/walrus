@@ -64,7 +64,9 @@ fn to_ready_row(
     }
 }
 
+/// This taxonomy is still growing; new variants must remain additive for downstream crates.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ManifestError {
     #[error(transparent)]
     Control(#[from] control::ControlError),

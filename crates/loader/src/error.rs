@@ -5,7 +5,9 @@
 use crate::config::ConfigError;
 use common::EpochNo;
 
+/// This taxonomy is still growing; new variants must remain additive for downstream crates.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum LoaderError {
     #[error(transparent)]
     Config(#[from] ConfigError),

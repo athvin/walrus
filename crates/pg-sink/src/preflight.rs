@@ -47,7 +47,9 @@ pub struct PkReport {
 }
 
 /// A terminal source-preflight mismatch. `main` maps it (via `common::Error`) to a distinct exit code.
+/// This taxonomy is still growing; new variants must remain additive for downstream crates.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum PreflightError {
     #[error("wal_level is {found}, need 'logical'")]
     WalLevel { found: String },

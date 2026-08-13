@@ -281,7 +281,9 @@ fn estimate_row_bytes(values: &[TupleValue]) -> u64 {
     META_OVERHEAD + value_bytes
 }
 
+/// This taxonomy is still growing; new variants must remain additive for downstream crates.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum BatchError {
     #[error("cannot seal mid-transaction (would split a committed txn tail)")]
     OpenTransaction,

@@ -263,7 +263,9 @@ impl Heartbeat {
     }
 }
 
+/// This taxonomy is still growing; new variants must remain additive for downstream crates.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum HeartbeatError {
     #[error("connect heartbeat SQL connection: {0}")]
     Connect(#[source] tokio_postgres::Error),

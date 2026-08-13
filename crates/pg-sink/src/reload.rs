@@ -39,7 +39,9 @@ pub enum PreflightOutcome {
 
 /// H11's fail-fast request validation: why a request never becomes an export. The reason lands in
 /// `table_reload.error` verbatim, so the operator reads it off the row.
+/// This taxonomy is still growing; new variants must remain additive for downstream crates.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum PreflightRejection {
     #[error("table {0}.{1} is not in the publication")]
     NotPublished(String, String),

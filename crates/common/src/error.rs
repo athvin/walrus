@@ -17,7 +17,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// **Invariant:** whether a variant is terminal or transient is decided by
 /// [`Error::is_terminal`] — a method matched exhaustively over the variants — *never* by
 /// inspecting the `Display` message string. Classification is modelled as data, not guessed.
+///
+/// This taxonomy is still growing; new variants must remain additive for downstream crates.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
     /// Misconfiguration — ConfigMap/env failed schema or bounds validation. Always terminal.
     #[error("invalid configuration: {0}")]
@@ -115,8 +118,11 @@ impl Error {
 /// Stable, distinct exit statuses. The numbers are a **public contract** — runbooks and alerts
 /// grep them — so never renumber an existing code, only append new ones. Kept small (< 125) to
 /// stay clear of shell-reserved statuses and to fit `std::process::ExitCode`'s `u8`.
+///
+/// This taxonomy is still growing; new codes must remain additive for downstream crates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
+#[non_exhaustive]
 pub enum ExitCode {
     Success = 0,
     Config = 10,

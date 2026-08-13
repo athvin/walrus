@@ -200,7 +200,9 @@ fn build_cached(
     })
 }
 
+/// This taxonomy is still growing; new variants must remain additive for downstream crates.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RelationError {
     #[error("build Arrow schema for {schema}.{table}: {source}")]
     Schema {

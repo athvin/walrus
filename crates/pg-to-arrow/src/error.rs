@@ -9,7 +9,9 @@ pub struct ValueParseDetail {
 }
 
 /// Everything that can go wrong mapping a Postgres relation to Arrow.
+/// This taxonomy is still growing; new variants must remain additive for downstream crates.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// The column's type is real but not handled at this tier yet — Tier-2 (interval/timetz/range/
     /// geometric) and Tier-3 (VARCHAR carriers) land in later PRs. We fail loudly rather than emit a
