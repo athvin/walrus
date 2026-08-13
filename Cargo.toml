@@ -14,6 +14,9 @@ warnings = "deny"
 # The rustc `unsafe-code` lint is allow-by-default, so `warnings = "deny"` never reaches it.
 # `forbid` prevents a member from reopening the door with an allow attribute; walrus has no sites.
 unsafe_code = "forbid"
+# This compatibility lint is allow-by-default in edition 2021 and warn-by-default in edition 2024;
+# the workspace warning deny would then make it an error. Deny it now as a staged migration step.
+unsafe_op_in_unsafe_fn = "deny"
 # This rustc lint is allow-by-default, so `warnings = "deny"` does not enable it.
 missing_copy_implementations = "deny"
 
@@ -39,6 +42,9 @@ expect_used = "deny"
 # unsafe block must carry a `// SAFETY:` comment. This is a restriction lint outside `clippy::all`,
 # so no group-vs-lint priority is needed.
 undocumented_unsafe_blocks = "deny"
+# Keep each unsafe block to one auditable invariant. This is another restriction lint outside
+# `clippy::all`, so it needs no group-vs-lint priority.
+multiple_unsafe_ops_per_block = "deny"
 # A suppression must say why. This restriction lint is outside `clippy::all`, so no priority is needed.
 allow_attributes_without_reason = "deny"
 # Promoting exactly this pedantic lint keeps every fallible public API's contract explicit.
