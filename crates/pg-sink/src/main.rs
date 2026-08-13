@@ -3,8 +3,7 @@
 //! `main` stays tiny: load+validate config, init tracing, build the runtime, and do the **only**
 //! `anyhow::Error → ExitCode` mapping in the whole binary (the "context in the loop, exit code at
 //! `main`" idiom — a broken deploy is greppable in `kubectl logs`). Everything below `main` returns
-//! `anyhow::Result<_>`; a bootstrap failure carries a `common::Error` whose distinct exit code is
-//! recovered here by downcast.
+//! `anyhow::Result<_>`; the application boundary recovers each typed failure's distinct exit code.
 
 use anyhow::Context;
 use pg_sink::config::SinkConfig;
@@ -43,12 +42,7 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!("walrus-pg-sink exiting: {e:#}");
-            // Recover the distinct exit code from a classified bootstrap error; anything else is Internal.
-            let code = e
-                .downcast_ref::<common::Error>()
-                .map(common::Error::exit_code)
-                .unwrap_or(common::ExitCode::Internal);
-            code.into()
+            pg_sink::exit::code_for(&e).into()
         }
     }
 }

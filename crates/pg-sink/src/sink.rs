@@ -136,6 +136,17 @@ pub enum SinkError {
     Store(#[from] object_store::Error),
 }
 
+impl From<SinkError> for common::Error {
+    fn from(e: SinkError) -> Self {
+        match e {
+            SinkError::Store(inner) => common::Error::ObjectStore(inner.to_string()),
+            SinkError::Encode(message) => {
+                common::Error::Internal(format!("parquet encode: {message}"))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "sink_test.rs"]
 mod tests;

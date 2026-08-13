@@ -253,6 +253,12 @@ pub enum HeartbeatError {
     Beat(#[source] tokio_postgres::Error),
 }
 
+impl From<HeartbeatError> for common::Error {
+    fn from(e: HeartbeatError) -> Self {
+        common::Error::SourceDb(e.to_string())
+    }
+}
+
 #[cfg(test)]
 #[path = "heartbeat_test.rs"]
 mod tests;

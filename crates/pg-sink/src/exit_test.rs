@@ -30,9 +30,7 @@ fn manifest_failure_exits_11() {
 
 #[test]
 fn control_failure_exits_11() {
-    let err = anyhow::Error::new(control::ControlError::Decode(
-        "bad control row".to_string(),
-    ));
+    let err = anyhow::Error::new(control::ControlError::Decode("bad control row".to_string()));
     assert_eq!(code_for(&err), common::ExitCode::ControlDb);
 }
 

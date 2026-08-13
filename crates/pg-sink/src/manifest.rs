@@ -60,6 +60,12 @@ pub enum ManifestError {
     Control(#[from] control::ControlError),
 }
 
+impl From<ManifestError> for common::Error {
+    fn from(e: ManifestError) -> Self {
+        common::Error::ControlDb(e.to_string())
+    }
+}
+
 #[cfg(test)]
 #[path = "manifest_test.rs"]
 mod tests;
