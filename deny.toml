@@ -54,6 +54,13 @@ confidence-threshold = 0.9
 multiple-versions = "warn"
 # Each future entry needs a justifying comment.
 skip = []
+# Architectural boundary (PR 10.8, rule `err-thiserror-lib`): libraries expose matchable errors,
+# while the `loader`, `pg-sink`, and `e2e` applications may erase them with anyhow. If a fourth
+# application legitimately needs anyhow, add it to `wrappers` in the same PR as the dependency so
+# the boundary receives explicit review.
+deny = [
+  { crate = "anyhow", wrappers = ["loader", "pg-sink", "e2e"] },
+]
 
 [sources]
 # Only crates.io (and any explicitly allow-listed git) may supply code.
