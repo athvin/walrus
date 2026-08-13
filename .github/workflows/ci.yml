@@ -513,6 +513,12 @@ jobs:
       - name: cargo deny check
         run: cargo deny check
 
+      # PR 11.17: Phase 11 declined five allocator/container crates, each with an ADR under
+      # docs/implementation/notes/. This keeps them out of member manifests; transitive presence
+      # in Cargo.lock is fine and expected.
+      - name: No speculative allocator/container deps (Phase 11 ADRs)
+        run: bash scripts/no-speculative-deps.sh
+
   # PR 4.7: MSRV drift guard. walrus pins one exact stable in rust-toolchain.toml and every job above
   # builds + tests on it, so CI already builds on the MSRV — this job's role is to fail fast if the
   # declared MSRV (Cargo.toml [workspace.package].rust-version) and the pinned toolchain channel ever
