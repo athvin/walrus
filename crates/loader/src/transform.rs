@@ -362,5 +362,8 @@ pub fn apply_transform(
 ) -> Result<(), LoaderError> {
     let boundary = t.latest_truncate(conn, after_lsn)?;
     conn.execute_batch(&t.render(after_lsn, &boundary))
-        .map_err(|e| LoaderError::Duck(format!("transform {}: {e}", t.table)))
+        .map_err(|source| LoaderError::Duck {
+            op: format!("transform {}", t.table),
+            source,
+        })
 }

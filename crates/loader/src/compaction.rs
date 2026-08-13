@@ -36,8 +36,11 @@ pub fn full_rebuild(
     // from the retained tail exactly as the incremental path resolves it.
     let boundary = t.latest_truncate(conn, &Lsn::ZERO)?;
     conn.execute_batch("BEGIN TRANSACTION;")
-        .map_err(|e| LoaderError::Duck(format!("begin rebuild txn: {e}")))?;
-    if let Err(e) = conn.execute_batch(&t.render_rebuild(&boundary)) {
+        .map_err(|source| LoaderError::Duck {
+            op: "begin rebuild txn".to_string(),
+            source,
+        })?;
+    if let Err(source) = conn.execute_batch(&t.render_rebuild(&boundary)) {
         let _ = conn.execute_batch("ROLLBACK;");
         if cancel.is_cancelled() {
             // Interrupted by the drain (the watcher called `interrupt()`): an intentional abort, the old
@@ -48,13 +51,16 @@ pub fn full_rebuild(
             );
             return Ok(());
         }
-        return Err(LoaderError::Duck(format!(
-            "full rebuild {}: {e}",
-            t.table()
-        )));
+        return Err(LoaderError::Duck {
+            op: format!("full rebuild {}", t.table()),
+            source,
+        });
     }
     conn.execute_batch("COMMIT;")
-        .map_err(|e| LoaderError::Duck(format!("commit rebuild txn: {e}")))?;
+        .map_err(|source| LoaderError::Duck {
+            op: "commit rebuild txn".to_string(),
+            source,
+        })?;
     Ok(())
 }
 
@@ -97,9 +103,15 @@ pub fn prune_raw(
             ),
             duckdb::params![floor.to_string()],
         )
-        .map_err(|e| LoaderError::Duck(format!("prune {}_raw: {e}", t.table())))?;
+        .map_err(|source| LoaderError::Duck {
+            op: format!("prune {}_raw", t.table()),
+            source,
+        })?;
     conn.execute_batch("CHECKPOINT;")
-        .map_err(|e| LoaderError::Duck(format!("checkpoint after prune {}: {e}", t.table())))?;
+        .map_err(|source| LoaderError::Duck {
+            op: format!("checkpoint after prune {}", t.table()),
+            source,
+        })?;
     Ok(n as u64)
 }
 

@@ -10,8 +10,14 @@ pub enum LoaderError {
     Config(#[from] ConfigError),
     #[error(transparent)]
     Control(#[from] control::ControlError),
-    #[error("DuckDB: {0}")]
-    Duck(String),
+    /// A DuckDB engine call failed. `op` names the operation while `source` keeps the typed engine
+    /// failure available to error-chain walkers.
+    #[error("DuckDB: {op}")]
+    Duck {
+        op: String,
+        #[source]
+        source: duckdb::Error,
+    },
     #[error("object store: {0}")]
     ObjectStore(String),
     /// A *live* owner already holds the lease — a second writer must NOT proceed.
@@ -40,7 +46,9 @@ impl LoaderError {
         match self {
             LoaderError::Config(e) => common::Error::Config(e.0.clone()),
             LoaderError::Control(e) => common::Error::ControlDb(e.to_string()),
-            LoaderError::Duck(m) => common::Error::Internal(format!("duckdb: {m}")),
+            LoaderError::Duck { op, source } => {
+                common::Error::Internal(format!("duckdb: {op}: {source}"))
+            }
             LoaderError::ObjectStore(m) => common::Error::ObjectStore(m.clone()),
             LoaderError::LeaseContended { table, owner } => {
                 common::Error::LeaseContended(format!("{table} held by {owner}"))

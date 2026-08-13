@@ -66,7 +66,10 @@ pub async fn run_phase_b(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
             [after.to_string()],
             |r| r.get(0),
         )
-        .map_err(|e| LoaderError::Duck(format!("scan un-transformed tail: {e}")))?;
+        .map_err(|source| LoaderError::Duck {
+            op: "scan un-transformed tail".to_string(),
+            source,
+        })?;
     let Some(max_hex) = max_hex else {
         return Ok(None); // <table>_raw is empty — nothing to transform yet
     };
@@ -79,13 +82,19 @@ pub async fn run_phase_b(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     // bootstrap shape (and, PR 4.2, with the Tier-2 emit/recombine from the descriptors).
     let t = current_transform(ctx).await?;
     conn.execute_batch("BEGIN TRANSACTION;")
-        .map_err(|e| LoaderError::Duck(format!("begin transform txn: {e}")))?;
+        .map_err(|source| LoaderError::Duck {
+            op: "begin transform txn".to_string(),
+            source,
+        })?;
     if let Err(e) = apply_transform(conn, &t, &after) {
         let _ = conn.execute_batch("ROLLBACK;");
         return Err(e);
     }
     conn.execute_batch("COMMIT;")
-        .map_err(|e| LoaderError::Duck(format!("commit transform txn: {e}")))?;
+        .map_err(|source| LoaderError::Duck {
+            op: "commit transform txn".to_string(),
+            source,
+        })?;
 
     // Advance the watermark AFTER the DuckDB commit. The CHECK (transformed_lsn <= raw_appended_lsn)
     // holds because Phase A ran first this cycle. `max_lsn` can equal the prior `transformed_lsn` (a
