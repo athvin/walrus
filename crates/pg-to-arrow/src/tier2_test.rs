@@ -51,3 +51,27 @@ fn interval_and_timetz_reject_garbage() {
     assert!(parse_interval("1 fortnight").is_err());
     assert!(parse_timetz("12:34:56").is_err()); // no offset
 }
+
+#[test]
+fn interval_hours_overflow_is_a_value_parse_error_not_a_panic() {
+    let out = parse_interval("9223372036854775807 hours");
+    assert!(matches!(out, Err(Error::ValueParse(_))), "got {out:?}");
+}
+
+#[test]
+fn interval_ago_negation_overflow_is_rejected() {
+    let out = parse_interval("-9223372036854775808 days ago");
+    assert!(matches!(out, Err(Error::ValueParse(_))), "got {out:?}");
+}
+
+#[test]
+fn clock_token_overflow_returns_a_value_parse_error() {
+    let out = parse_interval("9223372036854775807:00:00");
+    assert!(matches!(out, Err(Error::ValueParse(_))), "got {out:?}");
+}
+
+#[test]
+fn timetz_offset_overflow_returns_a_value_parse_error() {
+    let out = parse_timetz("12:00:00+2147483647:00");
+    assert!(matches!(out, Err(Error::ValueParse(_))), "got {out:?}");
+}

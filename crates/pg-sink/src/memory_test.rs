@@ -84,3 +84,23 @@ fn default_band_is_valid() {
     let band = HysteresisBand::DEFAULT;
     assert!(HysteresisBand::new(band.activate(), band.resume()).is_ok());
 }
+
+#[test]
+fn add_saturates_at_u64_max_and_stays_over_ceiling() {
+    let mut m = InflightMeter::new(1_000);
+    m.add((1, 100), u64::MAX);
+    m.add((1, 100), 1);
+    assert_eq!(m.total(), u64::MAX);
+    assert!(m.over_ceiling());
+}
+
+#[test]
+fn release_after_saturation_does_not_wrap_the_total() {
+    let mut m = InflightMeter::new(1_000);
+    m.add((1, 100), u64::MAX);
+    m.add((2, 200), 1);
+    m.release((1, 100));
+    m.release((2, 200));
+    assert_eq!(m.total(), 0);
+    assert!(!m.over_ceiling());
+}
