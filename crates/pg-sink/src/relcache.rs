@@ -9,7 +9,7 @@
 
 use arrow::datatypes::SchemaRef;
 use common::{PgRelation, TypeDescriptor};
-use std::collections::HashMap;
+use std::collections::{hash_map, HashMap};
 use std::sync::Arc;
 
 /// Everything the batching path (PR 2.23) needs for one relation at one `schema_version`, shared by
@@ -47,21 +47,26 @@ impl RelationCache {
     /// after a DDL bump (PR 2.33), so a change always lands in the latest-shape file.
     #[must_use]
     pub fn latest_for(&self, oid: u32) -> Option<Arc<CachedRelation>> {
-        self.by_key
-            .iter()
-            .filter(|((o, _), _)| *o == oid)
-            .max_by_key(|((_, v), _)| *v)
-            .map(|(_, r)| Arc::clone(r))
+        self.iter()
+            .filter(|cached| cached.relation.oid == oid)
+            .max_by_key(|cached| cached.schema_version)
+            .cloned()
     }
 
     /// The OID of a cached `schema.table` (any version) — the DDL-capture cut (PR 2.33) needs it to find
     /// the affected table's batcher.
     #[must_use]
     pub fn oid_for(&self, schema: &str, table: &str) -> Option<u32> {
-        self.by_key
-            .values()
-            .find(|r| r.relation.schema == schema && r.relation.name == table)
-            .map(|r| r.relation.oid)
+        self.iter()
+            .find(|cached| cached.relation.schema == schema && cached.relation.name == table)
+            .map(|cached| cached.relation.oid)
+    }
+
+    /// The cached relations, in unspecified order. The map key is a projection of each value, so
+    /// iteration yields values directly.
+    #[must_use]
+    pub fn iter(&self) -> hash_map::Values<'_, (u32, i64), Arc<CachedRelation>> {
+        <&Self as IntoIterator>::into_iter(self)
     }
 
     #[must_use]
@@ -102,26 +107,72 @@ impl RelationCache {
     /// Returns [`RelationError::Hydrate`] when a persisted snapshot is not a `PgRelation`, or
     /// [`RelationError::Schema`] when its shape cannot be mapped to Arrow.
     pub fn hydrate(&mut self, rows: Vec<control::RegistryRow>) -> Result<(), RelationError> {
-        for row in rows {
-            let relation: PgRelation = serde_json::from_value(row.columns).map_err(|e| {
-                RelationError::Hydrate(format!(
-                    "{}.{}: columns snapshot is not a PgRelation: {e}",
-                    row.source_schema, row.source_table
-                ))
-            })?;
-            let arrow_schema = build_arrow(&relation)?;
-            let key = (relation.oid, row.schema_version);
-            self.by_key.insert(
-                key,
-                Arc::new(CachedRelation {
+        let decoded = rows
+            .into_iter()
+            .map(|row| {
+                let relation: PgRelation = serde_json::from_value(row.columns).map_err(|e| {
+                    RelationError::Hydrate(format!(
+                        "{}.{}: columns snapshot is not a PgRelation: {e}",
+                        row.source_schema, row.source_table
+                    ))
+                })?;
+                let arrow_schema = build_arrow(&relation)?;
+                Ok(CachedRelation {
                     arrow_schema,
                     descriptors: row.descriptors,
                     schema_version: row.schema_version,
                     relation,
-                }),
-            );
-        }
+                })
+            })
+            .collect::<Result<Vec<_>, RelationError>>()?;
+        self.extend(decoded);
         Ok(())
+    }
+}
+
+impl FromIterator<CachedRelation> for RelationCache {
+    fn from_iter<I: IntoIterator<Item = CachedRelation>>(iter: I) -> Self {
+        let mut cache = RelationCache::default();
+        cache.extend(iter);
+        cache
+    }
+}
+
+impl Extend<CachedRelation> for RelationCache {
+    fn extend<I: IntoIterator<Item = CachedRelation>>(&mut self, iter: I) {
+        let iter = iter.into_iter();
+        self.by_key.reserve(iter.size_hint().0);
+        for cached in iter {
+            let key = (cached.relation.oid, cached.schema_version);
+            self.by_key.insert(key, Arc::new(cached));
+        }
+    }
+}
+
+impl IntoIterator for RelationCache {
+    type Item = Arc<CachedRelation>;
+    type IntoIter = hash_map::IntoValues<(u32, i64), Arc<CachedRelation>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.by_key.into_values()
+    }
+}
+
+impl<'a> IntoIterator for &'a RelationCache {
+    type Item = &'a Arc<CachedRelation>;
+    type IntoIter = hash_map::Values<'a, (u32, i64), Arc<CachedRelation>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.by_key.values()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut RelationCache {
+    type Item = &'a mut Arc<CachedRelation>;
+    type IntoIter = hash_map::ValuesMut<'a, (u32, i64), Arc<CachedRelation>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.by_key.values_mut()
     }
 }
 

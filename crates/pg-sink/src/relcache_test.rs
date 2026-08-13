@@ -93,9 +93,7 @@ fn collects_and_extends_like_a_collection() {
 
 #[test]
 fn iterates_by_ref_by_mut_and_by_value() {
-    let cache: RelationCache = [build_cached(orders(), 7).unwrap()]
-        .into_iter()
-        .collect();
+    let cache: RelationCache = [build_cached(orders(), 7).unwrap()].into_iter().collect();
 
     assert_eq!(cache.iter().count(), 1);
     assert_eq!((&cache).into_iter().count(), 1);
@@ -146,5 +144,8 @@ fn hydrate_message_is_unchanged_on_a_malformed_snapshot() {
             "hydrate from schema_registry: public.orders: columns snapshot is not a PgRelation: {source}"
         )
     );
-    assert!(cache.is_empty(), "hydration must not partially update the cache");
+    assert!(
+        cache.is_empty(),
+        "hydration must not partially update the cache"
+    );
 }
