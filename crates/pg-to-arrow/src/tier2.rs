@@ -88,7 +88,7 @@ fn parse_err(kind: &str, text: &str) -> Error {
 }
 
 /// Parse a `HH:MM:SS[.ffffff]` clock (no sign) into microseconds. Fractional seconds are padded /
-/// truncated to microsecond resolution.
+/// truncated to microsecond resolution. Returns `None` for malformed input or integer overflow.
 fn hms_to_micros(body: &str) -> Option<i64> {
     let mut it = body.split(':');
     let h: i64 = it.next()?.parse().ok()?;
@@ -101,13 +101,17 @@ fn hms_to_micros(body: &str) -> Option<i64> {
     let sec: i64 = sec.parse().ok()?;
     let frac_digits: String = frac.chars().chain(std::iter::repeat('0')).take(6).collect();
     let frac_micros: i64 = frac_digits.parse().ok()?;
-    Some((h * 3600 + m * 60 + sec) * 1_000_000 + frac_micros)
+    h.checked_mul(3600)?
+        .checked_add(m.checked_mul(60)?)?
+        .checked_add(sec)?
+        .checked_mul(1_000_000)?
+        .checked_add(frac_micros)
 }
 
 /// A signed `[-]HH:MM:SS[.ffffff]` time token (the negative sign applies to the whole clock).
 fn signed_time_to_micros(tok: &str) -> Option<i64> {
     match tok.strip_prefix('-') {
-        Some(body) => hms_to_micros(body).map(|us| -us),
+        Some(body) => hms_to_micros(body).and_then(i64::checked_neg),
         None => hms_to_micros(tok),
     }
 }
@@ -120,8 +124,8 @@ fn signed_time_to_micros(tok: &str) -> Option<i64> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::ValueParse`] for an unknown unit, malformed number or clock, a missing unit, or
-/// a month/day total outside the emitted `i32` range.
+/// Returns [`Error::ValueParse`] for an unknown unit, malformed number or clock, a missing unit,
+/// integer overflow, or a month/day total outside the emitted `i32` range.
 pub fn parse_interval(text: &str) -> Result<(i32, i32, i64), Error> {
     let err = || parse_err("interval", text);
     let mut months: i64 = 0;
@@ -135,7 +139,9 @@ pub fn parse_interval(text: &str) -> Result<(i32, i32, i64), Error> {
         let tok = toks[i];
         // A clock token (`04:05:06.5`) contributes microseconds directly.
         if tok.contains(':') {
-            micros += signed_time_to_micros(tok).ok_or_else(err)?;
+            micros = micros
+                .checked_add(signed_time_to_micros(tok).ok_or_else(err)?)
+                .ok_or_else(err)?;
             i += 1;
             continue;
         }
@@ -153,20 +159,40 @@ pub fn parse_interval(text: &str) -> Result<(i32, i32, i64), Error> {
         let n: i64 = tok.parse().map_err(|_| err())?;
         let unit = toks.get(i + 1).ok_or_else(err)?;
         match *unit {
-            "year" | "years" | "yr" | "yrs" => months += n * 12,
-            "mon" | "mons" | "month" | "months" => months += n,
-            "day" | "days" => days += n,
-            "hour" | "hours" | "hr" | "hrs" => micros += n * 3_600_000_000,
-            "min" | "mins" | "minute" | "minutes" => micros += n * 60_000_000,
-            "sec" | "secs" | "second" | "seconds" => micros += n * 1_000_000,
+            "year" | "years" | "yr" | "yrs" => {
+                months = months
+                    .checked_add(n.checked_mul(12).ok_or_else(err)?)
+                    .ok_or_else(err)?;
+            }
+            "mon" | "mons" | "month" | "months" => {
+                months = months.checked_add(n).ok_or_else(err)?;
+            }
+            "day" | "days" => {
+                days = days.checked_add(n).ok_or_else(err)?;
+            }
+            "hour" | "hours" | "hr" | "hrs" => {
+                micros = micros
+                    .checked_add(n.checked_mul(3_600_000_000).ok_or_else(err)?)
+                    .ok_or_else(err)?;
+            }
+            "min" | "mins" | "minute" | "minutes" => {
+                micros = micros
+                    .checked_add(n.checked_mul(60_000_000).ok_or_else(err)?)
+                    .ok_or_else(err)?;
+            }
+            "sec" | "secs" | "second" | "seconds" => {
+                micros = micros
+                    .checked_add(n.checked_mul(1_000_000).ok_or_else(err)?)
+                    .ok_or_else(err)?;
+            }
             _ => return Err(err()),
         }
         i += 2;
     }
     if ago {
-        months = -months;
-        days = -days;
-        micros = -micros;
+        months = months.checked_neg().ok_or_else(err)?;
+        days = days.checked_neg().ok_or_else(err)?;
+        micros = micros.checked_neg().ok_or_else(err)?;
     }
     let months = i32::try_from(months).map_err(|_| err())?;
     let days = i32::try_from(days).map_err(|_| err())?;
@@ -181,7 +207,7 @@ pub fn parse_interval(text: &str) -> Result<(i32, i32, i64), Error> {
 /// # Errors
 ///
 /// Returns [`Error::ValueParse`] if the clock, UTC-offset separator, or offset components are
-/// missing or malformed.
+/// missing, malformed, or outside the representable integer range.
 pub fn parse_timetz(text: &str) -> Result<(i64, i32), Error> {
     let err = || parse_err("timetz", text);
     let idx = text.find(['+', '-']).ok_or_else(err)?;
@@ -195,7 +221,13 @@ pub fn parse_timetz(text: &str) -> Result<(i64, i32), Error> {
     if it.next().is_some() {
         return Err(err());
     }
-    Ok((micros, sign * (oh * 3600 + om * 60 + os)))
+    let offset = oh
+        .checked_mul(3600)
+        .and_then(|hours| hours.checked_add(om.checked_mul(60)?))
+        .and_then(|seconds| seconds.checked_add(os))
+        .and_then(|seconds| seconds.checked_mul(sign))
+        .ok_or_else(err)?;
+    Ok((micros, offset))
 }
 
 #[cfg(test)]

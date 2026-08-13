@@ -38,15 +38,30 @@ impl InflightMeter {
     }
 
     /// Account `bytes` more buffered for `(table, xid)`.
+    ///
+    /// This gauge saturates because its consumer only needs to know whether memory is over the
+    /// ceiling. At the integer bound, `u64::MAX` preserves that answer; returning an error would
+    /// leave the shedding caller with no more accurate value to record.
     pub fn add(&mut self, key: (TableId, u32), bytes: u64) {
-        *self.by_stream.entry(key).or_insert(0) += bytes;
-        self.total += bytes;
+        let stream = self.by_stream.entry(key).or_insert(0);
+        *stream = stream.saturating_add(bytes);
+        self.total = self.total.saturating_add(bytes);
     }
 
     /// Drop all accounting for `(table, xid)` (its buffer was flushed or spilled).
+    ///
+    /// The normal path clamps at zero rather than wrapping. Once the aggregate reaches `u64::MAX`,
+    /// it no longer records the overflow amount, so release recomputes the saturating sum of the
+    /// remaining streams to keep the gauge conservative.
     pub fn release(&mut self, key: (TableId, u32)) {
         if let Some(bytes) = self.by_stream.remove(&key) {
-            self.total -= bytes;
+            self.total = if self.total == u64::MAX {
+                self.by_stream
+                    .values()
+                    .fold(0_u64, |total, &stream| total.saturating_add(stream))
+            } else {
+                self.total.saturating_sub(bytes)
+            };
         }
     }
 
