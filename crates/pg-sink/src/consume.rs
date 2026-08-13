@@ -778,3 +778,7 @@ fn trace_message(msg: &Message) {
         other => tracing::info!(op = "other", detail = ?other, "decoded"),
     }
 }
+
+#[cfg(test)]
+#[path = "consume_test.rs"]
+mod tests;
