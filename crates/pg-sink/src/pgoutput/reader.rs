@@ -156,3 +156,7 @@ impl<'a> Reader<'a> {
         Ok(Lsn::new(self.int64()? as u64))
     }
 }
+
+#[cfg(test)]
+#[path = "reader_test.rs"]
+mod tests;
