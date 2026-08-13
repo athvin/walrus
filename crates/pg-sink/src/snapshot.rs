@@ -27,6 +27,7 @@ use common::{
     EpochNo, Kind, Lsn, Op, PgColumn, PgRelation, ReplicaIdentity, SinkMeta, TupleValue,
     UtcTimestamp,
 };
+use std::marker::PhantomData;
 use std::sync::Arc;
 use tokio_postgres::NoTls;
 
@@ -38,25 +39,38 @@ pub struct ExportedSnapshot {
     pub snapshot_name: String,
 }
 
+/// State marker for an idle replication connection that has not exported a snapshot.
+#[derive(Debug, Clone, Copy)]
+pub struct NotExported;
+
+/// State marker for a connection holding an exported snapshot and ready to start replication.
+#[derive(Debug, Clone, Copy)]
+pub struct Exported;
+
 /// Holds the slot-creating replication connection, which **must stay open + idle** so the exported
 /// snapshot remains valid until every backfill session has attached to it.
 ///
 /// Streaming before slot creation is forbidden:
 ///
 /// ```compile_fail
-/// # async fn demo(dsn: &str) -> anyhow::Result<()> {
+/// # async fn demo(
+/// #     dsn: &str,
+/// #     snapshot: &pg_sink::snapshot::ExportedSnapshot,
+/// # ) -> anyhow::Result<()> {
 /// let conn = pg_sink::snapshot::SnapshotConn::connect(dsn).await?;
-/// let _stream = conn.into_stream("walrus_slot", "walrus_pub").await?;
+/// let _stream = conn
+///     .into_stream("walrus_slot", snapshot, "walrus_pub")
+///     .await?;
 /// # Ok(())
 /// # }
 /// ```
 #[derive(Debug)]
-pub struct SnapshotConn {
+pub struct SnapshotConn<S = NotExported> {
     stream: ReplicationStream,
-    exported: Option<ExportedSnapshot>,
+    _state: PhantomData<S>,
 }
 
-impl SnapshotConn {
+impl SnapshotConn<NotExported> {
     /// Open a replication connection and complete startup (no `START_REPLICATION` yet).
     ///
     /// # Errors
@@ -67,21 +81,22 @@ impl SnapshotConn {
             stream: ReplicationStream::connect(dsn)
                 .await
                 .context("open replication connection for snapshot export")?,
-            exported: None,
+            _state: PhantomData,
         })
     }
 
-    /// `CREATE_REPLICATION_SLOT <slot> LOGICAL pgoutput (SNAPSHOT 'export')`. The connection now holds
-    /// the exported snapshot — do **not** run anything else on it until backfill is done.
+    /// `CREATE_REPLICATION_SLOT <slot> LOGICAL pgoutput (SNAPSHOT 'export')`. Consumes the idle
+    /// connection and returns its exported state with the snapshot value; do **not** run anything else
+    /// on the connection until backfill is done.
     ///
     /// # Errors
     ///
     /// Returns [`anyhow::Error`] if PostgreSQL rejects slot creation or its exported snapshot response
     /// is missing or malformed.
     pub async fn create_slot_with_snapshot(
-        &mut self,
+        mut self,
         slot: &str,
-    ) -> anyhow::Result<ExportedSnapshot> {
+    ) -> anyhow::Result<(SnapshotConn<Exported>, ExportedSnapshot)> {
         let (consistent_point, snapshot_name) =
             self.stream.create_replication_slot_export(slot).await?;
         let snap = ExportedSnapshot {
@@ -94,30 +109,27 @@ impl SnapshotConn {
             snapshot_name = %snap.snapshot_name,
             "created replication slot with exported snapshot"
         );
-        self.exported = Some(snap.clone());
-        Ok(snap)
+        let exported = SnapshotConn {
+            stream: self.stream,
+            _state: PhantomData,
+        };
+        Ok((exported, snap))
     }
+}
 
-    /// The consistent point streaming will resume from (available after slot creation).
-    pub fn consistent_point(&self) -> Option<Lsn> {
-        self.exported.as_ref().map(|s| s.consistent_point)
-    }
-
+impl SnapshotConn<Exported> {
     /// Hand off to streaming: `START_REPLICATION` from `consistent_point` (this ends the exported
     /// snapshot, which is safe once every backfill session has attached). Consumes the connection.
     ///
     /// # Errors
     ///
-    /// Returns [`anyhow::Error`] if no snapshot was created first or starting replication from its
-    /// consistent point fails.
+    /// Returns [`anyhow::Error`] if starting replication from the snapshot's consistent point fails.
     pub async fn into_stream(
         mut self,
         slot: &str,
+        snap: &ExportedSnapshot,
         publication: &str,
     ) -> anyhow::Result<ReplicationStream> {
-        let snap = self
-            .exported
-            .context("create_slot_with_snapshot must run before streaming")?;
         self.stream
             .start_streaming(slot, snap.consistent_point, publication)
             .await

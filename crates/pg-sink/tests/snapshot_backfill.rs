@@ -101,8 +101,12 @@ async fn backfill_preloaded_rows_then_streams_post_consistent_point() {
     drop_slot(&admin, slot).await;
 
     // Create the slot with an exported snapshot — this fixes consistent_point.
-    let mut snap_conn = SnapshotConn::connect(&source_url()).await.unwrap();
-    let snapshot = snap_conn.create_slot_with_snapshot(slot).await.unwrap();
+    let (snap_conn, snapshot) = SnapshotConn::connect(&source_url())
+        .await
+        .unwrap()
+        .create_slot_with_snapshot(slot)
+        .await
+        .unwrap();
 
     // A row written AFTER the export: absent from the snapshot, must stream on handoff.
     admin
@@ -183,7 +187,10 @@ async fn backfill_preloaded_rows_then_streams_post_consistent_point() {
 
     // Hand off to streaming from consistent_point → the post-export row arrives as a STREAM change
     // (it was never in the snapshot: no double count).
-    let mut stream = snap_conn.into_stream(slot, "walrus_pub").await.unwrap();
+    let mut stream = snap_conn
+        .into_stream(slot, &snapshot, "walrus_pub")
+        .await
+        .unwrap();
     let mut ctx = StreamCtx::default();
     let saw_streamed = tokio::time::timeout(Duration::from_secs(15), async {
         loop {

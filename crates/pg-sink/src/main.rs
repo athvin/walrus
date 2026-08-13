@@ -266,10 +266,9 @@ async fn establish_stream(
     // bootstrap when no prior epoch exists, or a TOTAL-RESTART (§1.8) when the slot was lost/absent while
     // a generation was running — `bump_epoch` yields `1` on an empty table and `MAX+1` otherwise, so a
     // single path serves both; we distinguish them only to alert loudly on the disaster case.
-    let mut snap = pg_sink::snapshot::SnapshotConn::connect(&cfg.source_db_url)
+    let (snap, snapshot) = pg_sink::snapshot::SnapshotConn::connect(&cfg.source_db_url)
         .await
-        .context("open snapshot replication connection")?;
-    let snapshot = snap
+        .context("open snapshot replication connection")?
         .create_slot_with_snapshot(&cfg.slot_name)
         .await
         .context("CREATE_REPLICATION_SLOT with exported snapshot")?;
@@ -335,7 +334,7 @@ async fn establish_stream(
 
     // Hand off: START_REPLICATION from consistent_point on the (now snapshot-done) connection.
     let stream = snap
-        .into_stream(&cfg.slot_name, &cfg.publication_name)
+        .into_stream(&cfg.slot_name, &snapshot, &cfg.publication_name)
         .await
         .context("hand off snapshot → streaming")?;
     Ok(Bootstrapped {
