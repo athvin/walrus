@@ -335,6 +335,7 @@ async fn lossy_cast_failure_quarantines_the_table_and_alerts() {
         epoch,
         schema: "public".into(),
         table: "orders".into(),
+        series: "public.orders".into(),
         rel: orders_v1,
         db,
         state: Arc::clone(&state),

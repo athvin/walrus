@@ -133,6 +133,7 @@ async fn setup(epoch: i64) -> (TableCtx, std::path::PathBuf) {
         epoch,
         schema: "public".into(),
         table: "orders".into(),
+        series: "public.orders".into(),
         rel: orders(),
         db,
         state: LoaderState::new(),

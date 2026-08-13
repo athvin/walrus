@@ -88,6 +88,8 @@ pub struct ChunkExporter {
     /// The table shape at the reload's (single) schema version — from the REGISTRY, so files
     /// always match the descriptors their stamped version points at.
     rel: PgRelation,
+    /// The `table` metric label (`"<schema>.<table>"`) for this export, precomputed from `rel`.
+    series: String,
     /// PK columns in PK-INDEX order (pg_index.indkey position) — the pagination total order.
     pk_cols: Vec<String>,
     schema_version: i64,
@@ -191,6 +193,7 @@ impl ChunkExporter {
             pool,
             sink,
             cfg,
+            series: format!("{}.{}", rel.schema, rel.name),
             rel,
             pk_cols,
             schema_version,
@@ -336,7 +339,7 @@ impl ChunkExporter {
         );
         let mut conn = self.pool.acquire().await?;
         control::reload::fail(&mut conn, self.reload_id, &reason).await?;
-        common::metrics::record_reload_failed(&format!("{}.{}", self.rel.schema, self.rel.name));
+        common::metrics::record_reload_failed(&self.series);
         anyhow::bail!("reload {} failed: {reason}", self.reload_id);
     }
 
@@ -434,7 +437,7 @@ impl ChunkExporter {
 
         let n = rows.len() as u64;
         // One chunk file exported (PR 6.11): bump the per-table chunk + row counters.
-        common::metrics::record_reload_chunk(&format!("{}.{}", self.rel.schema, self.rel.name), n);
+        common::metrics::record_reload_chunk(&self.series, n);
         if n < self.cfg.chunk_rows {
             Ok(ChunkOutcome::Drained {
                 rows: n,

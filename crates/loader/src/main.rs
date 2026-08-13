@@ -119,6 +119,7 @@ async fn run(cfg: LoaderConfig) -> Result<(), LoaderError> {
                 epoch,
                 schema: o.schema.clone(),
                 table: o.table.clone(),
+                series: format!("{}.{}", o.schema, o.table),
                 rel: o.relation,
                 db: o.db,
                 state: Arc::clone(&state),

@@ -143,6 +143,7 @@ fn ctx_on(
         epoch,
         schema: "public".into(),
         table: "orders".into(),
+        series: "public.orders".into(),
         rel: orders(),
         db,
         state: LoaderState::new(),

@@ -25,6 +25,9 @@ pub struct TableCtx {
     pub epoch: i64,
     pub schema: String,
     pub table: String,
+    /// The `table` metric label (`"<schema>.<table>"`), precomputed at construction. Cardinality is
+    /// bounded by the tables this pod owns, and the value is constant per worker.
+    pub series: String,
     /// The table shape — the transform (Phase B) renders its SQL from this.
     pub rel: PgRelation,
     pub db: TableDb,
@@ -86,10 +89,7 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
         .await?
         .map(|cp| cp.raw_appended_lsn)
         .unwrap_or(Lsn::ZERO);
-    common::metrics::set_raw_append_lag(
-        &format!("{}.{}", ctx.schema, ctx.table),
-        raw_append_lag_bytes(max_ready, raw_appended),
-    );
+    common::metrics::set_raw_append_lag(&ctx.series, raw_append_lag_bytes(max_ready, raw_appended));
 
     // 1. Claim in (lsn_end, id) order — NEVER `lsn_end > raw_appended_lsn` (that skips equal-lsn_end
     //    snapshot files forever).

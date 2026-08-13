@@ -60,7 +60,7 @@ pub async fn run_phase_b(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     // Phase-B transform lag = raw_appended_lsn − transformed_lsn (PR 4.10); pure math from the checkpoint
     // just read, no extra query. Labelled per table (bounded cardinality).
     common::metrics::set_transform_lag(
-        &format!("{}.{}", ctx.schema, ctx.table),
+        &ctx.series,
         cp.raw_appended_lsn
             .as_u64()
             .saturating_sub(cp.transformed_lsn.as_u64()),

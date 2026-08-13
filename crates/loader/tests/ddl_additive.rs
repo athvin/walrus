@@ -518,6 +518,7 @@ async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
         epoch,
         schema: "public".into(),
         table: "orders".into(),
+        series: "public.orders".into(),
         rel: orders_v1(),
         db,
         state: LoaderState::new(),
