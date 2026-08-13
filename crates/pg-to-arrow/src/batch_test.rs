@@ -1,8 +1,8 @@
 use super::*;
 use crate::oids;
 use arrow::array::{
-    Array, AsArray, Decimal128Array, Int32Array, Int64Array, ListArray, StringArray, StructArray,
-    TimestampMicrosecondArray,
+    Array, AsArray, BinaryArray, Decimal128Array, Int32Array, Int64Array, ListArray, StringArray,
+    StructArray, TimestampMicrosecondArray,
 };
 use common::{Kind, Op, PgColumn, PgRelation, ReplicaIdentity, SinkMeta, UtcTimestamp};
 
@@ -111,6 +111,45 @@ fn null_value_sets_validity_false() {
         .downcast_ref::<StringArray>()
         .unwrap();
     assert!(note.is_null(0));
+}
+
+#[test]
+fn binary_column_accepts_binary_text_and_null() {
+    let relation = one_col_rel("payload", oids::BYTEA, -1);
+    let mut builder = BatchBuilder::new(&relation).unwrap();
+    builder
+        .append_row(
+            &[TupleValue::Binary(vec![0xca, 0xfe].into())],
+            &meta(vec![]),
+        )
+        .unwrap();
+    builder
+        .append_row(
+            &[TupleValue::Text("\\xdeadbeef".to_string())],
+            &meta(vec![]),
+        )
+        .unwrap();
+    builder
+        .append_row(&[TupleValue::Null], &meta(vec![]))
+        .unwrap();
+
+    let batch = builder.finish().unwrap();
+    let payload = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .unwrap();
+    assert_eq!(payload.value(0), &[0xca, 0xfe]);
+    assert_eq!(payload.value(1), &[0xde, 0xad, 0xbe, 0xef]);
+    assert!(payload.is_null(2));
+}
+
+#[test]
+fn binary_arm_has_no_runtime_unreachable() {
+    assert!(
+        !include_str!("batch.rs").contains("unreachable!("),
+        "the Binary arm must be exhaustive over TupleValue"
+    );
 }
 
 #[test]
