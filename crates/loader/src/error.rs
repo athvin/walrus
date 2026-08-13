@@ -62,3 +62,7 @@ impl LoaderError {
         self.as_common().exit_code()
     }
 }
+
+#[cfg(test)]
+#[path = "error_test.rs"]
+mod tests;
