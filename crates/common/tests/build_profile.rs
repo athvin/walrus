@@ -7,6 +7,8 @@ const CODEGEN_UNITS_ADR: &str = "docs/implementation/notes/rust-skills/opt-codeg
 const CODEGEN_UNITS_NOTE: &str =
     include_str!("../../../docs/implementation/notes/rust-skills/opt-codegen-units.md");
 const TARGET_CPU_ADR: &str = "docs/implementation/notes/rust-skills/opt-target-cpu.md";
+const TARGET_CPU_NOTE: &str =
+    include_str!("../../../docs/implementation/notes/rust-skills/opt-target-cpu.md");
 const BUILD_SURFACES: &[(&str, &str)] = &[
     ("Cargo.toml", WORKSPACE_MANIFEST),
     (
@@ -240,5 +242,9 @@ fn target_cpu_rejection_is_recorded() {
     assert!(
         root.join(TARGET_CPU_ADR).is_file(),
         "missing target-CPU decision at {TARGET_CPU_ADR}"
+    );
+    assert!(
+        !TARGET_CPU_NOTE.trim().is_empty(),
+        "{TARGET_CPU_ADR} must contain the recorded decision"
     );
 }
