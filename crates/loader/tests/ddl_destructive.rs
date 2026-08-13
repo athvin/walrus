@@ -40,7 +40,7 @@ fn rel(name: &str, columns: Vec<PgColumn>) -> PgRelation {
 }
 
 fn mem(rel: &PgRelation) -> TableDb {
-    let db = TableDb::open(std::path::Path::new(":memory:")).unwrap();
+    let db = TableDb::open(":memory:").unwrap();
     db.ensure_tables(rel, 1).unwrap();
     db
 }
@@ -326,7 +326,7 @@ async fn lossy_cast_failure_quarantines_the_table_and_alerts() {
     .unwrap();
 
     let dir = tmpdir(&epoch.to_string());
-    let db = TableDb::open(&dir.join("orders.duckdb")).unwrap();
+    let db = TableDb::open(dir.join("orders.duckdb")).unwrap();
     db.ensure_tables(&orders_v1, 1).unwrap();
     db.configure_s3(&s3()).unwrap();
     let state = LoaderState::new();

@@ -141,7 +141,7 @@ async fn setup(epoch: EpochNo) -> (TableCtx, std::path::PathBuf) {
     .await
     .unwrap();
     let dir = tmpdir(&epoch.to_string());
-    let db = TableDb::open(&dir.join("orders.duckdb")).unwrap();
+    let db = TableDb::open(dir.join("orders.duckdb")).unwrap();
     db.ensure_tables(&orders(), 1).unwrap();
     db.configure_s3(&s3()).unwrap();
     let ctx = TableCtx {

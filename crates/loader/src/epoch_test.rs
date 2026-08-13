@@ -19,7 +19,7 @@ fn orders() -> PgRelation {
 }
 
 fn open_fresh(dir: &Path) -> TableDb {
-    let db = TableDb::open(&dir.join("orders.duckdb")).unwrap();
+    let db = TableDb::open(dir.join("orders.duckdb")).unwrap();
     db.ensure_tables(&orders(), 1).unwrap();
     db
 }

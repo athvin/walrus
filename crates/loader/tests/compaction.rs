@@ -37,7 +37,7 @@ fn lsn(n: u64) -> String {
 }
 
 fn mem(rel: &PgRelation) -> TableDb {
-    let db = TableDb::open(std::path::Path::new(":memory:")).unwrap();
+    let db = TableDb::open(":memory:").unwrap();
     db.ensure_tables(rel, 1).unwrap();
     db
 }
@@ -182,7 +182,7 @@ fn rebuild_reclaims_space_and_prune_keeps_mirror_correct() {
     let rel = orders_rel();
     let t = TransformSql::from_relation(&rel);
     let dir = tmpdir("reclaim");
-    let db = TableDb::open(&dir.join("orders.duckdb")).unwrap();
+    let db = TableDb::open(dir.join("orders.duckdb")).unwrap();
     db.ensure_tables(&rel, 1).unwrap();
 
     // Seed one key incrementally, then BLOAT the mirror with UPDATE churn (each tombstones the prior row

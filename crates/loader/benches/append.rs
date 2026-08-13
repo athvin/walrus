@@ -21,7 +21,6 @@ use loader::duck::TableDb;
 use pg_to_arrow::{write_parquet_bytes, BatchBuilder};
 use std::hint::black_box;
 use std::io::Write;
-use std::path::Path;
 
 const ROWS: usize = 50_000;
 
@@ -122,7 +121,7 @@ fn bench_append(c: &mut Criterion) {
         g.bench_with_input(BenchmarkId::from_parameter(name), &rel, |b, rel| {
             b.iter_batched(
                 || {
-                    let db = TableDb::open(Path::new(":memory:")).unwrap();
+                    let db = TableDb::open(":memory:").unwrap();
                     db.ensure_tables(rel, 1).unwrap();
                     db
                 },
@@ -144,7 +143,7 @@ fn bench_describe(c: &mut Criterion) {
         let sql = format!("DESCRIBE SELECT * FROM read_parquet('{uri}')");
         g.bench_with_input(BenchmarkId::from_parameter(name), &sql, |b, sql| {
             b.iter_batched(
-                || TableDb::open(Path::new(":memory:")).unwrap(),
+                || TableDb::open(":memory:").unwrap(),
                 |db| {
                     let mut stmt = db.conn().prepare(sql).unwrap();
                     let cols: Vec<String> = stmt

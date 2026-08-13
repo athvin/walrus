@@ -51,7 +51,8 @@ impl TableDb {
     /// # Errors
     ///
     /// Returns [`LoaderError::Duck`] if DuckDB cannot open the file or acquire its writer lock.
-    pub fn open(path: &Path) -> Result<Self, LoaderError> {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, LoaderError> {
+        let path = path.as_ref();
         let conn = duckdb::Connection::open(path).map_err(|source| LoaderError::Duck {
             op: format!("open {}", path.display()),
             source,

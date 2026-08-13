@@ -256,7 +256,7 @@ async fn sigterm_mid_apply_commits_both_watermarks_and_releases_lease() {
 #[ignore = "requires a real .duckdb file (interrupt across threads)"]
 async fn in_flight_full_rebuild_is_aborted_on_sigterm() {
     let dir = tmpdir("abort");
-    let db = TableDb::open(&dir.join("orders.duckdb")).unwrap();
+    let db = TableDb::open(dir.join("orders.duckdb")).unwrap();
     db.ensure_tables(&orders(), 1).unwrap();
     let t = TransformSql::from_relation(&orders());
 

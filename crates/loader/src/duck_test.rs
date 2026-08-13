@@ -59,7 +59,7 @@ fn commit_lsns(db: &TableDb, ids: (i64, i64)) -> Vec<String> {
 #[test]
 fn table_db_moves_across_a_thread() {
     let dir = tempfile::tempdir().unwrap();
-    let db = TableDb::open(&dir.path().join("orders.duckdb")).unwrap();
+    let db = TableDb::open(dir.path().join("orders.duckdb")).unwrap();
     db.ensure_tables(&orders(), 7).unwrap();
 
     let handle = std::thread::spawn(move || db.schema_version().unwrap());
@@ -74,7 +74,7 @@ fn spill_override_stamps_lsn_end_but_verbatim_otherwise() {
     let dir = std::env::temp_dir().join("walrus-loader-spill-override");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let db = TableDb::open(&dir.join("orders.duckdb")).unwrap();
+    let db = TableDb::open(dir.join("orders.duckdb")).unwrap();
     db.ensure_tables(&orders(), 1).unwrap();
     // Local Parquet + JSON extraction need the json extension (no S3 here → configure_s3 is not called).
     db.conn.execute_batch("INSTALL json; LOAD json;").unwrap();
@@ -117,7 +117,7 @@ fn parquet_column_cache_hit_then_mutation_capable_miss() {
         .contains("let cached = { self.parquet_cols.borrow().get(&schema_version).cloned() };"));
 
     let dir = tempfile::tempdir().unwrap();
-    let db = TableDb::open(&dir.path().join("cache.duckdb")).unwrap();
+    let db = TableDb::open(dir.path().join("cache.duckdb")).unwrap();
     let parquet = write_local_fixture(dir.path(), "columns.parquet", (1, 2), "0");
 
     let initial = db.columns_for(&parquet, 1).unwrap();
