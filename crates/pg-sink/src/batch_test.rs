@@ -131,6 +131,35 @@ fn committed_rows_keep_byte_identical_batch_id_with_clone_from() {
 }
 
 #[test]
+fn on_commit_reuses_the_pending_buffer_allocation() {
+    let clock = FakeClock::new();
+    let mut b = TableBatcher::new(
+        cached(),
+        triggers(u64::MAX, u64::MAX, Duration::from_secs(3600)),
+        clock,
+    )
+    .unwrap();
+    for i in 0..64 {
+        b.push(meta("0/1"), &row(&i.to_string()));
+    }
+    let capacity = b.pending.capacity();
+    assert!(
+        capacity >= 64,
+        "pre-condition: the open transaction buffered 64 rows"
+    );
+
+    b.on_commit("0/2".parse().unwrap(), UtcTimestamp::now())
+        .unwrap();
+
+    assert!(b.pending.is_empty(), "commit promotes every pending row");
+    assert!(
+        b.pending.capacity() >= capacity,
+        "on_commit must reuse the pending allocation, got capacity {}",
+        b.pending.capacity()
+    );
+}
+
+#[test]
 fn flushes_on_byte_size_at_commit_boundary() {
     let mut b = TableBatcher::new(
         cached(),
