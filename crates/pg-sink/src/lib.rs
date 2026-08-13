@@ -14,6 +14,7 @@ pub mod config;
 pub mod consume;
 pub mod ddl;
 pub mod epoch;
+pub mod exit;
 pub mod health;
 pub mod heartbeat;
 pub mod manifest;
