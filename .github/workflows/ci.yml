@@ -116,9 +116,15 @@ jobs:
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
 
-      # Cheapest gate first: fail fast on formatting before spending time on clippy/test. There is no
-      # standalone `cargo build` step — `clippy --all-targets` type-checks every target and `test`
-      # builds + runs them, so a third dev-profile compile adds cost without new signal (PR 5.1).
+      # Cheapest gates first: fail on sub-second repository invariants, then formatting, before
+      # spending time on clippy/test. There is no standalone `cargo build` step — `clippy
+      # --all-targets` type-checks every target and `test` builds + runs them, so a third dev-profile
+      # compile adds cost without new signal (PR 5.1).
+      # Repo invariant (PR 12.6): first-party Rust never constructs fake initialized memory.
+      # `scripts/**` is in the changes filter, so editing this guard reruns the job.
+      - name: Unsafe invariants (scripts/check-unsafe-invariants.sh)
+        run: bash scripts/check-unsafe-invariants.sh
+
       - name: cargo fmt --check
         run: cargo fmt --check
 

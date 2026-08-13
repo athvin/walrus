@@ -23,6 +23,15 @@ trap cleanup_self_test EXIT
 
 scan_uninit() {
   echo "== fake initialization (${UNINIT_PATTERN}) =="
+  local hits
+  hits="$(grep -rnE --include='*.rs' "$UNINIT_PATTERN" "$@" 2>/dev/null || true)"
+  if [[ -n "$hits" ]]; then
+    printf '%s\n' "$hits" >&2
+    echo "FAIL: uninitialized-memory construction found in first-party sources." >&2
+    echo "      walrus gets uninitialized spare capacity safely via BytesMut + read_buf." >&2
+    echo "      See docs/implementation/notes/rust-skills/unsafe-maybeuninit.md" >&2
+    return 1
+  fi
   echo "   0 sites"
 }
 
@@ -66,6 +75,8 @@ self_test() {
 
 case "${1:-}" in
   "")
+    # First-party Rust source roots only. Dependency and generated-code unsafe internals are outside
+    # this policy; legitimate reserve-only calls such as `with_capacity` are not in the pattern.
     SCOPE=(crates/*/src tests/*/src)
     scan_uninit "${SCOPE[@]}"
     echo "check-unsafe-invariants: PASS"
