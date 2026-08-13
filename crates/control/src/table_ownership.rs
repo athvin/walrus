@@ -49,8 +49,7 @@ pub async fn acquire_lease(
     .bind(self_pod)
     .bind(ttl_secs as f64)
     .fetch_optional(ex)
-    .await
-    .map_err(ControlError::from_sqlx)?;
+    .await?;
     Ok(row.map(|(fencing_token, owner_pod)| Lease {
         fencing_token,
         owner_pod,
@@ -80,8 +79,7 @@ pub async fn renew_lease(
     .bind(self_pod)
     .bind(ttl_secs as f64)
     .execute(ex)
-    .await
-    .map_err(ControlError::from_sqlx)?;
+    .await?;
     Ok(done.rows_affected() > 0)
 }
 
@@ -106,7 +104,6 @@ pub async fn release_lease(
     .bind(table)
     .bind(self_pod)
     .execute(ex)
-    .await
-    .map_err(ControlError::from_sqlx)?;
+    .await?;
     Ok(())
 }

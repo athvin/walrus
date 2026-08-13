@@ -20,13 +20,12 @@ pub struct ReplicationState {
 pub async fn read_current_epoch(
     ex: impl PgExecutor<'_>,
 ) -> Result<Option<ReplicationState>, ControlError> {
-    sqlx::query_file_as!(
+    Ok(sqlx::query_file_as!(
         ReplicationState,
         "sql/postgres/queries/read_current_epoch.sql",
     )
     .fetch_optional(ex)
-    .await
-    .map_err(ControlError::from_sqlx)
+    .await?)
 }
 
 /// Insert a new generation row (a new slot). Epoch bump / total-restart lands in PR 4.6.
@@ -42,8 +41,7 @@ pub async fn insert_epoch(
         s.status,
     )
     .execute(ex)
-    .await
-    .map_err(ControlError::from_sqlx)?;
+    .await?;
     Ok(())
 }
 
@@ -66,7 +64,6 @@ pub async fn bump_epoch(
         status,
     )
     .fetch_one(ex)
-    .await
-    .map_err(ControlError::from_sqlx)?;
+    .await?;
     Ok(rec.epoch)
 }

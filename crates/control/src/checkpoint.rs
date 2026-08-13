@@ -30,7 +30,7 @@ pub async fn read_checkpoint(
     schema: &str,
     table: &str,
 ) -> Result<Option<Checkpoint>, ControlError> {
-    sqlx::query_file_as!(
+    Ok(sqlx::query_file_as!(
         Checkpoint,
         "sql/postgres/queries/read_checkpoint.sql",
         epoch,
@@ -38,8 +38,7 @@ pub async fn read_checkpoint(
         table,
     )
     .fetch_optional(ex)
-    .await
-    .map_err(ControlError::from_sqlx)
+    .await?)
 }
 
 /// Create the row at `(0/0, 0/0)` if missing; a no-op if present. Called once at loader bootstrap
@@ -58,8 +57,7 @@ pub async fn ensure_checkpoint(
         table,
     )
     .execute(ex)
-    .await
-    .map_err(ControlError::from_sqlx)?;
+    .await?;
     Ok(())
 }
 
@@ -81,8 +79,7 @@ pub async fn advance_raw_appended(
         lsn as Lsn,
     )
     .execute(ex)
-    .await
-    .map_err(ControlError::from_sqlx)?;
+    .await?;
     Ok(())
 }
 
@@ -105,7 +102,6 @@ pub async fn advance_transformed(
         lsn as Lsn,
     )
     .execute(ex)
-    .await
-    .map_err(ControlError::from_sqlx)?;
+    .await?;
     Ok(())
 }

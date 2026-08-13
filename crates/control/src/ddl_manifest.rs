@@ -52,8 +52,7 @@ pub async fn insert_ddl(
         c_columns,
     )
     .fetch_one(ex)
-    .await
-    .map_err(ControlError::from_sqlx)?;
+    .await?;
     Ok(rec.id)
 }
 
@@ -66,7 +65,7 @@ pub async fn read_pending_ddl(
     table: &str,
     after_lsn: Lsn,
 ) -> Result<Vec<DdlRow>, ControlError> {
-    sqlx::query_file_as!(
+    Ok(sqlx::query_file_as!(
         DdlRow,
         "sql/postgres/queries/read_pending_ddl.sql",
         epoch,
@@ -75,6 +74,5 @@ pub async fn read_pending_ddl(
         after_lsn as Lsn,
     )
     .fetch_all(ex)
-    .await
-    .map_err(ControlError::from_sqlx)
+    .await?)
 }

@@ -151,7 +151,7 @@ pub async fn request(
                 };
             }
         }
-        ControlError::from_sqlx(e)
+        ControlError::from(e)
     })?;
     Ok(rec.reload_id)
 }
@@ -167,7 +167,7 @@ pub async fn claim_requested(
     lease_ttl_secs: i64,
     limit: i64,
 ) -> Result<Vec<ReloadRow>, ControlError> {
-    sqlx::query_file_as!(
+    Ok(sqlx::query_file_as!(
         ReloadRow,
         "sql/postgres/queries/claim_requested.sql",
         epoch,
@@ -176,8 +176,7 @@ pub async fn claim_requested(
         limit,
     )
     .fetch_all(ex)
-    .await
-    .map_err(ControlError::from_sqlx)
+    .await?)
 }
 
 /// Return a claimed-but-never-started row to the queue: `exporting → requested`, lease cleared.
@@ -194,8 +193,7 @@ pub async fn release_claim(
 ) -> Result<bool, ControlError> {
     let done = sqlx::query_file!("sql/postgres/queries/release_claim.sql", reload_id, holder,)
         .execute(ex)
-        .await
-        .map_err(ControlError::from_sqlx)?;
+        .await?;
     Ok(done.rows_affected() > 0)
 }
 
@@ -214,8 +212,7 @@ pub async fn renew_lease(
         lease_ttl_secs as f64,
     )
     .execute(ex)
-    .await
-    .map_err(ControlError::from_sqlx)?;
+    .await?;
     Ok(done.rows_affected() > 0)
 }
 
@@ -247,8 +244,7 @@ pub async fn advance_cursor(
         schema_version,
     )
     .execute(ex)
-    .await
-    .map_err(ControlError::from_sqlx)?;
+    .await?;
     if done.rows_affected() == 0 {
         return Err(ControlError::ReloadTransition {
             reload_id,
@@ -271,8 +267,7 @@ pub async fn complete_export(
         final_lsn as Lsn,
     )
     .execute(ex)
-    .await
-    .map_err(ControlError::from_sqlx)?;
+    .await?;
     if done.rows_affected() == 0 {
         return Err(ControlError::ReloadTransition {
             reload_id,
@@ -288,8 +283,7 @@ pub async fn complete_export(
 pub async fn complete(ex: impl PgExecutor<'_>, reload_id: i64) -> Result<(), ControlError> {
     let done = sqlx::query_file!("sql/postgres/queries/complete.sql", reload_id,)
         .execute(ex)
-        .await
-        .map_err(ControlError::from_sqlx)?;
+        .await?;
     if done.rows_affected() == 0 {
         return Err(ControlError::ReloadTransition {
             reload_id,
@@ -312,11 +306,10 @@ pub async fn fail(
     reload_id: i64,
     reason: &str,
 ) -> Result<(), ControlError> {
-    let mut tx = conn.begin().await.map_err(ControlError::from_sqlx)?;
+    let mut tx = conn.begin().await?;
     let done = sqlx::query_file!("sql/postgres/queries/fail.sql", reload_id, reason,)
         .execute(&mut *tx)
-        .await
-        .map_err(ControlError::from_sqlx)?;
+        .await?;
     if done.rows_affected() == 0 {
         // Dropping `tx` rolls the savepoint/transaction back.
         return Err(ControlError::ReloadTransition {
@@ -326,9 +319,8 @@ pub async fn fail(
     }
     sqlx::query_file!("sql/postgres/queries/fail_purge_files.sql", reload_id,)
         .execute(&mut *tx)
-        .await
-        .map_err(ControlError::from_sqlx)?;
-    tx.commit().await.map_err(ControlError::from_sqlx)?;
+        .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -370,14 +362,14 @@ pub async fn restart_for_ddl(
         format!("superseded: ddl bumped schema_version to {new_schema_version}")
     };
 
-    let mut tx = conn.begin().await.map_err(ControlError::from_sqlx)?;
+    let mut tx = conn.begin().await?;
     // Reuse fail() (a savepoint inside this tx): one place owns "terminal ⇒ no claimable files".
     // The Transaction auto-derefs to the PgConnection fail() wants; its inner begin() nests as a
     // savepoint under this transaction.
     fail(&mut tx, old.reload_id, &reason).await?;
     if capped {
         // Fail-only: the reload is abandoned, its chunk files already purged by fail().
-        tx.commit().await.map_err(ControlError::from_sqlx)?;
+        tx.commit().await?;
         return Ok(None);
     }
     // The successor: copy identity + lease from the (now failed) predecessor, reset the cursor and
@@ -389,9 +381,8 @@ pub async fn restart_for_ddl(
         next_restart,
     )
     .fetch_one(&mut *tx)
-    .await
-    .map_err(ControlError::from_sqlx)?;
-    tx.commit().await.map_err(ControlError::from_sqlx)?;
+    .await?;
+    tx.commit().await?;
     Ok(Some(rec.reload_id))
 }
 
@@ -416,8 +407,7 @@ pub async fn complete_reached(
         source_table,
     )
     .fetch_all(ex)
-    .await
-    .map_err(ControlError::from_sqlx)?;
+    .await?;
     Ok(rows.into_iter().map(|r| r.reload_id).collect())
 }
 
@@ -445,8 +435,7 @@ pub async fn reload_supersede_floor(
         source_table,
     )
     .fetch_optional(ex)
-    .await
-    .map_err(ControlError::from_sqlx)?;
+    .await?;
     Ok(rec.and_then(|r| r.first_lsn))
 }
 
@@ -467,7 +456,7 @@ pub async fn adopt_resumable(
     lease_ttl_secs: i64,
     limit: i64,
 ) -> Result<Vec<ReloadRow>, ControlError> {
-    sqlx::query_file_as!(
+    Ok(sqlx::query_file_as!(
         ReloadRow,
         "sql/postgres/queries/adopt_resumable.sql",
         epoch,
@@ -476,8 +465,7 @@ pub async fn adopt_resumable(
         limit,
     )
     .fetch_all(ex)
-    .await
-    .map_err(ControlError::from_sqlx)
+    .await?)
 }
 
 /// Genuinely stuck exports (PR 6.9): `exporting` rows whose lease has expired and which nobody is
@@ -490,8 +478,7 @@ pub async fn stuck_exporting(
 ) -> Result<Vec<(i64, Option<String>)>, ControlError> {
     let rows = sqlx::query_file!("sql/postgres/queries/stuck_exporting.sql", epoch,)
         .fetch_all(ex)
-        .await
-        .map_err(ControlError::from_sqlx)?;
+        .await?;
     Ok(rows
         .into_iter()
         .map(|r| (r.reload_id, r.lease_holder))
@@ -508,10 +495,11 @@ pub async fn active_rebuilds(
     ex: impl PgExecutor<'_>,
     epoch: i64,
 ) -> Result<Vec<ReloadRow>, ControlError> {
-    sqlx::query_file_as!(ReloadRow, "sql/postgres/queries/active_rebuilds.sql", epoch,)
-        .fetch_all(ex)
-        .await
-        .map_err(ControlError::from_sqlx)
+    Ok(
+        sqlx::query_file_as!(ReloadRow, "sql/postgres/queries/active_rebuilds.sql", epoch,)
+            .fetch_all(ex)
+            .await?,
+    )
 }
 
 /// Read one reload attempt, if it exists.
@@ -519,10 +507,11 @@ pub async fn get(
     ex: impl PgExecutor<'_>,
     reload_id: i64,
 ) -> Result<Option<ReloadRow>, ControlError> {
-    sqlx::query_file_as!(ReloadRow, "sql/postgres/queries/get.sql", reload_id,)
-        .fetch_optional(ex)
-        .await
-        .map_err(ControlError::from_sqlx)
+    Ok(
+        sqlx::query_file_as!(ReloadRow, "sql/postgres/queries/get.sql", reload_id,)
+            .fetch_optional(ex)
+            .await?,
+    )
 }
 
 #[cfg(test)]

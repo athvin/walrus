@@ -40,8 +40,7 @@ pub async fn upsert_registry(
         row.columns,
     )
     .execute(ex)
-    .await
-    .map_err(ControlError::from_sqlx)?;
+    .await?;
     Ok(())
 }
 
@@ -61,8 +60,7 @@ pub async fn read_registry(
         version,
     )
     .fetch_optional(ex)
-    .await
-    .map_err(ControlError::from_sqlx)?;
+    .await?;
 
     Ok(rec.map(|r| RegistryRow {
         epoch: r.epoch,
@@ -88,8 +86,7 @@ pub async fn read_latest_version(
         table,
     )
     .fetch_one(ex)
-    .await
-    .map_err(ControlError::from_sqlx)?;
+    .await?;
     Ok(rec.max_version)
 }
 
@@ -119,27 +116,19 @@ pub async fn read_all_latest_registry(
     )
     .bind(epoch)
     .fetch_all(ex)
-    .await
-    .map_err(ControlError::from_sqlx)?;
+    .await?;
 
     rows.into_iter()
         .map(|row| {
             Ok(RegistryRow {
-                epoch: row.try_get("epoch").map_err(ControlError::from_sqlx)?,
-                source_schema: row
-                    .try_get("source_schema")
-                    .map_err(ControlError::from_sqlx)?,
-                source_table: row
-                    .try_get("source_table")
-                    .map_err(ControlError::from_sqlx)?,
-                schema_version: row
-                    .try_get("schema_version")
-                    .map_err(ControlError::from_sqlx)?,
+                epoch: row.try_get("epoch")?,
+                source_schema: row.try_get("source_schema")?,
+                source_table: row.try_get("source_table")?,
+                schema_version: row.try_get("schema_version")?,
                 descriptors: row
-                    .try_get::<Json<Vec<TypeDescriptor>>, _>("descriptors")
-                    .map_err(ControlError::from_sqlx)?
+                    .try_get::<Json<Vec<TypeDescriptor>>, _>("descriptors")?
                     .0,
-                columns: row.try_get("columns").map_err(ControlError::from_sqlx)?,
+                columns: row.try_get("columns")?,
             })
         })
         .collect()

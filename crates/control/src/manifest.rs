@@ -254,8 +254,7 @@ pub async fn delete_superseded(
         first_lsn as Lsn,
     )
     .execute(executor)
-    .await
-    .map_err(ControlError::from_sqlx)?;
+    .await?;
     Ok(done.rows_affected())
 }
 

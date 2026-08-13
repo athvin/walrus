@@ -62,8 +62,9 @@ impl ControlError {
     /// Classify a `sqlx::Error`: a CHECK violation (SQLSTATE `23514`) becomes the terminal
     /// [`ControlError::CheckViolation`]; everything else is a (possibly transient) [`Connect`].
     ///
-    /// Reached through [`From<sqlx::Error>`] on every `?`; call sites do not choose a variant.
-    pub(crate) fn from_sqlx(e: sqlx::Error) -> Self {
+    /// Private on purpose: conversion goes through `?` / [`From`], so call sites cannot skip the
+    /// classification. The reload module's constraint-specific closure delegates here as well.
+    fn from_sqlx(e: sqlx::Error) -> Self {
         if let sqlx::Error::Database(db) = &e {
             if db.code().as_deref() == Some("23514") {
                 return ControlError::CheckViolation(db.message().to_string());
