@@ -33,17 +33,21 @@ pub struct Echo {
     pub embedded_lsn: Lsn,
 }
 
+type WaiterKey = (i64, i64);
+type WaiterEntry = (u64, oneshot::Sender<Echo>);
+
 /// Registry of in-flight watermark waits, keyed by `(reload_id, chunk_no)`.
 ///
 /// Shared (`Arc`) between the decode loop (which resolves) and the exporter tasks (which
-/// subscribe, PR 6.5) — kept next to the loop's `InternalTables` wiring so no re-plumbing is
-/// needed. Senders never leak: an entry is removed on resolve, a re-subscribe for the same key
-/// replaces (drops) the stale sender, and an exporter that gives up simply drops its receiver —
-/// `resolve` on a closed channel is a quiet no-op.
+/// subscribe, PR 6.5). [`Self::subscribe`] returns a [`SubscribeGuard`] whose [`Drop`] removes its
+/// entry, including when the exporter returns before sending the signal. [`Self::resolve`] also
+/// removes the entry before delivering its echo. Each entry has a generation so dropping a stale
+/// guard after a re-subscribe cannot evict the replacement waiter.
 #[derive(Debug, Default)]
 pub struct WatermarkWaiters {
     // LOCK-CHOICE: parking_lot::Mutex — subscribe and resolve are both one-operation writes; see docs/implementation/notes/rust-skills/own-rwlock-readers.md.
-    waiters: Mutex<HashMap<(i64, i64), oneshot::Sender<Echo>>>,
+    waiters: Mutex<HashMap<WaiterKey, WaiterEntry>>,
+    next_generation: AtomicU64,
     /// Cross-check violations observed (mirrors the Prometheus counter so unit tests — which run
     /// without a recorder — can assert the count).
     crosscheck_violations: AtomicU64,
@@ -53,10 +57,34 @@ impl WatermarkWaiters {
     /// Register interest in chunk `(reload_id, chunk_no)`'s echo. Call BEFORE inserting the
     /// signal row (subscribe-then-insert). A duplicate subscribe replaces the stale sender —
     /// the previous receiver resolves as `Err(Closed)`, which the exporter treats as superseded.
-    pub fn subscribe(&self, reload_id: i64, chunk_no: i64) -> oneshot::Receiver<Echo> {
+    pub fn subscribe(&self, reload_id: i64, chunk_no: i64) -> SubscribeGuard<'_> {
         let (tx, rx) = oneshot::channel();
-        self.waiters.lock().insert((reload_id, chunk_no), tx);
-        rx
+        let key = (reload_id, chunk_no);
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        self.waiters.lock().insert(key, (generation, tx));
+        SubscribeGuard {
+            waiters: self,
+            key,
+            generation,
+            rx,
+        }
+    }
+
+    /// Remove `key` only if it still holds `generation`; a stale guard must not evict the live
+    /// waiter that replaced it.
+    fn unsubscribe(&self, key: WaiterKey, generation: u64) {
+        let mut waiters = self.waiters.lock();
+        if waiters
+            .get(&key)
+            .is_some_and(|(stored_generation, _)| *stored_generation == generation)
+        {
+            waiters.remove(&key);
+        }
+    }
+
+    /// Number of in-flight watermark waits.
+    pub fn waiter_count(&self) -> usize {
+        self.waiters.lock().len()
     }
 
     /// Deliver an echo from the consume path (at the `Commit` of a transaction that carried a
@@ -82,7 +110,7 @@ impl WatermarkWaiters {
         // removal first so logging and sender notification never hold the registry lock.
         let waiter = self.waiters.lock().remove(&(reload_id, chunk_no));
         match waiter {
-            Some(tx) => {
+            Some((_, tx)) => {
                 if tx.send(echo).is_err() {
                     // The exporter gave up (timeout) and dropped its receiver — fine.
                     tracing::debug!(reload_id, chunk_no, "echo resolved after waiter gave up");
@@ -105,6 +133,47 @@ impl WatermarkWaiters {
     /// Cross-check violations seen so far (the unit-testable mirror of the Prometheus counter).
     pub fn crosscheck_violations(&self) -> u64 {
         self.crosscheck_violations.load(Ordering::Relaxed)
+    }
+}
+
+/// An in-flight watermark subscription. Awaiting the guard awaits its echo; dropping it removes
+/// the matching registry entry.
+#[derive(Debug)]
+pub struct SubscribeGuard<'a> {
+    waiters: &'a WatermarkWaiters,
+    key: WaiterKey,
+    generation: u64,
+    rx: oneshot::Receiver<Echo>,
+}
+
+impl std::ops::Deref for SubscribeGuard<'_> {
+    type Target = oneshot::Receiver<Echo>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.rx
+    }
+}
+
+impl std::ops::DerefMut for SubscribeGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.rx
+    }
+}
+
+impl std::future::Future for SubscribeGuard<'_> {
+    type Output = Result<Echo, oneshot::error::RecvError>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::future::Future::poll(std::pin::Pin::new(&mut self.get_mut().rx), cx)
+    }
+}
+
+impl Drop for SubscribeGuard<'_> {
+    fn drop(&mut self) {
+        self.waiters.unsubscribe(self.key, self.generation);
     }
 }
 
