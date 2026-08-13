@@ -1,4 +1,5 @@
 use super::*;
+use std::num::NonZeroU32;
 
 fn col(name: &str, oid: u32, typmod: i32) -> PgColumn {
     PgColumn {
@@ -48,8 +49,11 @@ fn char_n_descriptor_carries_char_length() {
     // char(5) → bpchar, typmod = 5 + VARHDRSZ(4) = 9.
     let d = describe_column(&col("code", oids::BPCHAR, 9));
     assert_eq!(d.tier, Tier::One);
-    assert_eq!(d.meta.char_length, Some(5));
+    assert_eq!(d.meta.char_length, NonZeroU32::new(5));
     assert_eq!(d.emit, vec!["code:VARCHAR"]);
+
+    let invalid = describe_column(&col("code", oids::BPCHAR, 4));
+    assert_eq!(invalid.meta.char_length, None);
 }
 
 #[test]
@@ -57,7 +61,10 @@ fn bit_descriptor_carries_bit_length() {
     // bit(8): atttypmod is the raw bit count (no VARHDRSZ), and it's a Tier-3 VARCHAR carrier.
     let d = describe_column(&col("flags", oids::BIT, 8));
     assert_eq!(d.tier, Tier::Three);
-    assert_eq!(d.meta.bit_length, Some(8));
+    assert_eq!(d.meta.bit_length, NonZeroU32::new(8));
+
+    let invalid = describe_column(&col("flags", oids::BIT, 0));
+    assert_eq!(invalid.meta.bit_length, None);
 }
 
 #[test]

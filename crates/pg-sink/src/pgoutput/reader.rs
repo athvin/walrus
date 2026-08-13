@@ -5,6 +5,11 @@ use super::error::DecodeError;
 use bytes::Bytes;
 use common::Lsn;
 
+/// A pgoutput frame is `Int32`-bounded. Saturating keeps malformed-input errors infallible.
+pub(super) fn u32c(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
 /// Cursor over one message's bytes.
 #[derive(Debug, Clone)]
 pub struct Reader<'a> {
@@ -32,9 +37,9 @@ impl<'a> Reader<'a> {
     fn need(&self, n: usize) -> Result<(), DecodeError> {
         if self.remaining() < n {
             Err(DecodeError::UnexpectedEof {
-                needed: n,
-                offset: self.pos,
-                remaining: self.remaining(),
+                needed: u32c(n),
+                offset: u32c(self.pos),
+                remaining: u32c(self.remaining()),
             })
         } else {
             Ok(())
@@ -63,8 +68,8 @@ impl<'a> Reader<'a> {
         let arr: [u8; 2] = self.buf[self.pos..self.pos + 2].try_into().map_err(|_| {
             DecodeError::UnexpectedEof {
                 needed: 2,
-                offset: self.pos,
-                remaining: self.remaining(),
+                offset: u32c(self.pos),
+                remaining: u32c(self.remaining()),
             }
         })?;
         self.pos += 2;
@@ -81,8 +86,8 @@ impl<'a> Reader<'a> {
         let arr: [u8; 4] = self.buf[self.pos..self.pos + 4].try_into().map_err(|_| {
             DecodeError::UnexpectedEof {
                 needed: 4,
-                offset: self.pos,
-                remaining: self.remaining(),
+                offset: u32c(self.pos),
+                remaining: u32c(self.remaining()),
             }
         })?;
         self.pos += 4;
@@ -100,8 +105,8 @@ impl<'a> Reader<'a> {
         let arr: [u8; 8] = self.buf[self.pos..self.pos + 8].try_into().map_err(|_| {
             DecodeError::UnexpectedEof {
                 needed: 8,
-                offset: self.pos,
-                remaining: self.remaining(),
+                offset: u32c(self.pos),
+                remaining: u32c(self.remaining()),
             }
         })?;
         self.pos += 8;
@@ -124,8 +129,8 @@ impl<'a> Reader<'a> {
             }
             None => Err(DecodeError::UnexpectedEof {
                 needed: 1,
-                offset: start,
-                remaining: self.remaining(),
+                offset: u32c(start),
+                remaining: u32c(self.remaining()),
             }),
         }
     }

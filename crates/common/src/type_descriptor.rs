@@ -7,6 +7,7 @@
 //! operation rather than a guess.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::num::NonZeroU32;
 
 /// The three-tier mapping model (walrus-pg-sink.md §2.2). Serializes as the **integer** `1 | 2 | 3`
 /// to match the `"tier": 2` form in the §2.6 descriptor JSON (not the string `"2"`).
@@ -55,13 +56,20 @@ impl<'de> Deserialize<'de> for Tier {
 pub struct TypeMeta {
     /// Ordered label set for an `enum`.
     pub enum_labels: Option<Vec<String>>,
-    /// `n` for `bit(n)` / `varbit(n)`.
-    pub bit_length: Option<u32>,
-    /// `n` (+ bpchar padding) for `char(n)` / `varchar(n)`.
-    pub char_length: Option<u32>,
-    /// `lc_monetary` fractional digits for `money`.
+    /// `n` for `bit(n)` / `varbit(n)`; zero is invalid and becomes the `None` niche.
+    pub bit_length: Option<NonZeroU32>,
+    /// `n` (+ bpchar padding) for `char(n)` / `varchar(n)`; zero is likewise invalid.
+    pub char_length: Option<NonZeroU32>,
+    /// `lc_monetary` fractional digits for `money`. Zero is legal (for example, JPY), so this
+    /// intentionally remains `Option<u32>`.
     pub money_fraction_digits: Option<u32>,
 }
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+    std::mem::size_of::<TypeMeta>() == 40,
+    "TypeMeta: one per source column"
+);
 
 /// Per-column mapping descriptor written to `schema_registry` (§2.6).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

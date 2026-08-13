@@ -1,4 +1,5 @@
 use super::*;
+use std::num::NonZeroU32;
 
 /// The walrus-pg-sink.md §2.6 interval descriptor, comment-free.
 const DOCS_DESCRIPTOR: &str = r#"{
@@ -87,4 +88,25 @@ fn type_meta_carries_enum_labels() {
         serde_json::from_str(&serde_json::to_string(&meta).unwrap()).unwrap();
     assert_eq!(v["enum_labels"], serde_json::json!(["happy", "meh", "sad"]));
     assert_eq!(v["bit_length"], serde_json::Value::Null);
+}
+
+#[test]
+fn type_meta_nonzero_lengths_keep_the_json_number_shape() {
+    let meta = TypeMeta {
+        bit_length: NonZeroU32::new(8),
+        char_length: NonZeroU32::new(5),
+        ..TypeMeta::default()
+    };
+    let value = serde_json::to_value(&meta).unwrap();
+    assert_eq!(value["bit_length"], serde_json::json!(8));
+    assert_eq!(value["char_length"], serde_json::json!(5));
+    assert_eq!(serde_json::from_value::<TypeMeta>(value).unwrap(), meta);
+
+    let invalid = serde_json::json!({
+        "enum_labels": null,
+        "bit_length": 0,
+        "char_length": null,
+        "money_fraction_digits": null
+    });
+    assert!(serde_json::from_value::<TypeMeta>(invalid).is_err());
 }

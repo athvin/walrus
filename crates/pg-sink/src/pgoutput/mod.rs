@@ -473,7 +473,9 @@ pub fn parse_message(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Mes
     let msg = parse_one(reader, ctx)?;
     let unconsumed = reader.remaining();
     if unconsumed != 0 {
-        return Err(DecodeError::TrailingBytes { unconsumed });
+        return Err(DecodeError::TrailingBytes {
+            unconsumed: reader::u32c(unconsumed),
+        });
     }
     Ok(msg)
 }

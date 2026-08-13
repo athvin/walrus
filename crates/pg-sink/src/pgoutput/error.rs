@@ -4,11 +4,12 @@
 /// stringly-typed) so callers can branch on them; several are used from later PRs (2.3/2.4).
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 pub enum DecodeError {
+    /// Widths match pgoutput's `Int32` frame bound, keeping this per-byte error path compact.
     #[error("unexpected end of message: needed {needed}B at offset {offset}, {remaining} left")]
     UnexpectedEof {
-        needed: usize,
-        offset: usize,
-        remaining: usize,
+        needed: u32,
+        offset: u32,
+        remaining: u32,
     },
     #[error("unknown message type byte {byte:#04x}")]
     UnknownMessage { byte: u8 },
@@ -19,11 +20,11 @@ pub enum DecodeError {
     #[error("invalid UTF-8 in String field")]
     Utf8(#[from] std::str::Utf8Error),
     #[error("{unconsumed} trailing bytes after a complete message")]
-    TrailingBytes { unconsumed: usize },
+    TrailingBytes { unconsumed: u32 },
 }
 
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(
-    std::mem::size_of::<DecodeError>() == 32,
+    std::mem::size_of::<DecodeError>() == 24,
     "DecodeError crosses the pgoutput frame decode path"
 );

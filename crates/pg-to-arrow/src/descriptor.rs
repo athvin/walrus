@@ -13,6 +13,7 @@ use crate::range::RangeFamily;
 use crate::{geometric, oids, schema, tier3, uuid_enum};
 use arrow::datatypes::DataType;
 use common::{PgColumn, PgRelation, Tier, TypeDescriptor, TypeMeta};
+use std::num::NonZeroU32;
 
 /// Derive the per-column mapping descriptor (§2.6). Enum `enum_labels` are caller-supplied (the sink
 /// hydrates them from the catalog in PR 2.22); use [`describe_column_with_labels`] to pass them.
@@ -100,13 +101,17 @@ fn meta_of(col: &PgColumn, enum_labels: Option<Vec<String>>) -> TypeMeta {
     if uuid_enum::is_enum_oid(col.type_oid) {
         meta.enum_labels = enum_labels;
     }
-    // bit(n)/varbit(n): atttypmod IS the bit count (no VARHDRSZ header).
-    if (col.type_oid == oids::BIT || col.type_oid == oids::VARBIT) && col.type_modifier >= 0 {
-        meta.bit_length = Some(col.type_modifier as u32);
+    // bit(n)/varbit(n): atttypmod IS the bit count (no VARHDRSZ header); zero is invalid.
+    if (col.type_oid == oids::BIT || col.type_oid == oids::VARBIT) && col.type_modifier > 0 {
+        meta.bit_length = u32::try_from(col.type_modifier)
+            .ok()
+            .and_then(NonZeroU32::new);
     }
-    // char(n)/varchar(n): atttypmod is n + VARHDRSZ (4).
-    if (col.type_oid == oids::BPCHAR || col.type_oid == oids::VARCHAR) && col.type_modifier >= 4 {
-        meta.char_length = Some((col.type_modifier - 4) as u32);
+    // char(n)/varchar(n): atttypmod is n + VARHDRSZ (4); zero is invalid.
+    if (col.type_oid == oids::BPCHAR || col.type_oid == oids::VARCHAR) && col.type_modifier > 4 {
+        meta.char_length = u32::try_from(col.type_modifier - 4)
+            .ok()
+            .and_then(NonZeroU32::new);
     }
     meta
 }
