@@ -345,8 +345,8 @@ pub fn apply_destructive(
 ///
 /// Returns [`LoaderError::Internal`] if removing an existing file fails for any reason other than
 /// `NotFound`.
-pub fn retire_file(path: &std::path::Path) -> Result<(), LoaderError> {
-    match std::fs::remove_file(path) {
+pub async fn retire_file(path: &std::path::Path) -> Result<(), LoaderError> {
+    match tokio::fs::remove_file(path).await {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(LoaderError::Internal(format!(

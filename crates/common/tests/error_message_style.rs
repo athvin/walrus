@@ -1,7 +1,9 @@
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
-    reason = "integration test — unwrap/expect fine in setup + helpers"
+    clippy::disallowed_methods,
+    reason = "integration test — unwrap/expect are setup assertions; synchronous source scans are \
+              themselves repository-policy checks, not runtime I/O"
 )]
 //! Conformance gate for `err-lowercase-msg` (PR 10.7): every production `#[error("…")]` literal
 //! starts lowercase (or with an allow-listed acronym) and carries no trailing sentence punctuation,

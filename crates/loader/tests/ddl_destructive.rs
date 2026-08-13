@@ -174,8 +174,8 @@ fn lossy_type_change_widens_raw_to_varchar_without_recasting() {
 }
 
 // ---- DROP TABLE: retire both DuckDB tables + the .duckdb file (idempotent). ----
-#[test]
-fn drop_table_retires_both_tables_and_the_file() {
+#[tokio::test]
+async fn drop_table_retires_both_tables_and_the_file() {
     let dir = tmpdir("drop");
     let path = dir.join("orders.duckdb");
     {
@@ -201,9 +201,9 @@ fn drop_table_retires_both_tables_and_the_file() {
     } // drop the connection → release the DuckDB file lock
 
     assert!(path.exists(), "file present until explicitly retired");
-    retire_file(&path).unwrap();
+    retire_file(&path).await.unwrap();
     assert!(!path.exists(), "the .duckdb file is retired");
-    retire_file(&path).unwrap(); // idempotent — a crash-mid-retire re-run is a no-op
+    retire_file(&path).await.unwrap(); // idempotent — a crash-mid-retire re-run is a no-op
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -1,7 +1,9 @@
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
-    reason = "integration test — unwrap/expect fine in setup + helpers"
+    clippy::disallowed_methods,
+    reason = "integration test — unwrap/expect are setup assertions; synchronous manifest and \
+              clippy-config reads are themselves repository-policy checks, not runtime I/O"
 )]
 //! Guard for `err-no-unwrap-prod` (PR 10.11). `[workspace.lints]` is a default a member must
 //! *request*: without `[lints] workspace = true` in its own manifest, a crate silently opts out of

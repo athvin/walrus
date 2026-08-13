@@ -2,3 +2,15 @@ allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true
 enum-variant-size-threshold = 64
+
+# Blocking file I/O has no place in an async function: `tokio::fs` runs the same operation on the
+# blocking pool instead of parking an executor thread. Directory setup/teardown is deliberately
+# omitted because workspace integration tests use it synchronously for temporary fixtures.
+disallowed-methods = [
+  { path = "std::fs::read", reason = "blocking in async; use tokio::fs::read" },
+  { path = "std::fs::read_to_string", reason = "blocking in async; use tokio::fs::read_to_string" },
+  { path = "std::fs::write", reason = "blocking in async; use tokio::fs::write" },
+  { path = "std::fs::remove_file", reason = "blocking in async; use tokio::fs::remove_file" },
+  { path = "std::fs::File::open", reason = "blocking in async; use tokio::fs::File::open" },
+  { path = "std::fs::File::create", reason = "blocking in async; use tokio::fs::File::create" },
+]
