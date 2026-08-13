@@ -22,18 +22,21 @@ pub struct Reader<'a> {
 impl<'a> Reader<'a> {
     /// Wrap a byte slice at position 0.
     #[must_use]
+    #[inline]
     pub fn new(buf: &'a [u8]) -> Self {
         Reader { buf, pos: 0 }
     }
 
     /// Bytes left to read.
     #[must_use]
+    #[inline]
     pub fn remaining(&self) -> usize {
         self.buf.len() - self.pos
     }
 
     /// The next byte without consuming it (`None` at end of buffer).
     #[must_use]
+    #[inline]
     pub fn peek(&self) -> Option<u8> {
         self.buf.get(self.pos).copied()
     }
@@ -57,6 +60,7 @@ impl<'a> Reader<'a> {
     /// # Errors
     ///
     /// Returns [`DecodeError::UnexpectedEof`] when no byte remains.
+    #[inline]
     pub fn byte1(&mut self) -> Result<u8, DecodeError> {
         // `need(1)` returns exactly one byte, so the total fallback cannot be reached.
         let b = self.need(1)?.first().copied().unwrap_or_default();
@@ -144,6 +148,7 @@ impl<'a> Reader<'a> {
     /// # Errors
     ///
     /// Returns [`DecodeError::UnexpectedEof`] when fewer than `n` bytes remain.
+    #[inline]
     pub fn slice(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
         let out = self.need(n)?;
         self.pos += n;
@@ -156,6 +161,7 @@ impl<'a> Reader<'a> {
     ///
     /// Returns [`DecodeError::UnexpectedEof`] for a short read or [`DecodeError::Utf8`] for invalid
     /// UTF-8.
+    #[inline]
     pub fn str(&mut self, n: usize) -> Result<&'a str, DecodeError> {
         Ok(std::str::from_utf8(self.slice(n)?)?)
     }
@@ -165,6 +171,7 @@ impl<'a> Reader<'a> {
     /// # Errors
     ///
     /// Returns [`DecodeError::UnexpectedEof`] when fewer than `n` bytes remain.
+    #[inline]
     pub fn take(&mut self, n: usize) -> Result<Bytes, DecodeError> {
         Ok(Bytes::from(self.slice(n)?.to_vec()))
     }
@@ -174,6 +181,7 @@ impl<'a> Reader<'a> {
     /// # Errors
     ///
     /// Returns [`DecodeError::UnexpectedEof`] when the eight-byte LSN is truncated.
+    #[inline]
     pub fn lsn(&mut self) -> Result<Lsn, DecodeError> {
         Ok(Lsn::new(self.int64()? as u64))
     }

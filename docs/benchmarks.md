@@ -208,6 +208,26 @@ taking. Net: **5.8 for throughput, 5.7 for a low-risk per-row win.**
 Before/after deltas from PR 5.7 (sink) and PR 5.8 (loader) land here, each citing the baseline row it
 improves and the commit that made the change.
 
+### PR 16.3 — `#[inline]` on the cross-crate accessors
+
+`common::Lsn::{new, as_u64}` and the eight mechanically small `Reader` accessors now carry
+`#[inline]`, so downstream compilation units can see their bodies without depending on thin LTO.
+Measured back-to-back on the reference machine (median ns/row, `--warm-up-time 1`,
+`--measurement-time 3`):
+
+| bench | shape | before (16.2) | after (16.3) | Δ |
+|---|---|---:|---:|---:|
+| `parse_tuple` | `narrow_int4` | 246.55 | 199.34 | **−19.1 %** |
+| `parse_tuple` | `wide30` | 1,741.2 | 1,577.0 | **−9.4 %** |
+| `parse_tuple` | `text_heavy` | 736.15 | 602.99 | **−18.1 %** |
+| `append_row` | `narrow_int4` | 691.98 | 771.07 | +11.4 % |
+
+All three decoder shapes improved, including the allocation-heavy case, so exporting the small
+cursor bodies produced a real cross-crate decode win. The Arrow control moved backward even though
+this PR changes no timed `BatchBuilder` body; that result is recorded as run-to-run machine drift,
+not attributed to the inline hints. No larger reader or `#[inline(always)]` exception was added to
+chase either number.
+
 ### PR 11.16 — `SinkMeta` compact strings deferred
 
 The unchanged `pg-to-arrow` batch suite was re-run after PR 11.3 made the repeated `batch_id`

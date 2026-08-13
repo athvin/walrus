@@ -20,16 +20,20 @@ pub struct Lsn(u64);
 
 impl Lsn {
     /// The zero LSN — orders below every nonzero LSN.
+    ///
+    /// This is an associated constant, not a function, so it has no call site to inline.
     pub const ZERO: Lsn = Lsn(0);
 
     /// Wrap a raw `u64` WAL position.
     #[must_use]
+    #[inline]
     pub const fn new(raw: u64) -> Self {
         Lsn(raw)
     }
 
     /// The raw `u64` WAL position.
     #[must_use]
+    #[inline]
     pub const fn as_u64(self) -> u64 {
         self.0
     }
