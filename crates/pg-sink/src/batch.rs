@@ -142,7 +142,8 @@ impl TableBatcher {
         }
         self.first_commit_lsn.get_or_insert(commit_lsn);
         self.last_commit_lsn = commit_lsn;
-        for (mut meta, values) in std::mem::take(&mut self.pending) {
+        // Draining keeps the allocation so the next transaction refills the same pending buffer.
+        for (mut meta, values) in self.pending.drain(..) {
             meta.commit_lsn = commit_lsn;
             meta.commit_ts = commit_ts;
             meta.batch_id.clone_from(&self.batch_id);

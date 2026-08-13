@@ -80,6 +80,8 @@ pub struct BatchBuilder {
     meta_const: Option<String>,
     /// Reused scratch for assembling each row's `{const,row}` meta JSON (avoids a per-row alloc).
     meta_buf: String,
+    /// Reused scratch for RFC-3339 candidates handed to `jiff`, cleared and refilled per cell.
+    ts_buf: String,
 }
 
 impl BatchBuilder {
@@ -110,6 +112,7 @@ impl BatchBuilder {
             rows: 0,
             meta_const: None,
             meta_buf: String::new(),
+            ts_buf: String::new(),
         })
     }
 
@@ -134,7 +137,12 @@ impl BatchBuilder {
         for (emit, value) in self.plan.iter().zip(values) {
             match emit {
                 Emit::Scalar => {
-                    append_value(self.builders[bi].as_mut(), &fields[bi], value)?;
+                    append_value(
+                        self.builders[bi].as_mut(),
+                        &fields[bi],
+                        value,
+                        &mut self.ts_buf,
+                    )?;
                     bi += 1;
                 }
                 Emit::Interval => {
@@ -146,11 +154,21 @@ impl BatchBuilder {
                     bi += 2;
                 }
                 Emit::Range => {
-                    append_range(&mut self.builders[bi..bi + 5], &fields[bi..bi + 5], value)?;
+                    append_range(
+                        &mut self.builders[bi..bi + 5],
+                        &fields[bi..bi + 5],
+                        value,
+                        &mut self.ts_buf,
+                    )?;
                     bi += 5;
                 }
                 Emit::Multirange => {
-                    append_multirange(self.builders[bi].as_mut(), &fields[bi], value)?;
+                    append_multirange(
+                        self.builders[bi].as_mut(),
+                        &fields[bi],
+                        value,
+                        &mut self.ts_buf,
+                    )?;
                     bi += 1;
                 }
                 Emit::Geometric(kind) => {
@@ -278,6 +296,7 @@ fn append_value(
     builder: &mut dyn ArrayBuilder,
     field: &Field,
     value: &TupleValue,
+    scratch: &mut String,
 ) -> Result<(), Error> {
     let col: &str = field.name();
     let dt = field.data_type();
@@ -325,14 +344,14 @@ fn append_value(
             let b = downcast!(builder, Date32Builder, col);
             match is_null {
                 true => b.append_null(),
-                false => b.append_value(parse_date_days(text(value, col, dt)?, col)?),
+                false => b.append_value(parse_date_days(text(value, col, dt)?, col, scratch)?),
             }
         }
         DataType::Time64(TimeUnit::Microsecond) => {
             let b = downcast!(builder, Time64MicrosecondBuilder, col);
             match is_null {
                 true => b.append_null(),
-                false => b.append_value(parse_time_micros(text(value, col, dt)?, col)?),
+                false => b.append_value(parse_time_micros(text(value, col, dt)?, col, scratch)?),
             }
         }
         DataType::Timestamp(TimeUnit::Microsecond, tz) => {
@@ -344,7 +363,7 @@ fn append_value(
                     let micros = if tz.is_some() {
                         parse_timestamptz_micros(s, col)?
                     } else {
-                        parse_timestamp_micros(s, col)?
+                        parse_timestamp_micros(s, col, scratch)?
                     };
                     b.append_value(micros);
                 }
@@ -439,12 +458,13 @@ fn append_range(
     builders: &mut [Box<dyn ArrayBuilder>],
     fields: &[FieldRef],
     value: &TupleValue,
+    scratch: &mut String,
 ) -> Result<(), Error> {
     let col = fields[0].name();
     if matches!(value, TupleValue::Null | TupleValue::UnchangedToast) {
         // Whole-column NULL → every sibling null (bounds via append_value, flags via BooleanBuilder).
-        append_value(builders[0].as_mut(), &fields[0], &TupleValue::Null)?;
-        append_value(builders[1].as_mut(), &fields[1], &TupleValue::Null)?;
+        append_value(builders[0].as_mut(), &fields[0], &TupleValue::Null, scratch)?;
+        append_value(builders[1].as_mut(), &fields[1], &TupleValue::Null, scratch)?;
         for b in builders[2..5].iter_mut() {
             bool_builder(b.as_mut(), col)?.append_null();
         }
@@ -456,11 +476,13 @@ fn append_range(
         builders[0].as_mut(),
         &fields[0],
         &opt_text_value(r.lower.as_deref()),
+        scratch,
     )?;
     append_value(
         builders[1].as_mut(),
         &fields[1],
         &opt_text_value(r.upper.as_deref()),
+        scratch,
     )?;
     bool_builder(builders[2].as_mut(), col)?.append_value(r.lower_inc);
     bool_builder(builders[3].as_mut(), col)?.append_value(r.upper_inc);
@@ -475,6 +497,7 @@ fn append_multirange(
     builder: &mut dyn ArrayBuilder,
     field: &Field,
     value: &TupleValue,
+    scratch: &mut String,
 ) -> Result<(), Error> {
     let col = field.name();
     let lb = downcast!(builder, ListBuilder<StructBuilder>, col);
@@ -487,8 +510,8 @@ fn append_multirange(
     {
         let sb = lb.values();
         for m in &members {
-            append_struct_bound(sb, 0, &elem, m.lower.as_deref(), col)?;
-            append_struct_bound(sb, 1, &elem, m.upper.as_deref(), col)?;
+            append_struct_bound(sb, 0, &elem, m.lower.as_deref(), col, scratch)?;
+            append_struct_bound(sb, 1, &elem, m.upper.as_deref(), col, scratch)?;
             struct_field::<BooleanBuilder>(sb, 2, col)?.append_value(m.lower_inc);
             struct_field::<BooleanBuilder>(sb, 3, col)?.append_value(m.upper_inc);
             sb.append(true);
@@ -517,6 +540,7 @@ fn append_struct_bound(
     dt: &DataType,
     bound: Option<&str>,
     col: &str,
+    scratch: &mut String,
 ) -> Result<(), Error> {
     match dt {
         DataType::Int32 => {
@@ -547,14 +571,14 @@ fn append_struct_bound(
         DataType::Date32 => {
             let b = struct_field::<Date32Builder>(sb, idx, col)?;
             match bound {
-                Some(s) => b.append_value(parse_date_days(s, col)?),
+                Some(s) => b.append_value(parse_date_days(s, col, scratch)?),
                 None => b.append_null(),
             }
         }
         DataType::Timestamp(TimeUnit::Microsecond, tz) => {
             let micros = match bound {
                 Some(s) if tz.is_some() => Some(parse_timestamptz_micros(s, col)?),
-                Some(s) => Some(parse_timestamp_micros(s, col)?),
+                Some(s) => Some(parse_timestamp_micros(s, col, scratch)?),
                 None => None,
             };
             let b = struct_field::<TimestampMicrosecondBuilder>(sb, idx, col)?;
@@ -870,22 +894,33 @@ fn value_err(col: &str, s: &str, dt: &str) -> Error {
     }
 }
 
-/// `"2024-01-02"` → days since 1970-01-01.
-fn parse_date_days(s: &str, col: &str) -> Result<i32, Error> {
-    let micros =
-        rfc3339_micros(&format!("{s}T00:00:00Z")).ok_or_else(|| value_err(col, s, "Date32"))?;
+/// `"2024-01-02"` → days since 1970-01-01, using a cleared and reused RFC-3339 scratch buffer.
+fn parse_date_days(s: &str, col: &str, scratch: &mut String) -> Result<i32, Error> {
+    scratch.clear();
+    scratch.push_str(s);
+    scratch.push_str("T00:00:00Z");
+    let micros = rfc3339_micros(scratch).ok_or_else(|| value_err(col, s, "Date32"))?;
     i32::try_from(micros / 86_400_000_000).map_err(|_| value_err(col, s, "Date32"))
 }
 
 /// `"03:04:05.678901"` → micros since midnight.
-fn parse_time_micros(s: &str, col: &str) -> Result<i64, Error> {
-    rfc3339_micros(&format!("1970-01-01T{s}Z")).ok_or_else(|| value_err(col, s, "Time64"))
+fn parse_time_micros(s: &str, col: &str, scratch: &mut String) -> Result<i64, Error> {
+    scratch.clear();
+    scratch.push_str("1970-01-01T");
+    scratch.push_str(s);
+    scratch.push('Z');
+    rfc3339_micros(scratch).ok_or_else(|| value_err(col, s, "Time64"))
 }
 
 /// `"2024-01-02 03:04:05.678901"` (no offset) → micros since epoch, treated as UTC.
-fn parse_timestamp_micros(s: &str, col: &str) -> Result<i64, Error> {
-    let normalized = s.replacen(' ', "T", 1);
-    rfc3339_micros(&format!("{normalized}Z")).ok_or_else(|| value_err(col, s, "Timestamp"))
+fn parse_timestamp_micros(s: &str, col: &str, scratch: &mut String) -> Result<i64, Error> {
+    scratch.clear();
+    scratch.push_str(s);
+    if let Some(i) = scratch.find(' ') {
+        scratch.replace_range(i..i + 1, "T");
+    }
+    scratch.push('Z');
+    rfc3339_micros(scratch).ok_or_else(|| value_err(col, s, "Timestamp"))
 }
 
 /// Canonical Postgres `timestamptz` (`"…+00"`, already UTC upstream) → micros since epoch.
