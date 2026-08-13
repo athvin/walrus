@@ -123,6 +123,11 @@ async fn scrub(pool: &sqlx::PgPool, epoch: EpochNo) {
 /// The decode-loop half of echo-wait, minimally: resolve signal echoes against `waiters`, and
 /// report the commit LSN of any transaction that carried a change on `watch_oid`'s table (the
 /// overlap/no-stall probe). Runs until cancelled.
+///
+/// The overlap probe consumes only the first matching LSN. A capacity of 64 provides diagnostic
+/// slack beyond a test's expected handful of watch-table commits while bounding retained messages.
+const WATCH_LSN_CAPACITY: usize = 64;
+
 fn spawn_echo_resolver(
     slot: &'static str,
     waiters: Arc<WatermarkWaiters>,
@@ -130,9 +135,9 @@ fn spawn_echo_resolver(
     token: CancellationToken,
 ) -> (
     tokio::task::JoinHandle<()>,
-    tokio::sync::mpsc::UnboundedReceiver<Lsn>,
+    tokio::sync::mpsc::Receiver<Lsn>,
 ) {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::mpsc::channel(WATCH_LSN_CAPACITY);
     let handle = tokio::spawn(async move {
         let admin = admin().await;
         drop_slot(&admin, slot).await;
@@ -179,7 +184,14 @@ fn spawn_echo_resolver(
                 Message::Commit { commit_lsn, .. } => {
                     pending.on_commit(*commit_lsn, &waiters);
                     if std::mem::take(&mut txn_touched_watch) {
-                        let _ = tx.send(*commit_lsn);
+                        // Never park the echo resolver: a blocked `send().await` would stop
+                        // watermark resolution and misreport an exporter echo timeout. Full means
+                        // the probe already has earlier overlap evidence; Closed means it finished.
+                        match tx.try_send(*commit_lsn) {
+                            Ok(())
+                            | Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+                            | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+                        }
                     }
                 }
                 _ => {}
