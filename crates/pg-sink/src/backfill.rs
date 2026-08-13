@@ -32,6 +32,10 @@ struct CtidRangePlan {
 /// and worker count. v1 runs one serial `COPY` per table; see the module docs and
 /// `docs/deferred-goals.md`.
 #[allow(dead_code)]
+#[expect(
+    clippy::unimplemented,
+    reason = "deferred goal — parallel CTID-range backfill; see docs/deferred-goals.md"
+)]
 fn plan_ctid_ranges(_table: &str) -> CtidRangePlan {
     unimplemented!("deferred goal — parallel CTID-range backfill; see docs/deferred-goals.md")
 }

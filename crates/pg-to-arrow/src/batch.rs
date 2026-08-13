@@ -299,15 +299,11 @@ fn append_value(
         }
         DataType::Binary => {
             let b = downcast!(builder, BinaryBuilder, col);
-            if is_null {
-                b.append_null();
-            } else {
-                match value {
-                    TupleValue::Binary(bytes) => b.append_value(bytes),
-                    // bytea text is `\x…` hex under text mode.
-                    TupleValue::Text(s) => b.append_value(&parse_bytea(s, col)?),
-                    _ => unreachable!("is_null covers Null/UnchangedToast"),
-                }
+            match value {
+                TupleValue::Null | TupleValue::UnchangedToast => b.append_null(),
+                TupleValue::Binary(bytes) => b.append_value(bytes),
+                // bytea text is `\x…` hex under text mode.
+                TupleValue::Text(s) => b.append_value(&parse_bytea(s, col)?),
             }
         }
         DataType::Date32 => {

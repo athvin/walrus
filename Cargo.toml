@@ -29,6 +29,11 @@ trivially_copy_pass_by_ref = "deny"
 # and integration `tests/`; benches (`harness = false`) and the e2e harness lib carry a file-level allow.
 unwrap_used = "deny"
 expect_used = "deny"
+panic = "deny"              # a service returns a classified error instead of aborting the pod
+todo = "deny"               # unfinished code must not reach main
+unimplemented = "deny"      # the one deferred stub carries a scoped, fulfilled expectation
+unreachable = "deny"        # exhaustive matches turn impossible states into compile-time checks
+panic_in_result_fn = "deny" # a function that can return failure must not panic instead
 # Lock scope is a correctness property on the decode hot path (PR 9.11, `own-mutex-interior`):
 # matching directly on `self.x.lock().remove(..)` holds the guard for the whole body. These nursery
 # lints are outside `clippy::all`, so no priority is needed.

@@ -1,3 +1,5 @@
+#![allow(clippy::unreachable)] // unit-test fakes: unreachable arms assert scripted lease outcomes
+
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
