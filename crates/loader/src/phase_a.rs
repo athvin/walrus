@@ -72,6 +72,27 @@ pub(crate) fn pause_began(logged: &Cell<Option<i64>>, live: Option<i64>) -> Opti
     }
 }
 
+/// Read the two independent inputs to the Phase-A backlog gauge concurrently.
+///
+/// Neither indexed control-plane read consumes the other's output or runs inside a transaction, so
+/// concurrency changes their latency from the sum of two round trips to the maximum while retaining
+/// two SQL queries. This uses one task rather than spawning, which remains valid on the loader's
+/// `LocalSet`.
+///
+/// Each read may hold one of `control::connect`'s five default pool connections. With many owned
+/// tables that can queue, but it cannot deadlock here: neither future holds an open transaction while
+/// waiting to acquire another connection.
+async fn read_lag_inputs(ctx: &TableCtx) -> Result<(Option<Lsn>, Lsn), LoaderError> {
+    let (max_ready, checkpoint) = tokio::try_join!(
+        control::max_ready_lsn_end(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table),
+        control::read_checkpoint(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table),
+    )?;
+    Ok((
+        max_ready,
+        checkpoint.map_or(Lsn::ZERO, |cp| cp.raw_appended_lsn),
+    ))
+}
+
 /// One Phase-A pass. Returns the max `lsn_end` appended, or `None` if the queue was empty.
 ///
 /// # Errors
@@ -84,12 +105,7 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     // Observability (PR 5.6): set the Phase-A backlog gauge every poll (0 when caught up) —
     // `max(lsn_end over ready files) − raw_appended_lsn`. Both operands are cheap indexed control-DB
     // reads; doing this before the claim means idle polls report a truthful 0.
-    let max_ready =
-        control::max_ready_lsn_end(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table).await?;
-    let raw_appended = control::read_checkpoint(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table)
-        .await?
-        .map(|cp| cp.raw_appended_lsn)
-        .unwrap_or(Lsn::ZERO);
+    let (max_ready, raw_appended) = read_lag_inputs(ctx).await?;
     common::metrics::set_raw_append_lag(&ctx.series, raw_append_lag_bytes(max_ready, raw_appended));
 
     // 1. Claim in (lsn_end, id) order — NEVER `lsn_end > raw_appended_lsn` (that skips equal-lsn_end
