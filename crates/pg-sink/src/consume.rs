@@ -22,289 +22,338 @@ use std::sync::Arc;
 use tokio::time::{sleep, Instant};
 use tokio_util::sync::CancellationToken;
 
-/// Drive the stream: decode each `XLogData`, register each `Relation` (cache + schema_registry), route
-/// I/U/D into per-table batchers (sealing at commit boundaries), PUT sealed batches to S3, keep
-/// keepalives answered (inside `ReplicationStream`), and exit cleanly on cancel or stream end.
-///
-/// # Errors
-///
-/// Returns [`anyhow::Error`] when replication I/O or decoding fails, a relation/DDL/reload invariant
-/// is invalid, Arrow batching or S3/manifest durability fails, or a control-plane operation cannot
-/// complete. Context on the returned chain identifies the failed pipeline stage.
-// The loop driver wires together the full pipeline (cache, router, sink, control pool); its arity is
-// intrinsic, not a code smell.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "loop driver wires the full cache, sink, control, and reload pipeline explicitly"
-)]
-pub async fn run_decode_loop(
-    stream: &mut ReplicationStream,
+/// A missing required field at decode-loop build time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("decode loop builder: missing required field `{0}`")]
+pub struct DecodeLoopError(&'static str);
+
+/// The fully wired decode loop. Construct it with [`DecodeLoop::builder`]; [`DecodeLoop::run`]
+/// consumes the wiring so its mutable borrows cannot escape or be reused concurrently.
+#[derive(Debug)]
+pub struct DecodeLoop<'a> {
+    stream: &'a mut ReplicationStream,
     token: CancellationToken,
-    cache: &mut RelationCache,
-    router: &mut BatchRouter,
-    sink: &crate::sink::ParquetSink,
-    checkpoint: &mut crate::checkpoint::DurabilityCheckpoint,
-    demux: &mut crate::stream_txn::StreamDemux,
-    ddl: &mut crate::ddl::DdlConsumer,
-    heartbeat: &mut Heartbeat,
-    health: &HealthState,
-    pool: &sqlx::PgPool,
+    cache: &'a mut RelationCache,
+    router: &'a mut BatchRouter,
+    sink: &'a crate::sink::ParquetSink,
+    checkpoint: &'a mut crate::checkpoint::DurabilityCheckpoint,
+    demux: &'a mut crate::stream_txn::StreamDemux,
+    ddl: &'a mut crate::ddl::DdlConsumer,
+    heartbeat: &'a mut Heartbeat,
+    health: &'a HealthState,
+    pool: &'a sqlx::PgPool,
     epoch: EpochNo,
-    _schema_version: i64, // structural version now rides the DDL consumer / cached shape (PR 2.33)
-    waiters: &crate::reload_signal::WatermarkWaiters,
-) -> anyhow::Result<()> {
-    let mut ctx = StreamCtx::default();
-    let mut internal = InternalTables::default();
-    // reload_signal echoes buffered between their Insert and their transaction's fate (PR 6.3):
-    // the watermark is the COMMIT LSN, which only the Commit message carries.
-    let mut pending_signals = crate::reload_signal::PendingSignals::default();
-    // Idle windows are monotonic (`tokio::time::Instant`); `last_activity` moves on every user change,
-    // never on keepalives or the heartbeat's own round-trip.
-    let mut last_activity = Instant::now();
-    // Whether the transaction currently decoding carries the heartbeat change (its Commit lets the
-    // checkpoint advance on an idle publication).
-    let mut txn_has_heartbeat = false;
-    // Check idleness at the beat cadence; the first (immediate) tick is a no-op (just-started).
-    let mut beat_check = tokio::time::interval(heartbeat.idle_after());
-    beat_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        tokio::select! {
-            _ = token.cancelled() => {
-                // SIGTERM/SIGINT: the loop has stopped consuming — now run the ordered drain (NOT
-                // cancellable; the caller bounds it by the K8s grace period). The slot is never dropped.
-                tracing::info!("decode loop cancelled; draining");
-                health.mark_terminating();
-                let outcome = crate::shutdown::drain(stream, router, sink, checkpoint, pool, epoch)
-                    .await
-                    .context("graceful drain")?;
-                tracing::info!(?outcome, "drain complete; slot left in place, resume on restart");
-                return Ok(());
-            }
-            _ = beat_check.tick() => {
-                // The beat fires over a SEPARATE SQL connection only when idle on both clocks; a
-                // failure is logged and surfaced as `degraded`, never fatal (liveness never self-harms).
-                let now = Instant::now();
-                match heartbeat.maybe_beat(now, last_activity).await {
-                    Ok(Some(seq)) => tracing::info!(beat_seq = seq, "fired idle heartbeat"),
-                    Ok(None) => {}
-                    Err(e) => tracing::warn!(error = %e, "heartbeat beat failed"),
+    waiters: &'a crate::reload_signal::WatermarkWaiters,
+}
+
+/// Consuming configurator for [`DecodeLoop`]. Every field is required at [`Self::build`] time.
+#[derive(Debug, Default)]
+pub struct DecodeLoopBuilder<'a> {
+    stream: Option<&'a mut ReplicationStream>,
+    token: Option<CancellationToken>,
+    cache: Option<&'a mut RelationCache>,
+    router: Option<&'a mut BatchRouter>,
+    sink: Option<&'a crate::sink::ParquetSink>,
+    checkpoint: Option<&'a mut crate::checkpoint::DurabilityCheckpoint>,
+    demux: Option<&'a mut crate::stream_txn::StreamDemux>,
+    ddl: Option<&'a mut crate::ddl::DdlConsumer>,
+    heartbeat: Option<&'a mut Heartbeat>,
+    health: Option<&'a HealthState>,
+    pool: Option<&'a sqlx::PgPool>,
+    epoch: Option<EpochNo>,
+    waiters: Option<&'a crate::reload_signal::WatermarkWaiters>,
+}
+
+impl<'a> DecodeLoop<'a> {
+    #[allow(
+        clippy::must_use_candidate,
+        reason = "PR 13.9 adds the builder must-use contract"
+    )]
+    pub fn builder() -> DecodeLoopBuilder<'a> {
+        DecodeLoopBuilder::default()
+    }
+
+    /// Drive the stream: decode each `XLogData`, register each `Relation` (cache + schema_registry),
+    /// route I/U/D into per-table batchers (sealing at commit boundaries), PUT sealed batches to S3,
+    /// keep keepalives answered, and exit cleanly on cancel or stream end.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] when replication I/O or decoding fails, a relation/DDL/reload
+    /// invariant is invalid, Arrow batching or S3/manifest durability fails, or a control-plane
+    /// operation cannot complete. Context on the returned chain identifies the failed stage.
+    pub async fn run(self) -> anyhow::Result<()> {
+        let DecodeLoop {
+            stream,
+            token,
+            cache,
+            router,
+            sink,
+            checkpoint,
+            demux,
+            ddl,
+            heartbeat,
+            health,
+            pool,
+            epoch,
+            waiters,
+        } = self;
+        // `BatchRouter::route` retains its integration-test seam, but the cached relation owns the
+        // structural version now; this compatibility argument is intentionally ignored there.
+        let schema_version = 0;
+        let mut ctx = StreamCtx::default();
+        let mut internal = InternalTables::default();
+        // reload_signal echoes buffered between their Insert and their transaction's fate (PR 6.3):
+        // the watermark is the COMMIT LSN, which only the Commit message carries.
+        let mut pending_signals = crate::reload_signal::PendingSignals::default();
+        // Idle windows are monotonic (`tokio::time::Instant`); `last_activity` moves on every user change,
+        // never on keepalives or the heartbeat's own round-trip.
+        let mut last_activity = Instant::now();
+        // Whether the transaction currently decoding carries the heartbeat change (its Commit lets the
+        // checkpoint advance on an idle publication).
+        let mut txn_has_heartbeat = false;
+        // Check idleness at the beat cadence; the first (immediate) tick is a no-op (just-started).
+        let mut beat_check = tokio::time::interval(heartbeat.idle_after());
+        beat_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => {
+                    // SIGTERM/SIGINT: the loop has stopped consuming — now run the ordered drain (NOT
+                    // cancellable; the caller bounds it by the K8s grace period). The slot is never dropped.
+                    tracing::info!("decode loop cancelled; draining");
+                    health.mark_terminating();
+                    let outcome = crate::shutdown::drain(stream, router, sink, checkpoint, pool, epoch)
+                        .await
+                        .context("graceful drain")?;
+                    tracing::info!(?outcome, "drain complete; slot left in place, resume on restart");
+                    return Ok(());
                 }
-                health.set_degraded(heartbeat.degraded(now));
-            }
-            frame = stream.next() => {
-                match frame.context("read replication frame")? {
-                    None => {
-                        tracing::info!("replication stream ended");
-                        return Ok(());
+                _ = beat_check.tick() => {
+                    // The beat fires over a SEPARATE SQL connection only when idle on both clocks; a
+                    // failure is logged and surfaced as `degraded`, never fatal (liveness never self-harms).
+                    let now = Instant::now();
+                    match heartbeat.maybe_beat(now, last_activity).await {
+                        Ok(Some(seq)) => tracing::info!(beat_seq = seq, "fired idle heartbeat"),
+                        Ok(None) => {}
+                        Err(e) => tracing::warn!(error = %e, "heartbeat beat failed"),
                     }
-                    Some(frame) => {
-                        // The change's LSN is the XLogData frame's start (pgoutput change messages
-                        // carry no per-change LSN of their own).
-                        let frame_lsn = match &frame {
-                            ReplicationMessage::XLogData { wal_start, .. } => *wal_start,
-                            ReplicationMessage::Keepalive { .. } => Lsn::ZERO,
-                        };
-                        if let Some(msg) = on_frame(&mut ctx, frame)? {
-                            trace_message(&msg);
-                            match &msg {
-                                Message::Relation { relation, .. } => {
-                                    // Learn walrus.heartbeat / walrus.ddl_audit OIDs BEFORE their change
-                                    // arrives (Relation always precedes the change in the same txn).
-                                    internal.note_relation(relation);
-                                    // Register user tables at their CURRENT structural version (bumped by
-                                    // DDL capture, PR 2.33) so the new-shape file carries the new version.
-                                    let version = ddl.version_of(&relation.schema, &relation.name);
-                                    on_relation(cache, pool, epoch, relation.clone(), version).await?;
-                                }
-                                // The DDL signal: a walrus.ddl_audit INSERT. Write a ddl_manifest row,
-                                // bump the affected table's structural schema_version, and cut a fresh
-                                // file. NEVER materialised as user data.
-                                Message::Insert { relation_oid, new, .. }
-                                    if internal.is_ddl_audit(*relation_oid) =>
-                                {
-                                    if let Some(rel) = internal.ddl_audit_rel() {
-                                        let ev = crate::ddl::DdlEvent::from_tuple(rel, new)
-                                            .context("parse ddl_audit tuple")?;
-                                        let structural = ddl
-                                            .consume(pool, &ev)
-                                            .await
-                                            .context("consume ddl event")?;
-                                        if let Some(new_version) = structural {
-                                            // Cut the old-version file for that table, then flush it.
-                                            let sealed = router.cut_table(cache, &ev.source_schema, &ev.source_table)?;
-                                            flush_sealed(sealed, stream, sink, checkpoint, pool, epoch).await?;
-                                            tracing::info!(
-                                                source_table = %format_args!("{}.{}", ev.source_schema, ev.source_table),
-                                                c_tag = %ev.c_tag,
-                                                schema_version = new_version,
-                                                c_lsn = %ev.c_lsn,
-                                                "DDL: manifest + version bump + file cut"
-                                            );
-                                        } else {
-                                            tracing::info!(c_tag = %ev.c_tag, "DDL: metadata-only (recorded, no bump)");
-                                        }
+                    health.set_degraded(heartbeat.degraded(now));
+                }
+                frame = stream.next() => {
+                    match frame.context("read replication frame")? {
+                        None => {
+                            tracing::info!("replication stream ended");
+                            return Ok(());
+                        }
+                        Some(frame) => {
+                            // The change's LSN is the XLogData frame's start (pgoutput change messages
+                            // carry no per-change LSN of their own).
+                            let frame_lsn = match &frame {
+                                ReplicationMessage::XLogData { wal_start, .. } => *wal_start,
+                                ReplicationMessage::Keepalive { .. } => Lsn::ZERO,
+                            };
+                            if let Some(msg) = on_frame(&mut ctx, frame)? {
+                                trace_message(&msg);
+                                match &msg {
+                                    Message::Relation { relation, .. } => {
+                                        // Learn walrus.heartbeat / walrus.ddl_audit OIDs BEFORE their change
+                                        // arrives (Relation always precedes the change in the same txn).
+                                        internal.note_relation(relation);
+                                        // Register user tables at their CURRENT structural version (bumped by
+                                        // DDL capture, PR 2.33) so the new-shape file carries the new version.
+                                        let version = ddl.version_of(&relation.schema, &relation.name);
+                                        on_relation(cache, pool, epoch, relation.clone(), version).await?;
                                     }
-                                }
-                                // The reload echo (PR 6.3): the sink's own signal INSERT returning
-                                // through the stream. Buffered here; the waiter resolves at the
-                                // transaction's Commit with its commit LSN (= the chunk watermark
-                                // L_i). NEVER batched, never a Parquet file or manifest row.
-                                Message::Insert { relation_oid, new, xid }
-                                    if internal.is_reload_signal(*relation_oid) =>
-                                {
-                                    if let Some(rel) = internal.reload_signal_rel() {
-                                        match crate::reload_signal::PendingSignal::from_tuple(rel, new, *xid) {
-                                            Some(sig) => pending_signals.push(sig),
-                                            None => tracing::warn!(
-                                                "malformed walrus.reload_signal tuple; ignoring"
-                                            ),
-                                        }
-                                    }
-                                }
-                                // The heartbeat round-trip: record it, mark the txn, and NEVER stage it
-                                // to S3 / a manifest row — it is control-plane, not user data. Other
-                                // internal tables' non-signal ops (a ddl_audit UPDATE, a reload_signal
-                                // UPDATE — neither should happen) are consumed-and-ignored here: only
-                                // the heartbeat's tuple carries a beat_seq.
-                                Message::Insert { relation_oid, new, .. }
-                                | Message::Update { relation_oid, new, .. }
-                                    if internal.is_internal(*relation_oid) =>
-                                {
-                                    if internal.is_heartbeat(*relation_oid) {
-                                        if let Some(seq) = internal.beat_seq_of(new) {
-                                            heartbeat.observe_return(seq, Instant::now());
-                                            tracing::info!(beat_seq = seq, "heartbeat round-trip observed");
-                                        }
-                                        txn_has_heartbeat = true;
-                                    }
-                                }
-                                // Non-insert ops on internal tables — e.g. the future reload_signal
-                                // pruning DELETEs (PR 6.11's runbook) — are consumed-and-ignored:
-                                // acked like any record, never routed toward a batcher.
-                                Message::Delete { relation_oid, .. }
-                                    if internal.is_internal(*relation_oid) => {}
-                                Message::Commit { commit_lsn, .. } => {
-                                    // First seal/flush any user batch this commit made eligible.
-                                    flush_sealed(
-                                        router.route(cache, &msg, frame_lsn, _schema_version)?,
-                                        stream, sink, checkpoint, pool, epoch,
-                                    )
-                                    .await?;
-                                    // Resolve any signal echoes this transaction carried: its commit
-                                    // LSN IS the chunk watermark L_i (PR 6.3). The signal txn needs no
-                                    // special ack — confirmed_flush passes it like any consumed record.
-                                    pending_signals.on_commit(*commit_lsn, waiters);
-                                    // Then, for an idle heartbeat-only txn, advance to its commit LSN —
-                                    // but never past un-durable user data (a floor the flush above just
-                                    // cleared if it was eligible).
-                                    if std::mem::take(&mut txn_has_heartbeat) {
-                                        if let Some(floor) = router.undurable_floor() {
-                                            tracing::warn!(
-                                                floor = %floor,
-                                                "heartbeat: un-durable buffered data precedes the beat; holding confirmed_flush"
-                                            );
-                                        } else {
-                                            checkpoint.on_batch_durable(*commit_lsn);
-                                            checkpoint
-                                                .send(stream, false)
+                                    // The DDL signal: a walrus.ddl_audit INSERT. Write a ddl_manifest row,
+                                    // bump the affected table's structural schema_version, and cut a fresh
+                                    // file. NEVER materialised as user data.
+                                    Message::Insert { relation_oid, new, .. }
+                                        if internal.is_ddl_audit(*relation_oid) =>
+                                    {
+                                        if let Some(rel) = internal.ddl_audit_rel() {
+                                            let ev = crate::ddl::DdlEvent::from_tuple(rel, new)
+                                                .context("parse ddl_audit tuple")?;
+                                            let structural = ddl
+                                                .consume(pool, &ev)
                                                 .await
-                                                .context("send heartbeat standby status")?;
-                                            tracing::info!(
-                                                confirmed_flush = %checkpoint.confirmed_flush(),
-                                                "idle heartbeat advanced confirmed_flush"
-                                            );
+                                                .context("consume ddl event")?;
+                                            if let Some(new_version) = structural {
+                                                // Cut the old-version file for that table, then flush it.
+                                                let sealed = router.cut_table(cache, &ev.source_schema, &ev.source_table)?;
+                                                flush_sealed(sealed, stream, sink, checkpoint, pool, epoch).await?;
+                                                tracing::info!(
+                                                    source_table = %format_args!("{}.{}", ev.source_schema, ev.source_table),
+                                                    c_tag = %ev.c_tag,
+                                                    schema_version = new_version,
+                                                    c_lsn = %ev.c_lsn,
+                                                    "DDL: manifest + version bump + file cut"
+                                                );
+                                            } else {
+                                                tracing::info!(c_tag = %ev.c_tag, "DDL: metadata-only (recorded, no bump)");
+                                            }
                                         }
-                                        health.set_degraded(heartbeat.degraded(Instant::now()));
                                     }
-                                }
-                                // --- Large-transaction streaming (§1.6, PR 2.30). A txn over
-                                // logical_decoding_work_mem arrives BEFORE its commit as interleaved
-                                // Stream blocks; the demux stages speculatively and commit-gates.
-                                Message::StreamStart { xid, first_segment } => {
-                                    demux.on_stream_start(*xid, *first_segment, frame_lsn);
-                                    checkpoint.set_open_txn_floor(demux.open_floor());
-                                }
-                                Message::StreamStop => demux.on_stream_stop(),
-                                m @ (Message::Insert { xid: Some(_), .. }
-                                | Message::Update { xid: Some(_), .. }
-                                | Message::Delete { xid: Some(_), .. }) => {
-                                    last_activity = Instant::now();
-                                    demux.on_change(cache, m, sink, frame_lsn).await?;
-                                }
-                                Message::StreamCommit {
-                                    xid,
-                                    commit_lsn,
-                                    commit_ts,
-                                    ..
-                                } => {
-                                    // Commit-order fence (architecture.md §1.6): any regular (non-streamed)
-                                    // txn that committed WHILE this large txn was streaming is still buffered
-                                    // in the router — small batches flush on the `max_fill` cadence, not per
-                                    // commit — and its commit LSN is LOWER than this one. Flush those `ready`
-                                    // rows FIRST so the manifest stays in commit-LSN order. Otherwise this
-                                    // txn's file (higher `lsn_end`) becomes `ready` first, the loader
-                                    // transforms + advances `transformed_lsn` past it, and the late,
-                                    // lower-LSN regular file is then permanently skipped by the `>= ` window.
-                                    // (The slot stays clamped to this still-open txn's floor until its
-                                    // `on_batch_durable` below, so draining early never advances past it.)
-                                    flush_sealed(
-                                        router.drain_committed()?,
-                                        stream, sink, checkpoint, pool, epoch,
-                                    )
-                                    .await?;
-                                    // Materialise the survivors (aborted sub-xids excluded) to `ready`
-                                    // (lsn_end = commit_lsn), then advance the slot — clamped to any
-                                    // still-older open txn.
-                                    let objs = demux
-                                        .on_stream_commit(
-                                            *xid,
-                                            *commit_lsn,
-                                            UtcTimestamp::from_pg_micros(*commit_ts)?,
-                                            cache,
-                                            sink,
+                                    // The reload echo (PR 6.3): the sink's own signal INSERT returning
+                                    // through the stream. Buffered here; the waiter resolves at the
+                                    // transaction's Commit with its commit LSN (= the chunk watermark
+                                    // L_i). NEVER batched, never a Parquet file or manifest row.
+                                    Message::Insert { relation_oid, new, xid }
+                                        if internal.is_reload_signal(*relation_oid) =>
+                                    {
+                                        if let Some(rel) = internal.reload_signal_rel() {
+                                            match crate::reload_signal::PendingSignal::from_tuple(rel, new, *xid) {
+                                                Some(sig) => pending_signals.push(sig),
+                                                None => tracing::warn!(
+                                                    "malformed walrus.reload_signal tuple; ignoring"
+                                                ),
+                                            }
+                                        }
+                                    }
+                                    // The heartbeat round-trip: record it, mark the txn, and NEVER stage it
+                                    // to S3 / a manifest row — it is control-plane, not user data. Other
+                                    // internal tables' non-signal ops (a ddl_audit UPDATE, a reload_signal
+                                    // UPDATE — neither should happen) are consumed-and-ignored here: only
+                                    // the heartbeat's tuple carries a beat_seq.
+                                    Message::Insert { relation_oid, new, .. }
+                                    | Message::Update { relation_oid, new, .. }
+                                        if internal.is_internal(*relation_oid) =>
+                                    {
+                                        if internal.is_heartbeat(*relation_oid) {
+                                            if let Some(seq) = internal.beat_seq_of(new) {
+                                                heartbeat.observe_return(seq, Instant::now());
+                                                tracing::info!(beat_seq = seq, "heartbeat round-trip observed");
+                                            }
+                                            txn_has_heartbeat = true;
+                                        }
+                                    }
+                                    // Non-insert ops on internal tables — e.g. the future reload_signal
+                                    // pruning DELETEs (PR 6.11's runbook) — are consumed-and-ignored:
+                                    // acked like any record, never routed toward a batcher.
+                                    Message::Delete { relation_oid, .. }
+                                        if internal.is_internal(*relation_oid) => {}
+                                    Message::Commit { commit_lsn, .. } => {
+                                        // First seal/flush any user batch this commit made eligible.
+                                        flush_sealed(
+                                            router.route(cache, &msg, frame_lsn, schema_version)?,
+                                            stream, sink, checkpoint, pool, epoch,
                                         )
                                         .await?;
-                                    for obj in &objs {
-                                        crate::manifest::record_ready(pool, epoch, obj)
-                                            .await
-                                            .context("commit streamed manifest ready row")?;
+                                        // Resolve any signal echoes this transaction carried: its commit
+                                        // LSN IS the chunk watermark L_i (PR 6.3). The signal txn needs no
+                                        // special ack — confirmed_flush passes it like any consumed record.
+                                        pending_signals.on_commit(*commit_lsn, waiters);
+                                        // Then, for an idle heartbeat-only txn, advance to its commit LSN —
+                                        // but never past un-durable user data (a floor the flush above just
+                                        // cleared if it was eligible).
+                                        if std::mem::take(&mut txn_has_heartbeat) {
+                                            if let Some(floor) = router.undurable_floor() {
+                                                tracing::warn!(
+                                                    floor = %floor,
+                                                    "heartbeat: un-durable buffered data precedes the beat; holding confirmed_flush"
+                                                );
+                                            } else {
+                                                checkpoint.on_batch_durable(*commit_lsn);
+                                                checkpoint
+                                                    .send(stream, false)
+                                                    .await
+                                                    .context("send heartbeat standby status")?;
+                                                tracing::info!(
+                                                    confirmed_flush = %checkpoint.confirmed_flush(),
+                                                    "idle heartbeat advanced confirmed_flush"
+                                                );
+                                            }
+                                            health.set_degraded(heartbeat.degraded(Instant::now()));
+                                        }
                                     }
-                                    checkpoint.set_open_txn_floor(demux.open_floor());
-                                    checkpoint.on_batch_durable(*commit_lsn);
-                                    checkpoint
-                                        .send(stream, false)
-                                        .await
-                                        .context("send streamed-commit standby status")?;
-                                    // Can't-happen defense (PR 6.3): a single-row signal txn never
-                                    // streams, but if one somehow did, its surviving echo resolves here.
-                                    pending_signals.on_stream_commit(*commit_lsn, waiters);
-                                    tracing::info!(
-                                        xid,
-                                        files = objs.len(),
-                                        commit_lsn = %commit_lsn,
-                                        confirmed_flush = %checkpoint.confirmed_flush(),
-                                        "streamed txn committed → ready"
-                                    );
-                                }
-                                Message::StreamAbort { top_xid, sub_xid } => {
-                                    // sub == top → whole-txn drop; sub != top → exclude the rolled-back
-                                    // savepoint's rows (proto §9b) while the top-level txn commits on.
-                                    demux.on_stream_abort(*top_xid, *sub_xid, sink).await;
-                                    checkpoint.set_open_txn_floor(demux.open_floor());
-                                    // An aborted (sub)transaction's signal echo must never resolve a
-                                    // waiter — the commit never carried it (PR 6.3).
-                                    pending_signals.on_stream_abort(*top_xid, *sub_xid);
-                                }
-                                other => {
-                                    // A user change is activity — it suppresses the idle beat.
-                                    if matches!(other, Message::Insert { .. } | Message::Update { .. } | Message::Delete { .. }) {
+                                    // --- Large-transaction streaming (§1.6, PR 2.30). A txn over
+                                    // logical_decoding_work_mem arrives BEFORE its commit as interleaved
+                                    // Stream blocks; the demux stages speculatively and commit-gates.
+                                    Message::StreamStart { xid, first_segment } => {
+                                        demux.on_stream_start(*xid, *first_segment, frame_lsn);
+                                        checkpoint.set_open_txn_floor(demux.open_floor());
+                                    }
+                                    Message::StreamStop => demux.on_stream_stop(),
+                                    m @ (Message::Insert { xid: Some(_), .. }
+                                    | Message::Update { xid: Some(_), .. }
+                                    | Message::Delete { xid: Some(_), .. }) => {
                                         last_activity = Instant::now();
+                                        demux.on_change(cache, m, sink, frame_lsn).await?;
                                     }
-                                    flush_sealed(
-                                        router.route(cache, other, frame_lsn, _schema_version)?,
-                                        stream, sink, checkpoint, pool, epoch,
-                                    )
-                                    .await?;
+                                    Message::StreamCommit {
+                                        xid,
+                                        commit_lsn,
+                                        commit_ts,
+                                        ..
+                                    } => {
+                                        // Commit-order fence (architecture.md §1.6): any regular (non-streamed)
+                                        // txn that committed WHILE this large txn was streaming is still buffered
+                                        // in the router — small batches flush on the `max_fill` cadence, not per
+                                        // commit — and its commit LSN is LOWER than this one. Flush those `ready`
+                                        // rows FIRST so the manifest stays in commit-LSN order. Otherwise this
+                                        // txn's file (higher `lsn_end`) becomes `ready` first, the loader
+                                        // transforms + advances `transformed_lsn` past it, and the late,
+                                        // lower-LSN regular file is then permanently skipped by the `>= ` window.
+                                        // (The slot stays clamped to this still-open txn's floor until its
+                                        // `on_batch_durable` below, so draining early never advances past it.)
+                                        flush_sealed(
+                                            router.drain_committed()?,
+                                            stream, sink, checkpoint, pool, epoch,
+                                        )
+                                        .await?;
+                                        // Materialise the survivors (aborted sub-xids excluded) to `ready`
+                                        // (lsn_end = commit_lsn), then advance the slot — clamped to any
+                                        // still-older open txn.
+                                        let objs = demux
+                                            .on_stream_commit(
+                                                *xid,
+                                                *commit_lsn,
+                                                UtcTimestamp::from_pg_micros(*commit_ts)?,
+                                                cache,
+                                                sink,
+                                            )
+                                            .await?;
+                                        for obj in &objs {
+                                            crate::manifest::record_ready(pool, epoch, obj)
+                                                .await
+                                                .context("commit streamed manifest ready row")?;
+                                        }
+                                        checkpoint.set_open_txn_floor(demux.open_floor());
+                                        checkpoint.on_batch_durable(*commit_lsn);
+                                        checkpoint
+                                            .send(stream, false)
+                                            .await
+                                            .context("send streamed-commit standby status")?;
+                                        // Can't-happen defense (PR 6.3): a single-row signal txn never
+                                        // streams, but if one somehow did, its surviving echo resolves here.
+                                        pending_signals.on_stream_commit(*commit_lsn, waiters);
+                                        tracing::info!(
+                                            xid,
+                                            files = objs.len(),
+                                            commit_lsn = %commit_lsn,
+                                            confirmed_flush = %checkpoint.confirmed_flush(),
+                                            "streamed txn committed → ready"
+                                        );
+                                    }
+                                    Message::StreamAbort { top_xid, sub_xid } => {
+                                        // sub == top → whole-txn drop; sub != top → exclude the rolled-back
+                                        // savepoint's rows (proto §9b) while the top-level txn commits on.
+                                        demux.on_stream_abort(*top_xid, *sub_xid, sink).await;
+                                        checkpoint.set_open_txn_floor(demux.open_floor());
+                                        // An aborted (sub)transaction's signal echo must never resolve a
+                                        // waiter — the commit never carried it (PR 6.3).
+                                        pending_signals.on_stream_abort(*top_xid, *sub_xid);
+                                    }
+                                    other => {
+                                        // A user change is activity — it suppresses the idle beat.
+                                        if matches!(other, Message::Insert { .. } | Message::Update { .. } | Message::Delete { .. }) {
+                                            last_activity = Instant::now();
+                                        }
+                                        flush_sealed(
+                                            router.route(cache, other, frame_lsn, schema_version)?,
+                                            stream, sink, checkpoint, pool, epoch,
+                                        )
+                                        .await?;
+                                    }
                                 }
                             }
                         }
@@ -312,6 +361,103 @@ pub async fn run_decode_loop(
                 }
             }
         }
+    }
+}
+
+#[allow(
+    clippy::must_use_candidate,
+    reason = "PR 13.9 adds the builder must-use contract"
+)]
+impl<'a> DecodeLoopBuilder<'a> {
+    pub fn stream(mut self, stream: &'a mut ReplicationStream) -> Self {
+        self.stream = Some(stream);
+        self
+    }
+
+    pub fn token(mut self, token: CancellationToken) -> Self {
+        self.token = Some(token);
+        self
+    }
+
+    pub fn cache(mut self, cache: &'a mut RelationCache) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    pub fn router(mut self, router: &'a mut BatchRouter) -> Self {
+        self.router = Some(router);
+        self
+    }
+
+    pub fn sink(mut self, sink: &'a crate::sink::ParquetSink) -> Self {
+        self.sink = Some(sink);
+        self
+    }
+
+    pub fn checkpoint(
+        mut self,
+        checkpoint: &'a mut crate::checkpoint::DurabilityCheckpoint,
+    ) -> Self {
+        self.checkpoint = Some(checkpoint);
+        self
+    }
+
+    pub fn demux(mut self, demux: &'a mut crate::stream_txn::StreamDemux) -> Self {
+        self.demux = Some(demux);
+        self
+    }
+
+    pub fn ddl(mut self, ddl: &'a mut crate::ddl::DdlConsumer) -> Self {
+        self.ddl = Some(ddl);
+        self
+    }
+
+    pub fn heartbeat(mut self, heartbeat: &'a mut Heartbeat) -> Self {
+        self.heartbeat = Some(heartbeat);
+        self
+    }
+
+    pub fn health(mut self, health: &'a HealthState) -> Self {
+        self.health = Some(health);
+        self
+    }
+
+    pub fn pool(mut self, pool: &'a sqlx::PgPool) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+
+    pub fn epoch(mut self, epoch: EpochNo) -> Self {
+        self.epoch = Some(epoch);
+        self
+    }
+
+    pub fn waiters(mut self, waiters: &'a crate::reload_signal::WatermarkWaiters) -> Self {
+        self.waiters = Some(waiters);
+        self
+    }
+
+    /// Construct the fully wired loop, naming the first missing required field.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeLoopError`] naming the first setter omitted from the builder chain.
+    pub fn build(self) -> Result<DecodeLoop<'a>, DecodeLoopError> {
+        Ok(DecodeLoop {
+            stream: self.stream.ok_or(DecodeLoopError("stream"))?,
+            token: self.token.ok_or(DecodeLoopError("token"))?,
+            cache: self.cache.ok_or(DecodeLoopError("cache"))?,
+            router: self.router.ok_or(DecodeLoopError("router"))?,
+            sink: self.sink.ok_or(DecodeLoopError("sink"))?,
+            checkpoint: self.checkpoint.ok_or(DecodeLoopError("checkpoint"))?,
+            demux: self.demux.ok_or(DecodeLoopError("demux"))?,
+            ddl: self.ddl.ok_or(DecodeLoopError("ddl"))?,
+            heartbeat: self.heartbeat.ok_or(DecodeLoopError("heartbeat"))?,
+            health: self.health.ok_or(DecodeLoopError("health"))?,
+            pool: self.pool.ok_or(DecodeLoopError("pool"))?,
+            epoch: self.epoch.ok_or(DecodeLoopError("epoch"))?,
+            waiters: self.waiters.ok_or(DecodeLoopError("waiters"))?,
+        })
     }
 }
 
@@ -434,6 +580,15 @@ pub struct BatchRouter {
     txn_xid: u32,
 }
 
+/// One decoded change's live provenance before its cached relation supplies the structural shape.
+struct RowSource<'a> {
+    oid: u32,
+    op: Op,
+    values: &'a [TupleValue],
+    frame_lsn: Lsn,
+    xid: u32,
+}
+
 impl BatchRouter {
     pub fn new(
         triggers: BatchTriggers,
@@ -464,7 +619,7 @@ impl BatchRouter {
         cache: &RelationCache,
         msg: &Message,
         frame_lsn: Lsn,
-        schema_version: i64,
+        _schema_version: i64,
     ) -> anyhow::Result<Vec<SealedBatch>> {
         match msg {
             Message::Begin { xid, .. } => {
@@ -478,12 +633,13 @@ impl BatchRouter {
             } => {
                 self.push(
                     cache,
-                    *relation_oid,
-                    Op::Insert,
-                    new,
-                    frame_lsn,
-                    xid.unwrap_or(self.txn_xid),
-                    schema_version,
+                    RowSource {
+                        oid: *relation_oid,
+                        op: Op::Insert,
+                        values: new,
+                        frame_lsn,
+                        xid: xid.unwrap_or(self.txn_xid),
+                    },
                 )?;
                 Ok(Vec::new())
             }
@@ -495,12 +651,13 @@ impl BatchRouter {
             } => {
                 self.push(
                     cache,
-                    *relation_oid,
-                    Op::Update,
-                    new,
-                    frame_lsn,
-                    xid.unwrap_or(self.txn_xid),
-                    schema_version,
+                    RowSource {
+                        oid: *relation_oid,
+                        op: Op::Update,
+                        values: new,
+                        frame_lsn,
+                        xid: xid.unwrap_or(self.txn_xid),
+                    },
                 )?;
                 Ok(Vec::new())
             }
@@ -513,12 +670,13 @@ impl BatchRouter {
                 // The old-key tuple is full-width (non-key columns as NULL under DEFAULT identity).
                 self.push(
                     cache,
-                    *relation_oid,
-                    Op::Delete,
-                    old,
-                    frame_lsn,
-                    xid.unwrap_or(self.txn_xid),
-                    schema_version,
+                    RowSource {
+                        oid: *relation_oid,
+                        op: Op::Delete,
+                        values: old,
+                        frame_lsn,
+                        xid: xid.unwrap_or(self.txn_xid),
+                    },
                 )?;
                 Ok(Vec::new())
             }
@@ -531,34 +689,19 @@ impl BatchRouter {
         }
     }
 
-    // Each parameter is one provenance field the per-row `SinkMeta` must carry (oid, op, values, lsn,
-    // xid, schema_version) — the arity mirrors the CDC contract, not an extractable clump.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "each argument is a distinct provenance field required by the CDC row contract"
-    )]
-    fn push(
-        &mut self,
-        cache: &RelationCache,
-        oid: u32,
-        op: Op,
-        values: &[TupleValue],
-        frame_lsn: Lsn,
-        xid: u32,
-        _schema_version: i64, // the version now rides the cached shape (bumped by DDL capture, PR 2.33)
-    ) -> anyhow::Result<()> {
+    fn push(&mut self, cache: &RelationCache, row: RowSource<'_>) -> anyhow::Result<()> {
         // Always the LATEST cached shape for this OID — so a change after a DDL bump lands in a
         // new-version file (the homogeneous-file rule; the batcher was cut on the bump).
-        let Some(cached) = cache.latest_for(oid) else {
+        let Some(cached) = cache.latest_for(row.oid) else {
             tracing::warn!(
-                relation_oid = oid,
+                relation_oid = row.oid,
                 "change for a relation with no cached shape yet; skipping"
             );
             return Ok(());
         };
         let triggers = self.triggers;
         let clock = Arc::clone(&self.clock);
-        let batcher = match self.batchers.entry(oid) {
+        let batcher = match self.batchers.entry(row.oid) {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => e.insert(
                 TableBatcher::new(Arc::clone(&cached), triggers, clock)
@@ -566,11 +709,11 @@ impl BatchRouter {
             ),
         };
         let meta = SinkMeta {
-            op,
-            lsn: frame_lsn,
+            op: row.op,
+            lsn: row.frame_lsn,
             commit_lsn: Lsn::ZERO, // patched at the batcher's on_commit
             commit_ts: UtcTimestamp::now(), // placeholder — patched at on_commit from Commit's ts (PR 5.9)
-            xid,
+            xid: row.xid,
             epoch: self.epoch,
             batch_id: String::new(), // assigned by the batcher when the batch opens
             schema_version: cached.schema_version,
@@ -581,7 +724,7 @@ impl BatchRouter {
             sink_instance: self.sink_instance.clone(),
             sink_processed_at: UtcTimestamp::now(),
         };
-        batcher.push(meta, values);
+        batcher.push(meta, row.values);
         Ok(())
     }
 

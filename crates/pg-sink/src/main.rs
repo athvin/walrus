@@ -159,23 +159,24 @@ async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
         token.clone(),
     );
 
-    let result = consume::run_decode_loop(
-        &mut stream,
-        token.clone(),
-        &mut cache,
-        &mut router,
-        &sink,
-        &mut checkpoint,
-        &mut demux,
-        &mut ddl,
-        &mut heartbeat,
-        &state,
-        &ctx.control_pool,
-        epoch,
-        SCHEMA_VERSION,
-        &waiters,
-    )
-    .await;
+    let result = consume::DecodeLoop::builder()
+        .stream(&mut stream)
+        .token(token.clone())
+        .cache(&mut cache)
+        .router(&mut router)
+        .sink(&sink)
+        .checkpoint(&mut checkpoint)
+        .demux(&mut demux)
+        .ddl(&mut ddl)
+        .heartbeat(&mut heartbeat)
+        .health(&state)
+        .pool(&ctx.control_pool)
+        .epoch(epoch)
+        .waiters(&waiters)
+        .build()
+        .context("wire the decode loop")?
+        .run()
+        .await;
 
     // Whatever ended the loop (SIGTERM, stream end, or a decode error), drain the side tasks.
     state.mark_terminating();
