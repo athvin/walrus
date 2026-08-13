@@ -22,6 +22,7 @@ impl FakeClock {
         *self.offset.lock().unwrap() += d;
     }
 }
+impl super::private::Sealed for FakeClock {}
 impl Clock for FakeClock {
     fn now(&self) -> Instant {
         self.base + *self.offset.lock().unwrap()

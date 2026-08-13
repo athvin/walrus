@@ -17,6 +17,10 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+mod private {
+    pub trait Sealed {}
+}
+
 /// Injectable clock so `max_fill` is testable without sleeping. Production uses [`SystemClock`]; the
 /// single production impl is deliberate — the trait exists **for that test seam**, not as dead
 /// generality (audited PR 8.5, kept by design).
@@ -36,13 +40,15 @@ use std::time::{Duration, Instant};
 ///     }
 /// }
 /// ```
-pub trait Clock: Send + Sync + fmt::Debug {
+pub trait Clock: private::Sealed + Send + Sync + fmt::Debug {
     fn now(&self) -> Instant;
 }
 
 /// The wall clock.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemClock;
+
+impl private::Sealed for SystemClock {}
 
 impl Clock for SystemClock {
     fn now(&self) -> Instant {
