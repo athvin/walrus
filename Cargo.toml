@@ -29,6 +29,11 @@ trivially_copy_pass_by_ref = "deny"
 # and integration `tests/`; benches (`harness = false`) and the e2e harness lib carry a file-level allow.
 unwrap_used = "deny"
 expect_used = "deny"
+# Lock scope is a correctness property on the decode hot path (PR 9.11, `own-mutex-interior`):
+# matching directly on `self.x.lock().remove(..)` holds the guard for the whole body. These nursery
+# lints are outside `clippy::all`, so no priority is needed.
+significant_drop_in_scrutinee = "deny"
+significant_drop_tightening = "deny"
 # Shared-ownership bumps must say they are bumps (PR 9.8, `own-arc-shared`). Like `unwrap_used` /
 # `expect_used`, this is one `clippy::restriction` lint rather than the whole group; it is outside
 # `clippy::all`, so no `priority` is needed.

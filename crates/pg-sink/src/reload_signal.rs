@@ -77,7 +77,10 @@ impl WatermarkWaiters {
                  the watermark model is wrong; stop reloads and investigate"
             );
         }
-        match self.waiters.lock().remove(&(reload_id, chunk_no)) {
+        // A guard temporary in a `match` scrutinee lives through the whole match. Bind the
+        // removal first so logging and sender notification never hold the registry lock.
+        let waiter = self.waiters.lock().remove(&(reload_id, chunk_no));
+        match waiter {
             Some(tx) => {
                 if tx.send(echo).is_err() {
                     // The exporter gave up (timeout) and dropped its receiver — fine.

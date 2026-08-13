@@ -131,10 +131,7 @@ fn resolve_evicts_so_the_same_chunk_can_resubscribe() {
             embedded_lsn: lsn("0/30"),
         },
     );
-    assert_eq!(
-        second.try_recv().expect("resolved").commit_lsn,
-        lsn("0/40")
-    );
+    assert_eq!(second.try_recv().expect("resolved").commit_lsn, lsn("0/40"));
 }
 
 #[test]
