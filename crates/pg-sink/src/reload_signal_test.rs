@@ -108,6 +108,36 @@ fn dropped_receiver_then_resolve_is_fine_and_entry_is_evicted() {
 }
 
 #[test]
+fn resolve_evicts_so_the_same_chunk_can_resubscribe() {
+    let waiters = WatermarkWaiters::default();
+    let mut first = waiters.subscribe(7, 0);
+    waiters.resolve(
+        7,
+        0,
+        Echo {
+            commit_lsn: lsn("0/20"),
+            embedded_lsn: lsn("0/10"),
+        },
+    );
+    assert_eq!(first.try_recv().expect("resolved").commit_lsn, lsn("0/20"));
+
+    // Same key again: the previous entry was removed, so this is a fresh, resolvable wait.
+    let mut second = waiters.subscribe(7, 0);
+    waiters.resolve(
+        7,
+        0,
+        Echo {
+            commit_lsn: lsn("0/40"),
+            embedded_lsn: lsn("0/30"),
+        },
+    );
+    assert_eq!(
+        second.try_recv().expect("resolved").commit_lsn,
+        lsn("0/40")
+    );
+}
+
+#[test]
 fn non_insert_ops_on_signal_table_are_ignored() {
     // The consume loop never buffers Update/Delete on the signal table — only Insert reaches
     // `PendingSignal::from_tuple`. What this module can pin: a Delete's old-key tuple (PK
