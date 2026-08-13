@@ -54,6 +54,19 @@ fn commit_lsns(db: &TableDb, ids: (i64, i64)) -> Vec<String> {
         .collect()
 }
 
+/// PR 12.5: `TableDb` is `Send`. The apply worker moves one into `TableCtx` and then into a
+/// `spawn_local` future; this test exercises the bound by moving the database across an OS thread.
+#[test]
+fn table_db_moves_across_a_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = TableDb::open(&dir.path().join("orders.duckdb")).unwrap();
+    db.ensure_tables(&orders(), 7).unwrap();
+
+    let handle = std::thread::spawn(move || db.schema_version().unwrap());
+    let version = handle.join().unwrap();
+    assert_eq!(version, 7, "the schema version survives the thread move");
+}
+
 /// PR 4.3 fix: a `spill` file's per-row `commit_lsn` placeholder is overridden by the file's `lsn_end`
 /// (the real commit LSN), while a non-spill file appends the per-row value verbatim.
 #[test]
