@@ -19,6 +19,7 @@
 //! kept from double-exporting. Noted, deliberately not built (`replicas=1`).
 
 use crate::reload_signal::WatermarkWaiters;
+use anyhow::Context as _;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -112,8 +113,14 @@ pub async fn handle_ddl_restart(
     max_restarts: i32,
 ) -> anyhow::Result<RestartDecision> {
     let table = format!("{}.{}", old.source_schema, old.source_table);
-    let mut conn = pool.acquire().await?;
-    match control::reload::restart_for_ddl(&mut conn, old, new_version, max_restarts).await? {
+    let mut conn = pool
+        .acquire()
+        .await
+        .context("acquire a control-pg connection for the reload ddl restart")?;
+    match control::reload::restart_for_ddl(&mut conn, old, new_version, max_restarts)
+        .await
+        .with_context(|| format!("restart reload {} at schema v{new_version}", old.reload_id))?
+    {
         Some(new_id) => {
             common::metrics::record_reload_restart(&table);
             tracing::info!(
@@ -172,12 +179,19 @@ async fn export_with_ddl_restarts(
             deps.export_cfg.clone(),
             &req,
         )
-        .await?;
-        match exporter.run().await? {
+        .await
+        .with_context(|| format!("connect chunk exporter for reload {}", req.reload_id))?;
+        match exporter
+            .run()
+            .await
+            .with_context(|| format!("export chunks for reload {}", req.reload_id))?
+        {
             RunOutcome::Drained { final_lsn } => {
                 // The sink's last act (PR 6.9 / H10): flip export_complete carrying H. The LOADER
                 // then flips `complete` once transformed_lsn >= H — the sink never writes `complete`.
-                control::reload::complete_export(&pool, req.reload_id, final_lsn).await?;
+                control::reload::complete_export(&pool, req.reload_id, final_lsn)
+                    .await
+                    .with_context(|| format!("mark reload {} export complete", req.reload_id))?;
                 tracing::info!(
                     reload_id = req.reload_id,
                     final_lsn = %final_lsn,
@@ -323,7 +337,8 @@ impl ReloadController {
             self.cfg.lease_ttl.as_secs() as i64,
             free as i64,
         )
-        .await?;
+        .await
+        .with_context(|| format!("claim up to {free} reloads in epoch {}", self.cfg.epoch))?;
         if claimed.is_empty() {
             return Ok(());
         }
@@ -453,13 +468,14 @@ impl ReloadController {
                     let holder = holder.clone();
                     let reload_id = renew_id.load(Ordering::SeqCst);
                     async move {
-                        Ok(control::reload::renew_lease(
+                        control::reload::renew_lease(
                             &pool,
                             reload_id,
                             &holder,
                             ttl.as_secs() as i64,
                         )
-                        .await?)
+                        .await
+                        .with_context(|| format!("renew lease for reload {reload_id}"))
                     }
                 },
                 export,
@@ -535,7 +551,11 @@ impl ReloadController {
     /// nobody renewing — are warned per row AND counted into the `walrus_reload_lease_stale` gauge
     /// the stuck-lease alert reads (a gauge, so the alert never queries control-pg).
     async fn warn_stuck(&self) -> anyhow::Result<()> {
-        let stuck = control::reload::stuck_exporting(&self.pool, self.cfg.epoch).await?;
+        let stuck = control::reload::stuck_exporting(&self.pool, self.cfg.epoch)
+            .await
+            .with_context(|| {
+                format!("scan for stuck reload exports in epoch {}", self.cfg.epoch)
+            })?;
         common::metrics::set_reload_lease_stale(stuck.len() as u64);
         for (reload_id, holder) in stuck {
             tracing::warn!(
@@ -549,8 +569,12 @@ impl ReloadController {
 
     /// Record a typed rejection on the row (its reason IS the operator UX).
     async fn fail_row(&self, reload_id: i64, reason: &str) -> anyhow::Result<()> {
-        let mut conn = self.pool.acquire().await?;
-        control::reload::fail(&mut conn, reload_id, reason).await?;
+        let mut conn = self.pool.acquire().await.with_context(|| {
+            format!("acquire a control-pg connection to fail reload {reload_id}")
+        })?;
+        control::reload::fail(&mut conn, reload_id, reason)
+            .await
+            .with_context(|| format!("mark reload {reload_id} failed"))?;
         Ok(())
     }
 

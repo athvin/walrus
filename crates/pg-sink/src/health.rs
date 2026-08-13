@@ -9,6 +9,7 @@
 //!   after an outage has high lag *by definition*, and a lag-based liveness probe would kill it
 //!   exactly when it is doing its job. High lag feeds `degraded` on readiness/health, never a kill.
 
+use anyhow::Context as _;
 use axum::{
     extract::State, http::header, http::StatusCode, response::IntoResponse, routing::get, Json,
     Router,
@@ -159,7 +160,8 @@ pub async fn serve_on(
 ) -> anyhow::Result<()> {
     axum::serve(listener, router(state))
         .with_graceful_shutdown(async move { shutdown.cancelled().await })
-        .await?;
+        .await
+        .context("serve health endpoints")?;
     Ok(())
 }
 
@@ -169,7 +171,9 @@ pub async fn serve(
     state: Arc<HealthState>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind health endpoints on {addr}"))?;
     serve_on(listener, state, shutdown).await
 }
 

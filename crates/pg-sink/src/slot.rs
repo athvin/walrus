@@ -10,6 +10,7 @@
 //! needed for the initial backfill (PR 2.29), so the spike creates via SQL and leaves `snapshot_name`
 //! `None`; PR 2.29 will create via the replication command and keep the snapshot.
 
+use anyhow::Context as _;
 use common::Lsn;
 
 /// A pre-existing slot's resume position.
@@ -61,7 +62,8 @@ pub async fn read_slot(
              FROM pg_replication_slots WHERE slot_name = $1",
             &[&slot],
         )
-        .await?;
+        .await
+        .with_context(|| format!("read replication slot {slot:?} from pg_replication_slots"))?;
     let Some(row) = rows.first() else {
         return Ok(None);
     };
@@ -92,7 +94,8 @@ pub async fn verify_or_create_slot(
              FROM pg_replication_slots WHERE slot_name = $1",
             &[&slot],
         )
-        .await?;
+        .await
+        .with_context(|| format!("verify replication slot {slot:?} in pg_replication_slots"))?;
 
     if let Some(row) = rows.first() {
         // A freshly-created slot can have NULL LSNs until first use — treat NULL as ZERO.
@@ -119,7 +122,8 @@ pub async fn verify_or_create_slot(
             "SELECT lsn::text FROM pg_create_logical_replication_slot($1, 'pgoutput')",
             &[&slot],
         )
-        .await?;
+        .await
+        .with_context(|| format!("create logical replication slot {slot:?} with pgoutput"))?;
     let lsn: String = row.get(0);
     Ok(SlotResume::Created {
         consistent_point: parse_lsn(&lsn)?,
