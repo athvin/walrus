@@ -447,7 +447,7 @@ duplicated OID literals (Tier 2), the opt-in domain-ID newtype sweep (Tier 3), a
 |---|---|---|---|
 | ☐ | [12.1](./phase-12-rust-unsafe/pr-12.1-unsafe-safety-comment.md) | Forbid unsafe code workspace-wide and require SAFETY comments if it ever returns | `unsafe-safety-comment` |
 | ☐ | [12.2](./phase-12-rust-unsafe/pr-12.2-unsafe-minimize-scope.md) | Deny unsafe_op_in_unsafe_fn and multiple unsafe ops per block | `unsafe-minimize-scope` |
-| ☐ | [12.3](./phase-12-rust-unsafe/pr-12.3-unsafe-extern-block.md) | Deny missing_unsafe_on_extern and document the one native FFI boundary | `unsafe-extern-block` |
+| ☐ | [12.3](./phase-12-rust-unsafe/pr-12.3-unsafe-extern-block.md) | Deny missing_unsafe_on_extern and document bundled DuckDB's FFI boundary | `unsafe-extern-block` |
 | ☐ | [12.4](./phase-12-rust-unsafe/pr-12.4-unsafe-no-mangle-unsafe.md) | Deny unsafe_attr_outside_unsafe so exported symbols stay auditable | `unsafe-no-mangle-unsafe` |
 | ☐ | [12.5](./phase-12-rust-unsafe/pr-12.5-unsafe-send-sync-manual.md) | Correct the loader's Send/Sync claims and pin them with compile-time assertions | `unsafe-send-sync-manual` |
 | ☐ | [12.6](./phase-12-rust-unsafe/pr-12.6-unsafe-maybeuninit.md) | Guard against fake initialization and record why walrus never needs MaybeUninit | `unsafe-maybeuninit` |
