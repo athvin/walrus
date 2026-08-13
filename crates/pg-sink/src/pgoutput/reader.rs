@@ -48,11 +48,9 @@ impl<'a> Reader<'a> {
 
     /// Error unless at least `n` bytes remain, returning exactly the checked head.
     fn need(&self, n: usize) -> Result<&'a [u8], DecodeError> {
-        self.rest().get(..n).ok_or(DecodeError::UnexpectedEof {
-            needed: u32c(n),
-            offset: u32c(self.pos),
-            remaining: u32c(self.remaining()),
-        })
+        self.rest()
+            .get(..n)
+            .ok_or_else(|| eof(n, self.pos, self.remaining()))
     }
 
     /// One byte (a `Byte1` type tag or an `Int8`).
@@ -75,11 +73,7 @@ impl<'a> Reader<'a> {
     /// Returns [`DecodeError::UnexpectedEof`] when fewer than two bytes remain.
     pub fn int16(&mut self) -> Result<u16, DecodeError> {
         let Some(&arr) = self.rest().first_chunk::<2>() else {
-            return Err(DecodeError::UnexpectedEof {
-                needed: 2,
-                offset: u32c(self.pos),
-                remaining: u32c(self.remaining()),
-            });
+            return Err(eof(2, self.pos, self.remaining()));
         };
         self.pos += 2;
         Ok(u16::from_be_bytes(arr))
@@ -92,11 +86,7 @@ impl<'a> Reader<'a> {
     /// Returns [`DecodeError::UnexpectedEof`] when fewer than four bytes remain.
     pub fn int32(&mut self) -> Result<u32, DecodeError> {
         let Some(&arr) = self.rest().first_chunk::<4>() else {
-            return Err(DecodeError::UnexpectedEof {
-                needed: 4,
-                offset: u32c(self.pos),
-                remaining: u32c(self.remaining()),
-            });
+            return Err(eof(4, self.pos, self.remaining()));
         };
         self.pos += 4;
         Ok(u32::from_be_bytes(arr))
@@ -110,11 +100,7 @@ impl<'a> Reader<'a> {
     /// Returns [`DecodeError::UnexpectedEof`] when fewer than eight bytes remain.
     pub fn int64(&mut self) -> Result<i64, DecodeError> {
         let Some(&arr) = self.rest().first_chunk::<8>() else {
-            return Err(DecodeError::UnexpectedEof {
-                needed: 8,
-                offset: u32c(self.pos),
-                remaining: u32c(self.remaining()),
-            });
+            return Err(eof(8, self.pos, self.remaining()));
         };
         self.pos += 8;
         Ok(i64::from_be_bytes(arr))
@@ -130,11 +116,7 @@ impl<'a> Reader<'a> {
         let start = self.pos;
         let tail = self.rest();
         let Some(rel) = tail.iter().position(|&b| b == 0) else {
-            return Err(DecodeError::UnexpectedEof {
-                needed: 1,
-                offset: u32c(start),
-                remaining: u32c(self.remaining()),
-            });
+            return Err(eof(1, start, self.remaining()));
         };
         // `position` proved the split point; the total fallback is unreachable.
         let (text, _) = tail.split_at_checked(rel).unwrap_or_default();
@@ -184,6 +166,20 @@ impl<'a> Reader<'a> {
     #[inline]
     pub fn lsn(&mut self) -> Result<Lsn, DecodeError> {
         Ok(Lsn::new(self.int64()? as u64))
+    }
+}
+
+/// Build the modelled EOF error for a failed read.
+///
+/// `#[cold]` marks the branch as unlikely, while `#[inline(never)]` keeps the three-field setup out
+/// of the hot reader bodies. `reader_test.rs` pins the exact needed/offset/remaining payload.
+#[cold]
+#[inline(never)]
+fn eof(needed: usize, pos: usize, remaining: usize) -> DecodeError {
+    DecodeError::UnexpectedEof {
+        needed: u32c(needed),
+        offset: u32c(pos),
+        remaining: u32c(remaining),
     }
 }
 
