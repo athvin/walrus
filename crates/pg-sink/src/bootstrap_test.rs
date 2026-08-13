@@ -48,3 +48,23 @@ async fn retry_succeeds_after_a_transient_blip() {
     assert_eq!(out.unwrap(), 7);
     assert_eq!(attempts, 2);
 }
+
+/// The old `F: FnMut() -> Fut` bound could not express this: the attempt future borrows `label`
+/// from the enclosing scope while the closure also mutates `attempts`.
+#[tokio::test]
+async fn retry_accepts_a_borrowing_async_closure() {
+    let deadline = Instant::now() + Duration::from_secs(3600);
+    let label = String::from("canary");
+    let mut attempts = 0_u32;
+    let out: Result<usize, Error> = retry_transient(deadline, "borrowing", async || {
+        attempts += 1;
+        if attempts < 2 {
+            Err(Error::ObjectStore("503".into()))
+        } else {
+            Ok(label.len())
+        }
+    })
+    .await;
+    assert_eq!(out.unwrap(), 6);
+    assert_eq!(attempts, 2);
+}
