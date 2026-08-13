@@ -9,6 +9,7 @@ const CODEGEN_UNITS_NOTE: &str =
 const TARGET_CPU_ADR: &str = "docs/implementation/notes/rust-skills/opt-target-cpu.md";
 const TARGET_CPU_NOTE: &str =
     include_str!("../../../docs/implementation/notes/rust-skills/opt-target-cpu.md");
+const PGO_ADR: &str = "docs/implementation/notes/rust-skills/opt-pgo-profile.md";
 const BUILD_SURFACES: &[(&str, &str)] = &[
     ("Cargo.toml", WORKSPACE_MANIFEST),
     (
@@ -22,6 +23,26 @@ const BUILD_SURFACES: &[(&str, &str)] = &[
     (
         "deploy/docker/Dockerfile.loader",
         include_str!("../../../deploy/docker/Dockerfile.loader"),
+    ),
+];
+const PGO_SURFACES: &[(&str, &str)] = &[
+    ("Cargo.toml", WORKSPACE_MANIFEST),
+    (
+        ".github/workflows/ci.yml",
+        include_str!("../../../.github/workflows/ci.yml"),
+    ),
+    (
+        "deploy/docker/Dockerfile.pg-sink",
+        include_str!("../../../deploy/docker/Dockerfile.pg-sink"),
+    ),
+    (
+        "deploy/docker/Dockerfile.loader",
+        include_str!("../../../deploy/docker/Dockerfile.loader"),
+    ),
+    ("justfile", include_str!("../../../justfile")),
+    (
+        "scripts/bench-e2e.sh",
+        include_str!("../../../scripts/bench-e2e.sh"),
     ),
 ];
 
@@ -108,6 +129,19 @@ fn cargo_config_policy(
     } else {
         Ok(())
     }
+}
+
+fn pgo_policy(body: &str) -> Result<(), &'static str> {
+    for (needle, diagnostic) in [
+        ("profile-generate", "PGO profile generation is enabled"),
+        ("profile-use", "PGO profile use is enabled"),
+        ("llvm-profdata", "llvm-profdata is invoked"),
+    ] {
+        if body.contains(needle) {
+            return Err(diagnostic);
+        }
+    }
+    Ok(())
 }
 
 #[test]
@@ -246,5 +280,48 @@ fn target_cpu_rejection_is_recorded() {
     assert!(
         !TARGET_CPU_NOTE.trim().is_empty(),
         "{TARGET_CPU_ADR} must contain the recorded decision"
+    );
+}
+
+#[test]
+fn no_build_surface_enables_pgo() {
+    for (name, body) in PGO_SURFACES {
+        assert_eq!(
+            pgo_policy(body),
+            Ok(()),
+            "{name} must remain free of PGO instrumentation; see {PGO_ADR}"
+        );
+    }
+}
+
+#[test]
+fn pgo_policy_rejects_fabricated_input() {
+    let cases = [
+        ("RUN cargo build --release", Ok(())),
+        (
+            "ENV RUSTFLAGS=\"-Cprofile-generate=/tmp/pgo\"",
+            Err("PGO profile generation is enabled"),
+        ),
+        (
+            "RUSTFLAGS=\"-Cprofile-use=/tmp/pgo.profdata\" cargo build",
+            Err("PGO profile use is enabled"),
+        ),
+        (
+            "pgo:\n    llvm-profdata merge -o merged.profdata raw",
+            Err("llvm-profdata is invoked"),
+        ),
+    ];
+
+    for (body, expected) in cases {
+        assert_eq!(pgo_policy(body), expected, "surface:\n{body}");
+    }
+}
+
+#[test]
+fn pgo_decision_is_still_recorded() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    assert!(
+        root.join(PGO_ADR).is_file(),
+        "missing PGO decision at {PGO_ADR}"
     );
 }
