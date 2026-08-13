@@ -238,16 +238,14 @@ impl StreamDemux {
                     // skip this speculative-spill iteration rather than panic.
                     continue;
                 };
-                let mut take = Vec::new();
-                txn.changes.retain(|c| {
-                    if c.oid == oid && c.sub_xid == sub_xid {
-                        take.push(c.clone());
-                        false
-                    } else {
-                        true
-                    }
-                });
-                (txn.begin_lsn, take)
+                // Move the buffer out, split it in commit order, and put the survivors back.
+                // `partition` preserves the relative order of both halves.
+                let (rows, keep): (Vec<StreamedChange>, Vec<StreamedChange>) =
+                    std::mem::take(&mut txn.changes)
+                        .into_iter()
+                        .partition(|c| c.oid == oid && c.sub_xid == sub_xid);
+                txn.changes = keep;
+                (txn.begin_lsn, rows)
             };
             self.meter.release((oid, sub_xid));
             let Some(cached) = cache.latest_for(oid) else {

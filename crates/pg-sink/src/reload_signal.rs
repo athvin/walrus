@@ -224,15 +224,8 @@ impl PendingSignals {
 
 /// Drain every element matching `pred` out of `v`, preserving order.
 fn extract<T>(v: &mut Vec<T>, mut pred: impl FnMut(&T) -> bool) -> Vec<T> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < v.len() {
-        if pred(&v[i]) {
-            out.push(v.remove(i));
-        } else {
-            i += 1;
-        }
-    }
+    let (out, keep) = std::mem::take(v).into_iter().partition(|t| pred(t));
+    *v = keep;
     out
 }
 
