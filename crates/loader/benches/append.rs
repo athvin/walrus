@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // bench (harness=false, not test-cfg)
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "bench (harness=false, not test-cfg)"
+)]
 //! PR 5.5 — criterion micro-benches for the loader's Phase-A append (`TableDb::append_parquet`).
 //!
 //! Generates a local Parquet fixture with the sink's own Arrow→Parquet writer, then benches

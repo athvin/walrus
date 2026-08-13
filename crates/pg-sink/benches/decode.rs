@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // bench (harness=false, not test-cfg)
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "bench (harness=false, not test-cfg)"
+)]
 //! PR 5.4 — criterion micro-benches for the pgoutput decoder hot path.
 //!
 //! We synthesize *valid* pgoutput byte streams programmatically (the same message layouts the golden

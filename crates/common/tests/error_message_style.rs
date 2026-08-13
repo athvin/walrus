@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Conformance gate for `err-lowercase-msg` (PR 10.7): every production `#[error("…")]` literal
 //! starts lowercase (or with an allow-listed acronym) and carries no trailing sentence punctuation,
 //! so `{:#}` chains read as one sentence. Pure source scanning — no Docker, no new dependency.

@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Arrow → Parquet → S3 PUT against compose MinIO (`#[ignore]`). A flush lands an object at the
 //! epoch-namespaced key; it reads back with MICROS temporals + values intact. (DuckDB's *type
 //! inference* over this exact Parquet is proven by pg-to-arrow's conformance suite; here we verify

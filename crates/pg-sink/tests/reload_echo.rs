@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Echo routing against compose (`#[ignore]` — needs source PG + control PG). A manual
 //! `walrus.reload_signal` INSERT comes back through the slot, resolves a subscribed waiter with
 //! the transaction's COMMIT LSN (the chunk watermark `L_i`), passes the embedded-LSN cross-check,

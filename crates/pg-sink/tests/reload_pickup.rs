@@ -1,5 +1,12 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
-#![allow(clippy::panic)] // polling helper: panic reports the requested reload state and id on timeout
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
+#![allow(
+    clippy::panic,
+    reason = "polling helper: panic reports the requested reload state and id on timeout"
+)]
 //! Reload controller pickup against compose (`#[ignore]` — needs source + control PG). A
 //! `requested` row flips to `exporting` within one poll cadence with a live, observably-advancing
 //! lease; doomed requests (unpublished / keyless) fail fast with operator-readable reasons while a

@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! DDL capture against compose (`#[ignore]` — needs source PG + MinIO + control PG). An `ALTER TABLE …
 //! ADD COLUMN` on the source writes a `ddl_manifest` row (stamped with the DDL's `c_lsn`), bumps the
 //! table's structural `schema_version`, and cuts a fresh Parquet file — so the prior file carries the

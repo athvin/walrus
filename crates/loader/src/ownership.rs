@@ -18,7 +18,10 @@
 
 /// **Deferred** placeholder for a table's shard assignment across loader replicas. Nothing constructs
 /// this in v1 — one loader owns every table, so `owner_replica` is always `None`.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "deferred table-sharding seam; see docs/deferred-goals.md"
+)]
 struct TableAssignment {
     /// Fully-qualified `schema.table`.
     table: String,

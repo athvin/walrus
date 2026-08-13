@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Destructive DDL apply (loader §5.7, PR 3.9) — where mirror and raw **diverge**. Three hermetic tests
 //! (in-memory / temp-file `TableDb`) prove the per-taxonomy behaviour; the `#[ignore]` compose test
 //! proves a lossy-cast failure quarantines the table and degrades `/ready`.

@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Snapshot/stream boundary through the transform (loader §7, architecture §1.7) — compose (`#[ignore]`).
 //! The loader has **no special snapshot mode**: `kind='snapshot'` files append into `<table>_raw` like
 //! any `ready` file, and the transform collapses the overlap by `(commit_lsn, lsn)`. Two edges proven

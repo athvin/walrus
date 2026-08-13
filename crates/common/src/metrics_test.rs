@@ -21,7 +21,7 @@ fn init_is_idempotent() {
 
     let source = include_str!("metrics.rs");
     assert!(
-        source.contains("#[expect("),
+        source.contains(concat!("#[", "expect(")),
         "the sanctioned expect must use a checked lint expectation"
     );
     assert!(

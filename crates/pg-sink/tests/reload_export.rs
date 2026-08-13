@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Chunk export engine against compose (`#[ignore]` — needs source PG + control PG + MinIO).
 //! 2,500 seeded rows at `chunk_rows=1000` become exactly 3 `kind='reload'` files whose union is
 //! the table exactly, every row stamped `commit_lsn = lsn =` its chunk's `L_i`; a crashed export

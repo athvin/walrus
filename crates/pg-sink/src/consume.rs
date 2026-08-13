@@ -27,7 +27,10 @@ use tokio_util::sync::CancellationToken;
 /// keepalives answered (inside `ReplicationStream`), and exit cleanly on cancel or stream end.
 // The loop driver wires together the full pipeline (cache, router, sink, control pool); its arity is
 // intrinsic, not a code smell.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "loop driver wires the full cache, sink, control, and reload pipeline explicitly"
+)]
 pub async fn run_decode_loop(
     stream: &mut ReplicationStream,
     token: CancellationToken,
@@ -508,7 +511,10 @@ impl BatchRouter {
 
     // Each parameter is one provenance field the per-row `SinkMeta` must carry (oid, op, values, lsn,
     // xid, schema_version) — the arity mirrors the CDC contract, not an extractable clump.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each argument is a distinct provenance field required by the CDC row contract"
+    )]
     fn push(
         &mut self,
         cache: &RelationCache,

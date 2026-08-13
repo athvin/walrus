@@ -141,10 +141,14 @@ pub fn init() {
         // guarantees this closure runs at most once — so the panic is unreachable in practice. `init`
         // is infallible by signature and called from `main`/scrape-test setup; threading a `Result`
         // out (stable `OnceLock` has no `get_or_try_init`) would ripple with no recoverable path.
-        #[allow(clippy::expect_used)]
+        #[expect(
+            clippy::expect_used,
+            reason = "install-once invariant: OnceLock::get_or_init runs this closure at most once, \
+                      so install_recorder can only fail if another global recorder exists — a bug"
+        )]
         let handle = PrometheusBuilder::new()
             .install_recorder()
-            .expect("install a global Prometheus recorder exactly once");
+            .expect("BUG: a second global Prometheus recorder was installed");
         describe_all();
         zero_init_global();
         // The reload-active gauge is flavor-labelled: seed both flavors at 0 so the panel shows a

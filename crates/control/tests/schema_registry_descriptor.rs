@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Compose round-trip: a *generated* `pg-to-arrow` `TypeDescriptor` set persists to
 //! `schema_registry` and reads back equal. This exercises the sink↔loader seam end to end and proves
 //! `control` may dev-depend on `pg-to-arrow` with **no DAG cycle** (pg-to-arrow → common only).

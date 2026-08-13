@@ -19,7 +19,10 @@
 
 /// A per-table plan of disjoint CTID ranges to `COPY` concurrently under the exported snapshot.
 /// **Deferred** — nothing constructs or consumes this in v1.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "deferred CTID-range backfill plan; see docs/deferred-goals.md"
+)]
 struct CtidRangePlan {
     /// Fully-qualified `schema.table`.
     table: String,
@@ -31,7 +34,10 @@ struct CtidRangePlan {
 /// **Deferred goal — not implemented.** Would size CTID ranges from table stats (relpages / bloat)
 /// and worker count. v1 runs one serial `COPY` per table; see the module docs and
 /// `docs/deferred-goals.md`.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "deferred CTID-range backfill seam; see docs/deferred-goals.md"
+)]
 #[expect(
     clippy::unimplemented,
     reason = "deferred goal — parallel CTID-range backfill; see docs/deferred-goals.md"

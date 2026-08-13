@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Hermetic raw→mirror transform tests (loader §6) — `Connection::open_in_memory()`, **no docker
 //! compose, no Postgres, no S3**. They replay every worked case from `walrus-loader.md §6` against the
 //! *production* template (`loader::transform`), so test and Phase B (PR 3.4) share one source of truth.
@@ -449,7 +453,10 @@ fn docs_db() -> Connection {
 }
 
 /// `toast` is the JSON array text of the unchanged_toast list, e.g. `[]` or `["big"]`.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "test fixture seeds every raw-row field explicitly"
+)]
 fn docs_seed(
     c: &Connection,
     id: i64,

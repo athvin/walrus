@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Compose-gated integration tests for the loader-pause claim predicate (PR 6.6).
 //!
 //! "Pausing is not claiming" (reload §2): a live `flavor='reload'` reload in

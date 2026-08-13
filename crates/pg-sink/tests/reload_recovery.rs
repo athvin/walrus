@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Completion & crash recovery against compose (`#[ignore]` — needs source PG + control PG +
 //! MinIO). Three proofs (reload H7/H10, PR 6.9):
 //!

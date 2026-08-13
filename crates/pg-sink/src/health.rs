@@ -42,7 +42,10 @@ pub struct HealthState {
 
 impl HealthState {
     /// A fresh state (`Bootstrapping`, live, not terminating), shared across the handlers and the loop.
-    #[allow(clippy::new_ret_no_self)] // intentionally returns the shared handle probes and loop hold
+    #[allow(
+        clippy::new_ret_no_self,
+        reason = "intentionally returns the shared handle used by probes and the loop"
+    )]
     pub fn new() -> Arc<Self> {
         Arc::new(HealthState {
             phase: AtomicU8::new(PHASE_BOOTSTRAPPING),

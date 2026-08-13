@@ -29,6 +29,8 @@ trivially_copy_pass_by_ref = "deny"
 # and integration `tests/`; benches (`harness = false`) and the e2e harness lib carry a file-level allow.
 unwrap_used = "deny"
 expect_used = "deny"
+# A suppression must say why. This restriction lint is outside `clippy::all`, so no priority is needed.
+allow_attributes_without_reason = "deny"
 panic = "deny"              # a service returns a classified error instead of aborting the pod
 todo = "deny"               # unfinished code must not reach main
 unimplemented = "deny"      # the one deferred stub carries a scoped, fulfilled expectation

@@ -20,7 +20,10 @@ fn valid_config() -> CommonConfig {
 /// don't leak env across the shared test process. The one `#[allow]` lives here: `Jail`'s
 /// closure must return `Result<(), figment::Error>`, and that error type is large — a
 /// constraint of figment's API, not of our code.
-#[allow(clippy::result_large_err)]
+#[allow(
+    clippy::result_large_err,
+    reason = "figment Jail requires Result<(), figment::Error>, whose error variant is intentionally large"
+)]
 fn in_jail(body: impl FnOnce(&mut figment::Jail)) {
     figment::Jail::expect_with(|jail| {
         body(jail);
