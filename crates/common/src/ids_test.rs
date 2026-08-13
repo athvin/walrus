@@ -20,3 +20,23 @@ fn ordering_matches_the_inner_integer() {
     v.sort();
     assert_eq!(v, [ManifestId(1), ManifestId(2), ManifestId(3)]);
 }
+
+#[test]
+fn epoch_from_i64_and_back_round_trips() {
+    let epoch = EpochNo::from(7);
+    assert_eq!(epoch, EpochNo(7));
+    assert_eq!(i64::from(epoch), 7);
+}
+
+#[test]
+fn epoch_ordering_matches_the_inner_integer() {
+    assert!(EpochNo(1) < EpochNo(2));
+    let mut epochs = [EpochNo(3), EpochNo(1), EpochNo(2)];
+    epochs.sort();
+    assert_eq!(epochs, [EpochNo(1), EpochNo(2), EpochNo(3)]);
+}
+
+#[test]
+fn epoch_serializes_as_a_bare_number() {
+    assert_eq!(serde_json::to_string(&EpochNo(42)).unwrap(), "42");
+}
