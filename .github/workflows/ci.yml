@@ -134,6 +134,13 @@ jobs:
       - name: cargo test --workspace
         run: cargo test --workspace
 
+      # The ONLY build in which `common` is isolated with its optional `sqlx` feature off.
+      # Workspace feature unification turns it on through `control`, while `--all-features` does
+      # so directly. Package isolation is what exercises the off state; disabling defaults states
+      # the intent and preserves it if `common` gains default features later.
+      - name: common feature seam (sqlx off)
+        run: cargo check -p common --no-default-features --all-targets
+
       - name: sccache stats
         if: always()
         run: sccache --show-stats
