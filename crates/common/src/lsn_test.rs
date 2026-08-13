@@ -63,6 +63,30 @@ fn u64_round_trips_through_from() {
 }
 
 #[test]
+fn subtraction_is_the_byte_distance() {
+    assert_eq!(Lsn::new(500) - Lsn::new(200), 300);
+    assert_eq!(Lsn::new(200) - Lsn::new(200), 0);
+    assert_eq!(&Lsn::new(500) - &Lsn::new(200), 300);
+}
+
+#[test]
+fn addition_advances_a_position() {
+    assert_eq!(Lsn::new(100) + 24, Lsn::new(124));
+    let mut lsn = Lsn::new(100);
+    lsn += 24;
+    assert_eq!(lsn, Lsn::new(124));
+}
+
+#[test]
+fn saturating_sub_bytes_bottoms_out_at_zero() {
+    assert_eq!(
+        Lsn::new(300).saturating_sub_bytes(100),
+        Lsn::new(200)
+    );
+    assert_eq!(Lsn::new(100).saturating_sub_bytes(300), Lsn::ZERO);
+}
+
+#[test]
 fn serde_round_trips_as_padded_string() {
     let lsn = Lsn::new(0x19A2B3C);
     let json = serde_json::to_string(&lsn).unwrap();
