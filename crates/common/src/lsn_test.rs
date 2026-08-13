@@ -63,6 +63,7 @@ fn u64_round_trips_through_from() {
 }
 
 #[test]
+#[allow(clippy::op_ref, reason = "exercise the explicit borrowed Sub impl")]
 fn subtraction_is_the_byte_distance() {
     assert_eq!(Lsn::new(500) - Lsn::new(200), 300);
     assert_eq!(Lsn::new(200) - Lsn::new(200), 0);
@@ -79,10 +80,7 @@ fn addition_advances_a_position() {
 
 #[test]
 fn saturating_sub_bytes_bottoms_out_at_zero() {
-    assert_eq!(
-        Lsn::new(300).saturating_sub_bytes(100),
-        Lsn::new(200)
-    );
+    assert_eq!(Lsn::new(300).saturating_sub_bytes(100), Lsn::new(200));
     assert_eq!(Lsn::new(100).saturating_sub_bytes(300), Lsn::ZERO);
 }
 

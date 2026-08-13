@@ -33,6 +33,15 @@ impl Lsn {
     pub const fn as_u64(self) -> u64 {
         self.0
     }
+
+    /// Retreat this position by `bytes`, **saturating at 0**.
+    ///
+    /// A named method, not `Sub<u64>`: the clamp is a policy decision (the retention floor must
+    /// never go negative and must never wrap), and a reader seeing `lsn - lag` would not expect it.
+    #[must_use = "returns the retreated position; it does not move anything"]
+    pub const fn saturating_sub_bytes(self, bytes: u64) -> Self {
+        Lsn(self.0.saturating_sub(bytes))
+    }
 }
 
 impl From<u64> for Lsn {
@@ -46,6 +55,49 @@ impl From<Lsn> for u64 {
     /// The raw `u64` WAL position. [`Lsn::as_u64`] stays for `const` contexts.
     fn from(lsn: Lsn) -> Self {
         lsn.0
+    }
+}
+
+/// WAL byte distance between two positions.
+///
+/// **Defined for the ordered case only** (`self >= rhs`) — which is what the `(commit_lsn, lsn)`
+/// contract and the control DB's `CHECK (transformed_lsn <= raw_appended_lsn)` guarantee. A
+/// violation is a bug: it trips a `debug_assert!` in tests and saturates to 0 in release rather than
+/// wrapping. Callers whose inputs are genuinely unordered must branch first (see the loader's
+/// `phase_a::raw_append_lag_bytes`).
+impl std::ops::Sub<Lsn> for Lsn {
+    type Output = u64;
+
+    fn sub(self, rhs: Lsn) -> u64 {
+        debug_assert!(
+            self.0 >= rhs.0,
+            "Lsn subtraction is defined for the ordered case only"
+        );
+        self.0.saturating_sub(rhs.0)
+    }
+}
+
+/// The reference form, so a borrow site need not copy.
+impl std::ops::Sub<&Lsn> for &Lsn {
+    type Output = u64;
+
+    fn sub(self, rhs: &Lsn) -> u64 {
+        *self - *rhs
+    }
+}
+
+/// Advance a WAL position by `bytes`.
+impl std::ops::Add<u64> for Lsn {
+    type Output = Lsn;
+
+    fn add(self, bytes: u64) -> Lsn {
+        Lsn(self.0.saturating_add(bytes))
+    }
+}
+
+impl std::ops::AddAssign<u64> for Lsn {
+    fn add_assign(&mut self, bytes: u64) {
+        *self = *self + bytes;
     }
 }
 

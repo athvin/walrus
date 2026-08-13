@@ -343,11 +343,16 @@ async fn plan_at_version(
 }
 
 /// The raw-append backlog in LSN-bytes: how far the newest ready file's commit LSN leads the Phase-A
-/// frontier. An empty queue (`None`) is 0; a frontier already at/after the head saturates to 0 and
-/// never underflows. This is the value of `walrus_loader_raw_append_lag_bytes` (PR 5.6).
+/// frontier. An empty queue (`None`) is 0; a frontier already at/after the head is 0 — the ordered
+/// guard is explicit, so `-` is only ever reached in its defined domain. This is the value of
+/// `walrus_loader_raw_append_lag_bytes` (PR 5.6).
 fn raw_append_lag_bytes(max_ready_lsn_end: Option<Lsn>, raw_appended: Lsn) -> u64 {
     max_ready_lsn_end.map_or(0, |head| {
-        head.as_u64().saturating_sub(raw_appended.as_u64())
+        if head > raw_appended {
+            head - raw_appended
+        } else {
+            0
+        }
     })
 }
 
