@@ -22,6 +22,10 @@ unsafe_op_in_unsafe_fn = "deny"
 # declarations in pinned `libduckdb-sys`. Other dependency FFI is likewise not first-party. This
 # lint is allow-by-default here, so deny it explicitly to reject pre-2024 extern-block spelling.
 missing_unsafe_on_extern = "deny"
+# The tree has no no_mangle/export_name/link_section attributes and declares no custom crate type;
+# its production artifacts are the walrus-pg-sink and walrus-loader executables. Deny the otherwise
+# allow-by-default bare spelling because duplicate exported symbols can create linker-level UB.
+unsafe_attr_outside_unsafe = "deny"
 # This rustc lint is allow-by-default, so `warnings = "deny"` does not enable it.
 missing_copy_implementations = "deny"
 
