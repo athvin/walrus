@@ -11,6 +11,9 @@ rust-version = "1.95" # MSRV — keep in sync with rust-toolchain.toml; CI `msrv
 # NOTE: these only take effect in a member once it declares `[lints] workspace = true`.
 [workspace.lints.rust]
 warnings = "deny"
+# The rustc `unsafe-code` lint is allow-by-default, so `warnings = "deny"` never reaches it.
+# `forbid` prevents a member from reopening the door with an allow attribute; walrus has no sites.
+unsafe_code = "forbid"
 # This rustc lint is allow-by-default, so `warnings = "deny"` does not enable it.
 missing_copy_implementations = "deny"
 
@@ -32,6 +35,10 @@ trivially_copy_pass_by_ref = "deny"
 # and integration `tests/`; benches (`harness = false`) and the e2e harness lib carry a file-level allow.
 unwrap_used = "deny"
 expect_used = "deny"
+# Belt-and-braces if a future crate deliberately stops inheriting the rustc forbid above: every
+# unsafe block must carry a `// SAFETY:` comment. This is a restriction lint outside `clippy::all`,
+# so no group-vs-lint priority is needed.
+undocumented_unsafe_blocks = "deny"
 # A suppression must say why. This restriction lint is outside `clippy::all`, so no priority is needed.
 allow_attributes_without_reason = "deny"
 # Promoting exactly this pedantic lint keeps every fallible public API's contract explicit.
