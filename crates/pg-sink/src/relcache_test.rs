@@ -74,3 +74,77 @@ fn internal_tables_are_recognised() {
     );
     assert!(!is_internal_table("walrus", "something_else"));
 }
+
+#[test]
+fn collects_and_extends_like_a_collection() {
+    let first = build_cached(orders(), 1).unwrap();
+    let second = build_cached(orders(), 2).unwrap();
+    let cache: RelationCache = [first, second].into_iter().collect();
+
+    assert_eq!(cache.len(), 2);
+    assert!(cache.get(16397, 1).is_some());
+    assert!(cache.get(16397, 2).is_some());
+
+    let mut grown = RelationCache::default();
+    grown.extend([build_cached(orders(), 3).unwrap()]);
+    assert_eq!(grown.len(), 1);
+    assert!(grown.get(16397, 3).is_some());
+}
+
+#[test]
+fn iterates_by_ref_by_mut_and_by_value() {
+    let cache: RelationCache = [build_cached(orders(), 7).unwrap()]
+        .into_iter()
+        .collect();
+
+    assert_eq!(cache.iter().count(), 1);
+    assert_eq!((&cache).into_iter().count(), 1);
+
+    let mut cache = cache;
+    for relation in &mut cache {
+        let before = Arc::strong_count(relation);
+        let clone = Arc::clone(relation);
+        assert_eq!(Arc::strong_count(relation), before + 1);
+        drop(clone);
+    }
+
+    let versions: Vec<i64> = cache
+        .into_iter()
+        .map(|relation| relation.schema_version)
+        .collect();
+    assert_eq!(versions, vec![7]);
+}
+
+#[test]
+fn hydrate_message_is_unchanged_on_a_malformed_snapshot() {
+    let relation = orders();
+    let good = control::RegistryRow {
+        epoch: common::EpochNo(1),
+        source_schema: "public".to_string(),
+        source_table: "orders".to_string(),
+        schema_version: 1,
+        descriptors: pg_to_arrow::descriptor::describe_relation(&relation),
+        columns: serde_json::to_value(relation).unwrap(),
+    };
+    let malformed = serde_json::json!({"not": "a PgRelation"});
+    let source = serde_json::from_value::<PgRelation>(malformed.clone()).unwrap_err();
+    let bad = control::RegistryRow {
+        epoch: common::EpochNo(1),
+        source_schema: "public".to_string(),
+        source_table: "orders".to_string(),
+        schema_version: 2,
+        descriptors: vec![],
+        columns: malformed,
+    };
+    let mut cache = RelationCache::default();
+
+    let error = cache.hydrate(vec![good, bad]).unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "hydrate from schema_registry: public.orders: columns snapshot is not a PgRelation: {source}"
+        )
+    );
+    assert!(cache.is_empty(), "hydration must not partially update the cache");
+}
