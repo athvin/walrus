@@ -145,7 +145,7 @@ impl TableBatcher {
         for (mut meta, values) in std::mem::take(&mut self.pending) {
             meta.commit_lsn = commit_lsn;
             meta.commit_ts = commit_ts;
-            meta.batch_id = self.batch_id.clone();
+            meta.batch_id.clone_from(&self.batch_id);
             self.builder.append_row(&values, &meta)?;
             self.committed_rows += 1;
         }
