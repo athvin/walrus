@@ -13,6 +13,7 @@
 
 use crate::{EpochNo, Error, Lsn, Result, SchemaVersionNo};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::mem::{align_of, size_of};
 
 /// The change operation. Serializes to a single lowercase char: `i` | `u` | `d` | `t`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,8 +44,17 @@ pub enum Kind {
 /// Wrapping [`jiff::Timestamp`] (which is *always* a UTC instant) makes it impossible for a caller
 /// to emit a local or source-offset timestamp: the inner value has no offset, and serialization
 /// always renders the `Z` form.
+///
+/// The transparent representation guarantees that this validation wrapper costs exactly nothing
+/// over the inner [`jiff::Timestamp`].
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UtcTimestamp(jiff::Timestamp);
+
+const _: () = assert!(
+    size_of::<UtcTimestamp>() == size_of::<jiff::Timestamp>()
+        && align_of::<UtcTimestamp>() == align_of::<jiff::Timestamp>()
+);
 
 impl UtcTimestamp {
     /// The current instant, in UTC.

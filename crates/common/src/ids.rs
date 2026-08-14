@@ -5,11 +5,21 @@
 //! `ManifestId`, [`EpochNo`], [`SchemaVersionNo`], and [`ReloadId`] share the same transparent
 //! `int8` boundary while remaining distinct types inside Rust.
 
+use std::mem::{align_of, size_of};
+
 /// A `file_manifest` row's primary key (`id`): returned by `insert_ready`, claimed as
 /// `ManifestRow::id`, and retired through the loader's Phase-A lifecycle (`delete_claimed` /
 /// `mark_failed`). Those APIs live in downstream crates, so `common` cannot link to them.
+///
+/// The transparent representation makes the SQLx `i64` Encode/Decode delegation a
+/// compiler-guaranteed layout contract rather than a convention.
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ManifestId(pub i64);
+
+const _: () = assert!(
+    size_of::<ManifestId>() == size_of::<i64>() && align_of::<ManifestId>() == align_of::<i64>()
+);
 
 impl std::fmt::Display for ManifestId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -33,11 +43,17 @@ impl From<ManifestId> for i64 {
 /// replication slot is lost and a total restart opens a new generation (§1.8). It namespaces every
 /// control-plane row and every S3 key prefix — it is *not* a row id, and it must never be confused
 /// with a [`ManifestId`], a schema version, or a table OID.
+///
+/// The transparent representation guarantees the layout assumed by its SQLx `i64` delegation.
+#[repr(transparent)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 #[serde(transparent)]
 pub struct EpochNo(pub i64);
+
+const _: () =
+    assert!(size_of::<EpochNo>() == size_of::<i64>() && align_of::<EpochNo>() == align_of::<i64>());
 
 impl std::fmt::Display for EpochNo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -60,11 +76,19 @@ impl From<EpochNo> for i64 {
 /// A relation's structural schema-version number.
 ///
 /// The transparent serde representation preserves the bare JSON number stored in Parquet metadata.
+/// The transparent representation separately guarantees the layout assumed by SQLx's `i64`
+/// delegation.
+#[repr(transparent)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 #[serde(transparent)]
 pub struct SchemaVersionNo(pub i64);
+
+const _: () = assert!(
+    size_of::<SchemaVersionNo>() == size_of::<i64>()
+        && align_of::<SchemaVersionNo>() == align_of::<i64>()
+);
 
 impl std::fmt::Display for SchemaVersionNo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -85,8 +109,15 @@ impl From<SchemaVersionNo> for i64 {
 }
 
 /// A `table_reload` attempt's monotonic `bigserial` primary key.
+///
+/// The transparent representation guarantees the layout assumed by its SQLx `i64` delegation.
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ReloadId(pub i64);
+
+const _: () = assert!(
+    size_of::<ReloadId>() == size_of::<i64>() && align_of::<ReloadId>() == align_of::<i64>()
+);
 
 impl std::fmt::Display for ReloadId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -107,7 +138,8 @@ impl From<ReloadId> for i64 {
 }
 
 /// Postgres `int8` support (feature `sqlx`): `ManifestId` binds and decodes exactly as its inner
-/// `i64` — the transparent-newtype trick — so a `bigint` column round-trips with no SQL cast. Mirrors
+/// `i64` — the transparent-newtype trick, now backed by each type's representation attribute above
+/// — so a `bigint` column round-trips with no SQL cast. Mirrors
 /// [`Lsn`](crate::Lsn)'s `sqlx_support`; hand-written rather than derived so `common`'s `sqlx` dep
 /// needn't pull the `macros` feature. Array binds (`&[ManifestId]`) convert to `&[i64]` at the call
 /// site — a manual `Type` impl carries no `PgHasArrayType`.

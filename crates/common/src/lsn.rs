@@ -8,6 +8,7 @@
 //! relies on.
 
 use std::fmt;
+use std::mem::{align_of, size_of};
 use std::str::FromStr;
 
 /// A Postgres Log Sequence Number as a single `u64`.
@@ -15,8 +16,17 @@ use std::str::FromStr;
 /// Canonical text form is **uppercase, zero-padded 16-hex** ([`Display`](fmt::Display)), chosen so
 /// lexical order equals numeric order. `Ord` derives from the inner `u64`, so it *is* numeric
 /// order.
+///
+/// The transparent representation guarantees that the SQLx encoding delegation stays
+/// layout-identical to the single `u64` value it forwards as `i64` wire bits.
+#[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Lsn(u64);
+
+const _: () = assert!(
+    size_of::<Lsn>() == size_of::<u64>() && align_of::<Lsn>() == align_of::<u64>(),
+    "Lsn must stay layout-identical to u64 for SQLx encoding"
+);
 
 impl Lsn {
     /// The zero LSN — orders below every nonzero LSN.
