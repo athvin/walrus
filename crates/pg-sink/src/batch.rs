@@ -90,14 +90,14 @@ pub struct TableBatcher {
     pending_bytes: u64,
     committed_rows: u64,
     committed_bytes: u64,
-    /// Commit LSN of the batch's first / last committed txn.
+    /// Commit LSN of the batch's first / last committed txn. `None` until the first commit.
     first_commit_lsn: Option<Lsn>,
-    last_commit_lsn: Lsn,
+    last_commit_lsn: Option<Lsn>,
     /// When the first committed row landed (drives `max_fill`).
     opened_at: Option<Instant>,
     /// The file id shared by every row of this batch (assigned when it opens; the manifest, PR 2.25,
-    /// keys on it). Empty until the first row is pushed.
-    batch_id: String,
+    /// keys on it). `None` until the first row is pushed.
+    batch_id: Option<String>,
 }
 
 impl TableBatcher {
@@ -123,19 +123,18 @@ impl TableBatcher {
             committed_rows: 0,
             committed_bytes: 0,
             first_commit_lsn: None,
-            last_commit_lsn: Lsn::ZERO,
+            last_commit_lsn: None,
             opened_at: None,
-            batch_id: String::new(),
+            batch_id: None,
         })
     }
 
     /// Append one change to the OPEN txn buffer (not yet flush-eligible). Its `meta.commit_lsn` and
     /// `meta.batch_id` are patched at [`Self::on_commit`].
     pub fn push(&mut self, meta: SinkMeta, values: &[TupleValue]) {
-        if self.batch_id.is_empty() {
-            // Assign the file id when the batch opens; every row shares it.
-            self.batch_id = format!("{}.{}-{}", meta.source_schema, meta.source_table, meta.lsn);
-        }
+        self.batch_id.get_or_insert_with(|| {
+            format!("{}.{}-{}", meta.source_schema, meta.source_table, meta.lsn)
+        });
         self.pending_bytes += estimate_row_bytes(values);
         self.pending.push((meta, values.to_vec()));
     }
@@ -153,7 +152,8 @@ impl TableBatcher {
     ///
     /// # Errors
     ///
-    /// Returns [`BatchError::Arrow`] if a buffered value or its provenance cannot be appended to the
+    /// Returns [`BatchError::Unassigned`] if buffered rows have no assigned batch id, or
+    /// [`BatchError::Arrow`] if a buffered value or its provenance cannot be appended to the
     /// relation's Arrow builders.
     pub fn on_commit(
         &mut self,
@@ -163,16 +163,17 @@ impl TableBatcher {
         if self.pending.is_empty() {
             return Ok(());
         }
+        let batch_id = self.batch_id.clone().ok_or(BatchError::Unassigned)?;
         if self.opened_at.is_none() {
             self.opened_at = Some(self.clock.now());
         }
         self.first_commit_lsn.get_or_insert(commit_lsn);
-        self.last_commit_lsn = commit_lsn;
+        self.last_commit_lsn = Some(commit_lsn);
         // Draining keeps the allocation so the next transaction refills the same pending buffer.
         for (mut meta, values) in self.pending.drain(..) {
             meta.commit_lsn = commit_lsn;
             meta.commit_ts = commit_ts;
-            meta.batch_id.clone_from(&self.batch_id);
+            meta.batch_id.clone_from(&batch_id);
             self.builder.append_row(&values, &meta)?;
             self.committed_rows += 1;
         }
@@ -198,8 +199,9 @@ impl TableBatcher {
     /// # Errors
     ///
     /// Returns [`BatchError::OpenTransaction`] if uncommitted rows remain,
-    /// [`BatchError::Empty`] if no committed rows exist, or [`BatchError::Arrow`] if finishing or
-    /// rebuilding the typed Arrow batch fails.
+    /// [`BatchError::Empty`] if no committed rows exist, [`BatchError::Unassigned`] if committed
+    /// rows have no assigned id or LSN bounds, or [`BatchError::Arrow`] if finishing or rebuilding
+    /// the typed Arrow batch fails.
     pub fn seal(&mut self) -> Result<SealedBatch, BatchError> {
         if self.has_open_txn() {
             return Err(BatchError::OpenTransaction);
@@ -207,6 +209,13 @@ impl TableBatcher {
         if self.committed_rows == 0 {
             return Err(BatchError::Empty);
         }
+        let (Some(_batch_id), Some(lsn_start), Some(lsn_end)) = (
+            self.batch_id.as_deref(),
+            self.first_commit_lsn,
+            self.last_commit_lsn,
+        ) else {
+            return Err(BatchError::Unassigned);
+        };
         let builder = std::mem::replace(&mut self.builder, BatchBuilder::new(&self.rel.relation)?);
         let record_batch = builder.finish()?;
         let sealed = SealedBatch {
@@ -214,16 +223,16 @@ impl TableBatcher {
             schema: self.rel.relation.schema.clone(),
             table: self.rel.relation.name.clone(),
             schema_version: self.rel.schema_version,
-            lsn_start: self.first_commit_lsn.unwrap_or(Lsn::ZERO),
-            lsn_end: self.last_commit_lsn,
+            lsn_start,
+            lsn_end,
             row_count: self.committed_rows,
         };
         self.committed_rows = 0;
         self.committed_bytes = 0;
         self.first_commit_lsn = None;
-        self.last_commit_lsn = Lsn::ZERO;
+        self.last_commit_lsn = None;
         self.opened_at = None;
-        self.batch_id = String::new();
+        self.batch_id = None;
         Ok(sealed)
     }
 
@@ -256,8 +265,9 @@ impl TableBatcher {
     ///
     /// # Errors
     ///
-    /// Returns the [`BatchError::Arrow`] produced while sealing committed rows. The open transaction
-    /// is deliberately discarded first, so [`BatchError::OpenTransaction`] is not expected here.
+    /// Returns [`BatchError::Unassigned`] for inconsistent committed state or the
+    /// [`BatchError::Arrow`] produced while sealing committed rows. The open transaction is
+    /// deliberately discarded first, so [`BatchError::OpenTransaction`] is not expected here.
     pub fn drain_committed(&mut self) -> Result<Option<SealedBatch>, BatchError> {
         self.drop_open_txn();
         if self.committed_rows == 0 {
@@ -290,6 +300,9 @@ pub enum BatchError {
     OpenTransaction,
     #[error("nothing to seal (empty batch)")]
     Empty,
+    /// Committed rows exist but the batch id or its commit-LSN bounds were never assigned.
+    #[error("batch has committed rows but no assigned batch id / commit-LSN bounds")]
+    Unassigned,
     #[error(transparent)]
     Arrow(#[from] pg_to_arrow::Error),
 }
