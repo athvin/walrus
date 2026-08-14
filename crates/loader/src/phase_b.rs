@@ -11,6 +11,7 @@ use crate::duck_ext::DuckResultExt;
 use crate::error::LoaderError;
 use crate::phase_a::TableCtx;
 use crate::plan::TablePlan;
+use crate::table_name::{DuckTable, Mirror};
 use crate::transform::{apply_transform, TransformSql};
 use common::{Lsn, PgRelation};
 
@@ -71,11 +72,12 @@ pub async fn run_phase_b(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     // (`max()` is NULL only when `<table>_raw` is empty). A source that sits idle at the boundary re-scans
     // that one commit's rows each poll; normal streaming advances `transformed_lsn` past it immediately.
     let conn = ctx.db.conn();
+    let raw = DuckTable::<Mirror>::new(&ctx.table).raw();
     let max_hex: Option<String> = conn
         .query_row(
             &format!(
-                "SELECT max(\"_walrus_commit_lsn\") FROM \"{}_raw\" WHERE \"_walrus_commit_lsn\" >= ?",
-                ctx.table
+                "SELECT max(\"_walrus_commit_lsn\") FROM \"{}\" WHERE \"_walrus_commit_lsn\" >= ?",
+                raw.as_str()
             ),
             [after.to_string()],
             |r| r.get(0),

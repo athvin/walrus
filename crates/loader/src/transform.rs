@@ -13,6 +13,7 @@
 
 use crate::duck_ext::DuckResultExt;
 use crate::error::LoaderError;
+use crate::table_name::{DuckTable, Mirror};
 use common::{Lsn, PgRelation};
 use duckdb::OptionalExt;
 
@@ -56,7 +57,7 @@ struct MirrorCol {
 /// [`crate::plan::TablePlan`] — the Tier-1 plan reproduces the pre-descriptor scalar SQL exactly.
 #[derive(Debug)]
 pub struct TransformSql {
-    table: String,
+    table: DuckTable<Mirror>,
     mirror: Vec<MirrorCol>,
 }
 
@@ -74,7 +75,8 @@ impl TransformSql {
     pub fn from_plan(plan: &crate::plan::TablePlan) -> Self {
         use crate::plan::MirrorValue;
         let q = |c: &str| format!("\"{c}\"");
-        let table = &plan.table;
+        let table = DuckTable::<Mirror>::new(plan.table.as_ref());
+        let raw_table = table.raw();
         let pk: Vec<&str> = plan
             .mirror_cols
             .iter()
@@ -109,12 +111,13 @@ impl TransformSql {
                         };
                         format!(
                             "CASE WHEN {winner} THEN COALESCE(( \
-                               SELECT r.{qc} FROM \"{table}_raw\" r \
+                               SELECT r.{qc} FROM \"{raw_table}\" r \
                                WHERE {r_pk_eq_s} AND NOT ({raw}) \
                                  AND (r.\"_walrus_commit_lsn\", r.\"_walrus_lsn\") <= (s.\"_walrus_commit_lsn\", s.\"_walrus_lsn\") \
                                ORDER BY r.\"_walrus_commit_lsn\" DESC, r.\"_walrus_lsn\" DESC LIMIT 1), t.{qc}) \
                              ELSE s.{qc} END",
                             winner = listed("s"),
+                            raw_table = raw_table.as_str(),
                             raw = listed("r"),
                         )
                     }
@@ -127,10 +130,7 @@ impl TransformSql {
                 }
             })
             .collect();
-        TransformSql {
-            table: plan.table.to_string(),
-            mirror,
-        }
+        TransformSql { table, mirror }
     }
 
     fn pk_names(&self) -> Vec<&str> {
@@ -161,16 +161,18 @@ impl TransformSql {
         conn: &duckdb::Connection,
         after_lsn: &Lsn,
     ) -> Result<TruncateBoundary, LoaderError> {
+        let raw = self.table.raw();
         let sql = format!(
-            "SELECT \"_walrus_commit_lsn\", \"_walrus_lsn\" FROM \"{}_raw\" \
+            "SELECT \"_walrus_commit_lsn\", \"_walrus_lsn\" FROM \"{}\" \
              WHERE \"_walrus_op\" = 't' AND \"_walrus_commit_lsn\" > '{}' \
              ORDER BY \"_walrus_commit_lsn\" DESC, \"_walrus_lsn\" DESC LIMIT 1",
-            self.table, after_lsn
+            raw.as_str(),
+            after_lsn
         );
         let row: Option<(String, String)> = conn
             .query_row(&sql, [], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()
-            .duck_with(|| format!("scan truncate boundary on {}_raw", self.table))?;
+            .duck_with(|| format!("scan truncate boundary on {}", raw.as_str()))?;
         match row {
             None => Ok(TruncateBoundary::none()),
             Some((ct, lt)) => Ok(TruncateBoundary {
@@ -193,6 +195,7 @@ impl TransformSql {
     #[must_use]
     pub fn render(&self, after_lsn: &Lsn, boundary: &TruncateBoundary) -> String {
         let q = |c: &str| format!("\"{c}\"");
+        let table = self.table.as_str();
         let pk = self.pk_names();
         let non_key = self.non_key_names();
         let all: Vec<&str> = self.mirror.iter().map(|c| c.name.as_str()).collect();
@@ -246,13 +249,13 @@ impl TransformSql {
         // The truncate wipe (whole mirror) + the tuple-boundary window filter — empty when no truncate.
         let (truncate_wipe, truncate_bound) = match (boundary.ct, boundary.lt) {
             (Some(ct), Some(lt)) => (
-                format!("DELETE FROM \"{}\";", self.table),
+                format!("DELETE FROM \"{table}\";"),
                 format!(" AND (\"_walrus_commit_lsn\", \"_walrus_lsn\") > ('{ct}', '{lt}')"),
             ),
             _ => (String::new(), String::new()),
         };
         TRANSFORM_SQL
-            .replace("{table}", &self.table)
+            .replace("{table}", table)
             .replace("{pk_list}", &pk_list)
             .replace("{pk_join}", &pk_join)
             .replace("{set_cols}", &set_cols)
@@ -268,7 +271,7 @@ impl TransformSql {
     /// The table name (for compaction / prune SQL that lives outside the template).
     #[must_use]
     pub fn table(&self) -> &str {
-        &self.table
+        self.table.as_str()
     }
 
     /// Render the atomic full-rebuild (PR 3.11): `CREATE OR REPLACE TABLE <table>` over **retained raw ∪
@@ -286,7 +289,8 @@ impl TransformSql {
     #[must_use]
     pub fn render_rebuild(&self, boundary: &TruncateBoundary) -> String {
         let q = |c: &str| format!("\"{c}\"");
-        let t = &self.table;
+        let t = self.table.as_str();
+        let raw_table = self.table.raw();
         let pk = self.pk_names();
         let pk_list = pk.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
         let pk_join = pk
@@ -320,12 +324,13 @@ impl TransformSql {
         let src = format!(
             "SELECT {raw}, s.\"walrus_pg_sink_meta\" AS \"walrus_pg_sink_meta\", \
                  s.\"_walrus_op\" AS \"_walrus_op\", s.\"_walrus_commit_lsn\" AS \"_walrus_commit_lsn\", \
-                 s.\"_walrus_lsn\" AS \"_walrus_lsn\" FROM \"{t}_raw\" s WHERE s.\"_walrus_op\" <> 't' \
+                 s.\"_walrus_lsn\" AS \"_walrus_lsn\" FROM \"{raw_table}\" s WHERE s.\"_walrus_op\" <> 't' \
              UNION ALL BY NAME \
              SELECT {mirror_names}, '{{}}' AS \"walrus_pg_sink_meta\", 'i' AS \"_walrus_op\", \
                  \"_applied_commit_lsn\" AS \"_walrus_commit_lsn\", \
                  \"_applied_lsn\" AS \"_walrus_lsn\" FROM \"{t}\"",
             raw = raw_exprs.join(", "),
+            raw_table = raw_table.as_str(),
         );
         // The truncate tuple boundary applies to the union (the mirror baseline is post-truncate by
         // construction, so it survives); empty when the retained tail holds no truncate.
@@ -385,7 +390,7 @@ pub fn apply_transform(
 ) -> Result<(), LoaderError> {
     let boundary = t.latest_truncate(conn, after_lsn)?;
     conn.execute_batch(&t.render(after_lsn, &boundary))
-        .duck_with(|| format!("transform {}", t.table))
+        .duck_with(|| format!("transform {}", t.table()))
 }
 
 #[cfg(test)]
