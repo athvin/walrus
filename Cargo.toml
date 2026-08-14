@@ -124,6 +124,11 @@ implicit_clone = "deny"
 # Nursery (outside `clippy::all`, so no `priority` juggling): flags a lifetime that must exist but
 # need not be named. Its coarser sibling `needless_lifetimes` already arrives through `all`.
 elidable_lifetime_names = "deny"
+# Keep generic constraints singular: no repeated bound lists, duplicate traits, or split
+# declaration/where-clause ownership. These lints are outside `clippy::all`, so need no priority.
+type_repetition_in_bounds = "deny"
+trait_duplication_in_bounds = "deny"
+multiple_bound_locations = "deny"
 
 [workspace.dependencies]
 # Shared version pins land here as later PRs add deps (tracing, sqlx, arrow, …).
