@@ -1,6 +1,13 @@
 use super::*;
 
 #[test]
+fn phase_decoding_is_exhaustive() {
+    assert_eq!(Phase::try_from(0), Ok(Phase::Bootstrapping));
+    assert_eq!(Phase::try_from(1), Ok(Phase::Ready));
+    assert_eq!(Phase::try_from(7), Err(InvalidPhase(7)));
+}
+
+#[test]
 fn phase_gates_readiness() {
     let s = HealthState::new();
     assert_eq!(s.phase(), Phase::Bootstrapping);
