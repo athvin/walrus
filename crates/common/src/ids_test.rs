@@ -40,3 +40,47 @@ fn epoch_ordering_matches_the_inner_integer() {
 fn epoch_serializes_as_a_bare_number() {
     assert_eq!(serde_json::to_string(&EpochNo(42)).unwrap(), "42");
 }
+
+#[test]
+fn schema_version_from_i64_and_back_round_trips() {
+    let version = SchemaVersionNo::from(7);
+    assert_eq!(version, SchemaVersionNo(7));
+    assert_eq!(version.to_string(), "7");
+    assert_eq!(i64::from(version), 7);
+}
+
+#[test]
+fn schema_version_ordering_matches_the_inner_integer() {
+    assert!(SchemaVersionNo(1) < SchemaVersionNo(2));
+    let mut versions = [SchemaVersionNo(3), SchemaVersionNo(1), SchemaVersionNo(2)];
+    versions.sort();
+    assert_eq!(
+        versions,
+        [SchemaVersionNo(1), SchemaVersionNo(2), SchemaVersionNo(3)]
+    );
+}
+
+#[test]
+fn schema_version_serializes_as_a_bare_number() {
+    assert_eq!(serde_json::to_string(&SchemaVersionNo(42)).unwrap(), "42");
+    assert_eq!(
+        serde_json::from_str::<SchemaVersionNo>("42").unwrap(),
+        SchemaVersionNo(42)
+    );
+}
+
+#[test]
+fn reload_id_from_i64_and_back_round_trips() {
+    let reload_id = ReloadId::from(11);
+    assert_eq!(reload_id, ReloadId(11));
+    assert_eq!(reload_id.to_string(), "11");
+    assert_eq!(i64::from(reload_id), 11);
+}
+
+#[test]
+fn reload_id_ordering_matches_the_inner_integer() {
+    assert!(ReloadId(1) < ReloadId(2));
+    let mut ids = [ReloadId(3), ReloadId(1), ReloadId(2)];
+    ids.sort();
+    assert_eq!(ids, [ReloadId(1), ReloadId(2), ReloadId(3)]);
+}

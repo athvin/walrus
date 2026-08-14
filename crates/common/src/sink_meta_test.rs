@@ -102,7 +102,7 @@ fn deserializes_the_docs_example_block() {
     assert_eq!(meta.source_schema, "public");
     assert_eq!(meta.source_table, "orders");
     assert_eq!(meta.batch_id, "3f2a0000-0000-0000-0000-000000000001");
-    assert_eq!(meta.schema_version, 12);
+    assert_eq!(meta.schema_version, SchemaVersionNo(12));
     assert_eq!(meta.sink_instance, "walrus-pg-sink-0");
 }
 
