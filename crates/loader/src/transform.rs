@@ -384,3 +384,7 @@ pub fn apply_transform(
     conn.execute_batch(&t.render(after_lsn, &boundary))
         .duck_with(|| format!("transform {}", t.table))
 }
+
+#[cfg(test)]
+#[path = "transform_test.rs"]
+mod tests;
