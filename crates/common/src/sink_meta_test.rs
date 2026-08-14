@@ -12,6 +12,28 @@ fn utc_timestamp_is_layout_identical_to_jiff_timestamp() {
     );
 }
 
+#[test]
+fn utc_timestamp_conversions_round_trip() {
+    let timestamp: jiff::Timestamp = "2026-07-04T12:00:00.123Z".parse().unwrap();
+    let wrapped = UtcTimestamp::from(timestamp);
+
+    assert_eq!(wrapped.inner(), &timestamp);
+    assert_eq!(wrapped.into_inner(), timestamp);
+
+    let wrapped = UtcTimestamp::from(timestamp);
+    assert_eq!(jiff::Timestamp::from(wrapped), timestamp);
+}
+
+#[test]
+fn utc_timestamp_display_matches_serialized_text() {
+    let timestamp = UtcTimestamp::parse_rfc3339("2026-07-04T12:00:00.123Z").unwrap();
+
+    assert_eq!(
+        serde_json::to_string(&timestamp).unwrap(),
+        format!("\"{timestamp}\"")
+    );
+}
+
 /// The architecture.md §1.4 example block, comment-free (a real JSON document).
 const DOCS_EXAMPLE: &str = r#"{
         "op": "u",

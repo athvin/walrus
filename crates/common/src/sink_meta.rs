@@ -63,6 +63,18 @@ impl UtcTimestamp {
         UtcTimestamp(jiff::Timestamp::now())
     }
 
+    /// Borrow the underlying UTC instant.
+    #[must_use]
+    pub fn inner(&self) -> &jiff::Timestamp {
+        &self.0
+    }
+
+    /// Consume this wrapper and return the underlying UTC instant.
+    #[must_use]
+    pub fn into_inner(self) -> jiff::Timestamp {
+        self.0
+    }
+
     /// Parse an RFC-3339 string, **rejecting** anything not already normalized to UTC `Z` — a
     /// numeric offset (e.g. `+02:00`) is refused rather than silently converted, so the wire form
     /// is always UTC (architecture.md §1.4).
@@ -106,6 +118,24 @@ impl UtcTimestamp {
             ))
         })?;
         Ok(UtcTimestamp(ts))
+    }
+}
+
+impl std::fmt::Display for UtcTimestamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl From<jiff::Timestamp> for UtcTimestamp {
+    fn from(timestamp: jiff::Timestamp) -> Self {
+        Self(timestamp)
+    }
+}
+
+impl From<UtcTimestamp> for jiff::Timestamp {
+    fn from(timestamp: UtcTimestamp) -> Self {
+        timestamp.0
     }
 }
 
