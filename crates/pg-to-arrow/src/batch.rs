@@ -356,11 +356,11 @@ fn append_value(
                 false => b.append_value(parse_bool(text(value, col, dt)?, col)?),
             }
         }
-        DataType::Int16 => append_num::<Int16Builder, i16>(builder, value, col, dt, is_null)?,
-        DataType::Int32 => append_num::<Int32Builder, i32>(builder, value, col, dt, is_null)?,
-        DataType::Int64 => append_num::<Int64Builder, i64>(builder, value, col, dt, is_null)?,
-        DataType::Float32 => append_num::<Float32Builder, f32>(builder, value, col, dt, is_null)?,
-        DataType::Float64 => append_num::<Float64Builder, f64>(builder, value, col, dt, is_null)?,
+        DataType::Int16 => append_num::<Int16Builder>(builder, value, col, dt, is_null)?,
+        DataType::Int32 => append_num::<Int32Builder>(builder, value, col, dt, is_null)?,
+        DataType::Int64 => append_num::<Int64Builder>(builder, value, col, dt, is_null)?,
+        DataType::Float32 => append_num::<Float32Builder>(builder, value, col, dt, is_null)?,
+        DataType::Float64 => append_num::<Float64Builder>(builder, value, col, dt, is_null)?,
         DataType::Decimal128(_, scale) => {
             let b = downcast!(builder, Decimal128Builder, col);
             match is_null {
@@ -835,7 +835,7 @@ fn push_points_list(
 }
 
 /// Append a parsed number to a `FromStr` builder, attributing a failure to the column.
-fn append_num<B, T>(
+fn append_num<B>(
     builder: &mut dyn ArrayBuilder,
     value: &TupleValue,
     col: &str,
@@ -843,8 +843,7 @@ fn append_num<B, T>(
     is_null: bool,
 ) -> Result<(), Error>
 where
-    B: ArrayBuilder + ArrowNumBuilder<T>,
-    T: std::str::FromStr,
+    B: ArrayBuilder + ArrowNumBuilder,
 {
     let b = builder
         .as_any_mut()
@@ -857,22 +856,28 @@ where
     } else {
         let s = text(value, col, dt)?;
         let parsed = s
-            .parse::<T>()
+            .parse::<B::Val>()
             .map_err(|_| Error::value_parse(col, s, dt.to_string()))?;
         b.append_val(parsed);
     }
     Ok(())
 }
 
-/// Tiny bridge so `append_num` can be generic over the numeric builders.
-trait ArrowNumBuilder<T> {
-    fn append_val(&mut self, v: T);
+/// Tiny bridge so `append_num` can be generic over the numeric builders. Each Arrow numeric
+/// builder accepts exactly one Rust scalar, so the value type is associated with the builder.
+trait ArrowNumBuilder {
+    /// The one scalar this builder appends.
+    type Val: std::str::FromStr;
+
+    fn append_val(&mut self, v: Self::Val);
     fn append_null_val(&mut self);
 }
 macro_rules! num_builder {
     ($b:ty, $t:ty) => {
-        impl ArrowNumBuilder<$t> for $b {
-            fn append_val(&mut self, v: $t) {
+        impl ArrowNumBuilder for $b {
+            type Val = $t;
+
+            fn append_val(&mut self, v: Self::Val) {
                 self.append_value(v);
             }
             fn append_null_val(&mut self) {
