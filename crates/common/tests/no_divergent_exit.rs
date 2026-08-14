@@ -35,12 +35,55 @@ fn repo_root() -> PathBuf {
 }
 
 fn crate_sources(root: &Path) -> Vec<PathBuf> {
-    fs::read_dir(root.join("crates")).expect("the workspace crates directory must be readable");
-    Vec::new()
+    let mut sources = fs::read_dir(root.join("crates"))
+        .expect("the workspace crates directory must be readable")
+        .map(|entry| {
+            entry
+                .expect("a workspace crate directory entry must be readable")
+                .path()
+                .join("src")
+        })
+        .filter(|path| path.is_dir())
+        .flat_map(|path| rust_files(&path))
+        .collect::<Vec<_>>();
+    sources.sort();
+    sources
 }
 
-fn offenders(_source: &str) -> Vec<(usize, &'static str)> {
-    Vec::new()
+fn rust_files(directory: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(directory).expect("a crate source directory must be readable") {
+        let path = entry
+            .expect("a crate source directory entry must be readable")
+            .path();
+        if path.is_dir() {
+            files.extend(rust_files(&path));
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            files.push(path);
+        }
+    }
+    files
+}
+
+fn offenders(source: &str) -> Vec<(usize, &'static str)> {
+    let mut violations = Vec::new();
+    for (index, line) in source.lines().enumerate() {
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+
+        let compact = line
+            .chars()
+            .filter(|character| !character.is_ascii_whitespace())
+            .collect::<String>();
+        if compact.contains(NEVER_NEEDLE) {
+            violations.push((index + 1, "never-returning function"));
+        }
+        if line.contains(EXIT_NEEDLE) {
+            violations.push((index + 1, "direct process exit"));
+        }
+    }
+    violations
 }
 
 #[test]
