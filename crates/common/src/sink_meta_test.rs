@@ -1,5 +1,17 @@
 use super::*;
 
+#[test]
+fn utc_timestamp_is_layout_identical_to_jiff_timestamp() {
+    assert_eq!(
+        std::mem::size_of::<UtcTimestamp>(),
+        std::mem::size_of::<jiff::Timestamp>()
+    );
+    assert_eq!(
+        std::mem::align_of::<UtcTimestamp>(),
+        std::mem::align_of::<jiff::Timestamp>()
+    );
+}
+
 /// The architecture.md §1.4 example block, comment-free (a real JSON document).
 const DOCS_EXAMPLE: &str = r#"{
         "op": "u",

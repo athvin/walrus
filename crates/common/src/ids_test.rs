@@ -1,6 +1,33 @@
 use super::*;
 
 #[test]
+fn every_domain_id_is_layout_identical_to_i64() {
+    assert_eq!(
+        std::mem::size_of::<ManifestId>(),
+        std::mem::size_of::<i64>()
+    );
+    assert_eq!(
+        std::mem::align_of::<ManifestId>(),
+        std::mem::align_of::<i64>()
+    );
+    assert_eq!(std::mem::size_of::<EpochNo>(), std::mem::size_of::<i64>());
+    assert_eq!(std::mem::align_of::<EpochNo>(), std::mem::align_of::<i64>());
+    assert_eq!(
+        std::mem::size_of::<SchemaVersionNo>(),
+        std::mem::size_of::<i64>()
+    );
+    assert_eq!(
+        std::mem::align_of::<SchemaVersionNo>(),
+        std::mem::align_of::<i64>()
+    );
+    assert_eq!(std::mem::size_of::<ReloadId>(), std::mem::size_of::<i64>());
+    assert_eq!(
+        std::mem::align_of::<ReloadId>(),
+        std::mem::align_of::<i64>()
+    );
+}
+
+#[test]
 fn display_is_the_inner_integer() {
     assert_eq!(ManifestId(42).to_string(), "42");
     assert_eq!(format!("{}", ManifestId(-1)), "-1");

@@ -1,6 +1,12 @@
 use super::*;
 
 #[test]
+fn lsn_is_layout_identical_to_its_inner_u64() {
+    assert_eq!(std::mem::size_of::<Lsn>(), std::mem::size_of::<u64>());
+    assert_eq!(std::mem::align_of::<Lsn>(), std::mem::align_of::<u64>());
+}
+
+#[test]
 fn parses_x_slash_y_form() {
     assert_eq!("0/199BAC8".parse::<Lsn>().unwrap().as_u64(), 0x199BAC8);
     assert_eq!("1/0".parse::<Lsn>().unwrap().as_u64(), 1u64 << 32);
