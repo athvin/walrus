@@ -18,11 +18,18 @@ fn manifest_kind_round_trips_every_variant() {
 }
 
 #[test]
-fn manifest_kind_rejects_unknown() {
-    assert!("snapshottt".parse::<ManifestKind>().is_err());
-    assert!("".parse::<ManifestKind>().is_err());
+fn a_rejected_kind_keeps_the_offending_input_as_data() {
+    let err = "snapshottt".parse::<ManifestKind>().unwrap_err();
+    assert_eq!(err.expected, "manifest kind");
+    assert_eq!(err.input, "snapshottt");
+}
+
+#[test]
+fn case_sensitivity_is_still_rejected_and_reported() {
     // Case matters — the DB stores exactly the lowercase form.
-    assert!("Reload".parse::<ManifestKind>().is_err());
+    let err = "Reload".parse::<ManifestKind>().unwrap_err();
+    assert_eq!(err.expected, "manifest kind");
+    assert_eq!(err.input, "Reload");
 }
 
 #[test]
@@ -37,7 +44,15 @@ fn manifest_status_round_trips_every_variant() {
 }
 
 #[test]
-fn manifest_status_rejects_unknown() {
-    assert!("claimed".parse::<ManifestStatus>().is_err());
-    assert!("".parse::<ManifestStatus>().is_err());
+fn a_rejected_status_keeps_the_offending_input_as_data() {
+    let err = "claimed".parse::<ManifestStatus>().unwrap_err();
+    assert_eq!(err.expected, "manifest status");
+    assert_eq!(err.input, "claimed");
+}
+
+#[test]
+fn empty_input_is_reported_verbatim() {
+    let err = "".parse::<ManifestStatus>().unwrap_err();
+    assert_eq!(err.expected, "manifest status");
+    assert_eq!(err.input, "");
 }
