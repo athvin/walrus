@@ -230,7 +230,7 @@ impl TableDb {
             .conn
             .execute(&sql, [])
             .duck_with(|| format!("append {s3_uri} → {table}_raw"))?;
-        Ok(n as u64)
+        Ok(u64::try_from(n).unwrap_or(u64::MAX))
     }
 
     /// The Parquet column list for `schema_version`, introspecting `uri` **once** per version and

@@ -38,6 +38,26 @@ impl Lsn {
         self.0
     }
 
+    /// Reinterpret this unsigned LSN as the signed integer used by SQLx's binary encoder.
+    #[cfg(any(feature = "sqlx", test))]
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "pg_lsn and int8 share the same 64-bit wire representation"
+    )]
+    const fn to_sqlx_i64_bits(self) -> i64 {
+        self.0 as i64
+    }
+
+    /// Recover an unsigned LSN from SQLx's signed view of the same wire bits.
+    #[cfg(any(feature = "sqlx", test))]
+    #[allow(
+        clippy::cast_sign_loss,
+        reason = "pg_lsn and int8 share the same 64-bit wire representation"
+    )]
+    const fn from_sqlx_i64_bits(raw: i64) -> Self {
+        Self(raw as u64)
+    }
+
     /// Retreat this position by `bytes`, **saturating at 0**.
     ///
     /// A named method, not `Sub<u64>`: the clamp is a policy decision (the retention floor must
@@ -149,7 +169,7 @@ impl FromStr for Lsn {
             let high =
                 parse_hex_u32(hi).ok_or_else(|| reject("X/Y half is not a valid hex u32"))?;
             let low = parse_hex_u32(lo).ok_or_else(|| reject("X/Y half is not a valid hex u32"))?;
-            Ok(Lsn(((high as u64) << 32) | (low as u64)))
+            Ok(Lsn((u64::from(high) << 32) | u64::from(low)))
         } else {
             parse_hex_u64(s)
                 .map(Lsn)
@@ -213,15 +233,16 @@ mod sqlx_support {
             buf: &mut PgArgumentBuffer,
         ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
             // pg_lsn's binary wire format is an 8-byte big-endian integer — identical to int8, so
-            // reuse i64's encoder. `as i64` preserves the bit pattern.
-            <i64 as Encode<Postgres>>::encode_by_ref(&(self.as_u64() as i64), buf)
+            // reuse i64's encoder. The helper's documented `as i64` preserves the bit pattern;
+            // `TryFrom` would reject every valid LSN above i64::MAX.
+            <i64 as Encode<Postgres>>::encode_by_ref(&self.to_sqlx_i64_bits(), buf)
         }
     }
 
     impl<'r> Decode<'r, Postgres> for Lsn {
         fn decode(value: PgValueRef<'r>) -> Result<Self, sqlx::error::BoxDynError> {
             let raw = <i64 as Decode<Postgres>>::decode(value)?;
-            Ok(Lsn::new(raw as u64))
+            Ok(Lsn::from_sqlx_i64_bits(raw))
         }
     }
 }

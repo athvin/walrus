@@ -346,7 +346,7 @@ fn zero_init_global() {
 
 /// Slot `wal_status` as the categorical gauge (0 reserved / 1 unreserved / 2 lost).
 pub fn set_wal_status(code: u8) {
-    metrics::gauge!(names::SINK_WAL_STATUS).set(code as f64);
+    metrics::gauge!(names::SINK_WAL_STATUS).set(f64::from(code));
 }
 
 /// One reload echo cross-check violation (`embedded >= commit`, PR 6.3) — the watermark model is

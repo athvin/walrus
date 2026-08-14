@@ -34,6 +34,21 @@ use tokio_util::sync::CancellationToken;
 /// and PR 6.9 startup adoption.
 const EXPORTER_DRAIN_BUDGET: Duration = Duration::from_secs(5);
 
+/// Convert a duration to the control plane's signed seconds, saturating an oversized TTL.
+fn ttl_secs(ttl: Duration) -> i64 {
+    i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX)
+}
+
+/// Convert an in-memory count to a signed control-plane bound without wrapping.
+fn count_i64(count: usize) -> i64 {
+    i64::try_from(count).unwrap_or(i64::MAX)
+}
+
+/// Convert an in-memory count to the metrics API's unsigned domain without wrapping.
+fn count_u64(count: usize) -> u64 {
+    u64::try_from(count).unwrap_or(u64::MAX)
+}
+
 /// A preflight either genuinely REJECTS the request (typed, terminal, operator-facing) or fails
 /// for INFRA reasons (dead connection, timeout) — in which case the claim is released and retried
 /// next tick. Conflating the two would let an idle-connection kill terminally fail a valid
@@ -440,8 +455,8 @@ impl ReloadController {
             &self.pool,
             self.cfg.epoch,
             &self.cfg.instance,
-            self.cfg.lease_ttl.as_secs() as i64,
-            free as i64,
+            ttl_secs(self.cfg.lease_ttl),
+            count_i64(free),
         )
         .await
         .with_context(|| format!("claim up to {free} reloads in epoch {}", self.cfg.epoch))?;
@@ -580,14 +595,9 @@ impl ReloadController {
                     // Acquire pairs with the DDL-restart Release that repoints lease renewal.
                     let reload_id = renew_id.load(Ordering::Acquire);
                     async move {
-                        control::reload::renew_lease(
-                            &pool,
-                            reload_id,
-                            &holder,
-                            ttl.as_secs() as i64,
-                        )
-                        .await
-                        .with_context(|| format!("renew lease for reload {reload_id}"))
+                        control::reload::renew_lease(&pool, reload_id, &holder, ttl_secs(ttl))
+                            .await
+                            .with_context(|| format!("renew lease for reload {reload_id}"))
                     }
                 },
                 export,
@@ -627,8 +637,8 @@ impl ReloadController {
             &self.pool,
             self.cfg.epoch,
             &self.cfg.instance,
-            self.cfg.lease_ttl.as_secs() as i64,
-            free as i64,
+            ttl_secs(self.cfg.lease_ttl),
+            count_i64(free),
         )
         .await
         {
@@ -669,7 +679,7 @@ impl ReloadController {
             .with_context(|| {
                 format!("scan for stuck reload exports in epoch {}", self.cfg.epoch)
             })?;
-        common::metrics::set_reload_lease_stale(stuck.len() as u64);
+        common::metrics::set_reload_lease_stale(count_u64(stuck.len()));
         for (reload_id, holder) in stuck {
             tracing::warn!(
                 reload_id,

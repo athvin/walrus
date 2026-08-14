@@ -25,6 +25,11 @@ fn renew_interval(ttl: Duration) -> Duration {
     (ttl / 3).clamp(MIN_RENEW_INTERVAL, ttl)
 }
 
+/// Convert a lease TTL to the control plane's signed seconds, saturating oversized durations.
+fn ttl_secs(ttl: Duration) -> i64 {
+    i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX)
+}
+
 /// Acquire (or reclaim) the lease for one table. `Ok` only when the lease is free or already ours;
 /// a live owner is terminal.
 ///
@@ -40,8 +45,7 @@ pub async fn acquire(
     self_pod: &str,
     ttl: Duration,
 ) -> Result<control::Lease, LoaderError> {
-    match control::acquire_lease(pool, epoch, schema, table, self_pod, ttl.as_secs() as i64).await?
-    {
+    match control::acquire_lease(pool, epoch, schema, table, self_pod, ttl_secs(ttl)).await? {
         Some(lease) => Ok(lease),
         None => Err(LoaderError::LeaseContended {
             table: format!("{schema}.{table}"),
@@ -68,7 +72,7 @@ pub fn spawn_renewer(
                 _ = token.cancelled() => return,
                 _ = tick.tick() => {
                     for (schema, table) in &keys {
-                        match control::renew_lease(&pool, epoch, schema, table, &self_pod, ttl.as_secs() as i64).await {
+                        match control::renew_lease(&pool, epoch, schema, table, &self_pod, ttl_secs(ttl)).await {
                             Ok(true) => {}
                             Ok(false) => tracing::error!(table = %format_args!("{schema}.{table}"), "lease lost — no longer owner"),
                             Err(e) => tracing::warn!(error = %e, "lease renew failed (will retry)"),

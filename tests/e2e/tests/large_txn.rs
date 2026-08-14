@@ -71,7 +71,7 @@ async fn large_txn_is_atomic_and_bounded() {
     let n = h
         .duckdb_scalar("orders", "SELECT count(*) FROM orders WHERE status = 'big'")
         .unwrap();
-    assert_eq!(n as i64, N, "the whole txn appears atomically after commit");
+    assert_eq!(n, N, "the whole txn appears atomically after commit");
 
     // The slot did not leak WAL after commit + consume.
     let retained = h.slot_retained_bytes().await.unwrap();
@@ -183,7 +183,7 @@ async fn late_committing_large_txn_not_skipped() {
         .duckdb_scalar("orders", "SELECT count(*) FROM orders WHERE status = 'A'")
         .unwrap();
     assert_eq!(
-        a as i64, N,
+        a, N,
         "late-committing large txn A fully applied (not skipped)"
     );
     let b = h

@@ -495,8 +495,8 @@ fn estimate_change_bytes(values: &[TupleValue]) -> u64 {
         + values
             .iter()
             .map(|v| match v {
-                TupleValue::Text(s) => s.len() as u64,
-                TupleValue::Binary(b) => b.len() as u64,
+                TupleValue::Text(s) => u64::try_from(s.len()).unwrap_or(u64::MAX),
+                TupleValue::Binary(b) => u64::try_from(b.len()).unwrap_or(u64::MAX),
                 TupleValue::Null | TupleValue::UnchangedToast => 1,
             })
             .sum::<u64>()

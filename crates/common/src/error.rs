@@ -136,10 +136,19 @@ pub enum ExitCode {
     Internal = 70,
 }
 
+/// Stable fallback if a future exit-code discriminant no longer fits the process API's byte.
+const INTERNAL_EXIT_BYTE: u8 = 70;
+
 impl From<ExitCode> for std::process::ExitCode {
     fn from(code: ExitCode) -> Self {
-        // Every variant is < 125, so the i32 repr fits a u8 without truncation.
-        std::process::ExitCode::from(code as u8)
+        // Reading a repr(i32) discriminant has no From/TryFrom equivalent. The narrowing is checked;
+        // `error_test.rs` exhaustively proves that the fallback is unreachable for today's variants.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "read the enum's explicit repr(i32) discriminant before checked narrowing"
+        )]
+        let raw = code as i32;
+        std::process::ExitCode::from(u8::try_from(raw).unwrap_or(INTERNAL_EXIT_BYTE))
     }
 }
 

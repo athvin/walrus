@@ -4,7 +4,7 @@
 /// Decode a raw wire `atttypmod` into its signed value (`0xFFFFFFFF` → `-1`).
 #[must_use]
 pub fn atttypmod(raw: u32) -> i32 {
-    raw as i32
+    raw.cast_signed()
 }
 
 /// Recover `numeric(p, s)` from a decoded `atttypmod`. `< 4` (including the `-1` sentinel) means
@@ -15,9 +15,9 @@ pub fn numeric_precision_scale(typmod: i32) -> Option<(u16, u16)> {
     if typmod < 4 {
         return None;
     }
-    let packed = (typmod - 4) as u32;
-    let precision = ((packed >> 16) & 0xFFFF) as u16;
-    let scale = (packed & 0xFFFF) as u16;
+    let packed = u32::try_from(typmod - 4).ok()?;
+    let precision = u16::try_from((packed >> 16) & 0xFFFF).ok()?;
+    let scale = u16::try_from(packed & 0xFFFF).ok()?;
     Some((precision, scale))
 }
 

@@ -115,7 +115,7 @@ pub fn prune_raw(
         .duck_with(|| format!("prune {}_raw", t.table()))?;
     conn.execute_batch("CHECKPOINT;")
         .duck_with(|| format!("checkpoint after prune {}", t.table()))?;
-    Ok(n as u64)
+    Ok(u64::try_from(n).unwrap_or(u64::MAX))
 }
 
 /// The retention floor for a table: `transformed_lsn - retention_lsn_lag`, saturating at 0. Always `<=

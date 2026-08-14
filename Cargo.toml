@@ -58,6 +58,13 @@ trivially_copy_pass_by_ref = "deny"
 # and integration `tests/`; benches (`harness = false`) and the e2e harness lib carry a file-level allow.
 unwrap_used = "deny"
 expect_used = "deny"
+# Lossy integer casts are explicit policy (PR 17.3). These pedantic lints are outside `all`; a
+# surviving bit-pattern reinterpretation needs a scoped allow with a reason. `cast_precision_loss`
+# deliberately stays allowed: metrics gauges/ratios and sqlx float8 binds require f64.
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_possible_wrap = "deny"
+cast_lossless = "deny"
 # Forced inlining must cite a measured win (PR 16.4). This pedantic lint is outside `clippy::all`,
 # so it needs no priority. The escape hatch is a site-local Clippy allow with a reason citing its
 # `docs/benchmarks.md` delta.

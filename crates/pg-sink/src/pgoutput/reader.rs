@@ -165,7 +165,7 @@ impl<'a> Reader<'a> {
     /// Returns [`DecodeError::UnexpectedEof`] when the eight-byte LSN is truncated.
     #[inline]
     pub fn lsn(&mut self) -> Result<Lsn, DecodeError> {
-        Ok(Lsn::new(self.int64()? as u64))
+        Ok(Lsn::new(self.int64()?.cast_unsigned()))
     }
 }
 

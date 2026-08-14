@@ -31,6 +31,11 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use tokio_postgres::NoTls;
 
+/// Convert a catalog `::int8` OID without wrapping negative or oversized values.
+fn catalog_oid(raw: i64) -> anyhow::Result<u32> {
+    u32::try_from(raw).with_context(|| format!("catalog OID {raw} is outside the u32 range"))
+}
+
 /// The two values `CREATE_REPLICATION_SLOT … (SNAPSHOT 'export')` returns. All snapshot files share
 /// `lsn_end = consistent_point`.
 #[derive(Debug, Clone)]
@@ -401,16 +406,21 @@ pub async fn describe_source_relation(
 
     let columns = rows
         .iter()
-        .map(|r| PgColumn {
-            name: r.get::<_, String>(0),
-            type_oid: r.get::<_, i64>(1) as u32,
-            type_modifier: r.get::<_, i32>(2),
-            is_key: r.get::<_, bool>(3),
+        .map(|r| {
+            let type_oid = r.get::<_, i64>(1);
+            Ok(PgColumn {
+                name: r.get::<_, String>(0),
+                type_oid: catalog_oid(type_oid)
+                    .with_context(|| format!("describe {schema}.{table}: attribute type OID"))?,
+                type_modifier: r.get::<_, i32>(2),
+                is_key: r.get::<_, bool>(3),
+            })
         })
-        .collect();
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     Ok(PgRelation {
-        oid: oid as u32,
+        oid: catalog_oid(oid)
+            .with_context(|| format!("describe {schema}.{table}: relation OID"))?,
         schema: schema.to_string(),
         name: table.to_string(),
         replica_identity: match relreplident.as_str() {

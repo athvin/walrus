@@ -132,9 +132,9 @@ pub fn numeric_precision_scale(atttypmod: i32) -> Option<(u8, i8)> {
     if atttypmod < 4 {
         return None; // -1 (unconstrained) or an invalid value
     }
-    let packed = (atttypmod - 4) as u32;
-    let precision = ((packed >> 16) & 0xFFFF) as u8;
-    let scale = (packed & 0xFFFF) as i8;
+    let packed = u32::try_from(atttypmod - 4).ok()?;
+    let precision = u8::try_from((packed >> 16) & 0xFFFF).ok()?;
+    let scale = i8::try_from(packed & 0xFFFF).ok()?;
     Some((precision, scale))
 }
 

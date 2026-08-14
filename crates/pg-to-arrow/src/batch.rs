@@ -914,7 +914,7 @@ fn parse_decimal(s: &str, scale: i8, col: &str) -> Result<i128, Error> {
     if scale < 0 {
         return Err(err());
     }
-    let scale = scale as usize;
+    let scale = usize::try_from(scale).map_err(|_| err())?;
     let (sign, rest) = match s.strip_prefix('-') {
         Some(r) => (-1i128, r),
         None => (1, s.strip_prefix('+').unwrap_or(s)),

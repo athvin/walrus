@@ -70,12 +70,12 @@ impl PgColumn {
     /// `scale = (mod - 4) & 0xFFFF`.
     #[must_use]
     pub fn numeric_precision_scale(&self) -> Option<(u16, u16)> {
-        if self.type_oid != crate::oids::NUMERIC || self.type_modifier < 0 {
+        if self.type_oid != crate::oids::NUMERIC || self.type_modifier < 4 {
             return None;
         }
-        let packed = (self.type_modifier as u32).wrapping_sub(4);
-        let precision = ((packed >> 16) & 0xFFFF) as u16;
-        let scale = (packed & 0xFFFF) as u16;
+        let packed = u32::try_from(self.type_modifier - 4).ok()?;
+        let precision = u16::try_from((packed >> 16) & 0xFFFF).ok()?;
+        let scale = u16::try_from(packed & 0xFFFF).ok()?;
         Some((precision, scale))
     }
 }

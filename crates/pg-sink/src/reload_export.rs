@@ -436,7 +436,7 @@ impl ChunkExporter {
             self.first_lsn = Some(watermark);
         }
 
-        let n = rows.len() as u64;
+        let n = u64::try_from(rows.len()).unwrap_or(u64::MAX);
         // One chunk file exported (PR 6.11): bump the per-table chunk + row counters.
         common::metrics::record_reload_chunk(&self.series, n);
         if n < self.cfg.chunk_rows {

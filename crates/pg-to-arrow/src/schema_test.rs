@@ -89,7 +89,7 @@ fn numeric_typmod_minus_one_is_unconstrained() {
 fn numeric_typmod_out_of_range_is_unconstrained() {
     // 294 does not fit the decoder's u8 precision. The old `as u8` wrapped it to 38 and silently
     // selected Decimal128(38, 0), changing the source type instead of taking the lossless text path.
-    let numeric_294_0 = ((294_i32 << 16) | 0) + 4;
+    let numeric_294_0 = (294_i32 << 16) + 4;
     assert_eq!(numeric_precision_scale(numeric_294_0), None);
     assert_eq!(tier1_data_type(oids::NUMERIC, numeric_294_0), None);
 }

@@ -56,7 +56,7 @@ fn to_ready_row(
         source_table: obj.source_table.clone(),
         s3_uri: obj.s3_uri.clone(),
         kind: obj.kind,
-        row_count: obj.row_count as i64,
+        row_count: i64::try_from(obj.row_count).unwrap_or(i64::MAX),
         lsn_start: obj.lsn_start,
         lsn_end: obj.lsn_end,
         schema_version: obj.schema_version,

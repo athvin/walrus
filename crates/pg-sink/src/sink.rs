@@ -109,7 +109,7 @@ impl ParquetSink {
         let key = self.object_key(&batch.schema, &batch.table, batch.lsn_end, &uuid);
         // Flush-latency + throughput instrumentation (PR 4.10); no-op until a recorder is installed.
         let flush_start = std::time::Instant::now();
-        let rows = batch.record_batch.num_rows() as u64;
+        let rows = u64::try_from(batch.record_batch.num_rows()).unwrap_or(u64::MAX);
 
         // Multipart streaming writer — no local temp file, no whole-batch buffering.
         let buf_writer = BufWriter::new(Arc::clone(&self.store), key.clone());

@@ -68,7 +68,7 @@ fn row_values(rel: &PgRelation, i: usize) -> Vec<TupleValue> {
         .map(|c| {
             let v = match c.type_oid {
                 23 if c.is_key => i.to_string(),
-                23 => (i as i64 * 2).to_string(),
+                23 => (i64::try_from(i).unwrap() * 2).to_string(),
                 _ => format!("{}_{i}", c.name),
             };
             TupleValue::Text(v)
@@ -80,8 +80,8 @@ fn row_values(rel: &PgRelation, i: usize) -> Vec<TupleValue> {
 fn meta(i: usize) -> SinkMeta {
     SinkMeta {
         op: Op::Insert,
-        lsn: Lsn::new(i as u64 + 1),
-        commit_lsn: Lsn::new(i as u64 + 1),
+        lsn: Lsn::new(u64::try_from(i).unwrap() + 1),
+        commit_lsn: Lsn::new(u64::try_from(i).unwrap() + 1),
         commit_ts: UtcTimestamp::parse_rfc3339("2026-07-04T12:00:00Z").unwrap(),
         xid: 1,
         epoch: EpochNo(7),

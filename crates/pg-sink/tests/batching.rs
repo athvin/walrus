@@ -105,7 +105,10 @@ async fn a_stream_of_inserts_forms_and_seals_a_batch() {
                         for sealed in router.route(&cache, other, frame_lsn, 1).unwrap() {
                             assert_eq!(sealed.table, "orders");
                             assert!(sealed.row_count >= 1);
-                            assert_eq!(sealed.record_batch.num_rows(), sealed.row_count as usize);
+                            assert_eq!(
+                                sealed.record_batch.num_rows(),
+                                usize::try_from(sealed.row_count).unwrap()
+                            );
                             sealed_total += 1;
                         }
                     }

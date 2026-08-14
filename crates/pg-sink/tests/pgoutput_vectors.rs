@@ -323,7 +323,7 @@ fn fmt_ts(micros_since_2000: i64) -> String {
     let ts = jiff::Timestamp::from_microsecond(micros_since_2000 + MICROS_1970_TO_2000)
         .expect("timestamp in range");
     let dt = ts.to_zoned(jiff::tz::TimeZone::UTC).datetime();
-    let micros = (dt.subsec_nanosecond() / 1000) as u32;
+    let micros = u32::try_from(dt.subsec_nanosecond() / 1000).unwrap();
     let base = format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
         dt.year(),

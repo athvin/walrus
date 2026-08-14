@@ -400,8 +400,9 @@ impl ReplicationStream {
 
     /// Protocol-3.0 startup with `replication=database`; the dev harness answers `trust` (no SCRAM).
     async fn startup(&mut self, user: &str, database: &str) -> anyhow::Result<()> {
+        let startup_message = build_startup(user, database)?;
         self.stream
-            .write_all(&build_startup(user, database))
+            .write_all(&startup_message)
             .await
             .context("send StartupMessage")?;
         self.stream.flush().await?;
@@ -450,9 +451,20 @@ impl ReplicationStream {
     }
 
     async fn send_query(&mut self, sql: &str) -> anyhow::Result<()> {
-        let mut msg = Vec::with_capacity(6 + sql.len());
+        let capacity = sql
+            .len()
+            .checked_add(6)
+            .context("query too large to buffer for the wire protocol")?;
+        let len = sql
+            .len()
+            .checked_add(5)
+            .and_then(|len| u32::try_from(len).ok())
+            .with_context(|| {
+                format!("query too long for the wire protocol: {} bytes", sql.len())
+            })?;
+        let mut msg = Vec::with_capacity(capacity);
         msg.push(b'Q');
-        msg.extend_from_slice(&((4 + sql.len() + 1) as u32).to_be_bytes());
+        msg.extend_from_slice(&len.to_be_bytes());
         msg.extend_from_slice(sql.as_bytes());
         msg.push(0);
         self.stream.write_all(&msg).await.context("send Query")?;
@@ -466,10 +478,12 @@ fn pg_epoch_micros() -> i64 {
     let unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    (unix.as_micros() as i64) - PG_EPOCH_UNIX_SECS * 1_000_000
+    i64::try_from(unix.as_micros())
+        .unwrap_or(i64::MAX)
+        .saturating_sub(PG_EPOCH_UNIX_SECS * 1_000_000)
 }
 
-fn build_startup(user: &str, database: &str) -> Vec<u8> {
+fn build_startup(user: &str, database: &str) -> anyhow::Result<Vec<u8>> {
     let mut params = Vec::new();
     for (k, v) in [
         ("user", user),
@@ -483,12 +497,16 @@ fn build_startup(user: &str, database: &str) -> Vec<u8> {
         params.push(0);
     }
     params.push(0); // parameter-list terminator
-    let len = 4 + 4 + params.len();
+    let len = params
+        .len()
+        .checked_add(8)
+        .context("startup message length overflow")?;
+    let wire_len = u32::try_from(len).context("startup message exceeds the Int32 wire limit")?;
     let mut msg = Vec::with_capacity(len);
-    msg.extend_from_slice(&(len as u32).to_be_bytes());
+    msg.extend_from_slice(&wire_len.to_be_bytes());
     msg.extend_from_slice(&196_608u32.to_be_bytes()); // protocol 3.0
     msg.extend_from_slice(&params);
-    msg
+    Ok(msg)
 }
 
 fn build_standby_status(s: StandbyStatus) -> Vec<u8> {
@@ -501,8 +519,9 @@ fn build_standby_status(s: StandbyStatus) -> Vec<u8> {
     payload.push(u8::from(s.reply_requested));
 
     let mut msg = Vec::with_capacity(5 + payload.len());
-    msg.push(b'd'); // CopyData
-    msg.extend_from_slice(&((4 + payload.len()) as u32).to_be_bytes());
+    msg.push(b'd');
+    // CopyData's payload is fixed: one tag + three LSNs + one timestamp + one reply byte = 34 bytes.
+    msg.extend_from_slice(&38_u32.to_be_bytes());
     msg.extend_from_slice(&payload);
     msg
 }
@@ -514,7 +533,7 @@ fn parse_data_row(body: &[u8]) -> anyhow::Result<Vec<Option<String>>> {
     if body.len() < 2 {
         return Ok(out);
     }
-    let ncols = u16::from_be_bytes([body[0], body[1]]) as usize;
+    let ncols = usize::from(u16::from_be_bytes([body[0], body[1]]));
     let mut i = 2;
     for _ in 0..ncols {
         if i + 4 > body.len() {
@@ -526,14 +545,15 @@ fn parse_data_row(body: &[u8]) -> anyhow::Result<Vec<Option<String>>> {
             out.push(None);
             continue;
         }
-        let len = len as usize;
-        if i + len > body.len() {
+        let len = usize::try_from(len).context("negative DataRow length escaped validation")?;
+        let Some(end) = i.checked_add(len) else {
+            break;
+        };
+        if end > body.len() {
             break;
         }
-        out.push(Some(
-            String::from_utf8_lossy(&body[i..i + len]).into_owned(),
-        ));
-        i += len;
+        out.push(Some(String::from_utf8_lossy(&body[i..end]).into_owned()));
+        i = end;
     }
     Ok(out)
 }
@@ -545,8 +565,8 @@ fn take_message(buf: &mut BytesMut) -> Option<(u8, Bytes)> {
         return None;
     }
     let tag = buf[0];
-    let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
-    let total = 1 + len; // tag + (length field + body)
+    let len = usize::try_from(u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]])).ok()?;
+    let total = len.checked_add(1)?; // tag + (length field + body)
     if buf.len() < total {
         return None;
     }

@@ -103,12 +103,13 @@ fn n_keys_insert_delete_insert_each_row_equals_last_insert_and_count_is_n() {
     let c = db();
     let n = 50i64;
     for id in 1..=n {
+        let unsigned_id = u64::try_from(id).unwrap();
         seed(
             &c,
             &[
-                (id, 'i', 1, 3 * id as u64, "first"),
-                (id, 'd', 1, 3 * id as u64 + 1, "first"),
-                (id, 'i', 1, 3 * id as u64 + 2, "last"),
+                (id, 'i', 1, 3 * unsigned_id, "first"),
+                (id, 'd', 1, 3 * unsigned_id + 1, "first"),
+                (id, 'i', 1, 3 * unsigned_id + 2, "last"),
             ],
         );
     }

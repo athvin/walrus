@@ -104,7 +104,7 @@ async fn n_table_reloads_respect_the_cap_on_one_slot() {
         .fetch_one(&pool)
         .await
         .unwrap();
-        if complete == TABLES.len() as i64 {
+        if complete == i64::try_from(TABLES.len()).unwrap() {
             break;
         }
         assert!(

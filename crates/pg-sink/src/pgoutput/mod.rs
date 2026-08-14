@@ -18,6 +18,11 @@ use common::{Lsn, PgColumn, PgRelation, ReplicaIdentity, TupleValue};
 /// streamed block (proto §7): Relation, Type, Insert, Update, Delete, Truncate, Message.
 const XID_PREFIXED: &[u8] = b"RYIUDTM";
 
+/// Convert an Int32 protocol length/count to the platform index width without wrapping.
+fn wire_usize(raw: u32) -> usize {
+    usize::try_from(raw).unwrap_or(usize::MAX)
+}
+
 /// Whether we are inside a Stream Start..Stop block. The per-message xid prefix (proto §7) exists
 /// **only** while this is true; Stream Start/Stop toggle it (from PR 2.7). It is threaded through
 /// [`parse_stream`] so context carries across messages.
@@ -230,20 +235,20 @@ fn expect_n(reader: &mut Reader<'_>) -> Result<(), DecodeError> {
 /// invalid marker, or [`DecodeError::Utf8`] for invalid textual values.
 pub fn parse_tuple(reader: &mut Reader<'_>) -> Result<Vec<TupleValue>, DecodeError> {
     let ncols = reader.int16()?;
-    let mut cols = Vec::with_capacity(ncols as usize);
+    let mut cols = Vec::with_capacity(usize::from(ncols));
     for _ in 0..ncols {
         let value = match reader.byte1()? {
             b'n' => TupleValue::Null,
             b'u' => TupleValue::UnchangedToast, // one byte total — no length, no value
             b't' => {
-                let len = reader.int32()? as usize;
+                let len = wire_usize(reader.int32()?);
                 // `t` is the value's *text* representation; interpreting it (numeric? enum label?)
                 // is the type layer's job (pg-to-arrow). Validate UTF-8 on the borrowed frame, then
                 // allocate only the owned String that must outlive it.
                 TupleValue::Text(reader.str(len)?.to_string())
             }
             b'b' => {
-                let len = reader.int32()? as usize;
+                let len = wire_usize(reader.int32()?);
                 TupleValue::Binary(reader.take(len)?)
             }
             other => {
@@ -293,7 +298,7 @@ fn parse_one(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Message, De
             let replica_identity = ReplicaIdentity::from_wire(ident_byte)
                 .map_err(|_| DecodeError::BadReplicaIdentity { byte: ident_byte })?;
             let ncols = reader.int16()?;
-            let mut columns = Vec::with_capacity(ncols as usize);
+            let mut columns = Vec::with_capacity(usize::from(ncols));
             for _ in 0..ncols {
                 let flags = reader.byte1()?;
                 let col_name = reader.string()?;
@@ -384,7 +389,7 @@ fn parse_one(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Message, De
             })
         }
         b'T' => {
-            let nrel = reader.int32()? as usize;
+            let nrel = wire_usize(reader.int32()?);
             let opt = reader.byte1()?;
             // Fixed-count array: the count IS the length; no per-element framing, no tuple.
             let relations = (0..nrel)
@@ -401,7 +406,7 @@ fn parse_one(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Message, De
             let flags = reader.byte1()?;
             let lsn = reader.lsn()?;
             let prefix = reader.string()?;
-            let len = reader.int32()? as usize;
+            let len = wire_usize(reader.int32()?);
             let content = reader.take(len)?;
             Ok(Message::Message {
                 xid,
