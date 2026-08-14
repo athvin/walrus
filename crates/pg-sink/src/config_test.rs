@@ -266,5 +266,5 @@ fn numeric_wire_names_and_shapes_are_unchanged() {
 
     let cfg = result.expect("bare numeric environment values should parse");
     assert_eq!(cfg.max_rows.get(), 250_000);
-    assert_eq!(cfg.backpressure_activate_ratio.as_f64(), 0.9);
+    assert!((cfg.backpressure_activate_ratio.as_f64() - 0.9).abs() < f64::EPSILON);
 }

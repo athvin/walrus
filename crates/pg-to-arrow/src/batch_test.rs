@@ -1,4 +1,5 @@
 use super::*;
+use crate::approx::assert_approx_eq;
 use crate::oids;
 use arrow::array::{
     Array, AsArray, BinaryArray, Decimal128Array, Int32Array, Int64Array, ListArray, StringArray,
@@ -448,8 +449,8 @@ fn geometric_point_round_trips_and_nulls() {
         .unwrap();
     let x = s.column(0).as_primitive::<arrow::datatypes::Float64Type>();
     let y = s.column(1).as_primitive::<arrow::datatypes::Float64Type>();
-    assert_eq!(x.value(0), 1.0);
-    assert_eq!(y.value(0), 2.0);
+    assert_approx_eq(x.value(0), 1.0);
+    assert_approx_eq(y.value(0), 2.0);
     assert!(s.is_null(1), "a NULL point is a null struct row");
 }
 
@@ -470,18 +471,18 @@ fn geometric_box_nests_two_points() {
         .unwrap();
     let p1 = s.column(0).as_any().downcast_ref::<StructArray>().unwrap();
     let p2 = s.column(1).as_any().downcast_ref::<StructArray>().unwrap();
-    assert_eq!(
+    assert_approx_eq(
         p1.column(0)
             .as_primitive::<arrow::datatypes::Float64Type>()
             .value(0),
-        2.0
-    ); // p1.x
-    assert_eq!(
+        2.0,
+    );
+    assert_approx_eq(
         p2.column(1)
             .as_primitive::<arrow::datatypes::Float64Type>()
             .value(0),
-        1.0
-    ); // p2.y
+        1.0,
+    );
 }
 
 #[test]
@@ -532,5 +533,5 @@ fn geometric_polygon_is_list_of_points() {
     let members = list.value(0);
     let s = members.as_any().downcast_ref::<StructArray>().unwrap();
     let y = s.column(1).as_primitive::<arrow::datatypes::Float64Type>();
-    assert_eq!(y.value(2), 1.0);
+    assert_approx_eq(y.value(2), 1.0);
 }

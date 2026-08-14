@@ -42,6 +42,15 @@ const SOURCE_0001: &str = include_str!("../../../migrations/source/0001_publicat
 const SOURCE_0003: &str = include_str!("../../../migrations/source/0003_reload_signal.sql");
 const TABLE: &str = "_walrus_ddl_orders";
 
+#[track_caller]
+fn assert_approx_eq(got: f64, want: f64) {
+    const EPSILON: f64 = 1e-9;
+    assert!(
+        (got - want).abs() < EPSILON,
+        "{got} != {want} (absolute tolerance {EPSILON})"
+    );
+}
+
 fn source_url() -> String {
     std::env::var("WALRUS_SOURCE_DB_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/walrus".to_string())
@@ -377,10 +386,9 @@ async fn mid_export_ddl_restarts_fresh_attempt_at_new_schema() {
         RestartDecision::Restarted(id) => id,
         RestartDecision::Capped => panic!("cap of 3 must not be reached on the first DDL"),
     };
-    assert_eq!(
+    assert_approx_eq(
         counter_value(common::metrics::names::RELOAD_RESTARTS_TOTAL) - restarts_before,
         1.0,
-        "the restart counter incremented"
     );
 
     // Old: failed + superseded reason + zero chunk files. New: exporting, restart_count 1, fresh.
@@ -507,10 +515,9 @@ async fn restart_cap_exhaustion_fails_loudly() {
         matches!(decision, RestartDecision::Capped),
         "cap 0 caps the first DDL"
     );
-    assert_eq!(
+    assert_approx_eq(
         counter_value(common::metrics::names::RELOAD_RESTART_CAP_EXHAUSTED_TOTAL) - cap_before,
         1.0,
-        "the cap-exhausted counter incremented"
     );
 
     let rows = reload_rows(&pool, epoch).await;

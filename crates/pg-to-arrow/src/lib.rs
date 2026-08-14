@@ -20,6 +20,10 @@ pub mod tier2;
 pub mod tier3;
 pub mod uuid_enum;
 
+/// Tolerance-based float assertions shared by sibling unit tests (PR 17.5).
+#[cfg(test)]
+mod approx;
+
 pub use batch::BatchBuilder;
 pub use error::Error;
 pub use parquet::{default_writer_properties, write_parquet, write_parquet_bytes};

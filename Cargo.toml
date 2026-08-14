@@ -65,6 +65,9 @@ cast_possible_truncation = "deny"
 cast_sign_loss = "deny"
 cast_possible_wrap = "deny"
 cast_lossless = "deny"
+# Float equality is never exact by accident (PR 17.5). Test comparisons use documented tolerance
+# helpers; special values use `is_nan`/`is_infinite` predicates instead of lint suppression.
+float_cmp = "deny"
 # Forced inlining must cite a measured win (PR 16.4). This pedantic lint is outside `clippy::all`,
 # so it needs no priority. The escape hatch is a site-local Clippy allow with a reason citing its
 # `docs/benchmarks.md` delta.

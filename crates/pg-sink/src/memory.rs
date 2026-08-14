@@ -125,20 +125,30 @@ pub struct Ratio(f64);
 
 /// Why a raw `f64` was rejected as a [`Ratio`].
 #[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
-#[error("ratio {0} is out of range — require 0.0 < r < 1.0")]
-pub struct RatioError(f64);
+pub enum RatioError {
+    /// A special IEEE-754 value would poison the backpressure comparisons.
+    #[error("ratio {0} is not finite — NaN and infinities disable the backstop")]
+    NonFinite(f64),
+    /// A finite value lies outside the open unit interval.
+    #[error("ratio {0} is out of range — require 0.0 < r < 1.0")]
+    OutOfRange(f64),
+}
 
 impl Ratio {
     /// Parse a raw ratio. `NaN`, `0.0`, `1.0` and anything outside the open interval are rejected.
     ///
     /// # Errors
     ///
-    /// Returns [`RatioError`] unless `raw` is strictly between zero and one.
+    /// Returns [`RatioError::NonFinite`] for `NaN` or either infinity, and
+    /// [`RatioError::OutOfRange`] unless a finite value is strictly between zero and one.
     pub fn new(raw: f64) -> Result<Self, RatioError> {
+        if !raw.is_finite() {
+            return Err(RatioError::NonFinite(raw));
+        }
         if 0.0 < raw && raw < 1.0 {
             Ok(Ratio(raw))
         } else {
-            Err(RatioError(raw))
+            Err(RatioError::OutOfRange(raw))
         }
     }
 

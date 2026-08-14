@@ -34,6 +34,15 @@ const SOURCE_0001: &str = include_str!("../../../migrations/source/0001_publicat
 const SOURCE_0003: &str = include_str!("../../../migrations/source/0003_reload_signal.sql");
 const TABLE: &str = "_walrus_met_orders";
 
+#[track_caller]
+fn assert_approx_eq(got: f64, want: f64) {
+    const EPSILON: f64 = 1e-9;
+    assert!(
+        (got - want).abs() < EPSILON,
+        "{got} != {want} (absolute tolerance {EPSILON})"
+    );
+}
+
 fn source_url() -> String {
     std::env::var("WALRUS_SOURCE_DB_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/walrus".to_string())
@@ -273,24 +282,21 @@ async fn chunk_export_moves_chunk_row_and_echo_metrics() {
     .unwrap();
     exporter.run().await.unwrap();
 
-    assert_eq!(
+    assert_approx_eq(
         metric_sum(common::metrics::names::RELOAD_CHUNKS_TOTAL) - chunks_before,
         3.0,
-        "three chunk files ⇒ chunks_total += 3"
     );
-    assert_eq!(
+    assert_approx_eq(
         metric_sum(common::metrics::names::RELOAD_ROWS_EXPORTED_TOTAL) - rows_before,
         5.0,
-        "all 5 rows counted"
     );
     assert!(
         metric_sum("walrus_reload_echo_wait_seconds_count") - echo_before >= 3.0,
         "the echo-wait histogram observed at least one round-trip per chunk"
     );
-    assert_eq!(
+    assert_approx_eq(
         metric_sum(common::metrics::names::RELOAD_CROSSCHECK_VIOLATIONS) - crosscheck_before,
         0.0,
-        "a healthy export raises zero cross-check violations"
     );
 
     token.cancel();
@@ -341,10 +347,9 @@ async fn echo_timeout_moves_the_failed_metric() {
             .status,
         ReloadStatus::Failed
     );
-    assert_eq!(
+    assert_approx_eq(
         metric_sum(common::metrics::names::RELOAD_FAILED_TOTAL) - failed_before,
         1.0,
-        "the failed counter ticked for this table"
     );
 
     scrub(&pool, epoch).await;
