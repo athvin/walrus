@@ -8,7 +8,7 @@
 //! a max-row LSN, or a late-committing large transaction would be silently dropped. Retiring a file
 //! is a `DELETE`, not a status flip — the queue's frontier advances by removal.
 
-use crate::ControlError;
+use crate::{parse::ParseEnumError, ControlError};
 use common::{EpochNo, Lsn, ManifestId, ReloadId, SchemaVersionNo};
 use sqlx::PgExecutor;
 
@@ -41,7 +41,7 @@ impl ManifestKind {
 }
 
 impl std::str::FromStr for ManifestKind {
-    type Err = String;
+    type Err = ParseEnumError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
@@ -49,7 +49,7 @@ impl std::str::FromStr for ManifestKind {
             "stream" => Ok(ManifestKind::Stream),
             "spill" => Ok(ManifestKind::Spill),
             "reload" => Ok(ManifestKind::Reload),
-            other => Err(format!("unknown manifest kind: {other}")),
+            other => Err(ParseEnumError::new("manifest kind", other)),
         }
     }
 }
@@ -75,13 +75,13 @@ impl ManifestStatus {
 }
 
 impl std::str::FromStr for ManifestStatus {
-    type Err = String;
+    type Err = ParseEnumError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "ready" => Ok(ManifestStatus::Ready),
             "failed" => Ok(ManifestStatus::Failed),
-            other => Err(format!("unknown manifest status: {other}")),
+            other => Err(ParseEnumError::new("manifest status", other)),
         }
     }
 }
@@ -201,12 +201,18 @@ pub async fn claim_ready(
                 source_schema: r.source_schema,
                 source_table: r.source_table,
                 s3_uri: r.s3_uri,
-                kind: r.kind.parse().map_err(ControlError::Decode)?,
+                kind: r
+                    .kind
+                    .parse()
+                    .map_err(|e: ParseEnumError| ControlError::Decode(e.to_string()))?,
                 row_count: r.row_count,
                 lsn_start: r.lsn_start,
                 lsn_end: r.lsn_end,
                 schema_version: r.schema_version.into(),
-                status: r.status.parse().map_err(ControlError::Decode)?,
+                status: r
+                    .status
+                    .parse()
+                    .map_err(|e: ParseEnumError| ControlError::Decode(e.to_string()))?,
                 reload_id: r.reload_id.map(Into::into),
             })
         })

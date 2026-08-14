@@ -16,7 +16,7 @@
 //! caller-side idempotency keys — is not needed: "the same table, again" *is* the idempotency
 //! rule here.
 
-use crate::ControlError;
+use crate::{parse::ParseEnumError, ControlError};
 use common::{EpochNo, Lsn, ReloadId, SchemaVersionNo};
 use sqlx::{Connection, PgConnection, PgExecutor};
 
@@ -42,13 +42,13 @@ impl ReloadFlavor {
 }
 
 impl std::str::FromStr for ReloadFlavor {
-    type Err = String;
+    type Err = ParseEnumError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "reload" => Ok(ReloadFlavor::Reload),
             "resync" => Ok(ReloadFlavor::Resync),
-            other => Err(format!("unknown reload flavor: {other}")),
+            other => Err(ParseEnumError::new("reload flavor", other)),
         }
     }
 }
@@ -80,7 +80,7 @@ impl ReloadStatus {
 }
 
 impl std::str::FromStr for ReloadStatus {
-    type Err = String;
+    type Err = ParseEnumError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
@@ -89,7 +89,7 @@ impl std::str::FromStr for ReloadStatus {
             "export_complete" => Ok(ReloadStatus::ExportComplete),
             "complete" => Ok(ReloadStatus::Complete),
             "failed" => Ok(ReloadStatus::Failed),
-            other => Err(format!("unknown reload status: {other}")),
+            other => Err(ParseEnumError::new("reload status", other)),
         }
     }
 }

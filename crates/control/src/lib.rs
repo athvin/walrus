@@ -9,6 +9,7 @@ pub mod checkpoint;
 pub mod db;
 pub mod ddl_manifest;
 pub mod manifest;
+pub mod parse;
 pub mod reload;
 pub mod replication_state;
 pub mod schema_registry;
@@ -23,6 +24,7 @@ pub use manifest::{
     claim_ready, delete_claimed, delete_superseded, insert_ready, mark_failed, max_ready_lsn_end,
     ManifestKind, ManifestRow, ManifestStatus, NewManifestFile,
 };
+pub use parse::ParseEnumError;
 // The reload transition functions stay module-qualified (`reload::request`, `reload::fail`, …):
 // several of their names (`renew_lease`, `complete`, `get`) would collide with or read vaguer
 // than the flat exports above. Only the types go flat.
