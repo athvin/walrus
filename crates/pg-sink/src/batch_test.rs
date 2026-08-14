@@ -45,7 +45,7 @@ fn clock_bound_accepts_owned_shared_and_borrowed_clocks() {
     let a = tick(SystemClock);
     let b = tick(shared);
     let c = tick(fake);
-    let d = tick(&owned);
+    let d = tick::<&SystemClock>(&owned);
 
     assert!([a, b, c, d].into_iter().all(|instant| instant >= baseline));
 }

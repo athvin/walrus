@@ -57,6 +57,30 @@ impl Clock for SystemClock {
     }
 }
 
+/// Delegating wrapper impls preserve the private seal while allowing a shared or borrowed clock to
+/// satisfy a `C: Clock` bound — the std pattern (`impl<R: Read + ?Sized> Read for &mut R`). Walrus
+/// clocks are held behind an `Arc` because batchers share one, so without these impls the generic
+/// form is unusable.
+///
+/// `?Sized` is load-bearing: it keeps `Arc<dyn Clock>` covered. Both `Clock` impls target wrapper
+/// types; a bare `impl<T: Clock> Clock for T` would collide with `impl Clock for SystemClock`
+/// (E0119).
+impl<T: Clock + ?Sized> private::Sealed for std::sync::Arc<T> {}
+
+impl<T: Clock + ?Sized> Clock for std::sync::Arc<T> {
+    fn now(&self) -> Instant {
+        (**self).now()
+    }
+}
+
+impl<T: Clock + ?Sized> private::Sealed for &T {}
+
+impl<T: Clock + ?Sized> Clock for &T {
+    fn now(&self) -> Instant {
+        (**self).now()
+    }
+}
+
 /// The three per-batch flush triggers. Whichever trips first (at a commit boundary) cuts the file.
 #[derive(Clone, Copy, Debug)]
 pub struct BatchTriggers {
