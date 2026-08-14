@@ -12,18 +12,73 @@ use axum::{
     extract::State, http::header, http::StatusCode, response::IntoResponse, routing::get, Router,
 };
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+/// The loader's health lifecycle — exactly one of three states.
+///
+/// `Quarantined` implies bootstrap finished: its producer is a failed lossy DDL cast in the apply
+/// loop, which cannot run before bootstrap. That implication keeps `/startup` satisfied while
+/// `/ready` degrades.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum LoaderPhase {
+    #[default]
+    Bootstrapping = 0,
+    Ready = 1,
+    /// Latched by a failed lossy DDL cast. A reload rebuild is its only exit.
+    Quarantined = 2,
+}
+
+/// An out-of-range loader phase byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidPhase(pub u8);
+
+impl TryFrom<u8> for LoaderPhase {
+    type Error = InvalidPhase;
+
+    fn try_from(byte: u8) -> Result<Self, Self::Error> {
+        match byte {
+            0 => Ok(Self::Bootstrapping),
+            1 => Ok(Self::Ready),
+            2 => Ok(Self::Quarantined),
+            other => Err(InvalidPhase(other)),
+        }
+    }
+}
+
+/// A [`LoaderPhase`] stored atomically. Only enum values can be written through this wrapper.
+#[derive(Debug, Default)]
+struct AtomicPhase(AtomicU8);
+
+impl AtomicPhase {
+    fn store(&self, phase: LoaderPhase) {
+        self.0.store(phase as u8, Ordering::SeqCst);
+    }
+
+    fn load(&self) -> LoaderPhase {
+        let byte = self.0.load(Ordering::SeqCst);
+        LoaderPhase::try_from(byte).unwrap_or_else(|InvalidPhase(invalid)| {
+            tracing::error!(
+                phase_byte = invalid,
+                "invalid loader health phase byte; defaulting to bootstrapping"
+            );
+            LoaderPhase::Bootstrapping
+        })
+    }
+
+    fn transition(&self, from: LoaderPhase, to: LoaderPhase) -> bool {
+        self.0
+            .compare_exchange(from as u8, to as u8, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct LoaderState {
-    ready: AtomicBool,
-    /// Set once a table is quarantined by a failed lossy DDL cast (PR 3.9) — degrades `/ready`.
-    /// A latch with exactly one exit: a single-table-reload rebuild (PR 6.7) replaces the data,
-    /// so the failed cast no longer applies and the latch clears.
-    quarantined: AtomicBool,
+    phase: AtomicPhase,
     /// The end of the last poll cycle — liveness proof, NOT a lag metric. `None` until bootstrap ends.
     // LOCK-CHOICE: parking_lot::Mutex — poll-cycle writes dominate the one-expression kubelet read; see docs/implementation/notes/rust-skills/own-rwlock-readers.md.
     last_poll_completed_at: Mutex<Option<Instant>>,
@@ -37,19 +92,20 @@ impl LoaderState {
 
     /// Bootstrap finished: leases held + files open → `/startup` and `/ready` answer 200.
     pub fn mark_ready(&self) {
-        // Release publishes bootstrap's leases, open files, and initial progress stamp.
-        self.ready.store(true, Ordering::Release);
+        self.phase.store(LoaderPhase::Ready);
     }
 
-    /// `/startup` gate: bootstrap finished. Independent of a later quarantine (startup stays satisfied).
+    /// `/startup` gate: bootstrap finished, including a later quarantine.
     pub fn is_started(&self) -> bool {
-        self.ready.load(Ordering::Acquire) // pairs with mark_ready's Release store
+        matches!(
+            self.phase.load(),
+            LoaderPhase::Ready | LoaderPhase::Quarantined
+        )
     }
 
-    /// `/ready` answers 200 iff bootstrap finished AND we are not quarantined (degraded).
+    /// `/ready` answers 200 only in the ready phase.
     pub fn is_ready(&self) -> bool {
-        // Acquire pairs with mark_ready; quarantine is an independent probe latch, not a protocol.
-        self.ready.load(Ordering::Acquire) && !self.is_quarantined()
+        matches!(self.phase.load(), LoaderPhase::Ready)
     }
 
     /// Latch the quarantine flag — a failed lossy DDL cast (PR 3.9). `/ready` degrades and stays
@@ -57,20 +113,20 @@ impl LoaderState {
     /// exactly one exit: a single-table-reload rebuild, which REPLACES the data instead of
     /// retrying the cast on it ([`LoaderState::clear_quarantine`]).
     pub fn quarantine(&self) {
-        // Release publishes the failed-cast quarantine before a probe observes the latch.
-        self.quarantined.store(true, Ordering::Release);
+        self.phase.store(LoaderPhase::Quarantined);
     }
 
     /// The one legitimate quarantine exit (PR 6.7): a reload rebuild just recreated the table at
     /// the attempt's schema_version, so the lossy cast the latch recorded no longer applies to
     /// anything — `/ready` recovers.
     pub fn clear_quarantine(&self) {
-        // Release publishes completion of the rebuild that made the failed cast irrelevant.
-        self.quarantined.store(false, Ordering::Release);
+        let _ = self
+            .phase
+            .transition(LoaderPhase::Quarantined, LoaderPhase::Ready);
     }
 
     pub fn is_quarantined(&self) -> bool {
-        self.quarantined.load(Ordering::Acquire) // pairs with both quarantine stores
+        matches!(self.phase.load(), LoaderPhase::Quarantined)
     }
 
     /// Stamp progress — called at the end of **every** poll cycle (and once at bootstrap end so an

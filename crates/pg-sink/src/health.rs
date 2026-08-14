@@ -20,21 +20,57 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-const PHASE_BOOTSTRAPPING: u8 = 0;
-const PHASE_READY: u8 = 1;
-
 /// The bootstrap phase the probes read. `Bootstrapping` gates the other two.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
 pub enum Phase {
-    Bootstrapping,
-    Ready,
+    #[default]
+    Bootstrapping = 0,
+    Ready = 1,
+}
+
+/// An out-of-range pg-sink phase byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidPhase(pub u8);
+
+impl TryFrom<u8> for Phase {
+    type Error = InvalidPhase;
+
+    fn try_from(byte: u8) -> Result<Self, Self::Error> {
+        match byte {
+            0 => Ok(Self::Bootstrapping),
+            1 => Ok(Self::Ready),
+            other => Err(InvalidPhase(other)),
+        }
+    }
+}
+
+/// A [`Phase`] stored atomically. Only enum values can be written through this wrapper.
+#[derive(Debug, Default)]
+struct AtomicPhase(AtomicU8);
+
+impl AtomicPhase {
+    fn store(&self, phase: Phase) {
+        self.0.store(phase as u8, Ordering::SeqCst);
+    }
+
+    fn load(&self) -> Phase {
+        let byte = self.0.load(Ordering::SeqCst);
+        Phase::try_from(byte).unwrap_or_else(|InvalidPhase(invalid)| {
+            tracing::error!(
+                phase_byte = invalid,
+                "invalid pg-sink health phase byte; defaulting to bootstrapping"
+            );
+            Phase::Bootstrapping
+        })
+    }
 }
 
 /// The snapshot every probe handler reads. All fields are atomics so the (future) replication loop
 /// can update them without locking the probe path.
 #[derive(Debug)]
 pub struct HealthState {
-    phase: AtomicU8,
+    phase: AtomicPhase,
     terminating: AtomicBool,
     degraded: AtomicBool,
     live: AtomicBool,
@@ -49,7 +85,7 @@ impl HealthState {
     #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(HealthState {
-            phase: AtomicU8::new(PHASE_BOOTSTRAPPING),
+            phase: AtomicPhase::default(),
             terminating: AtomicBool::new(false),
             degraded: AtomicBool::new(false),
             live: AtomicBool::new(true),
@@ -58,7 +94,7 @@ impl HealthState {
 
     /// Bootstrap finished → `/startup` and `/ready` may now answer 200.
     pub fn mark_ready(&self) {
-        self.phase.store(PHASE_READY, Ordering::Release); // publishes bootstrap completion
+        self.phase.store(Phase::Ready);
     }
 
     /// SIGTERM received → drop out of rotation (`/ready` 503) while the loop drains.
@@ -79,11 +115,7 @@ impl HealthState {
     }
 
     pub fn phase(&self) -> Phase {
-        match self.phase.load(Ordering::Acquire) {
-            // The Acquire load pairs with mark_ready's Release store.
-            PHASE_READY => Phase::Ready,
-            _ => Phase::Bootstrapping,
-        }
+        self.phase.load()
     }
 
     pub fn is_ready(&self) -> bool {
