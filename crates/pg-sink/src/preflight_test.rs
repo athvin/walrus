@@ -43,7 +43,17 @@ fn preflight_errors_map_to_exit_codes() {
 fn sql_quoting_escapes() {
     assert_eq!(lit("wal_level"), "'wal_level'");
     assert_eq!(lit("a'b"), "'a''b'");
-    assert_eq!(ident("walrus_pub"), "\"walrus_pub\"");
+    assert_eq!(ident("walrus_pub").unwrap().to_string(), "\"walrus_pub\"");
+    assert_eq!(ident("a\"b").unwrap().to_string(), "\"a\"\"b\"");
+
+    assert!(matches!(
+        ident("").unwrap_err(),
+        PreflightError::Query(message) if message.contains("must not be empty")
+    ));
+    assert!(matches!(
+        ident("a\0b").unwrap_err(),
+        PreflightError::Query(message) if message.contains("interior NUL")
+    ));
 }
 
 #[test]
