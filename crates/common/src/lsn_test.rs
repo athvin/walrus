@@ -49,6 +49,36 @@ fn display_is_zero_padded_16_upper_hex() {
 }
 
 #[test]
+fn hex_specifiers_forward_to_the_inner_u64() {
+    let lsn = Lsn::new(0x019A_2B3C);
+    assert_eq!(format!("{lsn:x}"), "19a2b3c");
+    assert_eq!(format!("{lsn:X}"), "19A2B3C");
+    assert_eq!(format!("{lsn:#018X}"), "0x00000000019A2B3C");
+    assert_eq!(format!("{lsn:#010x}"), "0x019a2b3c");
+}
+
+#[test]
+fn octal_and_binary_specifiers_forward_to_the_inner_u64() {
+    assert_eq!(format!("{:o}", Lsn::new(8)), "10");
+    assert_eq!(format!("{:#b}", Lsn::new(5)), "0b101");
+}
+
+#[test]
+fn display_stays_padded_and_differs_from_raw_upper_hex() {
+    let lsn = Lsn::new(0x019A_2B3C);
+    assert_eq!(lsn.to_string(), "00000000019A2B3C");
+    assert_eq!(lsn.to_string().len(), 16);
+    assert_ne!(format!("{lsn}"), format!("{lsn:X}"));
+    assert_eq!(serde_json::to_string(&lsn).unwrap(), "\"00000000019A2B3C\"");
+}
+
+#[test]
+fn lower_hex_output_still_parses_back() {
+    let lsn = Lsn::new(0x019A_2B3C);
+    assert_eq!(format!("{lsn:x}").parse::<Lsn>().unwrap(), lsn);
+}
+
+#[test]
 fn round_trips_through_display_and_from_str() {
     for raw in [0u64, 1, 0x199BAC8, 0x1B4C000, 0xFEDCBA9876543210, u64::MAX] {
         let lsn = Lsn::new(raw);
