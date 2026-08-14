@@ -3,10 +3,7 @@ use super::*;
 #[test]
 fn display_quotes_the_rejected_input() {
     let error = ParseEnumError::new("manifest kind", "snapshottt");
-    assert_eq!(
-        error.to_string(),
-        "invalid manifest kind: \"snapshottt\""
-    );
+    assert_eq!(error.to_string(), "invalid manifest kind: \"snapshottt\"");
 }
 
 #[test]
