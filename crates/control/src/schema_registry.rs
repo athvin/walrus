@@ -6,7 +6,7 @@
 //! file's `schema_version`. A `DELETE` here would make old-version Parquet files un-reconstructable.
 
 use crate::ControlError;
-use common::{EpochNo, TypeDescriptor};
+use common::{EpochNo, SchemaVersionNo, TypeDescriptor};
 use sqlx::types::Json;
 use sqlx::{PgExecutor, Row};
 
@@ -16,7 +16,7 @@ pub struct RegistryRow {
     pub epoch: EpochNo,
     pub source_schema: String,
     pub source_table: String,
-    pub schema_version: i64,
+    pub schema_version: SchemaVersionNo,
     /// The per-column descriptors (stored as `jsonb`).
     pub descriptors: Vec<TypeDescriptor>,
     /// The resulting column-set snapshot (name/type/attnum/nullability/comment) — a `serde_json`
@@ -40,7 +40,7 @@ pub async fn upsert_registry(
         row.epoch.0,
         row.source_schema,
         row.source_table,
-        row.schema_version,
+        row.schema_version.0,
         Json(&row.descriptors) as _,
         row.columns,
     )
@@ -59,14 +59,14 @@ pub async fn read_registry(
     epoch: EpochNo,
     schema: &str,
     table: &str,
-    version: i64,
+    version: SchemaVersionNo,
 ) -> Result<Option<RegistryRow>, ControlError> {
     let rec = sqlx::query_file!(
         "sql/postgres/queries/read_registry.sql",
         epoch.0,
         schema,
         table,
-        version,
+        version.0,
     )
     .fetch_optional(ex)
     .await?;
@@ -75,7 +75,7 @@ pub async fn read_registry(
         epoch: r.epoch.into(),
         source_schema: r.source_schema,
         source_table: r.source_table,
-        schema_version: r.schema_version,
+        schema_version: r.schema_version.into(),
         descriptors: r.descriptors.0,
         columns: r.columns,
     }))
@@ -91,7 +91,7 @@ pub async fn read_latest_version(
     epoch: EpochNo,
     schema: &str,
     table: &str,
-) -> Result<Option<i64>, ControlError> {
+) -> Result<Option<SchemaVersionNo>, ControlError> {
     let rec = sqlx::query_file!(
         "sql/postgres/queries/read_latest_version.sql",
         epoch.0,
@@ -100,7 +100,7 @@ pub async fn read_latest_version(
     )
     .fetch_one(ex)
     .await?;
-    Ok(rec.max_version)
+    Ok(rec.max_version.map(Into::into))
 }
 
 /// The **latest** registry row for every `(source_schema, source_table)` under `epoch` — what the
@@ -142,7 +142,7 @@ pub async fn read_all_latest_registry(
                 epoch: row.try_get::<i64, _>("epoch")?.into(),
                 source_schema: row.try_get("source_schema")?,
                 source_table: row.try_get("source_table")?,
-                schema_version: row.try_get("schema_version")?,
+                schema_version: row.try_get::<i64, _>("schema_version")?.into(),
                 descriptors: row
                     .try_get::<Json<Vec<TypeDescriptor>>, _>("descriptors")?
                     .0,

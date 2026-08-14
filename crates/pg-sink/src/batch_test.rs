@@ -1,7 +1,7 @@
 use super::*;
 use crate::relcache::RelationCache;
 use arrow::array::StringArray;
-use common::{Kind, Op, PgColumn, PgRelation, ReplicaIdentity, UtcTimestamp};
+use common::{Kind, Op, PgColumn, PgRelation, ReplicaIdentity, SchemaVersionNo, UtcTimestamp};
 use pg_to_arrow::oids;
 use std::sync::Mutex;
 
@@ -51,7 +51,7 @@ fn cached() -> Arc<CachedRelation> {
         ],
     };
     RelationCache::default()
-        .upsert_from_relation(rel, 1)
+        .upsert_from_relation(rel, SchemaVersionNo(1))
         .unwrap()
 }
 
@@ -64,7 +64,7 @@ fn meta(lsn: &str) -> SinkMeta {
         xid: 7,
         epoch: common::EpochNo(1),
         batch_id: "b1".into(),
-        schema_version: 1,
+        schema_version: SchemaVersionNo(1),
         source_schema: "public".into(),
         source_table: "widgets".into(),
         kind: Kind::Stream,

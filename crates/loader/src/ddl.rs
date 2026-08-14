@@ -22,13 +22,13 @@ use crate::duck::{duck_type, user_view_sql, TableDb};
 use crate::duck_ext::DuckResultExt;
 use crate::error::LoaderError;
 use common::oids::{FLOAT4, FLOAT8, INT2, INT4, INT8};
-use common::{EpochNo, PgColumn, PgRelation};
+use common::{EpochNo, PgColumn, PgRelation, SchemaVersionNo};
 use std::fmt::Write as _;
 
 /// One `schema_version` of a table's shape — the `schema_registry` `columns` snapshot for that version.
 #[derive(Debug)]
 pub struct SchemaVersion {
-    pub version: i64,
+    pub version: SchemaVersionNo,
     pub relation: PgRelation,
 }
 
@@ -371,11 +371,11 @@ pub async fn reconcile_to_version(
     epoch: EpochNo,
     schema: &str,
     table: &str,
-    target: i64,
+    target: SchemaVersionNo,
 ) -> Result<(), LoaderError> {
     let mut cur = db.schema_version()?;
     while cur < target {
-        let next = cur + 1;
+        let next = SchemaVersionNo(cur.0 + 1);
         // A version with no registry pair to diff (e.g. a metadata-only revision that did not persist a
         // new `columns` snapshot) applies nothing structural — we still advance the watermark below.
         if let (Some(old), Some(new)) = (
@@ -400,7 +400,7 @@ async fn load_version(
     epoch: EpochNo,
     schema: &str,
     table: &str,
-    version: i64,
+    version: SchemaVersionNo,
 ) -> Result<Option<SchemaVersion>, LoaderError> {
     let Some(row) = control::read_registry(pool, epoch, schema, table, version).await? else {
         return Ok(None);
@@ -409,7 +409,7 @@ async fn load_version(
     let relation: PgRelation =
         serde_json::from_value(row.columns).map_err(|source| LoaderError::RegistryDecode {
             table,
-            version,
+            version: version.0,
             source,
         })?;
     Ok(Some(SchemaVersion { version, relation }))

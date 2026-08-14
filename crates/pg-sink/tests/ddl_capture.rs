@@ -192,14 +192,19 @@ async fn alter_add_column_bumps_version_and_cuts_file() {
                     }
                 }
                 Message::Insert { new, .. } => {
-                    router.route(&cache, &msg, frame_lsn, 1).unwrap();
+                    router
+                        .route(&cache, &msg, frame_lsn, common::SchemaVersionNo(1))
+                        .unwrap();
                     // The last row (850003) is our stop marker.
                     if matches!(new.first(), Some(common::TupleValue::Text(s)) if s == "850003") {
                         saw_end = true;
                     }
                 }
                 Message::Commit { .. } => {
-                    for sealed in router.route(&cache, &msg, frame_lsn, 1).unwrap() {
+                    for sealed in router
+                        .route(&cache, &msg, frame_lsn, common::SchemaVersionNo(1))
+                        .unwrap()
+                    {
                         flush_batch(&sink, &pool, epoch, sealed).await.unwrap();
                     }
                 }

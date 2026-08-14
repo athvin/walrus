@@ -10,7 +10,7 @@
 //! with `lsn_end` as zero-padded 16-hex ([`common::Lsn`]'s `Display`) so keys sort in commit order.
 
 use crate::batch::SealedBatch;
-use common::{EpochNo, Lsn};
+use common::{EpochNo, Lsn, SchemaVersionNo};
 use object_store::buffered::BufWriter;
 use object_store::path::Path;
 use object_store::ObjectStore;
@@ -38,7 +38,7 @@ pub struct WrittenObject {
     pub lsn_start: Lsn,
     pub lsn_end: Lsn,
     pub row_count: u64,
-    pub schema_version: i64,
+    pub schema_version: SchemaVersionNo,
     pub kind: FileKind,
 }
 

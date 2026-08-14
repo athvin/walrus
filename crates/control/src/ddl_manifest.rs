@@ -7,7 +7,7 @@
 //! ordering.
 
 use crate::ControlError;
-use common::{EpochNo, Lsn};
+use common::{EpochNo, Lsn, SchemaVersionNo};
 use sqlx::PgExecutor;
 
 /// A decoded schema-change event. (`c_columns` / `c_dropped` gain typed fields in PRs 3.8/3.9; they
@@ -26,7 +26,7 @@ pub struct DdlRow {
     /// `CREATE TABLE` | `ALTER TABLE` | `DROP TABLE` | `COMMENT` | …
     pub c_tag: String,
     /// The `schema_version` this DDL produces.
-    pub schema_version: i64,
+    pub schema_version: SchemaVersionNo,
 }
 
 /// Record a decoded schema-change event (sink, PR 2.33). `c_rel_oid` + `c_columns` are the structured
@@ -52,7 +52,7 @@ pub async fn insert_ddl(
         row.c_lsn as Lsn,
         row.c_event,
         row.c_tag,
-        row.schema_version,
+        row.schema_version.0,
         c_rel_oid,
         c_columns,
     )
@@ -74,8 +74,7 @@ pub async fn read_pending_ddl(
     table: &str,
     after_lsn: Lsn,
 ) -> Result<Vec<DdlRow>, ControlError> {
-    Ok(sqlx::query_file_as!(
-        DdlRow,
+    let rows = sqlx::query_file!(
         "sql/postgres/queries/read_pending_ddl.sql",
         epoch.0,
         schema,
@@ -83,5 +82,18 @@ pub async fn read_pending_ddl(
         after_lsn as Lsn,
     )
     .fetch_all(ex)
-    .await?)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| DdlRow {
+            id: row.id,
+            epoch: row.epoch.into(),
+            source_schema: row.source_schema,
+            source_table: row.source_table,
+            c_lsn: row.c_lsn,
+            c_event: row.c_event,
+            c_tag: row.c_tag,
+            schema_version: row.schema_version.into(),
+        })
+        .collect())
 }

@@ -17,7 +17,7 @@
 //!
 //!   cargo test -p pg-sink --test reload_recovery -- --ignored --test-threads=1
 
-use common::{EpochNo, Lsn};
+use common::{EpochNo, Lsn, ReloadId, SchemaVersionNo};
 use pg_sink::consume::on_frame;
 use pg_sink::heartbeat::InternalTables;
 use pg_sink::pgoutput::{Message, StreamCtx};
@@ -99,7 +99,7 @@ async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: EpochN
             epoch,
             source_schema: "public".to_string(),
             source_table: TABLE.to_string(),
-            schema_version: 1,
+            schema_version: SchemaVersionNo(1),
             descriptors: pg_to_arrow::descriptor::describe_relation(&rel),
             columns: serde_json::to_value(&rel).unwrap(),
         },
@@ -176,7 +176,7 @@ async fn await_resolver_ready(
     let sentinel = -epoch.0;
     let mut ready = false;
     for _ in 0..20 {
-        let rx = waiters.subscribe(sentinel, 1);
+        let rx = waiters.subscribe(ReloadId(sentinel), 1);
         admin
             .batch_execute(&format!(
                 "DELETE FROM walrus.reload_signal WHERE reload_id = {sentinel}; \
@@ -226,12 +226,12 @@ async fn request_and_claim(
         .unwrap()
 }
 
-async fn reload_file_count(pool: &sqlx::PgPool, epoch: EpochNo, reload_id: i64) -> i64 {
+async fn reload_file_count(pool: &sqlx::PgPool, epoch: EpochNo, reload_id: ReloadId) -> i64 {
     sqlx::query_scalar(
         "SELECT count(*) FROM walrus.file_manifest WHERE epoch = $1 AND reload_id = $2",
     )
     .bind(epoch)
-    .bind(reload_id)
+    .bind(reload_id.0)
     .fetch_one(pool)
     .await
     .unwrap()
@@ -252,7 +252,7 @@ async fn set_transformed(pool: &sqlx::PgPool, epoch: EpochNo, lsn: Lsn) {
         .unwrap();
 }
 
-async fn status(pool: &sqlx::PgPool, reload_id: i64) -> ReloadStatus {
+async fn status(pool: &sqlx::PgPool, reload_id: ReloadId) -> ReloadStatus {
     control::reload::get(pool, reload_id)
         .await
         .unwrap()
@@ -481,7 +481,7 @@ async fn adoption_respects_live_leases_but_takes_expired_ones() {
 
     // Expire it (a dead instance): now it is adoptable, and the guarded UPDATE re-acquires it.
     sqlx::query("UPDATE walrus.table_reload SET lease_expiry = now() - interval '1 hour' WHERE reload_id = $1")
-        .bind(reload_id)
+        .bind(reload_id.0)
         .execute(&pool)
         .await
         .unwrap();

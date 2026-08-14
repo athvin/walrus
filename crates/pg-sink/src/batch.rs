@@ -11,7 +11,7 @@
 
 use crate::relcache::CachedRelation;
 use arrow::record_batch::RecordBatch;
-use common::{Lsn, SinkMeta, TupleValue, UtcTimestamp};
+use common::{Lsn, SchemaVersionNo, SinkMeta, TupleValue, UtcTimestamp};
 use pg_to_arrow::BatchBuilder;
 use std::fmt;
 use std::num::NonZeroU64;
@@ -71,7 +71,7 @@ pub struct SealedBatch {
     pub record_batch: RecordBatch,
     pub schema: String,
     pub table: String,
-    pub schema_version: i64,
+    pub schema_version: SchemaVersionNo,
     pub lsn_start: Lsn,
     pub lsn_end: Lsn,
     pub row_count: u64,

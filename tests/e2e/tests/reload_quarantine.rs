@@ -150,7 +150,7 @@ async fn quarantined_table_recovers_via_reload_without_stalling_others() {
             epoch: epoch.into(),
             source_schema: "public".into(),
             source_table: "q_target".into(),
-            schema_version: 2,
+            schema_version: common::SchemaVersionNo(2),
             descriptors: Vec::new(),
             columns: serde_json::to_value(q_target_rel(21)).unwrap(),
         },
@@ -169,7 +169,7 @@ async fn quarantined_table_recovers_via_reload_without_stalling_others() {
             row_count: 1,
             lsn_start: "0/C8".parse().unwrap(),
             lsn_end: "0/C8".parse().unwrap(),
-            schema_version: 2,
+            schema_version: common::SchemaVersionNo(2),
             reload_id: None,
         },
     )

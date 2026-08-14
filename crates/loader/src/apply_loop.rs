@@ -75,7 +75,7 @@ pub async fn apply_loop(ctx: TableCtx, shutdown: CancellationToken) -> Result<()
         for reload_id in completed {
             tracing::info!(
                 table = %format_args!("{}.{}", ctx.schema, ctx.table),
-                reload_id,
+                reload_id = %reload_id,
                 "reload complete: transformed_lsn reached H"
             );
         }

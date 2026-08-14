@@ -72,11 +72,16 @@ fn commit_lsns(db: &TableDb, ids: (i64, i64)) -> Vec<String> {
 fn table_db_moves_across_a_thread() {
     let dir = tempfile::tempdir().unwrap();
     let db = TableDb::open(dir.path().join("orders.duckdb")).unwrap();
-    db.ensure_tables(&orders(), 7).unwrap();
+    db.ensure_tables(&orders(), common::SchemaVersionNo(7))
+        .unwrap();
 
     let handle = std::thread::spawn(move || db.schema_version().unwrap());
     let version = handle.join().unwrap();
-    assert_eq!(version, 7, "the schema version survives the thread move");
+    assert_eq!(
+        version,
+        common::SchemaVersionNo(7),
+        "the schema version survives the thread move"
+    );
 }
 
 #[test]
@@ -94,7 +99,8 @@ fn spill_override_stamps_lsn_end_but_verbatim_otherwise() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let db = TableDb::open(dir.join("orders.duckdb")).unwrap();
-    db.ensure_tables(&orders(), 1).unwrap();
+    db.ensure_tables(&orders(), common::SchemaVersionNo(1))
+        .unwrap();
     // Local Parquet + JSON extraction need the json extension (no S3 here → configure_s3 is not called).
     db.conn.execute_batch("INSTALL json; LOAD json;").unwrap();
 
@@ -103,7 +109,7 @@ fn spill_override_stamps_lsn_end_but_verbatim_otherwise() {
     let lsn_end = "00000000000000C8";
     let spill = write_local_fixture(&dir, "spill.parquet", (1, 2), placeholder);
     let n = db
-        .append_parquet("orders", &spill, 1, Some(lsn_end))
+        .append_parquet("orders", &spill, common::SchemaVersionNo(1), Some(lsn_end))
         .unwrap();
     assert_eq!(n, 2);
     assert_eq!(
@@ -114,7 +120,9 @@ fn spill_override_stamps_lsn_end_but_verbatim_otherwise() {
 
     // A non-spill (verbatim) file: the per-row placeholder is preserved.
     let batch = write_local_fixture(&dir, "batch.parquet", (3, 4), placeholder);
-    let n = db.append_parquet("orders", &batch, 1, None).unwrap();
+    let n = db
+        .append_parquet("orders", &batch, common::SchemaVersionNo(1), None)
+        .unwrap();
     assert_eq!(n, 2);
     assert_eq!(
         commit_lsns(&db, (3, 4)),
@@ -139,11 +147,17 @@ fn parquet_column_cache_hit_then_mutation_capable_miss() {
     let db = TableDb::open(dir.path().join("cache.duckdb")).unwrap();
     let parquet = write_local_fixture(dir.path(), "columns.parquet", (1, 2), "0");
 
-    let initial = db.columns_for(&parquet, 1).unwrap();
-    let hit = db.columns_for("not-read-on-cache-hit.parquet", 1).unwrap();
+    let initial = db
+        .columns_for(&parquet, common::SchemaVersionNo(1))
+        .unwrap();
+    let hit = db
+        .columns_for("not-read-on-cache-hit.parquet", common::SchemaVersionNo(1))
+        .unwrap();
     assert!(Arc::ptr_eq(&initial, &hit), "cache hit reuses the same Arc");
 
-    let miss = db.columns_for(&parquet, 2).unwrap();
+    let miss = db
+        .columns_for(&parquet, common::SchemaVersionNo(2))
+        .unwrap();
     assert_eq!(&*miss, &*initial);
     assert_eq!(
         db.cached_schema_versions(),

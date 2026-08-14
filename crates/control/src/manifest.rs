@@ -9,7 +9,7 @@
 //! is a `DELETE`, not a status flip — the queue's frontier advances by removal.
 
 use crate::ControlError;
-use common::{EpochNo, Lsn, ManifestId};
+use common::{EpochNo, Lsn, ManifestId, ReloadId, SchemaVersionNo};
 use sqlx::PgExecutor;
 
 /// The kind of a `file_manifest` row — the canonical enum for the `kind` text column, shared by the
@@ -102,10 +102,10 @@ pub struct ManifestRow {
     pub row_count: i64,
     pub lsn_start: Lsn,
     pub lsn_end: Lsn,
-    pub schema_version: i64,
+    pub schema_version: SchemaVersionNo,
     pub status: ManifestStatus,
     /// `Some` only for `kind='reload'` chunk files; the purge/routing key.
-    pub reload_id: Option<i64>,
+    pub reload_id: Option<ReloadId>,
 }
 
 /// What the sink inserts after its Parquet is durable in S3 (PR 2.25).
@@ -119,9 +119,9 @@ pub struct NewManifestFile {
     pub row_count: i64,
     pub lsn_start: Lsn,
     pub lsn_end: Lsn,
-    pub schema_version: i64,
+    pub schema_version: SchemaVersionNo,
     /// Set (with `kind=Reload`) only by the chunk export engine (PR 6.5); `None` otherwise.
-    pub reload_id: Option<i64>,
+    pub reload_id: Option<ReloadId>,
 }
 
 /// Insert a `status='ready'` row with `lsn_end` set to the commit LSN; returns the new `id`.
@@ -134,6 +134,7 @@ pub async fn insert_ready(
     executor: impl PgExecutor<'_>,
     f: &NewManifestFile,
 ) -> Result<ManifestId, ControlError> {
+    let reload_id = f.reload_id.map(|id| id.0);
     let rec = sqlx::query_file!(
         "sql/postgres/queries/insert_ready.sql",
         f.epoch.0,
@@ -144,8 +145,8 @@ pub async fn insert_ready(
         f.row_count,
         f.lsn_start as Lsn,
         f.lsn_end as Lsn,
-        f.schema_version,
-        f.reload_id,
+        f.schema_version.0,
+        reload_id,
     )
     .fetch_one(executor)
     .await?;
@@ -204,9 +205,9 @@ pub async fn claim_ready(
                 row_count: r.row_count,
                 lsn_start: r.lsn_start,
                 lsn_end: r.lsn_end,
-                schema_version: r.schema_version,
+                schema_version: r.schema_version.into(),
                 status: r.status.parse().map_err(ControlError::Decode)?,
-                reload_id: r.reload_id,
+                reload_id: r.reload_id.map(Into::into),
             })
         })
         .collect()

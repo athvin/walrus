@@ -152,7 +152,7 @@ async fn backfill_preloaded_rows_then_streams_post_consistent_point() {
             orders_oid = Some(rel.oid);
         }
         backfill
-            .copy_table(&rel, &snapshot, &sink, &pool, 1)
+            .copy_table(&rel, &snapshot, &sink, &pool, common::SchemaVersionNo(1))
             .await
             .unwrap();
     }

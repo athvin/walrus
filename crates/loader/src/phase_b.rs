@@ -31,7 +31,7 @@ pub async fn current_transform(ctx: &TableCtx) -> Result<TransformSql, LoaderErr
             let rel: PgRelation = serde_json::from_value(r.columns).map_err(|source| {
                 LoaderError::RegistryDecode {
                     table,
-                    version: ver,
+                    version: ver.0,
                     source,
                 }
             })?;

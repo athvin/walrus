@@ -10,7 +10,7 @@
 //! `integration` feature (needs the PR 0.6 control Postgres).
 #![cfg(feature = "integration")]
 
-use common::{EpochNo, Lsn};
+use common::{EpochNo, Lsn, SchemaVersionNo};
 use control::NewManifestFile;
 use control::{claim_ready, connect, delete_claimed, insert_ready, mark_failed, run_migrations};
 use sqlx::postgres::PgPool;
@@ -40,7 +40,7 @@ fn file(epoch: EpochNo, table: &str, lsn_end: &str) -> NewManifestFile {
         row_count: 1,
         lsn_start: lsn,
         lsn_end: lsn,
-        schema_version: 1,
+        schema_version: SchemaVersionNo(1),
         reload_id: None,
     }
 }

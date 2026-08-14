@@ -16,7 +16,7 @@ pub mod type_descriptor;
 
 pub use config::CommonConfig;
 pub use error::{Error, ExitCode, Result};
-pub use ids::{EpochNo, ManifestId};
+pub use ids::{EpochNo, ManifestId, ReloadId, SchemaVersionNo};
 pub use lsn::Lsn;
 pub use pg_shape::{PgColumn, PgRelation, ReplicaIdentity, TupleValue};
 pub use sink_meta::{Kind, Op, SinkMeta, UtcTimestamp};

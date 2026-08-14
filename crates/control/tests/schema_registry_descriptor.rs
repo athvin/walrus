@@ -15,7 +15,7 @@
 //! cargo test -p control -- --ignored schema_registry_roundtrips_a_type_descriptor
 //! ```
 
-use common::{PgColumn, PgRelation, ReplicaIdentity};
+use common::{PgColumn, PgRelation, ReplicaIdentity, SchemaVersionNo};
 use control::{connect, read_registry, run_migrations, upsert_registry, RegistryRow};
 use pg_to_arrow::descriptor::describe_relation;
 
@@ -62,7 +62,7 @@ async fn schema_registry_roundtrips_a_type_descriptor() {
         epoch: common::EpochNo(2_170_017),
         source_schema: "public".to_string(),
         source_table: "widgets".to_string(),
-        schema_version: 1,
+        schema_version: SchemaVersionNo(1),
         descriptors: descriptors.clone(),
         columns: serde_json::json!([]),
     };
@@ -70,7 +70,7 @@ async fn schema_registry_roundtrips_a_type_descriptor() {
     // Isolate in a rolled-back transaction (matches the other control integration tests).
     let mut tx = pool.begin().await.unwrap();
     upsert_registry(&mut *tx, &row).await.unwrap();
-    let back = read_registry(&mut *tx, row.epoch, "public", "widgets", 1)
+    let back = read_registry(&mut *tx, row.epoch, "public", "widgets", SchemaVersionNo(1))
         .await
         .unwrap()
         .expect("registry row present after upsert");

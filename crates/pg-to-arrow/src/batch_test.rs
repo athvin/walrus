@@ -40,7 +40,7 @@ fn meta(unchanged_toast: Vec<String>) -> SinkMeta {
         xid: 1,
         epoch: common::EpochNo(7),
         batch_id: "b1".to_string(),
-        schema_version: 1,
+        schema_version: common::SchemaVersionNo(1),
         source_schema: "public".to_string(),
         source_table: "orders".to_string(),
         kind: Kind::Stream,

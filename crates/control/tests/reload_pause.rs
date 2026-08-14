@@ -12,7 +12,7 @@
 //! never pauses. Rolled-back transactions + unique epochs, like the manifest tests.
 #![cfg(feature = "integration")]
 
-use common::{EpochNo, Lsn};
+use common::{EpochNo, Lsn, SchemaVersionNo};
 use control::reload::{self, ReloadFlavor};
 use control::{claim_ready, connect, insert_ready, max_ready_lsn_end, run_migrations};
 use control::{ManifestRow, NewManifestFile};
@@ -43,7 +43,7 @@ fn stream_file(epoch: EpochNo, table: &str, lsn_end: &str) -> NewManifestFile {
         row_count: 1,
         lsn_start: lsn,
         lsn_end: lsn,
-        schema_version: 1,
+        schema_version: SchemaVersionNo(1),
         reload_id: None,
     }
 }

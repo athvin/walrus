@@ -8,7 +8,7 @@
 //! resolve. At bootstrap the cache is **hydrated** from `schema_registry` so a restart is a resume.
 
 use arrow::datatypes::SchemaRef;
-use common::{PgRelation, TypeDescriptor};
+use common::{PgRelation, SchemaVersionNo, TypeDescriptor};
 use std::collections::{hash_map, HashMap};
 use std::sync::Arc;
 
@@ -21,7 +21,7 @@ pub struct CachedRelation {
     pub arrow_schema: SchemaRef,
     /// Per source column, for the loader to rebuild the exact types (§2.6).
     pub descriptors: Vec<TypeDescriptor>,
-    pub schema_version: i64,
+    pub schema_version: SchemaVersionNo,
 }
 
 /// The three walrus-internal source tables: control-plane, never registered or schematised as user
@@ -34,12 +34,12 @@ pub fn is_internal_table(schema: &str, table: &str) -> bool {
 
 #[derive(Debug, Default)]
 pub struct RelationCache {
-    by_key: HashMap<(u32, i64), Arc<CachedRelation>>,
+    by_key: HashMap<(u32, SchemaVersionNo), Arc<CachedRelation>>,
 }
 
 impl RelationCache {
     #[must_use]
-    pub fn get(&self, oid: u32, schema_version: i64) -> Option<Arc<CachedRelation>> {
+    pub fn get(&self, oid: u32, schema_version: SchemaVersionNo) -> Option<Arc<CachedRelation>> {
         self.by_key.get(&(oid, schema_version)).cloned()
     }
 
@@ -65,7 +65,7 @@ impl RelationCache {
     /// The cached relations, in unspecified order. The map key is a projection of each value, so
     /// iteration yields values directly.
     #[must_use]
-    pub fn iter(&self) -> hash_map::Values<'_, (u32, i64), Arc<CachedRelation>> {
+    pub fn iter(&self) -> hash_map::Values<'_, (u32, SchemaVersionNo), Arc<CachedRelation>> {
         <&Self as IntoIterator>::into_iter(self)
     }
 
@@ -89,7 +89,7 @@ impl RelationCache {
     pub fn upsert_from_relation(
         &mut self,
         relation: PgRelation,
-        schema_version: i64,
+        schema_version: SchemaVersionNo,
     ) -> Result<Arc<CachedRelation>, RelationError> {
         let cached = build_cached(relation, schema_version)?;
         let key = (cached.relation.oid, schema_version);
@@ -151,7 +151,7 @@ impl Extend<CachedRelation> for RelationCache {
 
 impl IntoIterator for RelationCache {
     type Item = Arc<CachedRelation>;
-    type IntoIter = hash_map::IntoValues<(u32, i64), Arc<CachedRelation>>;
+    type IntoIter = hash_map::IntoValues<(u32, SchemaVersionNo), Arc<CachedRelation>>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.by_key.into_values()
@@ -160,7 +160,7 @@ impl IntoIterator for RelationCache {
 
 impl<'a> IntoIterator for &'a RelationCache {
     type Item = &'a Arc<CachedRelation>;
-    type IntoIter = hash_map::Values<'a, (u32, i64), Arc<CachedRelation>>;
+    type IntoIter = hash_map::Values<'a, (u32, SchemaVersionNo), Arc<CachedRelation>>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.by_key.values()
@@ -169,7 +169,7 @@ impl<'a> IntoIterator for &'a RelationCache {
 
 impl<'a> IntoIterator for &'a mut RelationCache {
     type Item = &'a mut Arc<CachedRelation>;
-    type IntoIter = hash_map::ValuesMut<'a, (u32, i64), Arc<CachedRelation>>;
+    type IntoIter = hash_map::ValuesMut<'a, (u32, SchemaVersionNo), Arc<CachedRelation>>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.by_key.values_mut()
@@ -188,7 +188,7 @@ fn build_arrow(relation: &PgRelation) -> Result<SchemaRef, RelationError> {
 
 fn build_cached(
     relation: PgRelation,
-    schema_version: i64,
+    schema_version: SchemaVersionNo,
 ) -> Result<CachedRelation, RelationError> {
     let arrow_schema = build_arrow(&relation)?;
     let descriptors = pg_to_arrow::descriptor::describe_relation(&relation);

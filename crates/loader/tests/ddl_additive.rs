@@ -38,12 +38,15 @@ fn rel(name: &str, columns: Vec<PgColumn>) -> PgRelation {
 }
 
 fn sv(version: i64, relation: PgRelation) -> SchemaVersion {
-    SchemaVersion { version, relation }
+    SchemaVersion {
+        version: common::SchemaVersionNo(version),
+        relation,
+    }
 }
 
 fn mem(rel: &PgRelation) -> TableDb {
     let db = TableDb::open(":memory:").unwrap();
-    db.ensure_tables(rel, 1).unwrap();
+    db.ensure_tables(rel, common::SchemaVersionNo(1)).unwrap();
     db
 }
 
@@ -465,7 +468,7 @@ async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
                 epoch,
                 source_schema: "public".into(),
                 source_table: "orders".into(),
-                schema_version: v,
+                schema_version: common::SchemaVersionNo(v),
                 descriptors: Vec::new(),
                 columns: serde_json::to_value(&r).unwrap(),
             },
@@ -500,7 +503,7 @@ async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
                 row_count: 2,
                 lsn_start: lsn.parse().unwrap(),
                 lsn_end: lsn.parse().unwrap(),
-                schema_version: ver,
+                schema_version: common::SchemaVersionNo(ver),
                 reload_id: None,
             },
         )
@@ -511,7 +514,8 @@ async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
     // The loader starts at the v1 shape (a fresh .duckdb); Phase A reconciles across the boundary.
     let dir = tmpdir(&epoch.to_string());
     let db = TableDb::open(dir.join("orders.duckdb")).unwrap();
-    db.ensure_tables(&orders_v1(), 1).unwrap();
+    db.ensure_tables(&orders_v1(), common::SchemaVersionNo(1))
+        .unwrap();
     db.configure_s3(&s3()).unwrap();
     let ctx = TableCtx {
         pool,
@@ -534,7 +538,7 @@ async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
     run_phase_a(&ctx).await.unwrap();
     assert_eq!(
         ctx.db.schema_version().unwrap(),
-        2,
+        common::SchemaVersionNo(2),
         "Phase A reconciled to v2 before appending the v2 file (DDL applied at the boundary)"
     );
     run_phase_b(&ctx).await.unwrap();

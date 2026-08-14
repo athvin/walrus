@@ -93,7 +93,7 @@ async fn seed_file(
     uri: &str,
     kind: &str,
     lsn_end: &str,
-    reload_id: Option<i64>,
+    reload_id: Option<common::ReloadId>,
 ) -> i64 {
     control::insert_ready(
         pool,
@@ -106,7 +106,7 @@ async fn seed_file(
             row_count: 1,
             lsn_start: lsn_end.parse().unwrap(),
             lsn_end: lsn_end.parse().unwrap(),
-            schema_version: 1,
+            schema_version: common::SchemaVersionNo(1),
             reload_id,
         },
     )
@@ -145,7 +145,8 @@ async fn setup(epoch: EpochNo) -> (TableCtx, std::path::PathBuf) {
         .unwrap();
     let dir = tmpdir(&epoch.to_string());
     let db = TableDb::open(dir.join("orders.duckdb")).unwrap();
-    db.ensure_tables(&orders(), 1).unwrap();
+    db.ensure_tables(&orders(), common::SchemaVersionNo(1))
+        .unwrap();
     db.configure_s3(&s3()).unwrap();
     let ctx = TableCtx {
         pool,
@@ -168,7 +169,12 @@ async fn setup(epoch: EpochNo) -> (TableCtx, std::path::PathBuf) {
 }
 
 /// Walk a `resync` reload through the real transitions to `export_complete` at `first_lsn = l1`.
-async fn drained_resync(pool: &sqlx::PgPool, epoch: EpochNo, l1: &str, h: &str) -> i64 {
+async fn drained_resync(
+    pool: &sqlx::PgPool,
+    epoch: EpochNo,
+    l1: &str,
+    h: &str,
+) -> common::ReloadId {
     let id = reload::request(pool, epoch, "public", "orders", ReloadFlavor::Resync)
         .await
         .unwrap();
@@ -181,7 +187,7 @@ async fn drained_resync(pool: &sqlx::PgPool, epoch: EpochNo, l1: &str, h: &str) 
         1,
         &serde_json::json!(["999"]),
         l1.parse::<Lsn>().unwrap(),
-        1,
+        common::SchemaVersionNo(1),
     )
     .await
     .unwrap();
@@ -299,7 +305,7 @@ async fn resync_repairs_drift_but_phantoms_survive() {
     // No rebuild happened: no meta latch, raw history preserved.
     assert_eq!(
         ctx.db.recorded_reload_id().unwrap(),
-        0,
+        common::ReloadId(0),
         "resync never writes the reload_id latch"
     );
     assert!(
@@ -388,7 +394,11 @@ async fn resync_chunks_flow_through_raw() {
         "the pre-resync stream rows are still in raw — no rebuild discarded them"
     );
     assert_eq!(mirror_status(&ctx, 7).as_deref(), Some("from-chunk"));
-    assert_eq!(ctx.db.recorded_reload_id().unwrap(), 0, "no latch");
+    assert_eq!(
+        ctx.db.recorded_reload_id().unwrap(),
+        common::ReloadId(0),
+        "no latch"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -415,14 +425,14 @@ async fn resync_ddl_restart_preserves_the_resync_flavor() {
         1,
         &serde_json::json!(["10"]),
         "0/100".parse().unwrap(),
-        1,
+        common::SchemaVersionNo(1),
     )
     .await
     .unwrap();
     let old_row = reload::get(&ctx.pool, old).await.unwrap().unwrap();
 
     let mut conn = ctx.pool.acquire().await.unwrap();
-    let new_id = reload::restart_for_ddl(&mut conn, &old_row, 2, 3)
+    let new_id = reload::restart_for_ddl(&mut conn, &old_row, common::SchemaVersionNo(2), 3)
         .await
         .unwrap()
         .expect("cap 3 leaves room for the first restart");

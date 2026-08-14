@@ -1,6 +1,6 @@
 use super::*;
 use arrow::datatypes::DataType;
-use common::{PgColumn, ReplicaIdentity};
+use common::{PgColumn, ReplicaIdentity, SchemaVersionNo};
 use pg_to_arrow::oids;
 
 fn orders() -> PgRelation {
@@ -27,7 +27,9 @@ fn orders() -> PgRelation {
 #[test]
 fn caches_arrow_schema_and_descriptors_by_versioned_key() {
     let mut cache = RelationCache::default();
-    let entry = cache.upsert_from_relation(orders(), 1).unwrap();
+    let entry = cache
+        .upsert_from_relation(orders(), SchemaVersionNo(1))
+        .unwrap();
     // Tier-1 schema (PR 2.9): 4 data cols + the trailing meta col.
     assert_eq!(entry.arrow_schema.fields().len(), 5);
     assert_eq!(entry.arrow_schema.field(0).data_type(), &DataType::Int32);
@@ -37,8 +39,8 @@ fn caches_arrow_schema_and_descriptors_by_versioned_key() {
     );
     assert_eq!(entry.descriptors.len(), 4);
     // Keyed by (oid, version): a lookup at a different version misses.
-    assert!(cache.get(16397, 1).is_some());
-    assert!(cache.get(16397, 2).is_none());
+    assert!(cache.get(16397, SchemaVersionNo(1)).is_some());
+    assert!(cache.get(16397, SchemaVersionNo(2)).is_none());
 }
 
 #[test]
@@ -50,13 +52,15 @@ fn hydrate_round_trips_through_a_registry_row() {
         epoch: common::EpochNo(1),
         source_schema: "public".to_string(),
         source_table: "orders".to_string(),
-        schema_version: 3,
+        schema_version: SchemaVersionNo(3),
         descriptors: descriptors.clone(),
         columns: serde_json::to_value(&relation).unwrap(),
     };
     let mut cache = RelationCache::default();
     cache.hydrate(vec![row]).unwrap();
-    let entry = cache.get(16397, 3).expect("hydrated entry");
+    let entry = cache
+        .get(16397, SchemaVersionNo(3))
+        .expect("hydrated entry");
     assert_eq!(entry.relation, relation);
     assert_eq!(entry.descriptors, descriptors);
     assert_eq!(entry.arrow_schema.fields().len(), 5);
@@ -77,23 +81,25 @@ fn internal_tables_are_recognised() {
 
 #[test]
 fn collects_and_extends_like_a_collection() {
-    let first = build_cached(orders(), 1).unwrap();
-    let second = build_cached(orders(), 2).unwrap();
+    let first = build_cached(orders(), SchemaVersionNo(1)).unwrap();
+    let second = build_cached(orders(), SchemaVersionNo(2)).unwrap();
     let cache: RelationCache = [first, second].into_iter().collect();
 
     assert_eq!(cache.len(), 2);
-    assert!(cache.get(16397, 1).is_some());
-    assert!(cache.get(16397, 2).is_some());
+    assert!(cache.get(16397, SchemaVersionNo(1)).is_some());
+    assert!(cache.get(16397, SchemaVersionNo(2)).is_some());
 
     let mut grown = RelationCache::default();
-    grown.extend([build_cached(orders(), 3).unwrap()]);
+    grown.extend([build_cached(orders(), SchemaVersionNo(3)).unwrap()]);
     assert_eq!(grown.len(), 1);
-    assert!(grown.get(16397, 3).is_some());
+    assert!(grown.get(16397, SchemaVersionNo(3)).is_some());
 }
 
 #[test]
 fn iterates_by_ref_by_mut_and_by_value() {
-    let cache: RelationCache = [build_cached(orders(), 7).unwrap()].into_iter().collect();
+    let cache: RelationCache = [build_cached(orders(), SchemaVersionNo(7)).unwrap()]
+        .into_iter()
+        .collect();
 
     assert_eq!(cache.iter().count(), 1);
     assert_eq!((&cache).into_iter().count(), 1);
@@ -106,11 +112,11 @@ fn iterates_by_ref_by_mut_and_by_value() {
         drop(clone);
     }
 
-    let versions: Vec<i64> = cache
+    let versions: Vec<SchemaVersionNo> = cache
         .into_iter()
         .map(|relation| relation.schema_version)
         .collect();
-    assert_eq!(versions, vec![7]);
+    assert_eq!(versions, vec![SchemaVersionNo(7)]);
 }
 
 #[test]
@@ -120,7 +126,7 @@ fn hydrate_message_is_unchanged_on_a_malformed_snapshot() {
         epoch: common::EpochNo(1),
         source_schema: "public".to_string(),
         source_table: "orders".to_string(),
-        schema_version: 1,
+        schema_version: SchemaVersionNo(1),
         descriptors: pg_to_arrow::descriptor::describe_relation(&relation),
         columns: serde_json::to_value(relation).unwrap(),
     };
@@ -130,7 +136,7 @@ fn hydrate_message_is_unchanged_on_a_malformed_snapshot() {
         epoch: common::EpochNo(1),
         source_schema: "public".to_string(),
         source_table: "orders".to_string(),
-        schema_version: 2,
+        schema_version: SchemaVersionNo(2),
         descriptors: vec![],
         columns: malformed,
     };

@@ -1,5 +1,6 @@
 //! Control-DB connection pool and migration runner.
 
+use common::ReloadId;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
 /// Errors from the control-DB entrypoint, classified terminal-vs-transient like [`common::Error`].
@@ -31,7 +32,7 @@ pub enum ControlError {
     /// superseded actor, never a cold dependency.
     #[error("illegal reload transition: reload {reload_id} is not in status {expected}")]
     ReloadTransition {
-        reload_id: i64,
+        reload_id: ReloadId,
         expected: &'static str,
     },
 

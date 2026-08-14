@@ -170,7 +170,9 @@ async fn large_txn_single_ready_file_only_after_stream_commit() {
             };
             match &msg {
                 Message::Relation { relation, .. } => {
-                    cache.upsert_from_relation(relation.clone(), 1).unwrap();
+                    cache
+                        .upsert_from_relation(relation.clone(), common::SchemaVersionNo(1))
+                        .unwrap();
                 }
                 Message::StreamStart { xid, first_segment } => {
                     demux.on_stream_start(*xid, *first_segment, frame_lsn);
@@ -338,7 +340,9 @@ async fn whole_txn_abort_writes_no_ready_row() {
             };
             match &msg {
                 Message::Relation { relation, .. } => {
-                    cache.upsert_from_relation(relation.clone(), 1).unwrap();
+                    cache
+                        .upsert_from_relation(relation.clone(), common::SchemaVersionNo(1))
+                        .unwrap();
                 }
                 Message::StreamStart { xid, first_segment } => {
                     demux.on_stream_start(*xid, *first_segment, frame_lsn);

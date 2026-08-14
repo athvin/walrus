@@ -17,7 +17,7 @@
 //! echo, or the watermark model itself is broken (metric + error log, never a panic — see
 //! `docs/implementation/notes/commit-visibility-race.md` for the race this bounds).
 
-use common::Lsn;
+use common::{Lsn, ReloadId};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,7 +33,7 @@ pub struct Echo {
     pub embedded_lsn: Lsn,
 }
 
-type WaiterKey = (i64, i64);
+type WaiterKey = (ReloadId, i64);
 type WaiterEntry = (u64, oneshot::Sender<Echo>);
 
 /// Registry of in-flight watermark waits, keyed by `(reload_id, chunk_no)`.
@@ -57,7 +57,7 @@ impl WatermarkWaiters {
     /// Register interest in chunk `(reload_id, chunk_no)`'s echo. Call BEFORE inserting the
     /// signal row (subscribe-then-insert). A duplicate subscribe replaces the stale sender —
     /// the previous receiver resolves as `Err(Closed)`, which the exporter treats as superseded.
-    pub fn subscribe(&self, reload_id: i64, chunk_no: i64) -> SubscribeGuard<'_> {
+    pub fn subscribe(&self, reload_id: ReloadId, chunk_no: i64) -> SubscribeGuard<'_> {
         let (tx, rx) = oneshot::channel();
         let key = (reload_id, chunk_no);
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
@@ -93,12 +93,12 @@ impl WatermarkWaiters {
     /// still the only defensible stamp). An unsubscribed echo (e.g. redelivered WAL after an
     /// exporter crash — recovery is control-pg's job, never WAL replay) is dropped with a debug
     /// log.
-    pub fn resolve(&self, reload_id: i64, chunk_no: i64, echo: Echo) {
+    pub fn resolve(&self, reload_id: ReloadId, chunk_no: i64, echo: Echo) {
         if echo.embedded_lsn >= echo.commit_lsn {
             self.crosscheck_violations.fetch_add(1, Ordering::Relaxed);
             common::metrics::record_reload_crosscheck_violation();
             tracing::error!(
-                reload_id,
+                reload_id = %reload_id,
                 chunk_no,
                 embedded_lsn = %echo.embedded_lsn,
                 commit_lsn = %echo.commit_lsn,
@@ -113,10 +113,10 @@ impl WatermarkWaiters {
             Some((_, tx)) => {
                 if tx.send(echo).is_err() {
                     // The exporter gave up (timeout) and dropped its receiver — fine.
-                    tracing::debug!(reload_id, chunk_no, "echo resolved after waiter gave up");
+                    tracing::debug!(reload_id = %reload_id, chunk_no, "echo resolved after waiter gave up");
                 } else {
                     tracing::info!(
-                        reload_id,
+                        reload_id = %reload_id,
                         chunk_no,
                         commit_lsn = %echo.commit_lsn,
                         embedded_lsn = %echo.embedded_lsn,
@@ -125,7 +125,7 @@ impl WatermarkWaiters {
                 }
             }
             None => {
-                tracing::debug!(reload_id, chunk_no, "echo with no subscriber; dropped");
+                tracing::debug!(reload_id = %reload_id, chunk_no, "echo with no subscriber; dropped");
             }
         }
     }
@@ -180,7 +180,7 @@ impl Drop for SubscribeGuard<'_> {
 /// A decoded `reload_signal` insert held between its `Insert` message and its transaction's fate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PendingSignal {
-    pub reload_id: i64,
+    pub reload_id: ReloadId,
     pub chunk_no: i64,
     pub embedded_lsn: Lsn,
     /// The per-message xid — `Some` only inside a streamed transaction (which a single-row signal
@@ -205,7 +205,7 @@ impl PendingSignal {
             }
         };
         Some(PendingSignal {
-            reload_id: text("reload_id")?.parse().ok()?,
+            reload_id: ReloadId(text("reload_id")?.parse().ok()?),
             chunk_no: text("chunk_no")?.parse().ok()?,
             embedded_lsn: text("wal_insert_lsn")?.parse().ok()?,
             xid,
@@ -251,7 +251,7 @@ impl PendingSignals {
     pub fn on_stream_commit(&mut self, commit_lsn: Lsn, waiters: &WatermarkWaiters) {
         for sig in extract(&mut self.pending, |s| s.xid.is_some()) {
             tracing::warn!(
-                reload_id = sig.reload_id,
+                reload_id = %sig.reload_id,
                 chunk_no = sig.chunk_no,
                 "reload_signal echo arrived inside a STREAMED transaction (single-row signal \
                  txns should never stream); resolving at Stream Commit"
@@ -277,7 +277,7 @@ impl PendingSignals {
         });
         for sig in &dropped {
             tracing::warn!(
-                reload_id = sig.reload_id,
+                reload_id = %sig.reload_id,
                 chunk_no = sig.chunk_no,
                 top_xid,
                 sub_xid,

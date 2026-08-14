@@ -136,7 +136,8 @@ fn ctx_on(
     compaction: Duration,
 ) -> TableCtx {
     let db = TableDb::open(path).unwrap();
-    db.ensure_tables(&orders(), 1).unwrap();
+    db.ensure_tables(&orders(), common::SchemaVersionNo(1))
+        .unwrap();
     db.configure_s3(&s3()).unwrap();
     TableCtx {
         pool,
@@ -206,7 +207,7 @@ async fn sigterm_mid_apply_commits_both_watermarks_and_releases_lease() {
             row_count: 1,
             lsn_start: "0/64".parse().unwrap(),
             lsn_end: "0/64".parse().unwrap(),
-            schema_version: 1,
+            schema_version: common::SchemaVersionNo(1),
             reload_id: None,
         },
     )
@@ -262,7 +263,8 @@ async fn sigterm_mid_apply_commits_both_watermarks_and_releases_lease() {
 async fn in_flight_full_rebuild_is_aborted_on_sigterm() {
     let dir = tmpdir("abort");
     let db = TableDb::open(dir.join("orders.duckdb")).unwrap();
-    db.ensure_tables(&orders(), 1).unwrap();
+    db.ensure_tables(&orders(), common::SchemaVersionNo(1))
+        .unwrap();
     let t = TransformSql::from_relation(&orders());
 
     // A committed baseline the rebuild must NOT lose or partially replace.
@@ -347,7 +349,7 @@ async fn a_replacement_loader_resumes_from_the_two_watermarks() {
             row_count: 1,
             lsn_start: "0/64".parse().unwrap(),
             lsn_end: "0/64".parse().unwrap(),
-            schema_version: 1,
+            schema_version: common::SchemaVersionNo(1),
             reload_id: None,
         },
     )
@@ -375,7 +377,7 @@ async fn a_replacement_loader_resumes_from_the_two_watermarks() {
             row_count: 1,
             lsn_start: "0/C8".parse().unwrap(),
             lsn_end: "0/C8".parse().unwrap(),
-            schema_version: 1,
+            schema_version: common::SchemaVersionNo(1),
             reload_id: None,
         },
     )

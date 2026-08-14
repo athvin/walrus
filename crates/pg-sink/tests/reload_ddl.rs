@@ -19,7 +19,7 @@
 //!   cargo test -p pg-sink --test reload_ddl -- --ignored --test-threads=1
 
 use bytes::Bytes;
-use common::{EpochNo, Lsn};
+use common::{EpochNo, Lsn, ReloadId, SchemaVersionNo};
 use object_store::path::Path;
 use object_store::ObjectStore;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -103,7 +103,7 @@ async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: EpochN
         ))
         .await
         .unwrap();
-    register(admin, pool, epoch, 1).await;
+    register(admin, pool, epoch, SchemaVersionNo(1)).await;
 }
 
 /// (Re)register the table's CURRENT source shape at `version` — the sink's decode loop does this on
@@ -112,7 +112,7 @@ async fn register(
     admin: &tokio_postgres::Client,
     pool: &sqlx::PgPool,
     epoch: EpochNo,
-    version: i64,
+    version: SchemaVersionNo,
 ) {
     let rel = pg_sink::snapshot::describe_source_relation(admin, "public", TABLE)
         .await
@@ -198,7 +198,7 @@ async fn await_resolver_ready(
     let sentinel = -epoch.0;
     let mut ready = false;
     for _ in 0..20 {
-        let rx = waiters.subscribe(sentinel, 1);
+        let rx = waiters.subscribe(ReloadId(sentinel), 1);
         admin
             .batch_execute(&format!(
                 "DELETE FROM walrus.reload_signal WHERE reload_id = {sentinel}; \
@@ -262,33 +262,45 @@ async fn reload_rows(pool: &sqlx::PgPool, epoch: EpochNo) -> Vec<control::Reload
     .unwrap();
     let mut out = Vec::new();
     for id in ids {
-        out.push(control::reload::get(pool, id).await.unwrap().unwrap());
+        out.push(
+            control::reload::get(pool, ReloadId(id))
+                .await
+                .unwrap()
+                .unwrap(),
+        );
     }
     out
 }
 
-async fn manifest_count(pool: &sqlx::PgPool, epoch: EpochNo, reload_id: i64) -> i64 {
+async fn manifest_count(pool: &sqlx::PgPool, epoch: EpochNo, reload_id: ReloadId) -> i64 {
     sqlx::query_scalar(
         "SELECT count(*) FROM walrus.file_manifest WHERE epoch = $1 AND reload_id = $2",
     )
     .bind(epoch)
-    .bind(reload_id)
+    .bind(reload_id.0)
     .fetch_one(pool)
     .await
     .unwrap()
 }
 
 /// The (uri, schema_version) of a reload's chunk files, in claim order.
-async fn reload_files(pool: &sqlx::PgPool, epoch: EpochNo, reload_id: i64) -> Vec<(String, i64)> {
-    sqlx::query_as::<_, (String, i64)>(
+async fn reload_files(
+    pool: &sqlx::PgPool,
+    epoch: EpochNo,
+    reload_id: ReloadId,
+) -> Vec<(String, SchemaVersionNo)> {
+    let rows = sqlx::query_as::<_, (String, i64)>(
         "SELECT s3_uri, schema_version FROM walrus.file_manifest
          WHERE epoch = $1 AND reload_id = $2 ORDER BY lsn_end, id",
     )
     .bind(epoch)
-    .bind(reload_id)
+    .bind(reload_id.0)
     .fetch_all(pool)
     .await
-    .unwrap()
+    .unwrap();
+    rows.into_iter()
+        .map(|(uri, version)| (uri, SchemaVersionNo(version)))
+        .collect()
 }
 
 /// The Arrow column names of a chunk Parquet file — proves which shape it was exported at.
@@ -370,16 +382,21 @@ async fn mid_export_ddl_restarts_fresh_attempt_at_new_schema() {
         ))
         .await
         .unwrap();
-    register(&admin, &pool, epoch, 2).await;
+    register(&admin, &pool, epoch, SchemaVersionNo(2)).await;
 
     // The next chunk's staleness check trips: the run returns SchemaChanged (no chunk 2 at v1).
     let restarts_before = counter_value(common::metrics::names::RELOAD_RESTARTS_TOTAL);
     let outcome = exporter.run().await.unwrap();
-    assert_eq!(outcome, RunOutcome::SchemaChanged { new_version: 2 });
+    assert_eq!(
+        outcome,
+        RunOutcome::SchemaChanged {
+            new_version: SchemaVersionNo(2)
+        }
+    );
 
     // The controller fails-and-reissues in one transaction.
     let old_after_chunk1 = control::reload::get(&pool, old_id).await.unwrap().unwrap();
-    let decision = handle_ddl_restart(&pool, &old_after_chunk1, 2, 3)
+    let decision = handle_ddl_restart(&pool, &old_after_chunk1, SchemaVersionNo(2), 3)
         .await
         .unwrap();
     let new_id = match decision {
@@ -439,11 +456,15 @@ async fn mid_export_ddl_restarts_fresh_attempt_at_new_schema() {
     ));
 
     let done = control::reload::get(&pool, new_id).await.unwrap().unwrap();
-    assert_eq!(done.schema_version, Some(2), "the attempt froze at v2");
+    assert_eq!(
+        done.schema_version,
+        Some(SchemaVersionNo(2)),
+        "the attempt froze at v2"
+    );
     let files = reload_files(&pool, epoch, new_id).await;
     assert_eq!(files.len(), 3, "5 rows at chunk_rows=2 ⇒ 3 files");
     assert!(
-        files.iter().all(|f| f.1 == 2),
+        files.iter().all(|f| f.1 == SchemaVersionNo(2)),
         "every successor file stamped v2"
     );
     let cols = chunk_columns(&files[0].0).await;
@@ -499,16 +520,18 @@ async fn restart_cap_exhaustion_fails_loudly() {
         ))
         .await
         .unwrap();
-    register(&admin, &pool, epoch, 2).await;
+    register(&admin, &pool, epoch, SchemaVersionNo(2)).await;
     assert_eq!(
         exporter.run().await.unwrap(),
-        RunOutcome::SchemaChanged { new_version: 2 }
+        RunOutcome::SchemaChanged {
+            new_version: SchemaVersionNo(2)
+        }
     );
 
     // Cap 0: the first mid-export DDL fails the reload outright — no successor.
     let cap_before = counter_value(common::metrics::names::RELOAD_RESTART_CAP_EXHAUSTED_TOTAL);
     let old_after_chunk1 = control::reload::get(&pool, old_id).await.unwrap().unwrap();
-    let decision = handle_ddl_restart(&pool, &old_after_chunk1, 2, 0)
+    let decision = handle_ddl_restart(&pool, &old_after_chunk1, SchemaVersionNo(2), 0)
         .await
         .unwrap();
     assert!(

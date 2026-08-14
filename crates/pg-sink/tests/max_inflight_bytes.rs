@@ -139,7 +139,9 @@ async fn large_txn_low_ceiling_spills_and_stays_bounded() {
             };
             match &msg {
                 Message::Relation { relation, .. } => {
-                    cache.upsert_from_relation(relation.clone(), 1).unwrap();
+                    cache
+                        .upsert_from_relation(relation.clone(), common::SchemaVersionNo(1))
+                        .unwrap();
                 }
                 Message::StreamStart { xid, first_segment } => {
                     demux.on_stream_start(*xid, *first_segment, frame_lsn);

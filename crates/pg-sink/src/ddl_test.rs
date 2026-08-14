@@ -104,14 +104,14 @@ fn alter_table_is_structural_comment_is_metadata_only() {
 #[test]
 fn structural_ddl_bumps_version_metadata_does_not() {
     let mut c = DdlConsumer::new(common::EpochNo(1));
-    assert_eq!(c.version_of("public", "orders"), 1);
+    assert_eq!(c.version_of("public", "orders"), common::SchemaVersionNo(1));
     // Simulate the version bookkeeping consume() performs (no DB).
     assert!(c.versions.is_empty());
     // structural
     let v = c
         .versions
         .entry(("public".into(), "orders".into()))
-        .or_insert(1);
-    *v += 1;
-    assert_eq!(c.version_of("public", "orders"), 2);
+        .or_insert(common::SchemaVersionNo(1));
+    v.0 += 1;
+    assert_eq!(c.version_of("public", "orders"), common::SchemaVersionNo(2));
 }

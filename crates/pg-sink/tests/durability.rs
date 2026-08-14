@@ -142,10 +142,15 @@ async fn slot_advances_only_after_s3_and_manifest_durable() {
             if let Some(msg) = on_frame(&mut ctx, frame).unwrap() {
                 match &msg {
                     Message::Relation { relation, .. } => {
-                        cache.upsert_from_relation(relation.clone(), 1).unwrap();
+                        cache
+                            .upsert_from_relation(relation.clone(), common::SchemaVersionNo(1))
+                            .unwrap();
                     }
                     other => {
-                        for sealed in router.route(&cache, other, frame_lsn, 1).unwrap() {
+                        for sealed in router
+                            .route(&cache, other, frame_lsn, common::SchemaVersionNo(1))
+                            .unwrap()
+                        {
                             let obj = flush_batch(&sink, &mut *tx, epoch, sealed).await.unwrap(); // (a)+(b)
                             checkpoint.on_batch_durable(obj.lsn_end); // (c)
                             checkpoint.send(&mut stream, false).await.unwrap();
@@ -239,10 +244,15 @@ async fn crash_between_put_and_standby_restreams_without_loss() {
                 if let Some(msg) = on_frame(&mut ctx, frame).unwrap() {
                     match &msg {
                         Message::Relation { relation, .. } => {
-                            cache.upsert_from_relation(relation.clone(), 1).unwrap();
+                            cache
+                                .upsert_from_relation(relation.clone(), common::SchemaVersionNo(1))
+                                .unwrap();
                         }
                         other => {
-                            for sealed in router.route(&cache, other, frame_lsn, 1).unwrap() {
+                            for sealed in router
+                                .route(&cache, other, frame_lsn, common::SchemaVersionNo(1))
+                                .unwrap()
+                            {
                                 let obj =
                                     flush_batch(&sink, &mut *tx, epoch, sealed).await.unwrap();
                                 key = Some(obj.key); // PUT + manifest done...

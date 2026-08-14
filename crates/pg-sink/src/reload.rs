@@ -180,7 +180,7 @@ where
 #[derive(Debug, Clone, Copy)]
 pub enum RestartDecision {
     /// A fresh successor at the new schema; keep exporting under this `reload_id`.
-    Restarted(i64),
+    Restarted(common::ReloadId),
     /// `reload_max_restarts` is spent — the reload is now `failed`; stop.
     Capped,
 }
@@ -196,7 +196,7 @@ pub enum RestartDecision {
 pub async fn handle_ddl_restart(
     pool: &sqlx::PgPool,
     old: &control::ReloadRow,
-    new_version: i64,
+    new_version: common::SchemaVersionNo,
     max_restarts: i32,
 ) -> anyhow::Result<RestartDecision> {
     let table = format!("{}.{}", old.source_schema, old.source_table);
@@ -211,9 +211,9 @@ pub async fn handle_ddl_restart(
         Some(new_id) => {
             common::metrics::record_reload_restart(&table);
             tracing::info!(
-                old_reload_id = old.reload_id,
-                new_reload_id = new_id,
-                new_version,
+                old_reload_id = %old.reload_id,
+                new_reload_id = %new_id,
+                new_version = %new_version,
                 restart_count = old.restart_count + 1,
                 "reload restarted at the new schema (DDL landed between chunks)"
             );
@@ -223,8 +223,8 @@ pub async fn handle_ddl_restart(
             common::metrics::record_reload_restart_cap_exhausted();
             common::metrics::record_reload_failed(&table);
             tracing::error!(
-                reload_id = old.reload_id,
-                new_version,
+                reload_id = %old.reload_id,
+                new_version = %new_version,
                 max_restarts,
                 "reload restart cap exhausted — attempt failed (visible waste, not silent corruption)"
             );
@@ -280,7 +280,7 @@ async fn export_with_ddl_restarts(
                     .await
                     .with_context(|| format!("mark reload {} export complete", req.reload_id))?;
                 tracing::info!(
-                    reload_id = req.reload_id,
+                    reload_id = %req.reload_id,
                     final_lsn = %final_lsn,
                     "reload export_complete (loader flips complete once transformed_lsn >= H)"
                 );
@@ -292,7 +292,7 @@ async fn export_with_ddl_restarts(
                         // Release publishes the lease-carrying successor before the next await. The
                         // renewal currently shares this task; this documents the intended handoff if
                         // it later moves to its own task and pairs with the Acquire loads below.
-                        current_reload_id.store(new_id, Ordering::Release);
+                        current_reload_id.store(new_id.0, Ordering::Release);
                         req = control::reload::get(&pool, new_id).await?.ok_or_else(|| {
                             anyhow::anyhow!("successor reload {new_id} vanished after restart")
                         })?;
@@ -485,7 +485,7 @@ impl ReloadController {
                 Ok(()) => {}
                 Err(PreflightOutcome::Rejected(rejection)) => {
                     tracing::warn!(
-                        reload_id = req.reload_id,
+                        reload_id = %req.reload_id,
                         source_table = %format_args!("{}.{}", req.source_schema, req.source_table),
                         reason = %rejection,
                         "reload request rejected at preflight"
@@ -496,7 +496,7 @@ impl ReloadController {
                     ));
                     if let Err(e) = self.fail_row(req.reload_id, &rejection.to_string()).await {
                         tracing::error!(
-                            reload_id = req.reload_id,
+                            reload_id = %req.reload_id,
                             error = %e,
                             "could not record the rejection; releasing the claim instead"
                         );
@@ -506,7 +506,7 @@ impl ReloadController {
                 }
                 Err(PreflightOutcome::Infra(e)) => {
                     tracing::warn!(
-                        reload_id = req.reload_id,
+                        reload_id = %req.reload_id,
                         error = %e,
                         "preflight infra error (NOT a rejection); releasing the claim to retry"
                     );
@@ -521,12 +521,12 @@ impl ReloadController {
                     // All permits raced away within this tick (can't happen while this controller
                     // is the only claimant; harmless if it ever does): leave the row `exporting`
                     // with its lease — expiry + PR 6.9's adoption recover it.
-                    tracing::warn!(reload_id = req.reload_id, "no free permit after claim");
+                    tracing::warn!(reload_id = %req.reload_id, "no free permit after claim");
                     continue;
                 }
             };
             tracing::info!(
-                reload_id = req.reload_id,
+                reload_id = %req.reload_id,
                 source_table = %format_args!("{}.{}", req.source_schema, req.source_table),
                 flavor = req.flavor.as_str(),
                 "reload claimed → exporting; exporter scheduled"
@@ -567,7 +567,7 @@ impl ReloadController {
             let _permit = permit;
             // The lease-renewal target: the export loop repoints this on every DDL-restart, so
             // renewal follows the lease onto each successor row (PR 6.8).
-            let current_reload_id = Arc::new(AtomicI64::new(req.reload_id));
+            let current_reload_id = Arc::new(AtomicI64::new(req.reload_id.0));
             let renew_pool = pool.clone();
             let renew_id = Arc::clone(&current_reload_id);
             // The chunk engine (PR 6.5) under DDL-restart (PR 6.8): dial the side connection,
@@ -594,7 +594,7 @@ impl ReloadController {
                     let pool = renew_pool.clone();
                     let holder = holder.clone();
                     // Acquire pairs with the DDL-restart Release that repoints lease renewal.
-                    let reload_id = renew_id.load(Ordering::Acquire);
+                    let reload_id = common::ReloadId(renew_id.load(Ordering::Acquire));
                     async move {
                         control::reload::renew_lease(&pool, reload_id, &holder, ttl_secs(ttl))
                             .await
@@ -605,19 +605,19 @@ impl ReloadController {
             )
             .await;
             // Acquire pairs with the DDL-restart Release for the final successor-aware log.
-            let reload_id = current_reload_id.load(Ordering::Acquire);
+            let reload_id = common::ReloadId(current_reload_id.load(Ordering::Acquire));
             match &end {
                 ExporterEnd::Cancelled => tracing::info!(
-                    reload_id,
+                    reload_id = %reload_id,
                     "exporter cancelled (shutdown); row left for startup-scan resume (PR 6.9)"
                 ),
                 ExporterEnd::LostLease => tracing::warn!(
-                    reload_id,
+                    reload_id = %reload_id,
                     "exporter lost its lease; stopping (another holder owns the row now)"
                 ),
                 ExporterEnd::Finished(res) => match res {
-                    Ok(()) => tracing::info!(reload_id, "export finished"),
-                    Err(e) => tracing::error!(reload_id, error = %e, "export failed"),
+                    Ok(()) => tracing::info!(reload_id = %reload_id, "export finished"),
+                    Err(e) => tracing::error!(reload_id = %reload_id, error = %e, "export failed"),
                 },
             }
             common::metrics::dec_reload_active(flavor); // balances the inc above (PR 6.11)
@@ -654,14 +654,14 @@ impl ReloadController {
                 Ok(p) => p,
                 Err(_) => {
                     tracing::warn!(
-                        reload_id = req.reload_id,
+                        reload_id = %req.reload_id,
                         "no free permit to resume an adopted reload; leaving it (lease re-acquired)"
                     );
                     continue;
                 }
             };
             tracing::info!(
-                reload_id = req.reload_id,
+                reload_id = %req.reload_id,
                 source_table = %format_args!("{}.{}", req.source_schema, req.source_table),
                 status = req.status.as_str(),
                 cursor_chunk = req.chunk_no,
@@ -683,7 +683,7 @@ impl ReloadController {
         common::metrics::set_reload_lease_stale(count_u64(stuck.len()));
         for (reload_id, holder) in stuck {
             tracing::warn!(
-                reload_id,
+                reload_id = %reload_id,
                 lease_holder = ?holder,
                 "reload stuck: exporting with an expired, unadopted lease (no live exporter renewing it)"
             );
@@ -692,7 +692,7 @@ impl ReloadController {
     }
 
     /// Record a typed rejection on the row (its reason IS the operator UX).
-    async fn fail_row(&self, reload_id: i64, reason: &str) -> anyhow::Result<()> {
+    async fn fail_row(&self, reload_id: common::ReloadId, reason: &str) -> anyhow::Result<()> {
         let mut conn = self.pool.acquire().await.with_context(|| {
             format!("acquire a control-pg connection to fail reload {reload_id}")
         })?;
@@ -708,15 +708,15 @@ impl ReloadController {
     async fn release_row(&self, req: &control::ReloadRow) {
         match control::reload::release_claim(&self.pool, req.reload_id, &self.cfg.instance).await {
             Ok(true) => tracing::info!(
-                reload_id = req.reload_id,
+                reload_id = %req.reload_id,
                 "claim released → requested (retried next tick)"
             ),
             Ok(false) => tracing::warn!(
-                reload_id = req.reload_id,
+                reload_id = %req.reload_id,
                 "claim no longer ours to release; leaving it"
             ),
             Err(e) => tracing::error!(
-                reload_id = req.reload_id,
+                reload_id = %req.reload_id,
                 error = %e,
                 "release failed; row stays exporting — lease expiry + PR 6.9 adoption recover it"
             ),

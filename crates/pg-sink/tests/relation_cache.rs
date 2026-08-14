@@ -11,7 +11,7 @@
 //! Each test runs inside a rolled-back transaction under a unique epoch, so it is isolated.
 
 use arrow::datatypes::DataType;
-use common::{EpochNo, PgColumn, PgRelation, ReplicaIdentity};
+use common::{EpochNo, PgColumn, PgRelation, ReplicaIdentity, SchemaVersionNo};
 use control::{connect, read_all_latest_registry, read_registry, run_migrations};
 use pg_sink::consume::on_relation;
 use pg_sink::relcache::RelationCache;
@@ -65,15 +65,30 @@ async fn first_relation_writes_a_schema_registry_row() {
     let epoch = EpochNo(2_220_001);
     let mut cache = RelationCache::default();
 
-    on_relation(&mut cache, &mut *tx, epoch, orders_relation(50001), 1)
-        .await
-        .unwrap();
-    assert!(cache.get(50001, 1).is_some(), "cached under (oid, version)");
+    on_relation(
+        &mut cache,
+        &mut *tx,
+        epoch,
+        orders_relation(50001),
+        SchemaVersionNo(1),
+    )
+    .await
+    .unwrap();
+    assert!(
+        cache.get(50001, SchemaVersionNo(1)).is_some(),
+        "cached under (oid, version)"
+    );
 
     // A repeat at the same schema_version is idempotent — no duplicate row.
-    on_relation(&mut cache, &mut *tx, epoch, orders_relation(50001), 1)
-        .await
-        .unwrap();
+    on_relation(
+        &mut cache,
+        &mut *tx,
+        epoch,
+        orders_relation(50001),
+        SchemaVersionNo(1),
+    )
+    .await
+    .unwrap();
     let count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM walrus.schema_registry WHERE epoch = $1 AND source_table = 'orders'",
     )
@@ -83,7 +98,7 @@ async fn first_relation_writes_a_schema_registry_row() {
     .unwrap();
     assert_eq!(count, 1, "repeat at same version must not duplicate");
 
-    let row = read_registry(&mut *tx, epoch, "public", "orders", 1)
+    let row = read_registry(&mut *tx, epoch, "public", "orders", SchemaVersionNo(1))
         .await
         .unwrap()
         .expect("registry row present");
@@ -98,7 +113,7 @@ async fn cached_arrow_schema_matches_expected_orders_shape() {
     // Pure (no DB): the cached Arrow schema exactly matches PR 2.9's unit test.
     let mut cache = RelationCache::default();
     let entry = cache
-        .upsert_from_relation(orders_relation(50002), 1)
+        .upsert_from_relation(orders_relation(50002), SchemaVersionNo(1))
         .unwrap();
     let f = entry.arrow_schema.fields();
     assert_eq!(f.len(), 5); // 4 data + walrus_pg_sink_meta
@@ -118,16 +133,24 @@ async fn hydrate_reconstructs_cache_from_registry() {
 
     // Persist via on_relation, then hydrate a FRESH cache from what was written.
     let mut writer = RelationCache::default();
-    on_relation(&mut writer, &mut *tx, epoch, orders_relation(50003), 2)
-        .await
-        .unwrap();
+    on_relation(
+        &mut writer,
+        &mut *tx,
+        epoch,
+        orders_relation(50003),
+        SchemaVersionNo(2),
+    )
+    .await
+    .unwrap();
 
     let rows = read_all_latest_registry(&mut *tx, epoch).await.unwrap();
     assert_eq!(rows.len(), 1);
 
     let mut fresh = RelationCache::default();
     fresh.hydrate(rows).unwrap();
-    let entry = fresh.get(50003, 2).expect("hydrated entry");
+    let entry = fresh
+        .get(50003, SchemaVersionNo(2))
+        .expect("hydrated entry");
     assert_eq!(entry.relation.name, "orders");
     assert_eq!(entry.descriptors.len(), 4);
     assert_eq!(entry.arrow_schema.fields().len(), 5);
@@ -150,11 +173,14 @@ async fn internal_tables_are_never_registered() {
         replica_identity: ReplicaIdentity::Default,
         columns: vec![col("id", oids::INT4, -1, true)],
     };
-    on_relation(&mut cache, &mut *tx, epoch, heartbeat, 1)
+    on_relation(&mut cache, &mut *tx, epoch, heartbeat, SchemaVersionNo(1))
         .await
         .unwrap();
 
-    assert!(cache.get(60001, 1).is_none(), "internal table not cached");
+    assert!(
+        cache.get(60001, SchemaVersionNo(1)).is_none(),
+        "internal table not cached"
+    );
     let count: i64 =
         sqlx::query_scalar("SELECT count(*) FROM walrus.schema_registry WHERE epoch = $1")
             .bind(epoch)

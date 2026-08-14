@@ -9,7 +9,7 @@
 //! `integration` feature (needs the PR 0.6 control PG).
 #![cfg(feature = "integration")]
 
-use common::{EpochNo, Lsn, Tier, TypeDescriptor, TypeMeta};
+use common::{EpochNo, Lsn, SchemaVersionNo, Tier, TypeDescriptor, TypeMeta};
 use control::{
     connect, insert_ddl, read_latest_version, read_pending_ddl, read_registry, run_migrations,
     upsert_registry, DdlRow, RegistryRow,
@@ -61,7 +61,7 @@ fn descriptors() -> Vec<TypeDescriptor> {
     ]
 }
 
-fn registry_row(epoch: EpochNo, version: i64) -> RegistryRow {
+fn registry_row(epoch: EpochNo, version: SchemaVersionNo) -> RegistryRow {
     RegistryRow {
         epoch,
         source_schema: "public".to_string(),
@@ -75,7 +75,7 @@ fn registry_row(epoch: EpochNo, version: i64) -> RegistryRow {
     }
 }
 
-fn ddl(epoch: EpochNo, c_lsn: &str, version: i64) -> DdlRow {
+fn ddl(epoch: EpochNo, c_lsn: &str, version: SchemaVersionNo) -> DdlRow {
     DdlRow {
         id: 0, // ignored on insert
         epoch,
@@ -94,23 +94,25 @@ async fn registry_round_trips_a_type_descriptor_set() {
     let mut tx = pool.begin().await.unwrap();
     let epoch = EpochNo(800_001);
 
-    let row = registry_row(epoch, 3);
+    let row = registry_row(epoch, SchemaVersionNo(3));
     upsert_registry(&mut *tx, &row).await.unwrap();
 
-    let read = read_registry(&mut *tx, epoch, "public", "orders", 3)
+    let read = read_registry(&mut *tx, epoch, "public", "orders", SchemaVersionNo(3))
         .await
         .unwrap()
         .unwrap();
     // Descriptors round-trip byte-for-byte equal through jsonb.
     assert_eq!(read.descriptors, row.descriptors);
     assert_eq!(read.columns, row.columns);
-    assert_eq!(read.schema_version, 3);
+    assert_eq!(read.schema_version, SchemaVersionNo(3));
 
     // An unknown version reads as None.
-    assert!(read_registry(&mut *tx, epoch, "public", "orders", 99)
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        read_registry(&mut *tx, epoch, "public", "orders", SchemaVersionNo(99))
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     tx.rollback().await.unwrap();
 }
@@ -121,7 +123,7 @@ async fn upsert_registry_is_idempotent_per_version() {
     let mut tx = pool.begin().await.unwrap();
     let epoch = EpochNo(800_002);
 
-    let row = registry_row(epoch, 1);
+    let row = registry_row(epoch, SchemaVersionNo(1));
     upsert_registry(&mut *tx, &row).await.unwrap();
     upsert_registry(&mut *tx, &row).await.unwrap(); // same version again
 
@@ -139,13 +141,13 @@ async fn upsert_registry_is_idempotent_per_version() {
     );
 
     // read_latest_version reports the max across versions.
-    upsert_registry(&mut *tx, &registry_row(epoch, 5))
+    upsert_registry(&mut *tx, &registry_row(epoch, SchemaVersionNo(5)))
         .await
         .unwrap();
     let latest = read_latest_version(&mut *tx, epoch, "public", "orders")
         .await
         .unwrap();
-    assert_eq!(latest, Some(5));
+    assert_eq!(latest, Some(SchemaVersionNo(5)));
     // and None for an unknown table.
     assert_eq!(
         read_latest_version(&mut *tx, epoch, "public", "no_such")
@@ -163,9 +165,14 @@ async fn ddl_row_round_trips_with_commit_lsn() {
     let mut tx = pool.begin().await.unwrap();
     let epoch = EpochNo(800_003);
 
-    let id = insert_ddl(&mut *tx, &ddl(epoch, "0/500", 5), None, None)
-        .await
-        .unwrap();
+    let id = insert_ddl(
+        &mut *tx,
+        &ddl(epoch, "0/500", SchemaVersionNo(5)),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     assert!(id > 0);
 
     let pending = read_pending_ddl(
@@ -181,7 +188,7 @@ async fn ddl_row_round_trips_with_commit_lsn() {
     assert_eq!(pending[0].c_lsn, "0/500".parse::<Lsn>().unwrap());
     assert_eq!(pending[0].c_tag, "ALTER TABLE");
     assert_eq!(pending[0].c_event, "ddl_command_end");
-    assert_eq!(pending[0].schema_version, 5);
+    assert_eq!(pending[0].schema_version, SchemaVersionNo(5));
 
     tx.rollback().await.unwrap();
 }
@@ -193,15 +200,30 @@ async fn read_pending_ddl_orders_by_c_lsn() {
     let epoch = EpochNo(800_004);
 
     // Insert out of LSN order.
-    insert_ddl(&mut *tx, &ddl(epoch, "0/300", 3), None, None)
-        .await
-        .unwrap();
-    insert_ddl(&mut *tx, &ddl(epoch, "0/100", 1), None, None)
-        .await
-        .unwrap();
-    insert_ddl(&mut *tx, &ddl(epoch, "0/200", 2), None, None)
-        .await
-        .unwrap();
+    insert_ddl(
+        &mut *tx,
+        &ddl(epoch, "0/300", SchemaVersionNo(3)),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    insert_ddl(
+        &mut *tx,
+        &ddl(epoch, "0/100", SchemaVersionNo(1)),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    insert_ddl(
+        &mut *tx,
+        &ddl(epoch, "0/200", SchemaVersionNo(2)),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
 
     let all = read_pending_ddl(&mut *tx, epoch, "public", "orders", "0/0".parse().unwrap())
         .await

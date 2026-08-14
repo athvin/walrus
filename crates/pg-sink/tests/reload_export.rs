@@ -16,7 +16,7 @@
 //!   cargo test -p pg-sink --test reload_export -- --ignored --test-threads=1
 
 use bytes::Bytes;
-use common::{EpochNo, Lsn};
+use common::{EpochNo, Lsn, ReloadId, SchemaVersionNo};
 use object_store::path::Path;
 use object_store::ObjectStore;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -100,7 +100,7 @@ async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: EpochN
             epoch,
             source_schema: "public".to_string(),
             source_table: TABLE.to_string(),
-            schema_version: 1,
+            schema_version: SchemaVersionNo(1),
             descriptors: pg_to_arrow::descriptor::describe_relation(&rel),
             columns: serde_json::to_value(&rel).unwrap(),
         },
@@ -217,7 +217,7 @@ async fn await_resolver_ready(
                              // implicit txn — the engine's own re-signal shape; only an INSERT echoes).
     let mut ready = false;
     for _ in 0..20 {
-        let rx = waiters.subscribe(sentinel, 1);
+        let rx = waiters.subscribe(ReloadId(sentinel), 1);
         admin
             .batch_execute(&format!(
                 "DELETE FROM walrus.reload_signal WHERE reload_id = {sentinel}; \
@@ -273,8 +273,8 @@ async fn request_and_claim(pool: &sqlx::PgPool, epoch: EpochNo) -> control::Relo
 async fn reload_manifest_rows(
     pool: &sqlx::PgPool,
     epoch: EpochNo,
-) -> Vec<(String, i64, String, i64)> {
-    sqlx::query_as::<_, (String, i64, String, i64)>(
+) -> Vec<(String, i64, String, ReloadId)> {
+    let rows = sqlx::query_as::<_, (String, i64, String, i64)>(
         "SELECT s3_uri, row_count, lsn_end::text, reload_id
          FROM walrus.file_manifest
          WHERE epoch = $1 AND source_table = $2 AND kind = 'reload'
@@ -284,7 +284,10 @@ async fn reload_manifest_rows(
     .bind(TABLE)
     .fetch_all(pool)
     .await
-    .unwrap()
+    .unwrap();
+    rows.into_iter()
+        .map(|(uri, count, lsn, reload_id)| (uri, count, lsn, ReloadId(reload_id)))
+        .collect()
 }
 
 /// Read a reload chunk file back: (ids, every-row (commit_lsn, lsn) from the meta JSON).

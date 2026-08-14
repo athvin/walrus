@@ -18,7 +18,7 @@
 //!
 //!   cargo test -p pg-sink --test reload_pickup -- --ignored
 
-use common::EpochNo;
+use common::{EpochNo, ReloadId, SchemaVersionNo};
 use control::reload::{self, ReloadFlavor, ReloadStatus};
 use pg_sink::consume::on_frame;
 use pg_sink::pgoutput::{Message, StreamCtx};
@@ -117,7 +117,7 @@ async fn seed_registry(
             epoch,
             source_schema: "public".to_string(),
             source_table: table.to_string(),
-            schema_version: 1,
+            schema_version: SchemaVersionNo(1),
             descriptors: pg_to_arrow::descriptor::describe_relation(&rel),
             columns: serde_json::to_value(&rel).unwrap(),
         };
@@ -125,13 +125,13 @@ async fn seed_registry(
     }
 }
 
-async fn status_of(pool: &sqlx::PgPool, reload_id: i64) -> (ReloadStatus, Option<String>) {
+async fn status_of(pool: &sqlx::PgPool, reload_id: ReloadId) -> (ReloadStatus, Option<String>) {
     let row = reload::get(pool, reload_id).await.unwrap().unwrap();
     (row.status, row.error)
 }
 
 /// Poll until the row reaches `want` (the controller's cadence is 200ms; give it a few).
-async fn await_status(pool: &sqlx::PgPool, reload_id: i64, want: ReloadStatus) {
+async fn await_status(pool: &sqlx::PgPool, reload_id: ReloadId, want: ReloadStatus) {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if status_of(pool, reload_id).await.0 == want {
@@ -185,12 +185,12 @@ async fn just_reload_recipe_sql_selects_current_epoch_and_parses_table() {
     tx.rollback().await.unwrap();
 }
 
-async fn lease_expiry_epoch(pool: &sqlx::PgPool, reload_id: i64) -> f64 {
+async fn lease_expiry_epoch(pool: &sqlx::PgPool, reload_id: ReloadId) -> f64 {
     sqlx::query_scalar::<_, f64>(
         "SELECT extract(epoch FROM lease_expiry)::float8
          FROM walrus.table_reload WHERE reload_id = $1",
     )
-    .bind(reload_id)
+    .bind(reload_id.0)
     .fetch_one(pool)
     .await
     .unwrap()
@@ -418,7 +418,7 @@ async fn cap_of_two_holds_and_the_stream_keeps_flowing() {
     // frees through the real controller, not a test copy. (Row `a` stays `exporting` under the
     // thief — from here on 3 rows carry that status, but only 2 are ever OUR exporters.)
     sqlx::query("UPDATE walrus.table_reload SET lease_holder = 'lease-thief' WHERE reload_id = $1")
-        .bind(a)
+        .bind(a.0)
         .execute(&pool)
         .await
         .unwrap();

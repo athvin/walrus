@@ -104,7 +104,7 @@ async fn seed(pool: &sqlx::PgPool, epoch: EpochNo) {
             epoch,
             source_schema: rel.schema.clone(),
             source_table: rel.name.clone(),
-            schema_version: 1,
+            schema_version: common::SchemaVersionNo(1),
             descriptors: Vec::new(),
             columns: serde_json::to_value(&rel).unwrap(),
         },

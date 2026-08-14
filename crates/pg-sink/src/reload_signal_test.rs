@@ -1,8 +1,12 @@
 use super::*;
-use common::{PgColumn, PgRelation, ReplicaIdentity, TupleValue};
+use common::{PgColumn, PgRelation, ReloadId, ReplicaIdentity, TupleValue};
 
 fn lsn(s: &str) -> Lsn {
     s.parse().unwrap()
+}
+
+fn reload(id: i64) -> ReloadId {
+    ReloadId(id)
 }
 
 fn signal_rel() -> PgRelation {
@@ -38,7 +42,7 @@ fn tuple(reload_id: &str, chunk_no: &str, wal_lsn: &str) -> Vec<TupleValue> {
 #[test]
 fn subscribe_then_resolve_delivers_commit_lsn() {
     let waiters = WatermarkWaiters::default();
-    let mut rx = waiters.subscribe(42, 1);
+    let mut rx = waiters.subscribe(reload(42), 1);
 
     // Buffered at Insert, resolved at Commit — the receiver gets the COMMIT LSN, not the
     // insert's message/frame LSN.
@@ -58,12 +62,12 @@ fn subscribe_then_resolve_delivers_commit_lsn() {
 #[test]
 fn crosscheck_violation_counts_and_still_resolves() {
     let waiters = WatermarkWaiters::default();
-    let mut rx = waiters.subscribe(7, 3);
+    let mut rx = waiters.subscribe(reload(7), 3);
 
     // embedded >= commit is impossible under the model — loud (counter + error log), never
     // fatal, and the waiter STILL resolves with the commit LSN.
     waiters.resolve(
-        7,
+        reload(7),
         3,
         Echo {
             commit_lsn: lsn("0/100"),
@@ -79,7 +83,7 @@ fn crosscheck_violation_counts_and_still_resolves() {
 fn resolve_without_subscriber_is_a_quiet_noop() {
     let waiters = WatermarkWaiters::default();
     waiters.resolve(
-        1,
+        reload(1),
         1,
         Echo {
             commit_lsn: lsn("0/200"),
@@ -92,10 +96,10 @@ fn resolve_without_subscriber_is_a_quiet_noop() {
 #[test]
 fn dropped_receiver_then_resolve_is_fine_and_entry_is_evicted() {
     let waiters = WatermarkWaiters::default();
-    let rx = waiters.subscribe(5, 1);
+    let rx = waiters.subscribe(reload(5), 1);
     drop(rx); // the exporter timed out (PR 6.5) and walked away
     waiters.resolve(
-        5,
+        reload(5),
         1,
         Echo {
             commit_lsn: lsn("0/200"),
@@ -103,7 +107,7 @@ fn dropped_receiver_then_resolve_is_fine_and_entry_is_evicted() {
         },
     );
     // The key is gone: a later subscribe starts fresh.
-    let mut rx2 = waiters.subscribe(5, 1);
+    let mut rx2 = waiters.subscribe(reload(5), 1);
     assert!(rx2.try_recv().is_err(), "fresh channel, nothing delivered");
 }
 
@@ -113,7 +117,7 @@ fn dropped_receiver_then_resolve_is_fine_and_entry_is_evicted() {
 fn subscribe_then_failed_insert_leaves_no_waiter() {
     let waiters = WatermarkWaiters::default();
     {
-        let _guard = waiters.subscribe(42, 7);
+        let _guard = waiters.subscribe(reload(42), 7);
         assert_eq!(waiters.waiter_count(), 1);
     }
     assert_eq!(
@@ -126,14 +130,14 @@ fn subscribe_then_failed_insert_leaves_no_waiter() {
 #[test]
 fn stale_guard_drop_does_not_evict_the_live_waiter() {
     let waiters = WatermarkWaiters::default();
-    let stale = waiters.subscribe(42, 7);
-    let mut live = waiters.subscribe(42, 7);
+    let stale = waiters.subscribe(reload(42), 7);
+    let mut live = waiters.subscribe(reload(42), 7);
 
     drop(stale);
     assert_eq!(waiters.waiter_count(), 1, "the live subscription survives");
 
     waiters.resolve(
-        42,
+        reload(42),
         7,
         Echo {
             commit_lsn: lsn("0/200"),
@@ -149,11 +153,11 @@ fn stale_guard_drop_does_not_evict_the_live_waiter() {
 #[test]
 fn resolve_then_drop_is_a_no_op() {
     let waiters = WatermarkWaiters::default();
-    let guard = waiters.subscribe(42, 7);
+    let guard = waiters.subscribe(reload(42), 7);
     assert_eq!(waiters.waiter_count(), 1);
 
     waiters.resolve(
-        42,
+        reload(42),
         7,
         Echo {
             commit_lsn: lsn("0/200"),
@@ -169,9 +173,9 @@ fn resolve_then_drop_is_a_no_op() {
 #[test]
 fn resolve_evicts_so_the_same_chunk_can_resubscribe() {
     let waiters = WatermarkWaiters::default();
-    let mut first = waiters.subscribe(7, 0);
+    let mut first = waiters.subscribe(reload(7), 0);
     waiters.resolve(
-        7,
+        reload(7),
         0,
         Echo {
             commit_lsn: lsn("0/20"),
@@ -181,9 +185,9 @@ fn resolve_evicts_so_the_same_chunk_can_resubscribe() {
     assert_eq!(first.try_recv().expect("resolved").commit_lsn, lsn("0/20"));
 
     // Same key again: the previous entry was removed, so this is a fresh, resolvable wait.
-    let mut second = waiters.subscribe(7, 0);
+    let mut second = waiters.subscribe(reload(7), 0);
     waiters.resolve(
-        7,
+        reload(7),
         0,
         Echo {
             commit_lsn: lsn("0/40"),
@@ -214,8 +218,8 @@ fn subtransaction_aborted_signal_never_resolves_the_waiter() {
     // Abort naming its sub-xid says to drop them. A signal insert tagged with that sub-xid
     // must never resolve — the commit never carried it.
     let waiters = WatermarkWaiters::default();
-    let mut rx_aborted = waiters.subscribe(9, 1);
-    let mut rx_survivor = waiters.subscribe(9, 2);
+    let mut rx_aborted = waiters.subscribe(reload(9), 1);
+    let mut rx_survivor = waiters.subscribe(reload(9), 2);
 
     let mut pending = PendingSignals::default();
     let rel = signal_rel();
@@ -239,7 +243,7 @@ fn subtransaction_aborted_signal_never_resolves_the_waiter() {
 #[test]
 fn whole_txn_stream_abort_drops_every_buffered_signal() {
     let waiters = WatermarkWaiters::default();
-    let mut rx = waiters.subscribe(9, 1);
+    let mut rx = waiters.subscribe(reload(9), 1);
     let mut pending = PendingSignals::default();
     pending.push(
         PendingSignal::from_tuple(&signal_rel(), &tuple("9", "1", "0/100"), Some(866)).unwrap(),

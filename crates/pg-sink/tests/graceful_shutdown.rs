@@ -167,10 +167,14 @@ async fn sigterm_mid_stream_drains_commits_and_resumes() {
                         if relation.name == "orders" {
                             orders_oid = Some(relation.oid);
                         }
-                        cache.upsert_from_relation(relation.clone(), 1).unwrap();
+                        cache
+                            .upsert_from_relation(relation.clone(), common::SchemaVersionNo(1))
+                            .unwrap();
                     }
                     other => {
-                        router.route(&cache, other, frame_lsn, 1).unwrap();
+                        router
+                            .route(&cache, other, frame_lsn, common::SchemaVersionNo(1))
+                            .unwrap();
                         // Stop once the insert has committed but is still un-durable.
                         if matches!(other, Message::Commit { .. })
                             && router.undurable_floor().is_some()

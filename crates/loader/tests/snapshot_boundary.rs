@@ -115,7 +115,7 @@ async fn insert_file(pool: &sqlx::PgPool, epoch: EpochNo, uri: String, kind: &st
             row_count: 1,
             lsn_start: lsn_end.parse().unwrap(),
             lsn_end: lsn_end.parse().unwrap(),
-            schema_version: 1,
+            schema_version: common::SchemaVersionNo(1),
             reload_id: None,
         },
     )
@@ -149,7 +149,8 @@ async fn setup(epoch: EpochNo, max_files: i64) -> (TableCtx, std::path::PathBuf)
 
     let dir = tmpdir(&epoch.to_string());
     let db = TableDb::open(dir.join("orders.duckdb")).unwrap();
-    db.ensure_tables(&orders(), 1).unwrap();
+    db.ensure_tables(&orders(), common::SchemaVersionNo(1))
+        .unwrap();
     db.configure_s3(&s3()).unwrap();
     let ctx = TableCtx {
         pool,

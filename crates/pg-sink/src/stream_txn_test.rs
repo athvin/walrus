@@ -31,7 +31,8 @@ fn cache() -> RelationCache {
         ],
     };
     let mut c = RelationCache::default();
-    c.upsert_from_relation(rel, 1).unwrap();
+    c.upsert_from_relation(rel, common::SchemaVersionNo(1))
+        .unwrap();
     c
 }
 

@@ -94,9 +94,18 @@ async fn seed_file(
     uri: &str,
     kind: &str,
     lsn_end: &str,
-    reload_id: Option<i64>,
+    reload_id: Option<common::ReloadId>,
 ) -> i64 {
-    seed_file_v(pool, epoch, uri, kind, lsn_end, reload_id, 1).await
+    seed_file_v(
+        pool,
+        epoch,
+        uri,
+        kind,
+        lsn_end,
+        reload_id,
+        common::SchemaVersionNo(1),
+    )
+    .await
 }
 
 /// Like [`seed_file`] but at an explicit `schema_version` — a file at a version NEWER than the
@@ -107,8 +116,8 @@ async fn seed_file_v(
     uri: &str,
     kind: &str,
     lsn_end: &str,
-    reload_id: Option<i64>,
-    schema_version: i64,
+    reload_id: Option<common::ReloadId>,
+    schema_version: common::SchemaVersionNo,
 ) -> i64 {
     control::insert_ready(
         pool,
@@ -161,7 +170,8 @@ async fn setup(epoch: EpochNo) -> (TableCtx, std::path::PathBuf) {
         .unwrap();
     let dir = tmpdir(&epoch.to_string());
     let db = TableDb::open(dir.join("orders.duckdb")).unwrap();
-    db.ensure_tables(&orders(), 1).unwrap();
+    db.ensure_tables(&orders(), common::SchemaVersionNo(1))
+        .unwrap();
     db.configure_s3(&s3()).unwrap();
     let ctx = TableCtx {
         pool,
@@ -192,7 +202,7 @@ async fn drained_reload(
     l1: &str,
     h: &str,
     flavor: ReloadFlavor,
-) -> i64 {
+) -> common::ReloadId {
     let id = reload::request(pool, epoch, "public", "orders", flavor)
         .await
         .unwrap();
@@ -205,7 +215,7 @@ async fn drained_reload(
         1,
         &serde_json::json!(["999"]),
         l1.parse::<Lsn>().unwrap(),
-        1,
+        common::SchemaVersionNo(1),
     )
     .await
     .unwrap();
@@ -404,7 +414,15 @@ async fn delete_superseded_prunes_by_kind_and_lsn() {
     );
     let old_stream = seed_file(&ctx.pool, epoch, &f, "stream", "0/60", None).await;
     let boundary_stream = seed_file(&ctx.pool, epoch, &f, "stream", "0/100", None).await;
-    let chunk_at_boundary = seed_file(&ctx.pool, epoch, &f, "reload", "0/100", Some(42)).await;
+    let chunk_at_boundary = seed_file(
+        &ctx.pool,
+        epoch,
+        &f,
+        "reload",
+        "0/100",
+        Some(common::ReloadId(42)),
+    )
+    .await;
     let newer_stream = seed_file(&ctx.pool, epoch, &f, "stream", "0/200", None).await;
 
     let purged = control::delete_superseded(
@@ -447,13 +465,23 @@ async fn stale_reload_file_is_skipped_and_retired() {
     let (ctx, dir) = setup(epoch).await;
 
     // The .duckdb already rebuilt for a NEWER attempt (PR 6.8's restart hygiene, simulated).
-    ctx.db.set_recorded_reload_id(999_999).unwrap();
+    ctx.db
+        .set_recorded_reload_id(common::ReloadId(999_999))
+        .unwrap();
     let stale = write_rows(
         epoch,
         "stale",
         &[(1, "stale", "i", "0000000000000100", "0000000000000100")],
     );
-    let stale_id = seed_file(&ctx.pool, epoch, &stale, "reload", "0/100", Some(5)).await;
+    let stale_id = seed_file(
+        &ctx.pool,
+        epoch,
+        &stale,
+        "reload",
+        "0/100",
+        Some(common::ReloadId(5)),
+    )
+    .await;
 
     run_phase_a(&ctx).await.unwrap();
 
@@ -471,7 +499,7 @@ async fn stale_reload_file_is_skipped_and_retired() {
     assert_eq!(raw, 0, "retired UNAPPLIED — DuckDB untouched");
     assert_eq!(
         ctx.db.recorded_reload_id().unwrap(),
-        999_999,
+        common::ReloadId(999_999),
         "the latch never regresses (latest wins)"
     );
 
@@ -591,7 +619,7 @@ async fn resync_flavor_never_rebuilds_and_merges_over_the_live_mirror() {
     // quarantine exit (only a rebuild clears it).
     assert_eq!(
         ctx.db.recorded_reload_id().unwrap(),
-        0,
+        common::ReloadId(0),
         "resync never sets the reload_id latch"
     );
     assert!(
@@ -628,7 +656,16 @@ async fn superseded_version_crossing_file_is_skipped_not_reconciled() {
         "blocker",
         &[(8, "blocker", "i", "0000000000000060", "0000000000000060")],
     );
-    let blocker_id = seed_file_v(&ctx.pool, epoch, &blocker, "stream", "0/60", None, 2).await;
+    let blocker_id = seed_file_v(
+        &ctx.pool,
+        epoch,
+        &blocker,
+        "stream",
+        "0/60",
+        None,
+        common::SchemaVersionNo(2),
+    )
+    .await;
 
     // A drained rebuild reload at first_lsn = 0/100 (>= the blocker's 0/60 ⇒ supersedes it).
     let reload_id = drained_reload(&ctx.pool, epoch, "0/100", "0/100", ReloadFlavor::Reload).await;

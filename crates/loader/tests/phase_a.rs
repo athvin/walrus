@@ -92,7 +92,7 @@ async fn seed_manifest(pool: &sqlx::PgPool, epoch: EpochNo, uri: &str) {
             row_count: 2,
             lsn_start: "0/64".parse().unwrap(),
             lsn_end: "0/64".parse().unwrap(),
-            schema_version: 1,
+            schema_version: common::SchemaVersionNo(1),
             reload_id: None,
         },
     )
@@ -126,7 +126,8 @@ async fn setup(epoch: EpochNo) -> (TableCtx, std::path::PathBuf) {
         .unwrap();
     let dir = tmpdir(&epoch.to_string());
     let db = TableDb::open(dir.join("orders.duckdb")).unwrap();
-    db.ensure_tables(&orders(), 1).unwrap();
+    db.ensure_tables(&orders(), common::SchemaVersionNo(1))
+        .unwrap();
     db.configure_s3(&s3()).unwrap();
     let ctx = TableCtx {
         pool,

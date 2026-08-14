@@ -70,7 +70,7 @@ pub async fn bootstrap(
         let rel: PgRelation =
             serde_json::from_value(row.columns).map_err(|source| LoaderError::RegistryDecode {
                 table,
-                version,
+                version: version.0,
                 source,
             })?;
 
@@ -120,7 +120,7 @@ pub async fn bootstrap(
                             serde_json::from_value(r.columns).map_err(|source| {
                                 LoaderError::RegistryDecode {
                                     table: decode_table,
-                                    version: decode_version,
+                                    version: decode_version.0,
                                     source,
                                 }
                             })?;
@@ -132,8 +132,8 @@ pub async fn bootstrap(
             db.set_built_epoch(epoch)?;
             tracing::warn!(
                 table = %format_args!("{}.{}", rel.schema, rel.name),
-                current_version = cur,
-                registry_version = version,
+                current_version = %cur,
+                registry_version = %version,
                 "bootstrap: a rebuild reload is pending — skipping the forward reconcile (Phase A rebuilds this table)"
             );
         } else {

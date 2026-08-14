@@ -16,7 +16,7 @@
 //! (globals fire nothing; `TRUNCATE` is a native pgoutput message) — the Relation-message drift backstop
 //! (TODO: full handling is the loader's, PR 3.8/3.9) covers the rest.
 
-use common::{EpochNo, Lsn, PgRelation, TupleValue};
+use common::{EpochNo, Lsn, PgRelation, SchemaVersionNo, TupleValue};
 use std::collections::HashMap;
 
 /// A decoded `walrus.ddl_audit` INSERT — the sink's only signal that the schema changed.
@@ -81,7 +81,7 @@ impl DdlEvent {
 #[derive(Debug)]
 pub struct DdlConsumer {
     epoch: EpochNo,
-    versions: HashMap<(String, String), i64>,
+    versions: HashMap<(String, String), SchemaVersionNo>,
 }
 
 impl DdlConsumer {
@@ -95,11 +95,11 @@ impl DdlConsumer {
 
     /// The current structural version for a table (1 until its first structural DDL).
     #[must_use]
-    pub fn version_of(&self, schema: &str, table: &str) -> i64 {
-        *self
-            .versions
+    pub fn version_of(&self, schema: &str, table: &str) -> SchemaVersionNo {
+        self.versions
             .get(&(schema.to_string(), table.to_string()))
-            .unwrap_or(&1)
+            .copied()
+            .unwrap_or(SchemaVersionNo(1))
     }
 
     /// **(1)** write a `ddl_manifest` row stamped with `c_lsn`; **(2)** for a *structural* event, bump the
@@ -113,15 +113,18 @@ impl DdlConsumer {
         &mut self,
         ex: impl sqlx::PgExecutor<'_>,
         ev: &DdlEvent,
-    ) -> Result<Option<i64>, DdlError> {
+    ) -> Result<Option<SchemaVersionNo>, DdlError> {
         let key = (ev.source_schema.clone(), ev.source_table.clone());
         let structural = ev.is_structural();
         let version = if structural {
-            let v = self.versions.entry(key).or_insert(1);
-            *v += 1;
+            let v = self.versions.entry(key).or_insert(SchemaVersionNo(1));
+            v.0 += 1;
             *v
         } else {
-            *self.versions.get(&key).unwrap_or(&1)
+            self.versions
+                .get(&key)
+                .copied()
+                .unwrap_or(SchemaVersionNo(1))
         };
         let row = control::DdlRow {
             id: 0,

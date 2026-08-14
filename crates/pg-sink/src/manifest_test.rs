@@ -12,7 +12,7 @@ fn maps_written_object_to_a_stream_ready_row() {
         lsn_start: "0/100".parse().unwrap(),
         lsn_end: "0/A100".parse().unwrap(),
         row_count: 42,
-        schema_version: 3,
+        schema_version: common::SchemaVersionNo(3),
         kind: FileKind::Stream,
     };
     let row = to_ready_row(common::EpochNo(9), &obj, None);
@@ -26,5 +26,5 @@ fn maps_written_object_to_a_stream_ready_row() {
     assert_eq!(row.kind, FileKind::Stream);
     assert_eq!(row.row_count, 42);
     assert_eq!(row.lsn_end, "0/A100".parse().unwrap());
-    assert_eq!(row.schema_version, 3);
+    assert_eq!(row.schema_version, common::SchemaVersionNo(3));
 }

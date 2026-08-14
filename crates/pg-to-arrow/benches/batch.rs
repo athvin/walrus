@@ -32,7 +32,7 @@ fn meta() -> SinkMeta {
         xid: 1,
         epoch: common::EpochNo(7),
         batch_id: "3f2a0000-0000-0000-0000-000000000001".to_string(),
-        schema_version: 1,
+        schema_version: common::SchemaVersionNo(1),
         source_schema: "public".to_string(),
         source_table: "orders".to_string(),
         kind: Kind::Stream,

@@ -99,10 +99,15 @@ async fn a_stream_of_inserts_forms_and_seals_a_batch() {
             if let Some(msg) = on_frame(&mut ctx, frame).expect("decode") {
                 match &msg {
                     Message::Relation { relation, .. } => {
-                        cache.upsert_from_relation(relation.clone(), 1).unwrap();
+                        cache
+                            .upsert_from_relation(relation.clone(), common::SchemaVersionNo(1))
+                            .unwrap();
                     }
                     other => {
-                        for sealed in router.route(&cache, other, frame_lsn, 1).unwrap() {
+                        for sealed in router
+                            .route(&cache, other, frame_lsn, common::SchemaVersionNo(1))
+                            .unwrap()
+                        {
                             assert_eq!(sealed.table, "orders");
                             assert!(sealed.row_count >= 1);
                             assert_eq!(

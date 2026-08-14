@@ -12,7 +12,7 @@
 use crate::duck::TableDb;
 use crate::error::LoaderError;
 use crate::health::LoaderState;
-use common::{EpochNo, Lsn, PgRelation};
+use common::{EpochNo, Lsn, PgRelation, ReloadId, SchemaVersionNo};
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::num::NonZeroI64;
@@ -47,21 +47,24 @@ pub struct TableCtx {
     /// The reload_id whose claim pause was already logged (PR 6.6) — a paused table says *why* it
     /// is idle once per pause, not once per poll. Per-table by construction (one `TableCtx` per
     /// worker, with `!Sync` interior state), so this needs interior mutability behind
-    /// `run_phase_a(&ctx)`, not synchronisation. `Option<i64>` is `Copy`, so `Cell` has no borrow
+    /// `run_phase_a(&ctx)`, not synchronisation. `Option<ReloadId>` is `Copy`, so `Cell` has no borrow
     /// flag or runtime panic path.
-    pub pause_logged: Cell<Option<i64>>,
+    pub pause_logged: Cell<Option<ReloadId>>,
     /// reload_ids already identified as `resync` (PR 6.10). A resync never sets the meta latch, so
     /// every one of its chunk files would otherwise re-enter `route_reload_file`'s "greater" arm and
     /// re-fetch the reload row; caching the flavor here makes chunks 2…n a plain append with no
     /// per-file lookup. `HashSet` is not `Copy`, so this uses `RefCell`; it remains confined to the
     /// same single worker and every borrow ends before an await.
-    pub resync_ids: RefCell<HashSet<i64>>,
+    pub resync_ids: RefCell<HashSet<ReloadId>>,
 }
 
 /// The once-per-pause transition: `Some(reload_id)` exactly when a NEW pause begins (a different
 /// reload than last logged, or the first). A lifted pause (no live rebuild) clears the latch so
 /// the next reload logs again.
-pub(crate) fn pause_began(logged: &Cell<Option<i64>>, live: Option<i64>) -> Option<i64> {
+pub(crate) fn pause_began(
+    logged: &Cell<Option<ReloadId>>,
+    live: Option<ReloadId>,
+) -> Option<ReloadId> {
     match (logged.get(), live) {
         (prev, Some(id)) if prev != Some(id) => {
             logged.set(Some(id));
@@ -134,7 +137,7 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
             if let Some(reload_id) = pause_began(&ctx.pause_logged, live) {
                 tracing::info!(
                     table = %format_args!("{}.{}", ctx.schema, ctx.table),
-                    reload_id,
+                    reload_id = %reload_id,
                     reason = "rebuild-in-flight",
                     "claims paused: ready rows accumulate (frontier frozen at W) until export_complete"
                 );
@@ -172,7 +175,7 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
             tracing::debug!(
                 table = %format_args!("{}.{}", ctx.schema, ctx.table),
                 manifest_id = f.id.0,
-                stale_reload_id = f.reload_id,
+                stale_reload_id = ?f.reload_id,
                 "stale reload file retired unapplied (latest-id wins)"
             );
             ids.push(f.id);
@@ -191,7 +194,7 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
                 table = %format_args!("{}.{}", ctx.schema, ctx.table),
                 manifest_id = f.id.0,
                 lsn_end = %f.lsn_end,
-                schema_version = f.schema_version,
+                schema_version = %f.schema_version,
                 "skipping a version-crossing file superseded by a pending reload rebuild (quarantine-recovery in flight)"
             );
             continue;
@@ -335,8 +338,8 @@ async fn route_reload_file(ctx: &TableCtx, f: &control::ManifestRow) -> Result<b
     ctx.db.set_recorded_reload_id(file_reload_id)?;
     tracing::info!(
         table = %format_args!("{}.{}", ctx.schema, ctx.table),
-        reload_id = file_reload_id,
-        schema_version = f.schema_version,
+        reload_id = %file_reload_id,
+        schema_version = %f.schema_version,
         first_lsn = %first_lsn,
         purged,
         "reload rebuild: tables replaced at the attempt's version; superseded rows purged; latch set"
@@ -349,7 +352,7 @@ async fn route_reload_file(ctx: &TableCtx, f: &control::ManifestRow) -> Result<b
 /// single-version setups — `phase_b::current_transform`'s exact precedent.
 async fn plan_at_version(
     ctx: &TableCtx,
-    version: i64,
+    version: SchemaVersionNo,
 ) -> Result<crate::plan::TablePlan, LoaderError> {
     match control::read_registry(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table, version).await? {
         Some(r) => {
@@ -357,7 +360,7 @@ async fn plan_at_version(
             let rel: PgRelation = serde_json::from_value(r.columns).map_err(|source| {
                 LoaderError::RegistryDecode {
                     table,
-                    version,
+                    version: version.0,
                     source,
                 }
             })?;

@@ -112,7 +112,7 @@ impl<'a> DecodeLoop<'a> {
         } = self;
         // `BatchRouter::route` retains its integration-test seam, but the cached relation owns the
         // structural version now; this compatibility argument is intentionally ignored there.
-        let schema_version = 0;
+        let schema_version = common::SchemaVersionNo(0);
         let mut ctx = StreamCtx::default();
         let mut internal = InternalTables::default();
         // reload_signal echoes buffered between their Insert and their transaction's fate (PR 6.3):
@@ -223,7 +223,7 @@ impl<'a> DecodeLoop<'a> {
                                                 tracing::info!(
                                                     source_table = %format_args!("{}.{}", ev.source_schema, ev.source_table),
                                                     c_tag = %ev.c_tag,
-                                                    schema_version = new_version,
+                                                    schema_version = %new_version,
                                                     c_lsn = %ev.c_lsn,
                                                     "DDL: manifest + version bump + file cut"
                                                 );
@@ -712,7 +712,7 @@ impl BatchRouter {
         cache: &RelationCache,
         msg: &Message,
         frame_lsn: Lsn,
-        _schema_version: i64,
+        _schema_version: common::SchemaVersionNo,
     ) -> anyhow::Result<Vec<SealedBatch>> {
         match msg {
             Message::Begin { xid, .. } => {
@@ -905,7 +905,7 @@ pub async fn on_relation(
     ex: impl sqlx::PgExecutor<'_>,
     epoch: EpochNo,
     relation: common::PgRelation,
-    schema_version: i64,
+    schema_version: common::SchemaVersionNo,
 ) -> anyhow::Result<()> {
     if is_internal_table(&relation.schema, &relation.name) {
         return Ok(());
@@ -926,7 +926,7 @@ pub async fn on_relation(
         .context("upsert schema_registry")?;
     tracing::info!(
         source_table = %format_args!("{}.{}", cached.relation.schema, cached.relation.name),
-        schema_version,
+        schema_version = %schema_version,
         "registered relation"
     );
     Ok(())

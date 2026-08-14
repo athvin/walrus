@@ -10,7 +10,7 @@ use common::oids::{
     BOOL, BYTEA, DATE, FLOAT4, FLOAT8, INT2, INT4, INT8, JSON, JSONB, NUMERIC, TIMESTAMP,
     TIMESTAMPTZ, UUID,
 };
-use common::{EpochNo, PgRelation};
+use common::{EpochNo, PgRelation, ReloadId, SchemaVersionNo};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
@@ -58,7 +58,7 @@ pub struct TableDb {
     /// and shared-thread open finding in
     /// `docs/implementation/notes/rust-skills/async-spawn-blocking.md`.
     /// `Arc<[String]>` keeps reads to one indirection while preserving `TableDb: Send`.
-    parquet_cols: RefCell<HashMap<i64, Arc<[String]>>>,
+    parquet_cols: RefCell<HashMap<SchemaVersionNo, Arc<[String]>>>,
 }
 
 impl TableDb {
@@ -87,7 +87,11 @@ impl TableDb {
     /// # Errors
     ///
     /// Returns [`LoaderError::Duck`] if DuckDB cannot create or reconcile the planned tables and view.
-    pub fn ensure_tables(&self, rel: &PgRelation, schema_version: i64) -> Result<(), LoaderError> {
+    pub fn ensure_tables(
+        &self,
+        rel: &PgRelation,
+        schema_version: SchemaVersionNo,
+    ) -> Result<(), LoaderError> {
         self.ensure_tables_planned(&crate::plan::TablePlan::tier1(rel), schema_version)
     }
 
@@ -101,7 +105,7 @@ impl TableDb {
     pub fn ensure_tables_planned(
         &self,
         plan: &TablePlan,
-        schema_version: i64,
+        schema_version: SchemaVersionNo,
     ) -> Result<(), LoaderError> {
         let cols: Vec<String> = plan
             .mirror_cols
@@ -201,7 +205,7 @@ impl TableDb {
         &self,
         table: &str,
         s3_uri: &str,
-        schema_version: i64,
+        schema_version: SchemaVersionNo,
         commit_lsn_override: Option<&str>,
     ) -> Result<u64, LoaderError> {
         let uri = common::sql::sql_literal(s3_uri);
@@ -235,7 +239,11 @@ impl TableDb {
 
     /// The Parquet column list for `schema_version`, introspecting `uri` **once** per version and
     /// caching it (PR 5.8; sound by the homogeneous-file rule — see [`TableDb::parquet_cols`]).
-    fn columns_for(&self, uri: &str, schema_version: i64) -> Result<Arc<[String]>, LoaderError> {
+    fn columns_for(
+        &self,
+        uri: &str,
+        schema_version: SchemaVersionNo,
+    ) -> Result<Arc<[String]>, LoaderError> {
         let cached = { self.parquet_cols.borrow().get(&schema_version).cloned() };
         if let Some(columns) = cached {
             return Ok(columns);
@@ -278,14 +286,16 @@ impl TableDb {
     /// # Errors
     ///
     /// Returns [`LoaderError::Duck`] if the metadata watermark cannot be read.
-    pub fn schema_version(&self) -> Result<i64, LoaderError> {
-        self.conn
+    pub fn schema_version(&self) -> Result<SchemaVersionNo, LoaderError> {
+        let version = self
+            .conn
             .query_row(
                 "SELECT v FROM \"_walrus_meta\" WHERE k = 'schema_version'",
                 [],
                 |r| r.get(0),
             )
-            .duck("read schema_version")
+            .duck("read schema_version")?;
+        Ok(SchemaVersionNo(version))
     }
 
     /// Advance the reconcile watermark after the additive DDL for `v` has been applied to both tables.
@@ -293,11 +303,11 @@ impl TableDb {
     /// # Errors
     ///
     /// Returns [`LoaderError::Duck`] if updating the persisted schema watermark fails.
-    pub fn set_schema_version(&self, v: i64) -> Result<(), LoaderError> {
+    pub fn set_schema_version(&self, version: SchemaVersionNo) -> Result<(), LoaderError> {
         self.conn
             .execute(
                 "UPDATE \"_walrus_meta\" SET v = ? WHERE k = 'schema_version'",
-                duckdb::params![v],
+                duckdb::params![version.0],
             )
             .duck("set schema_version")?;
         Ok(())
@@ -360,7 +370,7 @@ impl TableDb {
     /// # Errors
     ///
     /// Returns [`LoaderError::Duck`] if the reload latch cannot be read.
-    pub fn recorded_reload_id(&self) -> Result<i64, LoaderError> {
+    pub fn recorded_reload_id(&self) -> Result<ReloadId, LoaderError> {
         let v: Option<i64> = self
             .conn
             .query_row(
@@ -369,7 +379,7 @@ impl TableDb {
                 |r| r.get(0),
             )
             .duck("read recorded reload_id")?;
-        Ok(v.unwrap_or(0))
+        Ok(ReloadId(v.unwrap_or(0)))
     }
 
     /// Latch the reload generation this `.duckdb` is now rebuilt for. With a monotonic bigserial
@@ -378,12 +388,12 @@ impl TableDb {
     /// # Errors
     ///
     /// Returns [`LoaderError::Duck`] if the reload-id upsert fails.
-    pub fn set_recorded_reload_id(&self, reload_id: i64) -> Result<(), LoaderError> {
+    pub fn set_recorded_reload_id(&self, reload_id: ReloadId) -> Result<(), LoaderError> {
         self.conn
             .execute(
                 "INSERT INTO \"_walrus_meta\" (k, v) VALUES ('reload_id', ?) \
                  ON CONFLICT (k) DO UPDATE SET v = excluded.v",
-                duckdb::params![reload_id],
+                duckdb::params![reload_id.0],
             )
             .duck("set recorded reload_id")?;
         Ok(())
@@ -410,7 +420,7 @@ impl TableDb {
     pub fn rebuild_for_reload(
         &self,
         plan: &TablePlan,
-        schema_version: i64,
+        schema_version: SchemaVersionNo,
     ) -> Result<(), LoaderError> {
         let table = &plan.table;
         self.conn
@@ -491,7 +501,7 @@ const _: fn() = || {
     assert_sync::<Arc<crate::health::LoaderState>>();
 
     // Pin walrus's own source of `!Sync`; DuckDB independently keeps the overall type `!Sync`.
-    fn cache_refcell(db: &TableDb) -> &RefCell<HashMap<i64, Arc<[String]>>> {
+    fn cache_refcell(db: &TableDb) -> &RefCell<HashMap<SchemaVersionNo, Arc<[String]>>> {
         &db.parquet_cols
     }
     let _ = cache_refcell;

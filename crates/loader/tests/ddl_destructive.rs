@@ -41,7 +41,7 @@ fn rel(name: &str, columns: Vec<PgColumn>) -> PgRelation {
 
 fn mem(rel: &PgRelation) -> TableDb {
     let db = TableDb::open(":memory:").unwrap();
-    db.ensure_tables(rel, 1).unwrap();
+    db.ensure_tables(rel, common::SchemaVersionNo(1)).unwrap();
     db
 }
 
@@ -185,7 +185,7 @@ async fn drop_table_retires_both_tables_and_the_file() {
                 "orders",
                 vec![col("id", 23, true), col("status", 25, false)],
             ),
-            1,
+            common::SchemaVersionNo(1),
         )
         .unwrap();
         apply_destructive(
@@ -299,7 +299,7 @@ async fn lossy_cast_failure_quarantines_the_table_and_alerts() {
             epoch,
             source_schema: "public".into(),
             source_table: "orders".into(),
-            schema_version: 1,
+            schema_version: common::SchemaVersionNo(1),
             descriptors: Vec::new(),
             columns: serde_json::to_value(&orders_v1).unwrap(),
         },
@@ -318,7 +318,7 @@ async fn lossy_cast_failure_quarantines_the_table_and_alerts() {
             row_count: 1,
             lsn_start: "0/64".parse().unwrap(),
             lsn_end: "0/64".parse().unwrap(),
-            schema_version: 1,
+            schema_version: common::SchemaVersionNo(1),
             reload_id: None,
         },
     )
@@ -327,7 +327,8 @@ async fn lossy_cast_failure_quarantines_the_table_and_alerts() {
 
     let dir = tmpdir(&epoch.to_string());
     let db = TableDb::open(dir.join("orders.duckdb")).unwrap();
-    db.ensure_tables(&orders_v1, 1).unwrap();
+    db.ensure_tables(&orders_v1, common::SchemaVersionNo(1))
+        .unwrap();
     db.configure_s3(&s3()).unwrap();
     let state = LoaderState::new();
     let ctx = TableCtx {
@@ -362,7 +363,7 @@ async fn lossy_cast_failure_quarantines_the_table_and_alerts() {
             epoch,
             source_schema: "public".into(),
             source_table: "orders".into(),
-            schema_version: 2,
+            schema_version: common::SchemaVersionNo(2),
             descriptors: Vec::new(),
             columns: serde_json::to_value(&orders_v2).unwrap(),
         },
@@ -381,7 +382,7 @@ async fn lossy_cast_failure_quarantines_the_table_and_alerts() {
             row_count: 1,
             lsn_start: "0/C8".parse().unwrap(),
             lsn_end: "0/C8".parse().unwrap(),
-            schema_version: 2,
+            schema_version: common::SchemaVersionNo(2),
             reload_id: None,
         },
     )

@@ -96,7 +96,7 @@ async fn pipeline(
     state.mark_ready();
     tracing::info!("bootstrap complete; ready");
 
-    const SCHEMA_VERSION: i64 = 1;
+    const SCHEMA_VERSION: common::SchemaVersionNo = common::SchemaVersionNo(1);
     let triggers = pg_sink::batch::BatchTriggers {
         max_fill: cfg.max_fill,
         max_rows: cfg.max_rows,
@@ -214,7 +214,7 @@ async fn establish_stream(
     ctx: &bootstrap::BootstrapCtx,
     cache: &mut pg_sink::relcache::RelationCache,
     triggers: pg_sink::batch::BatchTriggers,
-    schema_version: i64,
+    schema_version: common::SchemaVersionNo,
 ) -> anyhow::Result<Bootstrapped> {
     let make_sink = |epoch| {
         pg_sink::sink::ParquetSink::new(

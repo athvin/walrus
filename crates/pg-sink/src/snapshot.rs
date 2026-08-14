@@ -206,7 +206,7 @@ impl Backfill {
         snap: &ExportedSnapshot,
         sink: &ParquetSink,
         pool: &sqlx::PgPool,
-        schema_version: i64,
+        schema_version: common::SchemaVersionNo,
     ) -> anyhow::Result<u64> {
         // Attach the exported snapshot — the ONLY consistency mechanism (no "COPY at an LSN"). If the
         // slot-creating connection has closed, `SET TRANSACTION SNAPSHOT` fails here (terminal).
@@ -267,7 +267,7 @@ impl Backfill {
         &self,
         rel: &PgRelation,
         snap: &ExportedSnapshot,
-        schema_version: i64,
+        schema_version: common::SchemaVersionNo,
     ) -> SinkMeta {
         SinkMeta {
             op: Op::Insert,

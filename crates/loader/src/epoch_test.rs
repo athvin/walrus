@@ -20,7 +20,8 @@ fn orders() -> PgRelation {
 
 fn open_fresh(dir: &Path) -> TableDb {
     let db = TableDb::open(dir.join("orders.duckdb")).unwrap();
-    db.ensure_tables(&orders(), 1).unwrap();
+    db.ensure_tables(&orders(), common::SchemaVersionNo(1))
+        .unwrap();
     db
 }
 
@@ -45,7 +46,8 @@ fn rebuild_wipes_a_stale_generation_and_is_idempotent() {
     // Control epoch bumped to 2 → the file is stale → rebuild wipes it (raw + mirror gone).
     assert!(rebuild_for_new_epoch(&db, "orders", common::EpochNo(2)).unwrap());
     // Recreate empty (as bootstrap does) and confirm the stale rows are gone.
-    db.ensure_tables(&orders(), 1).unwrap();
+    db.ensure_tables(&orders(), common::SchemaVersionNo(1))
+        .unwrap();
     db.set_built_epoch(common::EpochNo(2)).unwrap();
     let mirror: i64 = db
         .conn()

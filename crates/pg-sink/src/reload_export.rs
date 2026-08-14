@@ -25,7 +25,10 @@
 use crate::reload_signal::WatermarkWaiters;
 use crate::sink::{FileKind, ParquetSink};
 use anyhow::Context;
-use common::{EpochNo, Kind, Lsn, Op, PgRelation, SinkMeta, TupleValue, UtcTimestamp};
+use common::{
+    EpochNo, Kind, Lsn, Op, PgRelation, ReloadId, SchemaVersionNo, SinkMeta, TupleValue,
+    UtcTimestamp,
+};
 use std::fmt::Write as _;
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -54,7 +57,7 @@ pub enum RunOutcome {
     Drained { final_lsn: Lsn },
     /// DDL bumped the table's structural `schema_version` past the frozen one between chunks: this
     /// attempt is invalid and the controller must restart it at `new_version` (reload H9).
-    SchemaChanged { new_version: i64 },
+    SchemaChanged { new_version: SchemaVersionNo },
 }
 
 /// Has the table's structural `schema_version` moved past the reload's `frozen` version? Returns
@@ -62,7 +65,10 @@ pub enum RunOutcome {
 /// only on structural DDL (a decoded Relation message, PR 2.33), so metadata-only DDL (`COMMENT
 /// ON`) never trips it — and never restarts backwards (`latest < frozen` is a stale read). Pure so
 /// the restart trigger unit-tests without a database.
-fn version_changed(frozen: i64, latest: Option<i64>) -> Option<i64> {
+fn version_changed(
+    frozen: SchemaVersionNo,
+    latest: Option<SchemaVersionNo>,
+) -> Option<SchemaVersionNo> {
     match latest {
         Some(v) if v > frozen => Some(v),
         _ => None,
@@ -94,8 +100,8 @@ pub struct ChunkExporter {
     series: String,
     /// PK columns in PK-INDEX order (pg_index.indkey position) — the pagination total order.
     pk_cols: Vec<String>,
-    schema_version: i64,
-    reload_id: i64,
+    schema_version: SchemaVersionNo,
+    reload_id: ReloadId,
     /// Last COMPLETED chunk (from `table_reload`; 0 = fresh start).
     chunk_no: i64,
     /// Last exported PK bound as a JSON array of text values in PK-column order; `None` = start.
@@ -230,9 +236,9 @@ impl ChunkExporter {
         loop {
             if let Some(new_version) = self.check_schema_still_current().await? {
                 tracing::info!(
-                    reload_id = self.reload_id,
-                    frozen = self.schema_version,
-                    new_version,
+                    reload_id = %self.reload_id,
+                    frozen = %self.schema_version,
+                    new_version = %new_version,
                     "reload interrupted: DDL bumped schema_version between chunks — restarting (H9)"
                 );
                 return Ok(RunOutcome::SchemaChanged { new_version });
@@ -240,7 +246,7 @@ impl ChunkExporter {
             match self.export_next_chunk().await? {
                 ChunkOutcome::Exported { rows } => {
                     tracing::info!(
-                        reload_id = self.reload_id,
+                        reload_id = %self.reload_id,
                         chunk_no = self.chunk_no,
                         rows,
                         "reload chunk exported"
@@ -250,7 +256,7 @@ impl ChunkExporter {
                     // H = the last probe's watermark, carried by the drain outcome itself (every
                     // probe echoes and sets the watermark before it can report drained).
                     tracing::info!(
-                        reload_id = self.reload_id,
+                        reload_id = %self.reload_id,
                         chunk_no = self.chunk_no,
                         rows,
                         final_lsn = %final_lsn,
@@ -272,7 +278,7 @@ impl ChunkExporter {
     /// that chunk exports at the old shape, but the NEXT chunk's check catches the bump and the
     /// restart throws that file away with the rest — harmless only because the restart's purge is
     /// total (H9).
-    async fn check_schema_still_current(&self) -> anyhow::Result<Option<i64>> {
+    async fn check_schema_still_current(&self) -> anyhow::Result<Option<SchemaVersionNo>> {
         let latest = control::read_latest_version(
             &self.pool,
             self.cfg.epoch,
@@ -321,7 +327,7 @@ impl ChunkExporter {
                     anyhow::bail!("echo waiter superseded (a newer subscriber replaced it)")
                 }
                 Err(_) => tracing::warn!(
-                    reload_id = self.reload_id,
+                    reload_id = %self.reload_id,
                     chunk_no,
                     attempt,
                     timeout = ?self.cfg.echo_timeout,

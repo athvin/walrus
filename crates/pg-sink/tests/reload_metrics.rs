@@ -107,7 +107,7 @@ async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: EpochN
             epoch,
             source_schema: "public".to_string(),
             source_table: TABLE.to_string(),
-            schema_version: 1,
+            schema_version: common::SchemaVersionNo(1),
             descriptors: pg_to_arrow::descriptor::describe_relation(&rel),
             columns: serde_json::to_value(&rel).unwrap(),
         },
@@ -179,7 +179,7 @@ async fn await_resolver_ready(
     let sentinel = -epoch.0;
     let mut ready = false;
     for _ in 0..20 {
-        let rx = waiters.subscribe(sentinel, 1);
+        let rx = waiters.subscribe(common::ReloadId(sentinel), 1);
         admin
             .batch_execute(&format!(
                 "DELETE FROM walrus.reload_signal WHERE reload_id = {sentinel}; \

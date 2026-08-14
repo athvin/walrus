@@ -60,7 +60,7 @@ fn snapshot_rows_carry_kind_snapshot_and_consistent_point_commit_lsn() {
         xid: 0,
         epoch: common::EpochNo(7),
         batch_id: String::new(),
-        schema_version: 1,
+        schema_version: common::SchemaVersionNo(1),
         source_schema: "public".into(),
         source_table: "orders".into(),
         kind: Kind::Snapshot,
@@ -75,7 +75,7 @@ fn snapshot_rows_carry_kind_snapshot_and_consistent_point_commit_lsn() {
     );
 
     let cached = RelationCache::default()
-        .upsert_from_relation(orders(), 1)
+        .upsert_from_relation(orders(), common::SchemaVersionNo(1))
         .unwrap();
     let mut b = TableBatcher::new(
         cached,
@@ -100,7 +100,7 @@ fn snapshot_rows_carry_kind_snapshot_and_consistent_point_commit_lsn() {
 fn all_snapshot_manifest_files_share_lsn_end() {
     let cp: Lsn = "0/500".parse().unwrap();
     let cached = RelationCache::default()
-        .upsert_from_relation(orders(), 1)
+        .upsert_from_relation(orders(), common::SchemaVersionNo(1))
         .unwrap();
     let meta = |lsn: Lsn| SinkMeta {
         op: Op::Insert,
@@ -110,7 +110,7 @@ fn all_snapshot_manifest_files_share_lsn_end() {
         xid: 0,
         epoch: common::EpochNo(7),
         batch_id: String::new(),
-        schema_version: 1,
+        schema_version: common::SchemaVersionNo(1),
         source_schema: "public".into(),
         source_table: "orders".into(),
         kind: Kind::Snapshot,

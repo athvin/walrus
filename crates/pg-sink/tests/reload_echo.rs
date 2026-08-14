@@ -15,7 +15,7 @@
 //!
 //!   cargo test -p pg-sink --test reload_echo -- --ignored
 
-use common::{EpochNo, Lsn};
+use common::{EpochNo, Lsn, ReloadId, SchemaVersionNo};
 use pg_sink::batch::{BatchTriggers, SealedBatch, SystemClock};
 use pg_sink::checkpoint::DurabilityCheckpoint;
 use pg_sink::consume::{on_frame, on_relation, BatchRouter};
@@ -66,7 +66,7 @@ async fn drop_slot(admin: &tokio_postgres::Client, slot: &str) {
 async fn signal_insert_resolves_waiter_and_never_reaches_parquet() {
     let _g = SOURCE_LOCK.lock().await;
     let slot = "walrus_reload_echo";
-    let reload_id = 990_042i64;
+    let reload_id = ReloadId(990_042);
     let epoch = EpochNo(990_042);
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
@@ -75,7 +75,7 @@ async fn signal_insert_resolves_waiter_and_never_reaches_parquet() {
     admin
         .execute(
             "DELETE FROM walrus.reload_signal WHERE reload_id = $1",
-            &[&reload_id],
+            &[&reload_id.0],
         )
         .await
         .unwrap();
@@ -131,7 +131,7 @@ async fn signal_insert_resolves_waiter_and_never_reaches_parquet() {
     admin
         .execute(
             "INSERT INTO walrus.reload_signal (reload_id, chunk_no) VALUES ($1, 1)",
-            &[&reload_id],
+            &[&reload_id.0],
         )
         .await
         .unwrap();
@@ -159,9 +159,15 @@ async fn signal_insert_resolves_waiter_and_never_reaches_parquet() {
                     // The REAL registration path: its `is_internal_table` refusal is the
                     // production defense that keeps the signal table out of the cache — a
                     // membership regression here surfaces below as a sealed signal batch.
-                    on_relation(&mut cache, &pool, epoch, relation.clone(), 1)
-                        .await
-                        .unwrap();
+                    on_relation(
+                        &mut cache,
+                        &pool,
+                        epoch,
+                        relation.clone(),
+                        SchemaVersionNo(1),
+                    )
+                    .await
+                    .unwrap();
                 }
                 Message::Insert {
                     relation_oid,
@@ -174,14 +180,22 @@ async fn signal_insert_resolves_waiter_and_never_reaches_parquet() {
                     signal_insert_frame_lsn = frame_lsn;
                 }
                 Message::Commit { commit_lsn, .. } => {
-                    sealed.extend(router.route(&cache, &msg, frame_lsn, 1).unwrap());
+                    sealed.extend(
+                        router
+                            .route(&cache, &msg, frame_lsn, SchemaVersionNo(1))
+                            .unwrap(),
+                    );
                     pending.on_commit(*commit_lsn, &waiters);
                     if signal_seen {
                         return *commit_lsn;
                     }
                 }
                 other => {
-                    sealed.extend(router.route(&cache, other, frame_lsn, 1).unwrap());
+                    sealed.extend(
+                        router
+                            .route(&cache, other, frame_lsn, SchemaVersionNo(1))
+                            .unwrap(),
+                    );
                 }
             }
         }
@@ -263,7 +277,7 @@ async fn signal_insert_resolves_waiter_and_never_reaches_parquet() {
     admin
         .execute(
             "DELETE FROM walrus.reload_signal WHERE reload_id = $1",
-            &[&reload_id],
+            &[&reload_id.0],
         )
         .await
         .unwrap();

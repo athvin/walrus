@@ -86,7 +86,7 @@ fn meta(i: usize) -> SinkMeta {
         xid: 1,
         epoch: EpochNo(7),
         batch_id: "3f2a0000-0000-0000-0000-000000000001".to_string(),
-        schema_version: 1,
+        schema_version: common::SchemaVersionNo(1),
         source_schema: "public".to_string(),
         source_table: "orders".to_string(),
         kind: Kind::Stream,
@@ -122,10 +122,15 @@ fn bench_append(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     let db = TableDb::open(":memory:").unwrap();
-                    db.ensure_tables(rel, 1).unwrap();
+                    db.ensure_tables(rel, common::SchemaVersionNo(1)).unwrap();
                     db
                 },
-                |db| black_box(db.append_parquet("orders", &uri, 1, None).unwrap()),
+                |db| {
+                    black_box(
+                        db.append_parquet("orders", &uri, common::SchemaVersionNo(1), None)
+                            .unwrap(),
+                    )
+                },
                 BatchSize::PerIteration,
             );
         });

@@ -96,15 +96,23 @@ fn pagination_follows_pk_index_order_not_attnum_order() {
 fn schema_bump_between_chunks_interrupts_with_new_version() {
     // A structural bump past the frozen version restarts; equal (metadata-only DDL never bumps
     // the registry) and a stale backwards read do not.
-    assert_eq!(version_changed(1, Some(2)), Some(2), "1 → 2 restarts");
     assert_eq!(
-        version_changed(1, Some(1)),
+        version_changed(common::SchemaVersionNo(1), Some(common::SchemaVersionNo(2))),
+        Some(common::SchemaVersionNo(2)),
+        "1 → 2 restarts"
+    );
+    assert_eq!(
+        version_changed(common::SchemaVersionNo(1), Some(common::SchemaVersionNo(1))),
         None,
         "metadata-only: no restart"
     );
-    assert_eq!(version_changed(2, Some(1)), None, "never restart backwards");
     assert_eq!(
-        version_changed(1, None),
+        version_changed(common::SchemaVersionNo(2), Some(common::SchemaVersionNo(1))),
+        None,
+        "never restart backwards"
+    );
+    assert_eq!(
+        version_changed(common::SchemaVersionNo(1), None),
         None,
         "no registry row: no restart"
     );
