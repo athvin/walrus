@@ -15,6 +15,7 @@ use crate::health::LoaderState;
 use common::{EpochNo, Lsn, PgRelation};
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
+use std::num::NonZeroI64;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,7 +37,7 @@ pub struct TableCtx {
     pub db: TableDb,
     pub state: Arc<LoaderState>,
     /// Files claimed per cycle.
-    pub max_files: i64,
+    pub max_files: NonZeroI64,
     /// The apply-loop poll cadence.
     pub poll_interval: Duration,
     /// The compaction cadence — full-rebuild + prune, on this worker thread after an apply cycle (PR 3.11).
@@ -112,8 +113,14 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
 
     // 1. Claim in (lsn_end, id) order — NEVER `lsn_end > raw_appended_lsn` (that skips equal-lsn_end
     //    snapshot files forever).
-    let claimed =
-        control::claim_ready(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table, ctx.max_files).await?;
+    let claimed = control::claim_ready(
+        &ctx.pool,
+        ctx.epoch,
+        &ctx.schema,
+        &ctx.table,
+        ctx.max_files.get(),
+    )
+    .await?;
     if claimed.is_empty() {
         // Distinguish IDLE from PAUSED (PR 6.6): a live rebuild-flavor reload withholds this
         // table's claims (reload §2 — claiming would retire post-`W` files the rebuild must

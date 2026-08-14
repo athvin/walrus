@@ -80,8 +80,8 @@ fn row(id: &str) -> Vec<TupleValue> {
 
 fn triggers(max_rows: u64, max_bytes: u64, max_fill: Duration) -> BatchTriggers {
     BatchTriggers {
-        max_rows,
-        max_bytes,
+        max_rows: NonZeroU64::new(max_rows).unwrap(),
+        max_bytes: NonZeroU64::new(max_bytes).unwrap(),
         max_fill,
     }
 }

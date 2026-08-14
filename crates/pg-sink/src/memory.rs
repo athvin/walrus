@@ -14,6 +14,7 @@
 //! resort. Freeing memory and advancing the slot stay separable (§1.5).
 
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 
 /// A pg relation OID (a stable table id).
 pub type TableId = u32;
@@ -22,14 +23,14 @@ pub type TableId = u32;
 /// single batch's `max_bytes`.
 #[derive(Debug)]
 pub struct InflightMeter {
-    ceiling_bytes: u64,
+    ceiling_bytes: NonZeroU64,
     total: u64,
     by_stream: HashMap<(TableId, u32), u64>,
 }
 
 impl InflightMeter {
     #[must_use]
-    pub fn new(ceiling_bytes: u64) -> Self {
+    pub fn new(ceiling_bytes: NonZeroU64) -> Self {
         InflightMeter {
             ceiling_bytes,
             total: 0,
@@ -71,13 +72,13 @@ impl InflightMeter {
     }
 
     #[must_use]
-    pub fn ceiling(&self) -> u64 {
+    pub fn ceiling(&self) -> NonZeroU64 {
         self.ceiling_bytes
     }
 
     #[must_use = "the ceiling check drives shedding — ignoring it silently disables backpressure"]
     pub fn over_ceiling(&self) -> bool {
-        self.total > self.ceiling_bytes
+        self.total > self.ceiling_bytes.get()
     }
 
     /// The largest in-flight `(table, xid)` stream — the best spill candidate.
@@ -235,12 +236,9 @@ impl Backpressure {
     }
 
     /// Update from the current total vs ceiling; returns whether intake should be PAUSED afterwards.
-    pub fn tick(&mut self, total: u64, ceiling: u64) -> bool {
-        let ratio = if ceiling == 0 {
-            f64::INFINITY
-        } else {
-            total as f64 / ceiling as f64
-        };
+    /// The non-zero ceiling makes the ratio total, so this path needs no divide-by-zero fallback.
+    pub fn tick(&mut self, total: u64, ceiling: NonZeroU64) -> bool {
+        let ratio = total as f64 / ceiling.get() as f64;
         if self.paused {
             if ratio <= self.band.resume().as_f64() {
                 self.paused = false;

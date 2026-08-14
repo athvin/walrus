@@ -198,7 +198,7 @@ async fn await_resolver_ready(
 
 fn export_cfg(epoch: EpochNo, chunk_rows: u64, echo_timeout: Duration) -> ChunkExportConfig {
     ChunkExportConfig {
-        chunk_rows,
+        chunk_rows: std::num::NonZeroU64::new(chunk_rows).unwrap(),
         echo_timeout,
         instance: "walrus-sink-test".to_string(),
         epoch,
@@ -384,7 +384,7 @@ async fn active_gauge_rises_and_returns_to_zero() {
             instance: "walrus-sink-test".to_string(),
             publication_name: "walrus_pub".to_string(),
             epoch,
-            chunk_rows: 1000,
+            chunk_rows: std::num::NonZeroU64::new(1000).unwrap(),
             echo_timeout: Duration::from_secs(3600), // park forever, no resolver
             reload_max_restarts: 3,
         },

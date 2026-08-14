@@ -133,14 +133,14 @@ async fn large_txn_single_ready_file_only_after_stream_commit() {
     let mut demux = StreamDemux::new(
         // Small caps → the open txn spills speculatively (no manifest) many times before commit.
         BatchTriggers {
-            max_rows: 500,
-            max_bytes: u64::MAX,
+            max_rows: std::num::NonZeroU64::new(500).unwrap(),
+            max_bytes: std::num::NonZeroU64::MAX,
             max_fill: Duration::from_secs(3600),
         },
         Arc::new(SystemClock),
         epoch,
         "test".to_string(),
-        u64::MAX,
+        std::num::NonZeroU64::MAX,
     );
     let mut checkpoint = DurabilityCheckpoint::new(resume.start_lsn());
     let mut cache = RelationCache::default();
@@ -293,14 +293,14 @@ async fn whole_txn_abort_writes_no_ready_row() {
     control::run_migrations(&pool).await.unwrap();
     let mut demux = StreamDemux::new(
         BatchTriggers {
-            max_rows: 500,
-            max_bytes: u64::MAX,
+            max_rows: std::num::NonZeroU64::new(500).unwrap(),
+            max_bytes: std::num::NonZeroU64::MAX,
             max_fill: Duration::from_secs(3600),
         },
         Arc::new(SystemClock),
         epoch,
         "test".to_string(),
-        u64::MAX,
+        std::num::NonZeroU64::MAX,
     );
     let mut cache = RelationCache::default();
     let mut ctx = StreamCtx::default();

@@ -148,7 +148,7 @@ fn ctx_on(
         rel: orders(),
         db,
         state: LoaderState::new(),
-        max_files: 100,
+        max_files: std::num::NonZeroI64::new(100).unwrap(),
         poll_interval: poll,
         compaction_interval: compaction,
         retention_lsn_lag: 16 << 20,

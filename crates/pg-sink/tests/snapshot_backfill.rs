@@ -126,8 +126,8 @@ async fn backfill_preloaded_rows_then_streams_post_consistent_point() {
         epoch,
         "walrus-snapshot-test".to_string(),
         BatchTriggers {
-            max_rows: u64::MAX,
-            max_bytes: u64::MAX,
+            max_rows: std::num::NonZeroU64::MAX,
+            max_bytes: std::num::NonZeroU64::MAX,
             max_fill: Duration::from_secs(3600),
         },
         Duration::ZERO,

@@ -523,7 +523,7 @@ async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
         rel: orders_v1(),
         db,
         state: LoaderState::new(),
-        max_files: 100,
+        max_files: std::num::NonZeroI64::new(100).unwrap(),
         poll_interval: Duration::from_secs(5),
         compaction_interval: Duration::from_secs(3600),
         retention_lsn_lag: 16 << 20,

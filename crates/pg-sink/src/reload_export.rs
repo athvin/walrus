@@ -27,6 +27,7 @@ use crate::sink::{FileKind, ParquetSink};
 use anyhow::Context;
 use common::{EpochNo, Kind, Lsn, Op, PgRelation, SinkMeta, TupleValue, UtcTimestamp};
 use std::fmt::Write as _;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_postgres::NoTls;
@@ -71,7 +72,7 @@ fn version_changed(frozen: i64, latest: Option<i64>) -> Option<i64> {
 /// Everything the exporter needs beyond the reload row itself.
 #[derive(Clone, Debug)]
 pub struct ChunkExportConfig {
-    pub chunk_rows: u64,
+    pub chunk_rows: NonZeroU64,
     pub echo_timeout: Duration,
     pub instance: String,
     pub epoch: EpochNo,
@@ -382,8 +383,8 @@ impl ChunkExporter {
         let mut batcher = crate::batch::TableBatcher::new(
             cached,
             crate::batch::BatchTriggers {
-                max_rows: u64::MAX, // one file per chunk; chunk_rows bounds the SELECT
-                max_bytes: u64::MAX,
+                max_rows: NonZeroU64::MAX, // one file per chunk; chunk_rows bounds the SELECT
+                max_bytes: NonZeroU64::MAX,
                 max_fill: Duration::from_secs(3600),
             },
             Arc::new(crate::batch::SystemClock),
@@ -439,7 +440,7 @@ impl ChunkExporter {
         let n = u64::try_from(rows.len()).unwrap_or(u64::MAX);
         // One chunk file exported (PR 6.11): bump the per-table chunk + row counters.
         common::metrics::record_reload_chunk(&self.series, n);
-        if n < self.cfg.chunk_rows {
+        if n < self.cfg.chunk_rows.get() {
             Ok(ChunkOutcome::Drained {
                 rows: n,
                 final_lsn: watermark,
@@ -457,7 +458,7 @@ impl ChunkExporter {
             &self.rel,
             &self.pk_cols,
             self.cursor.as_ref(),
-            self.cfg.chunk_rows,
+            self.cfg.chunk_rows.get(),
         )
     }
 

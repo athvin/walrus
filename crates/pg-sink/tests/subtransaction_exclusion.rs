@@ -103,14 +103,14 @@ async fn savepoint_rollback_ready_file_has_exactly_6000_rows() {
         .unwrap();
     let mut demux = StreamDemux::new(
         BatchTriggers {
-            max_rows: 100_000,
-            max_bytes: u64::MAX,
+            max_rows: std::num::NonZeroU64::new(100_000).unwrap(),
+            max_bytes: std::num::NonZeroU64::MAX,
             max_fill: Duration::from_secs(3600),
         },
         Arc::new(SystemClock),
         epoch,
         "test".to_string(),
-        u64::MAX,
+        std::num::NonZeroU64::MAX,
     );
     let mut cache = RelationCache::default();
     let mut ctx = StreamCtx::default();

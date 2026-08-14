@@ -74,7 +74,7 @@ fn controller_cfg(epoch: EpochNo, cap: usize) -> ReloadControllerConfig {
         instance: "walrus-sink-test".to_string(),
         publication_name: "walrus_pub".to_string(),
         epoch,
-        chunk_rows: 1000,
+        chunk_rows: std::num::NonZeroU64::new(1000).unwrap(),
         // No decode loop resolves echoes in these tests, so exporters PARK on the echo await —
         // exactly the observable-scheduling role PR 6.4's stub used to play. The echo/export
         // behaviour itself is reload_export.rs's suite.

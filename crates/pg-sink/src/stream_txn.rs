@@ -31,6 +31,7 @@ use anyhow::Context;
 use common::{EpochNo, Kind, Lsn, Op, SinkMeta, TupleValue, UtcTimestamp};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 /// One streamed change, tagged with **its** sub-transaction xid (proto §7).
@@ -118,7 +119,7 @@ impl StreamDemux {
         clock: Arc<dyn Clock>,
         epoch: EpochNo,
         sink_instance: impl Into<String>,
-        max_inflight_bytes: u64,
+        max_inflight_bytes: NonZeroU64,
     ) -> Self {
         let sink_instance = sink_instance.into();
         StreamDemux {

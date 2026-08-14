@@ -2,7 +2,12 @@ use super::*;
 use crate::batch::SystemClock;
 use common::{PgColumn, PgRelation, ReplicaIdentity};
 use pg_to_arrow::oids;
+use std::num::NonZeroU64;
 use std::time::Duration;
+
+fn nz(value: u64) -> NonZeroU64 {
+    NonZeroU64::new(value).unwrap()
+}
 
 fn cache() -> RelationCache {
     let rel = PgRelation {
@@ -44,14 +49,14 @@ fn insert_id(id: i32, sub_xid: u32) -> Message {
 fn demux(ceiling: u64) -> StreamDemux {
     StreamDemux::new(
         BatchTriggers {
-            max_rows: 100_000,
-            max_bytes: u64::MAX,
+            max_rows: nz(100_000),
+            max_bytes: NonZeroU64::MAX,
             max_fill: Duration::from_secs(3600),
         },
         Arc::new(SystemClock),
         common::EpochNo(1),
         "test",
-        ceiling,
+        nz(ceiling),
     )
 }
 

@@ -109,8 +109,8 @@ async fn signal_insert_resolves_waiter_and_never_reaches_parquet() {
     let mut checkpoint = DurabilityCheckpoint::new(resume.start_lsn());
     let mut router = BatchRouter::new(
         BatchTriggers {
-            max_rows: 1, // seal-happy: ANY routed row seals a batch at its commit
-            max_bytes: u64::MAX,
+            max_rows: std::num::NonZeroU64::MIN, // seal-happy: ANY routed row seals a batch at its commit
+            max_bytes: std::num::NonZeroU64::MAX,
             max_fill: Duration::from_secs(3600),
         },
         Arc::new(SystemClock),

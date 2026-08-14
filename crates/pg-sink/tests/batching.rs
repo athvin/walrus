@@ -80,8 +80,8 @@ async fn a_stream_of_inserts_forms_and_seals_a_batch() {
     }
 
     let triggers = BatchTriggers {
-        max_rows: 1,
-        max_bytes: u64::MAX,
+        max_rows: std::num::NonZeroU64::MIN,
+        max_bytes: std::num::NonZeroU64::MAX,
         max_fill: Duration::from_secs(3600),
     };
     let mut router = BatchRouter::new(triggers, Arc::new(SystemClock), common::EpochNo(1), "test");

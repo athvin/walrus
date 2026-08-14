@@ -80,8 +80,8 @@ fn snapshot_rows_carry_kind_snapshot_and_consistent_point_commit_lsn() {
     let mut b = TableBatcher::new(
         cached,
         BatchTriggers {
-            max_rows: u64::MAX,
-            max_bytes: u64::MAX,
+            max_rows: std::num::NonZeroU64::MAX,
+            max_bytes: std::num::NonZeroU64::MAX,
             max_fill: std::time::Duration::from_secs(3600),
         },
         Arc::new(SystemClock),
@@ -123,8 +123,8 @@ fn all_snapshot_manifest_files_share_lsn_end() {
         let mut b = TableBatcher::new(
             Arc::clone(&cached),
             BatchTriggers {
-                max_rows: 1,
-                max_bytes: u64::MAX,
+                max_rows: std::num::NonZeroU64::MIN,
+                max_bytes: std::num::NonZeroU64::MAX,
                 max_fill: std::time::Duration::from_secs(3600),
             },
             Arc::new(SystemClock),

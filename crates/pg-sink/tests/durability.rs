@@ -111,8 +111,8 @@ async fn slot_advances_only_after_s3_and_manifest_durable() {
     let mut checkpoint = DurabilityCheckpoint::new(resume.start_lsn());
     let mut router = BatchRouter::new(
         BatchTriggers {
-            max_rows: 1,
-            max_bytes: u64::MAX,
+            max_rows: std::num::NonZeroU64::MIN,
+            max_bytes: std::num::NonZeroU64::MAX,
             max_fill: Duration::from_secs(3600),
         },
         Arc::new(SystemClock),
@@ -203,8 +203,8 @@ async fn crash_between_put_and_standby_restreams_without_loss() {
     let mut cache = RelationCache::default();
     let mut router = BatchRouter::new(
         BatchTriggers {
-            max_rows: 1,
-            max_bytes: u64::MAX,
+            max_rows: std::num::NonZeroU64::MIN,
+            max_bytes: std::num::NonZeroU64::MAX,
             max_fill: Duration::from_secs(3600),
         },
         Arc::new(SystemClock),

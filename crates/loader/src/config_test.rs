@@ -30,7 +30,7 @@ fn defaults_are_the_shipped_contract() {
     assert_eq!(cfg.poll_interval, Duration::from_secs(5));
     assert_eq!(cfg.compaction_interval, Duration::from_secs(3600));
     assert_eq!(cfg.retention_lsn_lag, 16 << 20);
-    assert_eq!(cfg.max_files_per_cycle, 32);
+    assert_eq!(cfg.max_files_per_cycle.get(), 32);
     assert_eq!(cfg.startup_deadline, Duration::from_secs(60));
     assert_eq!(cfg.health_addr, SocketAddr::from(([0, 0, 0, 0], 8080)));
     assert_eq!(cfg.worker_threads, None);
@@ -96,18 +96,17 @@ fn zero_max_files_per_cycle_is_rejected_during_deserialization() {
 
 #[test]
 fn zero_poll_and_compaction_intervals_are_rejected() {
-    let cases: [(&str, fn(&mut LoaderConfig)); 2] = [
-        ("poll_interval", |cfg: &mut LoaderConfig| {
-            cfg.poll_interval = Duration::ZERO
-        }),
-        ("compaction_interval", |cfg: &mut LoaderConfig| {
-            cfg.compaction_interval = Duration::ZERO
-        }),
-    ];
-    for (field, update) in cases {
-        let mut cfg = valid();
-        update(&mut cfg);
-        let err = cfg.validate().expect_err("zero interval must be rejected");
-        assert!(err.to_string().contains(field), "{field}: {err}");
-    }
+    let mut cfg = valid();
+    cfg.poll_interval = Duration::ZERO;
+    let err = cfg
+        .validate()
+        .expect_err("zero poll interval must be rejected");
+    assert!(err.to_string().contains("poll_interval"), "{err}");
+
+    let mut cfg = valid();
+    cfg.compaction_interval = Duration::ZERO;
+    let err = cfg
+        .validate()
+        .expect_err("zero compaction interval must be rejected");
+    assert!(err.to_string().contains("compaction_interval"), "{err}");
 }

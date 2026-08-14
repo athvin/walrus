@@ -99,8 +99,8 @@ async fn pipeline(
     const SCHEMA_VERSION: i64 = 1;
     let triggers = pg_sink::batch::BatchTriggers {
         max_fill: cfg.max_fill,
-        max_rows: cfg.max_rows.get(),
-        max_bytes: cfg.max_bytes.get(),
+        max_rows: cfg.max_rows,
+        max_bytes: cfg.max_bytes,
     };
     let mut cache = pg_sink::relcache::RelationCache::default();
 
@@ -128,7 +128,7 @@ async fn pipeline(
         std::sync::Arc::new(pg_sink::batch::SystemClock),
         epoch,
         &cfg.instance,
-        cfg.max_inflight_bytes.get(),
+        cfg.max_inflight_bytes,
     );
 
     // The idle heartbeat rides a SEPARATE ordinary SQL connection (distinct from replication); its
@@ -164,7 +164,7 @@ async fn pipeline(
             instance: cfg.instance.clone(),
             publication_name: cfg.publication_name.clone(),
             epoch,
-            chunk_rows: cfg.reload_chunk_rows.get(),
+            chunk_rows: cfg.reload_chunk_rows,
             echo_timeout: cfg.reload_echo_timeout,
             reload_max_restarts: cfg.reload_max_restarts,
         },

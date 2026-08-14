@@ -114,8 +114,8 @@ async fn alter_add_column_bumps_version_and_cuts_file() {
     // High row cap → the pre-DDL row stays buffered until the DDL CUTS it (the interesting path).
     let mut router = BatchRouter::new(
         BatchTriggers {
-            max_rows: u64::MAX,
-            max_bytes: u64::MAX,
+            max_rows: std::num::NonZeroU64::MAX,
+            max_bytes: std::num::NonZeroU64::MAX,
             max_fill: Duration::from_secs(3600),
         },
         Arc::new(SystemClock),

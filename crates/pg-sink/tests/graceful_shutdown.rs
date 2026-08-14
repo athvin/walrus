@@ -133,8 +133,8 @@ async fn sigterm_mid_stream_drains_commits_and_resumes() {
     // Thresholds so high nothing auto-flushes: the batch is committed but stays in flight.
     let mut router = BatchRouter::new(
         BatchTriggers {
-            max_rows: u64::MAX,
-            max_bytes: u64::MAX,
+            max_rows: std::num::NonZeroU64::MAX,
+            max_bytes: std::num::NonZeroU64::MAX,
             max_fill: Duration::from_secs(3600),
         },
         Arc::new(SystemClock),

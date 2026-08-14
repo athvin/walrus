@@ -21,6 +21,7 @@
 use crate::reload_signal::WatermarkWaiters;
 use anyhow::Context as _;
 use common::EpochNo;
+use std::num::NonZeroU64;
 use std::ops::AsyncFnMut;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
@@ -315,7 +316,7 @@ pub struct ReloadControllerConfig {
     pub publication_name: String,
     pub epoch: EpochNo,
     /// Rows per chunk SELECT (PR 6.5).
-    pub chunk_rows: u64,
+    pub chunk_rows: NonZeroU64,
     /// How long a chunk waits for its watermark echo before failing loudly (PR 6.5 / H11).
     pub echo_timeout: Duration,
     /// How many DDL-restarts a reload may consume before it fails (PR 6.8 / H9).

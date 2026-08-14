@@ -161,7 +161,7 @@ async fn setup(epoch: EpochNo, max_files: i64) -> (TableCtx, std::path::PathBuf)
         rel: orders(),
         db,
         state: LoaderState::new(),
-        max_files,
+        max_files: std::num::NonZeroI64::new(max_files).unwrap(),
         poll_interval: Duration::from_secs(5),
         compaction_interval: Duration::from_secs(3600),
         retention_lsn_lag: 16 << 20,

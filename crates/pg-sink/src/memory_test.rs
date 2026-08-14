@@ -1,8 +1,12 @@
 use super::*;
 
+fn nz(value: u64) -> NonZeroU64 {
+    NonZeroU64::new(value).unwrap()
+}
+
 #[test]
 fn over_ceiling_when_sum_across_streams_exceeds_budget() {
-    let mut m = InflightMeter::new(1000);
+    let mut m = InflightMeter::new(nz(1000));
     m.add((1, 100), 400);
     m.add((2, 100), 400);
     assert!(!m.over_ceiling(), "800 <= 1000");
@@ -19,7 +23,7 @@ fn over_ceiling_when_sum_across_streams_exceeds_budget() {
 
 #[test]
 fn largest_open_picks_the_biggest_stream() {
-    let mut m = InflightMeter::new(10_000);
+    let mut m = InflightMeter::new(nz(10_000));
     m.add((1, 100), 200);
     m.add((2, 101), 900);
     m.add((3, 102), 500);
@@ -28,7 +32,7 @@ fn largest_open_picks_the_biggest_stream() {
 
 #[test]
 fn shed_prefers_committed_then_spill_then_pause() {
-    let mut m = InflightMeter::new(100);
+    let mut m = InflightMeter::new(nz(100));
     assert_eq!(decide(&m, true), None, "under ceiling → no shedding");
     m.add((7, 55), 200); // over ceiling
     assert_eq!(
@@ -41,8 +45,8 @@ fn shed_prefers_committed_then_spill_then_pause() {
         Some(ShedAction::SpillOpenTxn(7, 55)),
         "no committed → spill the largest open stream"
     );
-    let mut empty = InflightMeter::new(0); // over ceiling but nothing open
-    empty.total = 1; // simulate a tiny over-count with no streams
+    let mut empty = InflightMeter::new(nz(1)); // over ceiling but nothing open
+    empty.total = 2; // simulate a tiny over-count with no streams
     assert_eq!(
         decide(&empty, false),
         Some(ShedAction::PausePoll),
@@ -53,7 +57,7 @@ fn shed_prefers_committed_then_spill_then_pause() {
 #[test]
 fn hysteresis_pauses_at_activate_resumes_at_lower_ratio() {
     let mut bp = Backpressure::new(HysteresisBand::DEFAULT);
-    let c = 1000;
+    let c = nz(1000);
     assert!(!bp.tick(800, c), "0.80 < activate 0.85 → not paused");
     assert!(bp.tick(860, c), "0.86 >= activate → paused");
     assert!(
@@ -87,7 +91,7 @@ fn default_band_is_valid() {
 
 #[test]
 fn add_saturates_at_u64_max_and_stays_over_ceiling() {
-    let mut m = InflightMeter::new(1_000);
+    let mut m = InflightMeter::new(nz(1_000));
     m.add((1, 100), u64::MAX);
     m.add((1, 100), 1);
     assert_eq!(m.total(), u64::MAX);
@@ -96,7 +100,7 @@ fn add_saturates_at_u64_max_and_stays_over_ceiling() {
 
 #[test]
 fn release_after_saturation_does_not_wrap_the_total() {
-    let mut m = InflightMeter::new(1_000);
+    let mut m = InflightMeter::new(nz(1_000));
     m.add((1, 100), u64::MAX);
     m.add((2, 200), u64::MAX);
     m.release((1, 100));

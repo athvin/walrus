@@ -14,6 +14,7 @@ use arrow::record_batch::RecordBatch;
 use common::{Lsn, SinkMeta, TupleValue, UtcTimestamp};
 use pg_to_arrow::BatchBuilder;
 use std::fmt;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -60,8 +61,8 @@ impl Clock for SystemClock {
 #[derive(Clone, Copy, Debug)]
 pub struct BatchTriggers {
     pub max_fill: Duration,
-    pub max_rows: u64,
-    pub max_bytes: u64,
+    pub max_rows: NonZeroU64,
+    pub max_bytes: NonZeroU64,
 }
 
 /// A finished, ready-to-write batch. `lsn_end` = commit LSN of the last txn (NOT the max row LSN).
@@ -185,8 +186,8 @@ impl TableBatcher {
         if self.has_open_txn() || self.committed_rows == 0 {
             return false;
         }
-        self.committed_rows >= self.triggers.max_rows
-            || self.committed_bytes >= self.triggers.max_bytes
+        self.committed_rows >= self.triggers.max_rows.get()
+            || self.committed_bytes >= self.triggers.max_bytes.get()
             || self.opened_at.is_some_and(|t| {
                 self.clock.now().saturating_duration_since(t) >= self.triggers.max_fill
             })

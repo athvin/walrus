@@ -217,7 +217,7 @@ async fn await_resolver_ready(
 
 fn export_cfg(epoch: EpochNo, chunk_rows: u64) -> ChunkExportConfig {
     ChunkExportConfig {
-        chunk_rows,
+        chunk_rows: std::num::NonZeroU64::new(chunk_rows).unwrap(),
         echo_timeout: Duration::from_secs(20),
         instance: "walrus-sink-test".to_string(),
         epoch,

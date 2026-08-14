@@ -6,7 +6,15 @@ use common::config::ObjectStoreConfig;
 use common::TelemetryConfig;
 use serde::Deserialize;
 use std::net::SocketAddr;
+use std::num::NonZeroI64;
 use std::time::Duration;
+
+const fn nonzero_i64(value: i64) -> NonZeroI64 {
+    match NonZeroI64::new(value) {
+        Some(value) => value,
+        None => NonZeroI64::MIN,
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -39,8 +47,9 @@ pub struct LoaderConfig {
     /// `transformed_lsn - retention_lsn_lag`. The rebuild's mirror baseline makes even an aggressive
     /// prune lossless (a pruned value survives as the current mirror row).
     pub retention_lsn_lag: u64,
-    /// Manifest files claimed per Phase-A cycle.
-    pub max_files_per_cycle: i64,
+    /// Manifest files claimed per Phase-A cycle. A zero cap would make the loop claim nothing
+    /// forever, so the invariant is encoded in the type and enforced during deserialization.
+    pub max_files_per_cycle: NonZeroI64,
     /// Bootstrap retry budget for transient deps.
     #[serde(with = "humantime_serde")]
     pub startup_deadline: Duration,
@@ -61,7 +70,7 @@ impl Default for LoaderConfig {
             poll_interval: Duration::from_secs(5),
             compaction_interval: Duration::from_secs(3600),
             retention_lsn_lag: 16 << 20, // 16 MiB of WAL retained behind transformed_lsn
-            max_files_per_cycle: 32,
+            max_files_per_cycle: nonzero_i64(32),
             startup_deadline: Duration::from_secs(60),
             health_addr: SocketAddr::from(([0, 0, 0, 0], 8080)),
         }
@@ -108,8 +117,9 @@ impl LoaderConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError`] when a required value is empty, `lease_ttl` is too short for renewal,
-    /// or the runtime worker count is outside its documented bound. These are terminal failures.
+    /// Returns [`ConfigError`] when a required value is empty, a cadence is zero, `lease_ttl` is too
+    /// short for renewal, or the runtime worker count is outside its documented bound. These are
+    /// terminal failures.
     pub fn validate(&self) -> Result<(), ConfigError> {
         for (field, v) in [
             ("control_db_url", &self.control_db_url),
@@ -128,6 +138,14 @@ impl LoaderConfig {
                  use >= {MIN_LEASE_TTL:?}",
                 self.lease_ttl
             )));
+        }
+        for (field, value) in [
+            ("poll_interval", self.poll_interval),
+            ("compaction_interval", self.compaction_interval),
+        ] {
+            if value.is_zero() {
+                return Err(ConfigError(format!("{field} must be greater than zero")));
+            }
         }
         common::runtime::validate_worker_threads(self.worker_threads)
             .map_err(|detail| ConfigError(format!("worker_threads: {detail}")))?;
