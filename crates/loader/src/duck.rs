@@ -199,8 +199,9 @@ impl TableDb {
     ///
     /// # Errors
     ///
-    /// Returns [`LoaderError::Duck`] if the Parquet schema cannot be inspected or its rows cannot be
-    /// appended into the raw table.
+    /// Returns [`LoaderError::Internal`] if the Parquet schema contains a column name that cannot be
+    /// represented as a SQL identifier, or [`LoaderError::Duck`] if the schema cannot be inspected
+    /// or its rows cannot be appended into the raw table.
     pub fn append_parquet(
         &self,
         table: &str,
@@ -218,8 +219,14 @@ impl TableDb {
         let file_cols = self.columns_for(&uri, schema_version)?;
         let quoted = file_cols
             .iter()
-            .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
-            .collect::<Vec<_>>()
+            .map(|column| {
+                common::sql::SqlIdent::new(column)
+                    .map(|ident| ident.to_string())
+                    .map_err(|e| {
+                        LoaderError::Internal(format!("parquet column name from {s3_uri}: {e}"))
+                    })
+            })
+            .collect::<Result<Vec<_>, LoaderError>>()?
             .join(", ");
         let commit_lsn_expr = match commit_lsn_override {
             Some(lsn) => format!("'{}'", common::sql::sql_literal(lsn)),

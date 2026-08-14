@@ -15,6 +15,7 @@
 //! `version()`.
 
 use crate::config::SinkConfig;
+use common::sql::SqlIdent;
 use std::collections::HashSet;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 
@@ -295,7 +296,7 @@ impl<'a> SourcePreflight<'a> {
                 self.exec(&format!(
                     "CREATE PUBLICATION {} FOR TABLE walrus.heartbeat, walrus.ddl_audit, \
                      walrus.reload_signal WITH (publish_via_partition_root = true)",
-                    ident(pubname)
+                    ident(pubname)?
                 ))
                 .await?;
             } else {
@@ -319,9 +320,9 @@ impl<'a> SourcePreflight<'a> {
                 if self.cfg.manage_publication {
                     self.exec(&format!(
                         "ALTER PUBLICATION {} ADD TABLE {}.{}",
-                        ident(pubname),
-                        ident(schema),
-                        ident(table)
+                        ident(pubname)?,
+                        ident(schema)?,
+                        ident(table)?
                     ))
                     .await?;
                 } else {
@@ -475,9 +476,9 @@ fn lit(s: &str) -> String {
     format!("'{}'", common::sql::sql_literal(s))
 }
 
-/// A SQL identifier (double-quoted, quotes doubled).
-fn ident(s: &str) -> String {
-    format!("\"{}\"", s.replace('"', "\"\""))
+/// Validate a SQL identifier before its [`std::fmt::Display`] implementation quotes it.
+fn ident(s: &str) -> Result<SqlIdent, PreflightError> {
+    SqlIdent::new(s).map_err(|e| PreflightError::Query(format!("invalid SQL identifier: {e}")))
 }
 
 #[cfg(test)]
