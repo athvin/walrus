@@ -1,6 +1,7 @@
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
+    clippy::let_underscore_must_use,
     reason = "integration test — unwrap/expect fine in setup + helpers"
 )]
 //! End-to-end: the anchor use case (reload §2) — a lossy `ALTER COLUMN TYPE` quarantine recovered

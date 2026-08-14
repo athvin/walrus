@@ -1,6 +1,7 @@
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
+    clippy::let_underscore_must_use,
     reason = "integration test — unwrap/expect fine in setup + helpers"
 )]
 //! Full-rebuild / compaction (loader §5.7, §9.4). Three hermetic tests prove the rebuild matches the

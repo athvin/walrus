@@ -96,7 +96,12 @@ pub async fn run_phase_b(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     conn.execute_batch("BEGIN TRANSACTION;")
         .duck("begin transform txn")?;
     if let Err(e) = apply_transform(conn, &t, &after) {
-        let _ = conn.execute_batch("ROLLBACK;");
+        if let Err(rollback) = conn.execute_batch("ROLLBACK;") {
+            tracing::warn!(
+                error = %rollback,
+                "transform rollback failed; connection may be wedged"
+            );
+        }
         return Err(e);
     }
     conn.execute_batch("COMMIT;").duck("commit transform txn")?;

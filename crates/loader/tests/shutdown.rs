@@ -1,6 +1,7 @@
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
+    clippy::let_underscore_must_use,
     reason = "integration test — unwrap/expect fine in setup + helpers"
 )]
 //! Graceful SIGTERM drain (loader §8.5) — compose (`#[ignore]`). On cancel each worker finishes the

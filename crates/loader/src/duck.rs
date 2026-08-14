@@ -511,7 +511,7 @@ const _: fn() = || {
     fn cache_refcell(db: &TableDb) -> &RefCell<HashMap<SchemaVersionNo, Arc<[String]>>> {
         &db.parquet_cols
     }
-    let _ = cache_refcell;
+    let _cache_refcell_fn = cache_refcell;
 };
 
 // Negative assertion: while the overall `TableDb` is not `Sync`, only the `()` impl applies and `_`
@@ -524,7 +524,7 @@ const _: fn() = || {
     impl<T: ?Sized> AmbiguousIfSync<()> for T {}
     impl<T: ?Sized + Sync> AmbiguousIfSync<u8> for T {}
 
-    let _ = <TableDb as AmbiguousIfSync<_>>::some_item;
+    let _some_item = <TableDb as AmbiguousIfSync<_>>::some_item;
 };
 
 #[cfg(test)]

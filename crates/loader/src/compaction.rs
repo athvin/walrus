@@ -47,7 +47,12 @@ pub fn full_rebuild(
     conn.execute_batch("BEGIN TRANSACTION;")
         .duck("begin rebuild txn")?;
     if let Err(source) = conn.execute_batch(&t.render_rebuild(&boundary)) {
-        let _ = conn.execute_batch("ROLLBACK;");
+        if let Err(rollback) = conn.execute_batch("ROLLBACK;") {
+            tracing::warn!(
+                error = %rollback,
+                "full-rebuild rollback failed; connection may be wedged"
+            );
+        }
         if cancel.is_cancelled() {
             // Interrupted by the drain (the watcher called `interrupt()`): an intentional abort, the old
             // mirror is intact via ROLLBACK, and the rebuild re-runs next cycle. NOT an error.

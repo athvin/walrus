@@ -1,6 +1,7 @@
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
+    clippy::let_underscore_must_use,
     clippy::missing_errors_doc,
     clippy::must_use_candidate,
     clippy::disallowed_methods,

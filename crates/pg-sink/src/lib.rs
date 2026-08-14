@@ -1,3 +1,11 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::let_underscore_must_use,
+        reason = "unit tests intentionally discard cleanup results"
+    )
+)]
+
 //! `pg_sink` — the walrus Postgres sink library.
 //!
 //! The hand-rolled pgoutput decoder lives in [`pgoutput`] (driven by golden byte vectors from

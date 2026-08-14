@@ -1,6 +1,7 @@
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
+    clippy::let_underscore_must_use,
     reason = "integration test — unwrap/expect fine in setup + helpers"
 )]
 //! The flagship correctness test (§1.6, proto §9b) against compose (`#[ignore]` — needs source PG with

@@ -217,7 +217,7 @@ pub fn apply_additive(
                 let name = &c.name;
                 // Nullable on both (no NOT NULL): pre-change rows read NULL; old raw rows stay valid.
                 // `String`'s `fmt::Write` implementation is infallible.
-                let _ = write!(
+                let _write_result = write!(
                     &mut sql,
                     "ALTER TABLE \"{cur}\" ADD COLUMN IF NOT EXISTS \"{name}\" {ty}; \
                      ALTER TABLE \"{cur}_raw\" ADD COLUMN IF NOT EXISTS \"{name}\" {ty};"
@@ -225,7 +225,7 @@ pub fn apply_additive(
                 structural = true;
             }
             AdditiveChange::RenameColumn { from, to, .. } => {
-                let _ = write!(
+                let _write_result = write!(
                     &mut sql,
                     "ALTER TABLE \"{cur}\" RENAME COLUMN \"{from}\" TO \"{to}\"; \
                      ALTER TABLE \"{cur}_raw\" RENAME COLUMN \"{from}\" TO \"{to}\";"
@@ -234,7 +234,7 @@ pub fn apply_additive(
             }
             AdditiveChange::WidenColumn { name, new, .. } => {
                 let ty = duck_type(new.type_oid);
-                let _ = write!(
+                let _write_result = write!(
                     &mut sql,
                     "ALTER TABLE \"{cur}\" ALTER COLUMN \"{name}\" TYPE {ty}; \
                      ALTER TABLE \"{cur}_raw\" ALTER COLUMN \"{name}\" TYPE {ty};"
@@ -242,7 +242,7 @@ pub fn apply_additive(
                 structural = true;
             }
             AdditiveChange::RenameTable { from, to } => {
-                let _ = write!(
+                let _write_result = write!(
                     &mut sql,
                     "ALTER TABLE \"{cur}\" RENAME TO \"{to}\"; \
                      ALTER TABLE \"{cur}_raw\" RENAME TO \"{to}_raw\"; \
@@ -260,10 +260,12 @@ pub fn apply_additive(
                 };
                 match target {
                     CommentTarget::Table => {
-                        let _ = write!(&mut sql, "COMMENT ON TABLE \"{cur}\" IS {lit};");
+                        let _write_result =
+                            write!(&mut sql, "COMMENT ON TABLE \"{cur}\" IS {lit};");
                     }
                     CommentTarget::Column(col) => {
-                        let _ = write!(&mut sql, "COMMENT ON COLUMN \"{cur}\".\"{col}\" IS {lit};");
+                        let _write_result =
+                            write!(&mut sql, "COMMENT ON COLUMN \"{cur}\".\"{col}\" IS {lit};");
                     }
                 }
             }

@@ -552,14 +552,14 @@ fn continuation_sql(
                 other => sql_lit(&other.to_string()),
             })
             .collect();
-        let _ = write!(
+        let _write_result = write!(
             &mut sql,
             " WHERE ({}) > ({})",
             key_cols.join(", "),
             literals.join(", ")
         );
     }
-    let _ = write!(&mut sql, " ORDER BY {} LIMIT {limit}", key_cols.join(", "));
+    let _write_result = write!(&mut sql, " ORDER BY {} LIMIT {limit}", key_cols.join(", "));
     sql
 }
 

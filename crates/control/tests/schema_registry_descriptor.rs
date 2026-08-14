@@ -55,7 +55,7 @@ async fn schema_registry_roundtrips_a_type_descriptor() {
             col("code", 1042, 9, false),  // char(5): bpchar, typmod = 5 + VARHDRSZ(4)
         ],
     };
-    let descriptors = describe_relation(&rel);
+    let descriptors = describe_relation(&rel).unwrap();
     assert_eq!(descriptors.len(), 3);
 
     let row = RegistryRow {

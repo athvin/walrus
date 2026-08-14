@@ -1,6 +1,7 @@
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
+    clippy::let_underscore_must_use,
     reason = "integration test — unwrap/expect fine in setup + helpers"
 )]
 //! Chunk export engine against compose (`#[ignore]` — needs source PG + control PG + MinIO).
@@ -101,7 +102,7 @@ async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: EpochN
             source_schema: "public".to_string(),
             source_table: TABLE.to_string(),
             schema_version: SchemaVersionNo(1),
-            descriptors: pg_to_arrow::descriptor::describe_relation(&rel),
+            descriptors: pg_to_arrow::descriptor::describe_relation(&rel).unwrap(),
             columns: serde_json::to_value(&rel).unwrap(),
         },
     )

@@ -1,3 +1,11 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::let_underscore_must_use,
+        reason = "unit tests intentionally discard cleanup results"
+    )
+)]
+
 //! Shared primitives for walrus: errors + exit codes, `Lsn`, telemetry, config,
 //! `SinkMeta`, and the neutral Postgres shape types. Populated PR by PR (0.2 →).
 

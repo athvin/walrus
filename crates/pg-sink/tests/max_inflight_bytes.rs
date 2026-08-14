@@ -1,6 +1,7 @@
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
+    clippy::let_underscore_must_use,
     reason = "integration test — unwrap/expect fine in setup + helpers"
 )]
 //! Aggregate `max_inflight_bytes` ceiling (§1.3) against compose (`#[ignore]` — needs source PG with

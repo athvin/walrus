@@ -1,6 +1,7 @@
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
+    clippy::let_underscore_must_use,
     reason = "integration test — unwrap/expect fine in setup + helpers"
 )]
 //! Restart-on-DDL against compose (`#[ignore]` — needs source PG + control PG + MinIO). A schema
@@ -124,7 +125,7 @@ async fn register(
             source_schema: "public".to_string(),
             source_table: TABLE.to_string(),
             schema_version: version,
-            descriptors: pg_to_arrow::descriptor::describe_relation(&rel),
+            descriptors: pg_to_arrow::descriptor::describe_relation(&rel).unwrap(),
             columns: serde_json::to_value(&rel).unwrap(),
         },
     )

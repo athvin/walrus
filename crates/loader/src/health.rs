@@ -120,7 +120,7 @@ impl LoaderState {
     /// the attempt's schema_version, so the lossy cast the latch recorded no longer applies to
     /// anything — `/ready` recovers.
     pub fn clear_quarantine(&self) {
-        let _ = self
+        let _transitioned = self
             .phase
             .transition(LoaderPhase::Quarantined, LoaderPhase::Ready);
     }

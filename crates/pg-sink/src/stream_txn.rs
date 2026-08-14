@@ -328,7 +328,13 @@ impl StreamDemux {
             if let Some(txn) = self.open.remove(&top_xid) {
                 self.release_txn_meter(&txn);
                 for s in &txn.staged {
-                    let _ = sink.delete(&s.written.key).await;
+                    if let Err(error) = sink.delete(&s.written.key).await {
+                        tracing::warn!(
+                            key = %s.written.key,
+                            error = %error,
+                            "failed to delete aborted speculative spill; object orphaned in staging"
+                        );
+                    }
                 }
                 tracing::info!(
                     top_xid,
@@ -354,7 +360,13 @@ impl StreamDemux {
             None => return,
         };
         for key in &doomed {
-            let _ = sink.delete(key).await;
+            if let Err(error) = sink.delete(key).await {
+                tracing::warn!(
+                    key = %key,
+                    error = %error,
+                    "failed to delete rolled-back speculative spill; object orphaned in staging"
+                );
+            }
         }
         tracing::info!(
             top_xid,
@@ -400,7 +412,13 @@ impl StreamDemux {
         // Publish speculative spills whose sub-xid did NOT abort, stamped with the real commit LSN.
         for spill in staged {
             if aborted.contains(&spill.sub_xid) {
-                let _ = sink.delete(&spill.written.key).await; // defensive; usually deleted on abort
+                if let Err(error) = sink.delete(&spill.written.key).await {
+                    tracing::warn!(
+                        key = %spill.written.key,
+                        error = %error,
+                        "failed to delete aborted speculative spill; object orphaned in staging"
+                    );
+                }
                 continue;
             }
             let mut w = spill.written;

@@ -1,6 +1,7 @@
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
+    clippy::let_underscore_must_use,
     reason = "integration test — unwrap/expect fine in setup + helpers"
 )]
 #![allow(
@@ -118,7 +119,7 @@ async fn seed_registry(
             source_schema: "public".to_string(),
             source_table: table.to_string(),
             schema_version: SchemaVersionNo(1),
-            descriptors: pg_to_arrow::descriptor::describe_relation(&rel),
+            descriptors: pg_to_arrow::descriptor::describe_relation(&rel).unwrap(),
             columns: serde_json::to_value(&rel).unwrap(),
         };
         control::upsert_registry(pool, &row).await.unwrap();

@@ -10,40 +10,52 @@
 //! Parquet the sink actually writes. `tier_of` mirrors that dispatch's precedence branch-for-branch.
 
 use crate::range::RangeFamily;
-use crate::{geometric, oids, schema, tier3, uuid_enum};
+use crate::{geometric, oids, schema, tier3, uuid_enum, Error};
 use arrow::datatypes::DataType;
 use common::{PgColumn, PgRelation, Tier, TypeDescriptor, TypeMeta};
 use std::num::NonZeroU32;
 
 /// Derive the per-column mapping descriptor (§2.6). Enum `enum_labels` are caller-supplied (the sink
 /// hydrates them from the catalog in PR 2.22); use [`describe_column_with_labels`] to pass them.
-#[must_use]
-pub fn describe_column(col: &PgColumn) -> TypeDescriptor {
+///
+/// # Errors
+///
+/// Returns [`Error`] when the column cannot be mapped to its emitted Arrow fields.
+#[must_use = "the descriptor error must be handled"]
+pub fn describe_column(col: &PgColumn) -> Result<TypeDescriptor, Error> {
     describe_column_with_labels(col, None)
 }
 
 /// [`describe_column`] plus the ordered enum label set (only used when the column is an enum).
-#[must_use]
+///
+/// # Errors
+///
+/// Returns [`Error`] when the column cannot be mapped to its emitted Arrow fields.
+#[must_use = "the descriptor error must be handled"]
 pub fn describe_column_with_labels(
     col: &PgColumn,
     enum_labels: Option<Vec<String>>,
-) -> TypeDescriptor {
+) -> Result<TypeDescriptor, Error> {
     let tier = tier_of(col);
-    TypeDescriptor {
+    Ok(TypeDescriptor {
         column: col.name.clone(),
         pg_type_oid: col.type_oid,
         pg_type: pg_type_name(col.type_oid).to_string(),
         tier,
-        arrow: arrow_of(col, tier),
-        duckdb: duckdb_of(col, tier),
-        emit: emit_of(col),
+        arrow: arrow_of(col, tier)?,
+        duckdb: duckdb_of(col, tier)?,
+        emit: emit_of(col)?,
         recombine: recombine_of(col),
         meta: meta_of(col, enum_labels),
-    }
+    })
 }
 
 /// Descriptors for every column of a relation, in column order.
-pub fn describe_relation(rel: &PgRelation) -> Vec<TypeDescriptor> {
+///
+/// # Errors
+///
+/// Returns [`Error`] when any column cannot be mapped to its emitted Arrow fields.
+pub fn describe_relation(rel: &PgRelation) -> Result<Vec<TypeDescriptor>, Error> {
     rel.columns.iter().map(describe_column).collect()
 }
 
@@ -74,15 +86,11 @@ fn tier_of(col: &PgColumn) -> Tier {
 /// The emitted `name:ARROW_TYPE` list, taken **directly** from [`schema::emit_fields`] so it lists the
 /// sibling columns in exactly the order (and with the names) the sink writes them. The loader
 /// positional-binds against this list.
-fn emit_of(col: &PgColumn) -> Vec<String> {
-    schema::emit_fields(col)
-        .map(|fields| {
-            fields
-                .iter()
-                .map(|f| format!("{}:{}", f.name(), arrow_emit_name(f.data_type())))
-                .collect()
-        })
-        .unwrap_or_default()
+fn emit_of(col: &PgColumn) -> Result<Vec<String>, Error> {
+    Ok(schema::emit_fields(col)?
+        .iter()
+        .map(|f| format!("{}:{}", f.name(), arrow_emit_name(f.data_type())))
+        .collect())
 }
 
 /// The loader-side recombine expression (a hint the loader phase finalizes). Only the types that
@@ -119,18 +127,18 @@ fn meta_of(col: &PgColumn, enum_labels: Option<Vec<String>>) -> TypeMeta {
 }
 
 /// The `arrow` descriptor string: Tier-2 is a decomposition; Tier-1/Tier-3 report the single Arrow type.
-fn arrow_of(col: &PgColumn, tier: Tier) -> String {
-    match tier {
+fn arrow_of(col: &PgColumn, tier: Tier) -> Result<String, Error> {
+    Ok(match tier {
         Tier::Two => "Struct/Decomposed".to_string(),
-        _ => first_field_type(col)
+        _ => first_field_type(col)?
             .map(|dt| format!("{dt:?}"))
             .unwrap_or_else(|| "Utf8".to_string()),
-    }
+    })
 }
 
 /// The `duckdb` target type string.
-fn duckdb_of(col: &PgColumn, tier: Tier) -> String {
-    match tier {
+fn duckdb_of(col: &PgColumn, tier: Tier) -> Result<String, Error> {
+    Ok(match tier {
         Tier::Two => match col.type_oid {
             oids::INTERVAL => "INTERVAL".to_string(),
             oids::TIMETZ => "TIMETZ".to_string(),
@@ -142,16 +150,16 @@ fn duckdb_of(col: &PgColumn, tier: Tier) -> String {
             }
             _ => "STRUCT".to_string(), // geometric
         },
-        _ => first_field_type(col)
+        _ => first_field_type(col)?
             .map(|dt| duckdb_scalar_name(&dt).to_string())
             .unwrap_or_else(|| "VARCHAR".to_string()),
-    }
+    })
 }
 
-fn first_field_type(col: &PgColumn) -> Option<DataType> {
-    schema::emit_fields(col)
-        .ok()
-        .and_then(|fields| fields.first().map(|f| f.data_type().clone()))
+fn first_field_type(col: &PgColumn) -> Result<Option<DataType>, Error> {
+    Ok(schema::emit_fields(col)?
+        .first()
+        .map(|f| f.data_type().clone()))
 }
 
 /// Parquet-ish emit-suffix name (matches the §2.6 interval example `INT32`/`INT64`).

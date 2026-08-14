@@ -12,7 +12,7 @@ fn col(name: &str, oid: u32, typmod: i32) -> PgColumn {
 
 #[test]
 fn interval_descriptor_has_three_emits_and_recombine() {
-    let d = describe_column(&col("duration", oids::INTERVAL, -1));
+    let d = describe_column(&col("duration", oids::INTERVAL, -1)).unwrap();
     assert_eq!(d.tier, Tier::Two);
     assert_eq!(
         d.emit,
@@ -33,7 +33,7 @@ fn interval_descriptor_has_three_emits_and_recombine() {
 #[test]
 fn enum_descriptor_carries_ordered_labels() {
     let labels = vec!["happy".to_string(), "meh".to_string(), "sad".to_string()];
-    let d = describe_column_with_labels(&col("mood", 16400, -1), Some(labels.clone()));
+    let d = describe_column_with_labels(&col("mood", 16400, -1), Some(labels.clone())).unwrap();
     assert_eq!(d.tier, Tier::Three);
     assert_eq!(d.emit, vec!["mood:VARCHAR"]);
     assert_eq!(d.duckdb, "VARCHAR");
@@ -47,23 +47,23 @@ fn enum_descriptor_carries_ordered_labels() {
 #[test]
 fn char_n_descriptor_carries_char_length() {
     // char(5) → bpchar, typmod = 5 + VARHDRSZ(4) = 9.
-    let d = describe_column(&col("code", oids::BPCHAR, 9));
+    let d = describe_column(&col("code", oids::BPCHAR, 9)).unwrap();
     assert_eq!(d.tier, Tier::One);
     assert_eq!(d.meta.char_length, NonZeroU32::new(5));
     assert_eq!(d.emit, vec!["code:VARCHAR"]);
 
-    let invalid = describe_column(&col("code", oids::BPCHAR, 4));
+    let invalid = describe_column(&col("code", oids::BPCHAR, 4)).unwrap();
     assert_eq!(invalid.meta.char_length, None);
 }
 
 #[test]
 fn bit_descriptor_carries_bit_length() {
     // bit(8): atttypmod is the raw bit count (no VARHDRSZ), and it's a Tier-3 VARCHAR carrier.
-    let d = describe_column(&col("flags", oids::BIT, 8));
+    let d = describe_column(&col("flags", oids::BIT, 8)).unwrap();
     assert_eq!(d.tier, Tier::Three);
     assert_eq!(d.meta.bit_length, NonZeroU32::new(8));
 
-    let invalid = describe_column(&col("flags", oids::BIT, 0));
+    let invalid = describe_column(&col("flags", oids::BIT, 0)).unwrap();
     assert_eq!(invalid.meta.bit_length, None);
 }
 
@@ -96,7 +96,7 @@ fn tier_matches_emit_fields_for_every_supported_oid() {
             .iter()
             .map(|f| format!("{}:{}", f.name(), arrow_emit_name(f.data_type())))
             .collect();
-        let d = describe_column(&c);
+        let d = describe_column(&c).unwrap();
         assert_eq!(d.emit, expected, "emit drift for oid {oid}");
         assert!(
             !d.emit.is_empty(),
@@ -108,7 +108,7 @@ fn tier_matches_emit_fields_for_every_supported_oid() {
 
 #[test]
 fn descriptor_json_roundtrips() {
-    let d = describe_column(&col("duration", oids::INTERVAL, -1));
+    let d = describe_column(&col("duration", oids::INTERVAL, -1)).unwrap();
     let json = serde_json::to_string(&d).unwrap();
     let back: TypeDescriptor = serde_json::from_str(&json).unwrap();
     assert_eq!(back, d);

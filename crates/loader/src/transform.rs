@@ -14,6 +14,7 @@
 use crate::duck_ext::DuckResultExt;
 use crate::error::LoaderError;
 use common::{Lsn, PgRelation};
+use duckdb::OptionalExt;
 
 /// The transform template (single source of truth). Rendered by [`TransformSql::render`].
 pub const TRANSFORM_SQL: &str = include_str!("../sql/duckdb/templates/transform.sql");
@@ -152,8 +153,9 @@ impl TransformSql {
     ///
     /// # Errors
     ///
-    /// Returns [`LoaderError::LsnParse`] if a stored truncate commit or row LSN is malformed. A
-    /// missing row (including a failed optional lookup) is treated as no truncate boundary.
+    /// Returns [`LoaderError::LsnParse`] if a stored truncate commit or row LSN is malformed, or
+    /// [`LoaderError::Duck`] if DuckDB rejects the boundary query. Only a genuinely missing row is
+    /// treated as no truncate boundary.
     pub fn latest_truncate(
         &self,
         conn: &duckdb::Connection,
@@ -167,7 +169,8 @@ impl TransformSql {
         );
         let row: Option<(String, String)> = conn
             .query_row(&sql, [], |r| Ok((r.get(0)?, r.get(1)?)))
-            .ok(); // no rows → no truncate
+            .optional()
+            .duck_with(|| format!("scan truncate boundary on {}_raw", self.table))?;
         match row {
             None => Ok(TruncateBoundary::none()),
             Some((ct, lt)) => Ok(TruncateBoundary {
