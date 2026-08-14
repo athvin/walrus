@@ -11,6 +11,7 @@
 
 pub mod config;
 pub mod error;
+pub mod failure_class;
 pub mod ids;
 pub mod lsn;
 pub mod metrics;
@@ -24,6 +25,7 @@ pub mod type_descriptor;
 
 pub use config::CommonConfig;
 pub use error::{Error, ExitCode, Result};
+pub use failure_class::FailureClass;
 pub use ids::{EpochNo, ManifestId, ReloadId, SchemaVersionNo};
 pub use lsn::Lsn;
 pub use pg_shape::{PgColumn, PgRelation, ReplicaIdentity, TupleValue};
