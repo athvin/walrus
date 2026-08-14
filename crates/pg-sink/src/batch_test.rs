@@ -29,6 +29,27 @@ impl Clock for FakeClock {
     }
 }
 
+/// A `C: Clock` bound must accept every shape a walrus clock is actually held in: owned, shared
+/// (`Arc`, including the `Arc<FakeClock>` the test fake hands back) and borrowed.
+#[test]
+fn clock_bound_accepts_owned_shared_and_borrowed_clocks() {
+    fn tick<C: Clock>(c: C) -> Instant {
+        c.now()
+    }
+
+    let baseline = Instant::now();
+    let owned = SystemClock;
+    let shared = Arc::new(SystemClock);
+    let fake = FakeClock::new();
+
+    let a = tick(SystemClock);
+    let b = tick(shared);
+    let c = tick(fake);
+    let d = tick(&owned);
+
+    assert!([a, b, c, d].into_iter().all(|instant| instant >= baseline));
+}
+
 fn cached() -> Arc<CachedRelation> {
     let rel = PgRelation {
         oid: 42,
