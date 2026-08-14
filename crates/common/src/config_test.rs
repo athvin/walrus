@@ -1,4 +1,5 @@
 use super::*;
+use crate::FailureClass;
 
 /// A config that passes `validate()`, so a test can mutate exactly one field to prove the
 /// bound it targets.

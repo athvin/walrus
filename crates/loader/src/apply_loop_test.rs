@@ -1,5 +1,5 @@
 use super::*;
-use common::EpochNo;
+use common::{EpochNo, FailureClass};
 
 #[test]
 fn a_watch_bump_trips_the_total_restart_guard() {

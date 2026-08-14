@@ -3,7 +3,7 @@
 //! idiom). Transient failures are retried to a deadline *before* becoming one of these.
 
 use crate::config::ConfigError;
-use common::EpochNo;
+use common::{EpochNo, ExitCode, FailureClass};
 
 /// This taxonomy is still growing; new variants must remain additive for downstream crates.
 #[derive(Debug, thiserror::Error)]
@@ -120,9 +120,30 @@ impl From<&LoaderError> for common::Error {
     }
 }
 
-impl LoaderError {
-    #[must_use = "the exit code must reach `main` — dropping it loses the failure class"]
-    pub fn exit_code(&self) -> common::ExitCode {
+impl FailureClass for LoaderError {
+    /// Exhaustive, no `_` arm. Only a wrapped `ControlError` can be transient; every other variant
+    /// is a terminal bootstrap failure by construction.
+    fn is_terminal(&self) -> bool {
+        match self {
+            LoaderError::Control(e) => e.is_terminal(),
+            LoaderError::Config(_)
+            | LoaderError::Duck { .. }
+            | LoaderError::ObjectStore(_)
+            | LoaderError::LeaseContended { .. }
+            | LoaderError::CorruptCheckpoint { .. }
+            | LoaderError::Quarantine { .. }
+            | LoaderError::EpochBumped { .. }
+            | LoaderError::RegistryDecode { .. }
+            | LoaderError::LsnParse { .. }
+            | LoaderError::ControlTxn { .. }
+            | LoaderError::Health { .. }
+            | LoaderError::Internal(_) => true,
+        }
+    }
+
+    /// OVERRIDE of the default: preserve the existing per-variant codes by routing through the
+    /// exhaustive `From<&LoaderError>` mapping.
+    fn exit_code(&self) -> ExitCode {
         common::Error::from(self).exit_code()
     }
 }

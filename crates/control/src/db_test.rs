@@ -1,4 +1,5 @@
 use super::*;
+use common::FailureClass;
 use std::borrow::Cow;
 
 /// Minimal database-error double: sqlx's Postgres error cannot be constructed without the driver.

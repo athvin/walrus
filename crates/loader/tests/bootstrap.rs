@@ -11,7 +11,7 @@
 //!
 //!   cargo test -p loader --test bootstrap -- --ignored
 
-use common::{EpochNo, PgColumn, PgRelation, ReplicaIdentity};
+use common::{EpochNo, FailureClass, PgColumn, PgRelation, ReplicaIdentity};
 use loader::bootstrap::bootstrap;
 use loader::config::LoaderConfig;
 use loader::error::LoaderError;

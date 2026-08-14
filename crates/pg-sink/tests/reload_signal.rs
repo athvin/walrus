@@ -13,7 +13,7 @@
 //! snapshot file can ever exist for it), and preflight refuses a missing/unpublished signal table
 //! loudly (reload H11) — or heals it under `manage_publication=true`.
 
-use common::{Lsn, TupleValue};
+use common::{FailureClass, Lsn, TupleValue};
 use pg_sink::config::SinkConfig;
 use pg_sink::consume::on_frame;
 use pg_sink::pgoutput::{Message, StreamCtx};

@@ -1,4 +1,5 @@
 use super::*;
+use common::FailureClass;
 use std::error::Error as _;
 
 fn duck_error() -> LoaderError {

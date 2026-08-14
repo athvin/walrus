@@ -11,7 +11,7 @@
 //! savepoint, because a failed statement aborts the enclosing Postgres transaction.
 #![cfg(feature = "integration")]
 
-use common::{EpochNo, Lsn, ReloadId, SchemaVersionNo};
+use common::{EpochNo, FailureClass, Lsn, ReloadId, SchemaVersionNo};
 use control::reload::{self, ReloadFlavor, ReloadStatus};
 use control::{claim_ready, connect, insert_ready, run_migrations, ControlError, NewManifestFile};
 use sqlx::postgres::PgPool;

@@ -1,4 +1,5 @@
 use super::*;
+use common::FailureClass;
 
 fn valid() -> SinkConfig {
     SinkConfig {

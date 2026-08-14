@@ -1,6 +1,6 @@
 //! Control-DB connection pool and migration runner.
 
-use common::ReloadId;
+use common::{FailureClass, ReloadId};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
 /// Errors from the control-DB entrypoint, classified terminal-vs-transient like [`common::Error`].
@@ -43,11 +43,10 @@ pub enum ControlError {
     Decode(String),
 }
 
-impl ControlError {
+impl FailureClass for ControlError {
     /// True when retrying can never help — a broken migration or a violated invariant is a bug, not
     /// a cold dependency.
-    #[must_use]
-    pub fn is_terminal(&self) -> bool {
+    fn is_terminal(&self) -> bool {
         match self {
             ControlError::Migrate(_)
             | ControlError::CheckViolation(_)
@@ -58,12 +57,11 @@ impl ControlError {
         }
     }
 
-    /// The complement of [`ControlError::is_terminal`] — a dependency that may still be coming up.
-    #[must_use]
-    pub fn is_transient(&self) -> bool {
-        !self.is_terminal()
-    }
+    // `is_transient` and `exit_code` take the defaults. A ControlError is always wrapped before it
+    // reaches a `main`, so its own unclassified exit code is never surfaced by a running process.
+}
 
+impl ControlError {
     /// Classify a `sqlx::Error`: a CHECK violation (SQLSTATE `23514`) becomes the terminal
     /// [`ControlError::CheckViolation`]; everything else is a (possibly transient) [`Connect`].
     ///

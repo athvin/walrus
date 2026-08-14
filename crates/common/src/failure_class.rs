@@ -13,18 +13,21 @@ use crate::ExitCode;
 
 pub trait FailureClass {
     /// REQUIRED. True when retrying under the startup deadline can never help — die now, non-zero.
+    #[must_use = "classification is the whole point — calling this for effect does nothing"]
     fn is_terminal(&self) -> bool;
 
     /// DEFAULTED. The exact complement of [`Self::is_terminal`]: a dependency that may still be
     /// coming up, so the bootstrap retries it with backoff. Do not override.
+    #[must_use = "classification is the whole point — calling this for effect does nothing"]
     fn is_transient(&self) -> bool {
-        todo!("return the complement of is_terminal")
+        !self.is_terminal()
     }
 
     /// DEFAULTED. The process exit status for this failure. The default is the unclassified
     /// fallback; override it wherever the values can reach `std::process::ExitCode`.
+    #[must_use = "the exit code must reach main — dropping it loses the failure class"]
     fn exit_code(&self) -> ExitCode {
-        todo!("return the unclassified internal exit code")
+        ExitCode::Internal
     }
 }
 

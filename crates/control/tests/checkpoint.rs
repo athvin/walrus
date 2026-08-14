@@ -9,7 +9,7 @@
 //! and idempotent across runs. Gated behind the `integration` feature (needs the PR 0.6 control PG).
 #![cfg(feature = "integration")]
 
-use common::{EpochNo, Lsn};
+use common::{EpochNo, FailureClass, Lsn};
 use control::{
     advance_raw_appended, advance_transformed, connect, ensure_checkpoint, insert_epoch,
     read_checkpoint, read_current_epoch, run_migrations, ControlError, ReplicationState,

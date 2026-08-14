@@ -1,6 +1,6 @@
 //! The one place an `anyhow::Error` becomes a process exit status.
 
-use common::ExitCode;
+use common::{ExitCode, FailureClass};
 
 /// Recover the distinct exit code for a failure that reached `main`.
 ///

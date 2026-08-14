@@ -1,4 +1,5 @@
 use super::*;
+use common::FailureClass;
 
 #[tokio::test(start_paused = true)]
 async fn joined_dependency_checks_cost_the_max_not_the_sum() {

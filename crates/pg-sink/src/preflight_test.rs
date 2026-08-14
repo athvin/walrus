@@ -1,4 +1,5 @@
 use super::*;
+use common::FailureClass;
 
 #[test]
 fn preflight_errors_map_to_exit_codes() {

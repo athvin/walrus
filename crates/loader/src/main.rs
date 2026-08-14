@@ -10,6 +10,7 @@
 //! exit code at `main`). Everything below returns [`LoaderError`], whose distinct exit code `main`
 //! surfaces so a broken deploy is greppable in `kubectl logs`.
 
+use common::FailureClass;
 use loader::bootstrap;
 use loader::config::LoaderConfig;
 use loader::error::LoaderError;
@@ -50,7 +51,7 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!("walrus-loader exiting: {e}");
-            common::Error::from(&e).exit_code().into()
+            e.exit_code().into()
         }
     }
 }

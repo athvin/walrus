@@ -7,6 +7,7 @@
 //! decides whether retrying under the startup deadline could ever help, and [`ExitCode`] gives
 //! each terminal class a distinct, greppable process exit status.
 
+use crate::FailureClass;
 use thiserror::Error;
 
 /// Library-wide result alias.
@@ -70,14 +71,13 @@ pub enum Error {
 const ERROR_MAX_BYTES: usize = 32;
 const _: () = assert!(size_of::<Error>() <= ERROR_MAX_BYTES);
 
-impl Error {
+impl FailureClass for Error {
     /// True when retrying under the startup deadline can never help — die now, non-zero.
     ///
     /// The `match` has **no `_ =>` arm on purpose**: adding a future variant is a compile error
     /// until it is explicitly classified here. That is the whole point of modelling the property
     /// as data rather than a comment.
-    #[must_use = "classification is the whole point — calling this for effect does nothing"]
-    pub fn is_terminal(&self) -> bool {
+    fn is_terminal(&self) -> bool {
         match self {
             // Misconfiguration / unrecoverable preconditions — no retry can fix these.
             Error::Config(_)
@@ -91,16 +91,10 @@ impl Error {
         }
     }
 
-    /// The complement of [`Error::is_terminal`] — a dependency that may still be coming up, so the
-    /// bootstrap retries it with backoff up to the startup deadline.
-    #[must_use = "classification is the whole point — calling this for effect does nothing"]
-    pub fn is_transient(&self) -> bool {
-        !self.is_terminal()
-    }
-
-    /// The distinct process exit code for this failure (greppable in `kubectl logs`).
-    #[must_use = "the exit code must reach main — dropping it loses the failure class"]
-    pub fn exit_code(&self) -> ExitCode {
+    /// OVERRIDE of the default: the distinct process exit code for this failure (greppable in
+    /// `kubectl logs`). The exhaustive match has no `_` arm because the numbers are a runbook
+    /// contract.
+    fn exit_code(&self) -> ExitCode {
         match self {
             Error::Config(_) => ExitCode::Config,
             Error::ControlDb(_) => ExitCode::ControlDb,

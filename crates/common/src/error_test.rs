@@ -1,4 +1,5 @@
 use super::*;
+use crate::FailureClass;
 
 /// Every variant, paired with its DoD-mandated terminal classification.
 fn one_of_each() -> Vec<(Error, bool)> {

@@ -12,6 +12,7 @@
 //! The tests mutate shared source-pg state (a keyless table, the walrus schema), so they hold a
 //! process-wide async lock to run serially; each sets up its own preconditions under that lock.
 
+use common::FailureClass;
 use pg_sink::config::SinkConfig;
 use pg_sink::preflight::{connect_source, PkMode, PreflightError, SourcePreflight};
 use tokio_postgres::NoTls;
