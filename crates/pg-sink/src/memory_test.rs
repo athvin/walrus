@@ -84,6 +84,14 @@ fn ratio_rejects_the_closed_ends_and_nan() {
 }
 
 #[test]
+fn ratio_rejects_non_finite_values_explicitly() {
+    for raw in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let error = Ratio::new(raw).expect_err("non-finite ratio must be rejected");
+        assert!(error.to_string().contains("finite"), "{raw}: {error}");
+    }
+}
+
+#[test]
 fn default_band_is_valid() {
     let band = HysteresisBand::DEFAULT;
     assert!(HysteresisBand::new(band.activate(), band.resume()).is_ok());

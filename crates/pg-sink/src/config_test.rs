@@ -193,6 +193,34 @@ fn zero_thresholds_are_rejected_during_deserialization() {
 }
 
 #[test]
+fn non_finite_backpressure_ratios_fail_during_deserialization() {
+    use figment::providers::{Format, Toml};
+
+    for (field, source) in [
+        (
+            "backpressure_activate_ratio",
+            "backpressure_activate_ratio = nan",
+        ),
+        (
+            "backpressure_activate_ratio",
+            "backpressure_activate_ratio = inf",
+        ),
+        (
+            "backpressure_resume_ratio",
+            "backpressure_resume_ratio = -inf",
+        ),
+    ] {
+        let error = figment::Figment::new()
+            .merge(Toml::string(source))
+            .extract::<SinkConfig>()
+            .expect_err("non-finite ratio must not construct SinkConfig");
+        let message = error.to_string();
+        assert!(message.contains(field), "{field}: {message}");
+        assert!(message.contains("finite"), "{field}: {message}");
+    }
+}
+
+#[test]
 fn option_nonzero_u64_is_the_same_size_as_u64() {
     assert_eq!(
         std::mem::size_of::<Option<std::num::NonZeroU64>>(),

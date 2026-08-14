@@ -56,6 +56,25 @@ fn text_vals(vals: &[&str]) -> Vec<TupleValue> {
 }
 
 #[test]
+fn float8_nan_and_infinities_survive_the_text_parse_path() {
+    let relation = one_col_rel("d", oids::FLOAT8, -1);
+    let mut builder = BatchBuilder::new(&relation).unwrap();
+    for raw in ["NaN", "Infinity", "-Infinity"] {
+        builder
+            .append_row(&[TupleValue::Text(raw.to_string())], &meta(vec![]))
+            .unwrap();
+    }
+
+    let batch = builder.finish().unwrap();
+    let values = batch
+        .column(0)
+        .as_primitive::<arrow::datatypes::Float64Type>();
+    assert!(values.value(0).is_nan(), "NaN must not become zero");
+    assert!(values.value(1).is_infinite() && values.value(1).is_sign_positive());
+    assert!(values.value(2).is_infinite() && values.value(2).is_sign_negative());
+}
+
+#[test]
 fn builds_a_batch_from_an_orders_insert() {
     let mut b = BatchBuilder::new(&orders()).unwrap();
     b.append_row(
