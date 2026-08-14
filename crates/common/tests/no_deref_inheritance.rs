@@ -3,6 +3,10 @@
     clippy::expect_used,
     reason = "integration test — unwrap/expect fine in setup + helpers"
 )]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "the synchronous integration-test scan is a repository-policy check, not runtime I/O"
+)]
 
 //! Guard: walrus newtypes expose explicit accessors (`Lsn::as_u64`, `From<ManifestId> for i64`,
 //! `DuckTable::as_str`), never `Deref`. `Deref` is for smart pointers and owned→borrowed containers
@@ -47,8 +51,8 @@ fn no_walrus_type_implements_deref() {
                 .expect("source file is beneath the repository root")
                 .to_string_lossy()
                 .replace('\\', "/");
-            let source = fs::read_to_string(&file)
-                .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
+            let source =
+                fs::read_to_string(&file).expect("failed to read a production Rust source file");
             offences.extend(deref_offences(&rel, &source));
         }
     }
@@ -57,7 +61,11 @@ fn no_walrus_type_implements_deref() {
         files_scanned > 0,
         "the production source scan found no Rust files"
     );
-    assert_no_offences(&offences);
+    assert!(
+        offences.is_empty(),
+        "walrus newtypes must expose explicit accessors, not Deref (see {DECISION_NOTE}):\n{}",
+        offences.join("\n")
+    );
 }
 
 #[test]
@@ -79,10 +87,28 @@ impl std::ops::Deref for ManifestId {
     assert!(!rejection.contains(":3"));
 }
 
+#[test]
+fn allow_list_requires_the_path_and_exact_type() {
+    let implementation = "impl std::ops::Deref for SubscribeGuard<'_> {";
+
+    assert!(is_allowed(
+        "crates/pg-sink/src/reload_signal.rs",
+        implementation
+    ));
+    assert!(!is_allowed(
+        "crates/pg-sink/src/another_module.rs",
+        implementation
+    ));
+    assert!(!is_allowed(
+        "crates/pg-sink/src/reload_signal.rs",
+        "impl std::ops::Deref for SubscribeGuardAdapter<'_> {"
+    ));
+}
+
 /// `crates/<name>/src` for every member.
 fn crate_src_dirs(crates_dir: &Path) -> Vec<PathBuf> {
     let mut dirs = fs::read_dir(crates_dir)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", crates_dir.display()))
+        .expect("failed to read the workspace crates directory")
         .map(|entry| {
             entry
                 .expect("failed to read crate directory entry")
@@ -98,9 +124,7 @@ fn crate_src_dirs(crates_dir: &Path) -> Vec<PathBuf> {
 /// Every `.rs` file under `dir`, recursively (no `walkdir` dependency).
 fn rust_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    for entry in fs::read_dir(dir)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", dir.display()))
-    {
+    for entry in fs::read_dir(dir).expect("failed to read a production source directory") {
         let path = entry.expect("failed to read source directory entry").path();
         if path.is_dir() {
             files.extend(rust_files(&path));
@@ -113,11 +137,17 @@ fn rust_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 fn deref_offences(rel: &str, source: &str) -> Vec<String> {
-    let _classified_lines = source
+    source
         .lines()
-        .map(|line| (is_deref_impl(line), is_allowed(rel, line)))
-        .collect::<Vec<_>>();
-    Vec::new()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            if !is_deref_impl(line) || is_allowed(rel, line) {
+                return None;
+            }
+
+            Some(format!("{rel}:{}  {}", index + 1, line.trim()))
+        })
+        .collect()
 }
 
 /// A source line that actually implements `Deref`, ignoring doc comments and line comments —
@@ -148,12 +178,6 @@ fn impl_type_name(line: &str) -> Option<&str> {
         .split(|character: char| character == '<' || character == '{' || character.is_whitespace())
         .next()
         .and_then(|qualified| qualified.rsplit("::").next())
-}
-
-fn assert_no_offences(offences: &[String]) {
-    if let Some(message) = rejection_message(offences) {
-        panic!("{message}");
-    }
 }
 
 fn rejection_message(offences: &[String]) -> Option<String> {
