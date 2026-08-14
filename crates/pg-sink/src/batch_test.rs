@@ -107,7 +107,7 @@ fn flushes_on_row_count_at_commit_boundary() {
 
 #[test]
 fn committed_rows_keep_byte_identical_batch_id_with_clone_from() {
-    assert!(include_str!("batch.rs").contains("meta.batch_id.clone_from(&self.batch_id);"));
+    assert!(include_str!("batch.rs").contains("meta.batch_id.clone_from(&batch_id);"));
 
     let mut b = TableBatcher::new(
         cached(),
@@ -116,7 +116,7 @@ fn committed_rows_keep_byte_identical_batch_id_with_clone_from() {
     )
     .unwrap();
     b.push(meta("0/10"), &row("1"));
-    let expected = b.batch_id.clone();
+    let expected = b.batch_id.clone().expect("push assigns the batch id");
 
     b.on_commit("0/20".parse().unwrap(), UtcTimestamp::now())
         .unwrap();
@@ -130,6 +130,45 @@ fn committed_rows_keep_byte_identical_batch_id_with_clone_from() {
     let committed: SinkMeta = serde_json::from_str(meta_column.value(0)).unwrap();
 
     assert_eq!(committed.batch_id.as_bytes(), expected.as_bytes());
+}
+
+#[test]
+fn optional_batch_state_is_none_before_push_and_after_seal() {
+    let mut b = TableBatcher::new(
+        cached(),
+        triggers(u64::MAX, u64::MAX, Duration::from_secs(3600)),
+        Arc::new(SystemClock),
+    )
+    .unwrap();
+
+    assert_eq!(b.batch_id, None, "no id before the first row");
+    assert_eq!(b.first_commit_lsn, None, "no lower bound before commit");
+    assert_eq!(b.last_commit_lsn, None, "no upper bound before commit");
+
+    b.push(meta("0/10"), &row("1"));
+    b.on_commit("0/30".parse().unwrap(), UtcTimestamp::now())
+        .unwrap();
+    b.seal().unwrap();
+
+    assert_eq!(b.batch_id, None, "seal resets the assigned id");
+    assert_eq!(b.first_commit_lsn, None, "seal resets the lower bound");
+    assert_eq!(b.last_commit_lsn, None, "seal resets the upper bound");
+}
+
+#[test]
+fn sealing_without_an_assigned_batch_id_is_an_error() {
+    let mut b = TableBatcher::new(
+        cached(),
+        triggers(u64::MAX, u64::MAX, Duration::from_secs(3600)),
+        Arc::new(SystemClock),
+    )
+    .unwrap();
+    b.push(meta("0/10"), &row("1"));
+    b.on_commit("0/30".parse().unwrap(), UtcTimestamp::now())
+        .unwrap();
+
+    b.batch_id = None;
+    assert!(matches!(b.seal(), Err(BatchError::Unassigned)));
 }
 
 #[test]
