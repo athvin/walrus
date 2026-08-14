@@ -35,3 +35,7 @@ pub mod plan;
 pub mod shutdown;
 pub mod supervisor;
 pub mod transform;
+
+#[cfg(test)]
+#[path = "table_name_test.rs"]
+mod table_name_tests;
