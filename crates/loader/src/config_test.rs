@@ -82,3 +82,32 @@ fn zero_lease_ttl_is_still_rejected() {
     cfg.lease_ttl = Duration::ZERO;
     assert!(cfg.validate().is_err());
 }
+
+#[test]
+fn zero_max_files_per_cycle_is_rejected_during_deserialization() {
+    use figment::providers::{Format, Toml};
+
+    let result = figment::Figment::new()
+        .merge(Toml::string("max_files_per_cycle = 0"))
+        .extract::<LoaderConfig>();
+    let err = result.expect_err("zero must not deserialize into max_files_per_cycle");
+    assert!(err.to_string().contains("max_files_per_cycle"), "{err}");
+}
+
+#[test]
+fn zero_poll_and_compaction_intervals_are_rejected() {
+    let cases: [(&str, fn(&mut LoaderConfig)); 2] = [
+        ("poll_interval", |cfg: &mut LoaderConfig| {
+            cfg.poll_interval = Duration::ZERO
+        }),
+        ("compaction_interval", |cfg: &mut LoaderConfig| {
+            cfg.compaction_interval = Duration::ZERO
+        }),
+    ];
+    for (field, update) in cases {
+        let mut cfg = valid();
+        update(&mut cfg);
+        let err = cfg.validate().expect_err("zero interval must be rejected");
+        assert!(err.to_string().contains(field), "{field}: {err}");
+    }
+}

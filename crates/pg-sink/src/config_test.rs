@@ -193,6 +193,14 @@ fn zero_thresholds_are_rejected_during_deserialization() {
 }
 
 #[test]
+fn option_nonzero_u64_is_the_same_size_as_u64() {
+    assert_eq!(
+        std::mem::size_of::<Option<std::num::NonZeroU64>>(),
+        std::mem::size_of::<u64>()
+    );
+}
+
+#[test]
 fn numeric_wire_names_and_shapes_are_unchanged() {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = ENV_LOCK.lock().unwrap();
