@@ -201,6 +201,41 @@ impl fmt::Debug for Lsn {
     }
 }
 
+/// Lowercase hexadecimal, unpadded by default.
+///
+/// Forwards the whole formatter so alternate form, width, precision, and zero-fill flags behave
+/// exactly as they do for the inner `u64`. [`Display`](fmt::Display) remains the canonical padded
+/// walrus rendering.
+impl fmt::LowerHex for Lsn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::LowerHex::fmt(&self.0, f)
+    }
+}
+
+/// Uppercase hexadecimal, unpadded by default.
+///
+/// Formatter flags forward to the inner `u64`; unlike [`Display`](fmt::Display), the default form
+/// intentionally omits leading zeroes.
+impl fmt::UpperHex for Lsn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::UpperHex::fmt(&self.0, f)
+    }
+}
+
+/// Octal, unpadded by default, with all formatter flags forwarded to the inner `u64`.
+impl fmt::Octal for Lsn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Octal::fmt(&self.0, f)
+    }
+}
+
+/// Binary, unpadded by default, with all formatter flags forwarded to the inner `u64`.
+impl fmt::Binary for Lsn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Binary::fmt(&self.0, f)
+    }
+}
+
 impl serde::Serialize for Lsn {
     /// Emit the canonical padded string (never a bare JSON number) so the on-disk form sorts as
     /// text exactly as it sorts numerically.
