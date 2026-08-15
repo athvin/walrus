@@ -1,6 +1,17 @@
 use super::*;
 use common::{PgColumn, ReplicaIdentity};
 
+#[test]
+fn await_echo_keeps_a_shared_receiver() {
+    fn assert_shared_receiver<F, Fut>(_f: F)
+    where
+        F: Fn(&ChunkExporter, i64) -> Fut,
+    {
+    }
+
+    assert_shared_receiver(ChunkExporter::await_echo);
+}
+
 fn composite_rel() -> PgRelation {
     let col = |name: &str, is_key: bool| PgColumn {
         name: name.to_string(),
