@@ -3,13 +3,11 @@ use common::{PgColumn, ReplicaIdentity};
 
 #[test]
 fn await_echo_keeps_a_shared_receiver() {
-    fn assert_shared_receiver<F, Fut>(_f: F)
-    where
-        F: Fn(&ChunkExporter, i64) -> Fut,
-    {
+    fn call_with_shared(exporter: &ChunkExporter) {
+        std::mem::drop(ChunkExporter::await_echo(exporter, 0));
     }
 
-    assert_shared_receiver(ChunkExporter::await_echo);
+    let _ = call_with_shared as fn(&ChunkExporter);
 }
 
 fn composite_rel() -> PgRelation {
