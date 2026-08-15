@@ -58,6 +58,9 @@ trivially_copy_pass_by_ref = "deny"
 # and integration `tests/`; benches (`harness = false`) and the e2e harness lib carry a file-level allow.
 unwrap_used = "deny"
 expect_used = "deny"
+# This nursery lint is outside `clippy::all`, so no `priority` juggling is needed. It is the
+# mutable-borrow gate walrus lacked; see docs/implementation/notes/rust-skills/conv-asmut-mutable.md.
+needless_pass_by_ref_mut = "deny"
 # A discarded `Result`/`#[must_use]` value must be an explicit, argued decision. Test targets
 # re-allow this through their existing unwrap/expect carve-outs.
 let_underscore_must_use = "deny"

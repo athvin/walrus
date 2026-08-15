@@ -301,7 +301,7 @@ impl ChunkExporter {
     /// FRESH echo — an `ON CONFLICT DO NOTHING` would echo nothing); the same statement shape
     /// serves a crash-redone chunk. The DELETE also rides the slot; PR 6.3's routing ignores
     /// non-insert signal ops by design.
-    async fn await_echo(&mut self, chunk_no: i64) -> anyhow::Result<crate::reload_signal::Echo> {
+    async fn await_echo(&self, chunk_no: i64) -> anyhow::Result<crate::reload_signal::Echo> {
         const ECHO_ATTEMPTS: u32 = 3;
         for attempt in 1..=ECHO_ATTEMPTS {
             // Subscribe-then-insert (PR 6.3): the waiter must exist before the echo can arrive.
