@@ -59,7 +59,9 @@ pub struct DecodeLoop<'a, C> {
 ///
 /// ```compile_fail
 /// #![deny(unused_must_use)]
-/// let builder = pg_sink::consume::DecodeLoop::builder();
+/// let builder = pg_sink::consume::DecodeLoop::<
+///     std::sync::Arc<pg_sink::batch::SystemClock>,
+/// >::builder();
 /// builder.epoch(common::EpochNo(7));
 /// ```
 #[must_use = "a builder does nothing until you call build()"]
