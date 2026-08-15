@@ -220,7 +220,7 @@ fn negative_micros_pre_y2k() {
 fn round_trips_a_known_commit_ts() {
     // The µs the sink would receive for a real commit time, reconstructed back to the same instant.
     let want = "2026-07-04T12:00:00.123Z".parse::<UtcTimestamp>().unwrap();
-    let pg_micros = want.0.as_microsecond() - 946_684_800_000_000;
+    let pg_micros = want.0.as_microsecond() - PG_EPOCH_UNIX_MICROS;
     assert_eq!(UtcTimestamp::from_pg_micros(pg_micros).unwrap(), want);
 }
 

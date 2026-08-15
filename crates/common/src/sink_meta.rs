@@ -15,6 +15,16 @@ use crate::{EpochNo, Error, Lsn, Result, SchemaVersionNo};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::mem::{align_of, size_of};
 
+/// Postgres' epoch, 2000-01-01T00:00:00Z, as seconds after the Unix epoch: 946_684_800.
+///
+/// pgoutput commit timestamps (proto §4) and the CopyBoth standby-status clock (§1.9) are measured
+/// from this instant, not the Unix epoch. Unix time has no leap seconds, so the offset is exact and
+/// fixed. This is the workspace-wide definition; never re-type the digits at a use site.
+pub const PG_EPOCH_UNIX_SECS: i64 = 946_684_800;
+
+/// The same instant in microseconds, derived so it cannot drift from [`PG_EPOCH_UNIX_SECS`].
+pub const PG_EPOCH_UNIX_MICROS: i64 = PG_EPOCH_UNIX_SECS * 1_000_000;
+
 /// The change operation. Serializes to a single lowercase char: `i` | `u` | `d` | `t`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Op {
@@ -87,9 +97,9 @@ impl UtcTimestamp {
     }
 
     /// Build from a pgoutput wire timestamp: **microseconds since 2000-01-01T00:00:00Z** (proto §4) —
-    /// the Postgres epoch, NOT the Unix epoch. Offsets by the fixed 946_684_800 s (2000-01-01 −
-    /// 1970-01-01; Unix time has no leap seconds) and defers to jiff's range check, so a corrupt or
-    /// overflowing frame is a decode error — **never a panic** (PR 5.9; retires the `commit_ts` TODO).
+    /// the Postgres epoch, not the Unix epoch. Offsets by [`PG_EPOCH_UNIX_SECS`] and defers to
+    /// jiff's range check, so a corrupt or overflowing frame is a decode error — **never a panic**
+    /// (PR 5.9; retires the `commit_ts` TODO).
     ///
     /// This deliberately remains a named constructor rather than `TryFrom<i64>`: a bare `i64` is
     /// ambiguous between microseconds from the Postgres epoch and microseconds from the Unix epoch.
@@ -99,13 +109,9 @@ impl UtcTimestamp {
     /// Returns [`Error::Internal`] when adding the Postgres epoch offset overflows or the resulting
     /// instant is outside jiff's supported range. Either condition indicates a corrupt wire value.
     pub fn from_pg_micros(pg_micros: i64) -> Result<Self> {
-        // 2000-01-01T00:00:00Z expressed as microseconds since the Unix epoch.
-        const PG_EPOCH_OFFSET_MICROS: i64 = 946_684_800_000_000;
-        let unix_micros = pg_micros
-            .checked_add(PG_EPOCH_OFFSET_MICROS)
-            .ok_or_else(|| {
-                Error::Internal(format!("pgoutput commit_ts overflow: {pg_micros} µs"))
-            })?;
+        let unix_micros = pg_micros.checked_add(PG_EPOCH_UNIX_MICROS).ok_or_else(|| {
+            Error::Internal(format!("pgoutput commit_ts overflow: {pg_micros} µs"))
+        })?;
         let ts = jiff::Timestamp::from_microsecond(unix_micros).map_err(|e| {
             Error::Internal(format!(
                 "pgoutput commit_ts {pg_micros} µs out of range: {e}"

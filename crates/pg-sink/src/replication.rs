@@ -18,14 +18,11 @@
 
 use anyhow::{anyhow, bail, Context};
 use bytes::{Bytes, BytesMut};
-use common::Lsn;
+use common::{Lsn, PG_EPOCH_UNIX_SECS};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::Instant;
-
-/// Postgres' epoch (2000-01-01) as seconds after the Unix epoch.
-const PG_EPOCH_UNIX_SECS: i64 = 946_684_800;
 
 /// Default feedback cadence: well under any sane `wal_sender_timeout` (the dev harness uses 5s).
 const DEFAULT_FEEDBACK_INTERVAL: Duration = Duration::from_secs(1);

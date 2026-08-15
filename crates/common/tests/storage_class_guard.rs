@@ -10,6 +10,9 @@
 
 use std::path::{Path, PathBuf};
 
+const MUTABLE_GLOBAL_NEEDLE: &str = concat!("static", " mut ");
+const ALLOWED_STATIC_HEADS: [&str; 4] = ["OnceLock", "LazyLock", "Atomic", "Mutex"];
+
 /// Workspace root — this crate's manifest dir is `<root>/crates/common`.
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -57,18 +60,80 @@ fn display_path(root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
-fn mutable_global_offences(_path: &str, _source: &str) -> Vec<String> {
-    Vec::new()
+/// The `(name, type)` from a declaration-shaped line, after optional visibility.
+fn static_declaration(line: &str) -> Option<(&str, &str)> {
+    let mut declaration = line.trim_start();
+    if declaration.starts_with("//") {
+        return None;
+    }
+
+    if let Some(rest) = declaration.strip_prefix("pub ") {
+        declaration = rest;
+    } else if let Some(rest) = declaration.strip_prefix("pub(") {
+        let (_, after_visibility) = rest.split_once(") ")?;
+        declaration = after_visibility;
+    }
+
+    let declaration = declaration.strip_prefix("static ")?;
+    let (name, type_and_value) = declaration.split_once(':')?;
+    let type_name = type_and_value
+        .split_once('=')
+        .map_or(type_and_value, |(before_value, _)| before_value)
+        .trim();
+    Some((name.trim(), type_name))
 }
 
-fn plain_static_offences(_path: &str, _source: &str) -> Vec<String> {
-    Vec::new()
+fn mutable_global_offences(path: &str, source: &str) -> Vec<String> {
+    source
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            if !line.contains(MUTABLE_GLOBAL_NEEDLE) {
+                return None;
+            }
+            let (name, _) = static_declaration(line)?;
+            let name = name.strip_prefix("mut ")?;
+            Some(format!(
+                "{path}:{}: mutable global {name} is banned; use an Atomic*, OnceLock, LazyLock, \
+                 or Mutex instead",
+                index + 1
+            ))
+        })
+        .collect()
+}
+
+fn allowed_static_type(type_name: &str) -> bool {
+    let qualified_head = type_name
+        .split(['<', ';'])
+        .next()
+        .map(str::trim)
+        .unwrap_or_default();
+    let head = qualified_head.rsplit("::").next().unwrap_or_default();
+    ALLOWED_STATIC_HEADS
+        .iter()
+        .any(|allowed| head == *allowed || (*allowed == "Atomic" && head.starts_with("Atomic")))
+}
+
+fn plain_static_offences(path: &str, source: &str) -> Vec<String> {
+    source
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let (name, type_name) = static_declaration(line)?;
+            if name.starts_with("mut ") || allowed_static_type(type_name) {
+                return None;
+            }
+            Some(format!(
+                "{path}:{}: plain addressed global {name}: {type_name}; use const for a small \
+                 value, or OnceLock, LazyLock, an Atomic*, or Mutex for shared state",
+                index + 1
+            ))
+        })
+        .collect()
 }
 
 #[test]
 fn no_mutable_global_is_declared_anywhere() {
-    // The declaration spelling is assembled so this guard cannot match its own source.
-    let _needle = concat!("static", " mut ");
     let root = workspace_root();
     let mut files = Vec::new();
     rust_files(&root.join("crates"), &mut files);

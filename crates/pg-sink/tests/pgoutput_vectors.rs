@@ -320,8 +320,7 @@ fn fmt_lsn(v: u64) -> String {
 /// RFC-3339 `Z` stamp (PR 1.1). Formatted by hand (not jiff's `Display`, which trims trailing
 /// fractional zeros — `.914880` would render `.91488`).
 fn fmt_ts(micros_since_2000: i64) -> String {
-    const MICROS_1970_TO_2000: i64 = 946_684_800_000_000;
-    let ts = jiff::Timestamp::from_microsecond(micros_since_2000 + MICROS_1970_TO_2000)
+    let ts = jiff::Timestamp::from_microsecond(micros_since_2000 + common::PG_EPOCH_UNIX_MICROS)
         .expect("timestamp in range");
     let dt = ts.to_zoned(jiff::tz::TimeZone::UTC).datetime();
     let micros = u32::try_from(dt.subsec_nanosecond() / 1000).unwrap();

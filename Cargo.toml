@@ -64,6 +64,10 @@ needless_pass_by_ref_mut = "deny"
 # Pure stable-const functions are compile-time callable by policy (PR 21.1). This nursery lint is
 # outside `clippy::all`, so no group-vs-lint `priority` adjustment is needed.
 missing_const_for_fn = "deny"
+# Globals use std: `OnceLock`/`LazyLock`/atomics, never hand-rolled lazy statics (PR 21.2). This
+# pedantic lint is outside `clippy::all`, so it needs no `priority` today. If Phase 33 enables the
+# whole `pedantic` group at this level, revisit this named entry.
+non_std_lazy_statics = "deny"
 # A discarded `Result`/`#[must_use]` value must be an explicit, argued decision. Test targets
 # re-allow this through their existing unwrap/expect carve-outs.
 let_underscore_must_use = "deny"
