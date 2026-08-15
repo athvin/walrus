@@ -34,7 +34,7 @@ impl TruncateBoundary {
         TruncateBoundary::default()
     }
     #[must_use]
-    pub fn is_some(&self) -> bool {
+    pub const fn is_some(&self) -> bool {
         self.ct.is_some()
     }
 }

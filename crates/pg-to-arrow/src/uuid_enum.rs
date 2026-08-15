@@ -46,7 +46,7 @@ pub fn enum_field(name: &str) -> Field {
 /// Interim enum detection: a non-builtin OID (≥ `FIRST_NORMAL_OID`) is treated as an enum carrier.
 /// PR 2.22 replaces this with a catalog-derived marker (the decoder's `Type` message).
 #[must_use]
-pub fn is_enum_oid(type_oid: u32) -> bool {
+pub const fn is_enum_oid(type_oid: u32) -> bool {
     type_oid >= oids::FIRST_NORMAL_OID
 }
 

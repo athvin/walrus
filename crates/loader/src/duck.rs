@@ -283,7 +283,7 @@ impl TableDb {
     }
 
     /// The `.duckdb` connection (later PRs run the transform SQL through it).
-    pub fn conn(&self) -> &duckdb::Connection {
+    pub const fn conn(&self) -> &duckdb::Connection {
         &self.conn
     }
 
@@ -473,7 +473,7 @@ pub struct S3Access {
 
 /// Map a Postgres type OID to a DuckDB column type. Unknown types fall back to `VARCHAR` (the loader
 /// stages *text*-format tuples; the exact numeric/temporal fidelity is refined as the transform lands).
-pub(crate) fn duck_type(oid: u32) -> &'static str {
+pub(crate) const fn duck_type(oid: u32) -> &'static str {
     match oid {
         INT2 => "SMALLINT",
         INT4 => "INTEGER",
@@ -495,8 +495,8 @@ pub(crate) fn duck_type(oid: u32) -> &'static str {
 // Compile-time proof of the loader's threading model. This closure is type-checked but never run or
 // code-generated. The compiler derives every bound; no manual auto-trait implementation is needed.
 const _: fn() = || {
-    fn assert_send<T: Send + ?Sized>() {}
-    fn assert_sync<T: Sync + ?Sized>() {}
+    const fn assert_send<T: Send + ?Sized>() {}
+    const fn assert_sync<T: Sync + ?Sized>() {}
 
     // Moves into `TableCtx` and then into the worker future.
     assert_send::<TableDb>();
@@ -508,7 +508,7 @@ const _: fn() = || {
     assert_sync::<Arc<crate::health::LoaderState>>();
 
     // Pin walrus's own source of `!Sync`; DuckDB independently keeps the overall type `!Sync`.
-    fn cache_refcell(db: &TableDb) -> &RefCell<HashMap<SchemaVersionNo, Arc<[String]>>> {
+    const fn cache_refcell(db: &TableDb) -> &RefCell<HashMap<SchemaVersionNo, Arc<[String]>>> {
         &db.parquet_cols
     }
     let _cache_refcell_fn = cache_refcell;

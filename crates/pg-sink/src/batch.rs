@@ -191,7 +191,7 @@ impl<C: Clock> TableBatcher<C> {
 
     /// Whether an open transaction's rows are buffered (not a commit boundary).
     #[must_use]
-    pub fn has_open_txn(&self) -> bool {
+    pub const fn has_open_txn(&self) -> bool {
         !self.pending.is_empty()
     }
 
@@ -287,7 +287,7 @@ impl<C: Clock> TableBatcher<C> {
     }
 
     #[must_use]
-    pub fn committed_rows(&self) -> u64 {
+    pub const fn committed_rows(&self) -> u64 {
         self.committed_rows
     }
 

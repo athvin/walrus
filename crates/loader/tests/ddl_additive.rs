@@ -38,7 +38,7 @@ fn rel(name: &str, columns: Vec<PgColumn>) -> PgRelation {
     }
 }
 
-fn sv(version: i64, relation: PgRelation) -> SchemaVersion {
+const fn sv(version: i64, relation: PgRelation) -> SchemaVersion {
     SchemaVersion {
         version: common::SchemaVersionNo(version),
         relation,

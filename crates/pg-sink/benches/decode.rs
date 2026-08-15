@@ -49,7 +49,7 @@ enum TableShape {
 }
 
 impl TableShape {
-    fn name(self) -> &'static str {
+    const fn name(self) -> &'static str {
         match self {
             TableShape::NarrowInt4 => "narrow_int4",
             TableShape::Wide30 => "wide30",

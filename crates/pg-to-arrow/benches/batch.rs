@@ -51,7 +51,7 @@ enum Shape {
 }
 
 impl Shape {
-    fn name(self) -> &'static str {
+    const fn name(self) -> &'static str {
         match self {
             Shape::NarrowInt4 => "narrow_int4",
             Shape::Wide30 => "wide30",

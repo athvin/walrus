@@ -76,13 +76,13 @@ impl UtcTimestamp {
 
     /// Borrow the underlying UTC instant.
     #[must_use]
-    pub fn inner(&self) -> &jiff::Timestamp {
+    pub const fn inner(&self) -> &jiff::Timestamp {
         &self.0
     }
 
     /// Consume this wrapper and return the underlying UTC instant.
     #[must_use]
-    pub fn into_inner(self) -> jiff::Timestamp {
+    pub const fn into_inner(self) -> jiff::Timestamp {
         self.0
     }
 

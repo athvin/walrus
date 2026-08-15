@@ -136,7 +136,7 @@ impl<C: Clock + Clone> StreamDemux<C> {
 
     /// Total speculative spills so far (metric; PR 4.10 exports it).
     #[must_use]
-    pub fn spill_count(&self) -> u64 {
+    pub const fn spill_count(&self) -> u64 {
         self.spill_count
     }
 
@@ -149,7 +149,7 @@ impl<C: Clock + Clone> StreamDemux<C> {
     }
 
     /// `Stream Stop`: the block ended (the txn may resume with a later segment).
-    pub fn on_stream_stop(&mut self) {
+    pub const fn on_stream_stop(&mut self) {
         self.current_top = None;
     }
 
@@ -522,7 +522,7 @@ fn estimate_change_bytes(values: &[TupleValue]) -> u64 {
 }
 
 /// A streamed change carries its sub-xid; a non-streamed change never enters the demux.
-pub fn is_streamed_change(msg: &Message) -> bool {
+pub const fn is_streamed_change(msg: &Message) -> bool {
     matches!(
         msg,
         Message::Insert { xid: Some(_), .. }

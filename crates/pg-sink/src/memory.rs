@@ -67,17 +67,17 @@ impl InflightMeter {
     }
 
     #[must_use]
-    pub fn total(&self) -> u64 {
+    pub const fn total(&self) -> u64 {
         self.total
     }
 
     #[must_use]
-    pub fn ceiling(&self) -> NonZeroU64 {
+    pub const fn ceiling(&self) -> NonZeroU64 {
         self.ceiling_bytes
     }
 
     #[must_use = "the ceiling check drives shedding — ignoring it silently disables backpressure"]
-    pub fn over_ceiling(&self) -> bool {
+    pub const fn over_ceiling(&self) -> bool {
         self.total > self.ceiling_bytes.get()
     }
 
@@ -260,7 +260,7 @@ impl Backpressure {
     }
 
     #[must_use]
-    pub fn is_paused(&self) -> bool {
+    pub const fn is_paused(&self) -> bool {
         self.paused
     }
 }

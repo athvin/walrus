@@ -220,7 +220,7 @@ impl SinkConfig {
 
     /// The validated idle-heartbeat settings (PR 2.27).
     #[must_use]
-    pub fn heartbeat_config(&self) -> crate::heartbeat::HeartbeatConfig {
+    pub const fn heartbeat_config(&self) -> crate::heartbeat::HeartbeatConfig {
         crate::heartbeat::HeartbeatConfig {
             idle_after: self.heartbeat_idle_after,
             roundtrip_deadline: self.heartbeat_roundtrip_deadline,
@@ -229,7 +229,7 @@ impl SinkConfig {
 
     /// The keyless-table policy for the source preflight (§1.1, PR 2.19).
     #[must_use]
-    pub fn pk_mode(&self) -> crate::preflight::PkMode {
+    pub const fn pk_mode(&self) -> crate::preflight::PkMode {
         if self.strict_keys {
             crate::preflight::PkMode::Strict
         } else {

@@ -138,7 +138,7 @@ pub struct SourcePreflight<'a> {
 
 impl<'a> SourcePreflight<'a> {
     #[must_use]
-    pub fn new(client: &'a Client, cfg: &'a SinkConfig) -> Self {
+    pub const fn new(client: &'a Client, cfg: &'a SinkConfig) -> Self {
         SourcePreflight { client, cfg }
     }
 

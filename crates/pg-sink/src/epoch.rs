@@ -43,7 +43,7 @@ pub enum SlotAction {
 /// Decide what to do from a classified slot. Pure (no I/O) so the guard is unit-tested: `Unreachable`
 /// must map to `Retry`, and only `Absent` / `Invalidated` to `FreshSlot`.
 #[must_use]
-pub fn decide(status: &SlotStatus) -> SlotAction {
+pub const fn decide(status: &SlotStatus) -> SlotAction {
     match status {
         SlotStatus::Healthy { confirmed_flush } => SlotAction::Resume {
             confirmed_flush: *confirmed_flush,

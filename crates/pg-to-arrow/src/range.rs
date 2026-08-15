@@ -27,7 +27,7 @@ pub enum RangeFamily {
 
 impl RangeFamily {
     #[must_use]
-    pub fn from_range_oid(oid: u32) -> Option<Self> {
+    pub const fn from_range_oid(oid: u32) -> Option<Self> {
         Some(match oid {
             oids::INT4RANGE => Self::Int4,
             oids::INT8RANGE => Self::Int8,
@@ -40,7 +40,7 @@ impl RangeFamily {
     }
 
     #[must_use]
-    pub fn from_multirange_oid(oid: u32) -> Option<Self> {
+    pub const fn from_multirange_oid(oid: u32) -> Option<Self> {
         Some(match oid {
             oids::INT4MULTIRANGE => Self::Int4,
             oids::INT8MULTIRANGE => Self::Int8,

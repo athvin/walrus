@@ -27,7 +27,7 @@ pub enum GeoKind {
 
 /// The geometric `GeoKind` for an OID, or `None` for a non-geometric (incl. PostGIS) type.
 #[must_use]
-pub fn geo_kind(type_oid: u32) -> Option<GeoKind> {
+pub const fn geo_kind(type_oid: u32) -> Option<GeoKind> {
     Some(match type_oid {
         oids::POINT => GeoKind::Point,
         oids::LINE => GeoKind::Line,

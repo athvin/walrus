@@ -100,13 +100,13 @@ impl InternalTables {
 
     /// The `ddl_audit` relation shape, once its `Relation` message has been seen.
     #[must_use]
-    pub fn ddl_audit_rel(&self) -> Option<&common::PgRelation> {
+    pub const fn ddl_audit_rel(&self) -> Option<&common::PgRelation> {
         self.ddl_audit_rel.as_ref()
     }
 
     /// The `reload_signal` relation shape, once its `Relation` message has been seen.
     #[must_use]
-    pub fn reload_signal_rel(&self) -> Option<&common::PgRelation> {
+    pub const fn reload_signal_rel(&self) -> Option<&common::PgRelation> {
         self.reload_signal_rel.as_ref()
     }
 
@@ -133,7 +133,7 @@ struct BeatState {
 }
 
 impl BeatState {
-    fn new(cfg: HeartbeatConfig) -> Self {
+    const fn new(cfg: HeartbeatConfig) -> Self {
         BeatState {
             cfg,
             last_beat: None,
@@ -152,7 +152,7 @@ impl BeatState {
         idle_activity && idle_beat
     }
 
-    fn on_beat_sent(&mut self, seq: i64, now: Instant) {
+    const fn on_beat_sent(&mut self, seq: i64, now: Instant) {
         self.last_beat = Some(now);
         self.pending_seq = Some(seq);
     }
@@ -218,7 +218,7 @@ impl Heartbeat {
 
     /// The idle window — the decode loop uses it to pace its beat check.
     #[must_use]
-    pub fn idle_after(&self) -> Duration {
+    pub const fn idle_after(&self) -> Duration {
         self.state.cfg.idle_after
     }
 

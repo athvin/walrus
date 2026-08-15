@@ -294,7 +294,7 @@ impl ReplicationStream {
     }
 
     /// The highest received LSN (what the keepalive path reports as `write`).
-    pub fn last_received(&self) -> Lsn {
+    pub const fn last_received(&self) -> Lsn {
         self.last_received
     }
 
@@ -305,7 +305,7 @@ impl ReplicationStream {
     }
 
     /// The current durable (`confirmed_flush`) baseline.
-    pub fn durable(&self) -> Lsn {
+    pub const fn durable(&self) -> Lsn {
         self.durable
     }
 

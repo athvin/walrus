@@ -120,7 +120,7 @@ fn target_cpu_policy(body: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn cargo_config_policy(
+const fn cargo_config_policy(
     config_toml_exists: bool,
     legacy_config_exists: bool,
 ) -> Result<(), &'static str> {

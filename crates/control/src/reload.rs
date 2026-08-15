@@ -33,7 +33,7 @@ pub enum ReloadFlavor {
 impl ReloadFlavor {
     /// The exact string the migration's CHECK constraint admits (second line of defense).
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             ReloadFlavor::Reload => "reload",
             ReloadFlavor::Resync => "resync",
@@ -68,7 +68,7 @@ pub enum ReloadStatus {
 impl ReloadStatus {
     /// The exact string the migration's CHECK constraint admits.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             ReloadStatus::Requested => "requested",
             ReloadStatus::Exporting => "exporting",
@@ -397,7 +397,7 @@ pub async fn fail(
 /// attempt would carry `restart_count + 1`, so the cap is exceeded when that exceeds the max — a
 /// `max_restarts` of 0 fails the very first mid-export DDL. Pure so it unit-tests without a DB.
 #[must_use]
-pub fn restart_would_exceed_cap(restart_count: i32, max_restarts: i32) -> bool {
+pub const fn restart_would_exceed_cap(restart_count: i32, max_restarts: i32) -> bool {
     restart_count + 1 > max_restarts
 }
 

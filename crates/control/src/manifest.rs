@@ -30,7 +30,7 @@ pub enum ManifestKind {
 impl ManifestKind {
     /// The exact `file_manifest.kind` string persisted in the control DB.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             ManifestKind::Snapshot => "snapshot",
             ManifestKind::Stream => "stream",
@@ -66,7 +66,7 @@ pub enum ManifestStatus {
 impl ManifestStatus {
     /// The exact `file_manifest.status` string persisted in the control DB.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             ManifestStatus::Ready => "ready",
             ManifestStatus::Failed => "failed",

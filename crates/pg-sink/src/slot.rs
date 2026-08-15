@@ -36,7 +36,7 @@ impl SlotResume {
     /// `confirmed_flush_lsn`; a fresh slot means its creation point. (The server clamps up to its own
     /// value regardless.)
     #[must_use]
-    pub fn start_lsn(&self) -> Lsn {
+    pub const fn start_lsn(&self) -> Lsn {
         match self {
             SlotResume::Existing(info) => info.confirmed_flush_lsn,
             SlotResume::Created {

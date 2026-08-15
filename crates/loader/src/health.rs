@@ -151,7 +151,7 @@ async fn healthz(State(s): State<Arc<LoaderState>>) -> StatusCode {
     ok_or_unavailable(s.is_live())
 }
 
-fn ok_or_unavailable(ok: bool) -> StatusCode {
+const fn ok_or_unavailable(ok: bool) -> StatusCode {
     if ok {
         StatusCode::OK
     } else {

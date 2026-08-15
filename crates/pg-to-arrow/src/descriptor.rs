@@ -186,7 +186,7 @@ fn arrow_emit_name(dt: &DataType) -> String {
 }
 
 /// DuckDB scalar type name for a Tier-1/Tier-3 single-field column.
-fn duckdb_scalar_name(dt: &DataType) -> &'static str {
+const fn duckdb_scalar_name(dt: &DataType) -> &'static str {
     match dt {
         DataType::Boolean => "BOOLEAN",
         DataType::Int16 => "SMALLINT",
@@ -207,7 +207,7 @@ fn duckdb_scalar_name(dt: &DataType) -> &'static str {
 }
 
 /// The Postgres type name for an OID (informational descriptor field). Non-builtin → `enum`.
-fn pg_type_name(oid: u32) -> &'static str {
+const fn pg_type_name(oid: u32) -> &'static str {
     match oid {
         oids::BOOL => "bool",
         oids::BYTEA => "bytea",

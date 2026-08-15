@@ -612,7 +612,7 @@ fn render(m: &Message) -> String {
 }
 
 /// The old-image kind as its wire char: `Key` → `'K'`, `Full` → `'O'`.
-fn old_kind_char(k: OldTupleKind) -> char {
+const fn old_kind_char(k: OldTupleKind) -> char {
     match k {
         OldTupleKind::Key => 'K',
         OldTupleKind::Full => 'O',

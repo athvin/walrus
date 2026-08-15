@@ -3,7 +3,7 @@
 
 /// Decode a raw wire `atttypmod` into its signed value (`0xFFFFFFFF` → `-1`).
 #[must_use]
-pub fn atttypmod(raw: u32) -> i32 {
+pub const fn atttypmod(raw: u32) -> i32 {
     raw.cast_signed()
 }
 

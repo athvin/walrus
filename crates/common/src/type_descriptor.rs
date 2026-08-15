@@ -22,7 +22,7 @@ pub enum Tier {
 }
 
 impl Tier {
-    fn as_int(self) -> u8 {
+    const fn as_int(self) -> u8 {
         match self {
             Tier::One => 1,
             Tier::Two => 2,

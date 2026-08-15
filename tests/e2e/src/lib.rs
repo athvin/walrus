@@ -154,12 +154,12 @@ impl Harness {
     }
 
     /// The source Postgres pool — for tests that need multiple concurrent sessions (overlapping txns).
-    pub fn source_pool(&self) -> &sqlx::PgPool {
+    pub const fn source_pool(&self) -> &sqlx::PgPool {
         &self.source
     }
 
     /// The control Postgres pool — for tests that read checkpoints / the manifest directly (PR 4.4).
-    pub fn control_pool(&self) -> &sqlx::PgPool {
+    pub const fn control_pool(&self) -> &sqlx::PgPool {
         &self.control
     }
 

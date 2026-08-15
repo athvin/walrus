@@ -23,14 +23,14 @@ impl<'a> Reader<'a> {
     /// Wrap a byte slice at position 0.
     #[must_use]
     #[inline]
-    pub fn new(buf: &'a [u8]) -> Self {
+    pub const fn new(buf: &'a [u8]) -> Self {
         Reader { buf, pos: 0 }
     }
 
     /// Bytes left to read.
     #[must_use]
     #[inline]
-    pub fn remaining(&self) -> usize {
+    pub const fn remaining(&self) -> usize {
         self.buf.len() - self.pos
     }
 

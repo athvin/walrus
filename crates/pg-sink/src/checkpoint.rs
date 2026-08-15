@@ -30,7 +30,7 @@ pub struct DurabilityCheckpoint {
 
 impl DurabilityCheckpoint {
     #[must_use]
-    pub fn new(resume_lsn: Lsn) -> Self {
+    pub const fn new(resume_lsn: Lsn) -> Self {
         DurabilityCheckpoint {
             confirmed_flush: resume_lsn,
             open_txn_floor: None,
@@ -38,12 +38,12 @@ impl DurabilityCheckpoint {
     }
 
     #[must_use]
-    pub fn confirmed_flush(&self) -> Lsn {
+    pub const fn confirmed_flush(&self) -> Lsn {
         self.confirmed_flush
     }
 
     /// Set the open-txn floor (PR 2.30). `None` = no open streamed txn; small/whole txns leave it unset.
-    pub fn set_open_txn_floor(&mut self, floor: Option<Lsn>) {
+    pub const fn set_open_txn_floor(&mut self, floor: Option<Lsn>) {
         self.open_txn_floor = floor;
     }
 
@@ -60,7 +60,7 @@ impl DurabilityCheckpoint {
     /// The standby reply: `write` = the stream's received/keepalive LSN (unconditional), `flush`/`apply`
     /// = `confirmed_flush` (durable). A stalled flush advances `write` (via the stream) but not these.
     #[must_use]
-    pub fn standby_status(&self, received: Lsn, reply_requested: bool) -> StandbyStatus {
+    pub const fn standby_status(&self, received: Lsn, reply_requested: bool) -> StandbyStatus {
         StandbyStatus {
             write: received,
             flush: self.confirmed_flush,
