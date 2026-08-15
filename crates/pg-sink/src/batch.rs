@@ -54,7 +54,22 @@ mod private {
 /// ```
 pub trait Clock: private::Sealed + Send + Sync + fmt::Debug {
     fn now(&self) -> Instant;
+
+    /// Return the instant `after` from now, or `None` if it would overflow [`Instant`].
+    ///
+    /// This generic convenience method is available to concrete clocks. The `Self: Sized` gate
+    /// excludes it from the vtable so [`Clock`] remains dyn-compatible.
+    fn deadline<D: Into<Duration>>(&self, after: D) -> Option<Instant>
+    where
+        Self: Sized,
+    {
+        self.now().checked_add(after.into())
+    }
 }
+
+/// Dyn-compatibility guard. Adding an ungated generic method, a bare-`Self` return, or an
+/// associated const to [`Clock`] breaks compilation here, which is exactly the intent.
+const _: fn(&dyn Clock) -> std::time::Instant = |c| c.now();
 
 /// The wall clock.
 #[derive(Debug, Default, Clone, Copy)]

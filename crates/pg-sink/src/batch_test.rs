@@ -72,7 +72,9 @@ fn clock_is_dyn_compatible_and_usable_in_a_heterogeneous_collection() {
 fn gated_deadline_is_reachable_from_a_concrete_clock() {
     let clock = FakeClock::new();
     let after = Duration::from_millis(100);
-    let deadline = clock.deadline(after).expect("100ms deadline is representable");
+    let deadline = clock
+        .deadline(after)
+        .expect("100ms deadline is representable");
 
     assert_eq!(deadline, clock.now().checked_add(after).unwrap());
     clock.advance(after + Duration::from_millis(1));
