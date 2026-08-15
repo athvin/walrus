@@ -23,14 +23,20 @@ fn object_store_failure_exits_12_not_70() {
 #[test]
 fn manifest_failure_exits_11() {
     let err = anyhow::Error::new(crate::manifest::ManifestError::Control(
-        control::ControlError::Decode("bad manifest row".to_string()),
+        control::ControlError::Decode(control::ParseEnumError::new(
+            "file_manifest.kind",
+            "bad manifest row",
+        )),
     ));
     assert_eq!(code_for(&err), common::ExitCode::ControlDb);
 }
 
 #[test]
 fn control_failure_exits_11() {
-    let err = anyhow::Error::new(control::ControlError::Decode("bad control row".to_string()));
+    let err = anyhow::Error::new(control::ControlError::Decode(control::ParseEnumError::new(
+        "file_manifest.status",
+        "bad control row",
+    )));
     assert_eq!(code_for(&err), common::ExitCode::ControlDb);
 }
 

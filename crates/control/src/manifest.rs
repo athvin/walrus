@@ -49,7 +49,7 @@ impl std::str::FromStr for ManifestKind {
             "stream" => Ok(ManifestKind::Stream),
             "spill" => Ok(ManifestKind::Spill),
             "reload" => Ok(ManifestKind::Reload),
-            other => Err(ParseEnumError::new("manifest kind", other)),
+            other => Err(ParseEnumError::new("file_manifest.kind", other)),
         }
     }
 }
@@ -81,7 +81,7 @@ impl std::str::FromStr for ManifestStatus {
         match s {
             "ready" => Ok(ManifestStatus::Ready),
             "failed" => Ok(ManifestStatus::Failed),
-            other => Err(ParseEnumError::new("manifest status", other)),
+            other => Err(ParseEnumError::new("file_manifest.status", other)),
         }
     }
 }
@@ -201,18 +201,12 @@ pub async fn claim_ready(
                 source_schema: r.source_schema,
                 source_table: r.source_table,
                 s3_uri: r.s3_uri,
-                kind: r
-                    .kind
-                    .parse()
-                    .map_err(|e: ParseEnumError| ControlError::Decode(e.to_string()))?,
+                kind: r.kind.parse()?,
                 row_count: r.row_count,
                 lsn_start: r.lsn_start,
                 lsn_end: r.lsn_end,
                 schema_version: r.schema_version.into(),
-                status: r
-                    .status
-                    .parse()
-                    .map_err(|e: ParseEnumError| ControlError::Decode(e.to_string()))?,
+                status: r.status.parse()?,
                 reload_id: r.reload_id.map(Into::into),
             })
         })

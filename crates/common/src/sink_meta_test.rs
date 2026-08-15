@@ -26,9 +26,7 @@ fn utc_timestamp_conversions_round_trip() {
 
 #[test]
 fn display_and_from_str_round_trip() {
-    let timestamp = "2026-07-04T12:00:00.123Z"
-        .parse::<UtcTimestamp>()
-        .unwrap();
+    let timestamp = "2026-07-04T12:00:00.123Z".parse::<UtcTimestamp>().unwrap();
 
     assert_eq!(timestamp.to_string().parse::<UtcTimestamp>(), Ok(timestamp));
     assert_eq!(
@@ -129,9 +127,7 @@ fn non_utc_timestamp_is_rejected() {
             input: "2026-07-04T12:00:00+02:00".to_string(),
         })
     );
-    assert!("2026-07-04T12:00:00-05:00"
-        .parse::<UtcTimestamp>()
-        .is_err());
+    assert!("2026-07-04T12:00:00-05:00".parse::<UtcTimestamp>().is_err());
     assert_eq!(
         "not a timestamp".parse::<UtcTimestamp>(),
         Err(TimestampParseError::NotUtcZ {
@@ -144,6 +140,20 @@ fn non_utc_timestamp_is_rejected() {
     ));
     // The UTC `Z` form is accepted.
     assert!("2026-07-04T12:00:00Z".parse::<UtcTimestamp>().is_ok());
+}
+
+#[test]
+fn timestamp_parse_error_keeps_common_error_wording() {
+    let parse_error = "2026-07-04T12:00:00+02:00"
+        .parse::<UtcTimestamp>()
+        .unwrap_err();
+    let parse_message = parse_error.to_string();
+    let error = Error::from(parse_error);
+
+    assert_eq!(
+        error.to_string(),
+        format!("internal error: {parse_message}")
+    );
 }
 
 #[test]
@@ -209,9 +219,7 @@ fn negative_micros_pre_y2k() {
 #[test]
 fn round_trips_a_known_commit_ts() {
     // The µs the sink would receive for a real commit time, reconstructed back to the same instant.
-    let want = "2026-07-04T12:00:00.123Z"
-        .parse::<UtcTimestamp>()
-        .unwrap();
+    let want = "2026-07-04T12:00:00.123Z".parse::<UtcTimestamp>().unwrap();
     let pg_micros = want.0.as_microsecond() - 946_684_800_000_000;
     assert_eq!(UtcTimestamp::from_pg_micros(pg_micros).unwrap(), want);
 }

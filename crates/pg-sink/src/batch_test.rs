@@ -113,7 +113,7 @@ fn meta(lsn: &str) -> SinkMeta {
         op: Op::Insert,
         lsn: lsn.parse().unwrap(),
         commit_lsn: Lsn::ZERO, // patched at on_commit
-        commit_ts: UtcTimestamp::parse_rfc3339("2026-07-07T12:00:00Z").unwrap(),
+        commit_ts: "2026-07-07T12:00:00Z".parse::<UtcTimestamp>().unwrap(),
         xid: 7,
         epoch: common::EpochNo(1),
         batch_id: "b1".into(),
@@ -123,7 +123,7 @@ fn meta(lsn: &str) -> SinkMeta {
         kind: Kind::Stream,
         unchanged_toast: Box::default(),
         sink_instance: "walrus-pg-sink-0".into(),
-        sink_processed_at: UtcTimestamp::parse_rfc3339("2026-07-07T12:00:00Z").unwrap(),
+        sink_processed_at: "2026-07-07T12:00:00Z".parse::<UtcTimestamp>().unwrap(),
     }
 }
 

@@ -91,10 +91,7 @@ fn from_sqlx_error_classifies_everything_else_as_transient_connect() {
 
 #[test]
 fn decode_preserves_column_and_input() {
-    let error = ControlError::from(ParseEnumError::new(
-        "file_manifest.kind",
-        "snapshottt",
-    ));
+    let error = ControlError::from(ParseEnumError::new("file_manifest.kind", "snapshottt"));
 
     assert!(error.is_terminal());
     let ControlError::Decode(source) = &error else {

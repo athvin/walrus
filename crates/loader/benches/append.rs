@@ -82,7 +82,7 @@ fn meta(i: usize) -> SinkMeta {
         op: Op::Insert,
         lsn: Lsn::new(u64::try_from(i).unwrap() + 1),
         commit_lsn: Lsn::new(u64::try_from(i).unwrap() + 1),
-        commit_ts: UtcTimestamp::parse_rfc3339("2026-07-04T12:00:00Z").unwrap(),
+        commit_ts: "2026-07-04T12:00:00Z".parse::<UtcTimestamp>().unwrap(),
         xid: 1,
         epoch: EpochNo(7),
         batch_id: "3f2a0000-0000-0000-0000-000000000001".to_string(),
@@ -92,7 +92,7 @@ fn meta(i: usize) -> SinkMeta {
         kind: Kind::Stream,
         unchanged_toast: Box::default(),
         sink_instance: "walrus-pg-sink-0".to_string(),
-        sink_processed_at: UtcTimestamp::parse_rfc3339("2026-07-04T12:00:00.123Z").unwrap(),
+        sink_processed_at: "2026-07-04T12:00:00.123Z".parse::<UtcTimestamp>().unwrap(),
     }
 }
 

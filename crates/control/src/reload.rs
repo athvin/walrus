@@ -48,7 +48,7 @@ impl std::str::FromStr for ReloadFlavor {
         match s {
             "reload" => Ok(ReloadFlavor::Reload),
             "resync" => Ok(ReloadFlavor::Resync),
-            other => Err(ParseEnumError::new("reload flavor", other)),
+            other => Err(ParseEnumError::new("table_reload.flavor", other)),
         }
     }
 }
@@ -89,7 +89,7 @@ impl std::str::FromStr for ReloadStatus {
             "export_complete" => Ok(ReloadStatus::ExportComplete),
             "complete" => Ok(ReloadStatus::Complete),
             "failed" => Ok(ReloadStatus::Failed),
-            other => Err(ParseEnumError::new("reload status", other)),
+            other => Err(ParseEnumError::new("table_reload.status", other)),
         }
     }
 }

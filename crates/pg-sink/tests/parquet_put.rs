@@ -62,7 +62,7 @@ fn meta() -> SinkMeta {
         op: Op::Insert,
         lsn: "0/10".parse().unwrap(),
         commit_lsn: "0/20".parse().unwrap(),
-        commit_ts: UtcTimestamp::parse_rfc3339("2026-07-07T12:00:00Z").unwrap(),
+        commit_ts: "2026-07-07T12:00:00Z".parse::<UtcTimestamp>().unwrap(),
         xid: 1,
         epoch: common::EpochNo(7),
         batch_id: "public.orders-0/10".to_string(),

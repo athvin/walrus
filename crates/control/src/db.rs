@@ -1,5 +1,6 @@
 //! Control-DB connection pool and migration runner.
 
+use crate::parse::ParseEnumError;
 use common::{FailureClass, ReloadId};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
@@ -40,7 +41,7 @@ pub enum ControlError {
     /// `kind`/`status`). The DB CHECK and the sink's `as_str()` writer should make this impossible,
     /// so it is a data-integrity bug — terminal, never transient.
     #[error("control-plane decode: {0}")]
-    Decode(String),
+    Decode(#[from] ParseEnumError),
 }
 
 impl FailureClass for ControlError {

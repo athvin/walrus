@@ -20,8 +20,5 @@ fn display_is_unambiguous_for_whitespace_and_empty_input() {
     );
 
     let empty = ParseEnumError::new("file_manifest.status", "");
-    assert_eq!(
-        empty.to_string(),
-        "unknown file_manifest.status value \"\""
-    );
+    assert_eq!(empty.to_string(), "unknown file_manifest.status value \"\"");
 }

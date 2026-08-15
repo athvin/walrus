@@ -64,6 +64,12 @@ pub enum Error {
     Internal(String),
 }
 
+impl From<crate::sink_meta::TimestampParseError> for Error {
+    fn from(error: crate::sink_meta::TimestampParseError) -> Self {
+        Error::Internal(error.to_string())
+    }
+}
+
 /// Move-cost budget for the error value propagated through every service hot path.
 ///
 /// Measured with `size_of::<Error>()` on PR 9.7. If this trips, shrink or box the growing variant

@@ -56,6 +56,17 @@ const _: () = assert!(
         && align_of::<UtcTimestamp>() == align_of::<jiff::Timestamp>()
 );
 
+/// Why an RFC-3339 string is not a legal walrus timestamp.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum TimestampParseError {
+    /// The text was not already normalized to walrus's required UTC `Z` form.
+    #[error("timestamp {input:?} must be UTC with a 'Z' suffix, not a numeric offset")]
+    NotUtcZ { input: String },
+    /// The text had a UTC suffix but was not a valid RFC-3339 timestamp.
+    #[error("invalid RFC-3339 timestamp {input:?}: {reason}")]
+    Malformed { input: String, reason: String },
+}
+
 impl UtcTimestamp {
     /// The current instant, in UTC.
     #[must_use]
@@ -73,26 +84,6 @@ impl UtcTimestamp {
     #[must_use]
     pub fn into_inner(self) -> jiff::Timestamp {
         self.0
-    }
-
-    /// Parse an RFC-3339 string, **rejecting** anything not already normalized to UTC `Z` — a
-    /// numeric offset (e.g. `+02:00`) is refused rather than silently converted, so the wire form
-    /// is always UTC (architecture.md §1.4).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Internal`] when `s` lacks a `Z` suffix or cannot be parsed as an RFC-3339
-    /// UTC timestamp. Invalid persisted provenance is terminal.
-    pub fn parse_rfc3339(s: &str) -> Result<Self> {
-        if !(s.ends_with('Z') || s.ends_with('z')) {
-            return Err(Error::Internal(format!(
-                "timestamp {s:?} must be UTC with a 'Z' suffix, not a numeric offset"
-            )));
-        }
-        let ts: jiff::Timestamp = s
-            .parse()
-            .map_err(|e| Error::Internal(format!("invalid RFC-3339 timestamp {s:?}: {e}")))?;
-        Ok(UtcTimestamp(ts))
     }
 
     /// Build from a pgoutput wire timestamp: **microseconds since 2000-01-01T00:00:00Z** (proto §4) —
@@ -124,6 +115,27 @@ impl UtcTimestamp {
     }
 }
 
+impl std::str::FromStr for UtcTimestamp {
+    type Err = TimestampParseError;
+
+    /// Parse RFC-3339, rejecting anything not already normalized to UTC `Z`.
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        if !(s.ends_with('Z') || s.ends_with('z')) {
+            return Err(TimestampParseError::NotUtcZ {
+                input: s.to_string(),
+            });
+        }
+
+        let timestamp =
+            s.parse::<jiff::Timestamp>()
+                .map_err(|error| TimestampParseError::Malformed {
+                    input: s.to_string(),
+                    reason: error.to_string(),
+                })?;
+        Ok(Self(timestamp))
+    }
+}
+
 impl std::fmt::Display for UtcTimestamp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
@@ -144,15 +156,15 @@ impl From<UtcTimestamp> for jiff::Timestamp {
 
 impl Serialize for UtcTimestamp {
     fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
-        // jiff::Timestamp's Display is RFC-3339 with a `Z` suffix — exactly walrus's wire form.
-        s.collect_str(&self.0)
+        // UtcTimestamp's Display is the single RFC-3339 `Z` rendering hook.
+        s.collect_str(self)
     }
 }
 
 impl<'de> Deserialize<'de> for UtcTimestamp {
     fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
         let s: String = Deserialize::deserialize(d)?;
-        UtcTimestamp::parse_rfc3339(&s).map_err(serde::de::Error::custom)
+        s.parse::<UtcTimestamp>().map_err(serde::de::Error::custom)
     }
 }
 

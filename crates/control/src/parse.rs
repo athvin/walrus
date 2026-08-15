@@ -6,20 +6,20 @@
 
 /// A control-plane enum rejected a text value read from the database.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("invalid {expected}: {input:?}")]
+#[error("unknown {column} value {input:?}")]
 pub struct ParseEnumError {
-    /// Which vocabulary rejected the value, such as `"manifest kind"` or `"reload status"`.
-    pub expected: &'static str,
+    /// Exact checked control-DB column, such as `file_manifest.kind`.
+    pub column: &'static str,
     /// The exact text that was rejected, preserved verbatim.
     pub input: String,
 }
 
 impl ParseEnumError {
-    /// Preserve a rejected enum value together with the vocabulary that rejected it.
+    /// Preserve a rejected enum value together with the exact column that rejected it.
     #[must_use]
-    pub fn new(expected: &'static str, input: &str) -> Self {
+    pub fn new(column: &'static str, input: &str) -> Self {
         Self {
-            expected,
+            column,
             input: input.to_string(),
         }
     }
