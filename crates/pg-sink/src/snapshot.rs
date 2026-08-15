@@ -145,15 +145,15 @@ impl SnapshotConn<Exported> {
 
 /// One serial per-table backfill over an ordinary SQL connection (distinct from the replication one).
 #[derive(Debug)]
-pub struct Backfill {
+pub struct Backfill<C> {
     client: tokio_postgres::Client,
     triggers: BatchTriggers,
-    clock: Arc<dyn Clock>,
+    clock: C,
     epoch: EpochNo,
     instance: String,
 }
 
-impl Backfill {
+impl Backfill<Arc<SystemClock>> {
     /// Open and configure an ordinary SQL connection for snapshot reads.
     ///
     /// # Errors
@@ -191,7 +191,9 @@ impl Backfill {
             instance,
         })
     }
+}
 
+impl<C: Clock + Clone> Backfill<C> {
     /// Copy one table under the exported snapshot into `kind='snapshot'` Parquet + manifest rows, all
     /// sharing `lsn_end = consistent_point`. Returns the row count copied. Output is chunked by the same
     /// `max_rows`/`max_bytes` caps as streamed batches (so a large table becomes many files).
@@ -218,7 +220,7 @@ impl Backfill {
         let cached = RelationCache::default()
             .upsert_from_relation(rel.clone(), schema_version)
             .context("build Arrow schema for backfill")?;
-        let mut batcher = TableBatcher::new(cached, self.triggers, Arc::clone(&self.clock))
+        let mut batcher = TableBatcher::new(cached, self.triggers, self.clock.clone())
             .context("create backfill batcher")?;
 
         // Every column cast ::text gives the type's output form — identical to pgoutput's text tuples,
@@ -289,11 +291,11 @@ impl Backfill {
     }
 }
 
-async fn flush_snapshot(
+async fn flush_snapshot<C: Clock>(
     sink: &ParquetSink,
     pool: &sqlx::PgPool,
     epoch: EpochNo,
-    batcher: &mut TableBatcher,
+    batcher: &mut TableBatcher<C>,
 ) -> anyhow::Result<()> {
     let sealed = batcher.seal().context("seal snapshot batch")?;
     let obj =

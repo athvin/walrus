@@ -20,6 +20,7 @@
 //! The signal task also selects on the token so it exits if cancellation comes from elsewhere — it
 //! never outlives the token as a leaked handle.
 
+use crate::batch::Clock;
 use crate::checkpoint::DurabilityCheckpoint;
 use crate::consume::{flush_batch, BatchRouter};
 use crate::replication::ReplicationStream;
@@ -68,9 +69,9 @@ pub enum DrainOutcome {
 ///
 /// Returns [`anyhow::Error`] if sealing a committed batch, S3/manifest durability, the final standby
 /// status, or `CopyDone` fails. Open uncommitted rows are intentionally discarded, not errors.
-pub async fn drain(
+pub async fn drain<C: Clock + Clone>(
     stream: &mut ReplicationStream,
-    router: &mut BatchRouter,
+    router: &mut BatchRouter<C>,
     sink: &ParquetSink,
     checkpoint: &mut DurabilityCheckpoint,
     pool: &sqlx::PgPool,

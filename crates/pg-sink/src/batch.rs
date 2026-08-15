@@ -8,6 +8,14 @@
 //!
 //! `lsn_end` is the **commit LSN** of the batch's last transaction — the load-bearing key for the
 //! manifest (PR 2.25) and checkpoint (PR 2.26), and deliberately *not* the max per-row LSN.
+//!
+//! ## Dynamic dispatch in `pg-sink` — the deliberate list
+//!
+//! | Site | Dispatch | Why |
+//! |---|---|---|
+//! | `Clock` (this module) | **static** (`C: Clock`) | one production impl on a per-commit path |
+//! | `Arc<dyn ObjectStore>` (`sink.rs`) | dynamic | backend is chosen from config at runtime |
+//! | `Box<dyn ArrayBuilder>` (`pg-to-arrow`) | dynamic | one heterogeneous builder per column |
 
 use crate::relcache::CachedRelation;
 use arrow::record_batch::RecordBatch;
@@ -22,9 +30,12 @@ mod private {
     pub trait Sealed {}
 }
 
-/// Injectable clock so `max_fill` is testable without sleeping. Production uses [`SystemClock`]; the
-/// single production impl is deliberate — the trait exists **for that test seam**, not as dead
-/// generality (audited PR 8.5, kept by design).
+/// Injectable clock so `max_fill` is testable without sleeping. Production has exactly one impl
+/// ([`SystemClock`]); the trait exists **for that test seam**, not as dead generality (audited
+/// PR 8.5, kept by design). Since PR 19.5 the seam is **statically dispatched**: every owner is
+/// generic over `C: Clock`, so the one production instantiation inlines and no vtable rides the
+/// per-commit path. `Arc<SystemClock>` / `Arc<FakeClock>` satisfy the bound via the delegating impls
+/// below (PR 19.4).
 ///
 /// This trait is sealed: it can be called and stored from anywhere, but only `pg-sink` can implement
 /// it.
@@ -62,9 +73,9 @@ impl Clock for SystemClock {
 /// clocks are held behind an `Arc` because batchers share one, so without these impls the generic
 /// form is unusable.
 ///
-/// `?Sized` is load-bearing: it keeps `Arc<dyn Clock>` covered. Both `Clock` impls target wrapper
-/// types; a bare `impl<T: Clock> Clock for T` would collide with `impl Clock for SystemClock`
-/// (E0119).
+/// `?Sized` is load-bearing: it keeps a trait-object clock behind `Arc` covered. Both `Clock` impls
+/// target wrapper types; a bare `impl<T: Clock> Clock for T` would collide with
+/// `impl Clock for SystemClock` (E0119).
 impl<T: Clock + ?Sized> private::Sealed for std::sync::Arc<T> {}
 
 impl<T: Clock + ?Sized> Clock for std::sync::Arc<T> {
@@ -103,10 +114,10 @@ pub struct SealedBatch {
 
 /// Accumulates one table's committed changes into an Arrow builder until a trigger trips.
 #[derive(Debug)]
-pub struct TableBatcher {
+pub struct TableBatcher<C> {
     rel: Arc<CachedRelation>,
     triggers: BatchTriggers,
-    clock: Arc<dyn Clock>,
+    clock: C,
     /// Committed (flush-eligible) rows.
     builder: BatchBuilder,
     /// Rows of the currently-open transaction — not yet flush-eligible.
@@ -124,7 +135,7 @@ pub struct TableBatcher {
     batch_id: Option<String>,
 }
 
-impl TableBatcher {
+impl<C: Clock> TableBatcher<C> {
     /// Create an empty batcher for one cached relation.
     ///
     /// # Errors
@@ -134,7 +145,7 @@ impl TableBatcher {
     pub fn new(
         rel: Arc<CachedRelation>,
         triggers: BatchTriggers,
-        clock: Arc<dyn Clock>,
+        clock: C,
     ) -> Result<Self, BatchError> {
         let builder = BatchBuilder::new(&rel.relation)?;
         Ok(TableBatcher {

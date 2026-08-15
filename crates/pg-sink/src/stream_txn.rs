@@ -22,7 +22,7 @@
 //! sub-xid so `survivors` excludes exactly the aborted ones. *Freeing memory (the spill) is NOT
 //! advancing the slot or making data visible (the `ready` row).*
 
-use crate::batch::{BatchTriggers, Clock, TableBatcher};
+use crate::batch::{BatchTriggers, Clock, SystemClock, TableBatcher};
 use crate::memory::InflightMeter;
 use crate::pgoutput::Message;
 use crate::relcache::RelationCache;
@@ -101,22 +101,22 @@ impl StreamedTxn {
 /// Demultiplexes interleaved streamed transactions, commit-gates visibility, and spills under memory
 /// pressure. **DB-free** — `on_stream_commit` returns the objects to `record_ready`.
 #[derive(Debug)]
-pub struct StreamDemux {
+pub struct StreamDemux<C = std::sync::Arc<SystemClock>> {
     open: HashMap<u32, StreamedTxn>,
     /// The top-level xid of the currently-open `Stream Start … Stream Stop` block; changes route here.
     current_top: Option<u32>,
     triggers: BatchTriggers,
-    clock: Arc<dyn Clock>,
+    clock: C,
     epoch: EpochNo,
     sink_instance: String,
     meter: InflightMeter,
     spill_count: u64,
 }
 
-impl StreamDemux {
+impl<C: Clock + Clone> StreamDemux<C> {
     pub fn new(
         triggers: BatchTriggers,
-        clock: Arc<dyn Clock>,
+        clock: C,
         epoch: EpochNo,
         sink_instance: impl Into<String>,
         max_inflight_bytes: NonZeroU64,
@@ -234,7 +234,7 @@ impl StreamDemux {
             };
             let (triggers, clock, epoch, instance) = (
                 self.triggers,
-                Arc::clone(&self.clock),
+                self.clock.clone(),
                 self.epoch,
                 self.sink_instance.clone(),
             );
@@ -428,11 +428,11 @@ impl StreamDemux {
         // Materialise the still-in-memory survivors.
         let (triggers, clock, epoch, instance) = (
             self.triggers,
-            Arc::clone(&self.clock),
+            self.clock.clone(),
             self.epoch,
             self.sink_instance.clone(),
         );
-        let mut batchers: HashMap<u32, TableBatcher> = HashMap::new();
+        let mut batchers: HashMap<u32, TableBatcher<C>> = HashMap::new();
         for c in changes.iter().filter(|c| !aborted.contains(&c.sub_xid)) {
             let Some(cached) = cache.latest_for(c.oid) else {
                 continue;
@@ -456,7 +456,7 @@ impl StreamDemux {
             let batcher = match batchers.entry(c.oid) {
                 Entry::Occupied(e) => e.into_mut(),
                 Entry::Vacant(e) => e.insert(
-                    TableBatcher::new(Arc::clone(&cached), triggers, Arc::clone(&clock))
+                    TableBatcher::new(Arc::clone(&cached), triggers, clock.clone())
                         .context("open streamed materialise batcher")?,
                 ),
             };

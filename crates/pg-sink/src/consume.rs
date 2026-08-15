@@ -36,14 +36,14 @@ enum FrameEvent {
 /// The fully wired decode loop. Construct it with [`DecodeLoop::builder`]; [`DecodeLoop::run`]
 /// consumes the wiring so its mutable borrows cannot escape or be reused concurrently.
 #[derive(Debug)]
-pub struct DecodeLoop<'a> {
+pub struct DecodeLoop<'a, C> {
     stream: &'a mut ReplicationStream,
     token: CancellationToken,
     cache: &'a mut RelationCache,
-    router: &'a mut BatchRouter,
+    router: &'a mut BatchRouter<C>,
     sink: &'a crate::sink::ParquetSink,
     checkpoint: &'a mut crate::checkpoint::DurabilityCheckpoint,
-    demux: &'a mut crate::stream_txn::StreamDemux,
+    demux: &'a mut crate::stream_txn::StreamDemux<C>,
     ddl: &'a mut crate::ddl::DdlConsumer,
     heartbeat: &'a mut Heartbeat,
     health: &'a HealthState,
@@ -63,15 +63,15 @@ pub struct DecodeLoop<'a> {
 /// builder.epoch(common::EpochNo(7));
 /// ```
 #[must_use = "a builder does nothing until you call build()"]
-#[derive(Debug, Default)]
-pub struct DecodeLoopBuilder<'a> {
+#[derive(Debug)]
+pub struct DecodeLoopBuilder<'a, C> {
     stream: Option<&'a mut ReplicationStream>,
     token: Option<CancellationToken>,
     cache: Option<&'a mut RelationCache>,
-    router: Option<&'a mut BatchRouter>,
+    router: Option<&'a mut BatchRouter<C>>,
     sink: Option<&'a crate::sink::ParquetSink>,
     checkpoint: Option<&'a mut crate::checkpoint::DurabilityCheckpoint>,
-    demux: Option<&'a mut crate::stream_txn::StreamDemux>,
+    demux: Option<&'a mut crate::stream_txn::StreamDemux<C>>,
     ddl: Option<&'a mut crate::ddl::DdlConsumer>,
     heartbeat: Option<&'a mut Heartbeat>,
     health: Option<&'a HealthState>,
@@ -80,11 +80,33 @@ pub struct DecodeLoopBuilder<'a> {
     waiters: Option<&'a crate::reload_signal::WatermarkWaiters>,
 }
 
-impl<'a> DecodeLoop<'a> {
-    pub fn builder() -> DecodeLoopBuilder<'a> {
+impl<C> Default for DecodeLoopBuilder<'_, C> {
+    fn default() -> Self {
+        Self {
+            stream: None,
+            token: None,
+            cache: None,
+            router: None,
+            sink: None,
+            checkpoint: None,
+            demux: None,
+            ddl: None,
+            heartbeat: None,
+            health: None,
+            pool: None,
+            epoch: None,
+            waiters: None,
+        }
+    }
+}
+
+impl<'a, C> DecodeLoop<'a, C> {
+    pub fn builder() -> DecodeLoopBuilder<'a, C> {
         DecodeLoopBuilder::default()
     }
+}
 
+impl<C: Clock + Clone> DecodeLoop<'_, C> {
     /// Drive the stream: decode each `XLogData`, register each `Relation` (cache + schema_registry),
     /// route I/U/D into per-table batchers (sealing at commit boundaries), PUT sealed batches to S3,
     /// keep keepalives answered, and exit cleanly on cancel or stream end.
@@ -434,7 +456,7 @@ impl<'a> DecodeLoop<'a> {
     }
 }
 
-impl<'a> DecodeLoopBuilder<'a> {
+impl<'a, C> DecodeLoopBuilder<'a, C> {
     #[must_use = "builder methods return the modified builder — chain or assign"]
     pub fn stream(mut self, stream: &'a mut ReplicationStream) -> Self {
         self.stream = Some(stream);
@@ -454,7 +476,7 @@ impl<'a> DecodeLoopBuilder<'a> {
     }
 
     #[must_use = "builder methods return the modified builder — chain or assign"]
-    pub fn router(mut self, router: &'a mut BatchRouter) -> Self {
+    pub fn router(mut self, router: &'a mut BatchRouter<C>) -> Self {
         self.router = Some(router);
         self
     }
@@ -475,7 +497,7 @@ impl<'a> DecodeLoopBuilder<'a> {
     }
 
     #[must_use = "builder methods return the modified builder — chain or assign"]
-    pub fn demux(mut self, demux: &'a mut crate::stream_txn::StreamDemux) -> Self {
+    pub fn demux(mut self, demux: &'a mut crate::stream_txn::StreamDemux<C>) -> Self {
         self.demux = Some(demux);
         self
     }
@@ -521,7 +543,7 @@ impl<'a> DecodeLoopBuilder<'a> {
     /// # Errors
     ///
     /// Returns [`DecodeLoopError`] naming the first setter omitted from the builder chain.
-    pub fn build(self) -> Result<DecodeLoop<'a>, DecodeLoopError> {
+    pub fn build(self) -> Result<DecodeLoop<'a, C>, DecodeLoopError> {
         Ok(DecodeLoop {
             stream: self.stream.ok_or(DecodeLoopError("stream"))?,
             token: self.token.ok_or(DecodeLoopError("token"))?,
@@ -661,10 +683,10 @@ pub async fn flush_batch_kind(
 /// Routes decoded changes into per-table [`TableBatcher`]s and seals at commit boundaries. Owns the
 /// per-table batchers + the sink context stamped into each row's `walrus_pg_sink_meta`.
 #[derive(Debug)]
-pub struct BatchRouter {
-    batchers: HashMap<u32, TableBatcher>,
+pub struct BatchRouter<C> {
+    batchers: HashMap<u32, TableBatcher<C>>,
     triggers: BatchTriggers,
-    clock: Arc<dyn Clock>,
+    clock: C,
     epoch: EpochNo,
     sink_instance: String,
     /// The current transaction's top-level xid (from `Begin`), used when a change carries no xid
@@ -681,10 +703,10 @@ struct RowSource<'a> {
     xid: u32,
 }
 
-impl BatchRouter {
+impl<C: Clock + Clone> BatchRouter<C> {
     pub fn new(
         triggers: BatchTriggers,
-        clock: Arc<dyn Clock>,
+        clock: C,
         epoch: EpochNo,
         sink_instance: impl Into<String>,
     ) -> Self {
@@ -793,7 +815,7 @@ impl BatchRouter {
             return Ok(());
         };
         let triggers = self.triggers;
-        let clock = Arc::clone(&self.clock);
+        let clock = self.clock.clone();
         let batcher = match self.batchers.entry(row.oid) {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => e.insert(
