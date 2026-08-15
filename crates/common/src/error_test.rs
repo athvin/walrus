@@ -115,3 +115,13 @@ fn every_exit_code_variant_fits_a_u8() {
         assert!(u8::try_from(raw).is_ok(), "{code:?} no longer fits a u8");
     }
 }
+
+#[test]
+fn every_exit_code_round_trips_through_its_i32() {
+    for (err, _) in one_of_each() {
+        let code = err.exit_code();
+        assert_eq!(ExitCode::try_from(code as i32), Ok(code), "{err:?}");
+    }
+    assert_eq!(ExitCode::try_from(0), Ok(ExitCode::Success));
+    assert_eq!(ExitCode::try_from(99), Err(UnknownExitCode(99)));
+}

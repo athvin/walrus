@@ -10,25 +10,21 @@ fn col(name: &str, type_oid: u32, type_modifier: i32, is_key: bool) -> PgColumn 
 }
 
 #[test]
-fn replica_identity_from_wire_char() {
+fn replica_identity_try_from_char() {
     assert_eq!(
-        ReplicaIdentity::from_wire(b'd').unwrap(),
+        ReplicaIdentity::try_from(b'd').unwrap(),
         ReplicaIdentity::Default
     );
+    let nothing: ReplicaIdentity = b'n'.try_into().unwrap();
+    assert_eq!(nothing, ReplicaIdentity::Nothing);
     assert_eq!(
-        ReplicaIdentity::from_wire(b'n').unwrap(),
-        ReplicaIdentity::Nothing
-    );
-    assert_eq!(
-        ReplicaIdentity::from_wire(b'f').unwrap(),
+        ReplicaIdentity::try_from(b'f').unwrap(),
         ReplicaIdentity::Full
     );
-    assert_eq!(
-        ReplicaIdentity::from_wire(b'i').unwrap(),
-        ReplicaIdentity::Index
-    );
-    assert!(ReplicaIdentity::from_wire(b'x').is_err());
-    assert!(ReplicaIdentity::from_wire(0).is_err());
+    let index: ReplicaIdentity = b'i'.try_into().unwrap();
+    assert_eq!(index, ReplicaIdentity::Index);
+    assert!(ReplicaIdentity::try_from(b'x').is_err());
+    assert!(ReplicaIdentity::try_from(0).is_err());
 }
 
 #[test]
