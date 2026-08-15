@@ -50,6 +50,36 @@ fn clock_bound_accepts_owned_shared_and_borrowed_clocks() {
     assert!([a, b, c, d].into_iter().all(|instant| instant >= baseline));
 }
 
+/// A harness that wants to run the same assertion over several clocks needs one collection of
+/// them — the legitimate `dyn` case from PR 19.5's decision table.
+///
+/// NOTE: `Box::new(FakeClock::new())` is a `Box<Arc<FakeClock>>`; it coerces to `Box<dyn Clock>`
+/// only because of PR 19.4's `impl<T: Clock + ?Sized> Clock for Arc<T>`. If this line ever stops
+/// compiling, that impl is what went missing.
+#[test]
+fn clock_is_dyn_compatible_and_usable_in_a_heterogeneous_collection() {
+    let baseline = Instant::now();
+    let clocks: Vec<Box<dyn Clock>> = vec![Box::new(SystemClock), Box::new(FakeClock::new())];
+
+    for clock in &clocks {
+        assert!(clock.now() >= baseline);
+    }
+}
+
+/// The gated method is reachable from a concrete receiver (`Self: Sized`) — and deliberately NOT
+/// through `dyn Clock`, which is what keeps the trait dyn-compatible.
+#[test]
+fn gated_deadline_is_reachable_from_a_concrete_clock() {
+    let clock = FakeClock::new();
+    let after = Duration::from_millis(100);
+    let deadline = clock.deadline(after).expect("100ms deadline is representable");
+
+    assert_eq!(deadline, clock.now().checked_add(after).unwrap());
+    clock.advance(after + Duration::from_millis(1));
+    assert!(clock.now() > deadline);
+    // `clocks[0].deadline(..)` would NOT compile — the method is excluded from the vtable.
+}
+
 fn cached() -> Arc<CachedRelation> {
     let rel = PgRelation {
         oid: 42,
