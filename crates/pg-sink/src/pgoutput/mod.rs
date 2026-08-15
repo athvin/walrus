@@ -39,6 +39,21 @@ pub enum OldTupleKind {
     Full,
 }
 
+impl TryFrom<u8> for OldTupleKind {
+    type Error = DecodeError;
+
+    fn try_from(tag: u8) -> Result<Self, Self::Error> {
+        match tag {
+            b'K' => Ok(Self::Key),
+            b'O' => Ok(Self::Full),
+            other => {
+                std::hint::cold_path();
+                Err(DecodeError::BadTupleFormat { byte: other })
+            }
+        }
+    }
+}
+
 /// One decoded pgoutput message. Variants are added family-by-family in PRs 2.2–2.8:
 /// 2.3 Relation/Type; 2.4 Insert; 2.5 Update/Delete; 2.6 Truncate/Message; 2.7 Stream*;
 /// 2.8 the two-phase family.
@@ -295,7 +310,7 @@ fn parse_one(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Message, De
             let schema = reader.string()?;
             let name = reader.string()?;
             let ident_byte = reader.byte1()?;
-            let replica_identity = ReplicaIdentity::from_wire(ident_byte)
+            let replica_identity = ReplicaIdentity::try_from(ident_byte)
                 .map_err(|_| DecodeError::BadReplicaIdentity { byte: ident_byte })?;
             let ncols = reader.int16()?;
             let mut columns = Vec::with_capacity(usize::from(ncols));
@@ -347,20 +362,12 @@ fn parse_one(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Message, De
             // Branch on the byte AFTER the OID: 'K'/'O' → an old image (then a 'N' before the new
             // tuple); 'N' → no old image, and the 'N' we just read IS the new-tuple marker.
             let (old_kind, old) = match reader.byte1()? {
-                b'K' => {
-                    let old = parse_tuple(reader)?;
-                    expect_n(reader)?;
-                    (Some(OldTupleKind::Key), Some(old))
-                }
-                b'O' => {
-                    let old = parse_tuple(reader)?;
-                    expect_n(reader)?;
-                    (Some(OldTupleKind::Full), Some(old))
-                }
                 b'N' => (None, None),
-                other => {
-                    std::hint::cold_path();
-                    return Err(DecodeError::BadTupleFormat { byte: other });
+                tag => {
+                    let kind = OldTupleKind::try_from(tag)?;
+                    let old = parse_tuple(reader)?;
+                    expect_n(reader)?;
+                    (Some(kind), Some(old))
                 }
             };
             Ok(Message::Update {
@@ -373,14 +380,7 @@ fn parse_one(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Message, De
         }
         b'D' => {
             let relation_oid = reader.int32()?;
-            let old_kind = match reader.byte1()? {
-                b'K' => OldTupleKind::Key,
-                b'O' => OldTupleKind::Full,
-                other => {
-                    std::hint::cold_path();
-                    return Err(DecodeError::BadTupleFormat { byte: other });
-                }
-            };
+            let old_kind: OldTupleKind = reader.byte1()?.try_into()?;
             Ok(Message::Delete {
                 xid,
                 relation_oid,

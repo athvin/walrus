@@ -130,6 +130,34 @@ pub enum ExitCode {
     Internal = 70,
 }
 
+/// An `i32` that is not one of [`ExitCode`]'s documented statuses.
+///
+/// This is concrete rather than a string so callers can recover the offending number.
+#[derive(Debug, Clone, Copy, thiserror::Error, PartialEq, Eq)]
+#[error("unknown walrus exit code {0}")]
+pub struct UnknownExitCode(pub i32);
+
+/// The inverse of the documented `#[repr(i32)]` contract.
+impl TryFrom<i32> for ExitCode {
+    type Error = UnknownExitCode;
+
+    fn try_from(code: i32) -> std::result::Result<Self, Self::Error> {
+        match code {
+            0 => Ok(Self::Success),
+            10 => Ok(Self::Config),
+            11 => Ok(Self::ControlDb),
+            12 => Ok(Self::ObjectStore),
+            13 => Ok(Self::Preflight),
+            14 => Ok(Self::KeylessTable),
+            15 => Ok(Self::LeaseContended),
+            16 => Ok(Self::SourceDb),
+            17 => Ok(Self::Quarantine),
+            70 => Ok(Self::Internal),
+            other => Err(UnknownExitCode(other)),
+        }
+    }
+}
+
 /// Stable fallback if a future exit-code discriminant no longer fits the process API's byte.
 const INTERNAL_EXIT_BYTE: u8 = 70;
 

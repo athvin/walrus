@@ -24,19 +24,21 @@ pub enum ReplicaIdentity {
     Index,
 }
 
-impl ReplicaIdentity {
+impl TryFrom<u8> for ReplicaIdentity {
+    type Error = crate::Error;
+
     /// Parse the Relation message's `relreplident` byte; error on any other value.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Internal`] if `c` is not one of `b'd'`, `b'n'`, `b'f'`, or `b'i'`, the
     /// four bytes PostgreSQL emits for `pg_class.relreplident`. This protocol mismatch is terminal.
-    pub fn from_wire(c: u8) -> Result<Self, Error> {
+    fn try_from(c: u8) -> Result<Self, Self::Error> {
         match c {
-            b'd' => Ok(ReplicaIdentity::Default),
-            b'n' => Ok(ReplicaIdentity::Nothing),
-            b'f' => Ok(ReplicaIdentity::Full),
-            b'i' => Ok(ReplicaIdentity::Index),
+            b'd' => Ok(Self::Default),
+            b'n' => Ok(Self::Nothing),
+            b'f' => Ok(Self::Full),
+            b'i' => Ok(Self::Index),
             other => Err(Error::Internal(format!(
                 "unknown relreplident byte {:?}",
                 other as char

@@ -100,6 +100,9 @@ impl UtcTimestamp {
     /// 1970-01-01; Unix time has no leap seconds) and defers to jiff's range check, so a corrupt or
     /// overflowing frame is a decode error — **never a panic** (PR 5.9; retires the `commit_ts` TODO).
     ///
+    /// This deliberately remains a named constructor rather than `TryFrom<i64>`: a bare `i64` is
+    /// ambiguous between microseconds from the Postgres epoch and microseconds from the Unix epoch.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Internal`] when adding the Postgres epoch offset overflows or the resulting
