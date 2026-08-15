@@ -30,11 +30,11 @@ fn status_and_flavor_round_trip_their_sql_strings() {
 #[test]
 fn rejected_reload_values_keep_the_offending_input_as_data() {
     let status_err = ReloadStatus::from_str("superseded").unwrap_err();
-    assert_eq!(status_err.expected, "reload status");
+    assert_eq!(status_err.column, "table_reload.status");
     assert_eq!(status_err.input, "superseded");
 
     let flavor_err = ReloadFlavor::from_str("rebuild").unwrap_err();
-    assert_eq!(flavor_err.expected, "reload flavor");
+    assert_eq!(flavor_err.column, "table_reload.flavor");
     assert_eq!(flavor_err.input, "rebuild");
 }
 

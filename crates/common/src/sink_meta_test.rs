@@ -25,9 +25,12 @@ fn utc_timestamp_conversions_round_trip() {
 }
 
 #[test]
-fn utc_timestamp_display_matches_serialized_text() {
-    let timestamp = UtcTimestamp::parse_rfc3339("2026-07-04T12:00:00.123Z").unwrap();
+fn display_and_from_str_round_trip() {
+    let timestamp = "2026-07-04T12:00:00.123Z"
+        .parse::<UtcTimestamp>()
+        .unwrap();
 
+    assert_eq!(timestamp.to_string().parse::<UtcTimestamp>(), Ok(timestamp));
     assert_eq!(
         serde_json::to_string(&timestamp).unwrap(),
         format!("\"{timestamp}\"")
@@ -120,11 +123,27 @@ fn timestamps_always_render_with_z_suffix() {
 #[test]
 fn non_utc_timestamp_is_rejected() {
     // A numeric offset is refused rather than silently converted to UTC.
-    assert!(UtcTimestamp::parse_rfc3339("2026-07-04T12:00:00+02:00").is_err());
-    assert!(UtcTimestamp::parse_rfc3339("2026-07-04T12:00:00-05:00").is_err());
-    assert!(UtcTimestamp::parse_rfc3339("not a timestamp").is_err());
+    assert_eq!(
+        "2026-07-04T12:00:00+02:00".parse::<UtcTimestamp>(),
+        Err(TimestampParseError::NotUtcZ {
+            input: "2026-07-04T12:00:00+02:00".to_string(),
+        })
+    );
+    assert!("2026-07-04T12:00:00-05:00"
+        .parse::<UtcTimestamp>()
+        .is_err());
+    assert_eq!(
+        "not a timestamp".parse::<UtcTimestamp>(),
+        Err(TimestampParseError::NotUtcZ {
+            input: "not a timestamp".to_string(),
+        })
+    );
+    assert!(matches!(
+        "not a timestampZ".parse::<UtcTimestamp>(),
+        Err(TimestampParseError::Malformed { input, .. }) if input == "not a timestampZ"
+    ));
     // The UTC `Z` form is accepted.
-    assert!(UtcTimestamp::parse_rfc3339("2026-07-04T12:00:00Z").is_ok());
+    assert!("2026-07-04T12:00:00Z".parse::<UtcTimestamp>().is_ok());
 }
 
 #[test]
@@ -190,7 +209,9 @@ fn negative_micros_pre_y2k() {
 #[test]
 fn round_trips_a_known_commit_ts() {
     // The µs the sink would receive for a real commit time, reconstructed back to the same instant.
-    let want = UtcTimestamp::parse_rfc3339("2026-07-04T12:00:00.123Z").unwrap();
+    let want = "2026-07-04T12:00:00.123Z"
+        .parse::<UtcTimestamp>()
+        .unwrap();
     let pg_micros = want.0.as_microsecond() - 946_684_800_000_000;
     assert_eq!(UtcTimestamp::from_pg_micros(pg_micros).unwrap(), want);
 }

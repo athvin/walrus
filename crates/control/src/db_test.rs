@@ -88,3 +88,25 @@ fn from_sqlx_error_classifies_everything_else_as_transient_connect() {
     assert!(error.is_transient());
     assert!(!error.is_terminal());
 }
+
+#[test]
+fn decode_preserves_column_and_input() {
+    let error = ControlError::from(ParseEnumError::new(
+        "file_manifest.kind",
+        "snapshottt",
+    ));
+
+    assert!(error.is_terminal());
+    let ControlError::Decode(source) = &error else {
+        panic!("expected typed decode error");
+    };
+    assert_eq!(source.column, "file_manifest.kind");
+    assert_eq!(source.input, "snapshottt");
+
+    let source = std::error::Error::source(&error).expect("decode error must retain its source");
+    let source = source
+        .downcast_ref::<ParseEnumError>()
+        .expect("decode source must remain ParseEnumError");
+    assert_eq!(source.column, "file_manifest.kind");
+    assert_eq!(source.input, "snapshottt");
+}
