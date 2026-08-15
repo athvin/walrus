@@ -61,6 +61,9 @@ expect_used = "deny"
 # This nursery lint is outside `clippy::all`, so no `priority` juggling is needed. It is the
 # mutable-borrow gate walrus lacked; see docs/implementation/notes/rust-skills/conv-asmut-mutable.md.
 needless_pass_by_ref_mut = "deny"
+# Pure stable-const functions are compile-time callable by policy (PR 21.1). This nursery lint is
+# outside `clippy::all`, so no group-vs-lint `priority` adjustment is needed.
+missing_const_for_fn = "deny"
 # A discarded `Result`/`#[must_use]` value must be an explicit, argued decision. Test targets
 # re-allow this through their existing unwrap/expect carve-outs.
 let_underscore_must_use = "deny"
