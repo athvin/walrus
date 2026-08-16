@@ -36,7 +36,8 @@ const DEFAULT_FILTER: &str = "info";
 
 /// How to render logs. `json` on in the cluster, off (pretty) for local dev.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+// `default` permits omitted keys; `deny_unknown_fields` makes present-but-misspelled keys fatal.
+#[serde(deny_unknown_fields, default)]
 pub struct TelemetryConfig {
     /// Emit newline-delimited JSON (one object per event) instead of the pretty formatter.
     pub json: bool,
