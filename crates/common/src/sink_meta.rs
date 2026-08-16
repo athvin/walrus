@@ -208,8 +208,10 @@ pub struct SinkMeta {
     ///
     /// This is the one defaulting field: empty means no placeholders, so an older sink that omits
     /// the key remains compatible with a newer loader. Identity and ordering fields deliberately
-    /// remain required. Fixed at row construction and never grown afterwards.
-    #[serde(default)]
+    /// remain required. Empty values are also omitted when serializing; the loader treats a missing
+    /// key as `[]`, and the paired default makes the omitted document round-trip safely. Fixed at
+    /// row construction and never grown afterwards.
+    #[serde(default, skip_serializing_if = "<[String]>::is_empty")]
     pub unchanged_toast: Box<[String]>,
     /// Stable identity of the sink pod that produced this row.
     pub sink_instance: String,
@@ -230,10 +232,10 @@ const _: () = assert!(size_of::<SinkMeta>() <= SINK_META_MAX_BYTES);
 // ~91 % of the narrow-row cost). Within one sealed Parquet file the *batch-constant* fields never
 // change, so the batcher serializes them ONCE and, per row, serializes only the varying fields —
 // splicing the two into `{const,row}`. Byte-equivalence with `to_string(SinkMeta)` is guaranteed by
-// construction: these borrow structs carry the identical field names and types, and `SinkMeta` has
-// no serialization-affecting serde attributes (`default` is deserialization-only), so each field
-// serializes exactly as before; only the key ORDER shifts, and the loader parses by key (`$.op`, …),
-// never by position. Proven by `amortized_meta_matches_full`.
+// construction: these borrow structs carry the identical field names and types and mirror every
+// serialization-affecting serde attribute on `SinkMeta` (`default` remains deserialization-only).
+// Only the key ORDER shifts, and the loader parses by key (`$.op`, …), never by position. Proven by
+// `amortized_meta_matches_full`.
 
 /// The batch-constant subset of [`SinkMeta`] — the same for every row of one sealed file.
 #[derive(Serialize)]
@@ -255,6 +257,7 @@ struct MetaRow<'a> {
     commit_lsn: &'a Lsn,
     commit_ts: &'a UtcTimestamp,
     xid: u32,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
     unchanged_toast: &'a [String],
     sink_processed_at: &'a UtcTimestamp,
 }
