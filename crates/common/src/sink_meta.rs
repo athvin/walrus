@@ -26,6 +26,7 @@ pub const PG_EPOCH_UNIX_SECS: i64 = 946_684_800;
 pub const PG_EPOCH_UNIX_MICROS: i64 = PG_EPOCH_UNIX_SECS * 1_000_000;
 
 /// The change operation. Serializes to a single lowercase char: `i` | `u` | `d` | `t`.
+/// Wire form locked by `crates/common/tests/enum_wire_form.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Op {
     #[serde(rename = "i")]
@@ -41,6 +42,7 @@ pub enum Op {
 /// Where the row originated: an exported-snapshot backfill row, a live WAL-stream row, or a
 /// single-table-reload chunk row (PR 6.5 — stamped `commit_lsn = lsn = L_i`, snapshot-op
 /// semantics so any overlapping stream event wins the loader's dedup).
+/// Wire form locked by `crates/common/tests/enum_wire_form.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {

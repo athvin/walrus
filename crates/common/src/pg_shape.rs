@@ -20,6 +20,7 @@ use crate::Error;
 ///
 /// Roll out readers before writers: deploy `walrus-loader` before `walrus-pg-sink`. The upgraded
 /// reader accepts both spellings, while an old reader cannot parse newly written lowercase names.
+/// Wire form locked by `crates/common/tests/enum_wire_form.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReplicaIdentity {

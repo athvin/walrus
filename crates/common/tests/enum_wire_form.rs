@@ -4,30 +4,43 @@
 
 use common::{Kind, Op, ReplicaIdentity, Tier};
 use serde::{de::DeserializeOwned, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 /// Serialize, compare against the golden scalar, prove it is a scalar, and round-trip.
 fn assert_scalar_wire<T>(value: T, expected: &Value)
 where
     T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug + Copy,
 {
-    let wire = serde_json::to_value(value).expect("serializes");
-    assert_eq!(&wire, expected, "wire form drifted for {value:?}");
+    let serialized = serde_json::to_value(value);
+    assert_eq!(
+        serialized.as_ref().ok(),
+        Some(expected),
+        "wire form drifted for {value:?}; serialization error: {:?}",
+        serialized.as_ref().err()
+    );
+    let Ok(wire) = serialized else {
+        return;
+    };
     assert!(
         wire.is_string() || wire.is_number(),
         "must stay a JSON scalar; an object or array means a variant gained a payload: {wire}"
     );
-    let round_tripped: T = serde_json::from_value(wire).expect("round-trips");
-    assert_eq!(round_tripped, value);
+    let round_tripped = serde_json::from_value::<T>(wire);
+    assert_eq!(
+        round_tripped.as_ref().ok(),
+        Some(&value),
+        "round-trip failed for {value:?}: {:?}",
+        round_tripped.as_ref().err()
+    );
 }
 
 /// Exhaustive: no wildcard arm. Keys are documented in architecture.md section 1.4.
 fn op_wire(op: Op) -> Value {
     match op {
-        Op::Insert => todo!("lock the insert wire value"),
-        Op::Update => todo!("lock the update wire value"),
-        Op::Delete => todo!("lock the delete wire value"),
-        Op::Truncate => todo!("lock the truncate wire value"),
+        Op::Insert => json!("i"),
+        Op::Update => json!("u"),
+        Op::Delete => json!("d"),
+        Op::Truncate => json!("t"),
     }
 }
 
@@ -40,9 +53,9 @@ fn op_is_a_single_char_scalar() {
 
 fn kind_wire(kind: Kind) -> Value {
     match kind {
-        Kind::Snapshot => todo!("lock the snapshot wire value"),
-        Kind::Stream => todo!("lock the stream wire value"),
-        Kind::Reload => todo!("lock the reload wire value"),
+        Kind::Snapshot => json!("snapshot"),
+        Kind::Stream => json!("stream"),
+        Kind::Reload => json!("reload"),
     }
 }
 
@@ -55,10 +68,10 @@ fn kind_is_a_lowercase_scalar() {
 
 fn replica_identity_wire(identity: ReplicaIdentity) -> Value {
     match identity {
-        ReplicaIdentity::Default => todo!("lock the default wire value"),
-        ReplicaIdentity::Nothing => todo!("lock the nothing wire value"),
-        ReplicaIdentity::Full => todo!("lock the full wire value"),
-        ReplicaIdentity::Index => todo!("lock the index wire value"),
+        ReplicaIdentity::Default => json!("default"),
+        ReplicaIdentity::Nothing => json!("nothing"),
+        ReplicaIdentity::Full => json!("full"),
+        ReplicaIdentity::Index => json!("index"),
     }
 }
 
@@ -76,9 +89,9 @@ fn replica_identity_is_a_lowercase_scalar() {
 
 fn tier_wire(tier: Tier) -> Value {
     match tier {
-        Tier::One => todo!("lock tier one as a JSON number"),
-        Tier::Two => todo!("lock tier two as a JSON number"),
-        Tier::Three => todo!("lock tier three as a JSON number"),
+        Tier::One => json!(1),
+        Tier::Two => json!(2),
+        Tier::Three => json!(3),
     }
 }
 
@@ -103,7 +116,10 @@ const SERDE_MODULES: [(&str, &str); 3] = [
 fn no_enum_tagging_attribute_is_introduced() {
     for (module, source) in SERDE_MODULES {
         for attribute in ["serde(tag", "serde(content", "serde(untagged"] {
-            todo!("assert that {module} does not introduce {attribute}: {source}");
+            assert!(
+                !source.contains(attribute),
+                "{module} introduced enum tagging attribute {attribute}"
+            );
         }
     }
 }

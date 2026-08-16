@@ -14,6 +14,7 @@ use std::num::NonZeroU32;
 ///
 /// The `1|2|3` validation lives in [`TryFrom<u8>`], so it is reachable from ordinary code
 /// (`Tier::try_from(n)`) and not only from a deserializer.
+/// Wire form locked by `crates/common/tests/enum_wire_form.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "u8", into = "u8")]
 pub enum Tier {
