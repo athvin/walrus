@@ -50,14 +50,8 @@ fn humantime_durations_parse_for_every_field() {
         let cfg = SinkConfig::load().expect("valid humantime config should load");
         assert_eq!(cfg.max_fill, Duration::from_secs(2));
         assert_eq!(cfg.heartbeat_idle_after, Duration::from_secs(3));
-        assert_eq!(
-            cfg.heartbeat_roundtrip_deadline,
-            Duration::from_secs(45)
-        );
-        assert_eq!(
-            cfg.backfill_statement_timeout,
-            Duration::from_millis(250)
-        );
+        assert_eq!(cfg.heartbeat_roundtrip_deadline, Duration::from_secs(45));
+        assert_eq!(cfg.backfill_statement_timeout, Duration::from_millis(250));
         assert_eq!(cfg.startup_deadline, Duration::from_secs(90));
         assert_eq!(cfg.reload_lease_ttl, Duration::from_secs(20));
         assert_eq!(cfg.reload_echo_timeout, Duration::from_millis(1500));
