@@ -577,23 +577,19 @@ fn lsn_xy(lsn: Lsn) -> String {
     format!("{:X}/{:X}", v >> 32, v & 0xFFFF_FFFF)
 }
 
+fn fixed<const N: usize>(b: &[u8], what: &str) -> anyhow::Result<[u8; N]> {
+    b.try_into()
+        .map_err(|_| anyhow!("{what}: expected {N} bytes, got {}", b.len()))
+}
+
 fn read_lsn(b: &[u8]) -> anyhow::Result<Lsn> {
-    let arr = b
-        .try_into()
-        .map_err(|_| anyhow!("read_lsn: expected 8 bytes, got {}", b.len()))?;
-    Ok(Lsn::new(u64::from_be_bytes(arr)))
+    Ok(Lsn::new(u64::from_be_bytes(fixed(b, "read_lsn")?)))
 }
 fn read_i64(b: &[u8]) -> anyhow::Result<i64> {
-    let arr = b
-        .try_into()
-        .map_err(|_| anyhow!("read_i64: expected 8 bytes, got {}", b.len()))?;
-    Ok(i64::from_be_bytes(arr))
+    Ok(i64::from_be_bytes(fixed(b, "read_i64")?))
 }
 fn read_i32(b: &[u8]) -> anyhow::Result<i32> {
-    let arr = b
-        .try_into()
-        .map_err(|_| anyhow!("read_i32: expected 4 bytes, got {}", b.len()))?;
-    Ok(i32::from_be_bytes(arr))
+    Ok(i32::from_be_bytes(fixed(b, "read_i32")?))
 }
 
 /// The `'M'` (human message) field of an ErrorResponse/NoticeResponse body.

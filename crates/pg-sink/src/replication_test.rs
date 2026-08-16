@@ -53,9 +53,7 @@ fn error_message_extracts_the_message_field() {
 fn fixed_width_window_preserves_bytes_and_context() {
     assert_eq!(fixed::<4>(&[0, 0, 0, 7], "word").unwrap(), [0, 0, 0, 7]);
     assert_eq!(
-        fixed::<4>(&[0, 0, 0], "word")
-            .unwrap_err()
-            .to_string(),
+        fixed::<4>(&[0, 0, 0], "word").unwrap_err().to_string(),
         "word: expected 4 bytes, got 3"
     );
 }

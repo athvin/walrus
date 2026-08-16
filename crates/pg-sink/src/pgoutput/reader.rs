@@ -53,6 +53,18 @@ impl<'a> Reader<'a> {
             .ok_or_else(|| eof(n, self.pos, self.remaining()))
     }
 
+    /// Borrow `N` bytes at the cursor, advancing only after a successful width proof.
+    fn fixed<const N: usize>(&mut self) -> Result<&'a [u8; N], DecodeError> {
+        let head = self.need(N)?;
+        // `need(N)` returned exactly N bytes, so this branch is unreachable. Keep it modelled
+        // rather than unwrapping, and retain PR 16.5's cold error construction.
+        let Some(chunk) = head.first_chunk::<N>() else {
+            return Err(eof(N, self.pos, self.remaining()));
+        };
+        self.pos += N;
+        Ok(chunk)
+    }
+
     /// One byte (a `Byte1` type tag or an `Int8`).
     ///
     /// # Errors
@@ -72,11 +84,7 @@ impl<'a> Reader<'a> {
     ///
     /// Returns [`DecodeError::UnexpectedEof`] when fewer than two bytes remain.
     pub fn int16(&mut self) -> Result<u16, DecodeError> {
-        let Some(&arr) = self.rest().first_chunk::<2>() else {
-            return Err(eof(2, self.pos, self.remaining()));
-        };
-        self.pos += 2;
-        Ok(u16::from_be_bytes(arr))
+        Ok(u16::from_be_bytes(*self.fixed()?))
     }
 
     /// Big-endian `Int32` (OID / xid).
@@ -85,11 +93,7 @@ impl<'a> Reader<'a> {
     ///
     /// Returns [`DecodeError::UnexpectedEof`] when fewer than four bytes remain.
     pub fn int32(&mut self) -> Result<u32, DecodeError> {
-        let Some(&arr) = self.rest().first_chunk::<4>() else {
-            return Err(eof(4, self.pos, self.remaining()));
-        };
-        self.pos += 4;
-        Ok(u32::from_be_bytes(arr))
+        Ok(u32::from_be_bytes(*self.fixed()?))
     }
 
     /// Big-endian `Int64` (the raw 8-byte field; LSN reads it as unsigned via [`Reader::lsn`],
@@ -99,11 +103,7 @@ impl<'a> Reader<'a> {
     ///
     /// Returns [`DecodeError::UnexpectedEof`] when fewer than eight bytes remain.
     pub fn int64(&mut self) -> Result<i64, DecodeError> {
-        let Some(&arr) = self.rest().first_chunk::<8>() else {
-            return Err(eof(8, self.pos, self.remaining()));
-        };
-        self.pos += 8;
-        Ok(i64::from_be_bytes(arr))
+        Ok(i64::from_be_bytes(*self.fixed()?))
     }
 
     /// A null-terminated UTF-8 `String`. A missing terminator is `UnexpectedEof`, not a panic.
