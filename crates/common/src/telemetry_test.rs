@@ -1,4 +1,48 @@
 use super::*;
+use crate::{CommonConfig, Error, FailureClass};
+
+/// Run `body` inside a hermetic config environment so env changes cannot leak between tests.
+#[allow(
+    clippy::result_large_err,
+    reason = "figment Jail requires Result<(), figment::Error>, whose error variant is intentionally large"
+)]
+fn in_jail(body: impl FnOnce(&mut figment::Jail)) {
+    figment::Jail::expect_with(|jail| {
+        body(jail);
+        Ok(())
+    });
+}
+
+#[test]
+fn unknown_telemetry_key_is_rejected() {
+    in_jail(|jail| {
+        jail.set_env("WALRUS_CONTROL_DB_URL", "postgres://x/y");
+        jail.set_env("WALRUS_INSTANCE", "i");
+        jail.set_env("WALRUS_OBJECT_STORE__BUCKET", "b");
+        // A one-character typo of the real ConfigMap key.
+        jail.set_env("WALRUS_TELEMETRY__JSN", "true");
+
+        let err: Error = CommonConfig::load()
+            .expect_err("typo'd nested key must fail configuration loading");
+        assert!(
+            matches!(err, Error::Config(_)) && err.is_terminal(),
+            "a typo'd telemetry key must be a terminal Config error: {err:?}"
+        );
+    });
+}
+
+#[test]
+fn correctly_spelled_telemetry_key_still_loads() {
+    in_jail(|jail| {
+        jail.set_env("WALRUS_CONTROL_DB_URL", "postgres://x/y");
+        jail.set_env("WALRUS_INSTANCE", "i");
+        jail.set_env("WALRUS_OBJECT_STORE__BUCKET", "b");
+        jail.set_env("WALRUS_TELEMETRY__JSON", "true");
+
+        let cfg = CommonConfig::load().expect("valid config should load");
+        assert!(cfg.telemetry.json, "the real key must still take effect");
+    });
+}
 
 #[test]
 fn init_with_defaults_does_not_panic() {
