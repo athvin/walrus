@@ -6,12 +6,16 @@
 //! columns into place. That is what makes "reconcile to the exact source shape" a **mechanical**
 //! operation rather than a guess.
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use std::num::NonZeroU32;
 
 /// The three-tier mapping model (walrus-pg-sink.md §2.2). Serializes as the **integer** `1 | 2 | 3`
 /// to match the `"tier": 2` form in the §2.6 descriptor JSON (not the string `"2"`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The `1|2|3` validation lives in [`TryFrom<u8>`], so it is reachable from ordinary code
+/// (`Tier::try_from(n)`) and not only from a deserializer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u8", into = "u8")]
 pub enum Tier {
     /// Native 1:1 (Parquet-native logical type survives unchanged).
     One,
@@ -21,31 +25,27 @@ pub enum Tier {
     Three,
 }
 
-impl Tier {
-    const fn as_int(self) -> u8 {
-        match self {
-            Tier::One => 1,
-            Tier::Two => 2,
-            Tier::Three => 3,
+impl TryFrom<u8> for Tier {
+    type Error = crate::Error;
+
+    fn try_from(n: u8) -> std::result::Result<Self, Self::Error> {
+        match n {
+            1 => Ok(Tier::One),
+            2 => Ok(Tier::Two),
+            3 => Ok(Tier::Three),
+            other => Err(crate::Error::Internal(format!(
+                "invalid tier {other}, expected 1, 2, or 3"
+            ))),
         }
     }
 }
 
-impl Serialize for Tier {
-    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
-        s.serialize_u8(self.as_int())
-    }
-}
-
-impl<'de> Deserialize<'de> for Tier {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
-        match u8::deserialize(d)? {
-            1 => Ok(Tier::One),
-            2 => Ok(Tier::Two),
-            3 => Ok(Tier::Three),
-            other => Err(serde::de::Error::custom(format!(
-                "invalid tier {other}, expected 1, 2, or 3"
-            ))),
+impl From<Tier> for u8 {
+    fn from(t: Tier) -> u8 {
+        match t {
+            Tier::One => 1,
+            Tier::Two => 2,
+            Tier::Three => 3,
         }
     }
 }
