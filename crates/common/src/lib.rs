@@ -32,3 +32,7 @@ pub use pg_shape::{PgColumn, PgRelation, ReplicaIdentity, TupleValue};
 pub use sink_meta::{Kind, Op, SinkMeta, UtcTimestamp, PG_EPOCH_UNIX_MICROS, PG_EPOCH_UNIX_SECS};
 pub use telemetry::{init_tracing, TelemetryConfig};
 pub use type_descriptor::{Tier, TypeDescriptor, TypeMeta};
+
+#[cfg(test)]
+#[path = "lib_test.rs"]
+mod tests;
