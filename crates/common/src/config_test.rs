@@ -100,6 +100,15 @@ fn humantime_durations_parse() {
 }
 
 #[test]
+fn every_duration_field_carries_humantime() {
+    const SRC: &str = include_str!("config.rs");
+    let fields = SRC.matches(": Duration,").count();
+    let attrs = SRC.matches("humantime_serde").count();
+    assert_eq!(fields, 1, "CommonConfig Duration field count changed");
+    assert_eq!(attrs, fields, "every Duration field needs humantime serde");
+}
+
+#[test]
 fn unknown_key_is_rejected() {
     in_jail(|jail| {
         jail.set_env("WALRUS_CONTROL_DB_URL", "postgres://x/y");

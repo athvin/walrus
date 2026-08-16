@@ -14,6 +14,67 @@ fn valid() -> LoaderConfig {
     }
 }
 
+/// Run `body` inside a hermetic `figment::Jail` (fresh temp CWD + scoped env), so config tests
+/// do not leak env across the shared test process. The error type is fixed by figment's API.
+#[allow(
+    clippy::result_large_err,
+    reason = "figment Jail requires Result<(), figment::Error>, whose error variant is intentionally large"
+)]
+fn in_jail(body: impl FnOnce(&mut figment::Jail)) {
+    figment::Jail::expect_with(|jail| {
+        body(jail);
+        Ok(())
+    });
+}
+
+#[test]
+fn humantime_durations_parse_for_every_field() {
+    in_jail(|jail| {
+        jail.set_env("WALRUS_CONTROL_DB_URL", "postgres://x/y");
+        jail.set_env("WALRUS_INSTANCE", "walrus-loader-0");
+        jail.set_env("WALRUS_DUCKDB_DIR", "/var/lib/walrus");
+        jail.set_env("WALRUS_OBJECT_STORE__BUCKET", "b");
+        jail.set_env("WALRUS_LEASE_TTL", "45s");
+        jail.set_env("WALRUS_POLL_INTERVAL", "250ms");
+        jail.set_env("WALRUS_COMPACTION_INTERVAL", "30m");
+        jail.set_env("WALRUS_STARTUP_DEADLINE", "1m 30s");
+
+        let cfg = LoaderConfig::load().expect("valid humantime config should load");
+        assert_eq!(cfg.lease_ttl, Duration::from_secs(45));
+        assert_eq!(cfg.poll_interval, Duration::from_millis(250));
+        assert_eq!(cfg.compaction_interval, Duration::from_secs(30 * 60));
+        assert_eq!(cfg.startup_deadline, Duration::from_secs(90));
+    });
+}
+
+fn duration_attribute_mismatch(src: &str, expected_fields: usize) -> Option<String> {
+    let fields = src.matches(": Duration,").count();
+    let attrs = src.matches("humantime_serde").count();
+    if fields == expected_fields && attrs == fields {
+        None
+    } else {
+        Some(format!(
+            "{fields} Duration fields but {attrs} humantime attributes"
+        ))
+    }
+}
+
+#[test]
+fn every_duration_field_carries_humantime() {
+    let mismatch = duration_attribute_mismatch(include_str!("config.rs"), 4);
+    assert!(mismatch.is_none(), "{mismatch:?}");
+}
+
+#[test]
+fn every_duration_field_rejects_missing_attribute_fixture() {
+    const FIXTURE: &str = "struct Config { missing: Duration, }";
+    let mismatch = duration_attribute_mismatch(FIXTURE, 1);
+    assert_eq!(
+        mismatch.as_deref(),
+        Some("1 Duration fields but 0 humantime attributes")
+    );
+}
+
 /// `#[serde(default)]` makes these the shipped values for omitted fields; changing one is a
 /// deliberate product configuration change, not a test-maintenance detail.
 #[test]

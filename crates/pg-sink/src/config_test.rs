@@ -17,6 +17,62 @@ fn valid() -> SinkConfig {
     }
 }
 
+/// Run `body` inside a hermetic `figment::Jail` (fresh temp CWD + scoped env), so config tests
+/// do not leak env across the shared test process. The error type is fixed by figment's API.
+#[allow(
+    clippy::result_large_err,
+    reason = "figment Jail requires Result<(), figment::Error>, whose error variant is intentionally large"
+)]
+fn in_jail(body: impl FnOnce(&mut figment::Jail)) {
+    figment::Jail::expect_with(|jail| {
+        body(jail);
+        Ok(())
+    });
+}
+
+#[test]
+fn humantime_durations_parse_for_every_field() {
+    in_jail(|jail| {
+        jail.set_env("WALRUS_CONTROL_DB_URL", "postgres://x/y");
+        jail.set_env("WALRUS_SOURCE_DB_URL", "postgres://x/z");
+        jail.set_env("WALRUS_INSTANCE", "walrus-pg-sink-0");
+        jail.set_env("WALRUS_SLOT_NAME", "walrus_slot");
+        jail.set_env("WALRUS_PUBLICATION_NAME", "walrus_pub");
+        jail.set_env("WALRUS_OBJECT_STORE__BUCKET", "b");
+        jail.set_env("WALRUS_MAX_FILL", "2s");
+        jail.set_env("WALRUS_HEARTBEAT_IDLE_AFTER", "3s");
+        jail.set_env("WALRUS_HEARTBEAT_ROUNDTRIP_DEADLINE", "45s");
+        jail.set_env("WALRUS_BACKFILL_STATEMENT_TIMEOUT", "250ms");
+        jail.set_env("WALRUS_STARTUP_DEADLINE", "1m 30s");
+        jail.set_env("WALRUS_RELOAD_LEASE_TTL", "20s");
+        jail.set_env("WALRUS_RELOAD_ECHO_TIMEOUT", "1500ms");
+
+        let cfg = SinkConfig::load().expect("valid humantime config should load");
+        assert_eq!(cfg.max_fill, Duration::from_secs(2));
+        assert_eq!(cfg.heartbeat_idle_after, Duration::from_secs(3));
+        assert_eq!(
+            cfg.heartbeat_roundtrip_deadline,
+            Duration::from_secs(45)
+        );
+        assert_eq!(
+            cfg.backfill_statement_timeout,
+            Duration::from_millis(250)
+        );
+        assert_eq!(cfg.startup_deadline, Duration::from_secs(90));
+        assert_eq!(cfg.reload_lease_ttl, Duration::from_secs(20));
+        assert_eq!(cfg.reload_echo_timeout, Duration::from_millis(1500));
+    });
+}
+
+#[test]
+fn every_duration_field_carries_humantime() {
+    const SRC: &str = include_str!("config.rs");
+    let fields = SRC.matches(": Duration,").count();
+    let attrs = SRC.matches("humantime_serde").count();
+    assert_eq!(fields, 7, "SinkConfig Duration field count changed");
+    assert_eq!(attrs, fields, "every Duration field needs humantime serde");
+}
+
 /// `#[serde(default)]` makes these the shipped values for omitted fields; changing one is a
 /// deliberate product configuration change, not a test-maintenance detail.
 #[test]
