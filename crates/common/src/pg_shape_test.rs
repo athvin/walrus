@@ -28,6 +28,51 @@ fn replica_identity_try_from_char() {
 }
 
 #[test]
+fn replica_identity_wire_form_is_lowercase_and_accepts_legacy() {
+    let cases = [
+        (ReplicaIdentity::Default, "\"default\"", "\"Default\""),
+        (
+            ReplicaIdentity::Nothing,
+            "\"nothing\"",
+            "\"Nothing\"",
+        ),
+        (ReplicaIdentity::Full, "\"full\"", "\"Full\""),
+        (ReplicaIdentity::Index, "\"index\"", "\"Index\""),
+    ];
+
+    for (variant, lowercase, legacy) in cases {
+        assert_eq!(serde_json::to_string(&variant).unwrap(), lowercase);
+        assert_eq!(
+            serde_json::from_str::<ReplicaIdentity>(lowercase).unwrap(),
+            variant
+        );
+        assert_eq!(
+            serde_json::from_str::<ReplicaIdentity>(legacy).unwrap(),
+            variant
+        );
+    }
+
+    assert!(serde_json::from_str::<ReplicaIdentity>("\"partial\"").is_err());
+}
+
+#[test]
+fn a_legacy_registry_columns_document_still_hydrates() {
+    let legacy = r#"{
+        "oid": 42,
+        "schema": "public",
+        "name": "orders",
+        "replica_identity": "Default",
+        "columns": [{"name":"id","type_oid":23,"type_modifier":-1,"is_key":true}]
+    }"#;
+
+    let relation: PgRelation = serde_json::from_str(legacy).unwrap();
+    assert_eq!(relation.replica_identity, ReplicaIdentity::Default);
+
+    let serialized = serde_json::to_value(relation).unwrap();
+    assert_eq!(serialized["replica_identity"], "default");
+}
+
+#[test]
 fn numeric_typmod_decodes_precision_and_scale() {
     // The proto §4 example: atttypmod 655366 → numeric(10, 2).
     let c = col("amount", crate::oids::NUMERIC, 655366, false);
