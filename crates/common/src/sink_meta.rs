@@ -177,8 +177,9 @@ impl<'de> Deserialize<'de> for UtcTimestamp {
 /// The provenance document embedded (as JSON `Utf8`) in every Parquet row's `walrus_pg_sink_meta`.
 ///
 /// **Field order and keys are a cross-service wire contract** (architecture.md §1.4) — the loader
-/// reads this back verbatim. Deserialization is lenient about *unknown* keys on purpose, so a
-/// newer sink can add a provenance field without breaking an older loader mid-rollout.
+/// reads this back verbatim. Deserialization is deliberately lenient in both rollout directions:
+/// unknown keys let a newer sink feed an older loader, while a missing `unchanged_toast` defaults
+/// to empty so an older sink can feed a newer loader. Every identity and ordering key stays required.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SinkMeta {
     /// The change operation (`i`/`u`/`d`/`t`).
@@ -203,8 +204,12 @@ pub struct SinkMeta {
     pub source_table: String,
     /// Whether the row came from the exported snapshot or the live stream.
     pub kind: Kind,
-    /// Columns delivered as unchanged-TOAST placeholders (values absent from the wire). Fixed at
-    /// row construction and never grown afterwards.
+    /// Columns delivered as unchanged-TOAST placeholders (values absent from the wire).
+    ///
+    /// This is the one defaulting field: empty means no placeholders, so an older sink that omits
+    /// the key remains compatible with a newer loader. Identity and ordering fields deliberately
+    /// remain required. Fixed at row construction and never grown afterwards.
+    #[serde(default)]
     pub unchanged_toast: Box<[String]>,
     /// Stable identity of the sink pod that produced this row.
     pub sink_instance: String,
@@ -225,9 +230,10 @@ const _: () = assert!(size_of::<SinkMeta>() <= SINK_META_MAX_BYTES);
 // ~91 % of the narrow-row cost). Within one sealed Parquet file the *batch-constant* fields never
 // change, so the batcher serializes them ONCE and, per row, serializes only the varying fields —
 // splicing the two into `{const,row}`. Byte-equivalence with `to_string(SinkMeta)` is guaranteed by
-// construction: these borrow structs carry the identical field names and types (no serde attributes
-// on `SinkMeta`), so each field serializes exactly as before; only the key ORDER shifts, and the
-// loader parses by key (`$.op`, …), never by position. Proven by `amortized_meta_matches_full`.
+// construction: these borrow structs carry the identical field names and types, and `SinkMeta` has
+// no serialization-affecting serde attributes (`default` is deserialization-only), so each field
+// serializes exactly as before; only the key ORDER shifts, and the loader parses by key (`$.op`, …),
+// never by position. Proven by `amortized_meta_matches_full`.
 
 /// The batch-constant subset of [`SinkMeta`] — the same for every row of one sealed file.
 #[derive(Serialize)]
