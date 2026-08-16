@@ -281,41 +281,25 @@ fn option_nonzero_u64_is_the_same_size_as_u64() {
 
 #[test]
 fn numeric_wire_names_and_shapes_are_unchanged() {
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = ENV_LOCK.lock().unwrap();
-    let saved: Vec<_> = std::env::vars_os()
-        .filter(|(key, _)| key.to_string_lossy().starts_with("WALRUS_"))
-        .collect();
-    for (key, _) in &saved {
-        std::env::remove_var(key);
-    }
-    for (key, value) in [
-        (
-            "WALRUS_CONTROL_DB_URL",
-            "postgres://localhost/walrus_control",
-        ),
-        ("WALRUS_SOURCE_DB_URL", "postgres://localhost/walrus"),
-        ("WALRUS_OBJECT_STORE__BUCKET", "walrus"),
-        ("WALRUS_INSTANCE", "walrus-pg-sink-test"),
-        ("WALRUS_SLOT_NAME", "walrus_slot"),
-        ("WALRUS_PUBLICATION_NAME", "walrus_pub"),
-        ("WALRUS_MAX_ROWS", "250000"),
-        ("WALRUS_BACKPRESSURE_ACTIVATE_RATIO", "0.9"),
-    ] {
-        std::env::set_var(key, value);
-    }
+    in_jail(|jail| {
+        for (key, value) in [
+            (
+                "WALRUS_CONTROL_DB_URL",
+                "postgres://localhost/walrus_control",
+            ),
+            ("WALRUS_SOURCE_DB_URL", "postgres://localhost/walrus"),
+            ("WALRUS_OBJECT_STORE__BUCKET", "walrus"),
+            ("WALRUS_INSTANCE", "walrus-pg-sink-test"),
+            ("WALRUS_SLOT_NAME", "walrus_slot"),
+            ("WALRUS_PUBLICATION_NAME", "walrus_pub"),
+            ("WALRUS_MAX_ROWS", "250000"),
+            ("WALRUS_BACKPRESSURE_ACTIVATE_RATIO", "0.9"),
+        ] {
+            jail.set_env(key, value);
+        }
 
-    let result = SinkConfig::load();
-    for (key, _) in
-        std::env::vars_os().filter(|(key, _)| key.to_string_lossy().starts_with("WALRUS_"))
-    {
-        std::env::remove_var(key);
-    }
-    for (key, value) in saved {
-        std::env::set_var(key, value);
-    }
-
-    let cfg = result.expect("bare numeric environment values should parse");
-    assert_eq!(cfg.max_rows.get(), 250_000);
-    assert!((cfg.backpressure_activate_ratio.as_f64() - 0.9).abs() < f64::EPSILON);
+        let cfg = SinkConfig::load().expect("bare numeric environment values should parse");
+        assert_eq!(cfg.max_rows.get(), 250_000);
+        assert!((cfg.backpressure_activate_ratio.as_f64() - 0.9).abs() < f64::EPSILON);
+    });
 }
