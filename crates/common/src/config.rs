@@ -16,6 +16,7 @@ use std::time::Duration;
 const MAX_STARTUP_DEADLINE: Duration = Duration::from_secs(60 * 60);
 
 /// Configuration shared by both walrus services. Service-specific knobs embed this.
+/// Flattening is deferred; see `docs/implementation/notes/rust-skills/serde-flatten.md`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct CommonConfig {
