@@ -118,6 +118,28 @@ fn meta_without_unchanged_toast_defaults_to_empty() {
 }
 
 #[test]
+fn empty_unchanged_toast_is_omitted_from_the_wire() {
+    let base: SinkMeta = serde_json::from_str(DOCS_EXAMPLE).unwrap();
+    let empty = SinkMeta {
+        unchanged_toast: Box::default(),
+        ..base.clone()
+    };
+
+    let json = serde_json::to_string(&empty).unwrap();
+    let document: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert!(
+        document.get("unchanged_toast").is_none(),
+        "empty unchanged_toast must be omitted, got {json}"
+    );
+
+    let round_trip: SinkMeta = serde_json::from_str(&json).unwrap();
+    assert_eq!(round_trip, empty);
+
+    let non_empty = serde_json::to_string(&base).unwrap();
+    assert!(non_empty.contains("\"unchanged_toast\":[\"blob_col\"]"));
+}
+
+#[test]
 fn a_missing_identity_field_is_still_a_hard_error() {
     let without_commit_lsn = DOCS_EXAMPLE.replace("\"commit_lsn\"", "\"_commit_lsn\"");
     let error = serde_json::from_str::<SinkMeta>(&without_commit_lsn).unwrap_err();
