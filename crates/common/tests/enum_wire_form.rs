@@ -1,6 +1,7 @@
-// Every serde-carrying enum in `common` is unit-only, so its JSON form is a bare scalar under all
-// four of serde's tagging strategies. Each expected value comes from an exhaustive match with no
-// `_` arm, making a new variant or a payload a compile error before it can change the wire format.
+// Every serde-carrying enum in `common` is unit-only and uses serde's default externally tagged
+// representation, so its current JSON form is a bare scalar. Each expected value comes from an
+// exhaustive match with no `_` arm, making a new variant or payload a compile error before it can
+// change the wire format.
 
 use common::{Kind, Op, ReplicaIdentity, Tier};
 use serde::{de::DeserializeOwned, Serialize};
