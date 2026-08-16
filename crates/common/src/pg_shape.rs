@@ -12,15 +12,28 @@ use serde::{Deserialize, Serialize};
 use crate::Error;
 
 /// Postgres `relreplident` — governs which old-image columns Update/Delete carry (proto §6).
+///
+/// The pgoutput byte parsed below and this enum's serde string are distinct wire forms. The serde
+/// form is a persisted control-plane contract inside `schema_registry.columns`. Rows written
+/// before the lowercase form was introduced contain PascalCase names, so the per-variant aliases
+/// are permanent compatibility for those historical rows; no data migration is needed.
+///
+/// Roll out readers before writers: deploy `walrus-loader` before `walrus-pg-sink`. The upgraded
+/// reader accepts both spellings, while an old reader cannot parse newly written lowercase names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ReplicaIdentity {
     /// `'d'` — the default: Update/Delete carry key columns only (`'K'`).
+    #[serde(alias = "Default")]
     Default,
     /// `'n'` — nothing: Update/Delete carry no old image (unusable as a key source).
+    #[serde(alias = "Nothing")]
     Nothing,
     /// `'f'` — full: Update/Delete carry the whole old row (`'O'`).
+    #[serde(alias = "Full")]
     Full,
     /// `'i'` — a nominated unique index supplies the identity.
+    #[serde(alias = "Index")]
     Index,
 }
 
