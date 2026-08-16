@@ -36,6 +36,8 @@ tracing = { workspace = true }
 parking_lot = { workspace = true }
 
 [dev-dependencies]
+# `test` feature adds figment::Jail for hermetic env/file config tests (dev-only).
+figment = { workspace = true, features = ["test"] }
 # Raw-HTTP scrape test (metrics_scrape.rs) reads the /metrics body via AsyncReadExt/AsyncWriteExt.
 tokio = { workspace = true, features = ["io-util"] }
 # Micro-benches (PR 5.5): transform scaling / TOAST back-scan / Phase-A append against in-memory DuckDB.

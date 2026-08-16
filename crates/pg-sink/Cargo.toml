@@ -55,6 +55,8 @@ byteorder = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# `test` feature adds figment::Jail for hermetic env/file config tests (dev-only).
+figment = { workspace = true, features = ["test"] }
 hex = { workspace = true }
 # Test-only: tokio::time::pause via #[tokio::test(start_paused = true)] (the reload lease tests).
 tokio = { workspace = true, features = ["test-util"] }
