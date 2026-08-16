@@ -280,6 +280,14 @@ pub fn parse_tuple(reader: &mut Reader<'_>) -> Result<Vec<TupleValue>, DecodeErr
 /// consulted from PR 2.3 onward (the xid prefix); Begin/Commit/Origin are never xid-prefixed —
 /// they *are* the transaction frame.
 fn parse_one(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Message, DecodeError> {
+    // Changing this count changes how the same streamed bytes are framed and decoded.
+    const {
+        assert!(
+            XID_PREFIXED.len() == 7,
+            "proto v2 §7 requires exactly 7 xid-prefixed tags (RYIUDTM) or streamed bytes misalign"
+        );
+    }
+
     let tag = reader.byte1()?;
     // The per-message (sub-transaction) xid prefix exists only while streaming (proto §7/§9b). The
     // same bytes therefore parse differently in vs. out of a stream. Begin/Commit/Origin are the

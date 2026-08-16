@@ -117,6 +117,14 @@ impl CommonConfig {
     /// Returns [`Error::Config`] when a required string is empty, `startup_deadline` is zero, or
     /// that deadline exceeds the supported ceiling. All such failures are terminal.
     pub fn validate(&self) -> Result<()> {
+        // Assert the constant ceiling; configured input remains runtime, Result-returning data.
+        const {
+            assert!(
+                !MAX_STARTUP_DEADLINE.is_zero(),
+                "MAX_STARTUP_DEADLINE must be nonzero or every positive deadline exceeds the ceiling"
+            );
+        }
+
         if self.control_db_url.trim().is_empty() {
             return Err(Error::Config(
                 "control_db_url must not be empty".to_string(),

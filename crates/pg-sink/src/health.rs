@@ -37,6 +37,18 @@ impl TryFrom<u8> for Phase {
     type Error = InvalidPhase;
 
     fn try_from(byte: u8) -> Result<Self, Self::Error> {
+        // AtomicU8::default(), typed stores, and this decoder all rely on these exact bytes.
+        const {
+            assert!(
+                Phase::Bootstrapping as u8 == 0,
+                "Phase::Bootstrapping must stay byte 0 because AtomicPhase defaults to zero"
+            );
+            assert!(
+                Phase::Ready as u8 == 1,
+                "Phase::Ready must stay byte 1 so AtomicPhase store and decode agree"
+            );
+        }
+
         match byte {
             0 => Ok(Self::Bootstrapping),
             1 => Ok(Self::Ready),

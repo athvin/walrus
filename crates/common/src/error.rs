@@ -169,13 +169,72 @@ const INTERNAL_EXIT_BYTE: u8 = 70;
 
 impl From<ExitCode> for std::process::ExitCode {
     fn from(code: ExitCode) -> Self {
-        // Reading a repr(i32) discriminant has no From/TryFrom equivalent. The narrowing is checked;
-        // `error_test.rs` exhaustively proves that the fallback is unreachable for today's variants.
+        // The public range is stricter than merely fitting u8: 125..=255 are shell-reserved too.
+        const {
+            assert!(
+                (ExitCode::Success as i32) >= 0 && (ExitCode::Success as i32) < 125,
+                "ExitCode::Success must stay in 0..125 or the process status contract breaks"
+            );
+            assert!(
+                (ExitCode::Config as i32) >= 0 && (ExitCode::Config as i32) < 125,
+                "ExitCode::Config must stay in 0..125 or the process status contract breaks"
+            );
+            assert!(
+                (ExitCode::ControlDb as i32) >= 0 && (ExitCode::ControlDb as i32) < 125,
+                "ExitCode::ControlDb must stay in 0..125 or the process status contract breaks"
+            );
+            assert!(
+                (ExitCode::ObjectStore as i32) >= 0 && (ExitCode::ObjectStore as i32) < 125,
+                "ExitCode::ObjectStore must stay in 0..125 or the process status contract breaks"
+            );
+            assert!(
+                (ExitCode::Preflight as i32) >= 0 && (ExitCode::Preflight as i32) < 125,
+                "ExitCode::Preflight must stay in 0..125 or the process status contract breaks"
+            );
+            assert!(
+                (ExitCode::KeylessTable as i32) >= 0 && (ExitCode::KeylessTable as i32) < 125,
+                "ExitCode::KeylessTable must stay in 0..125 or the process status contract breaks"
+            );
+            assert!(
+                (ExitCode::LeaseContended as i32) >= 0
+                    && (ExitCode::LeaseContended as i32) < 125,
+                "ExitCode::LeaseContended must stay in 0..125 or the process status contract breaks"
+            );
+            assert!(
+                (ExitCode::SourceDb as i32) >= 0 && (ExitCode::SourceDb as i32) < 125,
+                "ExitCode::SourceDb must stay in 0..125 or the process status contract breaks"
+            );
+            assert!(
+                (ExitCode::Quarantine as i32) >= 0 && (ExitCode::Quarantine as i32) < 125,
+                "ExitCode::Quarantine must stay in 0..125 or the process status contract breaks"
+            );
+            assert!(
+                (ExitCode::Internal as i32) >= 0 && (ExitCode::Internal as i32) < 125,
+                "ExitCode::Internal must stay in 0..125 or the process status contract breaks"
+            );
+        }
+
+        // Reading repr(i32) discriminants has no From/TryFrom equivalent. This exhaustive match is
+        // the compiler-enforced census: adding a variant requires extending the range gate above.
         #[allow(
             clippy::cast_possible_truncation,
-            reason = "read the enum's explicit repr(i32) discriminant before checked narrowing"
+            reason = "read the enum's explicit repr(i32) discriminants before checked narrowing"
         )]
-        let raw = code as i32;
+        let raw = match code {
+            ExitCode::Success => ExitCode::Success as i32,
+            ExitCode::Config => ExitCode::Config as i32,
+            ExitCode::ControlDb => ExitCode::ControlDb as i32,
+            ExitCode::ObjectStore => ExitCode::ObjectStore as i32,
+            ExitCode::Preflight => ExitCode::Preflight as i32,
+            ExitCode::KeylessTable => ExitCode::KeylessTable as i32,
+            ExitCode::LeaseContended => ExitCode::LeaseContended as i32,
+            ExitCode::SourceDb => ExitCode::SourceDb as i32,
+            ExitCode::Quarantine => ExitCode::Quarantine as i32,
+            ExitCode::Internal => ExitCode::Internal as i32,
+        };
+
+        // Keep PR 17.3's checked narrowing as a defensive boundary. The compile-time range gate
+        // and `error_test.rs` both prove its fallback is unreachable for today's variants.
         std::process::ExitCode::from(u8::try_from(raw).unwrap_or(INTERNAL_EXIT_BYTE))
     }
 }
