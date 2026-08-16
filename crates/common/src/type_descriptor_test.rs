@@ -31,6 +31,25 @@ fn tier_serializes_as_integer() {
 }
 
 #[test]
+fn tier_validation_is_callable_outside_serde() {
+    assert_eq!(Tier::try_from(1u8).unwrap(), Tier::One);
+    assert_eq!(Tier::try_from(2u8).unwrap(), Tier::Two);
+    assert_eq!(Tier::try_from(3u8).unwrap(), Tier::Three);
+
+    // The rejection path is now ordinary Rust — no serde_json round trip needed.
+    for bad in [0u8, 4u8, 255u8] {
+        let err = Tier::try_from(bad).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid tier"),
+            "message is the operator-grepped one: {err}"
+        );
+    }
+
+    // And the serialize direction goes through the same conversion.
+    assert_eq!(u8::from(Tier::Three), 3);
+}
+
+#[test]
 fn type_descriptor_round_trips_the_docs_example() {
     let d: TypeDescriptor = serde_json::from_str(DOCS_DESCRIPTOR).unwrap();
     assert_eq!(d.column, "duration");
