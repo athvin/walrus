@@ -31,11 +31,7 @@ fn replica_identity_try_from_char() {
 fn replica_identity_wire_form_is_lowercase_and_accepts_legacy() {
     let cases = [
         (ReplicaIdentity::Default, "\"default\"", "\"Default\""),
-        (
-            ReplicaIdentity::Nothing,
-            "\"nothing\"",
-            "\"Nothing\"",
-        ),
+        (ReplicaIdentity::Nothing, "\"nothing\"", "\"Nothing\""),
         (ReplicaIdentity::Full, "\"full\"", "\"Full\""),
         (ReplicaIdentity::Index, "\"index\"", "\"Index\""),
     ];
