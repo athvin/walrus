@@ -22,8 +22,8 @@ fn unknown_telemetry_key_is_rejected() {
         // A one-character typo of the real ConfigMap key.
         jail.set_env("WALRUS_TELEMETRY__JSN", "true");
 
-        let err: Error = CommonConfig::load()
-            .expect_err("typo'd nested key must fail configuration loading");
+        let err: Error =
+            CommonConfig::load().expect_err("typo'd nested key must fail configuration loading");
         assert!(
             matches!(err, Error::Config(_)) && err.is_terminal(),
             "a typo'd telemetry key must be a terminal Config error: {err:?}"
