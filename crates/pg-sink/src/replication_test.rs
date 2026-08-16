@@ -48,3 +48,14 @@ fn error_message_extracts_the_message_field() {
     let body = b"SERROR\0C42704\0Mno such slot\0\0";
     assert_eq!(error_message(body), "no such slot");
 }
+
+#[test]
+fn fixed_width_window_preserves_bytes_and_context() {
+    assert_eq!(fixed::<4>(&[0, 0, 0, 7], "word").unwrap(), [0, 0, 0, 7]);
+    assert_eq!(
+        fixed::<4>(&[0, 0, 0], "word")
+            .unwrap_err()
+            .to_string(),
+        "word: expected 4 bytes, got 3"
+    );
+}
