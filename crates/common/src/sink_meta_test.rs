@@ -53,6 +53,23 @@ const DOCS_EXAMPLE: &str = r#"{
         "sink_processed_at": "2026-07-04T12:00:00.123Z"
     }"#;
 
+/// The architecture.md §1.4 example without `unchanged_toast`, as emitted by an older sink.
+const DOCS_EXAMPLE_NO_TOAST: &str = r#"{
+        "op": "u",
+        "lsn": "00000000019A2B3C",
+        "commit_lsn": "0000000001B4C000",
+        "commit_ts": "2026-07-04T12:00:00Z",
+        "xid": 918273,
+        "epoch": 7,
+        "batch_id": "3f2a0000-0000-0000-0000-000000000001",
+        "schema_version": 12,
+        "source_schema": "public",
+        "source_table": "orders",
+        "kind": "stream",
+        "sink_instance": "walrus-pg-sink-0",
+        "sink_processed_at": "2026-07-04T12:00:00.123Z"
+    }"#;
+
 #[test]
 fn op_serializes_as_single_char() {
     assert_eq!(serde_json::to_string(&Op::Insert).unwrap(), "\"i\"");
@@ -89,6 +106,26 @@ fn meta_round_trips_exact_keys() {
     // And the round-trip is the identity on the struct itself.
     let again: SinkMeta = serde_json::from_value(reserialized).unwrap();
     assert_eq!(again, meta);
+}
+
+#[test]
+fn meta_without_unchanged_toast_defaults_to_empty() {
+    let meta: SinkMeta = serde_json::from_str(DOCS_EXAMPLE_NO_TOAST).unwrap();
+
+    assert!(meta.unchanged_toast.is_empty());
+    assert_eq!(meta.commit_lsn, Lsn::new(0x1B4C000));
+    assert_eq!(meta.op, Op::Update);
+}
+
+#[test]
+fn a_missing_identity_field_is_still_a_hard_error() {
+    let without_commit_lsn = DOCS_EXAMPLE.replace("\"commit_lsn\"", "\"_commit_lsn\"");
+    let error = serde_json::from_str::<SinkMeta>(&without_commit_lsn).unwrap_err();
+
+    assert!(
+        error.to_string().contains("missing field `commit_lsn`"),
+        "missing commit_lsn must remain a hard error: {error}"
+    );
 }
 
 #[test]
