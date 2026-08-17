@@ -441,6 +441,7 @@ fn append_value(
 /// Fan a single `interval` value across its three sibling builders (`_months` i32, `_days` i32,
 /// `_micros` i64). NULL / unchanged-TOAST sets all three null in lockstep — the one shared logical
 /// NULL that keeps a real zero interval `(0,0,0)` distinguishable from absence (§2.4).
+#[deny(clippy::wildcard_enum_match_arm)]
 fn append_interval(
     builders: &mut [Box<dyn ArrayBuilder>],
     col: &str,
@@ -478,6 +479,7 @@ fn append_interval(
 }
 
 /// Fan a single `timetz` value across `_micros` (i64) and `_offset_seconds` (i32); NULL sets both.
+#[deny(clippy::wildcard_enum_match_arm)]
 fn append_timetz(
     builders: &mut [Box<dyn ArrayBuilder>],
     col: &str,
@@ -726,6 +728,7 @@ fn opt_text_value(bound: Option<&str>) -> TupleValue {
 /// Append one geometric value onto its single nested builder. Each shape appends to *every* leaf for
 /// every row (a NULL appends nulls to all leaves + closes the struct/list null), keeping the nested
 /// child arrays length-locked — the invariant `StructBuilder` requires.
+#[deny(clippy::wildcard_enum_match_arm)]
 fn append_geometric(
     builder: &mut dyn ArrayBuilder,
     field: &Field,

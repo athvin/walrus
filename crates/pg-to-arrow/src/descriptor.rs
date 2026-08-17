@@ -127,6 +127,7 @@ fn meta_of(col: &PgColumn, enum_labels: Option<Vec<String>>) -> TypeMeta {
 }
 
 /// The `arrow` descriptor string: Tier-2 is a decomposition; Tier-1/Tier-3 report the single Arrow type.
+#[deny(clippy::wildcard_enum_match_arm)]
 fn arrow_of(col: &PgColumn, tier: Tier) -> Result<String, Error> {
     Ok(match tier {
         Tier::Two => "Struct/Decomposed".to_string(),
@@ -137,6 +138,7 @@ fn arrow_of(col: &PgColumn, tier: Tier) -> Result<String, Error> {
 }
 
 /// The `duckdb` target type string.
+#[deny(clippy::wildcard_enum_match_arm)]
 fn duckdb_of(col: &PgColumn, tier: Tier) -> Result<String, Error> {
     Ok(match tier {
         Tier::Two => match col.type_oid {
