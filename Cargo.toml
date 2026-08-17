@@ -34,6 +34,8 @@ missing_copy_implementations = "deny"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
+# `manual_let_else` is pedantic (outside `clippy::all`), so no priority juggling is needed.
+manual_let_else = "deny"
 # Pure public computations must warn when their returned value is discarded. This pedantic lint is
 # outside `clippy::all`, so it needs no group priority adjustment (PR 13.2).
 must_use_candidate = "deny"

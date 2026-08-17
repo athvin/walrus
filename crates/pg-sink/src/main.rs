@@ -16,30 +16,25 @@ use tokio::time::Instant;
 
 fn main() -> ExitCode {
     // Step 1: config. Terminal on failure — before tracing exists, so report on stderr.
-    let cfg = match SinkConfig::load() {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            eprintln!("walrus-pg-sink: invalid configuration: {e}");
-            return common::ExitCode::Config.into();
-        }
+    let Ok(cfg) =
+        SinkConfig::load().inspect_err(|e| eprintln!("walrus-pg-sink: invalid configuration: {e}"))
+    else {
+        return common::ExitCode::Config.into();
     };
     if let Err(e) = common::init_tracing(&cfg.telemetry) {
         eprintln!("walrus-pg-sink: tracing init failed: {e}");
         return common::ExitCode::Internal.into();
     }
 
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
+    let Ok(runtime) = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("walrus-sink")
         .worker_threads(common::runtime::resolve_worker_threads(cfg.worker_threads))
         .max_blocking_threads(common::runtime::MAX_BLOCKING_THREADS)
         .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            tracing::error!("failed to build tokio runtime: {e}");
-            return common::ExitCode::Internal.into();
-        }
+        .inspect_err(|e| tracing::error!("failed to build tokio runtime: {e}"))
+    else {
+        return common::ExitCode::Internal.into();
     };
 
     match runtime.block_on(run(cfg)) {

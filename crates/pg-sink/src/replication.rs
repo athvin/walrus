@@ -612,9 +612,8 @@ fn error_message(body: &[u8]) -> String {
 
 fn parse_dsn(dsn: &str) -> anyhow::Result<(String, u16, String, String)> {
     let cfg: tokio_postgres::Config = dsn.parse().context("parse source DSN")?;
-    let host = match cfg.get_hosts().first() {
-        Some(tokio_postgres::config::Host::Tcp(h)) => h.clone(),
-        _ => bail!("replication DSN needs a TCP host"),
+    let Some(tokio_postgres::config::Host::Tcp(host)) = cfg.get_hosts().first() else {
+        bail!("replication DSN needs a TCP host");
     };
     let port = cfg.get_ports().first().copied().unwrap_or(5432);
     let user = cfg
@@ -625,7 +624,7 @@ fn parse_dsn(dsn: &str) -> anyhow::Result<(String, u16, String, String)> {
         .get_dbname()
         .ok_or_else(|| anyhow!("replication DSN needs a dbname"))?
         .to_string();
-    Ok((host, port, user, database))
+    Ok((host.clone(), port, user, database))
 }
 
 #[cfg(test)]

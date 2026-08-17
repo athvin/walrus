@@ -466,19 +466,18 @@ impl ReloadController {
         }
         // Fresh preflight connection per non-empty tick (see the field doc). If the SOURCE is
         // unreachable, no preflight can be trusted: release every claim and retry next tick.
-        let source = match crate::preflight::connect_source(&self.source_db_url).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    claims = claimed.len(),
-                    "preflight source connection failed; releasing claims to retry next tick"
-                );
-                for req in &claimed {
-                    self.release_row(req).await;
-                }
-                return Ok(());
+        let connected = crate::preflight::connect_source(&self.source_db_url).await;
+        let Ok(source) = connected.inspect_err(|e| {
+            tracing::warn!(
+                error = %e,
+                claims = claimed.len(),
+                "preflight source connection failed; releasing claims to retry next tick"
+            );
+        }) else {
+            for req in &claimed {
+                self.release_row(req).await;
             }
+            return Ok(());
         };
         for req in claimed {
             match self.preflight(&source, &req).await {
@@ -515,15 +514,12 @@ impl ReloadController {
                 }
             }
             // The permit is held INSIDE the spawned task — dropping it on task exit frees the slot.
-            let permit = match Arc::clone(&self.semaphore).try_acquire_owned() {
-                Ok(p) => p,
-                Err(_) => {
-                    // All permits raced away within this tick (can't happen while this controller
-                    // is the only claimant; harmless if it ever does): leave the row `exporting`
-                    // with its lease — expiry + PR 6.9's adoption recover it.
-                    tracing::warn!(reload_id = %req.reload_id, "no free permit after claim");
-                    continue;
-                }
+            let Ok(permit) = Arc::clone(&self.semaphore).try_acquire_owned() else {
+                // All permits raced away within this tick (can't happen while this controller
+                // is the only claimant; harmless if it ever does): leave the row `exporting`
+                // with its lease — expiry + PR 6.9's adoption recover it.
+                tracing::warn!(reload_id = %req.reload_id, "no free permit after claim");
+                continue;
             };
             tracing::info!(
                 reload_id = %req.reload_id,
@@ -634,31 +630,26 @@ impl ReloadController {
         if free == 0 {
             return;
         }
-        let adopted = match control::reload::adopt_resumable(
+        let scan = control::reload::adopt_resumable(
             &self.pool,
             self.cfg.epoch,
             &self.cfg.instance,
             ttl_secs(self.cfg.lease_ttl),
             count_i64(free),
         )
-        .await
-        {
-            Ok(rows) => rows,
-            Err(e) => {
-                tracing::warn!(error = %e, "startup reload-adoption scan failed; requested reloads still pick up per tick");
-                return;
-            }
+        .await;
+        let Ok(adopted) = scan.inspect_err(|e| {
+            tracing::warn!(error = %e, "startup reload-adoption scan failed; requested reloads still pick up per tick");
+        }) else {
+            return;
         };
         for req in adopted {
-            let permit = match Arc::clone(&self.semaphore).try_acquire_owned() {
-                Ok(p) => p,
-                Err(_) => {
-                    tracing::warn!(
-                        reload_id = %req.reload_id,
-                        "no free permit to resume an adopted reload; leaving it (lease re-acquired)"
-                    );
-                    continue;
-                }
+            let Ok(permit) = Arc::clone(&self.semaphore).try_acquire_owned() else {
+                tracing::warn!(
+                    reload_id = %req.reload_id,
+                    "no free permit to resume an adopted reload; leaving it (lease re-acquired)"
+                );
+                continue;
             };
             tracing::info!(
                 reload_id = %req.reload_id,
