@@ -57,3 +57,9 @@ fn fixed_width_window_preserves_bytes_and_context() {
         "word: expected 4 bytes, got 3"
     );
 }
+
+#[test]
+fn parse_dsn_rejects_a_dsn_without_a_tcp_host() {
+    let err = todo!("parse_dsn(\"user=walrus dbname=walrus\").unwrap_err()");
+    assert!(err.to_string().contains("needs a TCP host"));
+}
