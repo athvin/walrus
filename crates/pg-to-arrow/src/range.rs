@@ -61,7 +61,7 @@ impl RangeFamily {
             Self::Int4 => DataType::Int32,
             Self::Int8 => DataType::Int64,
             Self::Num => match crate::schema::numeric_precision_scale(atttypmod) {
-                Some((p, s)) if (1..=38).contains(&p) => DataType::Decimal128(p, s),
+                Some((p @ 1..=38, s)) => DataType::Decimal128(p, s),
                 _ => DataType::Utf8,
             },
             Self::Ts => DataType::Timestamp(TimeUnit::Microsecond, None),

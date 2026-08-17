@@ -105,13 +105,10 @@ pub fn tier1_data_type(type_oid: u32, atttypmod: i32) -> Option<DataType> {
         oids::FLOAT8 => DataType::Float64,
         // Two numeric cases, kept strictly apart (§2.3): p ≤ 38 is a lossless Decimal128;
         // unconstrained (typmod -1) or p > 38 is a Tier-3 VARCHAR carrier (PR 2.15) — NOT here.
-        oids::NUMERIC => {
-            let (precision, scale) = numeric_precision_scale(atttypmod)?;
-            if precision == 0 || precision > 38 {
-                return None;
-            }
-            DataType::Decimal128(precision, scale)
-        }
+        oids::NUMERIC => match numeric_precision_scale(atttypmod) {
+            Some((p @ 1..=38, s)) => DataType::Decimal128(p, s),
+            _ => return None,
+        },
         oids::TEXT | oids::VARCHAR | oids::BPCHAR | oids::CHAR => DataType::Utf8,
         oids::BYTEA => DataType::Binary,
         // json / jsonb ride as UTF-8 text (DuckDB infers JSON from the string).
