@@ -124,15 +124,15 @@ fn extract_points(text: &str) -> Result<Vec<Pt>, Error> {
     let bytes = text.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'(' {
-            if let Some(off) = text[i + 1..].find(')') {
-                let close = i + 1 + off;
-                let inner = &text[i + 1..close];
-                if !inner.contains('(') {
-                    pts.push(parse_pt_inner(inner, text)?);
-                    i = close + 1;
-                    continue;
-                }
+        if bytes[i] == b'('
+            && let Some(off) = text[i + 1..].find(')')
+        {
+            let close = i + 1 + off;
+            let inner = &text[i + 1..close];
+            if !inner.contains('(') {
+                pts.push(parse_pt_inner(inner, text)?);
+                i = close + 1;
+                continue;
             }
         }
         i += 1;

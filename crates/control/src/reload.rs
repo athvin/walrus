@@ -171,15 +171,14 @@ pub async fn request(
     .fetch_one(ex)
     .await
     .map_err(|e| {
-        if let sqlx::Error::Database(db) = &e {
-            if db.code().as_deref() == Some("23505")
-                && db.constraint() == Some("table_reload_one_live")
-            {
-                return ControlError::ReloadInProgress {
-                    schema: source_schema.to_string(),
-                    table: source_table.to_string(),
-                };
-            }
+        if let sqlx::Error::Database(db) = &e
+            && db.code().as_deref() == Some("23505")
+            && db.constraint() == Some("table_reload_one_live")
+        {
+            return ControlError::ReloadInProgress {
+                schema: source_schema.to_string(),
+                table: source_table.to_string(),
+            };
         }
         ControlError::from(e)
     })?;
