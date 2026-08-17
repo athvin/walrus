@@ -69,10 +69,10 @@ impl ControlError {
     /// Private on purpose: conversion goes through `?` / [`From`], so call sites cannot skip the
     /// classification. The reload module's constraint-specific closure delegates here as well.
     fn from_sqlx(e: sqlx::Error) -> Self {
-        if let sqlx::Error::Database(db) = &e {
-            if db.code().as_deref() == Some("23514") {
-                return ControlError::CheckViolation(db.message().to_string());
-            }
+        if let sqlx::Error::Database(db) = &e
+            && db.code().as_deref() == Some("23514")
+        {
+            return ControlError::CheckViolation(db.message().to_string());
         }
         ControlError::Connect(e)
     }

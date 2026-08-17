@@ -325,7 +325,7 @@ fn struct_child_builders(
 }
 
 macro_rules! downcast {
-    ($builder:expr, $ty:ty, $col:expr) => {
+    ($builder:expr_2021, $ty:ty, $col:expr_2021) => {
         $builder
             .as_any_mut()
             .downcast_mut::<$ty>()
@@ -604,12 +604,11 @@ fn append_multirange(
 
 /// The element (`_lower`/`_upper`) Arrow type carried inside a multirange's `LIST<STRUCT>` field.
 fn multirange_elem_type(field: &Field) -> Result<DataType, Error> {
-    if let DataType::List(item) = field.data_type() {
-        if let DataType::Struct(fs) = item.data_type() {
-            if let Some(bound) = fs.first() {
-                return Ok(bound.data_type().clone());
-            }
-        }
+    if let DataType::List(item) = field.data_type()
+        && let DataType::Struct(fs) = item.data_type()
+        && let Some(bound) = fs.first()
+    {
+        return Ok(bound.data_type().clone());
     }
     Err(Error::Downcast {
         column: field.name().clone(),
@@ -994,15 +993,13 @@ fn parse_timestamp_micros(s: &str, col: &str, scratch: &mut String) -> Result<i6
 fn parse_timestamptz_micros(s: &str, col: &str) -> Result<i64, Error> {
     let mut n = s.replacen(' ', "T", 1);
     // Postgres prints whole-hour offsets as `+HH`; jiff wants `+HH:MM`.
-    if let Some(t) = n.find('T') {
-        if let Some(sign) = n.get(t..).and_then(|suffix| suffix.rfind(['+', '-'])) {
-            if t.checked_add(sign)
-                .and_then(|start| n.get(start..))
-                .is_some_and(|offset| offset.len() == 3)
-            {
-                n.push_str(":00");
-            }
-        }
+    if let Some(t) = n.find('T')
+        && let Some(sign) = n.get(t..).and_then(|suffix| suffix.rfind(['+', '-']))
+        && t.checked_add(sign)
+            .and_then(|start| n.get(start..))
+            .is_some_and(|offset| offset.len() == 3)
+    {
+        n.push_str(":00");
     }
     rfc3339_micros(&n).ok_or_else(|| Error::value_parse(col, s, "TimestampTz"))
 }

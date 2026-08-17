@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/common", "crates/control", "crates/loader", "crates/pg-sink", "crates/pg-to-arrow", "tests/e2e"] # grows one crate at a time, following the DAG in docs/implementation/README.md
 
 [workspace.package]
-edition = "2021"
+edition = "2024" # if-let chains require edition 2024 + Rust 1.88; walrus pins 1.95.0.
 license = "MIT"
 rust-version = "1.95" # MSRV — keep in sync with rust-toolchain.toml; CI `msrv` job fails on drift (PR 4.7)
 

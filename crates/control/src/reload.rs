@@ -121,7 +121,7 @@ pub struct ReloadRow {
 }
 
 macro_rules! typed_reload_row {
-    ($row:expr) => {{
+    ($row:expr_2021) => {{
         let row = $row;
         ReloadRow {
             reload_id: row.reload_id.into(),

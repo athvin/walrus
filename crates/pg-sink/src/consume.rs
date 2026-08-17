@@ -864,10 +864,10 @@ impl<C: Clock + Clone> BatchRouter<C> {
             return Ok(Vec::new()); // never buffered this table yet — nothing to cut
         };
         let mut sealed = Vec::new();
-        if let Some(mut batcher) = self.batchers.remove(&oid) {
-            if let Some(batch) = batcher.drain_committed().context("cut table on DDL bump")? {
-                sealed.push(batch);
-            }
+        if let Some(mut batcher) = self.batchers.remove(&oid)
+            && let Some(batch) = batcher.drain_committed().context("cut table on DDL bump")?
+        {
+            sealed.push(batch);
         }
         Ok(sealed)
     }

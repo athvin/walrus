@@ -86,7 +86,7 @@ impl InflightMeter {
     pub fn largest_open(&self) -> Option<(TableId, u32)> {
         self.by_stream
             .iter()
-            .max_by_key(|(_, &bytes)| bytes)
+            .max_by_key(|&(_, &bytes)| bytes)
             .map(|(&k, _)| k)
     }
 }
