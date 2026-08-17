@@ -96,10 +96,10 @@ fn numeric_typmod_out_of_range_is_unconstrained() {
 
 #[test]
 fn numeric_precision_38_is_the_tier1_boundary_at_both_call_sites() {
-    const P0: i32 = ((0_i32 << 16) | 0) + 4;
-    const P1: i32 = ((1_i32 << 16) | 0) + 4;
-    const P38: i32 = ((38_i32 << 16) | 0) + 4;
-    const P39: i32 = ((39_i32 << 16) | 0) + 4;
+    const P0: i32 = 4;
+    const P1: i32 = (1_i32 << 16) + 4;
+    const P38: i32 = (38_i32 << 16) + 4;
+    const P39: i32 = (39_i32 << 16) + 4;
 
     for (typmod, expected) in [
         (P0, None),
