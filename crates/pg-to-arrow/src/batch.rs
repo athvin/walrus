@@ -351,9 +351,10 @@ fn append_value(
     match dt {
         DataType::Boolean => {
             let b = downcast!(builder, BooleanBuilder, col);
-            match is_null {
-                true => b.append_null(),
-                false => b.append_value(parse_bool(text(value, col, dt)?, col)?),
+            if is_null {
+                b.append_null();
+            } else {
+                b.append_value(parse_bool(text(value, col, dt)?, col)?);
             }
         }
         DataType::Int16 => append_num::<Int16Builder>(builder, value, col, dt, is_null)?,
@@ -363,16 +364,18 @@ fn append_value(
         DataType::Float64 => append_num::<Float64Builder>(builder, value, col, dt, is_null)?,
         DataType::Decimal128(_, scale) => {
             let b = downcast!(builder, Decimal128Builder, col);
-            match is_null {
-                true => b.append_null(),
-                false => b.append_value(parse_decimal(text(value, col, dt)?, *scale, col)?),
+            if is_null {
+                b.append_null();
+            } else {
+                b.append_value(parse_decimal(text(value, col, dt)?, *scale, col)?);
             }
         }
         DataType::Utf8 => {
             let b = downcast!(builder, StringBuilder, col);
-            match is_null {
-                true => b.append_null(),
-                false => b.append_value(text(value, col, dt)?),
+            if is_null {
+                b.append_null();
+            } else {
+                b.append_value(text(value, col, dt)?);
             }
         }
         DataType::Binary => {
@@ -386,31 +389,32 @@ fn append_value(
         }
         DataType::Date32 => {
             let b = downcast!(builder, Date32Builder, col);
-            match is_null {
-                true => b.append_null(),
-                false => b.append_value(parse_date_days(text(value, col, dt)?, col, scratch)?),
+            if is_null {
+                b.append_null();
+            } else {
+                b.append_value(parse_date_days(text(value, col, dt)?, col, scratch)?);
             }
         }
         DataType::Time64(TimeUnit::Microsecond) => {
             let b = downcast!(builder, Time64MicrosecondBuilder, col);
-            match is_null {
-                true => b.append_null(),
-                false => b.append_value(parse_time_micros(text(value, col, dt)?, col, scratch)?),
+            if is_null {
+                b.append_null();
+            } else {
+                b.append_value(parse_time_micros(text(value, col, dt)?, col, scratch)?);
             }
         }
         DataType::Timestamp(TimeUnit::Microsecond, tz) => {
             let b = downcast!(builder, TimestampMicrosecondBuilder, col);
-            match is_null {
-                true => b.append_null(),
-                false => {
-                    let s = text(value, col, dt)?;
-                    let micros = if tz.is_some() {
-                        parse_timestamptz_micros(s, col)?
-                    } else {
-                        parse_timestamp_micros(s, col, scratch)?
-                    };
-                    b.append_value(micros);
-                }
+            if is_null {
+                b.append_null();
+            } else {
+                let s = text(value, col, dt)?;
+                let micros = if tz.is_some() {
+                    parse_timestamptz_micros(s, col)?
+                } else {
+                    parse_timestamp_micros(s, col, scratch)?
+                };
+                b.append_value(micros);
             }
         }
         // uuid: parse canonical text → 16 bytes, append as fixed-width binary (PR 2.16).

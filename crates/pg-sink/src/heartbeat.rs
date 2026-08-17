@@ -169,12 +169,11 @@ impl BeatState {
     /// Non-gating: an outstanding beat that has not returned within `roundtrip_deadline`. Under steady
     /// traffic (no pending beat) this is always `false` — the stream itself proves liveness.
     fn degraded(&self, now: Instant) -> bool {
-        match (self.pending_seq, self.last_beat) {
-            (Some(_), Some(sent)) => {
-                now.saturating_duration_since(sent) > self.cfg.roundtrip_deadline
-            }
-            _ => false,
-        }
+        matches!(
+            (self.pending_seq, self.last_beat),
+            (Some(_), Some(sent))
+                if now.saturating_duration_since(sent) > self.cfg.roundtrip_deadline
+        )
     }
 }
 
