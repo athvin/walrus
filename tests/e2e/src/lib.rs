@@ -220,7 +220,7 @@ impl Harness {
 
     /// List S3 object keys under `<epoch>/<schema>/<table>/`.
     pub async fn s3_list(&self, table: &str) -> Result<Vec<String>> {
-        use object_store::{aws::AmazonS3Builder, ObjectStore};
+        use object_store::{ObjectStore, aws::AmazonS3Builder};
         let store = AmazonS3Builder::new()
             .with_bucket_name(BUCKET)
             .with_region("us-east-1")

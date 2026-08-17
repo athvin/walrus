@@ -11,13 +11,13 @@
 
 use anyhow::Context as _;
 use axum::{
-    extract::State, http::header, http::StatusCode, response::IntoResponse, routing::get, Json,
-    Router,
+    Json, Router, extract::State, http::StatusCode, http::header, response::IntoResponse,
+    routing::get,
 };
 use serde::Serialize;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use tokio_util::sync::CancellationToken;
 
 /// The bootstrap phase the probes read. `Bootstrapping` gates the other two.

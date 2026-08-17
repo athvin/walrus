@@ -8,7 +8,7 @@
 //! a max-row LSN, or a late-committing large transaction would be silently dropped. Retiring a file
 //! is a `DELETE`, not a status flip — the queue's frontier advances by removal.
 
-use crate::{parse::ParseEnumError, ControlError};
+use crate::{ControlError, parse::ParseEnumError};
 use common::{EpochNo, Lsn, ManifestId, ReloadId, SchemaVersionNo};
 use sqlx::PgExecutor;
 

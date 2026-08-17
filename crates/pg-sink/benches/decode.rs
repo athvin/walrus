@@ -14,8 +14,8 @@
 //!
 //! Run: `cargo bench -p pg-sink --bench decode` (or `just bench`).
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use pg_sink::pgoutput::{parse_stream, parse_tuple, Reader, StreamCtx};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use pg_sink::pgoutput::{Reader, StreamCtx, parse_stream, parse_tuple};
 use std::hint::black_box;
 
 const ROWS: usize = 10_000;

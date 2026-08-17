@@ -55,14 +55,18 @@ fn no_serde_flatten_evidence_fixture_preserves_strict_unknown_keys() {
         serde_json::from_str(r#"{"shared":"ok","service_only":true}"#).unwrap();
     assert_eq!(parsed.common.shared, "ok");
     assert!(parsed.service_only);
-    assert!(serde_json::from_str::<StrictServiceFixture>(
-        r#"{"shared":"ok","service_only":true,"nonsense":1}"#
-    )
-    .is_err());
+    assert!(
+        serde_json::from_str::<StrictServiceFixture>(
+            r#"{"shared":"ok","service_only":true,"nonsense":1}"#
+        )
+        .is_err()
+    );
 }
 
 #[test]
 fn no_serde_flatten_decision_is_linked_from_the_natural_site() {
-    assert!(include_str!("config.rs")
-        .contains("docs/implementation/notes/rust-skills/serde-flatten.md"));
+    assert!(
+        include_str!("config.rs")
+            .contains("docs/implementation/notes/rust-skills/serde-flatten.md")
+    );
 }

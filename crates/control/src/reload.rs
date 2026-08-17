@@ -16,7 +16,7 @@
 //! caller-side idempotency keys — is not needed: "the same table, again" *is* the idempotency
 //! rule here.
 
-use crate::{parse::ParseEnumError, ControlError};
+use crate::{ControlError, parse::ParseEnumError};
 use common::{EpochNo, Lsn, ReloadId, SchemaVersionNo};
 use sqlx::{Connection, PgConnection, PgExecutor};
 

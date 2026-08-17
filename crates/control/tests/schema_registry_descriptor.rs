@@ -16,7 +16,7 @@
 //! ```
 
 use common::{PgColumn, PgRelation, ReplicaIdentity, SchemaVersionNo};
-use control::{connect, read_registry, run_migrations, upsert_registry, RegistryRow};
+use control::{RegistryRow, connect, read_registry, run_migrations, upsert_registry};
 use pg_to_arrow::descriptor::describe_relation;
 
 fn control_dsn() -> String {

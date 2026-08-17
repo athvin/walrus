@@ -15,7 +15,7 @@ use common::{EpochNo, PgColumn, PgRelation, ReplicaIdentity, SchemaVersionNo};
 use control::{connect, read_all_latest_registry, read_registry, run_migrations};
 use pg_sink::consume::on_relation;
 use pg_sink::relcache::RelationCache;
-use pg_to_arrow::{oids, SINK_META_COLUMN};
+use pg_to_arrow::{SINK_META_COLUMN, oids};
 use sqlx::postgres::PgPool;
 
 fn control_url() -> String {

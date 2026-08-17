@@ -9,11 +9,11 @@
 //!   cycle (even a no-op). It reflects **no** lag metric — an idle-but-healthy loader must stay live.
 
 use axum::{
-    extract::State, http::header, http::StatusCode, response::IntoResponse, routing::get, Router,
+    Router, extract::State, http::StatusCode, http::header, response::IntoResponse, routing::get,
 };
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 

@@ -7,8 +7,8 @@
 //! three modules later. Connectivity (control PG, S3) is a *separate, transient* bootstrap check.
 
 use crate::memory::{HysteresisBand, Ratio};
-use common::config::ObjectStoreConfig;
 use common::TelemetryConfig;
+use common::config::ObjectStoreConfig;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
@@ -169,8 +169,8 @@ impl SinkConfig {
     /// Returns [`ConfigError::Load`] when file or environment values cannot be deserialized, or the
     /// [`ConfigError::Missing`] / [`ConfigError::OutOfBounds`] produced by [`Self::validate`].
     pub fn load() -> Result<Self, ConfigError> {
-        use figment::providers::{Env, Format, Toml, Yaml};
         use figment::Figment;
+        use figment::providers::{Env, Format, Toml, Yaml};
 
         let mut figment = Figment::new();
         if let Ok(path) = std::env::var("WALRUS_CONFIG") {

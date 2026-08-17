@@ -12,7 +12,7 @@ use crate::error::LoaderError;
 use crate::phase_a::TableCtx;
 use crate::plan::TablePlan;
 use crate::table_name::{DuckTable, Mirror};
-use crate::transform::{apply_transform, TransformSql};
+use crate::transform::{TransformSql, apply_transform};
 use common::{Lsn, PgRelation};
 
 /// Build the transform for a table at its CURRENT reconciled `schema_version` (PR 3.8): read the registry

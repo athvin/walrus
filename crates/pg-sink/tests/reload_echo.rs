@@ -19,7 +19,7 @@
 use common::{EpochNo, Lsn, ReloadId, SchemaVersionNo};
 use pg_sink::batch::{BatchTriggers, SealedBatch, SystemClock};
 use pg_sink::checkpoint::DurabilityCheckpoint;
-use pg_sink::consume::{on_frame, on_relation, BatchRouter};
+use pg_sink::consume::{BatchRouter, on_frame, on_relation};
 use pg_sink::heartbeat::InternalTables;
 use pg_sink::pgoutput::{Message, StreamCtx};
 use pg_sink::relcache::RelationCache;

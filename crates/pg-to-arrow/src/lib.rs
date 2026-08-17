@@ -27,5 +27,5 @@ mod approx;
 pub use batch::BatchBuilder;
 pub use error::Error;
 pub use parquet::{default_writer_properties, write_parquet, write_parquet_bytes};
-pub use schema::{build_schema, emit_fields, tier1_data_type, SINK_META_COLUMN};
+pub use schema::{SINK_META_COLUMN, build_schema, emit_fields, tier1_data_type};
 pub use tier2::{parse_interval, parse_timetz};

@@ -17,7 +17,7 @@ use common::{FailureClass, Lsn, TupleValue};
 use pg_sink::config::SinkConfig;
 use pg_sink::consume::on_frame;
 use pg_sink::pgoutput::{Message, StreamCtx};
-use pg_sink::preflight::{connect_source, PreflightError, SourcePreflight};
+use pg_sink::preflight::{PreflightError, SourcePreflight, connect_source};
 use pg_sink::replication::{ReplicationMessage, ReplicationStream};
 use pg_sink::slot::verify_or_create_slot;
 use pg_sink::snapshot::published_user_tables;
@@ -250,9 +250,10 @@ async fn missing_signal_table_is_terminal_and_manage_publication_heals_the_gap()
         PreflightError::PublicationGap { table, .. } => assert_eq!(table, "reload_signal"),
         other => panic!("expected PublicationGap for reload_signal, got {other:?}"),
     }
-    assert!(err
-        .to_string()
-        .contains("ALTER PUBLICATION walrus_pf62 ADD TABLE walrus.reload_signal"));
+    assert!(
+        err.to_string()
+            .contains("ALTER PUBLICATION walrus_pf62 ADD TABLE walrus.reload_signal")
+    );
 
     // (c) The same gap under manage_publication=true self-heals via the existing auto-add path.
     let cfg_manage = SinkConfig {

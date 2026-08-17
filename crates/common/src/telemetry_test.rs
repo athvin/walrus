@@ -54,11 +54,13 @@ fn second_init_is_handled_not_fatal() {
     // Tests share one process, so at most one of these actually installs the global
     // subscriber; the rest hit the "already initialised" path. None may panic.
     assert!(init_tracing(&TelemetryConfig::default()).is_ok());
-    assert!(init_tracing(&TelemetryConfig {
-        json: true,
-        filter: "debug".to_string(),
-    })
-    .is_ok());
+    assert!(
+        init_tracing(&TelemetryConfig {
+            json: true,
+            filter: "debug".to_string(),
+        })
+        .is_ok()
+    );
 }
 
 #[test]

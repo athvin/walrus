@@ -14,8 +14,8 @@
 
 use common::{EpochNo, Lsn, SchemaVersionNo};
 use control::reload::{self, ReloadFlavor};
-use control::{claim_ready, connect, insert_ready, max_ready_lsn_end, run_migrations};
 use control::{ManifestRow, NewManifestFile};
+use control::{claim_ready, connect, insert_ready, max_ready_lsn_end, run_migrations};
 use sqlx::postgres::PgPool;
 
 fn control_dsn() -> String {
@@ -83,10 +83,12 @@ async fn live_rebuild_pauses_claims_for_that_table_only() {
     reload::claim_requested(&mut *tx, epoch, "sink-a", 60, 10)
         .await
         .unwrap();
-    assert!(claim_ready(&mut *tx, epoch, "public", "orders", 100)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        claim_ready(&mut *tx, epoch, "public", "orders", 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
     // The OTHER table claims normally the whole time, and the paused table's backlog stays
     // visible (the lag gauge SHOULD grow during a pause — PR 6.11 documents it).
@@ -130,10 +132,12 @@ async fn export_complete_and_terminal_states_lift_the_pause() {
     reload::claim_requested(&mut *tx, epoch, "sink-a", 60, 10)
         .await
         .unwrap();
-    assert!(claim_ready(&mut *tx, epoch, "public", "orders", 100)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        claim_ready(&mut *tx, epoch, "public", "orders", 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
     // export_complete lifts the pause — exactly then the loader MUST claim again to reach the
     // chunk files and trigger the rebuild (pausing through export_complete deadlocks, PR 6.7).
@@ -166,10 +170,12 @@ async fn export_complete_and_terminal_states_lift_the_pause() {
     reload::claim_requested(&mut *tx, epoch, "sink-a", 60, 10)
         .await
         .unwrap();
-    assert!(claim_ready(&mut *tx, epoch, "public", "customers", 100)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        claim_ready(&mut *tx, epoch, "public", "customers", 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     reload::fail(&mut tx, cust, "demo").await.unwrap();
     assert_eq!(
         ids(&claim_ready(&mut *tx, epoch, "public", "customers", 100)

@@ -9,7 +9,7 @@
 //! `common::metrics::names::LOADER_*` constant, labelled by table.
 
 use common::metrics::names;
-use loader::health::{serve_on, LoaderState};
+use loader::health::{LoaderState, serve_on};
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};

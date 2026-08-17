@@ -6,7 +6,7 @@
 //! Exits cleanly on the shutdown token.
 
 use crate::error::LoaderError;
-use crate::phase_a::{run_phase_a, TableCtx};
+use crate::phase_a::{TableCtx, run_phase_a};
 use crate::phase_b::run_phase_b;
 use common::{EpochNo, Lsn};
 use std::time::Instant;

@@ -14,12 +14,12 @@
 use arrow::array::{Array, StringArray};
 use arrow::datatypes::{DataType, TimeUnit};
 use common::{Kind, Op, PgColumn, PgRelation, ReplicaIdentity, SinkMeta, TupleValue, UtcTimestamp};
-use object_store::aws::AmazonS3Builder;
 use object_store::ObjectStore;
+use object_store::aws::AmazonS3Builder;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use pg_sink::batch::SealedBatch;
 use pg_sink::sink::{FileKind, ParquetSink};
-use pg_to_arrow::{oids, BatchBuilder, SINK_META_COLUMN};
+use pg_to_arrow::{BatchBuilder, SINK_META_COLUMN, oids};
 use std::sync::Arc;
 
 fn minio_store() -> Arc<dyn ObjectStore> {

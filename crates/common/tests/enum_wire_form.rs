@@ -4,8 +4,8 @@
 // making a new variant or payload a compile error before it can change the wire format.
 
 use common::{Kind, Op, ReplicaIdentity, Tier};
-use serde::{de::DeserializeOwned, Serialize};
-use serde_json::{json, Value};
+use serde::{Serialize, de::DeserializeOwned};
+use serde_json::{Value, json};
 
 /// Serialize, compare against the golden scalar, prove it is a scalar, and round-trip.
 fn assert_scalar_wire<T>(value: T, expected: &Value)

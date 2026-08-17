@@ -2,8 +2,8 @@
 //! pattern: `WALRUS_`-prefixed env (optional file underneath) → typed serde struct → bounds-check.
 //! Invalid config is a **terminal** bootstrap error → [`common::ExitCode::Config`].
 
-use common::config::ObjectStoreConfig;
 use common::TelemetryConfig;
+use common::config::ObjectStoreConfig;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::num::NonZeroI64;
@@ -85,8 +85,8 @@ impl LoaderConfig {
     /// Returns [`ConfigError`] when a file or environment value cannot be deserialized, an unknown
     /// field is present, or the merged configuration fails [`Self::validate`].
     pub fn load() -> Result<Self, ConfigError> {
-        use figment::providers::{Env, Format, Toml, Yaml};
         use figment::Figment;
+        use figment::providers::{Env, Format, Toml, Yaml};
 
         let mut figment = Figment::new();
         if let Ok(path) = std::env::var("WALRUS_CONFIG") {

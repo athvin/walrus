@@ -7,9 +7,9 @@
 //! at its call sites — e.g. `info!({XID} = xid, {COMMIT_LSN} = %commit_lsn, "flushed batch")`.
 
 use serde::Deserialize;
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
 
 /// Canonical structured-field keys. Use these constants at every `tracing` call site so dashboards
 /// and log queries key on **one** spelling across both services — never a free-form format string.

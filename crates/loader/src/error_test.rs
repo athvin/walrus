@@ -24,9 +24,11 @@ fn duck_preserves_the_engine_error_as_source() {
         messages.push(source.to_string());
         cause = source.source();
     }
-    assert!(messages
-        .iter()
-        .any(|message| message.contains("_walrus_lsn")));
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("_walrus_lsn"))
+    );
 }
 
 #[test]

@@ -18,8 +18,8 @@
 
 use bytes::Bytes;
 use common::{EpochNo, Lsn, ReloadId, SchemaVersionNo};
-use object_store::path::Path;
 use object_store::ObjectStore;
+use object_store::path::Path;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use pg_sink::consume::on_frame;
 use pg_sink::heartbeat::InternalTables;
@@ -213,9 +213,9 @@ async fn await_resolver_ready(
     epoch: EpochNo,
 ) {
     let sentinel = -epoch.0; // never collides with real (bigserial, positive) reload ids
-                             // Retry the sentinel until the resolver answers: a signal committed BEFORE the resolver's
-                             // slot exists is never streamed, so each attempt re-signals fresh (DELETE + INSERT in one
-                             // implicit txn — the engine's own re-signal shape; only an INSERT echoes).
+    // Retry the sentinel until the resolver answers: a signal committed BEFORE the resolver's
+    // slot exists is never streamed, so each attempt re-signals fresh (DELETE + INSERT in one
+    // implicit txn — the engine's own re-signal shape; only an INSERT echoes).
     let mut ready = false;
     for _ in 0..20 {
         let rx = waiters.subscribe(ReloadId(sentinel), 1);

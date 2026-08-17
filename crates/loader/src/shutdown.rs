@@ -24,7 +24,7 @@
 //! the drain needs — let `SIGTERM` arrive at T=0. **PID-1 / exec-form** (so `SIGTERM` reaches the Rust
 //! process, not a shell) is a Dockerfile concern wired in **PR 4.8**; note it here.
 
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio_util::sync::CancellationToken;
 
 /// Run `body` while holding a [`CancellationToken`] drop guard. Whether the body succeeds,

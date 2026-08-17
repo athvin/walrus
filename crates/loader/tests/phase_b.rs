@@ -14,7 +14,7 @@
 use common::{EpochNo, Lsn, PgColumn, PgRelation, ReplicaIdentity};
 use loader::duck::{S3Access, TableDb};
 use loader::health::LoaderState;
-use loader::phase_a::{run_phase_a, TableCtx};
+use loader::phase_a::{TableCtx, run_phase_a};
 use loader::phase_b::run_phase_b;
 use std::time::Duration;
 
@@ -62,7 +62,8 @@ fn tmpdir(name: &str) -> std::path::PathBuf {
 fn meta(op: &str, l: u64) -> String {
     format!(
         "{{\"op\":\"{op}\",\"commit_lsn\":\"0000000000000064\",\"lsn\":\"{:016X}\",\"sink_processed_at\":\"2026-07-07T12:00:{:02}Z\"}}",
-        l, l % 60
+        l,
+        l % 60
     )
 }
 

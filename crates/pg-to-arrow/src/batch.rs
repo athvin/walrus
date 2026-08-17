@@ -13,12 +13,12 @@ use crate::error::Error;
 use crate::geometric::GeoKind;
 use crate::oids;
 use crate::range::RangeFamily;
-use crate::schema::{build_schema, tier1_data_type, SINK_META_COLUMN};
+use crate::schema::{SINK_META_COLUMN, build_schema, tier1_data_type};
 use arrow::array::{
-    make_builder, ArrayBuilder, ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder,
-    Decimal128Builder, FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder,
-    Int32Builder, Int64Builder, ListBuilder, RecordBatch, StringBuilder, StructBuilder,
-    Time64MicrosecondBuilder, TimestampMicrosecondBuilder,
+    ArrayBuilder, ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder,
+    FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder,
+    Int64Builder, ListBuilder, RecordBatch, StringBuilder, StructBuilder, Time64MicrosecondBuilder,
+    TimestampMicrosecondBuilder, make_builder,
 };
 use arrow::datatypes::{DataType, Field, FieldRef, SchemaRef, TimeUnit};
 use common::{PgColumn, PgRelation, SinkMeta, TupleValue};
@@ -432,7 +432,7 @@ fn append_value(
         _ => {
             return Err(Error::Downcast {
                 column: col.to_string(),
-            })
+            });
         }
     }
     Ok(())
@@ -520,8 +520,13 @@ fn append_range(
     scratch: &mut String,
 ) -> Result<(), Error> {
     let col = fields.first().map_or("<unknown>", |field| field.name());
-    let [lower_builder, upper_builder, lower_inc_builder, upper_inc_builder, empty_builder] =
-        builders
+    let [
+        lower_builder,
+        upper_builder,
+        lower_inc_builder,
+        upper_inc_builder,
+        empty_builder,
+    ] = builders
     else {
         return Err(Error::Downcast {
             column: col.to_string(),
@@ -685,7 +690,7 @@ fn append_struct_bound(
         _ => {
             return Err(Error::Downcast {
                 column: col.to_string(),
-            })
+            });
         }
     }
     Ok(())

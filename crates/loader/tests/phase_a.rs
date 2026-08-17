@@ -14,7 +14,7 @@
 use common::{EpochNo, Lsn, PgColumn, PgRelation, ReplicaIdentity};
 use loader::duck::{S3Access, TableDb};
 use loader::health::LoaderState;
-use loader::phase_a::{run_phase_a, TableCtx};
+use loader::phase_a::{TableCtx, run_phase_a};
 use std::time::Duration;
 
 static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

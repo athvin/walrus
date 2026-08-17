@@ -11,9 +11,9 @@
 
 use crate::batch::SealedBatch;
 use common::{EpochNo, Lsn, SchemaVersionNo};
+use object_store::ObjectStore;
 use object_store::buffered::BufWriter;
 use object_store::path::Path;
-use object_store::ObjectStore;
 use parquet::arrow::AsyncArrowWriter;
 use std::sync::Arc;
 

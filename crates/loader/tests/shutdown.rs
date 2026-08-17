@@ -16,7 +16,7 @@ use loader::compaction::full_rebuild_abortable;
 use loader::duck::{S3Access, TableDb};
 use loader::health::LoaderState;
 use loader::phase_a::TableCtx;
-use loader::transform::{apply_transform, TransformSql};
+use loader::transform::{TransformSql, apply_transform};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -64,7 +64,8 @@ fn tmpdir(name: &str) -> std::path::PathBuf {
 fn meta(op: &str, commit_hex: &str, l: u64) -> String {
     format!(
         "{{\"op\":\"{op}\",\"commit_lsn\":\"{commit_hex}\",\"lsn\":\"{:016X}\",\"sink_processed_at\":\"2026-07-08T12:00:{:02}Z\"}}",
-        l, l % 60
+        l,
+        l % 60
     )
 }
 

@@ -37,7 +37,9 @@ pub enum LoaderError {
     /// The control plane opened a NEW generation (§1.8 total-restart) while this loader was running the
     /// old one. Exit **loudly** so the orchestrator restarts us into a rebuild under the new epoch —
     /// never rebuild a running generation in place.
-    #[error("epoch bumped {from} → {to}: control-plane opened a new generation (total-restart) — restarting to rebuild")]
+    #[error(
+        "epoch bumped {from} → {to}: control-plane opened a new generation (total-restart) — restarting to rebuild"
+    )]
     EpochBumped { from: EpochNo, to: EpochNo },
     /// A schema-registry column snapshot did not decode into the relation shape the sink wrote.
     #[error("decode registry columns for {table} v{version}")]

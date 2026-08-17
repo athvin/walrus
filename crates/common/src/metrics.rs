@@ -182,7 +182,7 @@ pub fn init_table_series(table: &str) {
 }
 
 fn describe_all() {
-    use metrics::{describe_counter, describe_gauge, describe_histogram, Unit};
+    use metrics::{Unit, describe_counter, describe_gauge, describe_histogram};
     describe_gauge!(
         names::SINK_REPLICATION_LAG_BYTES,
         Unit::Bytes,

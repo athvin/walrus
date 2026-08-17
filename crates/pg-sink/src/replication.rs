@@ -16,7 +16,7 @@
 //! **unconditional**: it goes out well under `wal_sender_timeout`, never gated on S3 durability, or
 //! the walsender severs us with a reconnect storm.
 
-use anyhow::{anyhow, bail, Context};
+use anyhow::{Context, anyhow, bail};
 use bytes::{Bytes, BytesMut};
 use common::{Lsn, PG_EPOCH_UNIX_SECS};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

@@ -18,7 +18,7 @@ use common::{EpochNo, Lsn, PgColumn, PgRelation, ReplicaIdentity};
 use control::reload::{self, ReloadFlavor};
 use loader::duck::{S3Access, TableDb};
 use loader::health::LoaderState;
-use loader::phase_a::{run_phase_a, TableCtx};
+use loader::phase_a::{TableCtx, run_phase_a};
 use loader::phase_b::run_phase_b;
 use std::time::Duration;
 

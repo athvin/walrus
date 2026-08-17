@@ -9,7 +9,7 @@
 
 use arrow::datatypes::SchemaRef;
 use common::{PgRelation, SchemaVersionNo, TypeDescriptor};
-use std::collections::{hash_map, HashMap};
+use std::collections::{HashMap, hash_map};
 use std::sync::Arc;
 
 /// Everything the batching path (PR 2.23) needs for one relation at one `schema_version`, shared by

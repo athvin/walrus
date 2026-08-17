@@ -12,7 +12,7 @@
 //! ~2× transient space for the rewrite. The cross-table stall is an open finding recorded in
 //! `docs/implementation/notes/rust-skills/async-spawn-blocking.md`.
 
-use crate::duck_ext::{duck_err, DuckResultExt};
+use crate::duck_ext::{DuckResultExt, duck_err};
 use crate::error::LoaderError;
 use crate::transform::TransformSql;
 use common::Lsn;

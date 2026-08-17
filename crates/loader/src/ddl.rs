@@ -18,7 +18,7 @@
 //! `VARCHAR`, never re-cast), and `DROP TABLE` (retire both tables + file). Raw is an additive superset:
 //! it only ever adds / widens — it never destructively drops or re-casts history.
 
-use crate::duck::{duck_type, user_view_sql, TableDb};
+use crate::duck::{TableDb, duck_type, user_view_sql};
 use crate::duck_ext::DuckResultExt;
 use crate::error::LoaderError;
 use common::oids::{FLOAT4, FLOAT8, INT2, INT4, INT8};

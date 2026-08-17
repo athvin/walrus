@@ -14,7 +14,7 @@
 
 use common::FailureClass;
 use pg_sink::config::SinkConfig;
-use pg_sink::preflight::{connect_source, PkMode, PreflightError, SourcePreflight};
+use pg_sink::preflight::{PkMode, PreflightError, SourcePreflight, connect_source};
 use tokio_postgres::NoTls;
 
 const SOURCE_MIGRATION: &str = include_str!("../../../migrations/source/0001_publication.sql");

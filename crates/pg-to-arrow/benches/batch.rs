@@ -16,8 +16,8 @@
 
 use arrow::array::StringBuilder;
 use common::{Kind, Op, PgColumn, PgRelation, ReplicaIdentity, SinkMeta, TupleValue, UtcTimestamp};
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
-use pg_to_arrow::{oids, BatchBuilder};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use pg_to_arrow::{BatchBuilder, oids};
 use std::hint::black_box;
 
 /// Rows appended per measured iteration (throughput reads as rows/s).

@@ -6,7 +6,7 @@
 //! The health server, end to end: `/startup` gates `/ready` until bootstrap completes, and a
 //! cancelled token drives `with_graceful_shutdown` to return — the same path SIGTERM trips.
 
-use pg_sink::health::{serve_on, HealthState};
+use pg_sink::health::{HealthState, serve_on};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;

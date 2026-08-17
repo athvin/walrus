@@ -1,4 +1,4 @@
-use super::{parse_tuple, Reader};
+use super::{Reader, parse_tuple};
 use common::TupleValue;
 
 const ARRAYVEC_DECISION: &str =

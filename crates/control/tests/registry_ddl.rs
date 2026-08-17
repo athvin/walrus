@@ -11,8 +11,8 @@
 
 use common::{EpochNo, Lsn, SchemaVersionNo, Tier, TypeDescriptor, TypeMeta};
 use control::{
-    connect, insert_ddl, read_latest_version, read_pending_ddl, read_registry, run_migrations,
-    upsert_registry, DdlRow, RegistryRow,
+    DdlRow, RegistryRow, connect, insert_ddl, read_latest_version, read_pending_ddl, read_registry,
+    run_migrations, upsert_registry,
 };
 use sqlx::postgres::PgPool;
 

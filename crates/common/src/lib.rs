@@ -29,8 +29,8 @@ pub use failure_class::FailureClass;
 pub use ids::{EpochNo, ManifestId, ReloadId, SchemaVersionNo};
 pub use lsn::Lsn;
 pub use pg_shape::{PgColumn, PgRelation, ReplicaIdentity, TupleValue};
-pub use sink_meta::{Kind, Op, SinkMeta, UtcTimestamp, PG_EPOCH_UNIX_MICROS, PG_EPOCH_UNIX_SECS};
-pub use telemetry::{init_tracing, TelemetryConfig};
+pub use sink_meta::{Kind, Op, PG_EPOCH_UNIX_MICROS, PG_EPOCH_UNIX_SECS, SinkMeta, UtcTimestamp};
+pub use telemetry::{TelemetryConfig, init_tracing};
 pub use type_descriptor::{Tier, TypeDescriptor, TypeMeta};
 
 #[cfg(test)]

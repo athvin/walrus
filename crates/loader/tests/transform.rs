@@ -10,7 +10,7 @@
 use common::{PgColumn, PgRelation, ReplicaIdentity};
 use duckdb::Connection;
 use loader::duck::TableDb;
-use loader::transform::{apply_transform, TransformSql};
+use loader::transform::{TransformSql, apply_transform};
 
 fn orders_rel() -> PgRelation {
     let col = |name: &str, oid: u32, is_key: bool| PgColumn {

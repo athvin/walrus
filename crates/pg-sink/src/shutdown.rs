@@ -22,12 +22,12 @@
 
 use crate::batch::Clock;
 use crate::checkpoint::DurabilityCheckpoint;
-use crate::consume::{flush_batch, BatchRouter};
+use crate::consume::{BatchRouter, flush_batch};
 use crate::replication::ReplicationStream;
 use crate::sink::ParquetSink;
 use anyhow::Context;
 use common::{EpochNo, Lsn};
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio_util::sync::CancellationToken;
 
 /// Run `body` while holding a [`CancellationToken`] drop guard. Whether the body succeeds,

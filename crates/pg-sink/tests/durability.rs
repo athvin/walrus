@@ -14,7 +14,7 @@
 use common::{EpochNo, Lsn};
 use pg_sink::batch::{BatchTriggers, SystemClock};
 use pg_sink::checkpoint::DurabilityCheckpoint;
-use pg_sink::consume::{flush_batch, on_frame, BatchRouter};
+use pg_sink::consume::{BatchRouter, flush_batch, on_frame};
 use pg_sink::pgoutput::{Message, StreamCtx};
 use pg_sink::relcache::RelationCache;
 use pg_sink::replication::{ReplicationMessage, ReplicationStream};
@@ -267,7 +267,7 @@ async fn crash_between_put_and_standby_restreams_without_loss() {
         .await
         .expect("a PUT within 15s");
         tx.rollback().await.unwrap(); // the crash lost the uncommitted manifest too
-                                      // stream dropped here = the connection dies (the "crash").
+        // stream dropped here = the connection dies (the "crash").
     }
 
     // confirmed_flush never advanced (we never sent a durable standby update).

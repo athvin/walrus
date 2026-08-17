@@ -8,7 +8,7 @@
 //! exposition must contain every `common::metrics::names::SINK_*` constant.
 
 use common::metrics::names;
-use pg_sink::health::{serve_on, HealthState};
+use pg_sink::health::{HealthState, serve_on};
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};

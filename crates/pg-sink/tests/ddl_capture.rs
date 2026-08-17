@@ -15,7 +15,7 @@
 
 use common::{EpochNo, Lsn};
 use pg_sink::batch::{BatchTriggers, SystemClock};
-use pg_sink::consume::{flush_batch, on_frame, on_relation, BatchRouter};
+use pg_sink::consume::{BatchRouter, flush_batch, on_frame, on_relation};
 use pg_sink::ddl::{DdlConsumer, DdlEvent};
 use pg_sink::heartbeat::InternalTables;
 use pg_sink::pgoutput::{Message, StreamCtx};

@@ -76,8 +76,8 @@ impl CommonConfig {
     /// invalid, an environment value cannot be deserialized (including unknown fields), or the
     /// merged configuration fails [`Self::validate`].
     pub fn load() -> Result<Self> {
-        use figment::providers::{Env, Format, Toml, Yaml};
         use figment::Figment;
+        use figment::providers::{Env, Format, Toml, Yaml};
 
         let mut figment = Figment::new();
 

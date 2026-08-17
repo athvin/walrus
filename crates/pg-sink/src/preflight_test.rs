@@ -65,14 +65,17 @@ fn gap_and_signal_errors_name_their_remediation() {
         schema: "walrus".into(),
         table: "reload_signal".into(),
     };
-    assert!(gap
-        .to_string()
-        .contains("ALTER PUBLICATION walrus_pub ADD TABLE walrus.reload_signal"));
+    assert!(
+        gap.to_string()
+            .contains("ALTER PUBLICATION walrus_pub ADD TABLE walrus.reload_signal")
+    );
 
     let missing = PreflightError::ReloadSignalMissing {
         detail: "walrus.reload_signal table absent",
     };
-    assert!(missing
-        .to_string()
-        .contains("migrations/source/0003_reload_signal.sql"));
+    assert!(
+        missing
+            .to_string()
+            .contains("migrations/source/0003_reload_signal.sql")
+    );
 }

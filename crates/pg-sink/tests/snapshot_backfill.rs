@@ -13,13 +13,13 @@
 //!   cargo test -p pg-sink --test snapshot_backfill -- --ignored
 
 use common::{EpochNo, Lsn, TupleValue};
-use object_store::path::Path;
 use object_store::ObjectStore;
+use object_store::path::Path;
 use pg_sink::batch::BatchTriggers;
 use pg_sink::consume::on_frame;
 use pg_sink::pgoutput::{Message, StreamCtx};
 use pg_sink::replication::ReplicationMessage;
-use pg_sink::snapshot::{describe_source_relation, published_user_tables, Backfill, SnapshotConn};
+use pg_sink::snapshot::{Backfill, SnapshotConn, describe_source_relation, published_user_tables};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_postgres::NoTls;

@@ -15,12 +15,12 @@ use common::{
     UtcTimestamp,
 };
 use control::{connect, run_migrations};
-use object_store::aws::AmazonS3Builder;
 use object_store::ObjectStore;
+use object_store::aws::AmazonS3Builder;
 use pg_sink::batch::SealedBatch;
 use pg_sink::consume::flush_batch;
 use pg_sink::sink::ParquetSink;
-use pg_to_arrow::{oids, BatchBuilder};
+use pg_to_arrow::{BatchBuilder, oids};
 use sqlx::postgres::PgPool;
 use std::sync::Arc;
 

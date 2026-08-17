@@ -14,15 +14,15 @@
 //!   cargo test -p pg-sink --test graceful_shutdown -- --ignored
 
 use common::{EpochNo, Lsn, TupleValue};
-use object_store::path::Path;
 use object_store::ObjectStore;
+use object_store::path::Path;
 use pg_sink::batch::{BatchTriggers, SystemClock};
 use pg_sink::checkpoint::DurabilityCheckpoint;
-use pg_sink::consume::{on_frame, BatchRouter};
+use pg_sink::consume::{BatchRouter, on_frame};
 use pg_sink::pgoutput::{Message, StreamCtx};
 use pg_sink::relcache::RelationCache;
 use pg_sink::replication::{ReplicationMessage, ReplicationStream};
-use pg_sink::shutdown::{drain, DrainOutcome};
+use pg_sink::shutdown::{DrainOutcome, drain};
 use pg_sink::sink::ParquetSink;
 use pg_sink::slot::verify_or_create_slot;
 use std::sync::Arc;

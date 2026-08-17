@@ -10,7 +10,7 @@
 //! Parquet the sink actually writes. `tier_of` mirrors that dispatch's precedence branch-for-branch.
 
 use crate::range::RangeFamily;
-use crate::{geometric, oids, schema, tier3, uuid_enum, Error};
+use crate::{Error, geometric, oids, schema, tier3, uuid_enum};
 use arrow::datatypes::DataType;
 use common::{PgColumn, PgRelation, Tier, TypeDescriptor, TypeMeta};
 use std::num::NonZeroU32;

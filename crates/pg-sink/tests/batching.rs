@@ -11,7 +11,7 @@
 //!   cargo test -p pg-sink --test batching -- --ignored
 
 use pg_sink::batch::{BatchTriggers, SystemClock};
-use pg_sink::consume::{on_frame, BatchRouter};
+use pg_sink::consume::{BatchRouter, on_frame};
 use pg_sink::pgoutput::{Message, StreamCtx};
 use pg_sink::relcache::RelationCache;
 use pg_sink::replication::{ReplicationMessage, ReplicationStream};

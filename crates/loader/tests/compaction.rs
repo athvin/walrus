@@ -14,7 +14,7 @@
 use common::{Lsn, PgColumn, PgRelation, ReplicaIdentity};
 use loader::compaction::{full_rebuild, prune_raw, retention_floor};
 use loader::duck::TableDb;
-use loader::transform::{apply_transform, TransformSql};
+use loader::transform::{TransformSql, apply_transform};
 use tokio_util::sync::CancellationToken;
 
 fn orders_rel() -> PgRelation {

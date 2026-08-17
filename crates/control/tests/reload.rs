@@ -13,9 +13,9 @@
 
 use common::{EpochNo, FailureClass, Lsn, ReloadId, SchemaVersionNo};
 use control::reload::{self, ReloadFlavor, ReloadStatus};
-use control::{claim_ready, connect, insert_ready, run_migrations, ControlError, NewManifestFile};
-use sqlx::postgres::PgPool;
+use control::{ControlError, NewManifestFile, claim_ready, connect, insert_ready, run_migrations};
 use sqlx::Connection;
+use sqlx::postgres::PgPool;
 
 fn control_dsn() -> String {
     std::env::var("WALRUS_CONTROL_DB_URL").unwrap_or_else(|_| {
@@ -181,17 +181,21 @@ async fn full_status_walk_and_duplicate_request_rejected() {
 
     // The holder renews — and the lease observably extends (same frozen now(), bigger ttl);
     // a phantom does not.
-    assert!(reload::renew_lease(&mut *tx, id, "sink-a", 3600)
-        .await
-        .unwrap());
+    assert!(
+        reload::renew_lease(&mut *tx, id, "sink-a", 3600)
+            .await
+            .unwrap()
+    );
     let exp_renewed = expiry_epoch(&mut *tx, id).await;
     assert!(
         exp_renewed > exp_claim + 3000.0,
         "renew pushed lease_expiry out by the new ttl"
     );
-    assert!(!reload::renew_lease(&mut *tx, id, "sink-zombie", 60)
-        .await
-        .unwrap());
+    assert!(
+        !reload::renew_lease(&mut *tx, id, "sink-zombie", 60)
+            .await
+            .unwrap()
+    );
 
     // Chunk 1 freezes L₁ + schema_version; chunk 2's newer L₂ must NOT overwrite the frozen L₁.
     let l1: Lsn = "0/100".parse().unwrap();
@@ -362,9 +366,11 @@ async fn release_claim_returns_the_row_to_the_queue() {
         .unwrap();
 
     // A phantom can't release someone else's claim; releasing a `requested` row is a no-op too.
-    assert!(!reload::release_claim(&mut *tx, id, "sink-zombie")
-        .await
-        .unwrap());
+    assert!(
+        !reload::release_claim(&mut *tx, id, "sink-zombie")
+            .await
+            .unwrap()
+    );
 
     // The claimant releases: back to `requested`, lease cleared, immediately re-claimable — the
     // controller's un-claim path for infra failures between claim and exporter spawn (PR 6.4).

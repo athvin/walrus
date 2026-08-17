@@ -75,9 +75,11 @@ fn from_sqlx_error_classifies_23514_as_terminal_check_violation() {
     assert!(matches!(&error, ControlError::CheckViolation(_)));
     assert!(error.is_terminal());
     assert!(!error.is_transient());
-    assert!(error
-        .to_string()
-        .contains("raw watermark passed transformed watermark"));
+    assert!(
+        error
+            .to_string()
+            .contains("raw watermark passed transformed watermark")
+    );
 }
 
 #[test]

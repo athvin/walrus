@@ -17,7 +17,7 @@
 
 use common::{ReplicaIdentity, TupleValue};
 use pg_sink::pgoutput::{
-    parse_message, parse_stream, parse_tuple, DecodeError, Message, OldTupleKind, Reader, StreamCtx,
+    DecodeError, Message, OldTupleKind, Reader, StreamCtx, parse_message, parse_stream, parse_tuple,
 };
 use std::fmt::Write as _;
 
@@ -42,8 +42,7 @@ pub const VECTORS: &[Vector] = &[
         name: "begin",
         hex: "42000000000199bac80002f8dc466a6b4f000002ed",
         streaming: false,
-        expected:
-            "BEGIN         final_lsn=0/199BAC8 commit_ts=2026-07-05T13:55:11.294287+00:00 xid=749",
+        expected: "BEGIN         final_lsn=0/199BAC8 commit_ts=2026-07-05T13:55:11.294287+00:00 xid=749",
     },
     Vector {
         name: "type_enum",

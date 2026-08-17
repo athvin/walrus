@@ -16,8 +16,8 @@ use loader::bootstrap::bootstrap;
 use loader::config::LoaderConfig;
 use loader::error::LoaderError;
 use loader::health::LoaderState;
-use object_store::aws::AmazonS3Builder;
 use object_store::ObjectStore;
+use object_store::aws::AmazonS3Builder;
 use std::sync::Arc;
 use std::time::Duration;
 

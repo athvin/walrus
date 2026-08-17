@@ -17,9 +17,9 @@
 //! Run: `cargo bench -p loader --bench transform` (or `just bench`). The 1M grid takes minutes.
 
 use common::{Lsn, PgColumn, PgRelation, ReplicaIdentity};
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use duckdb::Connection;
-use loader::transform::{apply_transform, TransformSql};
+use loader::transform::{TransformSql, apply_transform};
 use std::hint::black_box;
 
 fn col(name: &str, oid: u32, is_key: bool) -> PgColumn {

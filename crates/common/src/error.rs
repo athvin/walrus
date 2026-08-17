@@ -196,8 +196,7 @@ impl From<ExitCode> for std::process::ExitCode {
                 "ExitCode::KeylessTable must stay in 0..125 or the process status contract breaks"
             );
             assert!(
-                (ExitCode::LeaseContended as i32) >= 0
-                    && (ExitCode::LeaseContended as i32) < 125,
+                (ExitCode::LeaseContended as i32) >= 0 && (ExitCode::LeaseContended as i32) < 125,
                 "ExitCode::LeaseContended must stay in 0..125 or the process status contract breaks"
             );
             assert!(

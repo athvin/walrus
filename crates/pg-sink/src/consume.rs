@@ -12,14 +12,14 @@ use crate::batch::{BatchTriggers, Clock, SealedBatch, TableBatcher};
 use crate::health::HealthState;
 use crate::heartbeat::{Heartbeat, InternalTables};
 use crate::pgoutput::{self, Message, Reader, StreamCtx};
-use crate::relcache::{is_internal_table, RelationCache};
+use crate::relcache::{RelationCache, is_internal_table};
 use crate::replication::{ReplicationMessage, ReplicationStream};
 use anyhow::Context;
 use common::{EpochNo, Kind, Lsn, Op, SinkMeta, TupleValue, UtcTimestamp};
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
-use tokio::time::{sleep, Instant};
+use tokio::time::{Instant, sleep};
 use tokio_util::sync::CancellationToken;
 
 /// A missing required field at decode-loop build time.

@@ -12,11 +12,11 @@
 //!   cargo test -p loader --test ddl_destructive -- --ignored # + compose (quarantine)
 
 use common::{EpochNo, PgColumn, PgRelation, ReplicaIdentity};
-use loader::ddl::{apply_destructive, retire_file, DestructiveChange};
+use loader::ddl::{DestructiveChange, apply_destructive, retire_file};
 use loader::duck::{S3Access, TableDb};
 use loader::error::LoaderError;
 use loader::health::LoaderState;
-use loader::phase_a::{run_phase_a, TableCtx};
+use loader::phase_a::{TableCtx, run_phase_a};
 use loader::phase_b::run_phase_b;
 use std::sync::Arc;
 use std::time::Duration;
@@ -121,9 +121,11 @@ fn drop_column_physical_on_mirror_retained_nullable_on_raw() {
         .unwrap();
     assert_eq!(x, None, "post-drop file NULL-fills the retained raw column");
     // The user view refreshed — no dropped column.
-    assert!(!columns_of(db.conn(), "orders_current")
-        .iter()
-        .any(|c| c == "x"));
+    assert!(
+        !columns_of(db.conn(), "orders_current")
+            .iter()
+            .any(|c| c == "x")
+    );
 }
 
 // ---- Lossy ALTER TYPE: raw widens to VARCHAR (history preserved), never re-cast. ----
@@ -231,7 +233,8 @@ fn s3() -> S3Access {
 fn meta(commit_hex: &str, l: u64) -> String {
     format!(
         "{{\"op\":\"i\",\"commit_lsn\":\"{commit_hex}\",\"lsn\":\"{:016X}\",\"sink_processed_at\":\"2026-07-07T12:00:{:02}Z\"}}",
-        l, l % 60
+        l,
+        l % 60
     )
 }
 

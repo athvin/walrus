@@ -21,13 +21,13 @@
 
 use bytes::Bytes;
 use common::{EpochNo, Lsn, ReloadId, SchemaVersionNo};
-use object_store::path::Path;
 use object_store::ObjectStore;
+use object_store::path::Path;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use pg_sink::consume::on_frame;
 use pg_sink::heartbeat::InternalTables;
 use pg_sink::pgoutput::{Message, StreamCtx};
-use pg_sink::reload::{handle_ddl_restart, RestartDecision};
+use pg_sink::reload::{RestartDecision, handle_ddl_restart};
 use pg_sink::reload_export::{ChunkExportConfig, ChunkExporter, RunOutcome};
 use pg_sink::reload_signal::{PendingSignal, PendingSignals, WatermarkWaiters};
 use pg_sink::replication::ReplicationStream;

@@ -379,7 +379,7 @@ impl<'a> SourcePreflight<'a> {
                             return Err(PreflightError::NoPrimaryKey {
                                 schema: id.schema,
                                 table: id.table,
-                            })
+                            });
                         }
                         PkMode::Lenient => {
                             tracing::warn!(

@@ -16,9 +16,9 @@ use common::{
     EpochNo, Kind, Lsn, Op, PgColumn, PgRelation, ReplicaIdentity, SinkMeta, TupleValue,
     UtcTimestamp,
 };
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use loader::duck::TableDb;
-use pg_to_arrow::{write_parquet_bytes, BatchBuilder};
+use pg_to_arrow::{BatchBuilder, write_parquet_bytes};
 use std::hint::black_box;
 use std::io::Write;
 

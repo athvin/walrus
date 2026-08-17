@@ -172,9 +172,11 @@ fn timestamps_always_render_with_z_suffix() {
     assert!(v["sink_processed_at"].as_str().unwrap().ends_with('Z'));
 
     // `now()` also renders with a Z suffix.
-    assert!(serde_json::to_string(&UtcTimestamp::now())
-        .unwrap()
-        .ends_with("Z\""));
+    assert!(
+        serde_json::to_string(&UtcTimestamp::now())
+            .unwrap()
+            .ends_with("Z\"")
+    );
 }
 
 #[test]

@@ -12,9 +12,10 @@ fn workspace_is_edition_2024_for_if_let_chains() {
 
 #[test]
 fn the_four_audited_nests_are_chains() {
-    assert!(CONTROL_DB.contains(
-        "if let sqlx::Error::Database(db) = &e\n            && db.code().as_deref()"
-    ));
+    assert!(
+        CONTROL_DB
+            .contains("if let sqlx::Error::Database(db) = &e\n            && db.code().as_deref()")
+    );
     assert!(SINK_CONSUME.contains(
         "if let Some(mut batcher) = self.batchers.remove(&oid)\n            && let Some(batch)"
     ));
@@ -22,9 +23,7 @@ fn the_four_audited_nests_are_chains() {
         "if let DataType::List(item) = field.data_type()\n        && let DataType::Struct(fs)"
     ));
     assert!(ARROW_BATCH.contains("&& let Some(bound) = fs.first()"));
-    assert!(
-        ARROW_BATCH.contains("if let Some(t) = n.find('T')\n        && let Some(sign)")
-    );
+    assert!(ARROW_BATCH.contains("if let Some(t) = n.find('T')\n        && let Some(sign)"));
 
     let audited = [CONTROL_DB, SINK_CONSUME, ARROW_BATCH].concat();
     assert!(audited.matches("&& let ").count() >= 4);

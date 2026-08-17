@@ -140,8 +140,10 @@ fn spill_override_stamps_lsn_end_but_verbatim_otherwise() {
 
 #[test]
 fn parquet_column_cache_hit_then_mutation_capable_miss() {
-    assert!(include_str!("duck.rs")
-        .contains("let cached = { self.parquet_cols.borrow().get(&schema_version).cloned() };"));
+    assert!(
+        include_str!("duck.rs")
+            .contains("let cached = { self.parquet_cols.borrow().get(&schema_version).cloned() };")
+    );
 
     let dir = tempfile::tempdir().unwrap();
     let db = TableDb::open(dir.path().join("cache.duckdb")).unwrap();
