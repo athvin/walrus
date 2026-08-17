@@ -220,6 +220,7 @@ impl Message {
     pub fn is_whole_txn_abort(&self) -> Option<bool> {
         match self {
             Message::StreamAbort { top_xid, sub_xid } => Some(top_xid == sub_xid),
+            // Wildcard is deliberate: Message is #[non_exhaustive], and this helper ignores other families.
             _ => None,
         }
     }

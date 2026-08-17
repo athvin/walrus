@@ -322,7 +322,9 @@ async fn kill_mid_export_resumes_from_cursor_and_completes() {
     .unwrap();
     let h = match resumed.run().await.unwrap() {
         RunOutcome::Drained { final_lsn } => final_lsn,
-        other => panic!("expected drain, got {other:?}"),
+        RunOutcome::SchemaChanged { new_version } => {
+            panic!("expected drain, got SchemaChanged(new_version = {new_version})")
+        }
     };
 
     // The sink's last act: export_complete(H). No chunk at/before the cursor was re-exported.
@@ -404,7 +406,9 @@ async fn complete_waits_for_transformed_lsn_to_reach_h() {
     .unwrap();
     let h = match exporter.run().await.unwrap() {
         RunOutcome::Drained { final_lsn } => final_lsn,
-        other => panic!("expected drain, got {other:?}"),
+        RunOutcome::SchemaChanged { new_version } => {
+            panic!("expected drain, got SchemaChanged(new_version = {new_version})")
+        }
     };
     control::reload::complete_export(&pool, reload_id, h)
         .await

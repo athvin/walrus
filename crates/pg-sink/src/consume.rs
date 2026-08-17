@@ -802,6 +802,7 @@ impl<C: Clock + Clone> BatchRouter<C> {
                 commit_ts,
                 ..
             } => self.commit(*commit_lsn, UtcTimestamp::from_pg_micros(*commit_ts)?),
+            // Wildcard is deliberate: Message is #[non_exhaustive], and this dispatcher ignores other families.
             _ => Ok(Vec::new()),
         }
     }

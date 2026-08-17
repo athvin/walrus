@@ -452,14 +452,13 @@ fn append_interval(
             column: col.to_string(),
         });
     };
-    let parts = match value {
-        TupleValue::Null | TupleValue::UnchangedToast => None,
-        _ => Some(crate::tier2::parse_interval(text(
-            value,
-            col,
-            &DataType::Int64,
-        )?)?),
-    };
+    let parts =
+        match value {
+            TupleValue::Null | TupleValue::UnchangedToast => None,
+            TupleValue::Text(_) | TupleValue::Binary(_) => Some(crate::tier2::parse_interval(
+                text(value, col, &DataType::Int64)?,
+            )?),
+        };
     let months = downcast!(months_builder.as_mut(), Int32Builder, col);
     match parts {
         Some((m, _, _)) => months.append_value(m),
@@ -492,7 +491,7 @@ fn append_timetz(
     };
     let parts = match value {
         TupleValue::Null | TupleValue::UnchangedToast => None,
-        _ => Some(crate::tier2::parse_timetz(text(
+        TupleValue::Text(_) | TupleValue::Binary(_) => Some(crate::tier2::parse_timetz(text(
             value,
             col,
             &DataType::Int64,
@@ -739,7 +738,7 @@ fn append_geometric(
     let col = field.name();
     let s = match value {
         TupleValue::Null | TupleValue::UnchangedToast => None,
-        _ => Some(text(value, col, field.data_type())?),
+        TupleValue::Text(_) | TupleValue::Binary(_) => Some(text(value, col, field.data_type())?),
     };
     match kind {
         GeoKind::Point => {

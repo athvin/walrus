@@ -131,7 +131,7 @@ fn meta_of(col: &PgColumn, enum_labels: Option<Vec<String>>) -> TypeMeta {
 fn arrow_of(col: &PgColumn, tier: Tier) -> Result<String, Error> {
     Ok(match tier {
         Tier::Two => "Struct/Decomposed".to_string(),
-        _ => first_field_type(col)?
+        Tier::One | Tier::Three => first_field_type(col)?
             .map(|dt| format!("{dt:?}"))
             .unwrap_or_else(|| "Utf8".to_string()),
     })
@@ -152,7 +152,7 @@ fn duckdb_of(col: &PgColumn, tier: Tier) -> Result<String, Error> {
             }
             _ => "STRUCT".to_string(), // geometric
         },
-        _ => first_field_type(col)?
+        Tier::One | Tier::Three => first_field_type(col)?
             .map(|dt| duckdb_scalar_name(&dt).to_string())
             .unwrap_or_else(|| "VARCHAR".to_string()),
     })

@@ -189,6 +189,7 @@ impl<C: Clock + Clone> StreamDemux<C> {
                 xid,
                 ..
             } => (*relation_oid, Op::Delete, old.clone(), xid.unwrap_or(top)),
+            // Wildcard is deliberate: Message is #[non_exhaustive], and this dispatcher ignores other families.
             _ => return Ok(()),
         };
         let bytes = estimate_change_bytes(&values);
