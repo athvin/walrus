@@ -34,6 +34,14 @@ string_enum! {
     }
 }
 
+impl Copy for Bare {}
+
+impl Clone for Bare {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
 #[test]
 fn round_trips_every_variant_both_directions() {
     for (v, s) in [
