@@ -22,7 +22,8 @@ string_enum! {
     /// loader treats the file's `lsn_end` — not the per-row placeholder — as the authoritative
     /// `commit_lsn` for its rows. `Reload` chunk files (PR 6.1+) enter the same `(lsn_end, id)` claim
     /// order carrying a `reload_id`; `Snapshot`/`Stream` rows never set it.
-    ManifestKind {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ManifestKind {
         error = ParseEnumError;
         column = "file_manifest.kind";
         Snapshot => "snapshot",
@@ -36,7 +37,8 @@ string_enum! {
     /// The lifecycle state of a `file_manifest` row: `Ready` to claim, or dead-lettered `Failed` (a
     /// poison file that can't block the queue — see [`mark_failed`]). Applied rows are DELETED, never
     /// kept (see [`delete_claimed`]), so those are the only two persisted states.
-    ManifestStatus {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ManifestStatus {
         error = ParseEnumError;
         column = "file_manifest.status";
         Ready => "ready",

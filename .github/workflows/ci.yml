@@ -128,6 +128,12 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --check
 
+      # Fragment-specifier guard (PR 24.3). The checker recognizes `$name:tt` captures after
+      # ignoring comments/string contents; bare prose `:tt` is not a finding. PR 24.6's deliberate
+      # compile_error! fallback is the only intended user of same-line `tt-fallback-ok`.
+      - name: guard — macro fragment specifiers (no untyped `:tt` capture)
+        run: bash scripts/check-macro-fragment-specifiers.sh --check
+
       - name: cargo clippy --all-targets --all-features -- -D warnings
         run: cargo clippy --all-targets --all-features -- -D warnings
 

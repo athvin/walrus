@@ -17,80 +17,37 @@
 //! rule here.
 
 use crate::{ControlError, parse::ParseEnumError};
+use common::string_enum;
 use common::{EpochNo, Lsn, ReloadId, SchemaVersionNo};
 use sqlx::{Connection, PgConnection, PgExecutor};
 
-/// `reload` rebuilds (clear + re-export — the quarantine-recovery flavor); `resync` merges chunks
-/// over the *live* mirror and tolerates phantoms (reload H3). Both flavors share every state and
-/// every transition in this module.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
-#[sqlx(rename_all = "lowercase")]
-pub enum ReloadFlavor {
-    Reload,
-    Resync,
-}
-
-impl ReloadFlavor {
-    /// The exact string the migration's CHECK constraint admits (second line of defense).
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            ReloadFlavor::Reload => "reload",
-            ReloadFlavor::Resync => "resync",
-        }
+string_enum! {
+    /// `reload` rebuilds (clear + re-export — the quarantine-recovery flavor); `resync` merges chunks
+    /// over the *live* mirror and tolerates phantoms (reload H3). Both flavors share every state and
+    /// every transition in this module.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+    #[sqlx(rename_all = "lowercase")]
+    pub enum ReloadFlavor {
+        error = ParseEnumError;
+        column = "table_reload.flavor";
+        Reload => "reload",
+        Resync => "resync",
     }
 }
 
-impl std::str::FromStr for ReloadFlavor {
-    type Err = ParseEnumError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "reload" => Ok(ReloadFlavor::Reload),
-            "resync" => Ok(ReloadFlavor::Resync),
-            other => Err(ParseEnumError::new("table_reload.flavor", other)),
-        }
-    }
-}
-
-/// `requested → exporting → export_complete → complete`; `failed` terminal from the middle. The
-/// SQL CHECK carries the same five values — belt and braces, like `loader_checkpoint`'s CHECK.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
-#[sqlx(rename_all = "snake_case")]
-pub enum ReloadStatus {
-    Requested,
-    Exporting,
-    ExportComplete,
-    Complete,
-    Failed,
-}
-
-impl ReloadStatus {
-    /// The exact string the migration's CHECK constraint admits.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            ReloadStatus::Requested => "requested",
-            ReloadStatus::Exporting => "exporting",
-            ReloadStatus::ExportComplete => "export_complete",
-            ReloadStatus::Complete => "complete",
-            ReloadStatus::Failed => "failed",
-        }
-    }
-}
-
-impl std::str::FromStr for ReloadStatus {
-    type Err = ParseEnumError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "requested" => Ok(ReloadStatus::Requested),
-            "exporting" => Ok(ReloadStatus::Exporting),
-            "export_complete" => Ok(ReloadStatus::ExportComplete),
-            "complete" => Ok(ReloadStatus::Complete),
-            "failed" => Ok(ReloadStatus::Failed),
-            other => Err(ParseEnumError::new("table_reload.status", other)),
-        }
+string_enum! {
+    /// `requested → exporting → export_complete → complete`; `failed` terminal from the middle. The
+    /// SQL CHECK carries the same five values — belt and braces, like `loader_checkpoint`'s CHECK.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+    #[sqlx(rename_all = "snake_case")]
+    pub enum ReloadStatus {
+        error = ParseEnumError;
+        column = "table_reload.status";
+        Requested => "requested",
+        Exporting => "exporting",
+        ExportComplete => "export_complete",
+        Complete => "complete",
+        Failed => "failed",
     }
 }
 

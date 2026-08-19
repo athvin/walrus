@@ -1,4 +1,4 @@
-//! `string_enum!`: one variant table -> a `Copy` enum plus its two-way `&'static str` mapping.
+//! `string_enum!`: one variant table -> an enum plus its two-way `&'static str` mapping.
 //!
 //! walrus stores several closed sets as plain Postgres `text` (`file_manifest.kind`/`.status`,
 //! `table_reload.flavor`/`.status`). Each needs the same pair of impls, and hand-writing them means
@@ -10,7 +10,8 @@
 /// ```ignore
 /// string_enum! {
 ///     /// Doc comments are captured and re-emitted onto the generated enum.
-///     ManifestKind {
+///     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///     pub enum ManifestKind {
 ///         error = ParseEnumError;
 ///         column = "file_manifest.kind";
 ///         Snapshot => "snapshot",
@@ -21,27 +22,28 @@
 #[macro_export]
 macro_rules! string_enum {
     (
-        // `///` reaches a matcher already desugared to `#[doc = "…"]`, so a `:literal` capture
-        // is enough here; PR 24.3 widens this to `$(#[$attr:meta])*`.
-        $(#[doc = $doc:literal])*
-        $name:ident {
-            // The caller owns the error taxonomy. `:path` accepts `ParseEnumError` or a qualified
-            // equivalent; `:literal` pins the exact persisted DB column as structured context.
+        // `:meta` captures complete attribute bodies, including desugared `///` docs and caller
+        // derives. Re-emitting them as caller tokens lets `sqlx::Type` resolve in `control`.
+        $(#[$attr:meta])*
+        // `:vis` alone may match nothing; one arm covers public, restricted, and private enums.
+        $vis:vis enum $name:ident {
+            // `:path` preserves the caller's typed error. The column and persisted values use
+            // `:literal`, not `:expr`, so expressions and macros are rejected at the call site.
             error = $error:path;
             column = $column:literal;
+            // `:ident` precisely names enum variants; `$(,)?` accepts one trailing comma.
             $($variant:ident => $text:literal),* $(,)?
         }
     ) => {
-        $(#[doc = $doc])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        pub enum $name {
+        $(#[$attr])*
+        $vis enum $name {
             $($variant,)*
         }
 
         impl $name {
             /// The exact string persisted in the control DB.
             #[must_use]
-            pub const fn as_str(self) -> &'static str {
+            $vis const fn as_str(self) -> &'static str {
                 match self {
                     $($name::$variant => $text,)*
                 }
