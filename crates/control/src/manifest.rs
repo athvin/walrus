@@ -9,80 +9,38 @@
 //! is a `DELETE`, not a status flip — the queue's frontier advances by removal.
 
 use crate::{ControlError, parse::ParseEnumError};
+use common::string_enum;
 use common::{EpochNo, Lsn, ManifestId, ReloadId, SchemaVersionNo};
 use sqlx::PgExecutor;
 
-/// The kind of a `file_manifest` row — the canonical enum for the `kind` text column, shared by the
-/// sink (which writes it; pg-sink re-exports this as `FileKind`) and the loader (which routes on it).
-///
-/// `Spill` is a *single* streamed transaction written before its commit LSN was known (PR 4.3); the
-/// loader treats the file's `lsn_end` — not the per-row placeholder — as the authoritative
-/// `commit_lsn` for its rows. `Reload` chunk files (PR 6.1+) enter the same `(lsn_end, id)` claim
-/// order carrying a `reload_id`; `Snapshot`/`Stream` rows never set it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ManifestKind {
-    Snapshot,
-    Stream,
-    Spill,
-    Reload,
-}
-
-impl ManifestKind {
-    /// The exact `file_manifest.kind` string persisted in the control DB.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            ManifestKind::Snapshot => "snapshot",
-            ManifestKind::Stream => "stream",
-            ManifestKind::Spill => "spill",
-            ManifestKind::Reload => "reload",
-        }
+// Each table below is the exact persisted string contract for its `file_manifest` text column.
+string_enum! {
+    /// The kind of a `file_manifest` row — the canonical enum for the `kind` text column, shared by the
+    /// sink (which writes it; pg-sink re-exports this as `FileKind`) and the loader (which routes on it).
+    ///
+    /// `Spill` is a *single* streamed transaction written before its commit LSN was known (PR 4.3); the
+    /// loader treats the file's `lsn_end` — not the per-row placeholder — as the authoritative
+    /// `commit_lsn` for its rows. `Reload` chunk files (PR 6.1+) enter the same `(lsn_end, id)` claim
+    /// order carrying a `reload_id`; `Snapshot`/`Stream` rows never set it.
+    ManifestKind {
+        error = ParseEnumError;
+        column = "file_manifest.kind";
+        Snapshot => "snapshot",
+        Stream => "stream",
+        Spill => "spill",
+        Reload => "reload",
     }
 }
 
-impl std::str::FromStr for ManifestKind {
-    type Err = ParseEnumError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "snapshot" => Ok(ManifestKind::Snapshot),
-            "stream" => Ok(ManifestKind::Stream),
-            "spill" => Ok(ManifestKind::Spill),
-            "reload" => Ok(ManifestKind::Reload),
-            other => Err(ParseEnumError::new("file_manifest.kind", other)),
-        }
-    }
-}
-
-/// The lifecycle state of a `file_manifest` row: `Ready` to claim, or dead-lettered `Failed` (a
-/// poison file that can't block the queue — see [`mark_failed`]). Applied rows are DELETED, never
-/// kept (see [`delete_claimed`]), so those are the only two persisted states.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ManifestStatus {
-    Ready,
-    Failed,
-}
-
-impl ManifestStatus {
-    /// The exact `file_manifest.status` string persisted in the control DB.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            ManifestStatus::Ready => "ready",
-            ManifestStatus::Failed => "failed",
-        }
-    }
-}
-
-impl std::str::FromStr for ManifestStatus {
-    type Err = ParseEnumError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "ready" => Ok(ManifestStatus::Ready),
-            "failed" => Ok(ManifestStatus::Failed),
-            other => Err(ParseEnumError::new("file_manifest.status", other)),
-        }
+string_enum! {
+    /// The lifecycle state of a `file_manifest` row: `Ready` to claim, or dead-lettered `Failed` (a
+    /// poison file that can't block the queue — see [`mark_failed`]). Applied rows are DELETED, never
+    /// kept (see [`delete_claimed`]), so those are the only two persisted states.
+    ManifestStatus {
+        error = ParseEnumError;
+        column = "file_manifest.status";
+        Ready => "ready",
+        Failed => "failed",
     }
 }
 

@@ -1,7 +1,5 @@
-use super::*;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct TestParseError {
+pub struct TestParseError {
     column: &'static str,
     input: String,
 }

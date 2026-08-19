@@ -23,7 +23,7 @@ pub mod sql;
 pub mod telemetry;
 pub mod type_descriptor;
 
-// `string_enum!` is published from the crate root by `#[macro_export]`, so this module stays
+// `string_enum!` is published from the crate root by its export attribute, so this module stays
 // private: `use common::string_enum;` resolves the macro, not the module.
 mod string_enum;
 
