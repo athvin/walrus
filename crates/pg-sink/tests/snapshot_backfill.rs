@@ -203,10 +203,10 @@ async fn backfill_preloaded_rows_then_streams_post_consistent_point() {
             if let Some(Message::Insert {
                 relation_oid, new, ..
             }) = on_frame(&mut ctx, frame).unwrap()
+                && orders_oid == Some(relation_oid)
+                && orders_id(&new) == Some(990002)
             {
-                if orders_oid == Some(relation_oid) && orders_id(&new) == Some(990002) {
-                    return true;
-                }
+                return true;
             }
         }
     })

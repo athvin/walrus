@@ -271,10 +271,10 @@ async fn sigterm_mid_stream_drains_commits_and_resumes() {
             if let Some(Message::Insert {
                 relation_oid, new, ..
             }) = on_frame(&mut ctx2, frame).unwrap()
+                && orders_oid == Some(relation_oid)
+                && orders_id(&new) == Some(980002)
             {
-                if orders_oid == Some(relation_oid) && orders_id(&new) == Some(980002) {
-                    return true;
-                }
+                return true;
             }
         }
     })

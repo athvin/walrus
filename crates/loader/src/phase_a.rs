@@ -199,8 +199,8 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
             );
             continue;
         }
-        if f.schema_version > ctx.db.schema_version()? {
-            if let Err(e) = crate::ddl::reconcile_to_version(
+        if f.schema_version > ctx.db.schema_version()?
+            && let Err(e) = crate::ddl::reconcile_to_version(
                 &ctx.db,
                 &ctx.pool,
                 ctx.epoch,
@@ -209,19 +209,18 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
                 f.schema_version,
             )
             .await
-            {
-                // A lossy DDL cast that fails is a QUARANTINE (PR 3.9): latch the state so `/ready`
-                // degrades, fire a loud error-level alert, and stop — never a silent continue.
-                if matches!(e, LoaderError::Quarantine { .. }) {
-                    ctx.state.quarantine();
-                    tracing::error!(
-                        table = %format_args!("{}.{}", ctx.schema, ctx.table),
-                        error = %e,
-                        "QUARANTINE: lossy schema change could not be applied — /ready degraded, processing stopped"
-                    );
-                }
-                return Err(e);
+        {
+            // A lossy DDL cast that fails is a QUARANTINE (PR 3.9): latch the state so `/ready`
+            // degrades, fire a loud error-level alert, and stop — never a silent continue.
+            if matches!(e, LoaderError::Quarantine { .. }) {
+                ctx.state.quarantine();
+                tracing::error!(
+                    table = %format_args!("{}.{}", ctx.schema, ctx.table),
+                    error = %e,
+                    "QUARANTINE: lossy schema change could not be applied — /ready degraded, processing stopped"
+                );
             }
+            return Err(e);
         }
         // A `spill` file is one streamed txn written before its commit LSN was known, so its per-row
         // `commit_lsn` is a placeholder; `lsn_end` (corrected on `Stream Commit`) is the real commit LSN

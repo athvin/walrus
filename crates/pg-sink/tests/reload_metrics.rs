@@ -234,12 +234,11 @@ fn metric_sum(name: &str) -> f64 {
         if line.starts_with('#') {
             continue;
         }
-        if let Some(rest) = line.strip_prefix(name) {
-            if rest.starts_with(' ') || rest.starts_with('{') {
-                if let Some(v) = rest.split_whitespace().last() {
-                    total += v.parse::<f64>().unwrap_or(0.0);
-                }
-            }
+        if let Some(rest) = line.strip_prefix(name)
+            && (rest.starts_with(' ') || rest.starts_with('{'))
+            && let Some(v) = rest.split_whitespace().last()
+        {
+            total += v.parse::<f64>().unwrap_or(0.0);
         }
     }
     total

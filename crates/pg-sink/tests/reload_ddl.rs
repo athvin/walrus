@@ -334,10 +334,10 @@ fn counter_value(name: &str) -> f64 {
         }
         if let Some(rest) = line.strip_prefix(name) {
             // The metric name must end exactly here — the next char is a space (no labels) or `{`.
-            if rest.starts_with(' ') || rest.starts_with('{') {
-                if let Some(v) = rest.split_whitespace().last() {
-                    total += v.parse::<f64>().unwrap_or(0.0);
-                }
+            if (rest.starts_with(' ') || rest.starts_with('{'))
+                && let Some(v) = rest.split_whitespace().last()
+            {
+                total += v.parse::<f64>().unwrap_or(0.0);
             }
         }
     }

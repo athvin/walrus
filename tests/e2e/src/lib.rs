@@ -271,13 +271,12 @@ impl Harness {
             .await?;
             let cp =
                 control::read_checkpoint(&self.control, self.epoch.into(), "public", table).await?;
-            if let Some(cp) = cp {
-                if pending == 0
-                    && cp.transformed_lsn > target
-                    && cp.transformed_lsn == cp.raw_appended_lsn
-                {
-                    return Ok(());
-                }
+            if let Some(cp) = cp
+                && pending == 0
+                && cp.transformed_lsn > target
+                && cp.transformed_lsn == cp.raw_appended_lsn
+            {
+                return Ok(());
             }
             if start.elapsed() > deadline {
                 anyhow::bail!(
@@ -389,10 +388,9 @@ impl Harness {
         loop {
             if let Some(cp) =
                 control::read_checkpoint(&self.control, self.epoch.into(), "public", table).await?
+                && cp.raw_appended_lsn > target
             {
-                if cp.raw_appended_lsn > target {
-                    return Ok(());
-                }
+                return Ok(());
             }
             if start.elapsed() > deadline {
                 anyhow::bail!(
