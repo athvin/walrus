@@ -324,17 +324,6 @@ fn struct_child_builders(
     fields.iter().map(|f| column_builder(f)).collect()
 }
 
-macro_rules! downcast {
-    ($builder:expr_2021, $ty:ty, $col:expr_2021) => {
-        $builder
-            .as_any_mut()
-            .downcast_mut::<$ty>()
-            .ok_or_else(|| Error::Downcast {
-                column: $col.to_string(),
-            })?
-    };
-}
-
 /// Append one `TupleValue` to one typed builder. `Null`/`UnchangedToast` → `append_null`.
 fn append_value(
     builder: &mut dyn ArrayBuilder,
@@ -350,7 +339,7 @@ fn append_value(
 
     match dt {
         DataType::Boolean => {
-            let b = downcast!(builder, BooleanBuilder, col);
+            let b = downcast::<BooleanBuilder>(builder, col)?;
             if is_null {
                 b.append_null();
             } else {
@@ -363,7 +352,7 @@ fn append_value(
         DataType::Float32 => append_num::<Float32Builder>(builder, value, col, dt, is_null)?,
         DataType::Float64 => append_num::<Float64Builder>(builder, value, col, dt, is_null)?,
         DataType::Decimal128(_, scale) => {
-            let b = downcast!(builder, Decimal128Builder, col);
+            let b = downcast::<Decimal128Builder>(builder, col)?;
             if is_null {
                 b.append_null();
             } else {
@@ -371,7 +360,7 @@ fn append_value(
             }
         }
         DataType::Utf8 => {
-            let b = downcast!(builder, StringBuilder, col);
+            let b = downcast::<StringBuilder>(builder, col)?;
             if is_null {
                 b.append_null();
             } else {
@@ -379,7 +368,7 @@ fn append_value(
             }
         }
         DataType::Binary => {
-            let b = downcast!(builder, BinaryBuilder, col);
+            let b = downcast::<BinaryBuilder>(builder, col)?;
             match value {
                 TupleValue::Null | TupleValue::UnchangedToast => b.append_null(),
                 TupleValue::Binary(bytes) => b.append_value(bytes),
@@ -388,7 +377,7 @@ fn append_value(
             }
         }
         DataType::Date32 => {
-            let b = downcast!(builder, Date32Builder, col);
+            let b = downcast::<Date32Builder>(builder, col)?;
             if is_null {
                 b.append_null();
             } else {
@@ -396,7 +385,7 @@ fn append_value(
             }
         }
         DataType::Time64(TimeUnit::Microsecond) => {
-            let b = downcast!(builder, Time64MicrosecondBuilder, col);
+            let b = downcast::<Time64MicrosecondBuilder>(builder, col)?;
             if is_null {
                 b.append_null();
             } else {
@@ -404,7 +393,7 @@ fn append_value(
             }
         }
         DataType::Timestamp(TimeUnit::Microsecond, tz) => {
-            let b = downcast!(builder, TimestampMicrosecondBuilder, col);
+            let b = downcast::<TimestampMicrosecondBuilder>(builder, col)?;
             if is_null {
                 b.append_null();
             } else {
@@ -419,7 +408,7 @@ fn append_value(
         }
         // uuid: parse canonical text → 16 bytes, append as fixed-width binary (PR 2.16).
         DataType::FixedSizeBinary(_) => {
-            let b = downcast!(builder, FixedSizeBinaryBuilder, col);
+            let b = downcast::<FixedSizeBinaryBuilder>(builder, col)?;
             if is_null {
                 b.append_null();
             } else {
@@ -459,17 +448,17 @@ fn append_interval(
                 text(value, col, &DataType::Int64)?,
             )?),
         };
-    let months = downcast!(months_builder.as_mut(), Int32Builder, col);
+    let months = downcast::<Int32Builder>(months_builder.as_mut(), col)?;
     match parts {
         Some((m, _, _)) => months.append_value(m),
         None => months.append_null(),
     }
-    let days = downcast!(days_builder.as_mut(), Int32Builder, col);
+    let days = downcast::<Int32Builder>(days_builder.as_mut(), col)?;
     match parts {
         Some((_, d, _)) => days.append_value(d),
         None => days.append_null(),
     }
-    let micros = downcast!(micros_builder.as_mut(), Int64Builder, col);
+    let micros = downcast::<Int64Builder>(micros_builder.as_mut(), col)?;
     match parts {
         Some((_, _, us)) => micros.append_value(us),
         None => micros.append_null(),
@@ -497,12 +486,12 @@ fn append_timetz(
             &DataType::Int64,
         )?)?),
     };
-    let micros = downcast!(micros_builder.as_mut(), Int64Builder, col);
+    let micros = downcast::<Int64Builder>(micros_builder.as_mut(), col)?;
     match parts {
         Some((us, _)) => micros.append_value(us),
         None => micros.append_null(),
     }
-    let offset = downcast!(offset_builder.as_mut(), Int32Builder, col);
+    let offset = downcast::<Int32Builder>(offset_builder.as_mut(), col)?;
     match parts {
         Some((_, off)) => offset.append_value(off),
         None => offset.append_null(),
@@ -552,7 +541,7 @@ fn append_range(
             scratch,
         )?;
         for builder in [lower_inc_builder, upper_inc_builder, empty_builder] {
-            bool_builder(builder.as_mut(), col)?.append_null();
+            downcast::<BooleanBuilder>(builder.as_mut(), col)?.append_null();
         }
         return Ok(());
     }
@@ -570,9 +559,9 @@ fn append_range(
         &opt_text_value(r.upper.as_deref()),
         scratch,
     )?;
-    bool_builder(lower_inc_builder.as_mut(), col)?.append_value(r.lower_inc);
-    bool_builder(upper_inc_builder.as_mut(), col)?.append_value(r.upper_inc);
-    bool_builder(empty_builder.as_mut(), col)?.append_value(r.empty);
+    downcast::<BooleanBuilder>(lower_inc_builder.as_mut(), col)?.append_value(r.lower_inc);
+    downcast::<BooleanBuilder>(upper_inc_builder.as_mut(), col)?.append_value(r.upper_inc);
+    downcast::<BooleanBuilder>(empty_builder.as_mut(), col)?.append_value(r.empty);
     Ok(())
 }
 
@@ -586,7 +575,7 @@ fn append_multirange(
     scratch: &mut String,
 ) -> Result<(), Error> {
     let col = field.name();
-    let lb = downcast!(builder, ListBuilder<StructBuilder>, col);
+    let lb = downcast::<ListBuilder<StructBuilder>>(builder, col)?;
     if matches!(value, TupleValue::Null | TupleValue::UnchangedToast) {
         lb.append_null();
         return Ok(());
@@ -707,14 +696,17 @@ fn struct_field<'a, T: ArrayBuilder>(
     })
 }
 
-/// Downcast a boxed builder to `BooleanBuilder` (the range inclusivity / empty flags).
-fn bool_builder<'a>(
+/// Typed accessor for a `dyn` column builder, attributing a downcast failure to the column.
+///
+/// The generic sibling of [`struct_field`]: that one reaches into a `StructBuilder` child, this one
+/// re-types a whole column builder.
+fn downcast<'a, T: ArrayBuilder>(
     builder: &'a mut dyn ArrayBuilder,
     col: &str,
-) -> Result<&'a mut BooleanBuilder, Error> {
+) -> Result<&'a mut T, Error> {
     builder
         .as_any_mut()
-        .downcast_mut::<BooleanBuilder>()
+        .downcast_mut::<T>()
         .ok_or_else(|| Error::Downcast {
             column: col.to_string(),
         })
@@ -746,12 +738,12 @@ fn append_geometric(
     };
     match kind {
         GeoKind::Point => {
-            let sb = downcast!(builder, StructBuilder, col);
+            let sb = downcast::<StructBuilder>(builder, col)?;
             let pt = s.map(geo::parse_point).transpose()?;
             push_doubles(sb, &[pt.map(|p| p.x), pt.map(|p| p.y)], col)?;
         }
         GeoKind::Line => {
-            let sb = downcast!(builder, StructBuilder, col);
+            let sb = downcast::<StructBuilder>(builder, col)?;
             let abc = s.map(geo::parse_line).transpose()?;
             push_doubles(
                 sb,
@@ -760,7 +752,7 @@ fn append_geometric(
             )?;
         }
         GeoKind::Circle => {
-            let sb = downcast!(builder, StructBuilder, col);
+            let sb = downcast::<StructBuilder>(builder, col)?;
             let xyr = s.map(geo::parse_circle).transpose()?;
             push_doubles(
                 sb,
@@ -769,14 +761,14 @@ fn append_geometric(
             )?;
         }
         GeoKind::Lseg | GeoKind::Box => {
-            let sb = downcast!(builder, StructBuilder, col);
+            let sb = downcast::<StructBuilder>(builder, col)?;
             let pts = s.map(geo::parse_box).transpose()?;
             push_point_child(sb, 0, pts.map(|(a, _)| a), col)?;
             push_point_child(sb, 1, pts.map(|(_, b)| b), col)?;
             sb.append(pts.is_some());
         }
         GeoKind::Path => {
-            let sb = downcast!(builder, StructBuilder, col);
+            let sb = downcast::<StructBuilder>(builder, col)?;
             let parsed = s.map(geo::parse_path).transpose()?;
             match &parsed {
                 Some((closed, _)) => {
@@ -794,7 +786,7 @@ fn append_geometric(
             sb.append(parsed.is_some());
         }
         GeoKind::Polygon => {
-            let lb = downcast!(builder, ListBuilder<StructBuilder>, col);
+            let lb = downcast::<ListBuilder<StructBuilder>>(builder, col)?;
             match s {
                 Some(t) => push_points_list(lb, &geo::parse_polygon(t)?, col)?,
                 None => lb.append_null(),
@@ -855,12 +847,7 @@ fn append_num<B>(
 where
     B: ArrayBuilder + ArrowNumBuilder,
 {
-    let b = builder
-        .as_any_mut()
-        .downcast_mut::<B>()
-        .ok_or_else(|| Error::Downcast {
-            column: col.to_string(),
-        })?;
+    let b = downcast::<B>(builder, col)?;
     if is_null {
         b.append_null_val();
     } else {
@@ -882,6 +869,13 @@ trait ArrowNumBuilder {
     fn append_val(&mut self, v: Self::Val);
     fn append_null_val(&mut self);
 }
+
+// KEPT DELIBERATELY (PR 24.1, rule `macro-prefer-functions`). The rule's table sanctions a macro
+// for "implementing a trait for many unrelated types" — exactly this: five Arrow builder types
+// that share no upstream trait carrying the needed inherent `append_value`/`append_null`
+// operations, so neither a blanket impl nor a generic function can emit these bodies. `downcast!`
+// had a fixed arity, one type parameter, and no impl to emit, so it became `fn downcast<T>` in the
+// same PR. Arms stay `:ty`-precise — never `:tt`.
 macro_rules! num_builder {
     ($b:ty, $t:ty) => {
         impl ArrowNumBuilder for $b {
