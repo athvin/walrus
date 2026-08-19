@@ -57,6 +57,16 @@ fn text_vals(vals: &[&str]) -> Vec<TupleValue> {
 }
 
 #[test]
+fn downcast_mismatch_names_the_column() {
+    let mut b = BooleanBuilder::new();
+    let err = downcast::<Int64Builder>(&mut b, "total_cents").expect_err("type mismatch");
+    assert!(
+        matches!(err, Error::Downcast { column } if column == "total_cents"),
+        "a builder mismatch must name the offending column"
+    );
+}
+
+#[test]
 fn float8_nan_and_infinities_survive_the_text_parse_path() {
     let relation = one_col_rel("d", oids::FLOAT8, -1);
     let mut builder = BatchBuilder::new(&relation).unwrap();
