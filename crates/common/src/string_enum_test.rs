@@ -14,13 +14,23 @@ impl TestParseError {
 }
 
 string_enum! {
-    /// A throwaway enum that exercises every generated item without touching a real contract.
-    Signal {
+    /// Attributes and explicit visibility ride through the same arm.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum Signal {
         error = TestParseError;
         column = "test.signal";
         Green => "green",
         Amber => "amber",
-        Red   => "red", // trailing comma must be accepted by the `$(,)?` in the matcher
+        Red => "red", // trailing comma must be accepted by the `$(,)?` in the matcher
+    }
+}
+
+string_enum! {
+    // No attributes and `$vis` matches nothing; typed rejection inputs remain explicit.
+    enum Bare {
+        error = TestParseError;
+        column = "test.bare";
+        One => "one",
     }
 }
 
@@ -49,4 +59,18 @@ fn generated_enum_is_copy_and_eq() {
     let b = a; // `a` is still usable => Copy, which `as_str(self)` requires.
     assert_eq!(a, b);
     assert_eq!(format!("{a:?}"), "Amber");
+}
+
+#[test]
+fn caller_derive_reaches_the_generated_enum() {
+    use std::collections::HashSet;
+
+    let values: HashSet<Signal> = [Signal::Green, Signal::Amber].into_iter().collect();
+    assert_eq!(values.len(), 2);
+}
+
+#[test]
+fn private_enum_without_attributes_still_round_trips() {
+    let value = "one".parse::<Bare>().unwrap();
+    assert_eq!(Bare::as_str(value), "one");
 }
