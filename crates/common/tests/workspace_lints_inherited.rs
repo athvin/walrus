@@ -29,11 +29,11 @@ fn workspace_members(root_manifest: &str) -> Vec<String> {
     let mut assignment = None;
     for line in workspace.split_inclusive('\n') {
         let trimmed = line.trim_start();
-        if let Some(after_key) = trimmed.strip_prefix("members") {
-            if after_key.trim_start().starts_with('=') {
-                assignment = Some(offset + (line.len() - trimmed.len()) + "members".len());
-                break;
-            }
+        if let Some(after_key) = trimmed.strip_prefix("members")
+            && after_key.trim_start().starts_with('=')
+        {
+            assignment = Some(offset + (line.len() - trimmed.len()) + "members".len());
+            break;
         }
         offset += line.len();
     }
