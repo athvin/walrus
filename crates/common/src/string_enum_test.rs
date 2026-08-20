@@ -62,6 +62,14 @@ fn rejection_keeps_the_supplied_column_and_input_as_data() {
 }
 
 #[test]
+fn defining_crate_helper_preserves_typed_error_inputs() {
+    let error = crate::unknown_variant("test.direct", "chartreuse", TestParseError::new);
+
+    assert_eq!(error.column, "test.direct");
+    assert_eq!(error.input, "chartreuse");
+}
+
+#[test]
 fn generated_enum_is_copy_and_eq() {
     let a = Signal::Amber;
     let b = a; // `a` is still usable => Copy, which `as_str(self)` requires.
