@@ -4,12 +4,17 @@
 //! `table_reload.flavor`/`.status`). Each needs the same pair of impls, and hand-writing them means
 //! every legal string is typed twice — once in `as_str`, once in `FromStr` — so the two directions
 //! can drift. This macro makes the variant table the single source of both.
+//!
+//! Generated code reaches the typed constructor adapter through `common`'s crate-root
+//! `__private` namespace. That namespace is a macro implementation detail with no stability
+//! expectation; the caller-selected error type and inputs remain unchanged.
 
 /// Construct the caller-selected error for an unknown `string_enum!` value.
 ///
-/// Generated code reaches this adapter through `$crate::unknown_variant`, so the item resolves in
-/// `common` even when the macro expands in another crate. The adapter deliberately preserves the
-/// caller's error taxonomy: it forwards the exact column and input to `make_error` and returns `E`.
+/// Generated code reaches this adapter through `$crate::__private::unknown_variant`, so the item
+/// resolves in `common` even when the macro expands in another crate. The adapter deliberately
+/// preserves the caller's error taxonomy: it forwards the exact column and input to `make_error`
+/// and returns `E`.
 #[must_use]
 pub fn unknown_variant<E>(
     column: &'static str,
@@ -71,7 +76,11 @@ macro_rules! string_enum {
                 match s {
                     $($text => Ok($name::$variant),)*
                     // Bare `crate::` resolves in the caller and produces E0425; `$crate` is common.
-                    other => Err($crate::unknown_variant($column, other, <$error>::new)),
+                    other => Err($crate::__private::unknown_variant(
+                        $column,
+                        other,
+                        <$error>::new,
+                    )),
                 }
             }
         }

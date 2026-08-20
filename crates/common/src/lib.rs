@@ -34,9 +34,18 @@ pub use ids::{EpochNo, ManifestId, ReloadId, SchemaVersionNo};
 pub use lsn::Lsn;
 pub use pg_shape::{PgColumn, PgRelation, ReplicaIdentity, TupleValue};
 pub use sink_meta::{Kind, Op, PG_EPOCH_UNIX_MICROS, PG_EPOCH_UNIX_SECS, SinkMeta, UtcTimestamp};
-pub use string_enum::unknown_variant;
 pub use telemetry::{TelemetryConfig, init_tracing};
 pub use type_descriptor::{Tier, TypeDescriptor, TypeMeta};
+
+/// Implementation details reachable from `#[macro_export]`ed macros. **Not API.**
+///
+/// Everything here must be `pub` so an expansion in another crate can name it as
+/// `$crate::__private::…`; the hidden-doc attribute keeps it out of rendered documentation.
+/// Nothing outside walrus's own macros may depend on these items; they change without notice.
+#[doc(hidden)]
+pub mod __private {
+    pub use crate::string_enum::unknown_variant;
+}
 
 #[cfg(test)]
 #[path = "lib_test.rs"]
