@@ -5,6 +5,20 @@
 //! every legal string is typed twice — once in `as_str`, once in `FromStr` — so the two directions
 //! can drift. This macro makes the variant table the single source of both.
 
+/// Construct the caller-selected error for an unknown `string_enum!` value.
+///
+/// Generated code reaches this adapter through `$crate::unknown_variant`, so the item resolves in
+/// `common` even when the macro expands in another crate. The adapter deliberately preserves the
+/// caller's error taxonomy: it forwards the exact column and input to `make_error` and returns `E`.
+#[must_use]
+pub fn unknown_variant<E>(
+    column: &'static str,
+    input: &str,
+    make_error: impl FnOnce(&'static str, &str) -> E,
+) -> E {
+    make_error(column, input)
+}
+
 /// Declare a `text`-column enum and its exact persisted strings in one table.
 ///
 /// ```ignore
@@ -56,7 +70,8 @@ macro_rules! string_enum {
             fn from_str(s: &str) -> ::std::result::Result<Self, Self::Err> {
                 match s {
                     $($text => Ok($name::$variant),)*
-                    other => Err(<$error>::new($column, other)),
+                    // Bare `crate::` resolves in the caller and produces E0425; `$crate` is common.
+                    other => Err($crate::unknown_variant($column, other, <$error>::new)),
                 }
             }
         }

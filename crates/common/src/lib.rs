@@ -34,6 +34,7 @@ pub use ids::{EpochNo, ManifestId, ReloadId, SchemaVersionNo};
 pub use lsn::Lsn;
 pub use pg_shape::{PgColumn, PgRelation, ReplicaIdentity, TupleValue};
 pub use sink_meta::{Kind, Op, PG_EPOCH_UNIX_MICROS, PG_EPOCH_UNIX_SECS, SinkMeta, UtcTimestamp};
+pub use string_enum::unknown_variant;
 pub use telemetry::{TelemetryConfig, init_tracing};
 pub use type_descriptor::{Tier, TypeDescriptor, TypeMeta};
 
