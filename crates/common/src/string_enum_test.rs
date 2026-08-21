@@ -34,6 +34,18 @@ string_enum! {
     }
 }
 
+string_enum! {
+    /// Doc comment (a `#[doc = ".."]` meta), an explicit derive list, an explicit visibility,
+    /// and a trailing comma in the variant table — all of it must take the first arm.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum AllOptions {
+        error = TestParseError;
+        column = "test.all_options";
+        First => "first",
+        Second => "second",
+    }
+}
+
 impl Copy for Bare {}
 
 impl Clone for Bare {
@@ -89,4 +101,10 @@ fn caller_derive_reaches_the_generated_enum() {
 fn private_enum_without_attributes_still_round_trips() {
     let value = "one".parse::<Bare>().unwrap();
     assert_eq!(Bare::as_str(value), "one");
+}
+
+#[test]
+fn every_optional_piece_takes_the_real_arm() {
+    assert_eq!(AllOptions::Second.as_str(), "second");
+    assert_eq!("first".parse::<AllOptions>(), Ok(AllOptions::First));
 }
