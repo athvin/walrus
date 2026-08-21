@@ -63,8 +63,7 @@ fn rejection_keeps_the_supplied_column_and_input_as_data() {
 
 #[test]
 fn defining_crate_helper_preserves_typed_error_inputs() {
-    let error =
-        crate::__private::unknown_variant("test.direct", "chartreuse", TestParseError::new);
+    let error = crate::__private::unknown_variant("test.direct", "chartreuse", TestParseError::new);
 
     assert_eq!(error.column, "test.direct");
     assert_eq!(error.input, "chartreuse");
