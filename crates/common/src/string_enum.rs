@@ -85,6 +85,19 @@ macro_rules! string_enum {
             }
         }
     };
+
+    // Fallback arm. This must stay last: moving the catch-all above the real arm would shadow every
+    // valid invocation. This is the one sanctioned token-tree slurp because the captured tokens
+    // are never re-parsed; they only replace an internal matcher error with a useful message.
+    // Declarative macros cannot attach a span, so the whole invocation is highlighted, and lexer
+    // errors such as unbalanced delimiters fail before this arm can match.
+    ($($bad:tt)*) => { // tt-fallback-ok — the PR 24.3 gates guard exempts this line
+        compile_error!(concat!(
+            "string_enum! expects `#[attrs] <vis> enum Name { error = ErrorType; ",
+            "column = \"db.column\"; Variant => \"db_string\", ... }`; ",
+            "every variant needs a `=> \"literal\"` giving the exact persisted string"
+        ));
+    };
 }
 
 #[cfg(test)]
