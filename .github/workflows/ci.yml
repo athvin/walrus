@@ -539,6 +539,11 @@ jobs:
       - name: cargo deny check
         run: cargo deny check
 
+      # PR 24.7: walrus declares no proc-macro toolchain of its own. Manifest-level only — the
+      # lockfile's transitive proc-macros (serde_derive, sqlx-macros, …) are required.
+      - name: No direct syn/quote/proc-macro2 dependency
+        run: bash scripts/proc-macro-guard.sh --check
+
       # PR 11.17: Phase 11 declined five allocator/container crates, each with an ADR under
       # docs/implementation/notes/. This keeps them out of member manifests; transitive presence
       # in Cargo.lock is fine and expected.

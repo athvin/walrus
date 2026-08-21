@@ -15,29 +15,64 @@ cd "$(git rev-parse --show-toplevel)"
 MANIFESTS=(Cargo.toml crates/*/Cargo.toml tests/e2e/Cargo.toml)
 
 check_direct() {
-  # The manifest matcher is implemented after this red self-test commit.
+  local direct
+  # grep exits 1 when it matches nothing, which is the success case. Keep that status from
+  # terminating a clean check under `set -e`, then decide from the captured diagnostics.
+  direct=$(grep -nEH -- \
+    '^[[:space:]]*(syn|quote|proc-macro2)[[:space:]]*[.=]|^[[:space:]]*\[[^]]*dependencies\.(syn|quote|proc-macro2)\]' \
+    "$@" || true)
+
+  if [ -n "$direct" ]; then
+    echo "::error::direct syn/quote/proc-macro2 dependency declared in a workspace manifest — walrus authors no proc-macros (docs/implementation/notes/rust-skills/macro-proc-syn-quote.md)"
+    echo "$direct"
+    return 1
+  fi
+
   echo "ok: 0 direct syn/quote/proc-macro2 dependencies across $# manifests (transitive copies are expected and fine)"
 }
 
 self_test() {
-  local fixture_dir output
-  fixture_dir=$(mktemp -d)
-  trap 'rm -rf -- "$fixture_dir"' EXIT
+  local output
+  PROC_MACRO_GUARD_FIXTURE_DIR=$(mktemp -d)
+  trap 'rm -rf -- "$PROC_MACRO_GUARD_FIXTURE_DIR"' EXIT
 
-  mkdir -p "$fixture_dir/fixture"
-  printf '%s\n' '[dependencies]' 'syn = "2"' >"$fixture_dir/fixture/direct-syn.toml"
+  mkdir -p "$PROC_MACRO_GUARD_FIXTURE_DIR/fixture"
+  printf '%s\n' '[dependencies]' 'syn = "2"' \
+    >"$PROC_MACRO_GUARD_FIXTURE_DIR/fixture/direct-syn.toml"
   printf '%s\n' '[dependencies]' 'syn.workspace = true' 'quote.workspace = true' \
-    >"$fixture_dir/fixture/workspace-dependencies.toml"
+    >"$PROC_MACRO_GUARD_FIXTURE_DIR/fixture/workspace-dependencies.toml"
   printf '%s\n' '[build-dependencies]' 'syn = { version = "2" }' \
-    'proc-macro2 = { version = "1" }' >"$fixture_dir/fixture/inline-dependencies.toml"
+    'proc-macro2 = { version = "1" }' \
+    >"$PROC_MACRO_GUARD_FIXTURE_DIR/fixture/inline-dependencies.toml"
   printf '%s\n' '[dev-dependencies.proc-macro2]' 'version = "1"' \
-    '[build-dependencies.quote]' 'version = "1"' >"$fixture_dir/fixture/dependency-tables.toml"
+    '[build-dependencies.quote]' 'version = "1"' \
+    >"$PROC_MACRO_GUARD_FIXTURE_DIR/fixture/dependency-tables.toml"
 
-  if output=$(check_direct "$fixture_dir"/fixture/*.toml 2>&1); then
+  if output=$(check_direct "$PROC_MACRO_GUARD_FIXTURE_DIR"/fixture/*.toml 2>&1); then
     echo "::error::proc-macro guard self-test expected direct dependency fixtures to be rejected"
     echo "$output"
     exit 1
   fi
+
+  echo "$output"
+  for expected in \
+    '::error::direct syn/quote/proc-macro2 dependency declared' \
+    'fixture/direct-syn.toml' \
+    'fixture/workspace-dependencies.toml' \
+    'fixture/inline-dependencies.toml' \
+    'fixture/dependency-tables.toml' \
+    'syn = "2"' \
+    'syn.workspace = true' \
+    'quote.workspace = true' \
+    'syn = { version = "2" }' \
+    'proc-macro2 = { version = "1" }' \
+    '[dev-dependencies.proc-macro2]' \
+    '[build-dependencies.quote]'; do
+    if ! grep -Fq -- "$expected" <<<"$output"; then
+      echo "::error::proc-macro guard self-test did not report expected fixture declaration: $expected"
+      exit 1
+    fi
+  done
 
   echo "proc-macro-guard self-test: PASS"
 }
