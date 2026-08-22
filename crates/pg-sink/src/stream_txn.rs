@@ -89,12 +89,16 @@ impl StreamedTxn {
     }
 
     /// The buffered (in-memory) rows that survive to commit: every change **except** aborted sub-xids.
-    /// (Commit materialisation inlines this filter; this accessor backs the tests + `survivor_count`.)
-    #[cfg(test)]
+    /// The single definition of survivorship — `on_stream_commit` materialises exactly this iterator,
+    /// and `survivor_count` counts it.
+    ///
+    /// `aborted` is bound to a local first: a `move` closure reading `self.aborted` would truncate
+    /// the capture path at the `*self` deref and capture the whole `&StreamedTxn` (RFC 2229).
     fn survivors(&self) -> impl Iterator<Item = &StreamedChange> {
+        let aborted = &self.aborted;
         self.changes
             .iter()
-            .filter(move |c| !self.aborted.contains(&c.sub_xid))
+            .filter(move |c| !aborted.contains(&c.sub_xid))
     }
 }
 
@@ -395,7 +399,7 @@ impl<C: Clock + Clone> StreamDemux<C> {
         if self.current_top == Some(top_xid) {
             self.current_top = None;
         }
-        let Some(txn) = self.open.remove(&top_xid) else {
+        let Some(mut txn) = self.open.remove(&top_xid) else {
             tracing::warn!(
                 top_xid,
                 "Stream Commit for an unknown xid; nothing to materialise"
@@ -403,16 +407,11 @@ impl<C: Clock + Clone> StreamDemux<C> {
             return Ok(Vec::new());
         };
         self.release_txn_meter(&txn);
-        let StreamedTxn {
-            changes,
-            staged,
-            aborted,
-            ..
-        } = txn;
         let mut out = Vec::new();
         // Publish speculative spills whose sub-xid did NOT abort, stamped with the real commit LSN.
-        for spill in staged {
-            if aborted.contains(&spill.sub_xid) {
+        // `take` moves the spill vector out without moving `txn`, so `txn.survivors()` remains usable.
+        for spill in std::mem::take(&mut txn.staged) {
+            if txn.aborted.contains(&spill.sub_xid) {
                 if let Err(error) = sink.delete(&spill.written.key).await {
                     tracing::warn!(
                         key = %spill.written.key,
@@ -426,7 +425,7 @@ impl<C: Clock + Clone> StreamDemux<C> {
             w.lsn_end = commit_lsn;
             out.push(w);
         }
-        // Materialise the still-in-memory survivors.
+        // Materialise the still-in-memory survivors — the same predicate the accessor defines.
         let (triggers, clock, epoch, instance) = (
             self.triggers,
             self.clock.clone(),
@@ -434,7 +433,7 @@ impl<C: Clock + Clone> StreamDemux<C> {
             self.sink_instance.clone(),
         );
         let mut batchers: HashMap<u32, TableBatcher<C>> = HashMap::new();
-        for c in changes.iter().filter(|c| !aborted.contains(&c.sub_xid)) {
+        for c in txn.survivors() {
             let Some(cached) = cache.latest_for(c.oid) else {
                 continue;
             };
