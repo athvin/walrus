@@ -12,6 +12,7 @@
 //! ~2× transient space for the rewrite. The cross-table stall is an open finding recorded in
 //! `docs/implementation/notes/rust-skills/async-spawn-blocking.md`.
 
+use crate::duck::TableDb;
 use crate::duck_ext::{DuckResultExt, duck_err};
 use crate::error::LoaderError;
 use crate::transform::TransformSql;
@@ -34,7 +35,7 @@ use tokio_util::sync::CancellationToken;
 /// [`LoaderError::Duck`] if beginning, executing, or committing the atomic rebuild fails for a reason
 /// other than cancellation.
 pub fn full_rebuild(
-    conn: &duckdb::Connection,
+    db: &TableDb,
     t: &TransformSql,
     cancel: &CancellationToken,
 ) -> Result<(), LoaderError> {
@@ -43,29 +44,27 @@ pub fn full_rebuild(
     }
     // Rebuild over ALL retained raw (from LSN 0) plus the mirror baseline; the truncate boundary comes
     // from the retained tail exactly as the incremental path resolves it.
-    let boundary = t.latest_truncate(conn, &Lsn::ZERO)?;
-    conn.execute_batch("BEGIN TRANSACTION;")
-        .duck("begin rebuild txn")?;
-    if let Err(source) = conn.execute_batch(&t.render_rebuild(&boundary)) {
-        if let Err(rollback) = conn.execute_batch("ROLLBACK;") {
-            tracing::warn!(
-                error = %rollback,
-                "full-rebuild rollback failed; connection may be wedged"
-            );
-        }
-        if cancel.is_cancelled() {
+    let boundary = t.latest_truncate(db.conn(), &Lsn::ZERO)?;
+    let rebuild_op = format!("full rebuild {}", t.table());
+    let rewrite = db.in_txn("rebuild", |conn| {
+        conn.execute_batch(&t.render_rebuild(&boundary))
+            .map_err(|source| duck_err(rebuild_op.clone(), source))
+    });
+    match rewrite {
+        Ok(()) => Ok(()),
+        Err(LoaderError::Duck { op, .. }) if cancel.is_cancelled() && op == rebuild_op => {
             // Interrupted by the drain (the watcher called `interrupt()`): an intentional abort, the old
-            // mirror is intact via ROLLBACK, and the rebuild re-runs next cycle. NOT an error.
+            // mirror is intact because `in_txn` rolled back, and the rebuild re-runs next cycle. NOT an
+            // error. Begin/commit errors have different operation labels and remain errors even if the
+            // token becomes cancelled at the same time.
             tracing::info!(
                 table = t.table(),
                 "full-rebuild aborted by drain (rolled back)"
             );
-            return Ok(());
+            Ok(())
         }
-        return Err(duck_err(format!("full rebuild {}", t.table()), source));
+        Err(error) => Err(error),
     }
-    conn.execute_batch("COMMIT;").duck("commit rebuild txn")?;
-    Ok(())
 }
 
 /// [`full_rebuild`] wrapped so an in-flight rewrite is **aborted** the instant `cancel` fires (PR 3.12).
@@ -80,17 +79,17 @@ pub fn full_rebuild(
 /// Returns the [`LoaderError::LsnParse`] or [`LoaderError::Duck`] produced by [`full_rebuild`]; a
 /// cancellation-triggered DuckDB interrupt is deliberately converted to `Ok(())`.
 pub async fn full_rebuild_abortable(
-    conn: &duckdb::Connection,
+    db: &TableDb,
     t: &TransformSql,
     cancel: &CancellationToken,
 ) -> Result<(), LoaderError> {
-    let handle = conn.interrupt_handle();
+    let handle = db.conn().interrupt_handle();
     let watch = cancel.clone();
     let watcher = tokio::spawn(async move {
         watch.cancelled().await;
         handle.interrupt(); // cancel the running rewrite from another thread
     });
-    let result = full_rebuild(conn, t, cancel);
+    let result = full_rebuild(db, t, cancel);
     watcher.abort();
     result
 }

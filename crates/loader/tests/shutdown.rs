@@ -301,7 +301,7 @@ async fn in_flight_full_rebuild_is_aborted_on_sigterm() {
         tokio::time::sleep(Duration::from_millis(150)).await;
         tc.cancel();
     });
-    full_rebuild_abortable(db.conn(), &t, &token)
+    full_rebuild_abortable(&db, &t, &token)
         .await
         .expect("an aborted rebuild is Ok (rolled back), not an error");
 

@@ -287,6 +287,47 @@ impl TableDb {
         &self.conn
     }
 
+    /// Run `f` inside one DuckDB transaction. Commits on success and attempts a best-effort rollback
+    /// on error, so callers cannot forget the unhappy path. `what` names the transaction in the
+    /// begin/commit error contexts and rollback warning.
+    ///
+    /// Bounded [`FnOnce`] because the body runs exactly once and may consume what it captured. This
+    /// is the weakest bound that works, accepting move-consuming closures too. There is no `Send`
+    /// bound: the body runs inline on the owning worker's `LocalSet` and never crosses a task or
+    /// thread boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] if beginning or committing the transaction fails, or returns
+    /// the body's error unchanged after attempting to roll back.
+    pub fn in_txn<T>(
+        &self,
+        what: &str,
+        f: impl FnOnce(&duckdb::Connection) -> Result<T, LoaderError>,
+    ) -> Result<T, LoaderError> {
+        self.conn
+            .execute_batch("BEGIN TRANSACTION;")
+            .duck_with(|| format!("begin {what} txn"))?;
+        match f(&self.conn) {
+            Ok(value) => {
+                self.conn
+                    .execute_batch("COMMIT;")
+                    .duck_with(|| format!("commit {what} txn"))?;
+                Ok(value)
+            }
+            Err(error) => {
+                if let Err(rollback) = self.conn.execute_batch("ROLLBACK;") {
+                    tracing::warn!(
+                        error = %rollback,
+                        transaction = what,
+                        "transaction rollback failed; connection may be wedged"
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
     /// This table's currently-reconciled `schema_version` (the `_walrus_meta` watermark). Persisted in
     /// the `.duckdb` file, so a restart resumes at the exact version its columns are already at.
     ///

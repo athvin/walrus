@@ -110,7 +110,7 @@ async fn compact(ctx: &TableCtx, shutdown: &CancellationToken) -> Result<(), Loa
     let t = crate::phase_b::current_transform(ctx).await?;
 
     // The rebuild is abortable: a SIGTERM mid-rewrite interrupts it, rolls back, and returns Ok (PR 3.12).
-    crate::compaction::full_rebuild_abortable(ctx.db.conn(), &t, shutdown).await?;
+    crate::compaction::full_rebuild_abortable(&ctx.db, &t, shutdown).await?;
     if shutdown.is_cancelled() {
         return Ok(()); // draining — skip the prune, the rebuild was aborted; both re-run next start
     }

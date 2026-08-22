@@ -57,7 +57,7 @@ fn in_txn_rolls_back_on_err() {
         .in_txn("probe", |conn| {
             conn.execute_batch("INSERT INTO txn_probe VALUES (1);")
                 .duck("rollback probe body")?;
-            Err(LoaderError::Quarantine {
+            Err::<(), LoaderError>(LoaderError::Quarantine {
                 table: "public.orders".into(),
                 reason: "identity sentinel".into(),
             })

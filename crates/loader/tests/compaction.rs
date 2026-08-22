@@ -92,7 +92,7 @@ fn full_rebuild_matches_incremental_mirror() {
 
     let reb = mem(&rel);
     seed_history(reb.conn());
-    full_rebuild(reb.conn(), &t, &CancellationToken::new()).unwrap();
+    full_rebuild(&reb, &t, &CancellationToken::new()).unwrap();
 
     assert_eq!(
         dump(inc.conn()),
@@ -124,7 +124,7 @@ fn pruned_value_survives_via_mirror_baseline() {
     assert_eq!(raw_count(db.conn()), 0, "raw evidence pruned");
 
     // The rebuild unions the current mirror as a baseline → the value is not lost.
-    full_rebuild(db.conn(), &t, &CancellationToken::new()).unwrap();
+    full_rebuild(&db, &t, &CancellationToken::new()).unwrap();
     assert_eq!(
         status_of(db.conn(), 1).as_deref(),
         Some("kept"),
@@ -140,11 +140,30 @@ fn deleted_keys_stay_absent_after_rebuild() {
     let db = mem(&rel);
     seed_raw(db.conn(), 1, "a", 'i', 100, 1);
     seed_raw(db.conn(), 1, "a", 'd', 100, 2);
-    full_rebuild(db.conn(), &t, &CancellationToken::new()).unwrap();
+    full_rebuild(&db, &t, &CancellationToken::new()).unwrap();
     assert_eq!(
         dump(db.conn()).len(),
         0,
         "the delete winner is dropped by the rebuild's WHERE op<>'d'"
+    );
+}
+
+// ---- A drain observed before the heavy rewrite starts is an intentional no-op.
+#[test]
+fn pre_cancelled_full_rebuild_does_not_start() {
+    let rel = orders_rel();
+    let t = TransformSql::from_relation(&rel);
+    let db = mem(&rel);
+    seed_raw(db.conn(), 1, "not-applied", 'i', 100, 1);
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    full_rebuild(&db, &t, &cancel).unwrap();
+
+    assert_eq!(
+        dump(db.conn()),
+        Vec::<(i64, String)>::new(),
+        "a pre-cancelled rebuild returns Ok without changing the mirror"
     );
 }
 
@@ -209,7 +228,7 @@ fn rebuild_reclaims_space_and_prune_keeps_mirror_correct() {
     );
 
     // The CREATE OR REPLACE rebuild rewrites the table to one clean row → blocks freed.
-    full_rebuild(db.conn(), &t, &CancellationToken::new()).unwrap();
+    full_rebuild(&db, &t, &CancellationToken::new()).unwrap();
     let rebuilt = used_blocks(db.conn());
     assert!(
         rebuilt < bloated,
@@ -225,7 +244,7 @@ fn rebuild_reclaims_space_and_prune_keeps_mirror_correct() {
     let floor = retention_floor("0/C8".parse().unwrap(), 0);
     prune_raw(db.conn(), &t, &floor).unwrap();
     assert_eq!(raw_count(db.conn()), 0, "raw pruned below the floor");
-    full_rebuild(db.conn(), &t, &CancellationToken::new()).unwrap();
+    full_rebuild(&db, &t, &CancellationToken::new()).unwrap();
     assert_eq!(
         status_of(db.conn(), 1).as_deref(),
         Some(wide.as_str()),
