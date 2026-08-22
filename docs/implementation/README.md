@@ -620,7 +620,7 @@ duplicated OID literals (Tier 2), the opt-in domain-ID newtype sweep (Tier 3), a
 
 | ☐ | PR | Delivers | Rust rule |
 |---|---|---|---|
-| ☐ | [25.1](./phase-25-rust-closures/pr-25.1-closure-impl-fn-return.md) | Return an impl FnOnce error mapper for the loader's DuckDB map_err closures | `closure-impl-fn-return` |
+| ☐ | [25.1](./phase-25-rust-closures/pr-25.1-closure-impl-fn-return.md) | Record why DuckResultExt supersedes a returned closure mapper | `closure-impl-fn-return` |
 | ☐ | [25.2](./phase-25-rust-closures/pr-25.2-closure-fn-trait-bounds.md) | Add a FnOnce transaction seam to TableDb so rollback cannot be forgotten | `closure-fn-trait-bounds` |
 | ☐ | [25.3](./phase-25-rust-closures/pr-25.3-closure-disjoint-capture.md) | Narrow the streamed-txn survivor closure from &self to the aborted set | `closure-disjoint-capture` |
 | ☐ | [25.4](./phase-25-rust-closures/pr-25.4-closure-move-capture.md) | Gate the clone-before-move discipline with clippy::redundant_clone | `closure-move-capture` |
