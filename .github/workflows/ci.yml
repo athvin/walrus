@@ -539,9 +539,9 @@ jobs:
       - name: cargo deny check
         run: cargo deny check
 
-      # PR 24.7: walrus declares no proc-macro toolchain of its own. Manifest-level only — the
-      # lockfile's transitive proc-macros (serde_derive, sqlx-macros, …) are required.
-      - name: No direct syn/quote/proc-macro2 dependency
+      # PR 24.7/24.8: walrus authors no proc-macros. Three workspace-shape invariants: no direct
+      # syn/quote/proc-macro2 dependency, no proc-macro member, and exactly six workspace packages.
+      - name: No proc-macro toolchain (direct deps · proc-macro crate · member count)
         run: bash scripts/proc-macro-guard.sh --check
 
       # PR 11.17: Phase 11 declined five allocator/container crates, each with an ADR under

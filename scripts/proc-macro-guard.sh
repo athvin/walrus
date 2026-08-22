@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# proc-macro-guard.sh — PR 24.7 workspace-shape gate. walrus authors no procedural macros: every
-# codegen need is met by `macro_rules!` (crates/common/src/string_enum.rs, and the hand-written
-# transparent-int8 sqlx blocks in ids.rs / lsn.rs). Rationale + the one condition that reopens the
-# decision: docs/implementation/notes/rust-skills/macro-proc-syn-quote.md.
+# proc-macro-guard.sh — PR 24.7/24.8 workspace-shape gate. walrus authors no procedural macros:
+# every codegen need is met by `macro_rules!` or a small hand-written implementation. Rationale +
+# the one condition that reopens the decision:
+# docs/implementation/notes/rust-skills/macro-proc-syn-quote.md.
 #
 #   bash scripts/proc-macro-guard.sh --check
 #   bash scripts/proc-macro-guard.sh --self-test
@@ -33,14 +33,35 @@ check_direct() {
 
 EXPECTED_MEMBERS=6
 
-# PR 24.8 tests-first seams. The negative controls below land before these checks are implemented,
-# so both stubs deliberately accept their bad fixtures in the intended-red commit.
 check_proc_macro_setting() {
-  return 0
+  local declared
+  # No match is the success case. Preserve grep's exit 1 under `set -e`, then decide from the
+  # captured diagnostics so whitespace variants such as `proc-macro=true` are still rejected.
+  declared=$(grep -nEH -- '^[[:space:]]*proc-macro[[:space:]]*=' "$@" || true)
+
+  if [ -n "$declared" ]; then
+    echo "::error::a workspace manifest declares a proc-macro library setting — read docs/implementation/notes/rust-skills/macro-proc-syn-quote.md (§ The two-crate split) before adding one"
+    echo "$declared"
+    return 1
+  fi
+
+  echo "ok: no workspace manifest declares a proc-macro library setting"
 }
 
 check_workspace_member_count() {
-  return 0
+  local workspace_root=$1 actual
+  actual=$(
+    cd "$workspace_root"
+    cargo metadata --no-deps --format-version 1 --locked --offline \
+      | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["packages"]))'
+  )
+
+  if [ "$actual" != "$EXPECTED_MEMBERS" ]; then
+    echo "::error::workspace member count is $actual, expected $EXPECTED_MEMBERS — if deliberate, update the guard and two-crate decision together"
+    return 1
+  fi
+
+  echo "ok: workspace resolves to $actual packages (expected $EXPECTED_MEMBERS)"
 }
 
 self_test() {
@@ -158,6 +179,8 @@ case "${1:-}" in
   --check)
     [ "$#" -eq 1 ] || usage
     check_direct "${MANIFESTS[@]}"
+    check_proc_macro_setting "${MANIFESTS[@]}"
+    check_workspace_member_count "$PWD"
     ;;
   --self-test)
     [ "$#" -eq 1 ] || usage
