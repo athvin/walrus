@@ -125,6 +125,62 @@ async fn stream_commit_materialises_survivors_stamped_with_commit_lsn() {
 }
 
 #[tokio::test]
+async fn commit_materialises_exactly_what_survivors_reports() {
+    let (cache, sink) = (cache(), mem_sink());
+    let mut d = demux(u64::MAX);
+    let top_xid = 857;
+    d.on_stream_start(top_xid, true, "0/100".parse().unwrap());
+    for (id, sub_xid, lsn) in [
+        (1, top_xid, "0/101"),
+        (2, 858, "0/102"),
+        (3, top_xid, "0/103"),
+    ] {
+        d.on_change(&cache, &insert_id(id, sub_xid), &sink, lsn.parse().unwrap())
+            .await
+            .unwrap();
+    }
+    d.on_stream_abort(top_xid, 858, &sink).await;
+    let expected = d.survivor_count(top_xid);
+
+    let files = d
+        .on_stream_commit(
+            top_xid,
+            "0/900".parse().unwrap(),
+            UtcTimestamp::now(),
+            &cache,
+            &sink,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        files.iter().map(|f| f.row_count).sum::<u64>(),
+        u64::try_from(expected).unwrap()
+    );
+}
+
+#[test]
+fn survivors_borrows_only_the_aborted_set() {
+    assert!(include_str!("stream_txn.rs").contains("let aborted = &self.aborted;"));
+
+    let mut txn = StreamedTxn::new("0/100".parse().unwrap());
+    txn.push_change(StreamedChange {
+        sub_xid: 857,
+        oid: 42,
+        op: Op::Insert,
+        values: Vec::new(),
+        lsn: "0/101".parse().unwrap(),
+    });
+    let survivors = txn.survivors();
+    let begin_lsn = txn.begin_lsn;
+    let staged_len = txn.staged.len();
+
+    assert_eq!(begin_lsn, "0/100".parse().unwrap());
+    assert_eq!(staged_len, 0);
+    assert_eq!(survivors.count(), 1);
+}
+
+#[tokio::test]
 async fn whole_txn_stream_abort_drops_the_buffer() {
     let (cache, sink) = (cache(), mem_sink());
     let mut d = demux(u64::MAX);
