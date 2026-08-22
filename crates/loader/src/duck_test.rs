@@ -29,6 +29,79 @@ fn orders() -> PgRelation {
     }
 }
 
+#[test]
+fn in_txn_commits_on_ok() {
+    let db = TableDb::open(":memory:").unwrap();
+
+    db.in_txn("probe", |conn| {
+        conn.execute_batch("CREATE TABLE txn_probe (id INTEGER); INSERT INTO txn_probe VALUES (1);")
+            .duck("commit probe body")
+    })
+    .unwrap();
+
+    let rows: i64 = db
+        .conn()
+        .query_row("SELECT count(*) FROM txn_probe", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 1, "an Ok transaction body is committed");
+}
+
+#[test]
+fn in_txn_rolls_back_on_err() {
+    let db = TableDb::open(":memory:").unwrap();
+    db.conn()
+        .execute_batch("CREATE TABLE txn_probe (id INTEGER);")
+        .unwrap();
+
+    let error = db
+        .in_txn("probe", |conn| {
+            conn.execute_batch("INSERT INTO txn_probe VALUES (1);")
+                .duck("rollback probe body")?;
+            Err(LoaderError::Quarantine {
+                table: "public.orders".into(),
+                reason: "identity sentinel".into(),
+            })
+        })
+        .unwrap_err();
+
+    match error {
+        LoaderError::Quarantine { table, reason } => {
+            assert_eq!(table, "public.orders");
+            assert_eq!(reason, "identity sentinel");
+        }
+        other => panic!("transaction changed the body error: {other:?}"),
+    }
+    let rows: i64 = db
+        .conn()
+        .query_row("SELECT count(*) FROM txn_probe", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 0, "an Err transaction body is rolled back");
+
+    db.in_txn("following", |conn| {
+        conn.execute_batch("INSERT INTO txn_probe VALUES (2);")
+            .duck("following transaction body")
+    })
+    .unwrap();
+    let rows: i64 = db
+        .conn()
+        .query_row("SELECT count(*) FROM txn_probe", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 1, "rollback leaves the connection transaction-ready");
+}
+
+#[test]
+fn in_txn_accepts_a_move_consuming_body() {
+    let db = TableDb::open(":memory:").unwrap();
+    let sql = String::from("CREATE TABLE t_once (a INTEGER);");
+
+    db.in_txn("once", move |conn| {
+        conn.execute_batch(&sql).duck("once body")?;
+        drop(sql);
+        Ok(())
+    })
+    .unwrap();
+}
+
 /// Write a local `(id, status, walrus_pg_sink_meta)` Parquet whose rows carry `commit_lsn = placeholder`
 /// — mimicking a speculative spill written before its txn's commit LSN was known.
 fn write_local_fixture(dir: &Path, name: &str, ids: (i64, i64), placeholder: &str) -> String {
