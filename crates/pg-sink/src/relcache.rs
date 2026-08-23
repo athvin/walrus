@@ -9,7 +9,7 @@
 
 use arrow::datatypes::SchemaRef;
 use common::{PgRelation, SchemaVersionNo, TypeDescriptor};
-use std::collections::{HashMap, hash_map};
+use std::collections::{BTreeMap, btree_map};
 use std::sync::Arc;
 
 /// Everything the batching path (PR 2.23) needs for one relation at one `schema_version`, shared by
@@ -34,7 +34,12 @@ pub fn is_internal_table(schema: &str, table: &str) -> bool {
 
 #[derive(Debug, Default)]
 pub struct RelationCache {
-    by_key: HashMap<(u32, SchemaVersionNo), Arc<CachedRelation>>,
+    /// Ordered by `(relation_oid, schema_version)`: tuple ordering makes all versions of one oid a
+    /// contiguous range, which [`Self::latest_for`] uses instead of scanning the full cache.
+    ///
+    /// `IndexMap` was considered and declined because insertion order cannot serve that range and
+    /// does not justify a new dependency.
+    by_key: BTreeMap<(u32, SchemaVersionNo), Arc<CachedRelation>>,
 }
 
 impl RelationCache {
@@ -47,10 +52,10 @@ impl RelationCache {
     /// after a DDL bump (PR 2.33), so a change always lands in the latest-shape file.
     #[must_use]
     pub fn latest_for(&self, oid: u32) -> Option<Arc<CachedRelation>> {
-        self.iter()
-            .filter(|cached| cached.relation.oid == oid)
-            .max_by_key(|cached| cached.schema_version)
-            .cloned()
+        self.by_key
+            .range((oid, SchemaVersionNo(i64::MIN))..=(oid, SchemaVersionNo(i64::MAX)))
+            .next_back()
+            .map(|(_, cached)| Arc::clone(cached))
     }
 
     /// The OID of a cached `schema.table` (any version) — the DDL-capture cut (PR 2.33) needs it to find
@@ -62,10 +67,10 @@ impl RelationCache {
             .map(|cached| cached.relation.oid)
     }
 
-    /// The cached relations, in unspecified order. The map key is a projection of each value, so
-    /// iteration yields values directly.
+    /// The cached relations in ascending `(relation_oid, schema_version)` key order. The map key is
+    /// a projection of each value, so iteration yields values directly.
     #[must_use]
-    pub fn iter(&self) -> hash_map::Values<'_, (u32, SchemaVersionNo), Arc<CachedRelation>> {
+    pub fn iter(&self) -> btree_map::Values<'_, (u32, SchemaVersionNo), Arc<CachedRelation>> {
         <&Self as IntoIterator>::into_iter(self)
     }
 
@@ -140,8 +145,6 @@ impl FromIterator<CachedRelation> for RelationCache {
 
 impl Extend<CachedRelation> for RelationCache {
     fn extend<I: IntoIterator<Item = CachedRelation>>(&mut self, iter: I) {
-        let iter = iter.into_iter();
-        self.by_key.reserve(iter.size_hint().0);
         for cached in iter {
             let key = (cached.relation.oid, cached.schema_version);
             self.by_key.insert(key, Arc::new(cached));
@@ -151,7 +154,7 @@ impl Extend<CachedRelation> for RelationCache {
 
 impl IntoIterator for RelationCache {
     type Item = Arc<CachedRelation>;
-    type IntoIter = hash_map::IntoValues<(u32, SchemaVersionNo), Arc<CachedRelation>>;
+    type IntoIter = btree_map::IntoValues<(u32, SchemaVersionNo), Arc<CachedRelation>>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.by_key.into_values()
@@ -160,7 +163,7 @@ impl IntoIterator for RelationCache {
 
 impl<'a> IntoIterator for &'a RelationCache {
     type Item = &'a Arc<CachedRelation>;
-    type IntoIter = hash_map::Values<'a, (u32, SchemaVersionNo), Arc<CachedRelation>>;
+    type IntoIter = btree_map::Values<'a, (u32, SchemaVersionNo), Arc<CachedRelation>>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.by_key.values()
@@ -169,7 +172,7 @@ impl<'a> IntoIterator for &'a RelationCache {
 
 impl<'a> IntoIterator for &'a mut RelationCache {
     type Item = &'a mut Arc<CachedRelation>;
-    type IntoIter = hash_map::ValuesMut<'a, (u32, SchemaVersionNo), Arc<CachedRelation>>;
+    type IntoIter = btree_map::ValuesMut<'a, (u32, SchemaVersionNo), Arc<CachedRelation>>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.by_key.values_mut()
