@@ -24,6 +24,13 @@ fn orders() -> PgRelation {
     }
 }
 
+fn table_at(oid: u32, name: &str) -> PgRelation {
+    let mut relation = orders();
+    relation.oid = oid;
+    relation.name = name.to_string();
+    relation
+}
+
 #[test]
 fn caches_arrow_schema_and_descriptors_by_versioned_key() {
     let mut cache = RelationCache::default();
@@ -153,5 +160,128 @@ fn hydrate_message_is_unchanged_on_a_malformed_snapshot() {
     assert!(
         cache.is_empty(),
         "hydration must not partially update the cache"
+    );
+}
+
+#[test]
+fn latest_for_picks_the_highest_version_per_oid_across_interleaved_tables() {
+    let mut cache = RelationCache::default();
+    for (oid, name, version) in [
+        (16397, "orders", 3),
+        (16400, "customers", 1),
+        (16397, "orders", 1),
+        (16401, "products", 7),
+        (16397, "orders", 2),
+        (16400, "customers", 5),
+    ] {
+        cache
+            .upsert_from_relation(table_at(oid, name), SchemaVersionNo(version))
+            .unwrap();
+    }
+
+    assert_eq!(
+        cache.latest_for(16397).unwrap().schema_version,
+        SchemaVersionNo(3)
+    );
+    assert_eq!(
+        cache.latest_for(16400).unwrap().schema_version,
+        SchemaVersionNo(5)
+    );
+    assert_eq!(
+        cache.latest_for(16401).unwrap().schema_version,
+        SchemaVersionNo(7)
+    );
+    assert!(cache.latest_for(9999).is_none());
+}
+
+#[test]
+fn latest_for_respects_neighbour_and_full_integer_range_edges() {
+    let mut cache = RelationCache::default();
+    for (oid, name, version) in [
+        (42, "lower", i64::MIN),
+        (43, "neighbour", i64::MAX),
+        (u32::MAX, "max_oid", i64::MIN),
+        (u32::MAX, "max_oid", i64::MAX),
+    ] {
+        cache
+            .upsert_from_relation(table_at(oid, name), SchemaVersionNo(version))
+            .unwrap();
+    }
+
+    assert_eq!(
+        cache.latest_for(42).unwrap().schema_version,
+        SchemaVersionNo(i64::MIN)
+    );
+    assert_eq!(
+        cache.latest_for(43).unwrap().schema_version,
+        SchemaVersionNo(i64::MAX)
+    );
+    assert_eq!(
+        cache.latest_for(u32::MAX).unwrap().schema_version,
+        SchemaVersionNo(i64::MAX)
+    );
+}
+
+#[test]
+fn btree_iterators_preserve_items_and_follow_key_order() {
+    let entries = [
+        build_cached(table_at(9, "nine"), SchemaVersionNo(3)).unwrap(),
+        build_cached(table_at(2, "two"), SchemaVersionNo(7)).unwrap(),
+        build_cached(table_at(9, "nine"), SchemaVersionNo(-1)).unwrap(),
+        build_cached(table_at(3, "three"), SchemaVersionNo(0)).unwrap(),
+    ];
+    let mut cache: RelationCache = entries.into_iter().collect();
+    let expected = vec![
+        (2, SchemaVersionNo(7)),
+        (3, SchemaVersionNo(0)),
+        (9, SchemaVersionNo(-1)),
+        (9, SchemaVersionNo(3)),
+    ];
+
+    let values: std::collections::btree_map::Values<
+        '_,
+        (u32, SchemaVersionNo),
+        Arc<CachedRelation>,
+    > = cache.iter();
+    assert_eq!(
+        values
+            .map(|cached| (cached.relation.oid, cached.schema_version))
+            .collect::<Vec<_>>(),
+        expected
+    );
+
+    let shared: std::collections::btree_map::Values<
+        '_,
+        (u32, SchemaVersionNo),
+        Arc<CachedRelation>,
+    > = (&cache).into_iter();
+    assert_eq!(
+        shared
+            .map(|cached| (cached.relation.oid, cached.schema_version))
+            .collect::<Vec<_>>(),
+        expected
+    );
+
+    let mutable: std::collections::btree_map::ValuesMut<
+        '_,
+        (u32, SchemaVersionNo),
+        Arc<CachedRelation>,
+    > = (&mut cache).into_iter();
+    assert_eq!(
+        mutable
+            .map(|cached| (cached.relation.oid, cached.schema_version))
+            .collect::<Vec<_>>(),
+        expected
+    );
+
+    let owned: std::collections::btree_map::IntoValues<
+        (u32, SchemaVersionNo),
+        Arc<CachedRelation>,
+    > = cache.into_iter();
+    assert_eq!(
+        owned
+            .map(|cached| (cached.relation.oid, cached.schema_version))
+            .collect::<Vec<_>>(),
+        expected
     );
 }
