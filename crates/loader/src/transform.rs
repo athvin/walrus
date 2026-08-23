@@ -133,14 +133,18 @@ impl TransformSql {
         TransformSql { table, mirror }
     }
 
-    fn pk_names(&self) -> Vec<&str> {
+    /// The mirror's key columns in relation order. Allocates a `Vec` per call — hence `to_`; the
+    /// borrowed `&str` elements still refer to `self`.
+    fn to_pk_names(&self) -> Vec<&str> {
         self.mirror
             .iter()
             .filter(|c| c.is_key)
             .map(|c| c.name.as_str())
             .collect()
     }
-    fn non_key_names(&self) -> Vec<&str> {
+    /// The mirror's non-key columns in relation order. Allocates a `Vec` per call — hence `to_`;
+    /// the borrowed `&str` elements still refer to `self`.
+    fn to_non_key_names(&self) -> Vec<&str> {
         self.mirror
             .iter()
             .filter(|c| !c.is_key)
@@ -196,8 +200,8 @@ impl TransformSql {
     pub fn render(&self, after_lsn: &Lsn, boundary: &TruncateBoundary) -> String {
         let q = |c: &str| format!("\"{c}\"");
         let table = self.table.as_str();
-        let pk = self.pk_names();
-        let non_key = self.non_key_names();
+        let pk = self.to_pk_names();
+        let non_key = self.to_non_key_names();
         let all: Vec<&str> = self.mirror.iter().map(|c| c.name.as_str()).collect();
         let pk_list = pk.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
         let pk_join = pk
@@ -291,7 +295,7 @@ impl TransformSql {
         let q = |c: &str| format!("\"{c}\"");
         let t = self.table.as_str();
         let raw_table = self.table.raw();
-        let pk = self.pk_names();
+        let pk = self.to_pk_names();
         let pk_list = pk.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
         let pk_join = pk
             .iter()

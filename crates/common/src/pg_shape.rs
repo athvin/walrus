@@ -115,8 +115,11 @@ const _: () = assert!(
 impl PgRelation {
     /// The key-column names (`is_key`) **in relation order** — the loader's MERGE/dedup key list.
     /// Order matters for composite PKs, so this preserves column order rather than sorting.
+    ///
+    /// `to_`, not `as_`: this allocates a fresh `Vec` on every call. The `&str`s inside borrow
+    /// from `self`, but the container does not. Bind it once; do not call it in a loop.
     #[must_use]
-    pub fn key_columns(&self) -> Vec<&str> {
+    pub fn to_key_columns(&self) -> Vec<&str> {
         self.columns
             .iter()
             .filter(|c| c.is_key)

@@ -183,7 +183,7 @@ impl ChunkExporter {
             .await
             .context("read PK index column order")?;
         let registry_keys: std::collections::BTreeSet<&str> =
-            rel.key_columns().into_iter().collect();
+            rel.to_key_columns().into_iter().collect();
         let live_keys: std::collections::BTreeSet<&str> =
             pk_cols.iter().map(String::as_str).collect();
         if registry_keys != live_keys {
