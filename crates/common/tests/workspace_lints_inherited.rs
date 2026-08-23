@@ -174,6 +174,21 @@ fn the_workspace_lint_table_still_denies_unwrap_and_expect() {
 }
 
 #[test]
+fn the_workspace_lint_table_denies_redundant_method_closures() {
+    let root_manifest = std::fs::read_to_string(repo_root().join("Cargo.toml")).unwrap();
+    let clippy = section(&root_manifest, "[workspace.lints.clippy]")
+        .expect("root manifest must define [workspace.lints.clippy]");
+    assert_eq!(
+        clippy
+            .lines()
+            .filter(|line| line.trim() == r#"redundant_closure_for_method_calls = "deny""#)
+            .count(),
+        1,
+        "workspace policy must deny redundant method-forwarding closures exactly once"
+    );
+}
+
+#[test]
 fn the_clippy_carve_out_is_still_scoped_to_tests() {
     let cfg = std::fs::read_to_string(repo_root().join("clippy.toml")).unwrap();
     assert!(cfg.contains("allow-unwrap-in-tests = true"));
