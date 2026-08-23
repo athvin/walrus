@@ -639,7 +639,7 @@ duplicated OID literals (Tier 2), the opt-in domain-ID newtype sweep (Tier 3), a
 
 | ☐ | PR | Delivers | Rust rule |
 |---|---|---|---|
-| ☐ | [27.1](./phase-27-rust-naming/pr-27.1-name-as-free.md) | Rename the allocating `LoaderError::as_common` to `to_common` | `name-as-free` |
+| ☐ | [27.1](./phase-27-rust-naming/pr-27.1-name-as-free.md) | Record PR 13.4 as owner of the LoaderError conversion | `name-as-free` |
 | ☐ | [27.2](./phase-27-rust-naming/pr-27.2-name-to-expensive.md) | Give the allocating column projections a `to_` cost signal | `name-to-expensive` |
 | ☐ | [27.3](./phase-27-rust-naming/pr-27.3-name-into-ownership.md) | Rename `BatchBuilder::finish` to `into_record_batch` to signal the move | `name-into-ownership` |
 | ☐ | [27.4](./phase-27-rust-naming/pr-27.4-name-is-has-bool.md) | Prefix the predicate methods with `is_` | `name-is-has-bool` |
