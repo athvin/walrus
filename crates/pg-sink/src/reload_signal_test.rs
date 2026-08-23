@@ -253,3 +253,45 @@ fn whole_txn_stream_abort_drops_every_buffered_signal() {
     pending.on_stream_commit(lsn("0/200"), &waiters); // nothing left to resolve
     assert!(rx.try_recv().is_err());
 }
+
+#[test]
+fn extract_preserves_capacity_and_both_relative_orders() {
+    let mut values = Vec::with_capacity(64);
+    values.extend([1, 2, 3, 4, 5, 6]);
+    let capacity = values.capacity();
+
+    let drained = extract(&mut values, |value| value % 2 == 0);
+
+    assert_eq!(drained, [2, 4, 6]);
+    assert_eq!(values, [1, 3, 5]);
+    assert_eq!(values.capacity(), capacity);
+}
+
+#[test]
+fn extract_all_matches_leaves_reusable_capacity() {
+    let mut values = Vec::with_capacity(64);
+    values.extend([1, 2, 3]);
+    let capacity = values.capacity();
+
+    assert_eq!(extract(&mut values, |_| true), [1, 2, 3]);
+    assert!(values.is_empty());
+    assert_eq!(values.capacity(), capacity);
+}
+
+#[test]
+fn extract_predicate_panic_keeps_capacity_and_unvisited_tail() {
+    let mut values = Vec::with_capacity(64);
+    values.extend([1, 2, 3, 4, 5, 6]);
+    let capacity = values.capacity();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _drained = extract(&mut values, |value| {
+            assert_ne!(*value, 4, "predicate panic seam");
+            value % 2 == 0
+        });
+    }));
+
+    assert!(result.is_err());
+    assert_eq!(values, [1, 3, 4, 5, 6]);
+    assert_eq!(values.capacity(), capacity);
+}
