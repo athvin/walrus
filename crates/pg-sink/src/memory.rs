@@ -13,7 +13,7 @@
 //! (frees memory, slot NOT advanced past the floor) → **pause-poll** (stop requesting WAL) as the last
 //! resort. Freeing memory and advancing the slot stay separable (§1.5).
 
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
 use std::num::NonZeroU64;
 
 /// A pg relation OID (a stable table id).
@@ -81,13 +81,33 @@ impl InflightMeter {
         self.total > self.ceiling_bytes.get()
     }
 
-    /// The largest in-flight `(table, xid)` stream — the best spill candidate.
+    /// A one-shot snapshot of spill candidates, largest first: `(bytes, table_id, xid)`.
+    ///
+    /// `by_stream` remains the authoritative accounting store. This heap is built for one shed
+    /// episode, drained by it, and dropped; it is never kept in sync with [`Self::add`] or
+    /// [`Self::release`], because `BinaryHeap` supports neither priority updates nor arbitrary
+    /// removal. Inside the drain loop priorities only ever fall: it calls `release`, never `add`.
+    /// A popped candidate is therefore only a hint that the caller re-validates against the live
+    /// meter and owner index.
+    ///
+    /// Tuple ordering provides a deterministic total order: bytes, then table id, then xid.
+    #[must_use = "the heap snapshot must be drained to select spill candidates"]
+    pub fn spill_order(&self) -> BinaryHeap<(u64, TableId, u32)> {
+        self.by_stream
+            .iter()
+            .map(|(&(table_id, xid), &bytes)| (bytes, table_id, xid))
+            .collect()
+    }
+
+    /// The largest in-flight `(table, xid)` stream — the best spill candidate. Uses the same
+    /// deterministic tie-break as [`Self::spill_order`].
     #[must_use]
     pub fn largest_open(&self) -> Option<(TableId, u32)> {
         self.by_stream
             .iter()
-            .max_by_key(|&(_, &bytes)| bytes)
-            .map(|(&k, _)| k)
+            .map(|(&(table_id, xid), &bytes)| (bytes, table_id, xid))
+            .max()
+            .map(|(_bytes, table_id, xid)| (table_id, xid))
     }
 }
 

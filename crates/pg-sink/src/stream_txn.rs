@@ -253,10 +253,19 @@ impl<C: Clock + Clone> StreamDemux<C> {
         cache: &RelationCache,
         sink: &ParquetSink,
     ) -> anyhow::Result<()> {
+        if !self.meter.over_ceiling() {
+            return Ok(());
+        }
+
+        // Build one snapshot per shed episode. Inside this loop priorities only ever fall: it calls
+        // `meter.release` through `forget_stream`, never `meter.add`. Each popped tuple is only a
+        // hint and its snapshot byte count is never treated as live accounting.
+        let mut candidates = self.meter.spill_order();
         while self.meter.over_ceiling() {
-            let Some(key @ (oid, sub_xid)) = self.meter.largest_open() else {
+            let Some((_bytes, oid, sub_xid)) = candidates.pop() else {
                 break;
             };
+            let key = (oid, sub_xid);
             let Some(top) = self.owner.get(&key).copied() else {
                 self.forget_stream(key); // stale accounting; nothing buffered
                 continue;
