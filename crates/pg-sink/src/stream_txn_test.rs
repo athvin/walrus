@@ -70,6 +70,108 @@ fn mem_sink() -> ParquetSink {
 }
 
 #[tokio::test]
+async fn spill_resolves_the_owning_txn_without_scanning_buffered_changes() {
+    let (cache, sink) = (cache(), mem_sink());
+    let mut d = demux(105_000);
+
+    for (top, rows) in [(100_u32, 500_u32), (200, 550), (300, 500)] {
+        d.on_stream_start(top, true, Lsn::new(u64::from(top)));
+        for row in 0..rows {
+            let values = vec![
+                TupleValue::Text((top * 10_000 + row).to_string()),
+                TupleValue::Text("n".into()),
+            ];
+            d.claim_stream((42, top), top, estimate_change_bytes(&values));
+            d.open.get_mut(&top).unwrap().push_change(StreamedChange {
+                sub_xid: top,
+                oid: 42,
+                op: Op::Insert,
+                values,
+                lsn: Lsn::new(u64::from(row)),
+            });
+        }
+    }
+
+    assert_eq!(d.owner_len(), 3);
+    d.spill_if_over_ceiling(&cache, &sink).await.unwrap();
+
+    assert_eq!(d.spill_count(), 1);
+    assert_eq!(d.owner_len(), 2);
+    assert_eq!(d.survivor_count(200), 0);
+    for top in [100_u32, 300] {
+        assert_eq!(d.survivor_count(top), 500);
+        let lsns: Vec<Lsn> = d.open[&top]
+            .changes
+            .iter()
+            .map(|change| change.lsn)
+            .collect();
+        assert_eq!(lsns, (0_u64..500).map(Lsn::new).collect::<Vec<_>>());
+    }
+}
+
+#[tokio::test]
+async fn owner_index_is_emptied_by_stream_commit() {
+    let (cache, sink) = (cache(), mem_sink());
+    let mut d = demux(u64::MAX);
+    d.on_stream_start(100, true, Lsn::new(100));
+    for (id, sub_xid, lsn) in [(1, 100, Lsn::new(1)), (2, 101, Lsn::new(2))] {
+        d.on_change(&cache, &insert_id(id, sub_xid), &sink, lsn)
+            .await
+            .unwrap();
+    }
+    assert_eq!(d.owner_len(), 2);
+
+    d.on_stream_commit(100, Lsn::new(900), UtcTimestamp::now(), &cache, &sink)
+        .await
+        .unwrap();
+
+    assert_eq!(d.owner_len(), 0);
+}
+
+#[tokio::test]
+async fn owner_index_is_emptied_by_a_whole_txn_abort() {
+    let (cache, sink) = (cache(), mem_sink());
+    let mut d = demux(u64::MAX);
+    d.on_stream_start(100, true, Lsn::new(100));
+    for (id, sub_xid, lsn) in [(1, 100, Lsn::new(1)), (2, 101, Lsn::new(2))] {
+        d.on_change(&cache, &insert_id(id, sub_xid), &sink, lsn)
+            .await
+            .unwrap();
+    }
+    assert_eq!(d.owner_len(), 2);
+
+    d.on_stream_abort(100, 100, &sink).await;
+
+    assert_eq!(d.owner_len(), 0);
+}
+
+#[tokio::test]
+async fn a_subtxn_abort_leaves_the_index_and_the_buffer_alone() {
+    let (cache, sink) = (cache(), mem_sink());
+    let mut d = demux(u64::MAX);
+    d.on_stream_start(100, true, Lsn::new(100));
+    for (id, sub_xid, lsn) in [(1, 101, Lsn::new(1)), (2, 102, Lsn::new(2))] {
+        d.on_change(&cache, &insert_id(id, sub_xid), &sink, lsn)
+            .await
+            .unwrap();
+    }
+    let owner_len = d.owner_len();
+    let buffered_len = d.open[&100].changes.len();
+
+    d.on_stream_abort(100, 101, &sink).await;
+
+    assert_eq!(d.owner_len(), owner_len);
+    assert_eq!(d.open[&100].changes.len(), buffered_len);
+    assert_eq!(d.survivor_count(100), 1);
+    let files = d
+        .on_stream_commit(100, Lsn::new(900), UtcTimestamp::now(), &cache, &sink)
+        .await
+        .unwrap();
+    assert_eq!(files.iter().map(|file| file.row_count).sum::<u64>(), 1);
+    assert_eq!(d.owner_len(), 0);
+}
+
+#[tokio::test]
 async fn demux_routes_interleaved_xids_to_their_buffers() {
     let (cache, sink) = (cache(), mem_sink());
     let mut d = demux(u64::MAX); // no spill
@@ -285,7 +387,7 @@ async fn low_ceiling_spills_yet_still_excludes_the_aborted_subxid() {
 
 #[tokio::test]
 async fn spill_preserves_commit_order_of_the_surviving_rows() {
-    assert!(include_str!("stream_txn.rs").contains("std::mem::take(&mut txn.changes)"));
+    assert!(include_str!("stream_txn.rs").contains("std::mem::take(&mut self.changes)"));
 
     let (cache, sink) = (cache(), mem_sink());
     let mut d = demux(250);
@@ -303,7 +405,7 @@ async fn spill_preserves_commit_order_of_the_surviving_rows() {
             TupleValue::Text(id.to_string()),
             TupleValue::Text("n".into()),
         ];
-        d.meter.add((42, sub_xid), estimate_change_bytes(&values));
+        d.claim_stream((42, sub_xid), top, estimate_change_bytes(&values));
         d.open.get_mut(&top).unwrap().push_change(StreamedChange {
             sub_xid,
             oid: 42,
@@ -322,3 +424,7 @@ async fn spill_preserves_commit_order_of_the_surviving_rows() {
         "partitioning the spill candidate must preserve survivor commit order"
     );
 }
+
+// Regression note (PR 26.2): the existing HashSet/BTreeSet membership indexes in loader/ddl.rs,
+// pg-sink/preflight.rs, and pg-sink/reload_export.rs stay sets. XID_PREFIXED stays a 7-byte slice
+// scan, and reload_signal/heartbeat/ddl column lookups stay Vec::position because they need indices.
