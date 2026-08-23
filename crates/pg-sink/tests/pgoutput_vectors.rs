@@ -755,7 +755,7 @@ fn relation_marks_only_key_columns() {
     match decode(lookup("relation_orders").hex, false) {
         Message::Relation { relation, xid } => {
             assert_eq!(xid, None, "a non-streamed Relation has no xid prefix");
-            assert_eq!(relation.key_columns(), vec!["id"]);
+            assert_eq!(relation.to_key_columns(), vec!["id"]);
             assert_eq!(relation.replica_identity, ReplicaIdentity::Default);
         }
         other => panic!("expected Relation, got {other:?}"),

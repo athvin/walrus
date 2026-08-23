@@ -101,7 +101,7 @@ fn key_columns_preserve_relation_order() {
             col("name", 25, -1, false),
         ],
     };
-    assert_eq!(rel.key_columns(), vec!["region", "id"]);
+    assert_eq!(rel.to_key_columns(), vec!["region", "id"]);
 
     // A key column declared after a non-key one still keeps relation order.
     let rel2 = PgRelation {
@@ -112,7 +112,7 @@ fn key_columns_preserve_relation_order() {
         ],
         ..rel
     };
-    assert_eq!(rel2.key_columns(), vec!["b", "c"]);
+    assert_eq!(rel2.to_key_columns(), vec!["b", "c"]);
 }
 
 #[test]
