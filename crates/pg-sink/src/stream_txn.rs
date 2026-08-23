@@ -64,6 +64,8 @@ struct StreamedTxn {
     begin_lsn: Lsn,
     /// Buffered (not-yet-spilled) changes in commit order, each tagged with its sub-xid.
     changes: Vec<StreamedChange>,
+    /// Exactly the distinct `(oid, sub_xid)` streams currently represented in `changes`.
+    keys: HashSet<(u32, u32)>,
     /// Speculatively-spilled files, each homogeneous in one sub-xid (droppable on that sub-xid's abort).
     staged: Vec<StagedSpill>,
     /// Sub-xids that rolled back (`Stream Abort {sub != top}`) — excluded from `survivors`.
@@ -75,13 +77,26 @@ impl StreamedTxn {
         StreamedTxn {
             begin_lsn,
             changes: Vec::new(),
+            keys: HashSet::new(),
             staged: Vec::new(),
             aborted: HashSet::new(),
         }
     }
 
     fn push_change(&mut self, change: StreamedChange) {
+        self.keys.insert((change.oid, change.sub_xid));
         self.changes.push(change);
+    }
+
+    /// Move one stream out without cloning and preserve the relative order of rows and survivors.
+    fn take_stream(&mut self, oid: u32, sub_xid: u32) -> Vec<StreamedChange> {
+        let (rows, keep): (Vec<StreamedChange>, Vec<StreamedChange>) =
+            std::mem::take(&mut self.changes)
+                .into_iter()
+                .partition(|c| c.oid == oid && c.sub_xid == sub_xid);
+        self.changes = keep;
+        self.keys.remove(&(oid, sub_xid));
+        rows
     }
 
     fn abort_subtxn(&mut self, sub_xid: u32) {
@@ -107,6 +122,11 @@ impl StreamedTxn {
 #[derive(Debug)]
 pub struct StreamDemux<C = std::sync::Arc<SystemClock>> {
     open: HashMap<u32, StreamedTxn>,
+    /// `(relation_oid, sub_xid)` maps to the one top-level xid buffering that stream.
+    ///
+    /// Postgres xids are process-global, so one stream key has one owner. Invariant:
+    /// `owner[key] == top` iff `open[top].keys` contains `key`; every owner key is metered.
+    owner: HashMap<(u32, u32), u32>,
     /// The top-level xid of the currently-open `Stream Start … Stream Stop` block; changes route here.
     current_top: Option<u32>,
     triggers: BatchTriggers,
@@ -128,6 +148,7 @@ impl<C: Clock + Clone> StreamDemux<C> {
         let sink_instance = sink_instance.into();
         StreamDemux {
             open: HashMap::new(),
+            owner: HashMap::new(),
             current_top: None,
             triggers,
             clock,
@@ -155,6 +176,19 @@ impl<C: Clock + Clone> StreamDemux<C> {
     /// `Stream Stop`: the block ended (the txn may resume with a later segment).
     pub const fn on_stream_stop(&mut self) {
         self.current_top = None;
+    }
+
+    /// Claim one buffered row's bytes and record or confirm the stream's unique owner.
+    fn claim_stream(&mut self, key: (u32, u32), top: u32, bytes: u64) {
+        self.meter.add(key, bytes);
+        let prior = self.owner.insert(key, top);
+        debug_assert!(prior.is_none() || prior == Some(top));
+    }
+
+    /// Forget a stream in the owner index and meter as one operation.
+    fn forget_stream(&mut self, key: (u32, u32)) {
+        self.owner.remove(&key);
+        self.meter.release(key);
     }
 
     /// A streamed change: buffer it against the current top-level xid, tagged with its sub-xid, and
@@ -208,7 +242,7 @@ impl<C: Clock + Clone> StreamDemux<C> {
             values,
             lsn,
         });
-        self.meter.add((oid, sub_xid), bytes);
+        self.claim_stream((oid, sub_xid), top, bytes);
         self.spill_if_over_ceiling(cache, sink).await
     }
 
@@ -220,21 +254,11 @@ impl<C: Clock + Clone> StreamDemux<C> {
         sink: &ParquetSink,
     ) -> anyhow::Result<()> {
         while self.meter.over_ceiling() {
-            let Some((oid, sub_xid)) = self.meter.largest_open() else {
+            let Some(key @ (oid, sub_xid)) = self.meter.largest_open() else {
                 break;
             };
-            // Find the top-level txn holding this (table, sub-xid) and drain exactly those rows.
-            let Some(top) = self
-                .open
-                .iter()
-                .find(|(_, t)| {
-                    t.changes
-                        .iter()
-                        .any(|c| c.oid == oid && c.sub_xid == sub_xid)
-                })
-                .map(|(&k, _)| k)
-            else {
-                self.meter.release((oid, sub_xid)); // stale accounting; nothing buffered
+            let Some(top) = self.owner.get(&key).copied() else {
+                self.forget_stream(key); // stale accounting; nothing buffered
                 continue;
             };
             let (triggers, clock, epoch, instance) = (
@@ -245,20 +269,13 @@ impl<C: Clock + Clone> StreamDemux<C> {
             );
             let (begin, rows) = {
                 let Some(txn) = self.open.get_mut(&top) else {
-                    // `top` was just derived from `self.open`'s own keys, so this is unreachable;
-                    // skip this speculative-spill iteration rather than panic.
+                    // A stale owner must be forgotten so the over-ceiling loop cannot spin.
+                    self.forget_stream(key);
                     continue;
                 };
-                // Move the buffer out, split it in commit order, and put the survivors back.
-                // `partition` preserves the relative order of both halves.
-                let (rows, keep): (Vec<StreamedChange>, Vec<StreamedChange>) =
-                    std::mem::take(&mut txn.changes)
-                        .into_iter()
-                        .partition(|c| c.oid == oid && c.sub_xid == sub_xid);
-                txn.changes = keep;
-                (txn.begin_lsn, rows)
+                (txn.begin_lsn, txn.take_stream(oid, sub_xid))
             };
-            self.meter.release((oid, sub_xid));
+            self.forget_stream(key);
             let Some(cached) = cache.latest_for(oid) else {
                 continue; // shape not cached (shouldn't happen mid-stream) — nothing to spill
             };
@@ -492,10 +509,14 @@ impl<C: Clock + Clone> StreamDemux<C> {
     }
 
     fn release_txn_meter(&mut self, txn: &StreamedTxn) {
-        let keys: HashSet<(u32, u32)> = txn.changes.iter().map(|c| (c.oid, c.sub_xid)).collect();
-        for key in keys {
-            self.meter.release(key);
+        for &key in &txn.keys {
+            self.forget_stream(key);
         }
+    }
+
+    #[cfg(test)]
+    fn owner_len(&self) -> usize {
+        self.owner.len()
     }
 
     #[cfg(test)]
