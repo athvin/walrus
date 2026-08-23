@@ -485,7 +485,7 @@ fn render(m: &Message) -> String {
             };
             let rels = relations
                 .iter()
-                .map(|r| r.to_string())
+                .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("TRUNCATE      {pre}opts={opts_str} rels=[{rels}]")

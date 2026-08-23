@@ -179,7 +179,7 @@ fn interval_emits_three_signed_int_fields() {
             ("dur_micros", &DataType::Int64),
         ]
     );
-    assert!(fields.iter().all(|f| f.is_nullable()));
+    assert!(fields.iter().all(Field::is_nullable));
 }
 
 #[test]

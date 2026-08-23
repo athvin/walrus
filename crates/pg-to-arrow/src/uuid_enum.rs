@@ -58,7 +58,7 @@ pub const fn is_enum_oid(type_oid: u32) -> bool {
 /// Returns [`Error::ValueParse`] when `text` is not a canonical UUID accepted by `uuid::Uuid`.
 pub fn parse_uuid_bytes(text: &str) -> Result<[u8; 16], Error> {
     uuid::Uuid::parse_str(text)
-        .map(|u| u.into_bytes())
+        .map(uuid::Uuid::into_bytes)
         .map_err(|_| Error::value_parse("uuid", text, "uuid"))
 }
 

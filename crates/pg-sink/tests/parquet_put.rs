@@ -140,7 +140,13 @@ async fn object_reads_back_with_micros_temporals_and_values() {
         .unwrap()
         .map(|r| r.unwrap())
         .collect();
-    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    assert_eq!(
+        batches
+            .iter()
+            .map(arrow::record_batch::RecordBatch::num_rows)
+            .sum::<usize>(),
+        1
+    );
 
     let schema = batches[0].schema();
     // §2.1: created_at survives as a MICROS timestamp carrying UTC (what DuckDB reads as tz-aware).

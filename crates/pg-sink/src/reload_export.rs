@@ -185,7 +185,7 @@ impl ChunkExporter {
         let registry_keys: std::collections::BTreeSet<&str> =
             rel.key_columns().into_iter().collect();
         let live_keys: std::collections::BTreeSet<&str> =
-            pk_cols.iter().map(|c| c.as_str()).collect();
+            pk_cols.iter().map(String::as_str).collect();
         if registry_keys != live_keys {
             // The live PK drifted from the registered shape (a between-attempts DDL): stop
             // without failing the row — PR 6.8's restart-on-DDL is the mechanism that reissues

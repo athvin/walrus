@@ -956,7 +956,7 @@ fn parse_bytea(s: &str, col: &str) -> Result<Vec<u8>, Error> {
 fn rfc3339_micros(s: &str) -> Option<i64> {
     s.parse::<jiff::Timestamp>()
         .ok()
-        .map(|t| t.as_microsecond())
+        .map(jiff::Timestamp::as_microsecond)
 }
 
 /// `"2024-01-02"` → days since 1970-01-01, using a cleared and reused RFC-3339 scratch buffer.
