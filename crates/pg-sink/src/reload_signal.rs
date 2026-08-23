@@ -292,11 +292,14 @@ impl PendingSignals {
     }
 }
 
-/// Drain every element matching `pred` out of `v`, preserving order.
+/// Drain every element matching `pred` out of `v`, preserving both halves' relative order and
+/// retaining `v`'s allocation for the next reload-signal transaction.
+///
+/// PR 11.7 made this linear with `mem::take` + `partition`; `extract_if` keeps that complexity and
+/// ordering while avoiding a fresh survivor buffer. `Vec` remains correct because callers drain by
+/// predicate, never from the front of a queue.
 fn extract<T>(v: &mut Vec<T>, mut pred: impl FnMut(&T) -> bool) -> Vec<T> {
-    let (out, keep) = std::mem::take(v).into_iter().partition(|t| pred(t));
-    *v = keep;
-    out
+    v.extract_if(.., |t| pred(t)).collect()
 }
 
 #[cfg(test)]

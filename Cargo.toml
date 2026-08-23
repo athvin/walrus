@@ -34,6 +34,9 @@ missing_copy_implementations = "deny"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
+# Phase 26 keeps ordered sequences contiguous. `linkedlist` is pedantic (outside `clippy::all`),
+# so this named deny needs no group-priority adjustment.
+linkedlist = "deny"
 # `redundant_closure_for_method_calls` is pedantic (outside `clippy::all`), so no `priority`
 # juggling is needed. Prefer the direct method item over a non-capturing forwarding adapter.
 redundant_closure_for_method_calls = "deny"
