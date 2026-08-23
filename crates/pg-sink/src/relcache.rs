@@ -69,7 +69,7 @@ impl RelationCache {
 
     /// The cached relations in ascending `(relation_oid, schema_version)` key order. The map key is
     /// a projection of each value, so iteration yields values directly.
-    #[must_use]
+    #[must_use = "iterators are lazy and do nothing unless consumed"]
     pub fn iter(&self) -> btree_map::Values<'_, (u32, SchemaVersionNo), Arc<CachedRelation>> {
         <&Self as IntoIterator>::into_iter(self)
     }
