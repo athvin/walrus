@@ -338,7 +338,9 @@ impl<C: Clock + Clone> DecodeLoop<'_, C> {
                                                     "idle heartbeat advanced confirmed_flush"
                                                 );
                                             }
-                                            health.set_degraded(heartbeat.is_degraded(Instant::now()));
+                                            health.set_degraded(
+                                                heartbeat.is_degraded(Instant::now()),
+                                            );
                                         }
                                     }
                                     // --- Large-transaction streaming (§1.6, PR 2.30). A txn over

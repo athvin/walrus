@@ -165,7 +165,10 @@ fn release_after_saturation_does_not_wrap_the_total() {
     m.add((2, 200), u64::MAX);
     m.release((1, 100));
     assert_eq!(m.total(), u64::MAX);
-    assert!(m.is_over_ceiling(), "the second saturated stream remains open");
+    assert!(
+        m.is_over_ceiling(),
+        "the second saturated stream remains open"
+    );
     m.release((2, 200));
     assert_eq!(m.total(), 0);
     assert!(!m.is_over_ceiling());
