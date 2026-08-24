@@ -176,7 +176,7 @@ async fn idle_publication_beats_and_advances_confirmed_flush() {
 
     // A completed round-trip leaves the sink un-degraded.
     assert!(
-        !heartbeat.degraded(Instant::now()),
+        !heartbeat.is_degraded(Instant::now()),
         "a fresh round-trip is not degraded"
     );
 

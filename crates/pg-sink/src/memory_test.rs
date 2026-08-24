@@ -9,16 +9,16 @@ fn over_ceiling_when_sum_across_streams_exceeds_budget() {
     let mut m = InflightMeter::new(nz(1000));
     m.add((1, 100), 400);
     m.add((2, 100), 400);
-    assert!(!m.over_ceiling(), "800 <= 1000");
+    assert!(!m.is_over_ceiling(), "800 <= 1000");
     m.add((1, 200), 300); // total 1100 across THREE streams
     assert!(
-        m.over_ceiling(),
+        m.is_over_ceiling(),
         "the AGGREGATE exceeds the ceiling, not any single stream"
     );
     assert_eq!(m.total(), 1100);
     m.release((1, 100));
     assert_eq!(m.total(), 700);
-    assert!(!m.over_ceiling());
+    assert!(!m.is_over_ceiling());
 }
 
 #[test]
@@ -155,7 +155,7 @@ fn add_saturates_at_u64_max_and_stays_over_ceiling() {
     m.add((1, 100), u64::MAX);
     m.add((1, 100), 1);
     assert_eq!(m.total(), u64::MAX);
-    assert!(m.over_ceiling());
+    assert!(m.is_over_ceiling());
 }
 
 #[test]
@@ -165,8 +165,8 @@ fn release_after_saturation_does_not_wrap_the_total() {
     m.add((2, 200), u64::MAX);
     m.release((1, 100));
     assert_eq!(m.total(), u64::MAX);
-    assert!(m.over_ceiling(), "the second saturated stream remains open");
+    assert!(m.is_over_ceiling(), "the second saturated stream remains open");
     m.release((2, 200));
     assert_eq!(m.total(), 0);
-    assert!(!m.over_ceiling());
+    assert!(!m.is_over_ceiling());
 }

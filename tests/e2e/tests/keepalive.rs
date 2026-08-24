@@ -71,7 +71,7 @@ async fn stalled_flush_keeps_connection_without_advancing() {
         "walsender stays connected past wal_sender_timeout during the stall (keepalive)"
     );
     assert!(
-        h.sink_running(),
+        h.is_sink_running(),
         "the sink did not exit — the replication connection was not severed"
     );
     assert!(

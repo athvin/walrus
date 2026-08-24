@@ -67,14 +67,14 @@ fn roundtrip_recorded_when_returned_seq_matches_pending() {
     let now = Instant::now();
     s.on_beat_sent(5, now);
     assert!(
-        s.degraded(now + Duration::from_secs(31)),
+        s.is_degraded(now + Duration::from_secs(31)),
         "un-returned past deadline → degraded"
     );
     // A returned seq ≥ pending closes it (coalesced beat: 6 ≥ 5).
     s.observe_return(6, now + Duration::from_secs(1));
     assert_eq!(s.pending_seq, None);
     assert!(
-        !s.degraded(now + Duration::from_secs(31)),
+        !s.is_degraded(now + Duration::from_secs(31)),
         "round-trip clears degraded"
     );
 }
@@ -83,14 +83,14 @@ fn roundtrip_recorded_when_returned_seq_matches_pending() {
 fn degraded_true_only_after_deadline_without_roundtrip() {
     let mut s = BeatState::new(cfg());
     let now = Instant::now();
-    assert!(!s.degraded(now), "no beat outstanding → never degraded");
+    assert!(!s.is_degraded(now), "no beat outstanding → never degraded");
     s.on_beat_sent(1, now);
     assert!(
-        !s.degraded(now + Duration::from_secs(29)),
+        !s.is_degraded(now + Duration::from_secs(29)),
         "within deadline → not yet"
     );
     assert!(
-        s.degraded(now + Duration::from_secs(31)),
+        s.is_degraded(now + Duration::from_secs(31)),
         "past deadline, un-returned → degraded"
     );
 }
