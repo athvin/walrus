@@ -77,7 +77,7 @@ impl InflightMeter {
     }
 
     #[must_use = "the ceiling check drives shedding — ignoring it silently disables backpressure"]
-    pub const fn over_ceiling(&self) -> bool {
+    pub const fn is_over_ceiling(&self) -> bool {
         self.total > self.ceiling_bytes.get()
     }
 
@@ -126,7 +126,7 @@ pub enum ShedAction {
 /// stream, then pause. `None` when under the ceiling.
 #[must_use]
 pub fn decide(meter: &InflightMeter, has_committed: bool) -> Option<ShedAction> {
-    if !meter.over_ceiling() {
+    if !meter.is_over_ceiling() {
         return None;
     }
     if has_committed {

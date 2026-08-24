@@ -81,7 +81,7 @@ pub enum DestructiveChange {
 
 /// Whether the two columns map to the SAME DuckDB type (the only thing an `ALTER COLUMN TYPE` would
 /// change) — a typmod-only tweak (e.g. `varchar(10)→varchar(20)`, both DuckDB `VARCHAR`) is a no-op.
-fn same_duck_type(a: &PgColumn, b: &PgColumn) -> bool {
+fn is_same_duck_type(a: &PgColumn, b: &PgColumn) -> bool {
     duck_type(a.type_oid) == duck_type(b.type_oid)
 }
 
@@ -153,7 +153,7 @@ pub fn diff(old: &SchemaVersion, new: &SchemaVersion) -> Result<SchemaDiff, Load
                 to: n.name.clone(),
             });
         }
-        if !same_duck_type(o, n) {
+        if !is_same_duck_type(o, n) {
             if is_lossless_widen(o, n) {
                 d.additive.push(AdditiveChange::WidenColumn {
                     position: i,

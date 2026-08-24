@@ -253,7 +253,7 @@ impl<C: Clock + Clone> StreamDemux<C> {
         cache: &RelationCache,
         sink: &ParquetSink,
     ) -> anyhow::Result<()> {
-        if !self.meter.over_ceiling() {
+        if !self.meter.is_over_ceiling() {
             return Ok(());
         }
 
@@ -261,7 +261,7 @@ impl<C: Clock + Clone> StreamDemux<C> {
         // `meter.release` through `forget_stream`, never `meter.add`. Each popped tuple is only a
         // hint and its snapshot byte count is never treated as live accounting.
         let mut candidates = self.meter.spill_order();
-        while self.meter.over_ceiling() {
+        while self.meter.is_over_ceiling() {
             let Some((_bytes, oid, sub_xid)) = candidates.pop() else {
                 break;
             };

@@ -168,7 +168,7 @@ impl BeatState {
 
     /// Non-gating: an outstanding beat that has not returned within `roundtrip_deadline`. Under steady
     /// traffic (no pending beat) this is always `false` — the stream itself proves liveness.
-    fn degraded(&self, now: Instant) -> bool {
+    fn is_degraded(&self, now: Instant) -> bool {
         matches!(
             (self.pending_seq, self.last_beat),
             (Some(_), Some(sent))
@@ -262,10 +262,10 @@ impl Heartbeat {
         self.state.observe_return(beat_seq, now);
     }
 
-    /// Non-gating health signal (see `BeatState::degraded`).
+    /// Non-gating health signal (see `BeatState::is_degraded`).
     #[must_use]
-    pub fn degraded(&self, now: Instant) -> bool {
-        self.state.degraded(now)
+    pub fn is_degraded(&self, now: Instant) -> bool {
+        self.state.is_degraded(now)
     }
 }
 

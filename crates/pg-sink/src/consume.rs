@@ -170,7 +170,7 @@ impl<C: Clock + Clone> DecodeLoop<'_, C> {
                                 Ok(None) => {}
                                 Err(e) => tracing::warn!(error = %e, "heartbeat beat failed"),
                             }
-                            health.set_degraded(heartbeat.degraded(now));
+                            health.set_degraded(heartbeat.is_degraded(now));
                         }
                         res = &mut frame => break FrameEvent::Frame(res),
                     }
@@ -338,7 +338,7 @@ impl<C: Clock + Clone> DecodeLoop<'_, C> {
                                                     "idle heartbeat advanced confirmed_flush"
                                                 );
                                             }
-                                            health.set_degraded(heartbeat.degraded(Instant::now()));
+                                            health.set_degraded(heartbeat.is_degraded(Instant::now()));
                                         }
                                     }
                                     // --- Large-transaction streaming (§1.6, PR 2.30). A txn over

@@ -338,7 +338,7 @@ impl Harness {
     /// makes a table worker return `Err`, which cancels the token and drains the whole loader — so
     /// this flips to `false`. PR 6.12 waits on it to observe the quarantine before requesting the
     /// recovery reload.
-    pub fn loader_running(&mut self) -> bool {
+    pub fn is_loader_running(&mut self) -> bool {
         matches!(self.loader.try_wait(), Ok(None))
     }
 
@@ -613,7 +613,7 @@ impl Harness {
 
     /// Whether the sink child is still running (has not exited) — proof the walsender did not sever it
     /// (a severed replication connection makes the sink's `next()` error and the process exit).
-    pub fn sink_running(&mut self) -> bool {
+    pub fn is_sink_running(&mut self) -> bool {
         matches!(self.sink.try_wait(), Ok(None))
     }
 
