@@ -262,12 +262,19 @@ impl BatchBuilder {
         self.rows == 0
     }
 
-    /// Finish all builders into arrays and assemble the schema-checked `RecordBatch`.
+    /// Consume the builder, finishing all column builders into arrays and assembling the
+    /// schema-checked `RecordBatch`.
+    ///
+    /// `into_`, not `finish`: arrow-rs's [`ArrayBuilder::finish`] takes `&mut self` and leaves the
+    /// builder reusable, but this takes `self` by value and spends it — one `BatchBuilder` per
+    /// sealed micro-batch. The names differ because the ownership does. Callers that hold the
+    /// builder behind a `&mut` (see `pg_sink::batch::TableBatcher::seal`) must `mem::replace` it out
+    /// first; the name is what tells them so.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Arrow`] if the finished arrays do not match the planned schema or row count.
-    pub fn finish(mut self) -> Result<RecordBatch, Error> {
+    pub fn into_record_batch(mut self) -> Result<RecordBatch, Error> {
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(self.builders.0.len() + 1);
         for builder in &mut self.builders.0 {
             arrays.push(builder.finish());

@@ -267,7 +267,7 @@ impl<C: Clock> TableBatcher<C> {
             return Err(BatchError::Unassigned);
         };
         let builder = std::mem::replace(&mut self.builder, BatchBuilder::new(&self.rel.relation)?);
-        let record_batch = builder.finish()?;
+        let record_batch = builder.into_record_batch()?;
         let sealed = SealedBatch {
             record_batch,
             schema: self.rel.relation.schema.clone(),

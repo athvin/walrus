@@ -102,7 +102,7 @@ fn gen_parquet(rel: &PgRelation) -> tempfile::NamedTempFile {
     for i in 0..ROWS {
         bb.append_row(&row_values(rel, i), &meta(i)).unwrap();
     }
-    let bytes = write_parquet_bytes(&bb.finish().unwrap()).unwrap();
+    let bytes = write_parquet_bytes(&bb.into_record_batch().unwrap()).unwrap();
     let mut f = tempfile::Builder::new()
         .suffix(".parquet")
         .tempfile()

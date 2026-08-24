@@ -6,11 +6,11 @@
 //! PR 5.4 — criterion micro-benches for the Arrow batch-building hot path.
 //!
 //! Measures `BatchBuilder::append_row` across Tier-1 shapes (narrow/wide/text-heavy) and a Tier-2
-//! fan-out shape (interval + range + timetz), plus a whole-batch `finish()`. It also isolates the
-//! per-row `serde_json::to_string(meta)` cost that the design flags as a suspect: two identical
-//! micro-benches append the meta column, one serialising the `SinkMeta` per row and one appending a
-//! pre-serialised constant, so the JSON cost reads as a direct subtraction. No production code is
-//! touched — this is the baseline PR 5.7 optimises against.
+//! fan-out shape (interval + range + timetz), plus a whole-batch `into_record_batch()`. It also
+//! isolates the per-row `serde_json::to_string(meta)` cost that the design flags as a suspect: two
+//! identical micro-benches append the meta column, one serialising the `SinkMeta` per row and one
+//! appending a pre-serialised constant, so the JSON cost reads as a direct subtraction. No
+//! production code is touched — this is the baseline PR 5.7 optimises against.
 //!
 //! Run: `cargo bench -p pg-to-arrow --bench batch` (or `just bench`).
 
@@ -154,7 +154,8 @@ fn bench_append_row(c: &mut Criterion) {
     g.finish();
 }
 
-/// The whole-batch cost: append `ROWS` rows (setup, untimed) then `finish()` → RecordBatch (timed).
+/// The whole-batch cost: append `ROWS` rows (setup, untimed) then `into_record_batch()` →
+/// RecordBatch (timed).
 fn bench_finish(c: &mut Criterion) {
     let m = meta();
     let mut g = c.benchmark_group("arrow/finish");
@@ -171,7 +172,7 @@ fn bench_finish(c: &mut Criterion) {
                     }
                     bb
                 },
-                |bb| black_box(bb.finish().unwrap()),
+                |bb| black_box(bb.into_record_batch().unwrap()),
                 BatchSize::SmallInput,
             );
         });
