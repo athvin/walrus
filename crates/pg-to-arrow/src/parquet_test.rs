@@ -55,7 +55,7 @@ fn round_trips_a_batch_through_parquet() {
         let vals: Vec<TupleValue> = v.iter().map(|s| TupleValue::Text(s.to_string())).collect();
         b.append_row(&vals, &meta()).unwrap();
     }
-    let batch = b.finish().unwrap();
+    let batch = b.into_record_batch().unwrap();
 
     let bytes = write_parquet_bytes(&batch).unwrap();
     let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes))

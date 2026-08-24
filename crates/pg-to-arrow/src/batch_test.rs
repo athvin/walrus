@@ -76,7 +76,7 @@ fn float8_nan_and_infinities_survive_the_text_parse_path() {
             .unwrap();
     }
 
-    let batch = builder.finish().unwrap();
+    let batch = builder.into_record_batch().unwrap();
     let values = batch
         .column(0)
         .as_primitive::<arrow::datatypes::Float64Type>();
@@ -94,7 +94,7 @@ fn builds_a_batch_from_an_orders_insert() {
     )
     .unwrap();
     assert_eq!(b.len(), 1);
-    let batch = b.finish().unwrap();
+    let batch = b.into_record_batch().unwrap();
 
     assert_eq!(batch.num_columns(), 5); // 4 data + meta
     assert_eq!(*batch.schema(), super::build_schema(&orders()).unwrap());
@@ -134,7 +134,7 @@ fn null_value_sets_validity_false() {
         TupleValue::Null,
     ];
     b.append_row(&vals, &meta(vec![])).unwrap();
-    let batch = b.finish().unwrap();
+    let batch = b.into_record_batch().unwrap();
     let note = batch
         .column(3)
         .as_any()
@@ -163,7 +163,7 @@ fn binary_column_accepts_binary_text_and_null() {
         .append_row(&[TupleValue::Null], &meta(vec![]))
         .unwrap();
 
-    let batch = builder.finish().unwrap();
+    let batch = builder.into_record_batch().unwrap();
     let payload = batch
         .column(0)
         .as_any()
@@ -193,7 +193,7 @@ fn unchanged_toast_appends_null_and_is_listed_in_meta() {
     ];
     b.append_row(&vals, &meta(vec!["note".to_string()]))
         .unwrap();
-    let batch = b.finish().unwrap();
+    let batch = b.into_record_batch().unwrap();
     let note = batch
         .column(3)
         .as_any()
@@ -248,7 +248,7 @@ fn meta_column_holds_serialized_sink_meta_json() {
         &m,
     )
     .unwrap();
-    let batch = b.finish().unwrap();
+    let batch = b.into_record_batch().unwrap();
     let meta_col = batch
         .column(4)
         .as_any()
@@ -290,7 +290,7 @@ fn interval_fans_out_to_three_builders() {
         &meta(vec![]),
     )
     .unwrap();
-    let batch = b.finish().unwrap();
+    let batch = b.into_record_batch().unwrap();
     assert_eq!(batch.num_columns(), 4); // months + days + micros + meta
     let months = batch
         .column(0)
@@ -321,7 +321,7 @@ fn timetz_fans_out_to_two_builders() {
         &meta(vec![]),
     )
     .unwrap();
-    let batch = b.finish().unwrap();
+    let batch = b.into_record_batch().unwrap();
     assert_eq!(batch.num_columns(), 3); // micros + offset + meta
     let micros = batch
         .column(0)
@@ -342,7 +342,7 @@ fn interval_null_maps_all_three_columns_null() {
     let rel = one_col_rel("dur", oids::INTERVAL, -1);
     let mut b = BatchBuilder::new(&rel).unwrap();
     b.append_row(&[TupleValue::Null], &meta(vec![])).unwrap();
-    let batch = b.finish().unwrap();
+    let batch = b.into_record_batch().unwrap();
     let months = batch
         .column(0)
         .as_any()
@@ -370,7 +370,7 @@ fn range_fans_out_to_five_builders() {
     let mut b = BatchBuilder::new(&rel).unwrap();
     b.append_row(&[TupleValue::Text("[1,10)".to_string())], &meta(vec![]))
         .unwrap();
-    let batch = b.finish().unwrap();
+    let batch = b.into_record_batch().unwrap();
     assert_eq!(batch.num_columns(), 6); // 5 range cols + meta
     let lower = batch
         .column(0)
@@ -397,7 +397,7 @@ fn range_empty_unbounded_and_null_are_three_distinct_states() {
     b.append_row(&[TupleValue::Text("(,10)".to_string())], &meta(vec![]))
         .unwrap(); // row 1: unbounded lower
     b.append_row(&[TupleValue::Null], &meta(vec![])).unwrap(); // row 2: whole NULL
-    let batch = b.finish().unwrap();
+    let batch = b.into_record_batch().unwrap();
     let lower = batch
         .column(0)
         .as_primitive::<arrow::datatypes::Int32Type>();
@@ -425,7 +425,7 @@ fn multirange_builds_list_of_structs_empty_vs_null() {
     b.append_row(&[TupleValue::Text("{}".to_string())], &meta(vec![]))
         .unwrap(); // row 1: empty list
     b.append_row(&[TupleValue::Null], &meta(vec![])).unwrap(); // row 2: NULL list
-    let batch = b.finish().unwrap();
+    let batch = b.into_record_batch().unwrap();
     let list = batch
         .column(0)
         .as_any()
@@ -451,7 +451,7 @@ fn geometric_point_round_trips_and_nulls() {
     b.append_row(&[TupleValue::Text("(1,2)".to_string())], &meta(vec![]))
         .unwrap();
     b.append_row(&[TupleValue::Null], &meta(vec![])).unwrap();
-    let batch = b.finish().unwrap();
+    let batch = b.into_record_batch().unwrap();
     let s = batch
         .column(0)
         .as_any()
@@ -473,7 +473,7 @@ fn geometric_box_nests_two_points() {
         &meta(vec![]),
     )
     .unwrap();
-    let batch = b.finish().unwrap();
+    let batch = b.into_record_batch().unwrap();
     let s = batch
         .column(0)
         .as_any()
@@ -509,7 +509,7 @@ fn geometric_path_open_vs_closed_only_differs_by_is_closed() {
         &meta(vec![]),
     )
     .unwrap(); // closed
-    let batch = b.finish().unwrap();
+    let batch = b.into_record_batch().unwrap();
     let s = batch
         .column(0)
         .as_any()
@@ -533,7 +533,7 @@ fn geometric_polygon_is_list_of_points() {
         &meta(vec![]),
     )
     .unwrap();
-    let batch = b.finish().unwrap();
+    let batch = b.into_record_batch().unwrap();
     let list = batch
         .column(0)
         .as_any()

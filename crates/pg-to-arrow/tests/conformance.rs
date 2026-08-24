@@ -55,7 +55,7 @@ fn one_col_batch(oid: u32, typmod: i32, value: &str) -> arrow::array::RecordBatc
     let mut b = BatchBuilder::new(&rel).unwrap();
     b.append_row(&[TupleValue::Text(value.to_string())], &meta())
         .unwrap();
-    b.finish().unwrap()
+    b.into_record_batch().unwrap()
 }
 
 /// Write `bytes` to a temp `.parquet`, then run `sql` (with `{p}` = `read_parquet('<path>')`) in
@@ -219,7 +219,7 @@ fn interval_null_sets_all_three_columns_null() {
     let rel = one_col_rel(oids::INTERVAL, -1);
     let mut b = BatchBuilder::new(&rel).unwrap();
     b.append_row(&[TupleValue::Null], &meta()).unwrap();
-    let bytes = write_parquet_bytes(&b.finish().unwrap()).unwrap();
+    let bytes = write_parquet_bytes(&b.into_record_batch().unwrap()).unwrap();
     let rows = read_parquet_rows(
         &bytes,
         "SELECT 'x', (c_months IS NULL AND c_days IS NULL AND c_micros IS NULL)::VARCHAR FROM {p}",
@@ -269,7 +269,7 @@ fn timetz_offset_sign_roundtrips() {
 fn one_col_value_batch(oid: u32, typmod: i32, value: TupleValue) -> arrow::array::RecordBatch {
     let mut b = BatchBuilder::new(&one_col_rel(oid, typmod)).unwrap();
     b.append_row(&[value], &meta()).unwrap();
-    b.finish().unwrap()
+    b.into_record_batch().unwrap()
 }
 
 #[test]

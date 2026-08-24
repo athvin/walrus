@@ -89,7 +89,7 @@ fn sealed(lsn_end: &str) -> SealedBatch {
     )
     .unwrap();
     SealedBatch {
-        record_batch: bb.finish().unwrap(),
+        record_batch: bb.into_record_batch().unwrap(),
         schema: "public".to_string(),
         table: "orders".to_string(),
         schema_version: common::SchemaVersionNo(1),
