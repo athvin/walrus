@@ -643,7 +643,7 @@ duplicated OID literals (Tier 2), the opt-in domain-ID newtype sweep (Tier 3), a
 | ☐ | [27.2](./phase-27-rust-naming/pr-27.2-name-to-expensive.md) | Give the allocating column projections a `to_` cost signal | `name-to-expensive` |
 | ☐ | [27.3](./phase-27-rust-naming/pr-27.3-name-into-ownership.md) | Rename `BatchBuilder::finish` to `into_record_batch` to signal the move | `name-into-ownership` |
 | ☐ | [27.4](./phase-27-rust-naming/pr-27.4-name-is-has-bool.md) | Prefix the predicate methods with `is_` | `name-is-has-bool` |
-| ☐ | [27.5](./phase-27-rust-naming/pr-27.5-name-lifetime-short.md) | Elide the two nameable-but-pointless sqlx encoder lifetimes and deny `elidable_lifetime_names` | `name-lifetime-short` |
+| ☐ | [27.5](./phase-27-rust-naming/pr-27.5-name-lifetime-short.md) | Record PR 9.6 as owner of SQLx encoder lifetime elision | `name-lifetime-short` |
 | ☐ | [27.6](./phase-27-rust-naming/pr-27.6-name-iter-method.md) | Give `PgRelation` `iter()` and `iter_mut()` over its columns | `name-iter-method` |
 | ☐ | [27.7](./phase-27-rust-naming/pr-27.7-name-iter-convention.md) | Implement `IntoIterator` for `PgRelation` and its two reference forms | `name-iter-convention` |
 | ☐ | [27.8](./phase-27-rust-naming/pr-27.8-name-iter-type-match.md) | Name the `PgRelation` iterator types `Iter`, `IterMut`, `IntoIter` | `name-iter-type-match` |
