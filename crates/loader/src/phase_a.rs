@@ -34,6 +34,10 @@ pub struct TableCtx {
     pub series: String,
     /// The table shape — the transform (Phase B) renders its SQL from this.
     pub rel: PgRelation,
+    /// The `.duckdb` writer connection — the ownership fence DuckDB itself enforces. Its **drop** is
+    /// observable across processes: dropping this `TableCtx` closes the file and frees the writer
+    /// lock, which is the "close" step of the drain contract (see [`crate::shutdown`]). `main`
+    /// therefore joins every worker — dropping each ctx — before releasing the leases.
     pub db: TableDb,
     pub state: Arc<LoaderState>,
     /// Files claimed per cycle.

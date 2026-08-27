@@ -198,7 +198,13 @@ async fn pipeline(
         }))
         .await;
 
-    tracing::info!("SIGTERM: releasing leases and draining");
+    // DROP ORDER, load-bearing (see `loader::shutdown` steps 4-5): every `h.await` above ended a
+    // worker task, which dropped its `TableCtx` — and with it the `TableDb` whose drop closes the
+    // `.duckdb` and releases DuckDB's writer lock. Only then is the lease released, so the two fences
+    // come off in the reverse of their bootstrap order (lease → file lock, so file lock → lease).
+    // Handing a replacement the lease first would only cost it a failed open and a retry, but this
+    // order leaves no such window — so keep `release_all` after the joins, never beside them.
+    tracing::info!("workers drained (files closed); releasing leases");
     if let Err(error) = epoch_watch.await {
         tracing::error!(%error, "epoch watch task panicked");
     }
