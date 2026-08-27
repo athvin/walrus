@@ -27,7 +27,7 @@
 
 use anyhow::{Context, anyhow, bail};
 use bytes::{Bytes, BytesMut};
-use common::{Lsn, PG_EPOCH_UNIX_SECS};
+use common::{Lsn, PG_EPOCH_UNIX_MICROS};
 use std::marker::PhantomData;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -544,9 +544,10 @@ fn pg_epoch_micros() -> i64 {
     let unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
+    // The offset is `common`'s derived constant, not a product recomputed per feedback frame.
     i64::try_from(unix.as_micros())
         .unwrap_or(i64::MAX)
-        .saturating_sub(PG_EPOCH_UNIX_SECS * 1_000_000)
+        .saturating_sub(PG_EPOCH_UNIX_MICROS)
 }
 
 fn build_startup(user: &str, database: &str) -> anyhow::Result<Vec<u8>> {

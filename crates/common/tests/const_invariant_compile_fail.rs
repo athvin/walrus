@@ -25,9 +25,19 @@ fn production_sites_contain_inline_const_guards() {
             "MAX_STARTUP_DEADLINE must be nonzero",
         ),
         (
+            "crates/pg-sink/src/config.rs",
+            include_str!("../../pg-sink/src/config.rs"),
+            "MAX_DURATION must be nonzero",
+        ),
+        (
             "crates/pg-sink/src/health.rs",
             include_str!("../../pg-sink/src/health.rs"),
             "Phase::Bootstrapping must stay byte 0",
+        ),
+        (
+            "crates/loader/src/health.rs",
+            include_str!("../../loader/src/health.rs"),
+            "LoaderPhase::Quarantined must stay byte 2",
         ),
         (
             "crates/pg-sink/src/pgoutput/mod.rs",
@@ -89,6 +99,27 @@ fn decode() {
 }
 "#,
             "Phase::Bootstrapping must stay byte 0",
+        ),
+        (
+            "quarantined_byte_3",
+            r#"
+#[repr(u8)]
+enum LoaderPhase {
+    Bootstrapping = 0,
+    Ready = 1,
+    Quarantined = 3,
+}
+
+fn decode() {
+    const {
+        assert!(
+            LoaderPhase::Quarantined as u8 == 2,
+            "LoaderPhase::Quarantined must stay byte 2 or clear_quarantine's compare_exchange swaps the wrong phase"
+        );
+    }
+}
+"#,
+            "LoaderPhase::Quarantined must stay byte 2",
         ),
         (
             "short_xid_prefix",

@@ -317,6 +317,14 @@ impl SinkConfig {
 }
 
 fn duration_bound(field: &'static str, d: Duration) -> Result<(), ConfigError> {
+    // Assert the constant ceiling; the configured duration stays runtime, Result-returning data.
+    const {
+        assert!(
+            !MAX_DURATION.is_zero(),
+            "MAX_DURATION must be nonzero or every positive cadence exceeds the ceiling"
+        );
+    }
+
     if d.is_zero() {
         return Err(ConfigError::OutOfBounds {
             field,

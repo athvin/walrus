@@ -48,6 +48,24 @@ impl TryFrom<u8> for LoaderPhase {
     /// ([`LoaderPhase::Quarantined`]). Only this module's typed stores write that atomic, so an
     /// unknown byte is a bug here rather than a probe input.
     fn try_from(byte: u8) -> Result<Self, Self::Error> {
+        // AtomicU8::default(), the typed stores, the quarantine compare_exchange, and this decoder
+        // all rely on these exact bytes.
+        const {
+            assert!(
+                LoaderPhase::Bootstrapping as u8 == 0,
+                "LoaderPhase::Bootstrapping must stay byte 0 because AtomicPhase defaults to zero"
+            );
+            assert!(
+                LoaderPhase::Ready as u8 == 1,
+                "LoaderPhase::Ready must stay byte 1 so AtomicPhase store and decode agree"
+            );
+            assert!(
+                LoaderPhase::Quarantined as u8 == 2,
+                "LoaderPhase::Quarantined must stay byte 2 or clear_quarantine's compare_exchange \
+                 swaps the wrong phase"
+            );
+        }
+
         match byte {
             0 => Ok(Self::Bootstrapping),
             1 => Ok(Self::Ready),
