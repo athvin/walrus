@@ -8,7 +8,17 @@
 //! Which bare integers deliberately stay bare — the pgoutput wire scalars (relation/type OIDs and
 //! transaction ids) — and what would reopen that, is recorded in
 //! `docs/implementation/notes/rust-skills/type-newtype-ids.md`.
+//!
+//! All five share one formatting contract: [`Display`](std::fmt::Display),
+//! [`LowerHex`](std::fmt::LowerHex), and [`UpperHex`](std::fmt::UpperHex) hand the whole formatter
+//! to the inner `i64`, so width, fill, `+`, and `#` behave exactly as they did on the bare integer
+//! each type replaced — wrapping an id must not cost a format specifier. (Hex of a negative id is
+//! the inner integer's two's-complement bit pattern, as it would be bare; real control-plane ids are
+//! positive.) `Octal` and `Binary` are deliberately absent: a `bigserial` key, a generation counter,
+//! and a schema version have no base-8 or base-2 reading. [`Lsn`](crate::Lsn) implements all four
+//! because a WAL byte address does.
 
+use std::fmt;
 use std::mem::{align_of, size_of};
 
 /// A `file_manifest` row's primary key (`id`): returned by `insert_ready`, claimed as
@@ -25,9 +35,21 @@ const _: () = assert!(
     size_of::<ManifestId>() == size_of::<i64>() && align_of::<ManifestId>() == align_of::<i64>()
 );
 
-impl std::fmt::Display for ManifestId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+impl fmt::Display for ManifestId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl fmt::LowerHex for ManifestId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::LowerHex::fmt(&self.0, f)
+    }
+}
+
+impl fmt::UpperHex for ManifestId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::UpperHex::fmt(&self.0, f)
     }
 }
 
@@ -59,9 +81,21 @@ pub struct EpochNo(pub i64);
 const _: () =
     assert!(size_of::<EpochNo>() == size_of::<i64>() && align_of::<EpochNo>() == align_of::<i64>());
 
-impl std::fmt::Display for EpochNo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+impl fmt::Display for EpochNo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl fmt::LowerHex for EpochNo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::LowerHex::fmt(&self.0, f)
+    }
+}
+
+impl fmt::UpperHex for EpochNo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::UpperHex::fmt(&self.0, f)
     }
 }
 
@@ -94,9 +128,21 @@ const _: () = assert!(
         && align_of::<SchemaVersionNo>() == align_of::<i64>()
 );
 
-impl std::fmt::Display for SchemaVersionNo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+impl fmt::Display for SchemaVersionNo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl fmt::LowerHex for SchemaVersionNo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::LowerHex::fmt(&self.0, f)
+    }
+}
+
+impl fmt::UpperHex for SchemaVersionNo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::UpperHex::fmt(&self.0, f)
     }
 }
 
@@ -123,9 +169,21 @@ const _: () = assert!(
     size_of::<ReloadId>() == size_of::<i64>() && align_of::<ReloadId>() == align_of::<i64>()
 );
 
-impl std::fmt::Display for ReloadId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+impl fmt::Display for ReloadId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl fmt::LowerHex for ReloadId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::LowerHex::fmt(&self.0, f)
+    }
+}
+
+impl fmt::UpperHex for ReloadId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::UpperHex::fmt(&self.0, f)
     }
 }
 
@@ -154,9 +212,21 @@ pub struct DdlId(pub i64);
 const _: () =
     assert!(size_of::<DdlId>() == size_of::<i64>() && align_of::<DdlId>() == align_of::<i64>());
 
-impl std::fmt::Display for DdlId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+impl fmt::Display for DdlId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl fmt::LowerHex for DdlId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::LowerHex::fmt(&self.0, f)
+    }
+}
+
+impl fmt::UpperHex for DdlId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::UpperHex::fmt(&self.0, f)
     }
 }
 

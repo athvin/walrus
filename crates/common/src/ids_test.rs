@@ -35,6 +35,36 @@ fn display_is_the_inner_integer() {
     assert_eq!(format!("{}", ManifestId(-1)), "-1");
 }
 
+/// `Display` hands the formatter to the inner `i64` rather than re-`write!`ing it, so width, fill,
+/// and sign flags survive the newtype instead of being silently dropped.
+#[test]
+fn display_forwards_formatter_flags_to_the_inner_i64() {
+    assert_eq!(format!("{:>6}", ManifestId(42)), "    42");
+    assert_eq!(format!("{:06}", EpochNo(42)), "000042");
+    assert_eq!(format!("{:+}", SchemaVersionNo(42)), "+42");
+    assert_eq!(format!("{:<6}|", ReloadId(42)), "42    |");
+    assert_eq!(format!("{:^6}|", DdlId(42)), "  42  |");
+}
+
+/// Wrapping a bare `i64` must not cost the `{:x}` / `{:X}` specifiers it already supported.
+#[test]
+fn hex_specifiers_forward_to_the_inner_i64() {
+    assert_eq!(format!("{:x}", ManifestId(0xDEAD)), "dead");
+    assert_eq!(format!("{:X}", ManifestId(0xDEAD)), "DEAD");
+    assert_eq!(format!("{:#06x}", EpochNo(0x2B)), "0x002b");
+    assert_eq!(format!("{:X}", SchemaVersionNo(255)), "FF");
+    assert_eq!(format!("{:x}", ReloadId(255)), "ff");
+    assert_eq!(format!("{:X}", DdlId(1_048_575)), "FFFFF");
+}
+
+/// Hex of a negative id is the inner integer's two's-complement pattern — the bare `i64` behaviour,
+/// documented here so it is a recorded consequence of forwarding rather than a surprise.
+#[test]
+fn hex_of_a_negative_id_is_the_inner_two_s_complement() {
+    assert_eq!(format!("{:x}", ManifestId(-1)), "ffffffffffffffff");
+    assert_eq!(format!("{:X}", DdlId(-1)), "FFFFFFFFFFFFFFFF");
+}
+
 #[test]
 fn from_i64_and_back_round_trips() {
     let id = ManifestId::from(7);
