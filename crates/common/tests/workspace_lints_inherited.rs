@@ -207,6 +207,26 @@ fn the_workspace_lint_table_still_denies_pre_2024_extern_blocks() {
     );
 }
 
+/// walrus exports no symbols: zero `#[no_mangle]` / `#[export_name]` / `#[link_section]`
+/// attributes and no `crate-type`, so both binaries are ordinary executables with no plugin ABI.
+/// Two items claiming one exported symbol is linker-level UB with no diagnostic, so the bare
+/// spelling must stay unreachable. Edition 2024 makes it a hard error — but again only for a member
+/// on that edition, and the lint that covers an earlier-edition one is allow-by-default, hence
+/// beyond `warnings = "deny"`.
+#[test]
+fn the_workspace_lint_table_still_denies_bare_export_attributes() {
+    let root_manifest = std::fs::read_to_string(repo_root().join("Cargo.toml")).unwrap();
+    let rust = section(&root_manifest, "[workspace.lints.rust]")
+        .expect("root manifest must define [workspace.lints.rust]");
+    assert_eq!(
+        rust.lines()
+            .filter(|line| line.trim() == r#"unsafe_attr_outside_unsafe = "deny""#)
+            .count(),
+        1,
+        "workspace policy must reject bare `#[no_mangle]`-family attributes exactly once"
+    );
+}
+
 #[test]
 fn the_clippy_carve_out_is_still_scoped_to_tests() {
     let cfg = std::fs::read_to_string(repo_root().join("clippy.toml")).unwrap();
