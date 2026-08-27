@@ -8,6 +8,10 @@
 //! should never be overridden. [`FailureClass::exit_code`] answers `Internal` (70) for an
 //! unclassified failure; every error type whose values reach a `main` overrides it with the
 //! documented per-variant code.
+//!
+//! **Deliberately NOT sealed.** Cross-crate implementation *is* the contract: `control::ControlError`
+//! and `loader::LoaderError` classify themselves from their own crates, which a private supertrait
+//! here would forbid. Sealing is for single-implementor seams like `pg_sink::batch::Clock`.
 
 use crate::ExitCode;
 
