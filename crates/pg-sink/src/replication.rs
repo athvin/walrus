@@ -507,20 +507,25 @@ fn build_startup(user: &str, database: &str) -> anyhow::Result<Vec<u8>> {
     Ok(msg)
 }
 
-fn build_standby_status(s: StandbyStatus) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(34);
-    payload.push(b'r');
-    payload.extend_from_slice(&s.write.as_u64().to_be_bytes());
-    payload.extend_from_slice(&s.flush.as_u64().to_be_bytes());
-    payload.extend_from_slice(&s.apply.as_u64().to_be_bytes());
-    payload.extend_from_slice(&pg_epoch_micros().to_be_bytes());
-    payload.push(u8::from(s.reply_requested));
+/// A whole `'r'` frame: the `'d'` tag, its 4-byte length, and the fixed 34-byte CopyData payload.
+/// The protocol fixes every field, so this is a compile-time width, not a capacity hint.
+const STANDBY_STATUS_FRAME_BYTES: usize = 39;
 
-    let mut msg = Vec::with_capacity(5 + payload.len());
-    msg.push(b'd');
-    // CopyData's payload is fixed: one tag + three LSNs + one timestamp + one reply byte = 34 bytes.
-    msg.extend_from_slice(&38_u32.to_be_bytes());
-    msg.extend_from_slice(&payload);
+/// Build the fixed-width `'r'` frame in a stack array — no field is variable-width, so the feedback
+/// path allocates nothing (`copy_done` writes its bare frame the same way). The offsets below are
+/// the wire layout; `replication_test::standby_status_frame_layout` reads them back.
+fn build_standby_status(s: StandbyStatus) -> [u8; STANDBY_STATUS_FRAME_BYTES] {
+    let mut msg = [0u8; STANDBY_STATUS_FRAME_BYTES];
+    msg[0] = b'd';
+    // CopyData's payload is fixed: one tag + three LSNs + one timestamp + one reply byte = 34 bytes,
+    // and the self-inclusive length adds its own 4 bytes but excludes the tag.
+    msg[1..5].copy_from_slice(&38_u32.to_be_bytes());
+    msg[5] = b'r';
+    msg[6..14].copy_from_slice(&s.write.as_u64().to_be_bytes());
+    msg[14..22].copy_from_slice(&s.flush.as_u64().to_be_bytes());
+    msg[22..30].copy_from_slice(&s.apply.as_u64().to_be_bytes());
+    msg[30..38].copy_from_slice(&pg_epoch_micros().to_be_bytes());
+    msg[38] = u8::from(s.reply_requested);
     msg
 }
 
