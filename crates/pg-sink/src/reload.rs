@@ -169,7 +169,14 @@ where
                     Ok(false) => return ExporterEnd::LostLease,
                     // A transient renewal error is NOT a lost lease: keep exporting — the lease
                     // expiry is the real deadline, and the next tick retries.
-                    Err(e) => tracing::warn!(error = %e, "reload lease renewal errored; retrying"),
+                    // `{:#}` — a bare `%e` on an `anyhow::Error` prints ONLY the outermost
+                    // context, dropping every `.context(..)` layer below it. These controller
+                    // logs are non-fatal, so this is the only place the chain is ever rendered
+                    // (`main` prints the fatal one).
+                    Err(e) => tracing::warn!(
+                        error = %format_args!("{e:#}"),
+                        "reload lease renewal errored; retrying"
+                    ),
                 }
             }
         }
@@ -421,7 +428,10 @@ impl ReloadController {
                             }
                             res = controller.tick(&mut exporters) => {
                                 if let Err(e) = res {
-                                    tracing::warn!(error = %e, "reload controller tick failed; retrying next tick");
+                                    tracing::warn!(
+                                        error = %format_args!("{e:#}"),
+                                        "reload controller tick failed; retrying next tick"
+                                    );
                                 }
                             }
                         }
@@ -445,7 +455,7 @@ impl ReloadController {
         // Surface genuinely stuck exports every tick (PR 6.9) — independent of free permits, and
         // best-effort so a transient control-pg blip on this read never skips the claim below.
         if let Err(e) = self.warn_stuck().await {
-            tracing::debug!(error = %e, "stuck-reload scan failed this tick");
+            tracing::debug!(error = %format_args!("{e:#}"), "stuck-reload scan failed this tick");
         }
         let free = self.semaphore.available_permits();
         if free == 0 {
@@ -496,7 +506,7 @@ impl ReloadController {
                     if let Err(e) = self.fail_row(req.reload_id, &rejection.to_string()).await {
                         tracing::error!(
                             reload_id = %req.reload_id,
-                            error = %e,
+                            error = %format_args!("{e:#}"),
                             "could not record the rejection; releasing the claim instead"
                         );
                         self.release_row(&req).await;
@@ -506,7 +516,7 @@ impl ReloadController {
                 Err(PreflightOutcome::Infra(e)) => {
                     tracing::warn!(
                         reload_id = %req.reload_id,
-                        error = %e,
+                        error = %format_args!("{e:#}"),
                         "preflight infra error (NOT a rejection); releasing the claim to retry"
                     );
                     self.release_row(&req).await;
@@ -613,7 +623,11 @@ impl ReloadController {
                 ),
                 ExporterEnd::Finished(res) => match res {
                     Ok(()) => tracing::info!(reload_id = %reload_id, "export finished"),
-                    Err(e) => tracing::error!(reload_id = %reload_id, error = %e, "export failed"),
+                    Err(e) => tracing::error!(
+                        reload_id = %reload_id,
+                        error = %format_args!("{e:#}"),
+                        "export failed"
+                    ),
                 },
             }
             common::metrics::dec_reload_active(flavor); // balances the inc above (PR 6.11)
@@ -738,7 +752,10 @@ impl ReloadController {
             )
             .await
             .map(|row| row.get::<_, bool>(0))
-            .map_err(|e| PreflightOutcome::Infra(anyhow::anyhow!(e)))?;
+            .with_context(|| {
+                format!("publication check for {}.{}", req.source_schema, req.source_table)
+            })
+            .map_err(PreflightOutcome::Infra)?;
         if !published {
             return Err(PreflightOutcome::Rejected(
                 PreflightRejection::NotPublished(
@@ -757,7 +774,10 @@ impl ReloadController {
             )
             .await
             .map(|row| row.get::<_, bool>(0))
-            .map_err(|e| PreflightOutcome::Infra(anyhow::anyhow!(e)))?;
+            .with_context(|| {
+                format!("primary-key check for {}.{}", req.source_schema, req.source_table)
+            })
+            .map_err(PreflightOutcome::Infra)?;
         if !has_pk {
             return Err(PreflightOutcome::Rejected(
                 PreflightRejection::NoPrimaryKey(

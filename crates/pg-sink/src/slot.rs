@@ -46,9 +46,13 @@ impl SlotResume {
     }
 }
 
-fn parse_lsn(s: &str) -> anyhow::Result<Lsn> {
+/// `field` names the catalog column the text came from, so a bad value says *which* one it was.
+/// Attaching context (rather than formatting the cause into an `anyhow!` message) keeps the typed
+/// `LsnParseError` — which already carries the offending text — in the chain, so `{:#}` reads
+/// "parse restart_lsn as a Postgres LSN: invalid LSN …" and `downcast_ref` still finds it.
+fn parse_lsn(s: &str, field: &'static str) -> anyhow::Result<Lsn> {
     s.parse()
-        .map_err(|e| anyhow::anyhow!("could not parse LSN {s:?}: {e:?}"))
+        .with_context(|| format!("parse {field} as a Postgres LSN"))
 }
 
 /// Read a slot's resume position **without** creating it — `None` if it does not exist. The bootstrap
@@ -78,12 +82,12 @@ pub async fn read_slot(
     Ok(Some(SlotInfo {
         restart_lsn: restart
             .as_deref()
-            .map(parse_lsn)
+            .map(|s| parse_lsn(s, "restart_lsn"))
             .transpose()?
             .unwrap_or(Lsn::ZERO),
         confirmed_flush_lsn: confirmed
             .as_deref()
-            .map(parse_lsn)
+            .map(|s| parse_lsn(s, "confirmed_flush_lsn"))
             .transpose()?
             .unwrap_or(Lsn::ZERO),
     }))
@@ -113,12 +117,12 @@ pub async fn verify_or_create_slot(
         let confirmed: Option<String> = row.get(1);
         let restart_lsn = restart
             .as_deref()
-            .map(parse_lsn)
+            .map(|s| parse_lsn(s, "restart_lsn"))
             .transpose()?
             .unwrap_or(Lsn::ZERO);
         let confirmed_flush_lsn = confirmed
             .as_deref()
-            .map(parse_lsn)
+            .map(|s| parse_lsn(s, "confirmed_flush_lsn"))
             .transpose()?
             .unwrap_or(Lsn::ZERO);
         return Ok(SlotResume::Existing(SlotInfo {
@@ -136,7 +140,11 @@ pub async fn verify_or_create_slot(
         .with_context(|| format!("create logical replication slot {slot:?} with pgoutput"))?;
     let lsn: String = row.get(0);
     Ok(SlotResume::Created {
-        consistent_point: parse_lsn(&lsn)?,
+        consistent_point: parse_lsn(&lsn, "consistent_point")?,
         snapshot_name: None,
     })
 }
+
+#[cfg(test)]
+#[path = "slot_test.rs"]
+mod tests;

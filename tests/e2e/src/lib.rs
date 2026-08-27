@@ -246,8 +246,7 @@ impl Harness {
         let s: String = sqlx::query_scalar("SELECT pg_current_wal_lsn()::text")
             .fetch_one(&self.source)
             .await?;
-        s.parse()
-            .map_err(|e| anyhow::anyhow!("parse wal lsn {s:?}: {e:?}"))
+        s.parse().context("parse pg_current_wal_lsn")
     }
 
     /// Poll `loader_checkpoint.transformed_lsn` for `table` until it passes `target` (every streamed
@@ -495,7 +494,7 @@ impl Harness {
         .await?;
         s.context("replication slot not found")?
             .parse()
-            .map_err(|e| anyhow::anyhow!("parse confirmed_flush_lsn: {e:?}"))
+            .context("parse confirmed_flush_lsn")
     }
 
     /// The slot's `restart_lsn` — the oldest WAL the slot still needs. Follows `confirmed_flush` once a
@@ -509,7 +508,7 @@ impl Harness {
         .await?;
         s.context("replication slot not found")?
             .parse()
-            .map_err(|e| anyhow::anyhow!("parse restart_lsn: {e:?}"))
+            .context("parse restart_lsn")
     }
 
     /// Whether a walsender is attached to the slot (`active = true`) — proof the connection is live. A

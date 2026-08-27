@@ -180,9 +180,11 @@ impl ReplicationStream {
             .get(2)
             .and_then(Clone::clone)
             .context("CREATE_REPLICATION_SLOT row missing snapshot_name")?;
+        // Context, not `anyhow!("…: {e:?}")`: the typed `LsnParseError` already prints the offending
+        // text, and keeping it as the cause leaves it in `{:#}` and reachable by `downcast_ref`.
         let consistent_point: Lsn = consistent
             .parse()
-            .map_err(|e| anyhow!("parse consistent_point {consistent:?}: {e:?}"))?;
+            .context("parse the slot's consistent_point as a Postgres LSN")?;
         Ok((consistent_point, snapshot_name))
     }
 
