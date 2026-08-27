@@ -77,11 +77,23 @@ move this workload beyond ordinary run-to-run variance.
 
 ## The guard
 
-`crates/common/tests/build_profile.rs` parses only the `[profile.release]` table and fails when a
-real `codegen-units` assignment appears; comments do not count as assignments. It also requires the
-manifest to retain this ADR path and embeds this file with `include_str!`, so a missing or empty
-record fails the same test target. Fabricated manifests prove both the override and missing-link
-diagnostics without temporarily editing the workspace manifest.
+`crates/common/tests/build_profile.rs` scans every `[profile.…]` table in the workspace manifest and
+fails when a real `codegen-units` assignment appears in any of them — `[profile.release]`, one of the
+`bench` / `release-with-debug` / `production` tables the rule's own snippets propose, or a
+`[profile.release.package.…]` override. `bench` inherits `release`, so an override parked there would
+quietly de-couple `docs/benchmarks.md`'s numbers from the shipped artifact while the release table
+still looked untouched. Comments do not count as assignments, so the rationale above the table keeps
+naming the key.
+
+A second check covers what Cargo reads from *outside* the manifest: the CI workflow, both
+Dockerfiles, the `justfile` and `scripts/bench-e2e.sh` must contain neither a
+`CARGO_PROFILE_<name>_CODEGEN_UNITS` environment override nor a `codegen-units` build flag
+(`-C codegen-units=…`, `--config profile.release.codegen-units=…`).
+
+The guard also requires the manifest to retain this ADR path and embeds this file with
+`include_str!`, so a missing or empty record fails the same test target. Fabricated manifests and
+surfaces prove the override, missing-link and environment-override diagnostics without temporarily
+editing the real build files.
 
 Run the focused guard with:
 

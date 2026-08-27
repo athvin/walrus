@@ -3,6 +3,11 @@
 use std::path::Path;
 
 const WORKSPACE_MANIFEST: &str = include_str!("../../../Cargo.toml");
+const CI_WORKFLOW: &str = include_str!("../../../.github/workflows/ci.yml");
+const DOCKERFILE_PG_SINK: &str = include_str!("../../../deploy/docker/Dockerfile.pg-sink");
+const DOCKERFILE_LOADER: &str = include_str!("../../../deploy/docker/Dockerfile.loader");
+const JUSTFILE: &str = include_str!("../../../justfile");
+const BENCH_E2E: &str = include_str!("../../../scripts/bench-e2e.sh");
 const CODEGEN_UNITS_ADR: &str = "docs/implementation/notes/rust-skills/opt-codegen-units.md";
 const CODEGEN_UNITS_NOTE: &str =
     include_str!("../../../docs/implementation/notes/rust-skills/opt-codegen-units.md");
@@ -14,38 +19,27 @@ const PGO_NOTE: &str =
     include_str!("../../../docs/implementation/notes/rust-skills/opt-pgo-profile.md");
 const BUILD_SURFACES: &[(&str, &str)] = &[
     ("Cargo.toml", WORKSPACE_MANIFEST),
-    (
-        ".github/workflows/ci.yml",
-        include_str!("../../../.github/workflows/ci.yml"),
-    ),
-    (
-        "deploy/docker/Dockerfile.pg-sink",
-        include_str!("../../../deploy/docker/Dockerfile.pg-sink"),
-    ),
-    (
-        "deploy/docker/Dockerfile.loader",
-        include_str!("../../../deploy/docker/Dockerfile.loader"),
-    ),
+    (".github/workflows/ci.yml", CI_WORKFLOW),
+    ("deploy/docker/Dockerfile.pg-sink", DOCKERFILE_PG_SINK),
+    ("deploy/docker/Dockerfile.loader", DOCKERFILE_LOADER),
+];
+// Every surface that invokes cargo, which is where a codegen-unit override can be reinstated from
+// outside `[profile.release]`. The manifest is deliberately absent: its rejection prose names the
+// key, and `codegen_units_declaration` already parses the tables there.
+const CODEGEN_UNITS_SURFACES: &[(&str, &str)] = &[
+    (".github/workflows/ci.yml", CI_WORKFLOW),
+    ("deploy/docker/Dockerfile.pg-sink", DOCKERFILE_PG_SINK),
+    ("deploy/docker/Dockerfile.loader", DOCKERFILE_LOADER),
+    ("justfile", JUSTFILE),
+    ("scripts/bench-e2e.sh", BENCH_E2E),
 ];
 const PGO_SURFACES: &[(&str, &str)] = &[
     ("Cargo.toml", WORKSPACE_MANIFEST),
-    (
-        ".github/workflows/ci.yml",
-        include_str!("../../../.github/workflows/ci.yml"),
-    ),
-    (
-        "deploy/docker/Dockerfile.pg-sink",
-        include_str!("../../../deploy/docker/Dockerfile.pg-sink"),
-    ),
-    (
-        "deploy/docker/Dockerfile.loader",
-        include_str!("../../../deploy/docker/Dockerfile.loader"),
-    ),
-    ("justfile", include_str!("../../../justfile")),
-    (
-        "scripts/bench-e2e.sh",
-        include_str!("../../../scripts/bench-e2e.sh"),
-    ),
+    (".github/workflows/ci.yml", CI_WORKFLOW),
+    ("deploy/docker/Dockerfile.pg-sink", DOCKERFILE_PG_SINK),
+    ("deploy/docker/Dockerfile.loader", DOCKERFILE_LOADER),
+    ("justfile", JUSTFILE),
+    ("scripts/bench-e2e.sh", BENCH_E2E),
 ];
 
 fn table_body<'a>(manifest: &'a str, header: &str) -> Option<&'a str> {
@@ -95,16 +89,52 @@ fn release_lto(manifest: &str) -> Result<&str, &'static str> {
     }
 }
 
-fn codegen_units_policy(manifest: &str) -> Result<(), &'static str> {
-    let release = table_body(manifest, "[profile.release]").ok_or("missing [profile.release]")?;
+/// The `[profile.…]` header that declares `codegen-units`, if any. *Every* profile table counts,
+/// not only `[profile.release]`: the rule parks the override in a `bench`, `production` or
+/// `release-with-debug` table just as readily, and `bench` inherits `release` — an override there
+/// would quietly de-couple `docs/benchmarks.md`'s numbers from the shipped artifact. Per-package
+/// tables (`[profile.release.package.…]`) accept the key too. Comments are not assignments, so the
+/// rationale above the table may keep naming it.
+fn codegen_units_declaration(manifest: &str) -> Option<&str> {
+    let mut profile = None;
 
-    if assignment_value(release, "codegen-units").is_some() {
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            profile = line.starts_with("[profile").then_some(line);
+        } else if let Some(header) = profile
+            && assignment_value(line, "codegen-units").is_some()
+        {
+            return Some(header);
+        }
+    }
+
+    None
+}
+
+fn codegen_units_policy(manifest: &str) -> Result<(), &'static str> {
+    if codegen_units_declaration(manifest).is_some() {
         Err("codegen-units declared")
     } else if !manifest.contains(CODEGEN_UNITS_ADR) {
         Err("missing codegen-units ADR link")
     } else {
         Ok(())
     }
+}
+
+/// Cargo also reads the setting from outside the manifest: `CARGO_PROFILE_<name>_CODEGEN_UNITS` in
+/// the environment, `-C codegen-units` in a rustc flag, or a `--config` override on the command
+/// line. Each of those reinstates the rejected setting with the manifest guard still green.
+fn codegen_units_override_policy(body: &str) -> Result<(), &'static str> {
+    for (needle, diagnostic) in [
+        ("CODEGEN_UNITS", "a codegen-units env override is set"),
+        ("codegen-units", "a codegen-units build flag is set"),
+    ] {
+        if body.contains(needle) {
+            return Err(diagnostic);
+        }
+    }
+    Ok(())
 }
 
 fn target_cpu_policy(body: &str) -> Result<(), &'static str> {
@@ -179,6 +209,26 @@ fn profile_comment_does_not_declare_codegen_units() {
 }
 
 #[test]
+fn no_profile_table_declares_codegen_units() {
+    assert_eq!(
+        codegen_units_declaration(WORKSPACE_MANIFEST),
+        None,
+        "walrus keeps the default codegen-unit count; see {CODEGEN_UNITS_ADR}"
+    );
+}
+
+#[test]
+fn no_build_surface_overrides_codegen_units() {
+    for (name, body) in CODEGEN_UNITS_SURFACES {
+        assert_eq!(
+            codegen_units_override_policy(body),
+            Ok(()),
+            "{name} must leave codegen-units at the default; see {CODEGEN_UNITS_ADR}"
+        );
+    }
+}
+
+#[test]
 fn codegen_units_rejection_rationale_is_still_recorded() {
     assert_eq!(codegen_units_policy(WORKSPACE_MANIFEST), Ok(()));
     assert!(
@@ -200,11 +250,37 @@ fn codegen_units_policy_rejects_fabricated_input() {
         "lto = \"thin\"\n",
         "codegen-units = 1\n",
     );
+    let linked_comment = concat!(
+        "# docs/implementation/notes/rust-skills/opt-codegen-units.md\n",
+        "[profile.release]\n",
+        "lto = \"thin\"\n",
+        "# codegen-units = 1\n",
+    );
+    let bench_override = concat!(
+        "# docs/implementation/notes/rust-skills/opt-codegen-units.md\n",
+        "[profile.release]\n",
+        "lto = \"thin\"\n",
+        "\n",
+        "[profile.bench]\n",
+        "inherits = \"release\"\n",
+        "codegen-units = 1\n",
+    );
+    let package_override = concat!(
+        "# docs/implementation/notes/rust-skills/opt-codegen-units.md\n",
+        "[profile.release]\n",
+        "lto = \"thin\"\n",
+        "\n",
+        "[profile.release.package.duckdb]\n",
+        "codegen-units = 1\n",
+    );
     let missing_link = "[profile.release]\nlto = \"thin\"\n";
 
     let cases = [
         (linked_default, Ok(())),
+        (linked_comment, Ok(())),
         (linked_override, Err("codegen-units declared")),
+        (bench_override, Err("codegen-units declared")),
+        (package_override, Err("codegen-units declared")),
         (missing_link, Err("missing codegen-units ADR link")),
     ];
 
@@ -213,6 +289,33 @@ fn codegen_units_policy_rejects_fabricated_input() {
             codegen_units_policy(manifest),
             expected,
             "manifest:\n{manifest}"
+        );
+    }
+}
+
+#[test]
+fn codegen_units_override_policy_rejects_fabricated_input() {
+    let cases = [
+        ("RUN cargo build --release", Ok(())),
+        (
+            "ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1",
+            Err("a codegen-units env override is set"),
+        ),
+        (
+            "RUSTFLAGS=\"-C codegen-units=1\" cargo build --release",
+            Err("a codegen-units build flag is set"),
+        ),
+        (
+            "cargo build --release --config profile.release.codegen-units=1",
+            Err("a codegen-units build flag is set"),
+        ),
+    ];
+
+    for (body, expected) in cases {
+        assert_eq!(
+            codegen_units_override_policy(body),
+            expected,
+            "surface:\n{body}"
         );
     }
 }
