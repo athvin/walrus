@@ -334,6 +334,29 @@ fn flushes_on_max_fill_via_fake_clock() {
     assert!(b.should_flush(), "max_fill tripped via the fake clock");
 }
 
+/// The erased counterpart of the test above: a `dyn Clock` must not only be *callable* (the
+/// `Box<dyn Clock>` collection), it must still satisfy the `C: Clock` bound every owner is written
+/// against — otherwise dyn compatibility buys nothing here. That is what the `?Sized` in
+/// `impl<T: Clock + ?Sized> Clock for Arc<T>` covers; without it `Arc<dyn Clock>` no longer
+/// satisfies `C: Clock` and the `TableBatcher` below stops compiling.
+#[test]
+fn an_erased_clock_still_satisfies_the_generic_bound() {
+    let fake = FakeClock::new();
+    let erased: Arc<dyn Clock> = Arc::<FakeClock>::clone(&fake);
+    let mut b = TableBatcher::new(
+        cached(),
+        triggers(u64::MAX, u64::MAX, Duration::from_millis(100)),
+        erased,
+    )
+    .unwrap();
+    b.push(meta("0/10"), &row("1"));
+    b.on_commit("0/30".parse().unwrap(), UtcTimestamp::now())
+        .unwrap();
+    assert!(!b.should_flush(), "no wall time has elapsed yet");
+    fake.advance(Duration::from_millis(150));
+    assert!(b.should_flush(), "max_fill tripped through `Arc<dyn Clock>`");
+}
+
 #[test]
 fn never_seals_with_an_open_transaction() {
     let mut b = TableBatcher::new(
