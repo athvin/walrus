@@ -180,20 +180,14 @@ impl BatchBuilder {
                 .map_or("<unknown>", |field| field.name());
             let (current_builders, rest) = std::mem::take(&mut builders)
                 .split_at_mut_checked(width)
-                .ok_or_else(|| Error::Downcast {
-                    column: column.to_string(),
-                })?;
+                .ok_or_else(|| downcast_error(column))?;
             let (current_fields, fields_rest) = remaining_fields
                 .split_at_checked(width)
-                .ok_or_else(|| Error::Downcast {
-                    column: column.to_string(),
-                })?;
+                .ok_or_else(|| downcast_error(column))?;
             match emit {
                 Emit::Scalar => {
                     let ([builder], [field]) = (current_builders, current_fields) else {
-                        return Err(Error::Downcast {
-                            column: column.to_string(),
-                        });
+                        return Err(downcast_error(column));
                     };
                     append_value(builder.as_mut(), field, value, &mut self.ts_buf)?;
                 }
@@ -208,17 +202,13 @@ impl BatchBuilder {
                 }
                 Emit::Multirange => {
                     let ([builder], [field]) = (current_builders, current_fields) else {
-                        return Err(Error::Downcast {
-                            column: column.to_string(),
-                        });
+                        return Err(downcast_error(column));
                     };
                     append_multirange(builder.as_mut(), field, value, &mut self.ts_buf)?;
                 }
                 Emit::Geometric(kind) => {
                     let ([builder], [field]) = (current_builders, current_fields) else {
-                        return Err(Error::Downcast {
-                            column: column.to_string(),
-                        });
+                        return Err(downcast_error(column));
                     };
                     append_geometric(builder.as_mut(), field, value, *kind)?;
                 }
@@ -430,9 +420,7 @@ fn append_value(
         // `append_value` runs for `Emit::Scalar` (Tier-1 + Tier-3 Utf8 + uuid) columns; the Tier-2
         // fan-out shapes have their own `append_*`. So no other Arrow type reaches this arm.
         _ => {
-            return Err(Error::Downcast {
-                column: col.to_string(),
-            });
+            return Err(downcast_error(col));
         }
     }
     Ok(())
@@ -448,9 +436,7 @@ fn append_interval(
     value: &TupleValue,
 ) -> Result<(), Error> {
     let [months_builder, days_builder, micros_builder] = builders else {
-        return Err(Error::Downcast {
-            column: col.to_string(),
-        });
+        return Err(downcast_error(col));
     };
     let parts =
         match value {
@@ -485,9 +471,7 @@ fn append_timetz(
     value: &TupleValue,
 ) -> Result<(), Error> {
     let [micros_builder, offset_builder] = builders else {
-        return Err(Error::Downcast {
-            column: col.to_string(),
-        });
+        return Err(downcast_error(col));
     };
     let parts = match value {
         TupleValue::Null | TupleValue::UnchangedToast => None,
@@ -528,14 +512,10 @@ fn append_range(
         empty_builder,
     ] = builders
     else {
-        return Err(Error::Downcast {
-            column: col.to_string(),
-        });
+        return Err(downcast_error(col));
     };
     let [lower_field, upper_field, _, _, _] = fields else {
-        return Err(Error::Downcast {
-            column: col.to_string(),
-        });
+        return Err(downcast_error(col));
     };
     if matches!(value, TupleValue::Null | TupleValue::UnchangedToast) {
         // Whole-column NULL → every sibling null (bounds via append_value, flags via BooleanBuilder).
@@ -615,9 +595,7 @@ fn multirange_elem_type(field: &Field) -> Result<DataType, Error> {
     {
         return Ok(bound.data_type().clone());
     }
-    Err(Error::Downcast {
-        column: field.name().clone(),
-    })
+    Err(downcast_error(field.name()))
 }
 
 /// Append one multirange member bound (parsed text, or `None` = unbounded → null) to struct child `idx`.
@@ -688,9 +666,7 @@ fn append_struct_bound(
             }
         }
         _ => {
-            return Err(Error::Downcast {
-                column: col.to_string(),
-            });
+            return Err(downcast_error(col));
         }
     }
     Ok(())
@@ -702,9 +678,7 @@ fn struct_field<'a, T: ArrayBuilder>(
     idx: usize,
     col: &str,
 ) -> Result<&'a mut T, Error> {
-    sb.field_builder::<T>(idx).ok_or_else(|| Error::Downcast {
-        column: col.to_string(),
-    })
+    sb.field_builder::<T>(idx).ok_or_else(|| downcast_error(col))
 }
 
 /// Typed accessor for a `dyn` column builder, attributing a downcast failure to the column.
@@ -718,9 +692,22 @@ fn downcast<'a, T: ArrayBuilder>(
     builder
         .as_any_mut()
         .downcast_mut::<T>()
-        .ok_or_else(|| Error::Downcast {
-            column: col.to_string(),
-        })
+        .ok_or_else(|| downcast_error(col))
+}
+
+/// Build the "builder does not match the plan" error for a column.
+///
+/// A downcast failure is a `plan`/`builders` disagreement — an invariant break, never a per-row data
+/// outcome — so `#[cold]` marks every branch reaching it as unlikely and `#[inline(never)]` keeps the
+/// owned-`String` construction out of the 460 ns/row append path. It matters most for [`downcast`]
+/// and [`struct_field`], which are generic: without this the allocation is re-emitted into every
+/// builder-type instantiation *and* every call site. `batch_test.rs` pins the column name payload.
+#[cold]
+#[inline(never)]
+fn downcast_error(col: &str) -> Error {
+    Error::Downcast {
+        column: col.to_string(),
+    }
 }
 
 /// A range bound as a `TupleValue`: `Some(text)` → `Text`, `None` (unbounded) → `Null` (→ append_null).
