@@ -178,7 +178,10 @@ fn parse_bound(s: &str) -> Option<Cow<'_, str>> {
 /// un-escape stays [`Cow::Borrowed`] — that covers every `tsrange`/`tstzrange` bound, which Postgres
 /// quotes unconditionally.
 fn unquote(s: &str) -> Cow<'_, str> {
-    let inner = &s[1..s.len().saturating_sub(1)];
+    // A lone `"` (`[a,")` splits the upper bound down to one delimiter) has no body between the
+    // quotes, and `s[1..0]` is an inverted range that panics. Wire text is untrusted input, so ask
+    // for the span and treat a missing one as the empty bound it describes.
+    let inner = s.get(1..s.len().saturating_sub(1)).unwrap_or_default();
     if !inner.contains(['"', '\\']) {
         return Cow::Borrowed(inner);
     }

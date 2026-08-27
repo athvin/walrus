@@ -82,6 +82,16 @@ fn bounds_borrow_the_literal_unless_un_escaping_is_needed() {
 }
 
 #[test]
+fn a_degenerate_quoted_bound_parses_instead_of_panicking() {
+    // The upper bound is a single `"`: there is nothing between the quotes to strip. Malformed wire
+    // text must come back as a value (or an error), never as an out-of-bounds slice.
+    let r = parse_range(r#"[a,")"#).unwrap();
+    assert_eq!(r.lower.as_deref(), Some("a"));
+    assert_eq!(r.upper.as_deref(), Some(""));
+    assert!(!r.upper_inc, "a `)` delimiter is exclusive");
+}
+
+#[test]
 fn multirange_parses_members_and_empty_list() {
     let ms = parse_multirange("{[1,4),[7,9)}").unwrap();
     assert_eq!(ms.len(), 2);

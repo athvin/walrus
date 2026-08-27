@@ -409,7 +409,7 @@ impl ReplicationStream {
             let (tag, body) = self.read_message().await?;
             match tag {
                 b'R' => {
-                    let sub = read_i32(&body[0..4])?;
+                    let sub = auth_sub_type(&body)?;
                     if sub != 0 {
                         bail!(
                             "source demands auth type {sub}; the dev harness must use trust auth \
@@ -592,6 +592,16 @@ fn read_i64(b: &[u8]) -> anyhow::Result<i64> {
 }
 fn read_i32(b: &[u8]) -> anyhow::Result<i32> {
     Ok(i32::from_be_bytes(fixed(b, "read_i32")?))
+}
+
+/// The `Int32` sub-type of an Authentication ('R') body. `take_message` frames on the 4-byte length
+/// header only, so the body it hands back may be shorter than the sub-type field — a truncated frame
+/// is a protocol error the handshake reports, never an out-of-bounds slice that aborts the sink.
+fn auth_sub_type(body: &[u8]) -> anyhow::Result<i32> {
+    let head = body
+        .get(..4)
+        .with_context(|| format!("short Authentication message ({} bytes)", body.len()))?;
+    read_i32(head)
 }
 
 /// The `'M'` (human message) field of an ErrorResponse/NoticeResponse body.

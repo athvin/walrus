@@ -213,7 +213,13 @@ impl TransformSql {
         // the UPDATE valid (a no-op) so `d→i` still lands via the MATCHED branch. Every UPDATE also stamps
         // the hidden `_applied_*` guard columns with the winner's tuple (§7).
         let mut set_parts: Vec<String> = if non_key.is_empty() {
-            vec![format!("{} = s.{}", q(pk[0]), q(pk[0]))]
+            // A column-less relation has no key to self-assign either. Render the guard stamps alone
+            // rather than indexing: DuckDB then rejects the degenerate statement as a classified
+            // `LoaderError::Duck` instead of the apply loop panicking mid-transaction.
+            pk.first()
+                .map(|k| format!("{} = s.{}", q(k), q(k)))
+                .into_iter()
+                .collect()
         } else {
             non_key
                 .iter()

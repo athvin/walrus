@@ -59,6 +59,17 @@ fn fixed_width_window_preserves_bytes_and_context() {
 }
 
 #[test]
+fn auth_sub_type_reports_a_truncated_body_instead_of_panicking() {
+    assert_eq!(auth_sub_type(&[0, 0, 0, 0]).unwrap(), 0); // AuthenticationOk
+    assert_eq!(auth_sub_type(&[0, 0, 0, 10, b'S']).unwrap(), 10); // SASL, mechanisms trail the Int32
+    assert_eq!(
+        auth_sub_type(&[0, 0, 0]).unwrap_err().to_string(),
+        "short Authentication message (3 bytes)"
+    );
+    assert!(auth_sub_type(&[]).is_err());
+}
+
+#[test]
 fn parse_dsn_rejects_a_dsn_without_a_tcp_host() {
     let err = parse_dsn("user=walrus dbname=walrus").unwrap_err();
     assert!(err.to_string().contains("needs a TCP host"));
