@@ -55,7 +55,7 @@ impl TryFrom<u8> for ReplicaIdentity {
             b'i' => Ok(Self::Index),
             other => Err(Error::Internal(format!(
                 "unknown relreplident byte {:?}",
-                other as char
+                char::from(other)
             ))),
         }
     }

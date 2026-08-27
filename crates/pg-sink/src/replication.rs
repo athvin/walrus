@@ -199,7 +199,7 @@ impl ReplicationStream<Idle> {
                 b'E' => bail!("CREATE_REPLICATION_SLOT failed: {}", error_message(&body)),
                 other => bail!(
                     "unexpected reply '{}' to CREATE_REPLICATION_SLOT",
-                    other as char
+                    char::from(other)
                 ),
             }
         }
@@ -302,7 +302,7 @@ impl ReplicationStream<Streaming> {
                 b'E' => bail!("replication stream error: {}", error_message(&body)),
                 other => bail!(
                     "unexpected message '{}' on the CopyBoth stream",
-                    other as char
+                    char::from(other)
                 ),
             }
         }
@@ -485,7 +485,7 @@ impl<S: Send> ReplicationStream<S> {
                 b'S' | b'K' | b'N' => {}
                 b'Z' => return Ok(()), // ReadyForQuery
                 b'E' => bail!("startup failed: {}", error_message(&body)),
-                other => bail!("unexpected startup message '{}'", other as char),
+                other => bail!("unexpected startup message '{}'", char::from(other)),
             }
         }
     }
@@ -508,7 +508,10 @@ impl<S: Send> ReplicationStream<S> {
                 b'W' => return Ok(()), // CopyBothResponse — streaming has begun
                 b'N' | b'S' => {}
                 b'E' => bail!("START_REPLICATION failed: {}", error_message(&body)),
-                other => bail!("unexpected reply '{}' to START_REPLICATION", other as char),
+                other => bail!(
+                    "unexpected reply '{}' to START_REPLICATION",
+                    char::from(other)
+                ),
             }
         }
     }

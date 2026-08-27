@@ -628,7 +628,7 @@ fn fmt_bytes(b: &[u8]) -> String {
             b'\n' => s.push_str("\\n"),
             b'\r' => s.push_str("\\r"),
             b'\t' => s.push_str("\\t"),
-            0x20..=0x7e => s.push(byte as char),
+            0x20..=0x7e => s.push(char::from(byte)),
             _ => {
                 let _ = write!(&mut s, "\\x{byte:02x}");
             }

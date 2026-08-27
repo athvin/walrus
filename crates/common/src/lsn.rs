@@ -50,22 +50,18 @@ impl Lsn {
 
     /// Reinterpret this unsigned LSN as the signed integer used by SQLx's binary encoder.
     #[cfg(any(feature = "sqlx", test))]
-    #[allow(
-        clippy::cast_possible_wrap,
-        reason = "pg_lsn and int8 share the same 64-bit wire representation"
-    )]
     const fn to_sqlx_i64_bits(self) -> i64 {
-        self.0 as i64
+        // `cast_signed`, not `as i64`: pg_lsn and int8 share the same 64-bit wire representation,
+        // so the reinterpretation is the point. The named method states that, needs no scoped
+        // `cast_possible_wrap` allow, and matches `pgoutput::typmod`/`reader`.
+        self.0.cast_signed()
     }
 
     /// Recover an unsigned LSN from SQLx's signed view of the same wire bits.
     #[cfg(any(feature = "sqlx", test))]
-    #[allow(
-        clippy::cast_sign_loss,
-        reason = "pg_lsn and int8 share the same 64-bit wire representation"
-    )]
     const fn from_sqlx_i64_bits(raw: i64) -> Self {
-        Self(raw as u64)
+        // The inverse reinterpretation — see `to_sqlx_i64_bits` for why this is not `TryFrom`.
+        Self(raw.cast_unsigned())
     }
 
     /// Retreat this position by `bytes`, **saturating at 0**.
@@ -296,7 +292,7 @@ mod sqlx_support {
             buf: &mut PgArgumentBuffer,
         ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
             // pg_lsn's binary wire format is an 8-byte big-endian integer — identical to int8, so
-            // reuse i64's encoder. The helper's documented `as i64` preserves the bit pattern;
+            // reuse i64's encoder. The helper's `cast_signed` preserves the bit pattern;
             // `TryFrom` would reject every valid LSN above i64::MAX.
             <i64 as Encode<Postgres>>::encode_by_ref(&self.to_sqlx_i64_bits(), buf)
         }
