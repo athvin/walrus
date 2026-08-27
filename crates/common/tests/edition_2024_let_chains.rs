@@ -23,7 +23,7 @@ fn the_four_audited_nests_are_chains() {
         "if let DataType::List(item) = field.data_type()\n        && let DataType::Struct(fs)"
     ));
     assert!(ARROW_BATCH.contains("&& let Some(bound) = fs.first()"));
-    assert!(ARROW_BATCH.contains("if let Some(t) = n.find('T')\n        && let Some(sign)"));
+    assert!(ARROW_BATCH.contains("if let Some(t) = scratch.find('T')\n        && let Some(sign)"));
 
     let audited = [CONTROL_DB, SINK_CONSUME, ARROW_BATCH].concat();
     assert!(audited.matches("&& let ").count() >= 4);

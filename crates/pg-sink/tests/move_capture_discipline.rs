@@ -160,13 +160,10 @@ fn sanitized_source(src: &str) -> String {
             end
         } else if original[cursor] == b'"' {
             quoted_string_end(original, cursor)
-        } else if original[cursor] == b'\'' {
-            if let Some(end) = char_literal_end(src, cursor) {
-                end
-            } else {
-                cursor += 1;
-                continue;
-            }
+        } else if original[cursor] == b'\''
+            && let Some(end) = char_literal_end(src, cursor)
+        {
+            end
         } else {
             cursor += 1;
             continue;
