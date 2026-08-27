@@ -144,7 +144,9 @@ async fn cap_of_two_schedules_third_request_only_after_a_permit_frees() {
         releases.push(Some(tx));
         exporters.spawn(async move {
             let _permit = sem.acquire_owned().await.unwrap();
-            flag.store(1, Ordering::SeqCst);
+            // Relaxed: an independent per-task latch. Nothing rides behind the flag, and the
+            // permits — not this store — are what the test's ordering claim rests on.
+            flag.store(1, Ordering::Relaxed);
             let _ = rx.await; // park like the PR 6.5 stub, holding the permit
         });
     }
@@ -154,7 +156,7 @@ async fn cap_of_two_schedules_third_request_only_after_a_permit_frees() {
     let started_count = || {
         started
             .iter()
-            .filter(|f| f.load(Ordering::SeqCst) == 1)
+            .filter(|f| f.load(Ordering::Relaxed) == 1)
             .count()
     };
     assert_eq!(started_count(), 2, "cap of two holds; the third waits");
@@ -162,7 +164,7 @@ async fn cap_of_two_schedules_third_request_only_after_a_permit_frees() {
     // Free exactly ONE permit (release a task that actually started): the third now runs.
     let running_idx = started
         .iter()
-        .position(|f| f.load(Ordering::SeqCst) == 1)
+        .position(|f| f.load(Ordering::Relaxed) == 1)
         .unwrap();
     releases[running_idx].take().unwrap().send(()).unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;

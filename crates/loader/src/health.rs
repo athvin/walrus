@@ -63,11 +63,15 @@ struct AtomicPhase(AtomicU8);
 
 impl AtomicPhase {
     fn store(&self, phase: LoaderPhase) {
-        self.0.store(phase as u8, Ordering::SeqCst);
+        // Release: `Ready` publishes bootstrap (leases held, files open) and `Quarantined` publishes
+        // the failed cast that latched it. SeqCst would only add a total order with other atomics,
+        // and this is the sole atomic every probe reads.
+        self.0.store(phase as u8, Ordering::Release);
     }
 
     fn load(&self) -> LoaderPhase {
-        let byte = self.0.load(Ordering::SeqCst);
+        // Acquire: pairs with the Release store, so a probe that sees a phase sees what produced it.
+        let byte = self.0.load(Ordering::Acquire);
         LoaderPhase::try_from(byte).unwrap_or_else(|InvalidPhase(invalid)| {
             tracing::error!(
                 phase_byte = invalid,
@@ -78,8 +82,11 @@ impl AtomicPhase {
     }
 
     fn transition(&self, from: LoaderPhase, to: LoaderPhase) -> bool {
+        // AcqRel on success: the read half sees the store that latched `from` (the quarantining
+        // cast), the write half publishes `to` like the plain store above. Relaxed on failure —
+        // the losing byte is dropped on the floor, so nothing is read behind it.
         self.0
-            .compare_exchange(from as u8, to as u8, Ordering::SeqCst, Ordering::SeqCst)
+            .compare_exchange(from as u8, to as u8, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
     }
 }

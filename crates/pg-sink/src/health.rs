@@ -70,11 +70,15 @@ struct AtomicPhase(AtomicU8);
 
 impl AtomicPhase {
     fn store(&self, phase: Phase) {
-        self.0.store(phase as u8, Ordering::SeqCst);
+        // Release: `Ready` publishes everything bootstrap set up before a probe may answer 200.
+        // Not SeqCst — that would only buy a total order across phase AND terminating, and
+        // `is_ready` reads those as two independent latches (no Dekker-style protocol here).
+        self.0.store(phase as u8, Ordering::Release);
     }
 
     fn load(&self) -> Phase {
-        let byte = self.0.load(Ordering::SeqCst);
+        // Acquire: pairs with the Release store, so a probe that sees `Ready` sees bootstrap's work.
+        let byte = self.0.load(Ordering::Acquire);
         Phase::try_from(byte).unwrap_or_else(|InvalidPhase(invalid)| {
             tracing::error!(
                 phase_byte = invalid,
