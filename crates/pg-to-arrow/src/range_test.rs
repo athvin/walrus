@@ -2,7 +2,7 @@ use super::*;
 use std::borrow::Cow;
 
 #[test]
-fn family_oid_dispatch_and_element_types() {
+fn range_family_resolves_known_oids_and_maps_element_types() {
     assert_eq!(
         RangeFamily::from_range_oid(oids::INT4RANGE),
         Some(RangeFamily::Int4)

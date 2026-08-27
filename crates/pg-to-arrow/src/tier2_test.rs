@@ -36,7 +36,7 @@ fn interval_1_month_ne_30_days_ne_720_hours() {
 }
 
 #[test]
-fn interval_negative_time_and_ago() {
+fn interval_keeps_a_negative_clock_and_ago_negates_every_field() {
     assert_eq!(parse_interval("-00:00:01").unwrap(), (0, 0, -1_000_000));
     // verbose `ago` negates every field.
     assert_eq!(parse_interval("@ 1 day ago").unwrap(), (0, -1, 0));

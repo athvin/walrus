@@ -41,7 +41,7 @@ fn preflight_errors_map_to_exit_codes() {
 }
 
 #[test]
-fn sql_quoting_escapes() {
+fn quoting_doubles_delimiters_and_rejects_unusable_idents() {
     assert_eq!("wal_level".to_quoted_literal(), "'wal_level'");
     assert_eq!("a'b".to_quoted_literal(), "'a''b'");
     assert_eq!(ident("walrus_pub").unwrap().to_string(), "\"walrus_pub\"");
