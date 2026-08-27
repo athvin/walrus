@@ -69,7 +69,12 @@ const _: () = assert!(
 );
 
 /// Why an RFC-3339 string is not a legal walrus timestamp.
+///
+/// This taxonomy is still growing — "legal walrus timestamp" is a normalization policy that can
+/// gain a rejection reason (sub-microsecond precision, say) rather than fold it into
+/// [`TimestampParseError::Malformed`] — so new variants must remain additive for downstream crates.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TimestampParseError {
     /// The text was not already normalized to walrus's required UTC `Z` form.
     #[error("timestamp {input:?} must be UTC with a 'Z' suffix, not a numeric offset")]

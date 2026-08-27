@@ -80,7 +80,12 @@ impl SqlStrExt for str {
 }
 
 /// Why a string cannot be represented as a SQL identifier.
+///
+/// This taxonomy is still growing — the accepted shape is a policy (a NAMEDATALEN cap, control
+/// characters) that can tighten, not a closed algebra — so new variants must remain additive for
+/// downstream crates.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum IdentError {
     /// SQL identifiers cannot be empty.
     #[error("must not be empty")]

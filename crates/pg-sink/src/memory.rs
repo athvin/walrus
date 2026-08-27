@@ -144,6 +144,9 @@ pub fn decide(meter: &InflightMeter, has_committed: bool) -> Option<ShedAction> 
 pub struct Ratio(f64);
 
 /// Why a raw `f64` was rejected as a [`Ratio`].
+///
+/// A candidate is either not finite or finite-and-outside the open unit interval, so these two
+/// variants are the whole taxonomy and this enum is deliberately exhaustive — no `#[non_exhaustive]`.
 #[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
 pub enum RatioError {
     /// A special IEEE-754 value would poison the backpressure comparisons.
