@@ -15,6 +15,12 @@
 /// resolves in `common` even when the macro expands in another crate. The adapter deliberately
 /// preserves the caller's error taxonomy: it forwards the exact column and input to `make_error`
 /// and returns `E`.
+///
+/// `#[cold]` because this is reachable only from the generated `from_str`'s catch-all: every value
+/// the control DB's `CHECK` constraints permit matches a variant arm above it. Being generic, the
+/// adapter is monomorphized into each generated parser, so without the hint every one of them
+/// inlines its error type's owned-`String` construction next to the string-compare chain.
+#[cold]
 #[must_use]
 pub fn unknown_variant<E>(
     column: &'static str,

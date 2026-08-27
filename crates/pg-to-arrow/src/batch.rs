@@ -163,10 +163,7 @@ impl BatchBuilder {
     /// converted into its planned Arrow builder or its provenance cannot be serialized.
     pub fn append_row(&mut self, values: &[TupleValue], meta: &SinkMeta) -> Result<(), Error> {
         if values.len() != self.plan.len() {
-            return Err(Error::RowLenMismatch {
-                expected: self.plan.len(),
-                got: values.len(),
-            });
+            return Err(row_len_error(self.plan.len(), values.len()));
         }
         // Read the field types straight out of the schema — `schema`, `builders`, and `ts_buf` are
         // disjoint fields, so the shared borrow coexists with the mutable ones (as `plan` already
@@ -708,6 +705,19 @@ fn downcast_error(col: &str) -> Error {
     Error::Downcast {
         column: col.to_string(),
     }
+}
+
+/// Build the "tuple width does not match the relation" error for [`BatchBuilder::append_row`].
+///
+/// The sibling of [`downcast_error`], and cold for the same reason: a width mismatch is a caller
+/// invariant break — every row of one relation has the same width — never a per-row data outcome. It
+/// guards the *entry* of the 460 ns/row append path, so `#[cold]` is what keeps that first branch
+/// from being laid out alongside the per-column loop it precedes. The payload is two `usize` moves
+/// with no allocation, so `#[inline(never)]` would add nothing on top. `batch_test.rs` pins the
+/// expected/got payload.
+#[cold]
+const fn row_len_error(expected: usize, got: usize) -> Error {
+    Error::RowLenMismatch { expected, got }
 }
 
 /// A range bound as a `TupleValue`: `Some(text)` → `Text`, `None` (unbounded) → `Null` (→ append_null).

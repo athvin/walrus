@@ -497,7 +497,12 @@ fn parse_one(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Message, De
             xid: reader.int32()?,
             gid: reader.string()?,
         }),
-        other => Err(DecodeError::UnknownMessage { byte: other }),
+        // The arms above are the protocol's whole tag set at v2+v3. Reaching here means a misaligned
+        // cursor or a peer speaking something walrus never negotiated — never a live walsender.
+        other => {
+            std::hint::cold_path();
+            Err(DecodeError::UnknownMessage { byte: other })
+        }
     }
 }
 
@@ -512,6 +517,9 @@ pub fn parse_message(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Mes
     let msg = parse_one(reader, ctx)?;
     let unconsumed = reader.remaining();
     if unconsumed != 0 {
+        // Every well-formed frame is consumed whole; leftovers mean the payload and the parser
+        // disagree about the message's width.
+        std::hint::cold_path();
         return Err(DecodeError::TrailingBytes {
             unconsumed: reader::u32c(unconsumed),
         });
