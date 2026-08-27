@@ -120,8 +120,12 @@ fn parse_pt_inner(inner: &str, text: &str) -> Result<Pt, Error> {
 /// Extract every flat `(x,y)` coordinate group from a geometric literal, in order. Outer wrapping
 /// parens (`((…),(…))`) are skipped because their inner span still contains a `(`.
 fn extract_points(text: &str) -> Result<Vec<Pt>, Error> {
-    let mut pts = Vec::new();
     let bytes = text.as_bytes();
+    // Every group starts at its own `(`, so the `(` count is an exact upper bound on the points, and
+    // a tight one — only the outer wrapper (`((…),(…))`) is ever slack. One extra byte scan buys a
+    // single allocation for a `path`/`polygon`, which carries an unbounded vertex list and is parsed
+    // per value on the batch-build path; the 1–2 point shapes size down to exactly what they need.
+    let mut pts = Vec::with_capacity(bytes.iter().filter(|&&b| b == b'(').count());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'('
