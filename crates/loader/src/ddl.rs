@@ -344,11 +344,18 @@ pub fn apply_destructive(
 /// Retire a dropped table's `.duckdb` file (call after its owning connection is closed). Idempotent —
 /// a missing file (a crash mid-retire re-run) is success.
 ///
+/// The path is only ever *read* here, so it is taken as a borrowed view — the same bound
+/// [`TableDb::open`](crate::duck::TableDb::open) and the wrapped `tokio::fs::remove_file` already
+/// carry. A caller holding the `<dir>/<table>.duckdb` name as a `String` (or a literal) reaches it
+/// without a `Path::new` at the call site; nothing is owned or allocated by this signature.
+///
 /// # Errors
 ///
 /// Returns [`LoaderError::Internal`] if removing an existing file fails for any reason other than
 /// `NotFound`.
-pub async fn retire_file(path: &std::path::Path) -> Result<(), LoaderError> {
+pub async fn retire_file(path: impl AsRef<std::path::Path>) -> Result<(), LoaderError> {
+    // Bind the borrow ONCE — the removal and the failure message share this one view.
+    let path = path.as_ref();
     match tokio::fs::remove_file(path).await {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

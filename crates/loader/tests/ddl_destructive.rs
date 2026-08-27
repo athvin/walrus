@@ -206,7 +206,10 @@ async fn drop_table_retires_both_tables_and_the_file() {
     assert!(path.exists(), "file present until explicitly retired");
     retire_file(&path).await.unwrap();
     assert!(!path.exists(), "the .duckdb file is retired");
-    retire_file(&path).await.unwrap(); // idempotent — a crash-mid-retire re-run is a no-op
+    // Idempotent — a crash-mid-retire re-run is a no-op. Spelled as a bare `&str` here (the call
+    // above passes `&PathBuf`) because `retire_file` takes a borrowed path view, not one exact type.
+    retire_file(path.to_str().unwrap()).await.unwrap();
+    assert!(!path.exists(), "the retire re-run left the file absent");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
