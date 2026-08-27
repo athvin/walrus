@@ -257,10 +257,10 @@ impl SinkConfig {
                 return Err(ConfigError::Missing(field));
             }
         }
-        common::runtime::validate_worker_threads(self.worker_threads).map_err(|detail| {
+        common::runtime::validate_worker_threads(self.worker_threads).map_err(|e| {
             ConfigError::OutOfBounds {
                 field: "worker_threads",
-                detail,
+                detail: e.to_string(),
             }
         })?;
         duration_bound("max_fill", self.max_fill)?;

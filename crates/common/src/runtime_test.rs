@@ -17,8 +17,34 @@ fn configured_worker_count_wins() {
 
 #[test]
 fn zero_and_values_above_the_ceiling_are_rejected() {
-    assert!(validate_worker_threads(Some(0)).is_err());
-    assert!(validate_worker_threads(Some(MAX_WORKER_THREADS + 1)).is_err());
+    assert_eq!(
+        validate_worker_threads(Some(0)),
+        Err(WorkerThreadsError::Zero)
+    );
+    assert_eq!(
+        validate_worker_threads(Some(MAX_WORKER_THREADS + 1)),
+        Err(WorkerThreadsError::TooMany {
+            configured: MAX_WORKER_THREADS + 1
+        })
+    );
+}
+
+#[test]
+fn rejection_messages_name_the_bound_and_the_escape_hatch() {
+    assert_eq!(
+        WorkerThreadsError::Zero.to_string(),
+        "must be >= 1 (omit for automatic sizing)"
+    );
+    assert_eq!(
+        WorkerThreadsError::TooMany {
+            configured: MAX_WORKER_THREADS + 1
+        }
+        .to_string(),
+        format!(
+            "must be <= {MAX_WORKER_THREADS} (got {}; omit for automatic sizing)",
+            MAX_WORKER_THREADS + 1
+        )
+    );
 }
 
 #[test]

@@ -148,7 +148,7 @@ impl LoaderConfig {
             }
         }
         common::runtime::validate_worker_threads(self.worker_threads)
-            .map_err(|detail| ConfigError(format!("worker_threads: {detail}")))?;
+            .map_err(|e| ConfigError(format!("worker_threads: {e}")))?;
         Ok(())
     }
 }
