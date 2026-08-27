@@ -15,10 +15,20 @@
 //! advance on durability — PR 2.26 — so we hold them at the durable baseline. Keepalive feedback is
 //! **unconditional**: it goes out well under `wal_sender_timeout`, never gated on S3 durability, or
 //! the walsender severs us with a reconnect storm.
+//!
+//! **The connection's two states are two types.** A `replication=database` connection that has only
+//! completed the startup handshake is *not* in CopyBoth: reading a frame or writing a `'r'`
+//! standby-status there is a wire-protocol violation, and the walsender's reply would be decoded as
+//! garbage rather than rejected. So [`ReplicationStream`] carries which state it is in
+//! ([`Idle`] vs [`Streaming`]) as a type parameter, and the only way to reach the streaming API is
+//! [`ReplicationStream::into_streaming`], which consumes the idle connection and is the Rust half of
+//! `START_REPLICATION`'s `CopyBothResponse`. "Forgot to `START_REPLICATION`" is a compile error, not
+//! a torn stream.
 
 use anyhow::{Context, anyhow, bail};
 use bytes::{Bytes, BytesMut};
 use common::{Lsn, PG_EPOCH_UNIX_SECS};
+use std::marker::PhantomData;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -56,9 +66,32 @@ pub struct StandbyStatus {
     pub reply_requested: bool,
 }
 
-/// A live `START_REPLICATION` CopyBoth stream over a hand-rolled connection.
+/// State marker: the startup handshake is done but no `START_REPLICATION` has been issued, so the
+/// connection is in the simple-query state, not CopyBoth.
+#[derive(Debug, Clone, Copy)]
+pub struct Idle;
+
+/// State marker: `START_REPLICATION` returned `CopyBothResponse`, so CopyBoth frames may flow.
+#[derive(Debug, Clone, Copy)]
+pub struct Streaming;
+
+/// A hand-rolled replication connection, typed by which protocol state it is in. `Streaming` is the
+/// default because every consumer of this module ([`crate::consume`], [`crate::shutdown`],
+/// [`crate::checkpoint`]) only ever holds a live CopyBoth stream; the [`Idle`] form exists for the
+/// snapshot-export handoff (PR 2.29) and exposes nothing that would tear the wire.
+///
+/// Frames cannot be read before `START_REPLICATION`:
+///
+/// ```compile_fail
+/// # use pg_sink::replication::{Idle, ReplicationStream};
+/// # async fn demo(dsn: &str) -> anyhow::Result<()> {
+/// let mut conn = ReplicationStream::<Idle>::connect(dsn).await?;
+/// let _frame = conn.next().await?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug)]
-pub struct ReplicationStream {
+pub struct ReplicationStream<S = Streaming> {
     stream: TcpStream,
     rbuf: BytesMut,
     /// The highest LSN we've received (sent as `write` in feedback).
@@ -69,32 +102,16 @@ pub struct ReplicationStream {
     feedback_interval: Duration,
     /// When the next unconditional feedback is due.
     feedback_deadline: Instant,
+    /// Which protocol state the connection is in. Stores nothing — the compiler reads it, the wire
+    /// never does.
+    _state: PhantomData<S>,
 }
 
-impl ReplicationStream {
-    /// Connect, hand-shake, and issue `START_REPLICATION SLOT … LOGICAL <lsn> (proto_version '2',
-    /// streaming 'on', publication_names '<publication>')`. `dsn` is parsed for host/port/user/db
-    /// (its auth is `trust` in the dev harness).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`anyhow::Error`] if the DSN is invalid, TCP/startup negotiation fails, or PostgreSQL
-    /// rejects `START_REPLICATION`.
-    pub async fn start(
-        dsn: &str,
-        slot: &str,
-        start_lsn: Lsn,
-        publication: &str,
-    ) -> anyhow::Result<Self> {
-        let mut this = Self::connect(dsn).await?;
-        this.start_streaming(slot, start_lsn, publication).await?;
-        Ok(this)
-    }
-
+impl ReplicationStream<Idle> {
     /// Open a `replication=database` connection and complete the startup handshake **without** yet
     /// issuing `START_REPLICATION` — the idle state a snapshot export needs (PR 2.29). The caller then
     /// either [`create_replication_slot_export`](Self::create_replication_slot_export) or
-    /// [`start_streaming`](Self::start_streaming).
+    /// [`into_streaming`](Self::into_streaming).
     ///
     /// # Errors
     ///
@@ -112,28 +129,44 @@ impl ReplicationStream {
             durable: Lsn::ZERO,
             feedback_interval: DEFAULT_FEEDBACK_INTERVAL,
             feedback_deadline: Instant::now() + DEFAULT_FEEDBACK_INTERVAL,
+            _state: PhantomData,
         };
         this.startup(&user, &database).await?;
         Ok(this)
     }
 
-    /// Issue `START_REPLICATION` from `start_lsn`, seeding the received/durable baselines. On its own
-    /// (after [`connect`](Self::connect)) this is the snapshot handoff: stream from `consistent_point`.
+    /// Issue `START_REPLICATION` from `start_lsn`, seeding the received/durable baselines, and hand
+    /// back the streaming half of the connection. On its own (after [`connect`](Self::connect)) this
+    /// is the snapshot handoff: stream from `consistent_point`.
+    ///
+    /// `into_`, not `start_`: the idle connection is **spent** here. Only one of the two states may
+    /// exist at a time, so the idle handle cannot linger and issue a second simple query into what is
+    /// now a CopyBoth stream. A failed transition drops the connection rather than leaving a
+    /// half-started one behind.
     ///
     /// # Errors
     ///
     /// Returns [`anyhow::Error`] if PostgreSQL rejects the replication command or the CopyBoth
     /// response cannot be written, read, or decoded.
-    pub async fn start_streaming(
-        &mut self,
+    pub async fn into_streaming(
+        mut self,
         slot: &str,
         start_lsn: Lsn,
         publication: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<ReplicationStream<Streaming>> {
         self.last_received = start_lsn;
         self.durable = start_lsn;
         self.feedback_deadline = Instant::now() + self.feedback_interval;
-        self.begin_replication(slot, start_lsn, publication).await
+        self.begin_replication(slot, start_lsn, publication).await?;
+        Ok(ReplicationStream {
+            stream: self.stream,
+            rbuf: self.rbuf,
+            last_received: self.last_received,
+            durable: self.durable,
+            feedback_interval: self.feedback_interval,
+            feedback_deadline: self.feedback_deadline,
+            _state: PhantomData,
+        })
     }
 
     /// `CREATE_REPLICATION_SLOT <slot> LOGICAL pgoutput (SNAPSHOT 'export')` (PR 2.29). Returns
@@ -186,6 +219,28 @@ impl ReplicationStream {
             .parse()
             .context("parse the slot's consistent_point as a Postgres LSN")?;
         Ok((consistent_point, snapshot_name))
+    }
+}
+
+impl ReplicationStream<Streaming> {
+    /// Connect, hand-shake, and issue `START_REPLICATION SLOT … LOGICAL <lsn> (proto_version '2',
+    /// streaming 'on', publication_names '<publication>')` — the resume path, which needs no exported
+    /// snapshot. `dsn` is parsed for host/port/user/db (its auth is `trust` in the dev harness).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if the DSN is invalid, TCP/startup negotiation fails, or PostgreSQL
+    /// rejects `START_REPLICATION`.
+    pub async fn start(
+        dsn: &str,
+        slot: &str,
+        start_lsn: Lsn,
+        publication: &str,
+    ) -> anyhow::Result<Self> {
+        ReplicationStream::<Idle>::connect(dsn)
+            .await?
+            .into_streaming(slot, start_lsn, publication)
+            .await
     }
 
     /// Override the unconditional-feedback cadence (must stay under the source's `wal_sender_timeout`).
@@ -307,7 +362,7 @@ impl ReplicationStream {
         self.durable
     }
 
-    // ---- internals --------------------------------------------------------------------------
+    // ---- CopyBoth internals -------------------------------------------------------------------
 
     async fn handle_copy_data(
         &mut self,
@@ -377,7 +432,17 @@ impl ReplicationStream {
         })
         .await
     }
+}
 
+/// Framing and simple-query plumbing, shared by both states: reading a framed backend message and
+/// writing a `'Q'` are the same bytes whether or not CopyBoth has started, so they are the one impl
+/// block that does not name a state.
+///
+/// `S: Send` is not a state-machine requirement — it is what keeps these `async fn`s' futures `Send`
+/// for the multi-thread scheduler. Auto traits leak through `PhantomData<S>`, so an unbounded `S`
+/// would make `&mut Self` (and every future holding it) conditionally `Send`. Both markers are ZSTs,
+/// so the bound costs callers nothing.
+impl<S: Send> ReplicationStream<S> {
     /// Buffered, cancellation-safe read of one backend message (`tag`, `body`). Retained bytes in
     /// `rbuf` survive a cancelled `read_buf`, so the feedback timer can cancel this mid-wait.
     async fn read_message(&mut self) -> anyhow::Result<(u8, Bytes)> {

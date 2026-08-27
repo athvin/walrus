@@ -20,7 +20,7 @@
 
 use crate::batch::{BatchTriggers, Clock, SystemClock, TableBatcher};
 use crate::relcache::RelationCache;
-use crate::replication::ReplicationStream;
+use crate::replication::{Idle, ReplicationStream};
 use crate::sink::{FileKind, ParquetSink};
 use anyhow::Context;
 use common::{
@@ -55,6 +55,11 @@ pub struct Exported;
 /// Holds the slot-creating replication connection, which **must stay open + idle** so the exported
 /// snapshot remains valid until every backfill session has attached to it.
 ///
+/// Two typestates stack here, on two independent axes: the held [`ReplicationStream`] is in its
+/// [`Idle`] state, which already forbids reading or acking CopyBoth frames before
+/// `START_REPLICATION`; `S` below forbids the handoff *to* `START_REPLICATION` before a snapshot has
+/// been exported.
+///
 /// Streaming before slot creation is forbidden:
 ///
 /// ```compile_fail
@@ -71,7 +76,7 @@ pub struct Exported;
 /// ```
 #[derive(Debug)]
 pub struct SnapshotConn<S = NotExported> {
-    stream: ReplicationStream,
+    stream: ReplicationStream<Idle>,
     _state: PhantomData<S>,
 }
 
@@ -83,7 +88,7 @@ impl SnapshotConn<NotExported> {
     /// Returns [`anyhow::Error`] if the replication DSN, TCP connection, or startup handshake fails.
     pub async fn connect(dsn: &str) -> anyhow::Result<Self> {
         Ok(SnapshotConn {
-            stream: ReplicationStream::connect(dsn)
+            stream: ReplicationStream::<Idle>::connect(dsn)
                 .await
                 .context("open replication connection for snapshot export")?,
             _state: PhantomData,
@@ -130,16 +135,15 @@ impl SnapshotConn<Exported> {
     ///
     /// Returns [`anyhow::Error`] if starting replication from the snapshot's consistent point fails.
     pub async fn into_stream(
-        mut self,
+        self,
         slot: &str,
         snap: &ExportedSnapshot,
         publication: &str,
     ) -> anyhow::Result<ReplicationStream> {
         self.stream
-            .start_streaming(slot, snap.consistent_point, publication)
+            .into_streaming(slot, snap.consistent_point, publication)
             .await
-            .context("hand off snapshot → streaming from consistent_point")?;
-        Ok(self.stream)
+            .context("hand off snapshot → streaming from consistent_point")
     }
 }
 
