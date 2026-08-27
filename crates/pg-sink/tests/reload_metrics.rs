@@ -384,7 +384,7 @@ async fn active_gauge_rises_and_returns_to_zero() {
         minio(epoch),
         ReloadControllerConfig {
             poll_interval: Duration::from_millis(200),
-            max_concurrent_reloads: 2,
+            max_concurrent_reloads: std::num::NonZeroUsize::new(2).unwrap(),
             lease_ttl: Duration::from_secs(6),
             instance: "walrus-sink-test".to_string(),
             publication_name: "walrus_pub".to_string(),

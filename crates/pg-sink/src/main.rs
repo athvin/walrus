@@ -10,6 +10,7 @@ use common::EpochNo;
 use pg_sink::config::SinkConfig;
 use pg_sink::replication::ReplicationStream;
 use pg_sink::{bootstrap, consume, health, shutdown};
+use std::num::NonZeroUsize;
 use std::process::ExitCode;
 use std::sync::Arc;
 use tokio::time::Instant;
@@ -151,7 +152,9 @@ async fn pipeline(
         sink.clone(),
         pg_sink::reload::ReloadControllerConfig {
             poll_interval: cfg.heartbeat_idle_after,
-            max_concurrent_reloads: usize::try_from(cfg.max_concurrent_reloads.get())
+            // Narrowing stays inside the non-zero domain: only the 64-bit magnitude can fail to fit
+            // a `usize`, never the "at least one exporter" invariant the config already proved.
+            max_concurrent_reloads: NonZeroUsize::try_from(cfg.max_concurrent_reloads)
                 .context("max_concurrent_reloads does not fit usize")?,
             lease_ttl: cfg.reload_lease_ttl,
             instance: cfg.instance.clone(),

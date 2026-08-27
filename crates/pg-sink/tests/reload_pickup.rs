@@ -28,6 +28,7 @@ use pg_sink::reload_signal::WatermarkWaiters;
 use pg_sink::replication::ReplicationStream;
 use pg_sink::sink::ParquetSink;
 use pg_sink::slot::verify_or_create_slot;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_postgres::NoTls;
@@ -67,7 +68,7 @@ async fn pool_for(epoch: EpochNo) -> sqlx::PgPool {
     pool
 }
 
-fn controller_cfg(epoch: EpochNo, cap: usize) -> ReloadControllerConfig {
+fn controller_cfg(epoch: EpochNo, cap: NonZeroUsize) -> ReloadControllerConfig {
     ReloadControllerConfig {
         poll_interval: Duration::from_millis(200), // fast cadence for the test
         max_concurrent_reloads: cap,
@@ -214,7 +215,7 @@ async fn pickup_flips_to_exporting_with_a_live_advancing_lease() {
         &source_url(),
         Arc::new(WatermarkWaiters::default()),
         minio(epoch),
-        controller_cfg(epoch, 2),
+        controller_cfg(epoch, NonZeroUsize::new(2).unwrap()),
         token.clone(),
     );
 
@@ -282,7 +283,7 @@ async fn preflight_failures_land_in_failed_with_reasons() {
         &source_url(),
         Arc::new(WatermarkWaiters::default()),
         minio(epoch),
-        controller_cfg(epoch, 2),
+        controller_cfg(epoch, NonZeroUsize::new(2).unwrap()),
         token.clone(),
     );
 
@@ -376,7 +377,7 @@ async fn cap_of_two_holds_and_the_stream_keeps_flowing() {
         &source_url(),
         Arc::new(WatermarkWaiters::default()),
         minio(epoch),
-        controller_cfg(epoch, 2),
+        controller_cfg(epoch, NonZeroUsize::new(2).unwrap()),
         token.clone(),
     );
 

@@ -21,7 +21,7 @@
 use crate::reload_signal::WatermarkWaiters;
 use anyhow::Context as _;
 use common::EpochNo;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::ops::AsyncFnMut;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -363,7 +363,12 @@ async fn export_with_ddl_restarts(
 pub struct ReloadControllerConfig {
     /// Poll cadence — the heartbeat cadence (`heartbeat_idle_after`), per the task's contract.
     pub poll_interval: Duration,
-    pub max_concurrent_reloads: usize,
+    /// Concurrent exporters — the semaphore's permit count, carried from `SinkConfig`'s
+    /// `NonZeroU64` without ever widening back to a zero-able count. A zero-permit semaphore is not
+    /// a *paused* controller but a dead one: `tick` and `adopt_and_resume` would find no free
+    /// permits, return early every cadence, and leave `requested` rows queued forever with nothing
+    /// in the logs to say why.
+    pub max_concurrent_reloads: NonZeroUsize,
     pub lease_ttl: Duration,
     /// `lease_holder` — the same identity the heartbeat/ownership machinery uses (never a second one).
     pub instance: String,
@@ -421,7 +426,7 @@ impl ReloadController {
             source_db_url: source_db_url.to_string(),
             waiters,
             sink,
-            semaphore: Arc::new(Semaphore::new(cfg.max_concurrent_reloads)),
+            semaphore: Arc::new(Semaphore::new(cfg.max_concurrent_reloads.get())),
             token: token.clone(),
             cfg,
         };
