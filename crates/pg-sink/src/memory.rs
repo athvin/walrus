@@ -168,11 +168,16 @@ pub enum RatioError {
 impl Ratio {
     /// Parse a raw ratio. `NaN`, `0.0`, `1.0` and anything outside the open interval are rejected.
     ///
+    /// Callable in a const initializer, so a compile-time ratio gets the same edge check an
+    /// operator-supplied one does. `clippy::missing_const_for_fn` does not ask for this `const` —
+    /// its const model still rejects every float operation — but `f64::is_finite` and the two
+    /// primitive comparisons below are const-stable at this workspace's 1.95 MSRV.
+    ///
     /// # Errors
     ///
     /// Returns [`RatioError::NonFinite`] for `NaN` or either infinity, and
     /// [`RatioError::OutOfRange`] unless a finite value is strictly between zero and one.
-    pub fn new(raw: f64) -> Result<Self, RatioError> {
+    pub const fn new(raw: f64) -> Result<Self, RatioError> {
         if !raw.is_finite() {
             return Err(RatioError::NonFinite(raw));
         }
@@ -236,6 +241,9 @@ impl HysteresisBand {
 
     /// Build a band whose resume threshold is strictly below its activation threshold.
     ///
+    /// Not `const`, unlike [`Ratio::new`]: the ordering test is `Ratio`'s derived
+    /// [`PartialOrd`], and a trait method is not callable in a const context on stable.
+    ///
     /// # Errors
     ///
     /// Returns [`BandError`] when `resume` is greater than or equal to `activate`.
@@ -284,7 +292,10 @@ impl Backpressure {
 
     /// Update from the current total vs ceiling; returns whether intake should be PAUSED afterwards.
     /// The non-zero ceiling makes the ratio total, so this path needs no divide-by-zero fallback.
-    pub fn tick(&mut self, total: u64, ceiling: NonZeroU64) -> bool {
+    ///
+    /// `const` for the same reason [`Ratio::new`] is: the float division and comparisons are what
+    /// clippy's const model cannot see through, not something the compiler refuses to evaluate.
+    pub const fn tick(&mut self, total: u64, ceiling: NonZeroU64) -> bool {
         let ratio = total as f64 / ceiling.get() as f64;
         if self.paused {
             if ratio <= self.band.resume().as_f64() {

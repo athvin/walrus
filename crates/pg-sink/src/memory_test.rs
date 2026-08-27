@@ -140,6 +140,16 @@ fn ratio_rejects_the_closed_ends_and_nan() {
 }
 
 #[test]
+fn ratio_is_constructible_in_a_const_context() {
+    // These fail to *compile* — not at runtime — if `Ratio::new` ever stops being a `const fn`, and
+    // the rejection below proves the range check itself runs during compilation.
+    const HALF: Result<Ratio, RatioError> = Ratio::new(0.5);
+    const TOO_LARGE: Result<Ratio, RatioError> = Ratio::new(1.5);
+    assert!(HALF.is_ok());
+    assert!(TOO_LARGE.is_err());
+}
+
+#[test]
 fn ratio_rejects_non_finite_values_explicitly() {
     for raw in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
         let error = Ratio::new(raw).expect_err("non-finite ratio must be rejected");
