@@ -50,14 +50,22 @@ image hardware-specific.
 
 ## What was measured
 
-At the PR 16.10 baseline, the shipped build surfaces contain zero occurrences of `target-cpu`,
-`RUSTFLAGS`, or lower-case `rustflags`: the workspace `Cargo.toml`, the sole workflow
-`.github/workflows/ci.yml`, and both Dockerfiles are clean. A repository-root `.cargo/` directory
-does not exist, so neither `.cargo/config.toml` nor the legacy `.cargo/config` spelling can inject
-the flag.
+Every surface that can hand a CPU or ISA flag to a cargo invocation contains zero occurrences of
+`target-cpu`, `target-feature`, `RUSTFLAGS`, or lower-case `rustflags`. That is the workspace
+`Cargo.toml`, the sole workflow `.github/workflows/ci.yml`, both Dockerfiles, and the three
+developer entry points that build a walrus binary — `justfile`, `scripts/bench-e2e.sh`, and
+`scripts/sink-smoke.sh`. The rule's own Cargo-config example is labelled “native builds for
+development”, so the local recipes are where the flag would realistically be added first;
+`bench-e2e.sh` is the one that would silently re-tune the release binaries behind
+`docs/benchmarks.md`.
 
-The source probe is deliberately limited to shipped configuration surfaces; the Rust regression
-test and this ADR necessarily name the rejected strings themselves.
+No `.cargo/` directory exists at the repository root or inside any workspace member, so neither
+`.cargo/config.toml` nor the legacy `.cargo/config` spelling can inject the flag. Member
+directories count because Cargo resolves configuration from the invocation's directory upwards: a
+config under `crates/loader/` would apply to any build started there while the root stayed clean.
+
+The source probe is deliberately limited to configuration and build-entry surfaces; the Rust
+regression test and this ADR necessarily name the rejected strings themselves.
 
 ## Why not even `x86-64-v2`
 
@@ -73,11 +81,21 @@ new compatibility floor.
 
 ## The guard
 
-`crates/common/tests/build_profile.rs` embeds the workspace manifest, the sole CI workflow, and
-both Dockerfiles with `include_str!`. It rejects `target-cpu`, upper-case `RUSTFLAGS`, and Cargo's
-lower-case `rustflags` form on every surface. A separate CWD-independent check resolves the
-workspace root from `CARGO_MANIFEST_DIR` and rejects both Cargo-config filenames. Fabricated inputs
-prove the build-flag and file-presence diagnostics without changing any shipped configuration.
+`crates/common/tests/build_profile.rs` embeds all seven surfaces above with `include_str!` and
+rejects four spellings on each: `target-cpu`, `target-feature`, upper-case `RUSTFLAGS`, and Cargo's
+lower-case `rustflags` form. `target-feature` earns its own needle because
+`cargo rustc --release -- -C target-feature=+avx2,+fma` raises exactly the ISA floor this decision
+declines while naming neither a CPU nor a rustflags variable — the other three needles all miss it.
+The `RUSTFLAGS` needle also covers the `CARGO_BUILD_RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS`
+environment forms as substrings.
+
+A separate CWD-independent check resolves the workspace root from `CARGO_MANIFEST_DIR`, reads the
+member list out of the embedded manifest, and rejects both Cargo-config filenames in the root and
+in every member directory. Parsing the member list rather than hard-coding it means a newly added
+crate is covered by the same change that adds it; the test also asserts the list parsed non-empty,
+so a manifest reshuffle cannot silently shrink the check back to the root. Fabricated inputs prove
+the build-flag, member-parsing, and file-presence diagnostics without changing any shipped
+configuration.
 
 Run the focused policy with:
 
@@ -85,8 +103,8 @@ Run the focused policy with:
 cargo test -p common --test build_profile
 ```
 
-The explicit list currently covers the repository's one workflow file. If another shipped workflow
-is added, extend `BUILD_SURFACES` in the same change.
+The explicit list covers the repository's one workflow file. If another shipped workflow, image, or
+cargo-invoking script is added, extend `TARGET_CPU_SURFACES` in the same change.
 
 ## The re-open trigger
 

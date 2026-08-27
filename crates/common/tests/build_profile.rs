@@ -8,6 +8,7 @@ const DOCKERFILE_PG_SINK: &str = include_str!("../../../deploy/docker/Dockerfile
 const DOCKERFILE_LOADER: &str = include_str!("../../../deploy/docker/Dockerfile.loader");
 const JUSTFILE: &str = include_str!("../../../justfile");
 const BENCH_E2E: &str = include_str!("../../../scripts/bench-e2e.sh");
+const SINK_SMOKE: &str = include_str!("../../../scripts/sink-smoke.sh");
 const CODEGEN_UNITS_ADR: &str = "docs/implementation/notes/rust-skills/opt-codegen-units.md";
 const CODEGEN_UNITS_NOTE: &str =
     include_str!("../../../docs/implementation/notes/rust-skills/opt-codegen-units.md");
@@ -17,11 +18,20 @@ const TARGET_CPU_NOTE: &str =
 const PGO_ADR: &str = "docs/implementation/notes/rust-skills/opt-pgo-profile.md";
 const PGO_NOTE: &str =
     include_str!("../../../docs/implementation/notes/rust-skills/opt-pgo-profile.md");
-const BUILD_SURFACES: &[(&str, &str)] = &[
+// Every surface that can hand a target-CPU or ISA flag to a cargo invocation: the manifest, the
+// sole workflow, both shipped Dockerfiles, and the three developer entry points that build a
+// walrus binary. The rule's own Cargo-config example is titled "native builds for development", so
+// the local recipes are a first-class drift vector. This list is wider than CODEGEN_UNITS_SURFACES
+// because it also covers debug-only `scripts/sink-smoke.sh`: an ISA floor is not a release-profile
+// knob, so a "native" flag on *any* build produces a host-specific binary.
+const TARGET_CPU_SURFACES: &[(&str, &str)] = &[
     ("Cargo.toml", WORKSPACE_MANIFEST),
     (".github/workflows/ci.yml", CI_WORKFLOW),
     ("deploy/docker/Dockerfile.pg-sink", DOCKERFILE_PG_SINK),
     ("deploy/docker/Dockerfile.loader", DOCKERFILE_LOADER),
+    ("justfile", JUSTFILE),
+    ("scripts/bench-e2e.sh", BENCH_E2E),
+    ("scripts/sink-smoke.sh", SINK_SMOKE),
 ];
 // Every surface that invokes cargo, which is where a codegen-unit override can be reinstated from
 // outside `[profile.release]`. The manifest is deliberately absent: its rejection prose names the
@@ -137,17 +147,42 @@ fn codegen_units_override_policy(body: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// `target-feature` is the fourth spelling and needs its own needle: `cargo rustc --release --
+/// -C target-feature=+avx2,+fma` establishes the same ISA floor as a named CPU — the AVX2/FMA
+/// instructions the rule's "What Changes" section is about — while mentioning neither `target-cpu`
+/// nor either rustflags variable, so the first three needles all miss it.
 fn target_cpu_policy(body: &str) -> Result<(), &'static str> {
     for (needle, diagnostic) in [
         ("target-cpu", "target-cpu is set"),
         ("RUSTFLAGS", "RUSTFLAGS is set"),
         ("rustflags", "rustflags is set"),
+        ("target-feature", "a target-feature flag is set"),
     ] {
         if body.contains(needle) {
             return Err(diagnostic);
         }
     }
     Ok(())
+}
+
+/// The paths named by `[workspace] members`. Cargo discovers configuration from the *invocation's*
+/// directory upwards, so a `.cargo/config.toml` dropped inside a member crate injects its
+/// `rustflags` into every `cargo build` run from there while the workspace root stays clean.
+/// Reading the list from the manifest keeps the check honest when a member is added.
+fn workspace_members(manifest: &str) -> Vec<&str> {
+    let Some(body) = table_body(manifest, "[workspace]") else {
+        return Vec::new();
+    };
+    let Some(members) = assignment_value(body, "members") else {
+        return Vec::new();
+    };
+
+    members
+        .trim_matches(['[', ']'])
+        .split(',')
+        .map(|entry| entry.trim().trim_matches('"'))
+        .filter(|entry| !entry.is_empty())
+        .collect()
 }
 
 const fn cargo_config_policy(
@@ -329,7 +364,7 @@ fn codegen_units_override_policy_rejects_fabricated_input() {
 
 #[test]
 fn no_build_surface_sets_a_target_cpu() {
-    for (name, body) in BUILD_SURFACES {
+    for (name, body) in TARGET_CPU_SURFACES {
         assert_eq!(
             target_cpu_policy(body),
             Ok(()),
@@ -341,14 +376,42 @@ fn no_build_surface_sets_a_target_cpu() {
 #[test]
 fn no_cargo_config_exists() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    assert_eq!(
-        cargo_config_policy(
-            root.join(".cargo/config.toml").exists(),
-            root.join(".cargo/config").exists(),
-        ),
-        Ok(()),
-        "workspace Cargo config must remain absent; see {TARGET_CPU_ADR}"
+    let members = workspace_members(WORKSPACE_MANIFEST);
+    assert!(
+        !members.is_empty(),
+        "the member list must stay parseable, or this check silently shrinks to the root"
     );
+
+    for dir in std::iter::once(".").chain(members) {
+        let path = root.join(dir);
+        assert_eq!(
+            cargo_config_policy(
+                path.join(".cargo/config.toml").exists(),
+                path.join(".cargo/config").exists(),
+            ),
+            Ok(()),
+            "{dir}/.cargo must remain absent; see {TARGET_CPU_ADR}"
+        );
+    }
+}
+
+#[test]
+fn workspace_members_reads_every_declared_member() {
+    let manifest = concat!(
+        "[workspace]\n",
+        "resolver = \"2\"\n",
+        "members = [\"crates/common\", \"tests/e2e\"] # one crate at a time\n",
+        "\n",
+        "[workspace.package]\n",
+        "edition = \"2024\"\n",
+    );
+
+    assert_eq!(workspace_members(manifest), ["crates/common", "tests/e2e"]);
+    assert_eq!(
+        workspace_members("[package]\nname = \"common\"\n"),
+        Vec::<&str>::new()
+    );
+    assert!(workspace_members(WORKSPACE_MANIFEST).contains(&"crates/loader"));
 }
 
 #[test]
@@ -363,6 +426,12 @@ fn target_cpu_policy_rejects_fabricated_input() {
         (
             "rustflags = [\"-C\", \"target-feature=+avx2\"]",
             Err("rustflags is set"),
+        ),
+        // Neither `target-cpu` nor a rustflags variable appears here, so only the fourth needle
+        // rejects this ISA floor.
+        (
+            "cargo rustc --release -p loader -- -C target-feature=+avx2,+fma",
+            Err("a target-feature flag is set"),
         ),
     ];
     for (body, expected) in surface_cases {
