@@ -8,6 +8,19 @@
 
 //! Shared primitives for walrus: errors + exit codes, `Lsn`, telemetry, config,
 //! `SinkMeta`, and the neutral Postgres shape types. Populated PR by PR (0.2 →).
+//!
+//! # Features
+//!
+//! - **`sqlx`** *(off by default)* — SQLx `Type`/`Encode`/`Decode` for [`Lsn`] (Postgres `pg_lsn`)
+//!   and for the [`ids`] newtypes (`int8`). `control` and `loader` enable it; a consumer that needs
+//!   only the domain types never links SQLx.
+//!
+//! Serde is deliberately *not* a feature. [`SinkMeta`], [`TypeDescriptor`], [`Lsn`] and
+//! [`CommonConfig`] **are** the wire and bootstrap contracts, and `figment`, `serde_json`,
+//! `humantime-serde`, and `tracing-subscriber`'s `json` layer each depend on serde
+//! unconditionally — so gating the derives would remove serde from no build at all. The decision,
+//! and what would reverse it, is recorded in
+//! `docs/implementation/notes/rust-skills/api-serde-optional.md`.
 
 pub mod config;
 pub mod error;
