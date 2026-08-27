@@ -157,6 +157,33 @@ fn ratio_rejects_non_finite_values_explicitly() {
     }
 }
 
+/// The `try_from = "f64"` attribute is what keeps the range check an *edge* check: an out-of-range
+/// knob must fail the parse rather than become a `Ratio` the hysteresis comparisons then trust. The
+/// config-level counterpart (`config_test.rs`) covers the non-finite half through figment; this
+/// pins the closed ends, which no other test reaches through a deserializer.
+#[test]
+fn out_of_range_ratios_are_rejected_during_deserialization() {
+    let parsed = serde_json::from_str::<Ratio>("0.5").expect("an in-range ratio must deserialize");
+    // A documented absolute tolerance, not `==`: config ratios are order-1 decimals, and bit
+    // equality on a parsed float would be a float_cmp blind spot dressed up as an assertion.
+    const EPSILON: f64 = 1e-9;
+    assert!(
+        (parsed.as_f64() - 0.5).abs() < EPSILON,
+        "{parsed:?} should carry the wire value 0.5"
+    );
+
+    for raw in ["0.0", "1.0", "1.5", "-0.25"] {
+        let error = serde_json::from_str::<Ratio>(raw)
+            .expect_err("a ratio outside the open unit interval must not deserialize");
+        assert!(error.to_string().contains("out of range"), "{raw}: {error}");
+    }
+
+    assert!(
+        serde_json::from_str::<Ratio>("\"0.5\"").is_err(),
+        "the wire shape stays a bare number, not a string"
+    );
+}
+
 #[test]
 fn default_band_is_valid() {
     let band = HysteresisBand::DEFAULT;

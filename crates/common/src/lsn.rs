@@ -260,7 +260,15 @@ impl serde::Serialize for Lsn {
 }
 
 impl<'de> serde::Deserialize<'de> for Lsn {
-    /// Read a string in either accepted dialect via [`FromStr`].
+    /// Read a string in either accepted dialect via [`FromStr`] — so a malformed WAL position is a
+    /// deserialization error and no out-of-grammar `Lsn` is ever constructed.
+    ///
+    /// Hand-written rather than `#[serde(try_from = "String")]`, which would need a `TryFrom<String>`
+    /// impl: a second owned-input parser aliasing [`FromStr`], the grammar's single entry point, to
+    /// reach this exact read-a-`String`-then-parse path. The paired `into = "String"` is declined for
+    /// a separate reason: it would allocate a `String` per LSN, where the
+    /// [`Serialize`](serde::Serialize) above renders straight into the serializer via `collect_str`
+    /// — and `lsn` plus `commit_lsn` ride every row of the provenance document.
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s: String = serde::Deserialize::deserialize(d)?;
         s.parse::<Lsn>().map_err(serde::de::Error::custom)

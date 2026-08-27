@@ -148,7 +148,14 @@ pub fn decide(meter: &InflightMeter, has_committed: bool) -> Option<ShedAction> 
 
 /// A ratio in the open unit interval `(0.0, 1.0)`. Constructed only through [`Ratio::new`], so a
 /// `Ratio` in hand is always in range — the check happens once, at the edge.
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+///
+/// `#[serde(try_from = "f64")]` makes the deserializer that same edge instead of a second one: serde
+/// reads a bare JSON/TOML/environment number (the wire shape stays numeric) and hands it to
+/// [`TryFrom<f64>`], so an out-of-range knob is a config-load failure rather than a `Ratio` that
+/// exists — however briefly — outside its interval and poisons the backpressure comparisons. There
+/// is no paired `into = "f64"`: nothing serializes a walrus config back out.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, serde::Deserialize)]
+#[serde(try_from = "f64")]
 pub struct Ratio(f64);
 
 /// Why a raw `f64` was rejected as a [`Ratio`].
@@ -197,7 +204,8 @@ impl Ratio {
 impl TryFrom<f64> for Ratio {
     type Error = RatioError;
 
-    /// The operator-facing spelling of [`Ratio::new`]; the deserializer below goes through it.
+    /// The operator-facing spelling of [`Ratio::new`], and the conversion the derived
+    /// `try_from = "f64"` deserializer runs — one range check serving both paths.
     ///
     /// # Errors
     ///
@@ -205,14 +213,6 @@ impl TryFrom<f64> for Ratio {
     /// [`RatioError::OutOfRange`] unless a finite `raw` is strictly between zero and one.
     fn try_from(raw: f64) -> Result<Self, RatioError> {
         Ratio::new(raw)
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for Ratio {
-    /// Read a bare JSON/TOML/environment float and parse it; the wire shape remains a number.
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let raw = <f64 as serde::Deserialize>::deserialize(d)?;
-        Ratio::try_from(raw).map_err(serde::de::Error::custom)
     }
 }
 
