@@ -39,6 +39,14 @@ pub struct InvalidPhase(pub u8);
 impl TryFrom<u8> for LoaderPhase {
     type Error = InvalidPhase;
 
+    /// Decode a phase byte read back out of the atomic the probes share.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidPhase`] carrying `byte` for anything other than `0`
+    /// ([`LoaderPhase::Bootstrapping`]), `1` ([`LoaderPhase::Ready`]), or `2`
+    /// ([`LoaderPhase::Quarantined`]). Only this module's typed stores write that atomic, so an
+    /// unknown byte is a bug here rather than a probe input.
     fn try_from(byte: u8) -> Result<Self, Self::Error> {
         match byte {
             0 => Ok(Self::Bootstrapping),

@@ -181,6 +181,12 @@ impl Ratio {
 impl TryFrom<f64> for Ratio {
     type Error = RatioError;
 
+    /// The operator-facing spelling of [`Ratio::new`]; the deserializer below goes through it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RatioError::NonFinite`] for `NaN` or either infinity, and
+    /// [`RatioError::OutOfRange`] unless a finite `raw` is strictly between zero and one.
     fn try_from(raw: f64) -> Result<Self, RatioError> {
         Ratio::new(raw)
     }

@@ -42,6 +42,12 @@ pub enum OldTupleKind {
 impl TryFrom<u8> for OldTupleKind {
     type Error = DecodeError;
 
+    /// Classify the old-image submessage tag that precedes an Update/Delete tuple.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError::BadTupleFormat`] carrying `tag` for any byte other than `b'K'` or
+    /// `b'O'`; the frame is then unparseable, so this is terminal rather than skippable.
     fn try_from(tag: u8) -> Result<Self, Self::Error> {
         match tag {
             b'K' => Ok(Self::Key),

@@ -170,6 +170,12 @@ impl FromStr for Lsn {
 
     /// Accepts `"0/199BAC8"` (two hex halves, `(high << 32) | low`) and `"00000000019A2B3C"`
     /// (bare 1–16 hex, with or without leading zeros).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LsnParseError`] carrying `s` verbatim when the text is neither form: an `X/Y`
+    /// half that is empty, non-hex, signed, or wider than a `u32`, or a bare value that is empty,
+    /// non-hex, signed, or wider than 16 significant hex digits.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let reject = |reason: &'static str| LsnParseError {
             input: s.to_string(),

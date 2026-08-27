@@ -147,6 +147,13 @@ pub struct UnknownExitCode(pub i32);
 impl TryFrom<i32> for ExitCode {
     type Error = UnknownExitCode;
 
+    /// Recover the typed status behind a raw process exit code.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnknownExitCode`] carrying `code` if it is not one of the documented statuses.
+    /// Because [`ExitCode`] is `#[non_exhaustive]` and still growing, an unknown number is an
+    /// older or newer walrus build's code — not necessarily a corrupt value.
     fn try_from(code: i32) -> std::result::Result<Self, Self::Error> {
         match code {
             0 => Ok(Self::Success),

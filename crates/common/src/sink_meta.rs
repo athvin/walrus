@@ -127,6 +127,12 @@ impl std::str::FromStr for UtcTimestamp {
     type Err = TimestampParseError;
 
     /// Parse RFC-3339, rejecting anything not already normalized to UTC `Z`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TimestampParseError::NotUtcZ`] if `s` has no `Z` suffix — a numeric offset is a
+    /// different wire form, not a value to convert — and [`TimestampParseError::Malformed`] if the
+    /// remaining text is not a valid RFC-3339 timestamp. Both preserve `s` verbatim.
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         if !(s.ends_with('Z') || s.ends_with('z')) {
             return Err(TimestampParseError::NotUtcZ {

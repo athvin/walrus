@@ -72,6 +72,13 @@ macro_rules! string_enum {
         impl ::std::str::FromStr for $name {
             type Err = $error;
 
+            /// Parse one of the exact strings persisted in the control DB — the inverse of
+            /// [`Self::as_str`].
+            ///
+            /// # Errors
+            ///
+            /// Returns the caller-selected error type, built from the declared column and the
+            /// verbatim input, when `s` is not one of the variant table's persisted strings.
             fn from_str(s: &str) -> ::std::result::Result<Self, Self::Err> {
                 match s {
                     $($text => Ok($name::$variant),)*

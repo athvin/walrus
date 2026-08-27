@@ -29,6 +29,13 @@ pub enum Tier {
 impl TryFrom<u8> for Tier {
     type Error = crate::Error;
 
+    /// Validate a descriptor's `"tier"` number — the same check the `try_from = "u8"` deserializer
+    /// runs on §2.6 JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Internal`] if `n` is not `1`, `2`, or `3`; a tier outside that set
+    /// means the registry row does not describe a mapping this build knows how to replay.
     fn try_from(n: u8) -> std::result::Result<Self, Self::Error> {
         match n {
             1 => Ok(Tier::One),
