@@ -125,7 +125,7 @@ impl Harness {
         .await
         .context("reset source tables + slot")?;
 
-        let bins = target_dir();
+        let bins = target_dir()?;
         build_bins(&bins).await?;
         let duckdb_dir = std::env::temp_dir().join(format!("walrus-e2e-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&duckdb_dir);
@@ -700,12 +700,15 @@ impl Drop for Harness {
 }
 
 /// The `target/<profile>/` directory holding the sibling binaries (next to this test binary).
-fn target_dir() -> PathBuf {
+fn target_dir() -> Result<PathBuf> {
     // .../target/<profile>/deps/<thisbin> → up two = target/<profile>/
-    let mut p = std::env::current_exe().expect("current_exe");
+    // Deliberately not an `expect`: an unresolvable `current_exe` is an environment failure (the test
+    // binary was moved or unlinked mid-run), not a violated invariant of ours, so it joins the
+    // harness's anyhow chain like every other setup step instead of panicking without a cause.
+    let mut p = std::env::current_exe().context("resolve current_exe for target/<profile>")?;
     p.pop(); // deps
     p.pop(); // <profile>
-    p
+    Ok(p)
 }
 
 async fn build_bins(_target: &std::path::Path) -> Result<()> {
