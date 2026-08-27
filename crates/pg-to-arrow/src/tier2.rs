@@ -1,3 +1,7 @@
+// These parsers run once per Tier-2 cell on `batch.rs`'s append path, which carries the same deny:
+// every read here is an iterator step or a `get`/`split_at_checked` proof, never an indexed cursor.
+#![deny(clippy::indexing_slicing)]
+
 //! Tier-2 **column-expansion** helpers: the source types that carry more than any single
 //! Arrow/Parquet/DuckDB scalar can hold, so the sink emits *several* sibling columns the loader
 //! recombines (walrus-pg-sink.md §2.4).
@@ -151,32 +155,30 @@ pub fn parse_interval(text: &str) -> Result<(i32, i32, i64), Error> {
     let mut micros: i64 = 0;
     let mut ago = false;
 
-    let toks: Vec<&str> = text.split_whitespace().collect();
-    let mut i = 0;
-    while i < toks.len() {
-        let tok = toks[i];
+    // Walk `split_whitespace` itself rather than collecting it: `<number> <unit>` is the only
+    // lookahead, and taking the unit with a second `next()` consumes it exactly the way an indexed
+    // `i += 2` cursor would — without the per-cell `Vec` or its bounds-checked reads. Every other
+    // token advances by one, which is the iterator's own step.
+    let mut toks = text.split_whitespace();
+    while let Some(tok) = toks.next() {
         // A clock token (`04:05:06.5`) contributes microseconds directly.
         if tok.contains(':') {
             micros = micros
                 .checked_add(signed_time_to_micros(tok).ok_or_else(err)?)
                 .ok_or_else(err)?;
-            i += 1;
             continue;
         }
         // `postgres_verbose` decorations: `@ 1 day ago`.
         if tok == "@" {
-            i += 1;
             continue;
         }
         if tok == "ago" {
             ago = true;
-            i += 1;
             continue;
         }
         // Otherwise a `<number> <unit>` pair.
         let n: i64 = tok.parse().map_err(|_| err())?;
-        let unit = toks.get(i + 1).ok_or_else(err)?;
-        match *unit {
+        match toks.next().ok_or_else(err)? {
             "year" | "years" | "yr" | "yrs" => {
                 months = months
                     .checked_add(n.checked_mul(12).ok_or_else(err)?)
@@ -205,7 +207,6 @@ pub fn parse_interval(text: &str) -> Result<(i32, i32, i64), Error> {
             }
             _ => return Err(err()),
         }
-        i += 2;
     }
     if ago {
         months = months.checked_neg().ok_or_else(err)?;
@@ -228,10 +229,18 @@ pub fn parse_interval(text: &str) -> Result<(i32, i32, i64), Error> {
 /// missing, malformed, or outside the representable integer range.
 pub fn parse_timetz(text: &str) -> Result<(i64, i32), Error> {
     let err = || parse_err("timetz", text);
+    // The clock carries no sign, so the first `+`/`-` opens the offset. Splitting there once yields
+    // both halves, and stripping the sign off the tail reads it without indexing back into the
+    // string. `find` returns a char boundary, so the `None` arm is unreachable — kept modelled
+    // rather than converted into a panicking `split_at`.
     let idx = text.find(['+', '-']).ok_or_else(err)?;
-    let micros = hms_to_micros(&text[..idx]).ok_or_else(err)?;
-    let sign: i32 = if text.as_bytes()[idx] == b'-' { -1 } else { 1 };
-    let off = &text[idx + 1..];
+    let (clock, signed_offset) = text.split_at_checked(idx).ok_or_else(err)?;
+    let micros = hms_to_micros(clock).ok_or_else(err)?;
+    let (sign, off): (i32, &str) = match signed_offset.strip_prefix('-') {
+        Some(rest) => (-1, rest),
+        // `find` matched one of the two signs, so this strip cannot fail either.
+        None => (1, signed_offset.strip_prefix('+').ok_or_else(err)?),
+    };
     let mut it = off.split(':');
     let oh: i32 = it.next().ok_or_else(err)?.parse().map_err(|_| err())?;
     let om: i32 = it.next().unwrap_or("0").parse().map_err(|_| err())?;

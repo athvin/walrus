@@ -58,6 +58,17 @@ fn timetz_positive_and_negative_offsets() {
 }
 
 #[test]
+fn interval_number_without_a_following_unit_is_rejected() {
+    // A `<number> <unit>` pair takes its unit from the *next* token, so a number at end of input has
+    // nothing to pair with. Pin both shapes — a lone number and one trailing a complete pair — so the
+    // token walk keeps failing instead of silently dropping the unattached value.
+    assert!(parse_interval("5").is_err());
+    assert!(parse_interval("1 day 2").is_err());
+    // `@`/`ago` are decorations, never units: consuming one as a unit would make this parse.
+    assert!(parse_interval("1 ago").is_err());
+}
+
+#[test]
 fn interval_and_timetz_reject_garbage() {
     assert!(parse_interval("1 fortnight").is_err());
     assert!(parse_timetz("12:34:56").is_err()); // no offset
