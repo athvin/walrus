@@ -355,10 +355,11 @@ async fn plan_at_version(
 ) -> Result<crate::plan::TablePlan, LoaderError> {
     match control::read_registry(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table, version).await? {
         Some(r) => {
-            let table = format!("{}.{}", ctx.schema, ctx.table);
+            // Label built inside the closure (`current_transform`'s precedent): only a decode
+            // failure pays for it.
             let rel: PgRelation = serde_json::from_value(r.columns).map_err(|source| {
                 LoaderError::RegistryDecode {
-                    table,
+                    table: format!("{}.{}", ctx.schema, ctx.table),
                     version: version.0,
                     source,
                 }

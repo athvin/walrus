@@ -407,10 +407,11 @@ async fn load_version(
     let Some(row) = control::read_registry(pool, epoch, schema, table, version).await? else {
         return Ok(None);
     };
-    let table = format!("{schema}.{table}");
+    // `reconcile_to_version` calls this twice per version step; the `schema.table` label is built
+    // inside the closure so only an actual decode failure allocates it.
     let relation: PgRelation =
         serde_json::from_value(row.columns).map_err(|source| LoaderError::RegistryDecode {
-            table,
+            table: format!("{schema}.{table}"),
             version: version.0,
             source,
         })?;

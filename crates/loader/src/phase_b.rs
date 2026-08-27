@@ -28,10 +28,11 @@ pub async fn current_transform(ctx: &TableCtx) -> Result<TransformSql, LoaderErr
     let ver = ctx.db.schema_version()?;
     match control::read_registry(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table, ver).await? {
         Some(r) => {
-            let table = format!("{}.{}", ctx.schema, ctx.table);
+            // The `schema.table` label is built INSIDE the closure: `map_err` only runs it on a
+            // decode failure, so the every-cycle success path allocates nothing.
             let rel: PgRelation = serde_json::from_value(r.columns).map_err(|source| {
                 LoaderError::RegistryDecode {
-                    table,
+                    table: format!("{}.{}", ctx.schema, ctx.table),
                     version: ver.0,
                     source,
                 }
