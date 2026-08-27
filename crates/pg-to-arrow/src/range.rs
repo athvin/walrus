@@ -12,6 +12,7 @@
 use crate::error::Error;
 use crate::oids;
 use arrow::datatypes::{DataType, TimeUnit};
+use std::borrow::Cow;
 
 /// The six built-in range/multirange families. The element type — and, in Postgres, the
 /// canonicalization — differ per family, but the wire form the sink parses is uniform.
@@ -75,11 +76,15 @@ impl RangeFamily {
 /// states are distinct: `empty` (`isempty` true, both bounds `None`), an unbounded bound (`None` with
 /// `empty=false`), and — at the column level — a whole SQL `NULL` (handled by the caller, not here).
 /// `lower_inf`/`upper_inf` are **derivable** (`bound.is_none() && !empty`) and deliberately not stored.
+///
+/// Each bound **borrows the wire literal** it was cut from: this is per-value work on the batch-build
+/// path, and a bound only ever needs its own buffer when Postgres quoted *and* escaped it — the
+/// [`Cow`] condition. Read a bound through `as_deref()`; the borrow is invisible to callers.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParsedRange {
+pub struct ParsedRange<'a> {
     pub empty: bool,
-    pub lower: Option<String>,
-    pub upper: Option<String>,
+    pub lower: Option<Cow<'a, str>>,
+    pub upper: Option<Cow<'a, str>>,
     pub lower_inc: bool,
     pub upper_inc: bool,
 }
@@ -96,7 +101,7 @@ fn range_err(text: &str) -> Error {
 ///
 /// Returns [`Error::ValueParse`] when delimiters are invalid or the two bounds are not separated by
 /// one top-level comma.
-pub fn parse_range(text: &str) -> Result<ParsedRange, Error> {
+pub fn parse_range(text: &str) -> Result<ParsedRange<'_>, Error> {
     let t = text.trim();
     if t.eq_ignore_ascii_case("empty") {
         return Ok(ParsedRange {
@@ -140,7 +145,7 @@ pub fn parse_range(text: &str) -> Result<ParsedRange, Error> {
 /// # Errors
 ///
 /// Returns [`Error::ValueParse`] if the outer braces are missing or any member is not a valid range.
-pub fn parse_multirange(text: &str) -> Result<Vec<ParsedRange>, Error> {
+pub fn parse_multirange(text: &str) -> Result<Vec<ParsedRange<'_>>, Error> {
     let t = text.trim();
     if !t.starts_with('{') || !t.ends_with('}') {
         return Err(range_err(text));
@@ -154,19 +159,29 @@ pub fn parse_multirange(text: &str) -> Result<Vec<ParsedRange>, Error> {
 
 /// One bound literal → its value: empty (unquoted) = unbounded (`None`); otherwise the raw text with
 /// surrounding quotes stripped and `""`/`\x` un-escaped.
-fn parse_bound(s: &str) -> Option<String> {
+///
+/// An unquoted bound (`[1,10)`) is returned as [`Cow::Borrowed`] — the overwhelmingly common shape,
+/// and the one the discrete families always take.
+fn parse_bound(s: &str) -> Option<Cow<'_, str>> {
     if s.is_empty() {
         return None; // unbounded side
     }
     if s.starts_with('"') {
         return Some(unquote(s));
     }
-    Some(s.to_string())
+    Some(Cow::Borrowed(s))
 }
 
 /// Strip the surrounding `"` and un-escape `""` → `"` and `\x` → `x` (Postgres' range/element quoting).
-fn unquote(s: &str) -> String {
+///
+/// Un-escaping is the *only* reason a bound needs its own buffer, so a quoted body with nothing to
+/// un-escape stays [`Cow::Borrowed`] — that covers every `tsrange`/`tstzrange` bound, which Postgres
+/// quotes unconditionally.
+fn unquote(s: &str) -> Cow<'_, str> {
     let inner = &s[1..s.len().saturating_sub(1)];
+    if !inner.contains(['"', '\\']) {
+        return Cow::Borrowed(inner);
+    }
     let mut out = String::with_capacity(inner.len());
     let mut chars = inner.chars().peekable();
     while let Some(c) = chars.next() {
@@ -183,7 +198,7 @@ fn unquote(s: &str) -> String {
             _ => out.push(c),
         }
     }
-    out
+    Cow::Owned(out)
 }
 
 /// Split `inner` at the single top-level comma (quote-aware), returning `(lower, upper)`.

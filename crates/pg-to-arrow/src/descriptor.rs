@@ -13,6 +13,7 @@ use crate::range::RangeFamily;
 use crate::{Error, geometric, oids, schema, tier3, uuid_enum};
 use arrow::datatypes::DataType;
 use common::{PgColumn, PgRelation, Tier, TypeDescriptor, TypeMeta};
+use std::borrow::Cow;
 use std::num::NonZeroU32;
 
 /// Derive the per-column mapping descriptor (§2.6). Enum `enum_labels` are caller-supplied (the sink
@@ -165,25 +166,29 @@ fn first_field_type(col: &PgColumn) -> Result<Option<DataType>, Error> {
 }
 
 /// Parquet-ish emit-suffix name (matches the §2.6 interval example `INT32`/`INT64`).
-fn arrow_emit_name(dt: &DataType) -> String {
+///
+/// Every fixed name stays [`Cow::Borrowed`] — the sibling [`duckdb_scalar_name`] is a plain
+/// `&'static str` for exactly that reason. Only the three parameterised forms (`DECIMAL(p,s)`,
+/// `FIXEDBINARY(n)`, and the `{other:?}` fallback) have to build a string.
+fn arrow_emit_name(dt: &DataType) -> Cow<'static, str> {
     match dt {
-        DataType::Boolean => "BOOLEAN".to_string(),
-        DataType::Int16 => "INT16".to_string(),
-        DataType::Int32 => "INT32".to_string(),
-        DataType::Int64 => "INT64".to_string(),
-        DataType::Float32 => "FLOAT".to_string(),
-        DataType::Float64 => "DOUBLE".to_string(),
-        DataType::Decimal128(p, s) => format!("DECIMAL({p},{s})"),
-        DataType::Utf8 => "VARCHAR".to_string(),
-        DataType::Binary => "BLOB".to_string(),
-        DataType::FixedSizeBinary(n) => format!("FIXEDBINARY({n})"),
-        DataType::Date32 => "DATE".to_string(),
-        DataType::Time64(_) => "TIME".to_string(),
-        DataType::Timestamp(_, Some(_)) => "TIMESTAMPTZ".to_string(),
-        DataType::Timestamp(_, None) => "TIMESTAMP".to_string(),
-        DataType::Struct(_) => "STRUCT".to_string(),
-        DataType::List(_) => "LIST".to_string(),
-        other => format!("{other:?}"),
+        DataType::Boolean => Cow::Borrowed("BOOLEAN"),
+        DataType::Int16 => Cow::Borrowed("INT16"),
+        DataType::Int32 => Cow::Borrowed("INT32"),
+        DataType::Int64 => Cow::Borrowed("INT64"),
+        DataType::Float32 => Cow::Borrowed("FLOAT"),
+        DataType::Float64 => Cow::Borrowed("DOUBLE"),
+        DataType::Decimal128(p, s) => Cow::Owned(format!("DECIMAL({p},{s})")),
+        DataType::Utf8 => Cow::Borrowed("VARCHAR"),
+        DataType::Binary => Cow::Borrowed("BLOB"),
+        DataType::FixedSizeBinary(n) => Cow::Owned(format!("FIXEDBINARY({n})")),
+        DataType::Date32 => Cow::Borrowed("DATE"),
+        DataType::Time64(_) => Cow::Borrowed("TIME"),
+        DataType::Timestamp(_, Some(_)) => Cow::Borrowed("TIMESTAMPTZ"),
+        DataType::Timestamp(_, None) => Cow::Borrowed("TIMESTAMP"),
+        DataType::Struct(_) => Cow::Borrowed("STRUCT"),
+        DataType::List(_) => Cow::Borrowed("LIST"),
+        other => Cow::Owned(format!("{other:?}")),
     }
 }
 
