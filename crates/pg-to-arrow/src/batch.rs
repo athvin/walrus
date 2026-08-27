@@ -165,10 +165,11 @@ impl BatchBuilder {
                 got: values.len(),
             });
         }
-        // Clone the Fields (Arc) so we can read the field types while mutably borrowing `builders`.
-        let fields = self.schema.fields().clone();
+        // Read the field types straight out of the schema — `schema`, `builders`, and `ts_buf` are
+        // disjoint fields, so the shared borrow coexists with the mutable ones (as `plan` already
+        // does below). Cloning `Fields` here would be an Arc refcount round-trip on every row.
         let mut builders: &mut [Box<dyn ArrayBuilder>] = &mut self.builders.0;
-        let mut remaining_fields: &[FieldRef] = &fields;
+        let mut remaining_fields: &[FieldRef] = self.schema.fields();
         for (emit, value) in self.plan.iter().zip(values) {
             let width = emit.width();
             let column = remaining_fields

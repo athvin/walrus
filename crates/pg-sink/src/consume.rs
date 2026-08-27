@@ -819,12 +819,14 @@ impl<C: Clock + Clone> BatchRouter<C> {
             );
             return Ok(());
         };
-        let triggers = self.triggers;
-        let clock = self.clock.clone();
         let batcher = match self.batchers.entry(row.oid) {
             Entry::Occupied(e) => e.into_mut(),
+            // The clock clone stays inside this arm. `C` is an `Arc` in production, so hoisting it
+            // above the match would bump and drop the refcount on every row for the overwhelmingly
+            // common occupied hit; `batchers`, `triggers`, and `clock` are disjoint fields, so the
+            // borrow checker is content reading them under the entry's `&mut self.batchers`.
             Entry::Vacant(e) => e.insert(
-                TableBatcher::new(Arc::clone(&cached), triggers, clock)
+                TableBatcher::new(Arc::clone(&cached), self.triggers, self.clock.clone())
                     .context("create table batcher")?,
             ),
         };

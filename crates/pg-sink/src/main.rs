@@ -110,17 +110,15 @@ async fn pipeline(
     } = establish_stream(cfg, &ctx, &mut cache, triggers, SCHEMA_VERSION).await?;
     tracing::info!(slot = %cfg.slot_name, start_lsn = %start_lsn, epoch = %epoch, "streaming logical replication");
 
-    let mut router = consume::BatchRouter::new(
-        triggers,
-        std::sync::Arc::new(pg_sink::batch::SystemClock),
-        epoch,
-        &cfg.instance,
-    );
+    // ONE wall clock for the whole decode path: the router's and the demux's batchers share it by
+    // `Arc` (see `batch::Clock`), so the test seam has a single instant source, not two.
+    let clock = Arc::new(pg_sink::batch::SystemClock);
+    let mut router = consume::BatchRouter::new(triggers, Arc::clone(&clock), epoch, &cfg.instance);
     let mut checkpoint = pg_sink::checkpoint::DurabilityCheckpoint::new(start_lsn);
     // Large-transaction demux (§1.6): a txn over logical_decoding_work_mem streams before its commit.
     let mut demux = pg_sink::stream_txn::StreamDemux::new(
         triggers,
-        std::sync::Arc::new(pg_sink::batch::SystemClock),
+        clock,
         epoch,
         &cfg.instance,
         cfg.max_inflight_bytes,
