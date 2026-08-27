@@ -21,6 +21,15 @@
 //! unconditionally — so gating the derives would remove serde from no build at all. The decision,
 //! and what would reverse it, is recorded in
 //! `docs/implementation/notes/rust-skills/api-serde-optional.md`.
+//!
+//! # Stability
+//!
+//! `common::__private` is **not** part of this crate's API. It exists only because expansions of
+//! `common`'s exported macros — currently `string_enum!` — must name their helpers from the
+//! caller's crate, which forces those helpers to be `pub` somewhere. Its contents are exempt from
+//! every stability guarantee the rest of this crate makes and may be renamed or removed in any
+//! change; walrus has no `CHANGELOG`, so this is the note that says so. Write `string_enum!` and
+//! let it reach `__private` for you; never name the module yourself.
 
 pub mod config;
 pub mod error;
