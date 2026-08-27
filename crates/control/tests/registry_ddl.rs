@@ -9,7 +9,7 @@
 //! `integration` feature (needs the PR 0.6 control PG).
 #![cfg(feature = "integration")]
 
-use common::{EpochNo, Lsn, SchemaVersionNo, Tier, TypeDescriptor, TypeMeta};
+use common::{DdlId, EpochNo, Lsn, SchemaVersionNo, Tier, TypeDescriptor, TypeMeta};
 use control::{
     DdlRow, RegistryRow, connect, insert_ddl, read_latest_version, read_pending_ddl, read_registry,
     run_migrations, upsert_registry,
@@ -77,7 +77,7 @@ fn registry_row(epoch: EpochNo, version: SchemaVersionNo) -> RegistryRow {
 
 fn ddl(epoch: EpochNo, c_lsn: &str, version: SchemaVersionNo) -> DdlRow {
     DdlRow {
-        id: 0, // ignored on insert
+        id: DdlId(0), // ignored on insert
         epoch,
         source_schema: "public".to_string(),
         source_table: "orders".to_string(),
@@ -173,7 +173,7 @@ async fn ddl_row_round_trips_with_commit_lsn() {
     )
     .await
     .unwrap();
-    assert!(id > 0);
+    assert!(id > DdlId(0));
 
     let pending = read_pending_ddl(
         &mut *tx,

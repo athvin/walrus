@@ -25,6 +25,8 @@ fn every_domain_id_is_layout_identical_to_i64() {
         std::mem::align_of::<ReloadId>(),
         std::mem::align_of::<i64>()
     );
+    assert_eq!(std::mem::size_of::<DdlId>(), std::mem::size_of::<i64>());
+    assert_eq!(std::mem::align_of::<DdlId>(), std::mem::align_of::<i64>());
 }
 
 #[test]
@@ -110,4 +112,21 @@ fn reload_id_ordering_matches_the_inner_integer() {
     let mut ids = [ReloadId(3), ReloadId(1), ReloadId(2)];
     ids.sort();
     assert_eq!(ids, [ReloadId(1), ReloadId(2), ReloadId(3)]);
+}
+
+#[test]
+fn ddl_id_from_i64_and_back_round_trips() {
+    let ddl_id = DdlId::from(13);
+    assert_eq!(ddl_id, DdlId(13));
+    assert_eq!(ddl_id.to_string(), "13");
+    assert_eq!(i64::from(ddl_id), 13);
+}
+
+/// `(c_lsn, id)` is the DDL history's order, so `DdlId`'s own ordering must be the integer's.
+#[test]
+fn ddl_id_ordering_matches_the_inner_integer() {
+    assert!(DdlId(1) < DdlId(2));
+    let mut ids = [DdlId(3), DdlId(1), DdlId(2)];
+    ids.sort();
+    assert_eq!(ids, [DdlId(1), DdlId(2), DdlId(3)]);
 }

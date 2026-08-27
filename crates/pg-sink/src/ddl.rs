@@ -16,7 +16,7 @@
 //! (globals fire nothing; `TRUNCATE` is a native pgoutput message) — the Relation-message drift backstop
 //! (TODO: full handling is the loader's, PR 3.8/3.9) covers the rest.
 
-use common::{EpochNo, Lsn, PgRelation, SchemaVersionNo, TupleValue};
+use common::{DdlId, EpochNo, Lsn, PgRelation, SchemaVersionNo, TupleValue};
 use std::collections::HashMap;
 
 /// A decoded `walrus.ddl_audit` INSERT — the sink's only signal that the schema changed.
@@ -126,7 +126,7 @@ impl DdlConsumer {
                 .unwrap_or(SchemaVersionNo(1))
         };
         let row = control::DdlRow {
-            id: 0,
+            id: DdlId(0), // ignored on insert; the DB assigns the bigserial
             epoch: self.epoch,
             source_schema: ev.source_schema.clone(),
             source_table: ev.source_table.clone(),

@@ -7,16 +7,16 @@ fn nz(value: u64) -> NonZeroU64 {
 #[test]
 fn over_ceiling_when_sum_across_streams_exceeds_budget() {
     let mut m = InflightMeter::new(nz(1000));
-    m.add((1, 100), 400);
-    m.add((2, 100), 400);
+    m.add((TableId(1), 100), 400);
+    m.add((TableId(2), 100), 400);
     assert!(!m.is_over_ceiling(), "800 <= 1000");
-    m.add((1, 200), 300); // total 1100 across THREE streams
+    m.add((TableId(1), 200), 300); // total 1100 across THREE streams
     assert!(
         m.is_over_ceiling(),
         "the AGGREGATE exceeds the ceiling, not any single stream"
     );
     assert_eq!(m.total(), 1100);
-    m.release((1, 100));
+    m.release((TableId(1), 100));
     assert_eq!(m.total(), 700);
     assert!(!m.is_over_ceiling());
 }
@@ -24,38 +24,42 @@ fn over_ceiling_when_sum_across_streams_exceeds_budget() {
 #[test]
 fn largest_open_picks_the_biggest_stream() {
     let mut m = InflightMeter::new(nz(10_000));
-    m.add((1, 100), 200);
-    m.add((2, 101), 900);
-    m.add((3, 102), 500);
-    assert_eq!(m.largest_open(), Some((2, 101)));
+    m.add((TableId(1), 100), 200);
+    m.add((TableId(2), 101), 900);
+    m.add((TableId(3), 102), 500);
+    assert_eq!(m.largest_open(), Some((TableId(2), 101)));
 }
 
 #[test]
 fn spill_order_pops_strictly_descending_by_bytes() {
     let mut m = InflightMeter::new(nz(10_000));
-    m.add((1, 100), 200);
-    m.add((2, 101), 900);
-    m.add((3, 102), 500);
+    m.add((TableId(1), 100), 200);
+    m.add((TableId(2), 101), 900);
+    m.add((TableId(3), 102), 500);
 
     let mut candidates = m.spill_order();
-    assert_eq!(candidates.pop(), Some((900, 2, 101)));
-    assert_eq!(candidates.pop(), Some((500, 3, 102)));
-    assert_eq!(candidates.pop(), Some((200, 1, 100)));
+    assert_eq!(candidates.pop(), Some((900, TableId(2), 101)));
+    assert_eq!(candidates.pop(), Some((500, TableId(3), 102)));
+    assert_eq!(candidates.pop(), Some((200, TableId(1), 100)));
     assert_eq!(candidates.pop(), None);
 }
 
 #[test]
 fn spill_order_breaks_an_exact_byte_tie_deterministically() {
     let mut m = InflightMeter::new(nz(10_000));
-    m.add((3, 9), 500);
-    m.add((7, 1), 500);
-    m.add((7, 2), 500);
+    m.add((TableId(3), 9), 500);
+    m.add((TableId(7), 1), 500);
+    m.add((TableId(7), 2), 500);
 
     let drain = || {
         let mut candidates = m.spill_order();
         std::iter::from_fn(|| candidates.pop()).collect::<Vec<_>>()
     };
-    let expected = vec![(500, 7, 2), (500, 7, 1), (500, 3, 9)];
+    let expected = vec![
+        (500, TableId(7), 2),
+        (500, TableId(7), 1),
+        (500, TableId(3), 9),
+    ];
     assert_eq!(drain(), expected);
     assert_eq!(drain(), expected);
 }
@@ -63,9 +67,9 @@ fn spill_order_breaks_an_exact_byte_tie_deterministically() {
 #[test]
 fn peek_agrees_with_largest_open() {
     let mut m = InflightMeter::new(nz(10_000));
-    m.add((3, 9), 200);
-    m.add((7, 1), 500);
-    m.add((7, 2), 500);
+    m.add((TableId(3), 9), 200);
+    m.add((TableId(7), 1), 500);
+    m.add((TableId(7), 2), 500);
 
     assert_eq!(
         m.spill_order()
@@ -86,7 +90,7 @@ fn spill_order_of_an_empty_meter_is_empty() {
 fn shed_prefers_committed_then_spill_then_pause() {
     let mut m = InflightMeter::new(nz(100));
     assert_eq!(decide(&m, true), None, "under ceiling → no shedding");
-    m.add((7, 55), 200); // over ceiling
+    m.add((TableId(7), 55), 200); // over ceiling
     assert_eq!(
         decide(&m, true),
         Some(ShedAction::FlushCommitted),
@@ -94,7 +98,7 @@ fn shed_prefers_committed_then_spill_then_pause() {
     );
     assert_eq!(
         decide(&m, false),
-        Some(ShedAction::SpillOpenTxn(7, 55)),
+        Some(ShedAction::SpillOpenTxn(TableId(7), 55)),
         "no committed → spill the largest open stream"
     );
     let mut empty = InflightMeter::new(nz(1)); // over ceiling but nothing open
@@ -152,8 +156,8 @@ fn default_band_is_valid() {
 #[test]
 fn add_saturates_at_u64_max_and_stays_over_ceiling() {
     let mut m = InflightMeter::new(nz(1_000));
-    m.add((1, 100), u64::MAX);
-    m.add((1, 100), 1);
+    m.add((TableId(1), 100), u64::MAX);
+    m.add((TableId(1), 100), 1);
     assert_eq!(m.total(), u64::MAX);
     assert!(m.is_over_ceiling());
 }
@@ -161,15 +165,15 @@ fn add_saturates_at_u64_max_and_stays_over_ceiling() {
 #[test]
 fn release_after_saturation_does_not_wrap_the_total() {
     let mut m = InflightMeter::new(nz(1_000));
-    m.add((1, 100), u64::MAX);
-    m.add((2, 200), u64::MAX);
-    m.release((1, 100));
+    m.add((TableId(1), 100), u64::MAX);
+    m.add((TableId(2), 200), u64::MAX);
+    m.release((TableId(1), 100));
     assert_eq!(m.total(), u64::MAX);
     assert!(
         m.is_over_ceiling(),
         "the second saturated stream remains open"
     );
-    m.release((2, 200));
+    m.release((TableId(2), 200));
     assert_eq!(m.total(), 0);
     assert!(!m.is_over_ceiling());
 }

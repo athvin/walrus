@@ -7,7 +7,7 @@
 //! ordering.
 
 use crate::ControlError;
-use common::{EpochNo, Lsn, SchemaVersionNo};
+use common::{DdlId, EpochNo, Lsn, SchemaVersionNo};
 use sqlx::PgExecutor;
 
 /// A decoded schema-change event. (`c_columns` / `c_dropped` gain typed fields in PRs 3.8/3.9; they
@@ -15,7 +15,7 @@ use sqlx::PgExecutor;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DdlRow {
     /// Assigned by the DB on insert; ignored by [`insert_ddl`].
-    pub id: i64,
+    pub id: DdlId,
     pub epoch: EpochNo,
     pub source_schema: String,
     pub source_table: String,
@@ -42,7 +42,7 @@ pub async fn insert_ddl(
     row: &DdlRow,
     c_rel_oid: Option<u32>,
     c_columns: Option<&serde_json::Value>,
-) -> Result<i64, ControlError> {
+) -> Result<DdlId, ControlError> {
     let c_rel_oid = c_rel_oid.map(sqlx::postgres::types::Oid);
     let rec = sqlx::query_file!(
         "sql/postgres/queries/insert_ddl.sql",
@@ -58,7 +58,9 @@ pub async fn insert_ddl(
     )
     .fetch_one(ex)
     .await?;
-    Ok(rec.id)
+    // Wrap the decoded scalar rather than binding the newtype: the SQL text is untouched, so the
+    // committed `.sqlx` offline cache stays valid without a regenerate.
+    Ok(DdlId(rec.id))
 }
 
 /// DDL the loader must apply before transforming past `after_lsn`, in `c_lsn` order (`id` breaks
@@ -86,7 +88,7 @@ pub async fn read_pending_ddl(
     Ok(rows
         .into_iter()
         .map(|row| DdlRow {
-            id: row.id,
+            id: DdlId(row.id),
             epoch: row.epoch.into(),
             source_schema: row.source_schema,
             source_table: row.source_table,

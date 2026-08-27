@@ -2,8 +2,12 @@
 //!
 //! `ManifestId` extends the [`Lsn`](crate::Lsn) newtype pattern to a `file_manifest` row's id, so it
 //! can't be silently swapped for another bare `i64` (a manifest id vs an epoch vs a schema version).
-//! `ManifestId`, [`EpochNo`], [`SchemaVersionNo`], and [`ReloadId`] share the same transparent
-//! `int8` boundary while remaining distinct types inside Rust.
+//! `ManifestId`, [`EpochNo`], [`SchemaVersionNo`], [`ReloadId`], and [`DdlId`] share the same
+//! transparent `int8` boundary while remaining distinct types inside Rust.
+//!
+//! Which bare integers deliberately stay bare — the pgoutput wire scalars (relation/type OIDs and
+//! transaction ids) — and what would reopen that, is recorded in
+//! `docs/implementation/notes/rust-skills/type-newtype-ids.md`.
 
 use std::mem::{align_of, size_of};
 
@@ -137,6 +141,37 @@ impl From<ReloadId> for i64 {
     }
 }
 
+/// A `ddl_manifest` row's monotonic `bigserial` primary key. The DDL history is ordered by
+/// `(c_lsn, id)` — `id` is the tiebreaker between two schema changes committed at the same LSN — so
+/// it is a real ordering key, not just a row handle, and must not be confused with the
+/// [`SchemaVersionNo`] the same row carries.
+///
+/// The transparent representation guarantees the layout assumed by its SQLx `i64` delegation.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DdlId(pub i64);
+
+const _: () =
+    assert!(size_of::<DdlId>() == size_of::<i64>() && align_of::<DdlId>() == align_of::<i64>());
+
+impl std::fmt::Display for DdlId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<i64> for DdlId {
+    fn from(value: i64) -> Self {
+        DdlId(value)
+    }
+}
+
+impl From<DdlId> for i64 {
+    fn from(value: DdlId) -> Self {
+        value.0
+    }
+}
+
 /// Postgres `int8` support (feature `sqlx`): `ManifestId` binds and decodes exactly as its inner
 /// `i64` — the transparent-newtype trick, now backed by each type's representation attribute above
 /// — so a `bigint` column round-trips with no SQL cast. Mirrors
@@ -145,7 +180,7 @@ impl From<ReloadId> for i64 {
 /// site — a manual `Type` impl carries no `PgHasArrayType`.
 #[cfg(feature = "sqlx")]
 mod sqlx_support {
-    use super::{EpochNo, ManifestId, ReloadId, SchemaVersionNo};
+    use super::{DdlId, EpochNo, ManifestId, ReloadId, SchemaVersionNo};
     use sqlx::postgres::{PgArgumentBuffer, PgTypeInfo, PgValueRef};
     use sqlx::{Decode, Encode, Postgres, Type};
 
@@ -242,6 +277,30 @@ mod sqlx_support {
     impl<'r> Decode<'r, Postgres> for ReloadId {
         fn decode(value: PgValueRef<'r>) -> Result<Self, sqlx::error::BoxDynError> {
             Ok(ReloadId(<i64 as Decode<Postgres>>::decode(value)?))
+        }
+    }
+
+    impl Type<Postgres> for DdlId {
+        fn type_info() -> PgTypeInfo {
+            <i64 as Type<Postgres>>::type_info()
+        }
+        fn compatible(ty: &PgTypeInfo) -> bool {
+            <i64 as Type<Postgres>>::compatible(ty)
+        }
+    }
+
+    impl Encode<'_, Postgres> for DdlId {
+        fn encode_by_ref(
+            &self,
+            buf: &mut PgArgumentBuffer,
+        ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+            <i64 as Encode<Postgres>>::encode_by_ref(&self.0, buf)
+        }
+    }
+
+    impl<'r> Decode<'r, Postgres> for DdlId {
+        fn decode(value: PgValueRef<'r>) -> Result<Self, sqlx::error::BoxDynError> {
+            Ok(DdlId(<i64 as Decode<Postgres>>::decode(value)?))
         }
     }
 }

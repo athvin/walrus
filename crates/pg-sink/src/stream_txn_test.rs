@@ -81,10 +81,10 @@ async fn spill_resolves_the_owning_txn_without_scanning_buffered_changes() {
                 TupleValue::Text((top * 10_000 + row).to_string()),
                 TupleValue::Text("n".into()),
             ];
-            d.claim_stream((42, top), top, estimate_change_bytes(&values));
+            d.claim_stream((TableId(42), top), top, estimate_change_bytes(&values));
             d.open.get_mut(&top).unwrap().push_change(StreamedChange {
                 sub_xid: top,
-                oid: 42,
+                oid: TableId(42),
                 op: Op::Insert,
                 values: values.into_boxed_slice(),
                 lsn: Lsn::new(u64::from(row)),
@@ -268,7 +268,7 @@ fn survivors_borrows_only_the_aborted_set() {
     let mut txn = StreamedTxn::new("0/100".parse().unwrap());
     txn.push_change(StreamedChange {
         sub_xid: 857,
-        oid: 42,
+        oid: TableId(42),
         op: Op::Insert,
         values: Box::default(),
         lsn: "0/101".parse().unwrap(),
@@ -405,10 +405,10 @@ async fn spill_preserves_commit_order_of_the_surviving_rows() {
             TupleValue::Text(id.to_string()),
             TupleValue::Text("n".into()),
         ];
-        d.claim_stream((42, sub_xid), top, estimate_change_bytes(&values));
+        d.claim_stream((TableId(42), sub_xid), top, estimate_change_bytes(&values));
         d.open.get_mut(&top).unwrap().push_change(StreamedChange {
             sub_xid,
-            oid: 42,
+            oid: TableId(42),
             op: Op::Insert,
             values: values.into_boxed_slice(),
             lsn: lsn.parse().unwrap(),

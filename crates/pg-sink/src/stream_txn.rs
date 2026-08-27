@@ -23,7 +23,7 @@
 //! advancing the slot or making data visible (the `ready` row).*
 
 use crate::batch::{BatchTriggers, Clock, SystemClock, TableBatcher};
-use crate::memory::InflightMeter;
+use crate::memory::{InflightMeter, TableId};
 use crate::pgoutput::Message;
 use crate::relcache::RelationCache;
 use crate::sink::{FileKind, ParquetSink, WrittenObject};
@@ -42,7 +42,7 @@ use std::sync::Arc;
 #[derive(Clone, Debug)]
 struct StreamedChange {
     sub_xid: u32,
-    oid: u32,
+    oid: TableId,
     op: Op,
     values: Box<[TupleValue]>,
     lsn: Lsn,
@@ -69,7 +69,7 @@ struct StreamedTxn {
     /// Buffered (not-yet-spilled) changes in commit order, each tagged with its sub-xid.
     changes: Vec<StreamedChange>,
     /// Exactly the distinct `(oid, sub_xid)` streams currently represented in `changes`.
-    keys: HashSet<(u32, u32)>,
+    keys: HashSet<(TableId, u32)>,
     /// Speculatively-spilled files, each homogeneous in one sub-xid (droppable on that sub-xid's abort).
     staged: Vec<StagedSpill>,
     /// Sub-xids that rolled back (`Stream Abort {sub != top}`) — excluded from `survivors`.
@@ -93,7 +93,7 @@ impl StreamedTxn {
     }
 
     /// Move one stream out without cloning and preserve the relative order of rows and survivors.
-    fn take_stream(&mut self, oid: u32, sub_xid: u32) -> Vec<StreamedChange> {
+    fn take_stream(&mut self, oid: TableId, sub_xid: u32) -> Vec<StreamedChange> {
         let (rows, keep): (Vec<StreamedChange>, Vec<StreamedChange>) =
             std::mem::take(&mut self.changes)
                 .into_iter()
@@ -130,7 +130,7 @@ pub struct StreamDemux<C = std::sync::Arc<SystemClock>> {
     ///
     /// Postgres xids are process-global, so one stream key has one owner. Invariant:
     /// `owner[key] == top` iff `open[top].keys` contains `key`; every owner key is metered.
-    owner: HashMap<(u32, u32), u32>,
+    owner: HashMap<(TableId, u32), u32>,
     /// The top-level xid of the currently-open `Stream Start … Stream Stop` block; changes route here.
     current_top: Option<u32>,
     triggers: BatchTriggers,
@@ -183,14 +183,14 @@ impl<C: Clock + Clone> StreamDemux<C> {
     }
 
     /// Claim one buffered row's bytes and record or confirm the stream's unique owner.
-    fn claim_stream(&mut self, key: (u32, u32), top: u32, bytes: u64) {
+    fn claim_stream(&mut self, key: (TableId, u32), top: u32, bytes: u64) {
         self.meter.add(key, bytes);
         let prior = self.owner.insert(key, top);
         debug_assert!(prior.is_none() || prior == Some(top));
     }
 
     /// Forget a stream in the owner index and meter as one operation.
-    fn forget_stream(&mut self, key: (u32, u32)) {
+    fn forget_stream(&mut self, key: (TableId, u32)) {
         self.owner.remove(&key);
         self.meter.release(key);
     }
@@ -221,7 +221,7 @@ impl<C: Clock + Clone> StreamDemux<C> {
                 new,
                 xid,
             } => (
-                *relation_oid,
+                TableId(*relation_oid),
                 Op::Insert,
                 new.clone().into_boxed_slice(),
                 xid.unwrap_or(top),
@@ -232,7 +232,7 @@ impl<C: Clock + Clone> StreamDemux<C> {
                 xid,
                 ..
             } => (
-                *relation_oid,
+                TableId(*relation_oid),
                 Op::Update,
                 new.clone().into_boxed_slice(),
                 xid.unwrap_or(top),
@@ -243,7 +243,7 @@ impl<C: Clock + Clone> StreamDemux<C> {
                 xid,
                 ..
             } => (
-                *relation_oid,
+                TableId(*relation_oid),
                 Op::Delete,
                 old.clone().into_boxed_slice(),
                 xid.unwrap_or(top),
@@ -306,7 +306,8 @@ impl<C: Clock + Clone> StreamDemux<C> {
                 (txn.begin_lsn, txn.take_stream(oid, sub_xid))
             };
             self.forget_stream(key);
-            let Some(cached) = cache.latest_for(oid) else {
+            // `RelationCache` is keyed by the decoder's raw wire OID, so unwrap at that boundary.
+            let Some(cached) = cache.latest_for(oid.0) else {
                 continue; // shape not cached (shouldn't happen mid-stream) — nothing to spill
             };
             let mut batcher = TableBatcher::new(Arc::clone(&cached), triggers, clock)
@@ -356,7 +357,7 @@ impl<C: Clock + Clone> StreamDemux<C> {
             tracing::info!(
                 top_xid = top,
                 sub_xid,
-                oid,
+                oid = oid.0,
                 spill_count = self.spill_count,
                 uri = %written.s3_uri,
                 "spilled open-txn buffer speculatively (no manifest, slot held)"
@@ -482,9 +483,9 @@ impl<C: Clock + Clone> StreamDemux<C> {
             self.epoch,
             self.sink_instance.clone(),
         );
-        let mut batchers: HashMap<u32, TableBatcher<C>> = HashMap::new();
+        let mut batchers: HashMap<TableId, TableBatcher<C>> = HashMap::new();
         for c in txn.survivors() {
-            let Some(cached) = cache.latest_for(c.oid) else {
+            let Some(cached) = cache.latest_for(c.oid.0) else {
                 continue;
             };
             let meta = SinkMeta {

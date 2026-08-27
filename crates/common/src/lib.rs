@@ -43,7 +43,7 @@ mod string_enum;
 pub use config::CommonConfig;
 pub use error::{Error, ExitCode, Result};
 pub use failure_class::FailureClass;
-pub use ids::{EpochNo, ManifestId, ReloadId, SchemaVersionNo};
+pub use ids::{DdlId, EpochNo, ManifestId, ReloadId, SchemaVersionNo};
 pub use lsn::Lsn;
 pub use pg_shape::{PgColumn, PgRelation, ReplicaIdentity, TupleValue};
 pub use sink_meta::{Kind, Op, PG_EPOCH_UNIX_MICROS, PG_EPOCH_UNIX_SECS, SinkMeta, UtcTimestamp};

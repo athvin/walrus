@@ -17,7 +17,15 @@ use std::collections::{BinaryHeap, HashMap};
 use std::num::NonZeroU64;
 
 /// A pg relation OID (a stable table id).
-pub type TableId = u32;
+///
+/// A newtype, not an alias: every in-flight stream is keyed by `(TableId, xid)` — two `u32`s that an
+/// alias lets a caller transpose silently, which is precisely the mix-up this accounting cannot
+/// detect (both halves are small opaque integers, and a swapped key simply meters the wrong stream).
+/// The transparent representation keeps it exactly one `u32` wide inside the per-row
+/// `StreamedChange`, whose move-cost budget is asserted in `stream_txn.rs`.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TableId(pub u32);
 
 /// Aggregate, process-wide accounting across all `(table, xid)` Arrow builders — distinct from any
 /// single batch's `max_bytes`.
