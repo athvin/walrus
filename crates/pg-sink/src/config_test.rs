@@ -275,7 +275,10 @@ fn config_error_maps_to_config_exit_code() {
 fn zero_worker_threads_is_rejected_as_terminal_config() {
     let mut cfg = valid();
     cfg.worker_threads = Some(0);
+
     let err = cfg.validate().unwrap_err();
+
+    // The pattern binds nothing, so the classification below still sees the same rejection.
     assert!(matches!(
         err,
         ConfigError::OutOfBounds {
@@ -283,10 +286,6 @@ fn zero_worker_threads_is_rejected_as_terminal_config() {
             ..
         }
     ));
-
-    let mut cfg = valid();
-    cfg.worker_threads = Some(0);
-    let err = cfg.validate().unwrap_err();
     assert_eq!(
         common::Error::from(err).exit_code(),
         common::ExitCode::Config
@@ -297,7 +296,9 @@ fn zero_worker_threads_is_rejected_as_terminal_config() {
 fn worker_threads_above_the_ceiling_is_rejected_as_terminal_config() {
     let mut cfg = valid();
     cfg.worker_threads = Some(65);
+
     let err = cfg.validate().unwrap_err();
+
     assert!(matches!(
         err,
         ConfigError::OutOfBounds {
@@ -305,10 +306,6 @@ fn worker_threads_above_the_ceiling_is_rejected_as_terminal_config() {
             ..
         }
     ));
-
-    let mut cfg = valid();
-    cfg.worker_threads = Some(65);
-    let err = cfg.validate().unwrap_err();
     assert_eq!(
         common::Error::from(err).exit_code(),
         common::ExitCode::Config

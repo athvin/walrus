@@ -17,10 +17,9 @@ fn utc_timestamp_conversions_round_trip() {
     let timestamp: jiff::Timestamp = "2026-07-04T12:00:00.123Z".parse().unwrap();
     let wrapped = UtcTimestamp::from(timestamp);
 
+    // The wrapper is `Copy`, so the one arranged value feeds all three projections.
     assert_eq!(wrapped.as_inner(), &timestamp);
     assert_eq!(wrapped.into_inner(), timestamp);
-
-    let wrapped = UtcTimestamp::from(timestamp);
     assert_eq!(jiff::Timestamp::from(wrapped), timestamp);
 }
 
