@@ -32,7 +32,12 @@ pub fn unknown_variant<E>(
 
 /// Declare a `text`-column enum and its exact persisted strings in one table.
 ///
+/// The export attribute below publishes this at `common`'s root, so a caller reaches it by ordinary
+/// path import — never the order-sensitive `#[macro_use] extern crate` of the 2015 edition.
+///
 /// ```ignore
+/// use common::string_enum;
+///
 /// string_enum! {
 ///     /// Doc comments are captured and re-emitted onto the generated enum.
 ///     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
