@@ -57,7 +57,10 @@ pub struct TableDb {
     /// non-`Send`, hence one apply worker per `.duckdb` file on a `LocalSet`. See the bound analysis
     /// and shared-thread open finding in
     /// `docs/implementation/notes/rust-skills/async-spawn-blocking.md`.
-    /// `Arc<[String]>` keeps reads to one indirection while preserving `TableDb: Send`.
+    /// `Arc<[String]>` keeps reads to one indirection while preserving `TableDb: Send`. The `Rc`
+    /// this `LocalSet`-confined cache would otherwise invite is declined: `Rc` is `!Send`, so it
+    /// would break `assert_send::<TableDb>()` below and foreclose the owned-move redesign that
+    /// note leaves open.
     parquet_cols: RefCell<HashMap<SchemaVersionNo, Arc<[String]>>>,
 }
 
