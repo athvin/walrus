@@ -299,7 +299,13 @@ fn parse_one(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Message, De
     // The per-message (sub-transaction) xid prefix exists only while streaming (proto §7/§9b). The
     // same bytes therefore parse differently in vs. out of a stream. Begin/Commit/Origin are the
     // txn frame itself and are never prefixed.
-    let xid = if XID_PREFIXED.contains(&tag) && ctx.in_stream {
+    //
+    // `ctx.in_stream` leads deliberately (`opt-likely-hint`): only a txn over
+    // `logical_decoding_work_mem` streams, so on the overwhelmingly common non-streamed path this
+    // one bool short-circuits the test. `<[u8]>::contains` is specialised to a memchr scan, and
+    // leading with it paid that scan for every decoded message only to discard the answer. Both
+    // operands are pure reads, so the order is purely which path is laid out short.
+    let xid = if ctx.in_stream && XID_PREFIXED.contains(&tag) {
         Some(reader.int32()?)
     } else {
         None
