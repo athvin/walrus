@@ -13,6 +13,41 @@ use std::time::Duration;
 /// Public because [`ConfigError::LeaseTtlTooShort`] reports it as data.
 pub const MIN_LEASE_TTL: Duration = Duration::from_secs(3);
 
+/// A lease TTL proven to be at least [`MIN_LEASE_TTL`] — the renewal cadence's precondition, carried
+/// by the type instead of re-checked (or merely hoped for) at each use.
+///
+/// [`LoaderConfig::lease_ttl`] stays a bare [`Duration`] because that is its *wire* shape: humantime
+/// text in a config file or a `WALRUS_LEASE_TTL` variable. [`LeaseTtl::new`] is the single gate that
+/// turns that raw duration into a renewable one, and [`crate::lease::spawn_renewer`] accepts nothing
+/// else — so the renewer cannot be handed a TTL its own renew interval could not fit inside.
+/// Acquiring or releasing a lease has no such floor and keeps taking a plain `Duration`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseTtl(Duration);
+
+impl LeaseTtl {
+    /// Parse a raw TTL into a renewable one, rejecting anything below [`MIN_LEASE_TTL`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::LeaseTtlTooShort`] — carrying both the rejected value and the floor it
+    /// missed — when renewal at TTL/3 could not land inside `ttl`. That failure is terminal.
+    pub fn new(ttl: Duration) -> Result<Self, ConfigError> {
+        if ttl < MIN_LEASE_TTL {
+            return Err(ConfigError::LeaseTtlTooShort {
+                ttl,
+                minimum: MIN_LEASE_TTL,
+            });
+        }
+        Ok(LeaseTtl(ttl))
+    }
+
+    /// The admitted TTL.
+    #[must_use]
+    pub const fn get(self) -> Duration {
+        self.0
+    }
+}
+
 const fn nonzero_i64(value: i64) -> NonZeroI64 {
     match NonZeroI64::new(value) {
         Some(value) => value,
@@ -137,12 +172,9 @@ impl LoaderConfig {
                 return Err(ConfigError::Missing(field));
             }
         }
-        if self.lease_ttl < MIN_LEASE_TTL {
-            return Err(ConfigError::LeaseTtlTooShort {
-                ttl: self.lease_ttl,
-                minimum: MIN_LEASE_TTL,
-            });
-        }
+        // The same constructor the renewer demands, so the config gate and the renew-cadence
+        // precondition can never drift apart.
+        LeaseTtl::new(self.lease_ttl)?;
         for (field, value) in [
             ("poll_interval", self.poll_interval),
             ("compaction_interval", self.compaction_interval),

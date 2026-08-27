@@ -3,6 +3,7 @@
 //! lease → reclaim. Renewal runs on a background task well under the TTL so a busy apply loop can never
 //! let the lease lapse and admit a phantom second writer.
 
+use crate::config::{LeaseTtl, MIN_LEASE_TTL};
 use crate::error::LoaderError;
 use common::EpochNo;
 use std::time::Duration;
@@ -12,16 +13,21 @@ use tokio_util::sync::CancellationToken;
 /// Floor for the renew cadence: never tick sub-second, however small the admitted TTL.
 pub(crate) const MIN_RENEW_INTERVAL: Duration = Duration::from_secs(1);
 
+// `renew_interval`'s `clamp` bounds invert — and panic — if its floor exceeds the TTL. A `LeaseTtl`
+// admits nothing below `MIN_LEASE_TTL`, so keeping that floor at or above this one is what turns the
+// ordering into a compile-time fact rather than a runtime hope.
+const _: () = assert!(
+    MIN_LEASE_TTL.as_nanos() >= MIN_RENEW_INTERVAL.as_nanos(),
+    "MIN_LEASE_TTL must stay >= MIN_RENEW_INTERVAL or renew_interval's clamp bounds invert"
+);
+
 /// Return one third of `ttl`, bounded into `[MIN_RENEW_INTERVAL, ttl]`.
 ///
 /// The upper bound is a correctness fence: renewal at or after expiry could admit a second writer.
-/// [`crate::config::LoaderConfig::validate`] establishes `MIN_RENEW_INTERVAL <= ttl`, which is the
-/// `clamp` precondition, before the renewer is spawned.
-fn renew_interval(ttl: Duration) -> Duration {
-    debug_assert!(
-        ttl >= MIN_RENEW_INTERVAL,
-        "config must reject lease_ttl < 3s (clamp precondition)"
-    );
+/// The lower bound needs `MIN_RENEW_INTERVAL <= ttl`; the [`LeaseTtl`] parameter *is* that proof (see
+/// the const assertion above), so no caller can reach this `clamp` with an unchecked duration.
+fn renew_interval(ttl: LeaseTtl) -> Duration {
+    let ttl = ttl.get();
     (ttl / 3).clamp(MIN_RENEW_INTERVAL, ttl)
 }
 
@@ -54,13 +60,16 @@ pub async fn acquire(
 }
 
 /// Renew every owned table's lease every `ttl/3`, off the apply-loop thread, until cancelled.
+///
+/// Takes a parsed [`LeaseTtl`] rather than a bare `Duration`: the renew cadence is only well-defined
+/// for a TTL the renewal can land inside, and that check belongs at the config edge, once.
 #[must_use]
 pub fn spawn_renewer(
     pool: sqlx::PgPool,
     epoch: EpochNo,
     keys: Vec<(String, String)>,
     self_pod: String,
-    ttl: Duration,
+    ttl: LeaseTtl,
     token: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -71,7 +80,7 @@ pub fn spawn_renewer(
                 _ = token.cancelled() => return,
                 _ = tick.tick() => {
                     for (schema, table) in &keys {
-                        match control::renew_lease(&pool, epoch, schema, table, &self_pod, ttl_secs(ttl)).await {
+                        match control::renew_lease(&pool, epoch, schema, table, &self_pod, ttl_secs(ttl.get())).await {
                             Ok(true) => {}
                             Ok(false) => tracing::error!(table = %format_args!("{schema}.{table}"), "lease lost — no longer owner"),
                             Err(e) => tracing::warn!(error = %e, "lease renew failed (will retry)"),

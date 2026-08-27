@@ -12,7 +12,7 @@
 
 use common::FailureClass;
 use loader::bootstrap;
-use loader::config::LoaderConfig;
+use loader::config::{LeaseTtl, LoaderConfig};
 use loader::error::LoaderError;
 use loader::health::{self, LoaderState};
 use loader::lease;
@@ -117,13 +117,14 @@ async fn pipeline(
         "bootstrap complete; starting apply loops"
     );
 
-    // Keep the lease alive off the apply thread until SIGTERM.
+    // Keep the lease alive off the apply thread until SIGTERM. `load()` already admitted this TTL;
+    // re-parsing it here is what hands the renewer the proof instead of a bare duration.
     let renewer = lease::spawn_renewer(
         pool.clone(),
         epoch,
         keys.clone(),
         cfg.instance.clone(),
-        cfg.lease_ttl,
+        LeaseTtl::new(cfg.lease_ttl)?,
         token.clone(),
     );
     let (epoch_rx, epoch_watch) =
