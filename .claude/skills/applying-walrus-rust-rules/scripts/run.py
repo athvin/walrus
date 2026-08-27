@@ -856,7 +856,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     mode.add_argument("--status", action="store_true")
     parser.add_argument("--model")
     parser.add_argument("--max-budget-usd", type=float)
-    parser.add_argument("--agent-timeout-seconds", type=int, default=600)
+    parser.add_argument("--agent-timeout-seconds", type=int, default=900)
     parser.add_argument("--allow-other-branch", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args(argv)
 
