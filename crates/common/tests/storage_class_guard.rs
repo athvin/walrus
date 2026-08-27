@@ -126,7 +126,7 @@ fn mutable_global_offences(path: &str, source: &str) -> Vec<String> {
         .collect()
 }
 
-fn allowed_static_type(type_name: &str) -> bool {
+fn is_allowed_static_type(type_name: &str) -> bool {
     let qualified_head = type_name
         .split(['<', ';'])
         .next()
@@ -148,7 +148,7 @@ fn plain_static_offences(path: &str, source: &str) -> Vec<String> {
                 return None;
             }
             let (name, type_name) = static_declaration(line)?;
-            if name.starts_with("mut ") || allowed_static_type(type_name) {
+            if name.starts_with("mut ") || is_allowed_static_type(type_name) {
                 return None;
             }
             Some(format!(

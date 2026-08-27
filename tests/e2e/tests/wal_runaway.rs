@@ -73,7 +73,7 @@ async fn wal_runaway_is_bounded_then_catches_up() {
         .await
         .expect("retained WAL rises past the alert threshold (runaway detected)");
     assert!(
-        h.slot_active().await.unwrap(),
+        h.is_slot_active().await.unwrap(),
         "walsender stays connected while S3 is stalled (keepalive keeps feedback flowing)"
     );
     // confirmed_flush is FROZEN while durability is stalled: two reads 3s apart are equal (the sink is

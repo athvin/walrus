@@ -513,7 +513,7 @@ impl Harness {
 
     /// Whether a walsender is attached to the slot (`active = true`) — proof the connection is live. A
     /// severed walsender (e.g. `wal_sender_timeout` with no keepalive) flips this to `false`.
-    pub async fn slot_active(&self) -> Result<bool> {
+    pub async fn is_slot_active(&self) -> Result<bool> {
         let active: Option<bool> =
             sqlx::query_scalar("SELECT active FROM pg_replication_slots WHERE slot_name = $1")
                 .bind(SLOT)

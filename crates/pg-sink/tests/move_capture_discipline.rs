@@ -178,7 +178,7 @@ const fn is_ident_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
-fn keyword_at(bytes: &[u8], start: usize, keyword: &[u8]) -> bool {
+fn is_keyword_at(bytes: &[u8], start: usize, keyword: &[u8]) -> bool {
     bytes.get(start..start + keyword.len()) == Some(keyword)
         && (start == 0 || !is_ident_byte(bytes[start - 1]))
         && bytes
@@ -244,9 +244,9 @@ fn move_bodies(src: &str) -> Vec<(usize, &'static str, String)> {
     let mut found = Vec::new();
     let mut cursor = 0usize;
     while cursor < bytes.len() {
-        if keyword_at(bytes, cursor, b"async") {
+        if is_keyword_at(bytes, cursor, b"async") {
             let after_async = skip_whitespace(bytes, cursor + "async".len());
-            if keyword_at(bytes, after_async, b"move") {
+            if is_keyword_at(bytes, after_async, b"move") {
                 let open = skip_whitespace(bytes, after_async + "move".len());
                 if bytes.get(open) == Some(&b'{')
                     && let Some((body, _)) = braced_body(&clean, open)
@@ -257,7 +257,7 @@ fn move_bodies(src: &str) -> Vec<(usize, &'static str, String)> {
             }
         }
 
-        if keyword_at(bytes, cursor, b"move") {
+        if is_keyword_at(bytes, cursor, b"move") {
             let params_open = skip_whitespace(bytes, cursor + "move".len());
             if bytes.get(params_open) == Some(&b'|')
                 && let Some(params_len) = bytes[params_open + 1..]
@@ -267,9 +267,9 @@ fn move_bodies(src: &str) -> Vec<(usize, &'static str, String)> {
                 let body_start = skip_whitespace(bytes, params_open + 1 + params_len + 1);
                 let body = if bytes.get(body_start) == Some(&b'{') {
                     braced_body(&clean, body_start).map(|(body, _)| body)
-                } else if keyword_at(bytes, body_start, b"async") {
+                } else if is_keyword_at(bytes, body_start, b"async") {
                     let after_async = skip_whitespace(bytes, body_start + "async".len());
-                    let open = if keyword_at(bytes, after_async, b"move") {
+                    let open = if is_keyword_at(bytes, after_async, b"move") {
                         skip_whitespace(bytes, after_async + "move".len())
                     } else {
                         after_async
@@ -294,7 +294,7 @@ fn move_bodies(src: &str) -> Vec<(usize, &'static str, String)> {
 fn reaches_through_self(body: &str) -> bool {
     let bytes = body.as_bytes();
     (0..bytes.len()).any(|cursor| {
-        keyword_at(bytes, cursor, b"self")
+        is_keyword_at(bytes, cursor, b"self")
             && bytes.get(skip_whitespace(bytes, cursor + "self".len())) == Some(&b'.')
     })
 }
@@ -303,12 +303,12 @@ fn clones_self(src: &str) -> bool {
     let clean = sanitized_source(src);
     let bytes = clean.as_bytes();
     (0..bytes.len()).any(|cursor| {
-        if !keyword_at(bytes, cursor, b"self") {
+        if !is_keyword_at(bytes, cursor, b"self") {
             return false;
         }
         let dot = skip_whitespace(bytes, cursor + "self".len());
         let clone = skip_whitespace(bytes, dot + 1);
-        bytes.get(dot) == Some(&b'.') && keyword_at(bytes, clone, b"clone")
+        bytes.get(dot) == Some(&b'.') && is_keyword_at(bytes, clone, b"clone")
     })
 }
 

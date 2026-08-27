@@ -67,7 +67,7 @@ async fn stalled_flush_keeps_connection_without_advancing() {
 
     // (1) Connected past the timeout — no `terminating walsender` reconnect churn.
     assert!(
-        h.slot_active().await.unwrap(),
+        h.is_slot_active().await.unwrap(),
         "walsender stays connected past wal_sender_timeout during the stall (keepalive)"
     );
     assert!(
