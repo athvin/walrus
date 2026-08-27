@@ -195,8 +195,10 @@ fn optional_batch_state_is_none_before_push_and_after_seal() {
     .unwrap();
 
     assert_eq!(b.batch_id, None, "no id before the first row");
-    assert_eq!(b.first_commit_lsn, None, "no lower bound before commit");
-    assert_eq!(b.last_commit_lsn, None, "no upper bound before commit");
+    assert!(
+        matches!(b.committed, CommittedRows::None),
+        "no committed state before commit"
+    );
 
     b.push(meta("0/10"), &row("1"));
     b.on_commit("0/30".parse().unwrap(), UtcTimestamp::now())
@@ -204,8 +206,55 @@ fn optional_batch_state_is_none_before_push_and_after_seal() {
     b.seal().unwrap();
 
     assert_eq!(b.batch_id, None, "seal resets the assigned id");
-    assert_eq!(b.first_commit_lsn, None, "seal resets the lower bound");
-    assert_eq!(b.last_commit_lsn, None, "seal resets the upper bound");
+    assert!(
+        matches!(b.committed, CommittedRows::None),
+        "seal resets the committed state"
+    );
+}
+
+/// The rows and their commit-LSN bounds are ONE value, so the count can never disagree with the
+/// bounds `seal` reads: the first promoted row fixes the lower bound and the `max_fill` start, and
+/// each later commit only extends the upper bound.
+#[test]
+fn committed_rows_carry_their_lsn_bounds() {
+    let mut b = TableBatcher::new(
+        cached(),
+        triggers(u64::MAX, u64::MAX, Duration::from_secs(3600)),
+        Arc::new(SystemClock),
+    )
+    .unwrap();
+
+    b.push(meta("0/10"), &row("1"));
+    b.on_commit("0/20".parse().unwrap(), UtcTimestamp::now())
+        .unwrap();
+    b.push(meta("0/30"), &row("2"));
+    b.push(meta("0/40"), &row("3"));
+    b.on_commit("0/50".parse().unwrap(), UtcTimestamp::now())
+        .unwrap();
+
+    let CommittedRows::Rows {
+        count,
+        first_commit_lsn,
+        last_commit_lsn,
+        ..
+    } = b.committed
+    else {
+        panic!("three rows committed across two transactions");
+    };
+    assert_eq!(count.get(), 3);
+    assert_eq!(first_commit_lsn, "0/20".parse().unwrap());
+    assert_eq!(last_commit_lsn, "0/50".parse().unwrap());
+    assert_eq!(
+        b.undurable_floor(),
+        Some(first_commit_lsn),
+        "the durability floor IS the batch's first commit LSN"
+    );
+
+    let sealed = b.seal().unwrap();
+    assert_eq!(sealed.row_count, 3);
+    assert_eq!(sealed.lsn_start, first_commit_lsn);
+    assert_eq!(sealed.lsn_end, last_commit_lsn);
+    assert_eq!(b.undurable_floor(), None, "seal clears the floor");
 }
 
 #[test]
