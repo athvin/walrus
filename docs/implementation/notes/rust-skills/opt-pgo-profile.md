@@ -1,8 +1,8 @@
 # Profile-guided optimization declined (PR 16.11)
 
-> **Status:** evaluated — **not adopted**. No build surface enables PGO instrumentation or profile
-> use. walrus's measured bottleneck is the loader's DuckDB C++ operators, which a Rust profile
-> cannot observe; `crates/common/tests/build_profile.rs` guards this decision.
+> **Status:** evaluated — **not adopted**. No build surface enables PGO instrumentation, profile
+> use, or the post-link BOLT step. walrus's measured bottleneck is the loader's DuckDB C++ operators,
+> which a Rust profile cannot observe; `crates/common/tests/build_profile.rs` guards this decision.
 
 ## What the rule asks for
 
@@ -95,9 +95,18 @@ code. walrus currently fails all three prerequisites.
 ## The guard
 
 `crates/common/tests/build_profile.rs` embeds the workspace manifest, the sole CI workflow, both
-Dockerfiles, `justfile`, and `scripts/bench-e2e.sh`. It rejects PGO generation, PGO use, and profdata
-merging on all six surfaces. Fabricated Dockerfile and justfile inputs prove each diagnostic without
-modifying a tracked build file, and the test embeds this ADR so deletion or an empty record fails.
+Dockerfiles, `justfile`, and `scripts/bench-e2e.sh`. It rejects PGO generation, PGO use, profdata
+merging, and a BOLT post-link step on all six surfaces. BOLT carries its own check because it runs
+*after* the linker against a `perf.data` profile: a bare `RUN llvm-bolt …` layer needs none of the
+`-Cprofile-*` flags the other three look for and applies to an ordinary release binary, so the
+profile-flag checks alone would not see it. Fabricated Dockerfile and justfile
+inputs prove each diagnostic without modifying a tracked build file, and the test embeds this ADR so
+deletion or an empty record fails.
+
+The rustup `llvm-tools` component is deliberately *not* guarded. It is a prerequisite for the
+`llvm-profdata` merge above, but it is equally the prerequisite for coverage tooling, so a needle on
+it would block unrelated legitimate work; `rust-toolchain.toml` keeps `components = ["rustfmt",
+"clippy"]` and the merge step itself is what the guard rejects.
 
 Run it with:
 

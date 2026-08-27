@@ -163,11 +163,18 @@ const fn cargo_config_policy(
     }
 }
 
+/// The build-surface half of the PGO rejection. `-Cprofile-generate` and `-Cprofile-use` are the
+/// instrument and optimize passes; `llvm-profdata` is the merge between them. `llvm-bolt` needs its
+/// own needle because the rule's post-link follow-on reorders blocks and functions from a
+/// `perf.data` profile *after* the linker has run: a bare `RUN llvm-bolt …` layer carries none of
+/// the `-Cprofile-*` flags the first three look for and applies to an ordinary release binary, so
+/// nothing above would see it.
 fn pgo_policy(body: &str) -> Result<(), &'static str> {
     for (needle, diagnostic) in [
         ("profile-generate", "PGO profile generation is enabled"),
         ("profile-use", "PGO profile use is enabled"),
         ("llvm-profdata", "llvm-profdata is invoked"),
+        ("llvm-bolt", "a BOLT post-link step is added"),
     ] {
         if body.contains(needle) {
             return Err(diagnostic);
@@ -414,6 +421,10 @@ fn pgo_policy_rejects_fabricated_input() {
         (
             "pgo:\n    llvm-profdata merge -o merged.profdata raw",
             Err("llvm-profdata is invoked"),
+        ),
+        (
+            "RUN llvm-bolt target/release/walrus-loader -o walrus-loader.bolt -data=perf.data",
+            Err("a BOLT post-link step is added"),
         ),
     ];
 
