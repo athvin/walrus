@@ -1,3 +1,5 @@
+use super::*;
+use crate::batch::SystemClock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
@@ -5,9 +7,7 @@ use std::time::Duration;
 fn build_names_the_first_missing_field() {
     // The DecodeLoopBuilder compile-fail doctest is the real dropped-setter regression; a runtime
     // test cannot express a compile-time unused-result error.
-    let Err(error) =
-        super::DecodeLoop::<std::sync::Arc<crate::batch::SystemClock>>::builder().build()
-    else {
+    let Err(error) = DecodeLoop::<Arc<SystemClock>>::builder().build() else {
         panic!("an empty builder must reject its first missing field");
     };
     assert_eq!(
