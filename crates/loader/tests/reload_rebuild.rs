@@ -303,7 +303,7 @@ async fn rebuild_converges_mirror_to_source_and_kills_phantoms() {
     assert_eq!(mirror_status(&ctx, 2), None, "mid-export delete holds");
     assert_eq!(mirror_status(&ctx, 3).as_deref(), Some("c"));
     assert_eq!(mirror_count(&ctx), 2);
-    assert_eq!(ctx.db.recorded_reload_id().unwrap(), reload_id);
+    assert_eq!(ctx.db.recorded_reload_id().unwrap(), Some(reload_id));
     let cp = control::read_checkpoint(&ctx.pool, epoch, "public", "orders")
         .await
         .unwrap()
@@ -500,7 +500,7 @@ async fn stale_reload_file_is_skipped_and_retired() {
     assert_eq!(raw, 0, "retired UNAPPLIED — DuckDB untouched");
     assert_eq!(
         ctx.db.recorded_reload_id().unwrap(),
-        common::ReloadId(999_999),
+        Some(common::ReloadId(999_999)),
         "the latch never regresses (latest wins)"
     );
 
@@ -620,7 +620,7 @@ async fn resync_flavor_never_rebuilds_and_merges_over_the_live_mirror() {
     // quarantine exit (only a rebuild clears it).
     assert_eq!(
         ctx.db.recorded_reload_id().unwrap(),
-        common::ReloadId(0),
+        None,
         "resync never sets the reload_id latch"
     );
     assert!(

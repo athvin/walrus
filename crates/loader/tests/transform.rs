@@ -393,7 +393,7 @@ fn transformed_lsn_advances_past_a_truncate_only_tail() {
         .latest_truncate(&c, common::Lsn::ZERO)
         .unwrap();
     assert_eq!(
-        b.ct,
+        b.map(|b| b.ct),
         Some("0/64".parse().unwrap()),
         "latest_truncate resolves the bare truncate"
     );

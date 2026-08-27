@@ -20,23 +20,16 @@ use duckdb::OptionalExt;
 /// The transform template (single source of truth). Rendered by [`TransformSql::render`].
 pub const TRANSFORM_SQL: &str = include_str!("../sql/duckdb/templates/transform.sql");
 
-/// The latest `TRUNCATE` tuple `(Ct, Lt)` in the un-transformed tail — `(None, None)` if there is none.
-/// The wipe boundary is the **tuple**, never the scalar `commit_lsn`.
-#[derive(Debug, Clone, Copy, Default)]
+/// The latest `TRUNCATE` tuple `(Ct, Lt)` in the un-transformed tail. The wipe boundary is the
+/// **tuple**, never the scalar `commit_lsn`.
+///
+/// "The tail holds no truncate" is the *absence* of this value — producers and consumers carry it
+/// as `Option<TruncateBoundary>` — so a half-resolved boundary (one LSN of the pair without the
+/// other) cannot be constructed, and no call site has to re-check the second field.
+#[derive(Debug, Clone, Copy)]
 pub struct TruncateBoundary {
-    pub ct: Option<Lsn>,
-    pub lt: Option<Lsn>,
-}
-
-impl TruncateBoundary {
-    #[must_use]
-    pub fn none() -> Self {
-        TruncateBoundary::default()
-    }
-    #[must_use]
-    pub const fn is_some(&self) -> bool {
-        self.ct.is_some()
-    }
+    pub ct: Lsn,
+    pub lt: Lsn,
 }
 
 /// One mirror column and the SQL producing its value from the winning raw row `s` (and, for a
@@ -155,7 +148,7 @@ impl TransformSql {
     }
 
     /// The latest `TRUNCATE` `(Ct, Lt)` in the tail (`op='t'`, `commit_lsn > after_lsn`), ordered by the
-    /// tuple. `(None, None)` if the tail holds no truncate — every downstream predicate is NULL-safe.
+    /// tuple. `None` if the tail holds no truncate — every downstream predicate is then simply omitted.
     ///
     /// # Errors
     ///
@@ -166,7 +159,7 @@ impl TransformSql {
         &self,
         conn: &duckdb::Connection,
         after_lsn: Lsn,
-    ) -> Result<TruncateBoundary, LoaderError> {
+    ) -> Result<Option<TruncateBoundary>, LoaderError> {
         let raw = self.table.raw();
         let sql = format!(
             "SELECT \"_walrus_commit_lsn\", \"_walrus_lsn\" FROM \"{}\" \
@@ -180,17 +173,17 @@ impl TransformSql {
             .optional()
             .duck_with(|| format!("scan truncate boundary on {}", raw.as_str()))?;
         match row {
-            None => Ok(TruncateBoundary::none()),
-            Some((ct, lt)) => Ok(TruncateBoundary {
-                ct: Some(ct.parse().map_err(|source| LoaderError::LsnParse {
+            None => Ok(None),
+            Some((ct, lt)) => Ok(Some(TruncateBoundary {
+                ct: ct.parse().map_err(|source| LoaderError::LsnParse {
                     field: "Ct",
                     source,
-                })?),
-                lt: Some(lt.parse().map_err(|source| LoaderError::LsnParse {
+                })?,
+                lt: lt.parse().map_err(|source| LoaderError::LsnParse {
                     field: "Lt",
                     source,
-                })?),
-            }),
+                })?,
+            })),
         }
     }
 
@@ -199,7 +192,7 @@ impl TransformSql {
     /// equal-`commit_lsn` snapshot straddle, §7 break face A; and — if the tail has a truncate — only
     /// rows STRICTLY after the `(Ct, Lt)` tuple). Composite-PK-aware.
     #[must_use]
-    pub fn render(&self, after_lsn: Lsn, boundary: &TruncateBoundary) -> String {
+    pub fn render(&self, after_lsn: Lsn, boundary: Option<TruncateBoundary>) -> String {
         let q = |c: &str| format!("\"{c}\"");
         let table = self.table.as_str();
         let pk = self.to_pk_names();
@@ -259,12 +252,12 @@ impl TransformSql {
         select_parts.push("s.\"_walrus_lsn\"".to_string());
         let resolved_select = select_parts.join(", ");
         // The truncate wipe (whole mirror) + the tuple-boundary window filter — empty when no truncate.
-        let (truncate_wipe, truncate_bound) = match (boundary.ct, boundary.lt) {
-            (Some(ct), Some(lt)) => (
+        let (truncate_wipe, truncate_bound) = match boundary {
+            Some(TruncateBoundary { ct, lt }) => (
                 format!("DELETE FROM \"{table}\";"),
                 format!(" AND (\"_walrus_commit_lsn\", \"_walrus_lsn\") > ('{ct}', '{lt}')"),
             ),
-            _ => (String::new(), String::new()),
+            None => (String::new(), String::new()),
         };
         TRANSFORM_SQL
             .replace("{table}", table)
@@ -299,7 +292,7 @@ impl TransformSql {
     /// the final resolve then only TOAST-resolves the Tier-1 columns and passes the recombined Tier-2 ones
     /// through.
     #[must_use]
-    pub fn render_rebuild(&self, boundary: &TruncateBoundary) -> String {
+    pub fn render_rebuild(&self, boundary: Option<TruncateBoundary>) -> String {
         let q = |c: &str| format!("\"{c}\"");
         let t = self.table.as_str();
         let raw_table = self.table.raw();
@@ -346,11 +339,11 @@ impl TransformSql {
         );
         // The truncate tuple boundary applies to the union (the mirror baseline is post-truncate by
         // construction, so it survives); empty when the retained tail holds no truncate.
-        let truncate_bound = match (boundary.ct, boundary.lt) {
-            (Some(ct), Some(lt)) => {
+        let truncate_bound = match boundary {
+            Some(TruncateBoundary { ct, lt }) => {
                 format!(" WHERE (\"_walrus_commit_lsn\", \"_walrus_lsn\") > ('{ct}', '{lt}')")
             }
-            _ => String::new(),
+            None => String::new(),
         };
         // The rebuilt row list: Tier-1 columns TOAST-resolve (over `s` = the collapsed winner + the raw
         // back-scan + the mirror `t` fallback); Tier-2 (recombined) columns pass through `s`. Then the
@@ -401,7 +394,7 @@ pub fn apply_transform(
     after_lsn: Lsn,
 ) -> Result<(), LoaderError> {
     let boundary = t.latest_truncate(conn, after_lsn)?;
-    conn.execute_batch(&t.render(after_lsn, &boundary))
+    conn.execute_batch(&t.render(after_lsn, boundary))
         .duck_with(|| format!("transform {}", t.table()))
 }
 

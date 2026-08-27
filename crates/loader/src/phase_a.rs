@@ -294,17 +294,20 @@ async fn route_reload_file(ctx: &TableCtx, f: &control::ManifestRow) -> Result<b
     if ctx.resync_ids.borrow().contains(&file_reload_id) {
         return Ok(true);
     }
-    let recorded = ctx.db.recorded_reload_id()?;
-    if file_reload_id < recorded {
-        return Ok(false); // a superseded attempt whose purge raced the claim (H9): retire
-    }
-    if file_reload_id == recorded {
-        return Ok(true); // chunks 2…n of the attempt already rebuilt for
+    // `None` = the latch was never set, so this file can only be a NEW attempt: fall through to
+    // the "greater" arm below rather than compare it against a stand-in id.
+    if let Some(recorded) = ctx.db.recorded_reload_id()? {
+        if file_reload_id < recorded {
+            return Ok(false); // a superseded attempt whose purge raced the claim (H9): retire
+        }
+        if file_reload_id == recorded {
+            return Ok(true); // chunks 2…n of the attempt already rebuilt for
+        }
     }
 
-    // Greater: the first file of a NEW attempt. The reload row carries the flavor: a `resync` merges
-    // over the LIVE mirror (H3) — no clear, no purge, no latch, and raw history preserved (chunks
-    // flow through Phase A like any file, PR 6.10); only a `reload` triggers the rebuild.
+    // Greater (or unlatched): the first file of a NEW attempt. The reload row carries the flavor: a
+    // `resync` merges over the LIVE mirror (H3) — no clear, no purge, no latch, and raw history
+    // preserved (chunks flow through Phase A like any file, PR 6.10); only a `reload` rebuilds.
     let row = control::reload::get(&ctx.pool, file_reload_id)
         .await?
         .ok_or_else(|| {

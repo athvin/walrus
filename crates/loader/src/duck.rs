@@ -416,13 +416,14 @@ impl TableDb {
     }
 
     /// The highest `reload_id` this `.duckdb` has rebuilt for — the H8 idempotency latch (PR 6.7).
-    /// Absent ⇒ 0, so any real (bigserial ≥ 1) reload triggers. `max(v)` yields NULL (→ 0) when
-    /// the key is missing, mirroring [`TableDb::built_epoch`]'s probe-free read.
+    /// `None` when the latch was never set, so the first attempt of any kind triggers a rebuild; a
+    /// caller can no longer confuse "never rebuilt" with a real id. `max(v)` yields NULL (→ `None`)
+    /// when the key is missing, mirroring [`TableDb::built_epoch`]'s probe-free read.
     ///
     /// # Errors
     ///
     /// Returns [`LoaderError::Duck`] if the reload latch cannot be read.
-    pub fn recorded_reload_id(&self) -> Result<ReloadId, LoaderError> {
+    pub fn recorded_reload_id(&self) -> Result<Option<ReloadId>, LoaderError> {
         let v: Option<i64> = self
             .conn
             .query_row(
@@ -431,7 +432,7 @@ impl TableDb {
                 |r| r.get(0),
             )
             .duck("read recorded reload_id")?;
-        Ok(ReloadId(v.unwrap_or(0)))
+        Ok(v.map(ReloadId))
     }
 
     /// Latch the reload generation this `.duckdb` is now rebuilt for. With a monotonic bigserial

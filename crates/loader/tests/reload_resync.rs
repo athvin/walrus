@@ -306,7 +306,7 @@ async fn resync_repairs_drift_but_phantoms_survive() {
     // No rebuild happened: no meta latch, raw history preserved.
     assert_eq!(
         ctx.db.recorded_reload_id().unwrap(),
-        common::ReloadId(0),
+        None,
         "resync never writes the reload_id latch"
     );
     assert!(
@@ -397,7 +397,7 @@ async fn resync_chunks_flow_through_raw() {
     assert_eq!(mirror_status(&ctx, 7).as_deref(), Some("from-chunk"));
     assert_eq!(
         ctx.db.recorded_reload_id().unwrap(),
-        common::ReloadId(0),
+        None,
         "no latch"
     );
 

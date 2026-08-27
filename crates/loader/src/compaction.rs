@@ -47,7 +47,7 @@ pub fn full_rebuild(
     let boundary = t.latest_truncate(db.conn(), Lsn::ZERO)?;
     let rebuild_op = format!("full rebuild {}", t.table());
     let rewrite = db.in_txn("rebuild", |conn| {
-        conn.execute_batch(&t.render_rebuild(&boundary))
+        conn.execute_batch(&t.render_rebuild(boundary))
             .map_err(|source| duck_err(rebuild_op.clone(), source))
     });
     match rewrite {
