@@ -15,9 +15,11 @@ pub struct Raw;
 
 /// A DuckDB table name tagged with which of the two tables it names.
 ///
-/// `PhantomData<K>` stores nothing: `size_of::<DuckTable<K>>() == size_of::<String>()` for every
-/// `K` (asserted in `table_name_test.rs`). The parameter exists purely so the compiler can tell a
-/// mirror name from a raw name.
+/// `PhantomData<K>` stores nothing, and the transparent representation makes that a guarantee
+/// rather than an observation: `size_of::<DuckTable<K>>() == size_of::<String>()` for every `K`
+/// (pinned in `table_name_test.rs`). The parameter exists purely so the compiler can tell a mirror
+/// name from a raw name.
+#[repr(transparent)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DuckTable<K> {
     name: String,
