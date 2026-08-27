@@ -200,3 +200,24 @@ fn rejects_garbage_and_overlong_input() {
         );
     }
 }
+
+/// A rejection is a comparable value, not just an `is_err()`: both `Lsn` and `LsnParseError` are
+/// `PartialEq`, so the whole `Result` is asserted at once — which pins the *reason* each form fails
+/// under, and the verbatim input the message quotes back to an operator.
+#[test]
+fn a_rejection_compares_as_a_whole_result() {
+    assert_eq!(
+        "xyz".parse::<Lsn>(),
+        Err(LsnParseError {
+            input: "xyz".to_string(),
+            reason: "not a 1–16 digit hex value",
+        })
+    );
+    assert_eq!(
+        "0/GG".parse::<Lsn>(),
+        Err(LsnParseError {
+            input: "0/GG".to_string(),
+            reason: "X/Y half is not a valid hex u32",
+        })
+    );
+}

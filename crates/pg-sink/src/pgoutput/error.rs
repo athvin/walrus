@@ -3,7 +3,11 @@
 /// Everything that can go wrong decoding a pgoutput message. Variants are *structured* (not
 /// stringly-typed) so callers can branch on them; several are used from later PRs (2.3/2.4).
 /// This taxonomy is still growing; new variants must remain additive for downstream crates.
-#[derive(Debug, Clone, Copy, thiserror::Error)]
+///
+/// Comparable like the [`Message`](super::Message) it is the alternative to, so a decode result can
+/// be asserted whole (`assert_eq!(parse_message(..), Err(DecodeError::TrailingBytes { .. }))`) rather
+/// than only pattern-matched. Every payload is a scalar, so `Eq` is exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum DecodeError {
     /// Widths match pgoutput's `Int32` frame bound, keeping this per-byte error path compact.

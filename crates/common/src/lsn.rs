@@ -136,7 +136,11 @@ impl std::ops::AddAssign<u64> for Lsn {
 }
 
 /// Failure to parse either the `X/Y` or the 16-hex form of an [`Lsn`].
-#[derive(Debug, thiserror::Error)]
+///
+/// Carries the value bundle its sibling leaf errors carry ([`crate::sql::IdentError`],
+/// [`WorkerThreadsError`](crate::runtime::WorkerThreadsError)): both fields are plain owned data, and
+/// [`Lsn`] is already [`PartialEq`], so `Result<Lsn, LsnParseError>` compares as a whole.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("invalid LSN {input:?}: {reason}")]
 pub struct LsnParseError {
     pub input: String,

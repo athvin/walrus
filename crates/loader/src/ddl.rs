@@ -27,21 +27,25 @@ use common::{EpochNo, PgColumn, PgRelation, SchemaVersionNo};
 use std::fmt::Write as _;
 
 /// One `schema_version` of a table's shape — the `schema_registry` `columns` snapshot for that version.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaVersion {
     pub version: SchemaVersionNo,
     pub relation: PgRelation,
 }
 
 /// What a `COMMENT` targets. `COMMENT` is metadata: mirror only, never a data gate.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommentTarget {
     Table,
     Column(String),
 }
 
 /// One additive/lossless structural (or metadata) change, derived by [`diff_additive`].
-#[derive(Debug)]
+///
+/// A classification result is pure data — every payload is a `String`, a `usize`, or a [`PgColumn`],
+/// all of which are already `Clone`/`Eq` — so a caller can compare a derived change against an
+/// expected one directly instead of pattern-matching it field by field.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdditiveChange {
     /// A column appended at the end (a higher attnum). Nullable on BOTH tables so pre-change rows read
     /// NULL and old verbatim `<table>_raw` rows stay valid.
@@ -69,7 +73,7 @@ pub enum AdditiveChange {
 
 /// One destructive change (PR 3.9) — where mirror and raw **diverge**: the mirror follows the exact
 /// current shape (physical drop / in-place cast), the raw log preserves history (retain / widen-only).
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DestructiveChange {
     /// `DROP COLUMN` — physically dropped from `<table>`; **retained nullable** in `<table>_raw`.
     DropColumn { name: String },
@@ -98,7 +102,7 @@ const fn is_lossless_widen(old: &PgColumn, new: &PgColumn) -> bool {
 
 /// The full classification of one version step: additive/lossless changes plus destructive ones
 /// (PR 3.9). The sink cuts one file per structural change, so a step usually yields a single change.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SchemaDiff {
     pub additive: Vec<AdditiveChange>,
     pub destructive: Vec<DestructiveChange>,

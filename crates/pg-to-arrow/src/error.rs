@@ -1,7 +1,11 @@
 //! `pg-to-arrow` error taxonomy.
 
 /// Cold parse-error detail boxed inside [`Error`] so successful per-cell conversions stay compact.
-#[derive(Debug)]
+///
+/// [`Error`] itself cannot be `Clone`/`PartialEq` (it carries opaque arrow/parquet sources), but this
+/// payload is three owned strings, so a caller that destructures [`Error::ValueParse`] can compare or
+/// keep the detail. Derives do not change the boxed layout the size assertion below pins.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValueParseDetail {
     pub column: String,
     pub value: String,

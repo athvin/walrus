@@ -73,7 +73,7 @@ const _: () = assert!(
 /// This taxonomy is still growing — "legal walrus timestamp" is a normalization policy that can
 /// gain a rejection reason (sub-microsecond precision, say) rather than fold it into
 /// [`TimestampParseError::Malformed`] — so new variants must remain additive for downstream crates.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TimestampParseError {
     /// The text was not already normalized to walrus's required UTC `Z` form.

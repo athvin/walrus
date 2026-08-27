@@ -69,7 +69,10 @@ pub struct ManifestRow {
 }
 
 /// What the sink inserts after its Parquet is durable in S3 (PR 2.25).
-#[derive(Debug, Clone)]
+///
+/// Comparable like the [`ManifestRow`] it becomes, so a mapper that builds one can be asserted as a
+/// whole record instead of field by field (which silently skips whatever the assertion forgot).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewManifestFile {
     pub epoch: EpochNo,
     pub source_schema: String,
