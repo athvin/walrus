@@ -136,53 +136,68 @@ impl ChunkExporter {
                 tracing::warn!(error = %e, "chunk-export SQL connection closed");
             }
         });
-        // A resumed attempt exports at its FROZEN version; a fresh one at the registry's latest.
-        let schema_version = match req.schema_version {
-            Some(v) => v,
-            None => control::read_latest_version(
-                &pool,
-                req.epoch,
-                &req.source_schema,
-                &req.source_table,
-            )
-            .await
-            .context("read registry version for reload")?
-            .with_context(|| {
-                format!(
-                    "{}.{} has no schema_registry entry — is the sink streaming it?",
-                    req.source_schema, req.source_table
+        // The registry chain (control-pg) and the PK-index read (the SOURCE catalog) hit different
+        // servers and neither consumes the other's output, so this dial-up costs the slower of the
+        // two instead of their sum — `main::establish_stream`'s argument, paid on every attempt and
+        // again on every DDL restart. Both branches are terminal-on-error and fail fast: whichever
+        // resolves first drops the other, and either way the exporter never connects.
+        let ((rel, schema_version), pk_cols) = tokio::try_join!(
+            async {
+                // A resumed attempt exports at its FROZEN version; a fresh one at the
+                // registry's latest.
+                let schema_version = match req.schema_version {
+                    Some(v) => v,
+                    None => control::read_latest_version(
+                        &pool,
+                        req.epoch,
+                        &req.source_schema,
+                        &req.source_table,
+                    )
+                    .await
+                    .context("read registry version for reload")?
+                    .with_context(|| {
+                        format!(
+                            "{}.{} has no schema_registry entry — is the sink streaming it?",
+                            req.source_schema, req.source_table
+                        )
+                    })?,
+                };
+                // The export shape comes from the REGISTRY at that version — never the live
+                // catalog — so every chunk file's columns match the descriptor set the loader
+                // will fetch for its stamped schema_version. (A live `describe` can be ahead of
+                // the registry: DDL bumps the registry only when the next Relation message
+                // decodes, and e.g. `ADD COLUMN … DEFAULT` backfills without any DML. Files
+                // carrying a shape their version doesn't describe would silently break Phase B's
+                // column plan.)
+                let registry_row = control::read_registry(
+                    &pool,
+                    req.epoch,
+                    &req.source_schema,
+                    &req.source_table,
+                    schema_version,
                 )
-            })?,
-        };
-        // The export shape comes from the REGISTRY at that version — never the live catalog — so
-        // every chunk file's columns match the descriptor set the loader will fetch for its
-        // stamped schema_version. (A live `describe` can be ahead of the registry: DDL bumps the
-        // registry only when the next Relation message decodes, and e.g. `ADD COLUMN … DEFAULT`
-        // backfills without any DML. Files carrying a shape their version doesn't describe would
-        // silently break Phase B's column plan.)
-        let registry_row = control::read_registry(
-            &pool,
-            req.epoch,
-            &req.source_schema,
-            &req.source_table,
-            schema_version,
-        )
-        .await
-        .context("read registry row for reload shape")?
-        .with_context(|| {
-            format!(
-                "{}.{} has no schema_registry row at version {schema_version}",
-                req.source_schema, req.source_table
-            )
-        })?;
-        let rel: PgRelation = serde_json::from_value(registry_row.columns)
-            .context("registry columns snapshot is not a PgRelation")?;
-        // Pagination order comes from the PRIMARY KEY INDEX (pg_index.indkey position) — not the
-        // relation's attnum order, and never the PK∪replica-identity union — so the row-comparison
-        // WHERE and the ORDER BY are served by the PK btree instead of a per-chunk top-N sort.
-        let pk_cols = pk_columns_in_index_order(&client, &req.source_schema, &req.source_table)
-            .await
-            .context("read PK index column order")?;
+                .await
+                .context("read registry row for reload shape")?
+                .with_context(|| {
+                    format!(
+                        "{}.{} has no schema_registry row at version {schema_version}",
+                        req.source_schema, req.source_table
+                    )
+                })?;
+                let rel: PgRelation = serde_json::from_value(registry_row.columns)
+                    .context("registry columns snapshot is not a PgRelation")?;
+                anyhow::Ok((rel, schema_version))
+            },
+            // Pagination order comes from the PRIMARY KEY INDEX (pg_index.indkey position) — not
+            // the relation's attnum order, and never the PK∪replica-identity union — so the
+            // row-comparison WHERE and the ORDER BY are served by the PK btree instead of a
+            // per-chunk top-N sort.
+            async {
+                pk_columns_in_index_order(&client, &req.source_schema, &req.source_table)
+                    .await
+                    .context("read PK index column order")
+            },
+        )?;
         let registry_keys: std::collections::BTreeSet<&str> =
             rel.to_key_columns().into_iter().collect();
         let live_keys: std::collections::BTreeSet<&str> =

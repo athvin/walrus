@@ -45,6 +45,26 @@ fn preflight_rejections_read_as_operator_reasons() {
 }
 
 #[test]
+fn an_unpublished_keyless_table_reports_the_publication_gap_first() {
+    // The two catalog reads run concurrently, so BOTH answers are always available here: the
+    // precedence is `classify_target`'s ordering alone. A table that is neither published nor keyed
+    // must still name the publication — the gap the operator fixes first.
+    let both_wrong = classify_target(false, false, "public", "ghost").unwrap_err();
+    assert!(
+        matches!(both_wrong, PreflightRejection::NotPublished(..)),
+        "not-published outranks no-primary-key; got {both_wrong}"
+    );
+
+    let keyless = classify_target(true, false, "public", "keyless").unwrap_err();
+    assert!(
+        matches!(keyless, PreflightRejection::NoPrimaryKey(..)),
+        "a published keyless table is rejected for its key; got {keyless}"
+    );
+
+    assert!(classify_target(true, true, "public", "orders").is_ok());
+}
+
+#[test]
 fn an_ad_hoc_preflight_failure_is_infra_never_a_rejection() {
     // `preflight` propagates its catalog queries with `?`; the From impl is what keeps a dead
     // connection out of `table_reload.error` as a false "not in the publication" reason.

@@ -249,6 +249,34 @@ pub async fn handle_ddl_restart(
     }
 }
 
+/// Classify a preflighted target from its two independent catalog answers (H11): not being in the
+/// publication outranks having no primary key, so a table that is neither still reports the
+/// publication gap the operator must fix first.
+///
+/// Pure, and split out of `ReloadController::preflight` deliberately: now that the two catalog
+/// reads run concurrently, that precedence no longer follows from short-circuiting the second
+/// query — it lives here alone, where a test pins it without a database.
+fn classify_target(
+    published: bool,
+    has_pk: bool,
+    schema: &str,
+    table: &str,
+) -> Result<(), PreflightRejection> {
+    if !published {
+        return Err(PreflightRejection::NotPublished(
+            schema.to_string(),
+            table.to_string(),
+        ));
+    }
+    if !has_pk {
+        return Err(PreflightRejection::NoPrimaryKey(
+            schema.to_string(),
+            table.to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// The connections + config an exporter needs, bundled so the restart loop takes few args.
 struct ExportDeps {
     source_db_url: String,
@@ -752,51 +780,49 @@ impl ReloadController {
         // Both flavors preflight identically (PR 6.10): in the publication + has a PK. `resync`
         // needs no special guard — it merges chunks over the live mirror on the loader side, no
         // pause and no rebuild; only the semantics differ, not the export.
-        let published = source
-            .query_one(
-                "SELECT EXISTS (SELECT 1 FROM pg_publication_tables
-                                WHERE pubname = $1 AND schemaname = $2 AND tablename = $3)",
-                &[
-                    &self.cfg.publication_name,
-                    &req.source_schema,
-                    &req.source_table,
-                ],
-            )
-            .await
-            .map(|row| row.get::<_, bool>(0))
-            .with_context(|| {
-                format!("publication check for {}.{}", req.source_schema, req.source_table)
-            })?;
-        if !published {
-            return Err(PreflightOutcome::Rejected(
-                PreflightRejection::NotPublished(
-                    req.source_schema.clone(),
-                    req.source_table.clone(),
-                ),
-            ));
-        }
-        let has_pk = source
-            .query_one(
-                "SELECT EXISTS (SELECT 1 FROM pg_index i
-                                JOIN pg_class c ON c.oid = i.indrelid
-                                JOIN pg_namespace n ON n.oid = c.relnamespace
-                                WHERE n.nspname = $1 AND c.relname = $2 AND i.indisprimary)",
-                &[&req.source_schema, &req.source_table],
-            )
-            .await
-            .map(|row| row.get::<_, bool>(0))
-            .with_context(|| {
-                format!("primary-key check for {}.{}", req.source_schema, req.source_table)
-            })?;
-        if !has_pk {
-            return Err(PreflightOutcome::Rejected(
-                PreflightRejection::NoPrimaryKey(
-                    req.source_schema.clone(),
-                    req.source_table.clone(),
-                ),
-            ));
-        }
-        Ok(())
+        //
+        // The two catalog reads are independent, and a tick preflights every claimed row in turn,
+        // so they ride this one connection concurrently (tokio-postgres pipelines futures polled
+        // together) — one round trip per row instead of two. The REJECTION precedence is unchanged:
+        // `classify_target` still tests the booleans in order, so a table that is neither published
+        // nor keyed still reports `NotPublished`. If both QUERIES fail, whichever error lands first
+        // wins; both classify as `Infra`, which releases the claim to retry either way.
+        let (published, has_pk) = tokio::try_join!(
+            async {
+                source
+                    .query_one(
+                        "SELECT EXISTS (SELECT 1 FROM pg_publication_tables
+                                        WHERE pubname = $1 AND schemaname = $2 AND tablename = $3)",
+                        &[
+                            &self.cfg.publication_name,
+                            &req.source_schema,
+                            &req.source_table,
+                        ],
+                    )
+                    .await
+                    .map(|row| row.get::<_, bool>(0))
+                    .with_context(|| {
+                        format!("publication check for {}.{}", req.source_schema, req.source_table)
+                    })
+            },
+            async {
+                source
+                    .query_one(
+                        "SELECT EXISTS (SELECT 1 FROM pg_index i
+                                        JOIN pg_class c ON c.oid = i.indrelid
+                                        JOIN pg_namespace n ON n.oid = c.relnamespace
+                                        WHERE n.nspname = $1 AND c.relname = $2 AND i.indisprimary)",
+                        &[&req.source_schema, &req.source_table],
+                    )
+                    .await
+                    .map(|row| row.get::<_, bool>(0))
+                    .with_context(|| {
+                        format!("primary-key check for {}.{}", req.source_schema, req.source_table)
+                    })
+            },
+        )?;
+        classify_target(published, has_pk, &req.source_schema, &req.source_table)
+            .map_err(PreflightOutcome::Rejected)
     }
 }
 

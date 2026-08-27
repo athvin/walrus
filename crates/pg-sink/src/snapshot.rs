@@ -380,37 +380,50 @@ pub async fn describe_source_relation(
     schema: &str,
     table: &str,
 ) -> anyhow::Result<PgRelation> {
-    let head = client
-        .query_one(
-            "SELECT c.oid::int8, c.relreplident::text
-             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-             WHERE n.nspname = $1 AND c.relname = $2",
-            &[&schema, &table],
-        )
-        .await
-        .with_context(|| format!("describe {schema}.{table}: relation not found"))?;
+    // The relation head and its column list are two independent catalog reads — neither consumes
+    // the other's output — so they ride ONE connection concurrently (tokio-postgres pipelines
+    // futures polled together) and cost the slower round trip instead of their sum. The backfill
+    // calls this once per published table while `/startup` still answers 503, so the saving scales
+    // with the table count; the same argument as `bootstrap::run_shared`.
+    // A missing relation still reports the head's "relation not found": the column query merely
+    // returns zero rows for one, so it cannot win the fail-fast race with a different message.
+    let (head, rows) = tokio::try_join!(
+        async {
+            client
+                .query_one(
+                    "SELECT c.oid::int8, c.relreplident::text
+                     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                     WHERE n.nspname = $1 AND c.relname = $2",
+                    &[&schema, &table],
+                )
+                .await
+                .with_context(|| format!("describe {schema}.{table}: relation not found"))
+        },
+        async {
+            client
+                .query(
+                    "SELECT a.attname,
+                            a.atttypid::int8            AS type_oid,
+                            a.atttypmod                 AS type_modifier,
+                            COALESCE(bool_or(i.indisprimary OR i.indisreplident), false) AS is_key
+                     FROM pg_class c
+                     JOIN pg_namespace n ON n.oid = c.relnamespace
+                     JOIN pg_attribute a
+                         ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+                     LEFT JOIN pg_index i
+                         ON i.indrelid = c.oid AND a.attnum = ANY (i.indkey)
+                         AND (i.indisprimary OR i.indisreplident)
+                     WHERE n.nspname = $1 AND c.relname = $2
+                     GROUP BY a.attname, a.atttypid, a.atttypmod, a.attnum
+                     ORDER BY a.attnum",
+                    &[&schema, &table],
+                )
+                .await
+                .with_context(|| format!("describe {schema}.{table}: read columns"))
+        },
+    )?;
     let oid: i64 = head.get(0);
     let relreplident: String = head.get(1);
-
-    let rows = client
-        .query(
-            "SELECT a.attname,
-                    a.atttypid::int8            AS type_oid,
-                    a.atttypmod                 AS type_modifier,
-                    COALESCE(bool_or(i.indisprimary OR i.indisreplident), false) AS is_key
-             FROM pg_class c
-             JOIN pg_namespace n ON n.oid = c.relnamespace
-             JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
-             LEFT JOIN pg_index i
-                 ON i.indrelid = c.oid AND a.attnum = ANY (i.indkey)
-                 AND (i.indisprimary OR i.indisreplident)
-             WHERE n.nspname = $1 AND c.relname = $2
-             GROUP BY a.attname, a.atttypid, a.atttypmod, a.attnum
-             ORDER BY a.attnum",
-            &[&schema, &table],
-        )
-        .await
-        .with_context(|| format!("describe {schema}.{table}: read columns"))?;
 
     let columns = rows
         .iter()
