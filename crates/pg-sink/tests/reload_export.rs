@@ -122,13 +122,12 @@ async fn scrub(pool: &sqlx::PgPool, epoch: EpochNo) {
 }
 
 /// The decode-loop half of echo-wait, minimally: resolve signal echoes against `waiters`, and
-/// report the commit LSN of any transaction that carried a change on `watch_oid`'s table (the
+/// publish the commit LSN of any transaction that carried a change on `watch_oid`'s table (the
 /// overlap/no-stall probe). Runs until cancelled.
 ///
-/// The overlap probe consumes only the first matching LSN. A capacity of 64 provides diagnostic
-/// slack beyond a test's expected handful of watch-table commits while bounding retained messages.
-const WATCH_LSN_CAPACITY: usize = 64;
-
+/// The probe only ever asks "what is the newest overlap commit?", never for the history, so that
+/// LSN rides a `watch`: latest-value semantics, so there is no capacity to size and no queue of
+/// superseded LSNs to retain. `None` is "no overlap commit decoded yet".
 fn spawn_echo_resolver(
     slot: &'static str,
     waiters: Arc<WatermarkWaiters>,
@@ -136,9 +135,9 @@ fn spawn_echo_resolver(
     token: CancellationToken,
 ) -> (
     tokio::task::JoinHandle<()>,
-    tokio::sync::mpsc::Receiver<Lsn>,
+    tokio::sync::watch::Receiver<Option<Lsn>>,
 ) {
-    let (tx, rx) = tokio::sync::mpsc::channel(WATCH_LSN_CAPACITY);
+    let (tx, rx) = tokio::sync::watch::channel(None);
     let handle = tokio::spawn(async move {
         let admin = admin().await;
         drop_slot(&admin, slot).await;
@@ -186,13 +185,10 @@ fn spawn_echo_resolver(
                     pending.on_commit(*commit_lsn, &waiters);
                     if std::mem::take(&mut txn_touched_watch) {
                         // Never park the echo resolver: a blocked `send().await` would stop
-                        // watermark resolution and misreport an exporter echo timeout. Full means
-                        // the probe already has earlier overlap evidence; Closed means it finished.
-                        match tx.try_send(*commit_lsn) {
-                            Ok(())
-                            | Err(tokio::sync::mpsc::error::TrySendError::Full(_))
-                            | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
-                        }
+                        // watermark resolution and misreport an exporter echo timeout.
+                        // `send_replace` overwrites in place, so it can neither wait on a slow
+                        // probe nor fail once a finished probe has dropped its receiver.
+                        tx.send_replace(Some(*commit_lsn));
                     }
                 }
                 _ => {}
@@ -382,10 +378,14 @@ async fn chunks_cover_the_table_exactly_with_per_chunk_stamps() {
         )
         .await
         .unwrap();
-    let overlap_commit = tokio::time::timeout(Duration::from_secs(10), watch_rx.recv())
+    tokio::time::timeout(Duration::from_secs(10), watch_rx.changed())
         .await
         .expect("the stream keeps decoding while the export is mid-flight")
-        .unwrap();
+        .expect("the resolver holds the sender until this test cancels it");
+    // Copy the LSN out inside the borrowing statement: a `watch::Ref` is a read guard on the
+    // channel, never held across an await (`clippy.toml`'s `await-holding-invalid-types`).
+    let overlap_commit =
+        (*watch_rx.borrow_and_update()).expect("a change is always a published overlap commit");
     let chunk1_l1 = control::reload::get(&pool, reload_id)
         .await
         .unwrap()
