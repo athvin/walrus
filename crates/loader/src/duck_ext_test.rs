@@ -36,6 +36,21 @@ fn duck_with_preserves_the_typed_error_and_formatted_operation() {
     );
 }
 
+/// Adding context is expressible with the receiver as the *only* type variable: `R::Ok` names the
+/// payload. Turning `Ok` back into a trait parameter would force a second, free `T` here.
+fn add_context<R: DuckResultExt>(result: R, op: &str) -> Result<R::Ok, LoaderError> {
+    result.duck(op)
+}
+
+#[test]
+fn a_bound_carries_the_payload_without_a_free_type_parameter() {
+    let ok: Result<u8, duckdb::Error> = Ok(9);
+    assert_eq!(add_context(ok, "unused").unwrap(), 9);
+
+    let got = add_context(Err::<u8, duckdb::Error>(a_duck_error()), "vacuum").unwrap_err();
+    assert_eq!(got.to_string(), "DuckDB: vacuum");
+}
+
 #[test]
 fn duck_with_does_not_format_on_success() {
     let mut called = false;

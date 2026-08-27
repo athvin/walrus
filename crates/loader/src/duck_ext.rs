@@ -32,7 +32,9 @@ pub(crate) fn duck_err(op: impl Into<String>, source: duckdb::Error) -> LoaderEr
 ///
 /// struct Outcome<T>(T);
 ///
-/// impl<T> DuckResultExt<T> for Outcome<T> {
+/// impl<T> DuckResultExt for Outcome<T> {
+///     type Ok = T;
+///
 ///     fn duck(self, _op: &str) -> Result<T, LoaderError> {
 ///         Ok(self.0)
 ///     }
@@ -42,14 +44,20 @@ pub(crate) fn duck_err(op: impl Into<String>, source: duckdb::Error) -> LoaderEr
 ///     }
 /// }
 /// ```
-pub trait DuckResultExt<T>: private::Sealed {
+pub trait DuckResultExt: private::Sealed {
+    /// The success payload the receiver carries through. It is *associated*, not a trait parameter:
+    /// a receiver determines exactly one payload — `Result<T, duckdb::Error>` can only ever hand
+    /// back its own `T` — so there is no second impl for the same receiver to disambiguate, and a
+    /// bound reads `R: DuckResultExt` instead of dragging a free `T` through every signature.
+    type Ok;
+
     /// Attach a constant operation description.
     ///
     /// # Errors
     ///
     /// Returns [`LoaderError::Duck`] with `op` and the original DuckDB error when the result is an
     /// error.
-    fn duck(self, op: &str) -> Result<T, LoaderError>;
+    fn duck(self, op: &str) -> Result<Self::Ok, LoaderError>;
 
     /// Lazily build a formatted operation description only on the error path.
     ///
@@ -57,7 +65,7 @@ pub trait DuckResultExt<T>: private::Sealed {
     ///
     /// Returns [`LoaderError::Duck`] with the generated operation and original DuckDB error when the
     /// result is an error.
-    fn duck_with(self, op: impl FnOnce() -> String) -> Result<T, LoaderError>;
+    fn duck_with(self, op: impl FnOnce() -> String) -> Result<Self::Ok, LoaderError>;
 }
 
 /// The one receiver, for every payload `T`: attaching this context is only meaningful where the
@@ -65,7 +73,9 @@ pub trait DuckResultExt<T>: private::Sealed {
 /// added or removed together.
 impl<T> private::Sealed for Result<T, duckdb::Error> {}
 
-impl<T> DuckResultExt<T> for Result<T, duckdb::Error> {
+impl<T> DuckResultExt for Result<T, duckdb::Error> {
+    type Ok = T;
+
     fn duck(self, op: &str) -> Result<T, LoaderError> {
         self.map_err(|source| duck_err(op, source))
     }
