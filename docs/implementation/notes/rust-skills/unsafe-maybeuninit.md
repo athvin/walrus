@@ -31,15 +31,23 @@ reserves `claimed.len()` IDs before pushing them. None exposes an initialized `T
 
 ## Measured
 
-The audited first-party scope is Rust under `crates/*/src` and `tests/*/src`:
+The audited first-party scope is every Rust root the guard resolves — `crates/*/src`,
+`crates/*/tests`, `crates/*/benches`, `tests/*/src`, and `tests/*/tests`. Benches earn their place:
+a perf-motivated `set_len` over spare capacity is likeliest to be written there. As of this audit:
 
 - 0 matches for `MaybeUninit|mem::uninitialized|mem::zeroed|assume_init|\.set_len\(`;
 - 0 zero-filled `vec![0; …]` scratch buffers;
-- 22 `with_capacity` calls, all used as length-tracked reservations.
+- 27 `with_capacity` calls, all used as length-tracked reservations.
 
 The replication buffer is the only site using spare capacity for I/O, and its initialization is
 encapsulated by `BytesMut` and `read_buf`. Arrow builders encapsulate their own storage; the other
 vectors and strings reserve capacity and then grow through safe APIs.
+
+The rule's array case has one counterpart here: `build_standby_status` in
+`crates/pg-sink/src/replication.rs` builds its 39-byte feedback frame in a `[0u8; …]` stack array
+and then overwrites every byte. The zero fill costs one 39-byte store on a per-timer path, and the
+`MaybeUninit` spelling that avoids it would need an `unsafe { assume_init() }` the workspace forbids.
+Safe and fully written beats uninitialized and provable here.
 
 ## Lints that already cover the bad forms
 
@@ -50,10 +58,13 @@ rule.
 
 ## The tripwire
 
-`scripts/check-unsafe-invariants.sh` scans only the audited first-party source roots and prints any
-offending `file:line`. Its isolated `--self-test` proves a clean `with_capacity` fixture passes and
-a `.set_len(` fixture fails. CI runs the same guard at the front of the `gates` job, before Rust
-formatting, Clippy, and tests.
+`scripts/check-unsafe-invariants.sh` resolves the first-party roots above, scans only those, and
+prints any offending `file:line`. A root pattern that matches nothing is skipped — a crate need not
+have benches — but resolving to *no* roots is a failure, because a scan over zero files would
+otherwise report `PASS`. Its isolated `--self-test` proves a clean `with_capacity` fixture passes, a
+`.set_len(` fixture fails, a bench-only violation is inside the resolved scope, and an empty scope is
+rejected. CI runs the same guard at the front of the `gates` job, before Rust formatting, Clippy,
+and tests.
 
 Revisit this **D** decision only if walrus gains a first-party FFI buffer that must be initialized by
 an external writer, or profiling against the bar in `docs/benchmarks.md` shows that safe zero-fill

@@ -12,6 +12,11 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 UNINIT_PATTERN='MaybeUninit|mem::uninitialized|mem::zeroed|assume_init|\.set_len\('
+# First-party Rust roots, relative to a tree root. Benches and integration tests are first-party
+# too — a perf-motivated `set_len` over spare capacity is likeliest to appear in a bench — so they
+# are scanned alongside library sources. Dependency and generated-code unsafe internals are outside
+# this policy; legitimate reserve-only calls such as `with_capacity` are not in the pattern.
+SCOPE_PATTERNS=('crates/*/src' 'crates/*/tests' 'crates/*/benches' 'tests/*/src' 'tests/*/tests')
 ADR="docs/implementation/notes/rust-skills/unsafe-miri-ci.md"
 WALRUS_SELF_TEST_DIR=""
 
@@ -24,6 +29,7 @@ trap cleanup_self_test EXIT
 
 scan_uninit() {
   echo "== fake initialization (${UNINIT_PATTERN}) =="
+  echo "   scope: $*"
   local hits
   hits="$(grep -rnE --include='*.rs' "$UNINIT_PATTERN" "$@" 2>/dev/null || true)"
   if [[ -n "$hits" ]]; then
@@ -39,6 +45,27 @@ scan_uninit() {
 fail() {
   echo "FAIL: $*" >&2
   return 1
+}
+
+# Expand SCOPE_PATTERNS under a tree root. A pattern that matches nothing is skipped (a crate need
+# not have benches), but an empty result means the layout moved and the scan would "pass" over zero
+# files — the one way this guard could go quiet without anyone noticing.
+resolve_scope() {
+  local root="${1%/}"
+  local pattern candidate
+  local -a roots=()
+  for pattern in "${SCOPE_PATTERNS[@]}"; do
+    for candidate in "$root"/$pattern; do
+      if [[ -d "$candidate" ]]; then
+        roots+=("${candidate#./}")
+      fi
+    done
+  done
+  if [[ ${#roots[@]} -eq 0 ]]; then
+    fail "no first-party Rust root under $root matched ${SCOPE_PATTERNS[*]}; the scan would pass on an empty file set. See $ADR."
+    return 1
+  fi
+  printf '%s\n' "${roots[@]}"
 }
 
 has_workspace_unsafe_forbid() {
@@ -155,6 +182,60 @@ self_test() {
   printf '%s\n' "$violation_line"
   echo "ok: temporary .set_len( fixture is rejected with its file and line"
 
+  local scope_root="$WALRUS_SELF_TEST_DIR/scope"
+  local scope_log="$WALRUS_SELF_TEST_DIR/scope.log"
+  local empty_root="$WALRUS_SELF_TEST_DIR/scope-empty"
+  local empty_log="$WALRUS_SELF_TEST_DIR/scope-empty.log"
+  mkdir -p "$scope_root/crates/example/benches" "$scope_root/tests/e2e/tests" "$empty_root/crates"
+
+  printf '%s\n' \
+    'fn bench(buffer: &mut Vec<u8>) {' \
+    '    buffer.set_len(1);' \
+    '}' >"$scope_root/crates/example/benches/append.rs"
+
+  local resolved
+  resolved="$(resolve_scope "$scope_root")"
+  local expected
+  for expected in crates/example/benches tests/e2e/tests; do
+    if ! grep -Fxq "$scope_root/$expected" <<<"$resolved"; then
+      printf '%s\n' "$resolved"
+      echo "not ok: resolved scope omitted $expected" >&2
+      return 1
+    fi
+  done
+
+  local -a resolved_dirs=()
+  local dir
+  while IFS= read -r dir; do
+    if [[ -n "$dir" ]]; then
+      resolved_dirs+=("$dir")
+    fi
+  done <<<"$resolved"
+
+  if scan_uninit "${resolved_dirs[@]}" >"$scope_log" 2>&1; then
+    echo "not ok: bench-only .set_len( fixture escaped the resolved scope" >&2
+    return 1
+  fi
+  local bench_line
+  bench_line="$(grep -F "$scope_root/crates/example/benches/append.rs:2:" "$scope_log" || true)"
+  if [[ -z "$bench_line" ]]; then
+    echo "not ok: bench rejection did not print the fixture file and line" >&2
+    return 1
+  fi
+  printf '%s\n' "$bench_line"
+  echo "ok: benches and integration tests are inside the resolved scope"
+
+  if resolve_scope "$empty_root" >"$empty_log" 2>&1; then
+    echo "not ok: a tree with no first-party Rust root unexpectedly resolved" >&2
+    return 1
+  fi
+  if ! grep -F "$ADR" "$empty_log" >/dev/null; then
+    echo "not ok: empty-scope diagnostic did not point to $ADR" >&2
+    return 1
+  fi
+  grep -F 'FAIL:' "$empty_log"
+  echo "ok: a tree with no first-party Rust root is rejected instead of scanning nothing"
+
   local clean_policy="$WALRUS_SELF_TEST_DIR/policy-clean"
   local missing_root="$WALRUS_SELF_TEST_DIR/policy-missing-root"
   local missing_member="$WALRUS_SELF_TEST_DIR/policy-missing-member"
@@ -196,9 +277,14 @@ self_test() {
 
 case "${1:-}" in
   "")
-    # First-party Rust source roots only. Dependency and generated-code unsafe internals are outside
-    # this policy; legitimate reserve-only calls such as `with_capacity` are not in the pattern.
-    SCOPE=(crates/*/src tests/*/src)
+    # Command substitution keeps `resolve_scope`'s failure status, unlike a process substitution.
+    SCOPE_LIST="$(resolve_scope ".")"
+    SCOPE=()
+    while IFS= read -r scope_root; do
+      if [[ -n "$scope_root" ]]; then
+        SCOPE+=("$scope_root")
+      fi
+    done <<<"$SCOPE_LIST"
     scan_uninit "${SCOPE[@]}"
     check_unsafe_policy "."
     echo "check-unsafe-invariants: PASS"
