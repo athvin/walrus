@@ -352,9 +352,17 @@ pub async fn fail(
 /// Would restarting an attempt with `restart_count` push it past `max_restarts` (PR 6.8)? The next
 /// attempt would carry `restart_count + 1`, so the cap is exceeded when that exceeds the max — a
 /// `max_restarts` of 0 fails the very first mid-export DDL. Pure so it unit-tests without a DB.
+///
+/// The successor count is `checked_add`ed, not `+`ed: `restart_count` is whatever the `int` column
+/// holds, and at [`i32::MAX`] a bare add wraps to [`i32::MIN`] in release — reporting a *spent* cap
+/// as unspent, which is the one answer a restart cap must never reach by accident. `None` is also
+/// the exact answer, since no `i32` cap can hold `i32::MAX + 1`.
 #[must_use]
 pub const fn restart_would_exceed_cap(restart_count: i32, max_restarts: i32) -> bool {
-    restart_count + 1 > max_restarts
+    match restart_count.checked_add(1) {
+        Some(next) => next > max_restarts,
+        None => true,
+    }
 }
 
 /// H9 restart-on-DDL (PR 6.8): in ONE transaction, fail the old attempt — [`fail`]'s coupling
@@ -383,7 +391,10 @@ pub async fn restart_for_ddl(
     new_schema_version: SchemaVersionNo,
     max_restarts: i32,
 ) -> Result<Option<ReloadId>, ControlError> {
-    let next_restart = old.restart_count + 1;
+    // Computed before `capped` is known, so it saturates for the same reason the cap check is
+    // checked: an `i32::MAX` predecessor must not wrap here either. The capped path discards it, and
+    // on the path that keeps it the cap has already proved the successor count is exact.
+    let next_restart = old.restart_count.saturating_add(1);
     let capped = restart_would_exceed_cap(old.restart_count, max_restarts);
     let reason = if capped {
         format!(

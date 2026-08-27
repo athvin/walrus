@@ -237,7 +237,7 @@ pub async fn handle_ddl_restart(
                 old_reload_id = %old.reload_id,
                 new_reload_id = %new_id,
                 new_version = %new_version,
-                restart_count = old.restart_count + 1,
+                restart_count = old.restart_count.saturating_add(1),
                 "reload restarted at the new schema (DDL landed between chunks)"
             );
             Ok(RestartDecision::Restarted(new_id))

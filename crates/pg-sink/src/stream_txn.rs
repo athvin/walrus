@@ -562,17 +562,20 @@ impl<C: Clock + Clone> StreamDemux<C> {
 }
 
 /// A rough per-change byte estimate (Arrow-buffered size, not serialized Parquet) for the meter.
+///
+/// Saturating to match the [`InflightMeter`] it feeds, whose own `add` clamps: a wrapped sum here
+/// would hand the meter a *small* number in release and silently lift the memory ceiling, which is
+/// the backstop against an OOM-kill.
 fn estimate_change_bytes(values: &[TupleValue]) -> u64 {
     const META_OVERHEAD: u64 = 96;
-    META_OVERHEAD
-        + values
-            .iter()
-            .map(|v| match v {
-                TupleValue::Text(s) => u64::try_from(s.len()).unwrap_or(u64::MAX),
-                TupleValue::Binary(b) => u64::try_from(b.len()).unwrap_or(u64::MAX),
-                TupleValue::Null | TupleValue::UnchangedToast => 1,
-            })
-            .sum::<u64>()
+    values
+        .iter()
+        .map(|v| match v {
+            TupleValue::Text(s) => u64::try_from(s.len()).unwrap_or(u64::MAX),
+            TupleValue::Binary(b) => u64::try_from(b.len()).unwrap_or(u64::MAX),
+            TupleValue::Null | TupleValue::UnchangedToast => 1,
+        })
+        .fold(META_OVERHEAD, u64::saturating_add)
 }
 
 /// A streamed change carries its sub-xid; a non-streamed change never enters the demux.

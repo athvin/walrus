@@ -55,3 +55,16 @@ fn restart_cap_counts_the_successor_not_the_predecessor() {
         "the 4th would exceed a cap of 3"
     );
 }
+
+#[test]
+fn restart_cap_holds_at_the_integer_ceiling() {
+    // A bare `restart_count + 1` wraps to i32::MIN in release at the ceiling, so a corrupt control
+    // row would report even a spent cap as unspent — an unbounded restart loop with no diagnostic.
+    assert!(
+        restart_would_exceed_cap(i32::MAX, i32::MAX),
+        "no i32 cap can hold i32::MAX + 1"
+    );
+    assert!(restart_would_exceed_cap(i32::MAX, 0));
+    // One below the ceiling still answers exactly: the successor is i32::MAX, which fits that cap.
+    assert!(!restart_would_exceed_cap(i32::MAX - 1, i32::MAX));
+}

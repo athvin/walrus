@@ -187,7 +187,7 @@ impl<C: Clock> TableBatcher<C> {
         self.batch_id.get_or_insert_with(|| {
             format!("{}.{}-{}", meta.source_schema, meta.source_table, meta.lsn)
         });
-        self.pending_bytes += estimate_row_bytes(values);
+        self.pending_bytes = self.pending_bytes.saturating_add(estimate_row_bytes(values));
         self.pending.push((meta, values.into()));
     }
 
@@ -229,7 +229,9 @@ impl<C: Clock> TableBatcher<C> {
             self.builder.append_row(&values, &meta)?;
             self.committed_rows += 1;
         }
-        self.committed_bytes += std::mem::take(&mut self.pending_bytes);
+        self.committed_bytes = self
+            .committed_bytes
+            .saturating_add(std::mem::take(&mut self.pending_bytes));
         Ok(())
     }
 
@@ -331,17 +333,21 @@ impl<C: Clock> TableBatcher<C> {
 
 /// A rough running byte estimate of the buffered Arrow size (not the compressed Parquet size, which
 /// isn't known until write) — enough to drive the `max_bytes` trigger.
+///
+/// Saturating for the reason [`crate::memory::InflightMeter::add`] is: the only question asked of
+/// this number is whether the batch has reached `max_bytes`, and `u64::MAX` preserves that answer.
+/// The per-value clamps already state that intent; a `sum`/`+` would discard it by wrapping to a
+/// *small* estimate in release — the one outcome that silently disables the trigger.
 fn estimate_row_bytes(values: &[TupleValue]) -> u64 {
     const META_OVERHEAD: u64 = 96; // the walrus_pg_sink_meta JSON per row, roughly
-    let value_bytes: u64 = values
+    values
         .iter()
         .map(|v| match v {
             TupleValue::Text(s) => u64::try_from(s.len()).unwrap_or(u64::MAX),
             TupleValue::Binary(b) => u64::try_from(b.len()).unwrap_or(u64::MAX),
             TupleValue::Null | TupleValue::UnchangedToast => 1,
         })
-        .sum();
-    META_OVERHEAD + value_bytes
+        .fold(META_OVERHEAD, u64::saturating_add)
 }
 
 /// This taxonomy is still growing; new variants must remain additive for downstream crates.
