@@ -34,6 +34,13 @@ fn main() -> ExitCode {
         eprintln!("walrus-loader: tracing init failed: {e}");
         return common::ExitCode::Internal.into();
     }
+    // The multi-thread FLAVOR is load-bearing; the worker count is not. `block_on` drives the
+    // pipeline — and with it the `LocalSet`'s apply loops — on THIS thread, which a full rebuild's
+    // `CREATE OR REPLACE` blocks synchronously for seconds. Everything `tokio::spawn`ed (health
+    // server, lease renewer, epoch watch, and `compaction::full_rebuild_abortable`'s interrupt
+    // watcher) lives on the worker pool instead, so it keeps running across that block: the lease
+    // stays renewed and SIGTERM still aborts the rewrite. `new_current_thread` would put all of
+    // it on the blocked thread and lose both. One worker suffices — it is a thread of its own.
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("walrus-loader")

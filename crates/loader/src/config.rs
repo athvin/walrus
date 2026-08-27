@@ -65,7 +65,9 @@ pub struct LoaderConfig {
     pub telemetry: TelemetryConfig,
     /// Tokio worker threads. `None` uses `available_parallelism()`; configured values must be
     /// within 1..=64. A loader pod wants a small value because every apply loop shares one
-    /// `LocalSet` thread; `WALRUS_WORKER_THREADS=2` is plenty for the remaining async work.
+    /// `LocalSet` thread; `WALRUS_WORKER_THREADS=2` is plenty for the remaining async work. Small,
+    /// though — never a *current-thread* runtime: the spawned side tasks must keep running through
+    /// a blocking full rebuild on the `LocalSet` thread (see the flavor note in `main`).
     pub worker_threads: Option<usize>,
     /// This pod's identity — the lease `owner_pod`.
     pub instance: String,
