@@ -300,9 +300,12 @@ async fn export_with_ddl_restarts(
                         // renewal currently shares this task; this documents the intended handoff if
                         // it later moves to its own task and pairs with the Acquire loads below.
                         current_reload_id.store(new_id.0, Ordering::Release);
-                        req = control::reload::get(&pool, new_id).await?.ok_or_else(|| {
-                            anyhow::anyhow!("successor reload {new_id} vanished after restart")
-                        })?;
+                        req = control::reload::get(&pool, new_id)
+                            .await
+                            .with_context(|| format!("read successor reload {new_id}"))?
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("successor reload {new_id} vanished after restart")
+                            })?;
                     }
                     RestartDecision::Capped => return Ok(()),
                 }

@@ -345,8 +345,15 @@ impl ChunkExporter {
              lagged",
             self.cfg.echo_timeout
         );
-        let mut conn = self.pool.acquire().await?;
-        control::reload::fail(&mut conn, self.reload_id, &reason).await?;
+        let mut conn = self.pool.acquire().await.with_context(|| {
+            format!(
+                "acquire a control-pg connection to fail reload {}",
+                self.reload_id
+            )
+        })?;
+        control::reload::fail(&mut conn, self.reload_id, &reason)
+            .await
+            .with_context(|| format!("mark reload {} failed", self.reload_id))?;
         common::metrics::record_reload_failed(&self.series);
         anyhow::bail!("reload {} failed: {reason}", self.reload_id);
     }

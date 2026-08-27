@@ -324,7 +324,10 @@ impl<C: Clock + Clone> StreamDemux<C> {
             // LSN is not yet known. `on_stream_commit` corrects the manifest `lsn_end` to the commit LSN;
             // the loader then reads `lsn_end` as the authoritative per-row `commit_lsn` for a `spill` file.
             let written = sink
-                .put_with_kind(batcher.seal()?, FileKind::Spill)
+                .put_with_kind(
+                    batcher.seal().context("seal speculative spill batch")?,
+                    FileKind::Spill,
+                )
                 .await
                 .context("speculative spill PUT")?;
             self.spill_count += 1;
@@ -492,7 +495,7 @@ impl<C: Clock + Clone> StreamDemux<C> {
                 .context("promote streamed survivors")?;
             if batcher.should_flush() {
                 out.push(
-                    sink.put(batcher.seal()?)
+                    sink.put(batcher.seal().context("seal streamed sub-batch")?)
                         .await
                         .context("materialise streamed sub-batch")?,
                 );
@@ -501,7 +504,7 @@ impl<C: Clock + Clone> StreamDemux<C> {
         for batcher in batchers.values_mut() {
             if batcher.committed_rows() > 0 {
                 out.push(
-                    sink.put(batcher.seal()?)
+                    sink.put(batcher.seal().context("seal final streamed batch")?)
                         .await
                         .context("materialise final streamed batch")?,
                 );

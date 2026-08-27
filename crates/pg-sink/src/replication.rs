@@ -271,7 +271,7 @@ impl ReplicationStream {
             .write_all(&build_standby_status(s))
             .await
             .context("write standby status")?;
-        self.stream.flush().await?;
+        self.stream.flush().await.context("flush standby status")?;
         self.feedback_deadline = Instant::now() + self.feedback_interval;
         Ok(())
     }
@@ -288,7 +288,7 @@ impl ReplicationStream {
             .write_all(&[b'c', 0, 0, 0, 4])
             .await
             .context("write CopyDone")?;
-        self.stream.flush().await?;
+        self.stream.flush().await.context("flush CopyDone")?;
         Ok(())
     }
 
@@ -404,7 +404,7 @@ impl ReplicationStream {
             .write_all(&startup_message)
             .await
             .context("send StartupMessage")?;
-        self.stream.flush().await?;
+        self.stream.flush().await.context("flush StartupMessage")?;
         loop {
             let (tag, body) = self.read_message().await?;
             match tag {
@@ -467,7 +467,7 @@ impl ReplicationStream {
         msg.extend_from_slice(sql.as_bytes());
         msg.push(0);
         self.stream.write_all(&msg).await.context("send Query")?;
-        self.stream.flush().await?;
+        self.stream.flush().await.context("flush Query")?;
         Ok(())
     }
 }
