@@ -304,10 +304,10 @@ impl<C: Clock + Clone> DecodeLoop<'_, C> {
                                     // acked like any record, never routed toward a batcher.
                                     Message::Delete { relation_oid, .. }
                                         if internal.is_internal(*relation_oid) => {}
-                                    Message::Commit { commit_lsn, .. } => {
+                                    m @ Message::Commit { commit_lsn, .. } => {
                                         // First seal/flush any user batch this commit made eligible.
                                         flush_sealed(
-                                            router.route(cache, &msg, frame_lsn, schema_version)?,
+                                            router.route(cache, m, frame_lsn, schema_version)?,
                                             stream,
                                             sink,
                                             checkpoint,
