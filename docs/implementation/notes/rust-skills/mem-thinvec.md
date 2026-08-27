@@ -17,7 +17,7 @@ On the supported 64-bit target:
 | type | size | evidence |
 |---|---:|---|
 | `Vec<TupleValue>` | 24 B | Rust standard layout on this target |
-| `Option<Vec<TupleValue>>` (`crates/pg-sink/src/pgoutput/mod.rs:83`) | 24 B | PR 11.15 const relationship assertion |
+| `Option<Vec<TupleValue>>` (`Message::Update.old`, `crates/pg-sink/src/pgoutput/mod.rs`) | 24 B | PR 11.15 const relationship assertion |
 | `PgRelation` | 80 B | `crates/common/src/pg_shape.rs` layout ratchet |
 | `pgoutput::Message` | 88 B | `MESSAGE_MAX_BYTES` ratchet in `pgoutput/mod.rs` |
 
