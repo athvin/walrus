@@ -77,6 +77,20 @@ pub struct ReloadRow {
     pub error: Option<String>,
 }
 
+/// Build a [`ReloadRow`] from one `table_reload` record.
+///
+/// A macro — not a function, a generic, or an `impl From<_> for ReloadRow` — for the one narrow
+/// reason that sanctions reaching for one: every `sqlx::query_file!` mints its OWN record struct
+/// inside its own expansion, so the four readers below ([`claim_requested`], [`adopt_resumable`],
+/// [`active_rebuilds`], [`get`]) hand in four *distinct*, unnameable types that merely happen to
+/// share a field set. Rust has no structural typing, so there is no bound to make a function
+/// generic over and no type to name in a `From` impl; the only alternative is these fourteen
+/// fields written out four times. Sibling modules ([`crate::manifest`], [`crate::ddl_manifest`])
+/// build their row struct inline precisely because each has a single reader.
+///
+/// `expr_2021` holds the capture to the 2021 expression grammar rather than edition 2024's wider
+/// `expr`, and the `let` binds the argument once so a caller's expression is never re-evaluated
+/// per field.
 macro_rules! typed_reload_row {
     ($row:expr_2021) => {{
         let row = $row;
