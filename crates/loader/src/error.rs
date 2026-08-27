@@ -9,7 +9,9 @@ use common::{EpochNo, ExitCode, FailureClass};
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum LoaderError {
-    #[error(transparent)]
+    /// Not `transparent`: [`ConfigError`]'s variants name the offending knob, and this is where the
+    /// "which configuration" framing belongs.
+    #[error("invalid loader configuration: {0}")]
     Config(#[from] ConfigError),
     #[error(transparent)]
     Control(#[from] control::ControlError),
@@ -82,7 +84,7 @@ pub enum LoaderError {
 impl From<&LoaderError> for common::Error {
     fn from(e: &LoaderError) -> Self {
         match e {
-            LoaderError::Config(e) => common::Error::Config(e.0.clone()),
+            LoaderError::Config(e) => common::Error::Config(e.to_string()),
             LoaderError::Control(e) => common::Error::ControlDb(e.to_string()),
             LoaderError::Duck { op, source } => {
                 common::Error::Internal(format!("duckdb: {op}: {source}"))

@@ -1,5 +1,6 @@
 use super::*;
 use common::FailureClass;
+use common::runtime::WorkerThreadsError;
 
 fn valid() -> LoaderConfig {
     LoaderConfig {
@@ -59,10 +60,31 @@ fn duration_attribute_mismatch(src: &str, expected_fields: usize) -> Option<Stri
     }
 }
 
+/// Just the `LoaderConfig` struct body. `config.rs` also defines `ConfigError`, whose
+/// `LeaseTtlTooShort` carries `Duration` *data* — not a serde-deserialized field — so the scan
+/// below must not count it.
+fn loader_config_struct_body(src: &str) -> &str {
+    let start = src
+        .find("pub struct LoaderConfig {")
+        .expect("config.rs defines LoaderConfig");
+    let body = &src[start..];
+    let end = body.find("\n}").expect("LoaderConfig has a closing brace");
+    &body[..end]
+}
+
 #[test]
 fn every_duration_field_carries_humantime() {
-    let mismatch = duration_attribute_mismatch(include_str!("config.rs"), 4);
+    let body = loader_config_struct_body(include_str!("config.rs"));
+    let mismatch = duration_attribute_mismatch(body, 4);
     assert!(mismatch.is_none(), "{mismatch:?}");
+}
+
+/// The slice really is the struct: it stops before `ConfigError`'s duration-carrying variant.
+#[test]
+fn the_struct_slice_excludes_the_error_taxonomy() {
+    let body = loader_config_struct_body(include_str!("config.rs"));
+    assert!(body.contains("pub lease_ttl: Duration,"));
+    assert!(!body.contains("LeaseTtlTooShort"), "{body}");
 }
 
 #[test]
@@ -103,7 +125,14 @@ fn zero_worker_threads_is_rejected_as_terminal_config() {
     let mut cfg = valid();
     cfg.worker_threads = Some(0);
     let err = cfg.validate().unwrap_err();
-    assert!(err.to_string().contains("worker_threads"));
+    assert!(
+        matches!(err, ConfigError::WorkerThreads(WorkerThreadsError::Zero)),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "worker_threads: must be >= 1 (omit for automatic sizing)"
+    );
     assert_eq!(
         common::Error::from(err).exit_code(),
         common::ExitCode::Config
@@ -115,11 +144,53 @@ fn worker_threads_above_the_ceiling_is_rejected_as_terminal_config() {
     let mut cfg = valid();
     cfg.worker_threads = Some(65);
     let err = cfg.validate().unwrap_err();
+    // The bound violation stays typed all the way down: the offending count is recoverable
+    // without re-reading the rendered message.
+    assert!(
+        matches!(
+            err,
+            ConfigError::WorkerThreads(WorkerThreadsError::TooMany { configured: 65 })
+        ),
+        "{err:?}"
+    );
     assert!(err.to_string().contains("worker_threads"));
     assert_eq!(
         common::Error::from(err).exit_code(),
         common::ExitCode::Config
     );
+}
+
+/// Each required string names itself as a `&'static str`, so a caller can point at the offending
+/// field instead of substring-matching the message.
+#[test]
+fn every_missing_required_field_is_named_by_the_variant() {
+    fn expect_missing(cfg: &LoaderConfig, field: &str) {
+        let err = cfg
+            .validate()
+            .expect_err("a blank required field is terminal");
+        assert!(
+            matches!(err, ConfigError::Missing(f) if f == field),
+            "{err:?}"
+        );
+        assert_eq!(err.to_string(), format!("missing required field: {field}"));
+    }
+
+    // Whitespace-only counts as blank, so this first case also pins the `trim()`.
+    let mut cfg = valid();
+    cfg.control_db_url = "   ".to_string();
+    expect_missing(&cfg, "control_db_url");
+
+    let mut cfg = valid();
+    cfg.instance = String::new();
+    expect_missing(&cfg, "instance");
+
+    let mut cfg = valid();
+    cfg.duckdb_dir = String::new();
+    expect_missing(&cfg, "duckdb_dir");
+
+    let mut cfg = valid();
+    cfg.object_store.bucket = String::new();
+    expect_missing(&cfg, "object_store.bucket");
 }
 
 #[test]
@@ -134,6 +205,15 @@ fn lease_ttl_below_three_seconds_is_a_terminal_config_error() {
     let mut cfg = valid();
     cfg.lease_ttl = Duration::from_secs(1);
     let err = cfg.validate().expect_err("1s TTL must be rejected");
+    // Both the rejected value and the floor it missed travel with the error.
+    assert!(
+        matches!(
+            err,
+            ConfigError::LeaseTtlTooShort { ttl, minimum }
+                if ttl == Duration::from_secs(1) && minimum == MIN_LEASE_TTL
+        ),
+        "{err:?}"
+    );
     assert!(err.to_string().contains("lease_ttl"), "{err}");
     assert!(common::Error::from(err).is_terminal());
 }
@@ -142,7 +222,10 @@ fn lease_ttl_below_three_seconds_is_a_terminal_config_error() {
 fn zero_lease_ttl_is_still_rejected() {
     let mut cfg = valid();
     cfg.lease_ttl = Duration::ZERO;
-    assert!(cfg.validate().is_err());
+    assert!(matches!(
+        cfg.validate(),
+        Err(ConfigError::LeaseTtlTooShort { ttl, .. }) if ttl.is_zero()
+    ));
 }
 
 #[test]
@@ -163,12 +246,56 @@ fn zero_poll_and_compaction_intervals_are_rejected() {
     let err = cfg
         .validate()
         .expect_err("zero poll interval must be rejected");
-    assert!(err.to_string().contains("poll_interval"), "{err}");
+    assert!(
+        matches!(err, ConfigError::ZeroInterval("poll_interval")),
+        "{err:?}"
+    );
+    assert_eq!(err.to_string(), "poll_interval must be greater than zero");
 
     let mut cfg = valid();
     cfg.compaction_interval = Duration::ZERO;
     let err = cfg
         .validate()
         .expect_err("zero compaction interval must be rejected");
+    assert!(
+        matches!(err, ConfigError::ZeroInterval("compaction_interval")),
+        "{err:?}"
+    );
     assert!(err.to_string().contains("compaction_interval"), "{err}");
+}
+
+/// Structuring the type must not move the operator-facing text: `main` prints
+/// `walrus-loader: invalid loader configuration: {e}` and `LoaderError::Config` re-adds the same
+/// framing, while the `common::Error` classifier keeps carrying the bare detail.
+#[test]
+fn the_rendered_message_is_unchanged_at_every_display_boundary() {
+    let err = ConfigError::Missing("instance");
+    assert_eq!(err.to_string(), "missing required field: instance");
+    assert_eq!(
+        crate::error::LoaderError::from(err).to_string(),
+        "invalid loader configuration: missing required field: instance"
+    );
+    assert_eq!(
+        common::Error::from(ConfigError::Missing("instance")).to_string(),
+        "invalid configuration: missing required field: instance"
+    );
+}
+
+/// A typo'd ConfigMap key is a deserialization failure, not a bounds failure — a distinction the
+/// old single-string type could not express. Figment's detail rides through verbatim.
+#[test]
+fn an_unknown_key_is_a_load_failure_carrying_figments_detail() {
+    in_jail(|jail| {
+        jail.set_env("WALRUS_CONTROL_DB_URL", "postgres://x/y");
+        jail.set_env("WALRUS_INSTANCE", "walrus-loader-0");
+        jail.set_env("WALRUS_DUCKDB_DIR", "/var/lib/walrus");
+        jail.set_env("WALRUS_OBJECT_STORE__BUCKET", "b");
+        jail.set_env("WALRUS_NONSENSE", "boom"); // typo'd ConfigMap key
+
+        let err = LoaderConfig::load().expect_err("unknown key must fail the load");
+        let ConfigError::Load(detail) = &err else {
+            panic!("expected a Load failure, got {err:?}");
+        };
+        assert!(detail.contains("nonsense"), "{detail}");
+    });
 }

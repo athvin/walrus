@@ -9,6 +9,10 @@ use std::net::SocketAddr;
 use std::num::NonZeroI64;
 use std::time::Duration;
 
+/// Floor for `lease_ttl`: renewal runs at TTL/3, so anything shorter cannot land inside the TTL.
+/// Public because [`ConfigError::LeaseTtlTooShort`] reports it as data.
+pub const MIN_LEASE_TTL: Duration = Duration::from_secs(3);
+
 const fn nonzero_i64(value: i64) -> NonZeroI64 {
     match NonZeroI64::new(value) {
         Some(value) => value,
@@ -82,8 +86,9 @@ impl LoaderConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError`] when a file or environment value cannot be deserialized, an unknown
-    /// field is present, or the merged configuration fails [`Self::validate`].
+    /// Returns [`ConfigError::Load`] when a file or environment value cannot be deserialized or an
+    /// unknown field is present, or whichever variant [`Self::validate`] rejects the merged
+    /// configuration with.
     pub fn load() -> Result<Self, ConfigError> {
         use figment::Figment;
         use figment::providers::{Env, Format, Toml, Yaml};
@@ -108,7 +113,7 @@ impl LoaderConfig {
                     .split("__"),
             )
             .extract()
-            .map_err(|e| ConfigError(e.to_string()))?;
+            .map_err(|e| ConfigError::Load(e.to_string()))?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -117,9 +122,10 @@ impl LoaderConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError`] when a required value is empty, a cadence is zero, `lease_ttl` is too
-    /// short for renewal, or the runtime worker count is outside its documented bound. These are
-    /// terminal failures.
+    /// Returns [`ConfigError::Missing`] for an empty required value, [`ConfigError::ZeroInterval`]
+    /// for a zero cadence, [`ConfigError::LeaseTtlTooShort`] when renewal could not land inside the
+    /// TTL, or [`ConfigError::WorkerThreads`] when the runtime worker count is outside its
+    /// documented bound. These are terminal failures.
     pub fn validate(&self) -> Result<(), ConfigError> {
         for (field, v) in [
             ("control_db_url", &self.control_db_url),
@@ -128,38 +134,65 @@ impl LoaderConfig {
             ("object_store.bucket", &self.object_store.bucket),
         ] {
             if v.trim().is_empty() {
-                return Err(ConfigError(format!("missing required field: {field}")));
+                return Err(ConfigError::Missing(field));
             }
         }
-        const MIN_LEASE_TTL: Duration = Duration::from_secs(3);
         if self.lease_ttl < MIN_LEASE_TTL {
-            return Err(ConfigError(format!(
-                "lease_ttl {:?} is too short — renewal runs at TTL/3 and must land inside the TTL; \
-                 use >= {MIN_LEASE_TTL:?}",
-                self.lease_ttl
-            )));
+            return Err(ConfigError::LeaseTtlTooShort {
+                ttl: self.lease_ttl,
+                minimum: MIN_LEASE_TTL,
+            });
         }
         for (field, value) in [
             ("poll_interval", self.poll_interval),
             ("compaction_interval", self.compaction_interval),
         ] {
             if value.is_zero() {
-                return Err(ConfigError(format!("{field} must be greater than zero")));
+                return Err(ConfigError::ZeroInterval(field));
             }
         }
-        common::runtime::validate_worker_threads(self.worker_threads)
-            .map_err(|e| ConfigError(format!("worker_threads: {e}")))?;
+        common::runtime::validate_worker_threads(self.worker_threads)?;
         Ok(())
     }
 }
 
+/// Why a loader configuration is unusable. Every variant is terminal — `main` maps them all to
+/// [`common::ExitCode::Config`] — but *which* knob is wrong is modelled as data, so a caller can
+/// branch on the variant (and recover the offending value) instead of re-reading the rendered
+/// message. The "invalid loader configuration" framing lives at the two display boundaries
+/// (`main`'s stderr line and [`crate::error::LoaderError::Config`]), keeping this taxonomy's
+/// messages usable on their own.
+///
+/// This taxonomy is still growing; new variants must remain additive for downstream crates.
 #[derive(Debug, thiserror::Error)]
-#[error("invalid loader configuration: {0}")]
-pub struct ConfigError(pub String);
+#[non_exhaustive]
+pub enum ConfigError {
+    /// A file or environment value could not be deserialized into [`LoaderConfig`] — bad syntax, a
+    /// wrong type, or an unknown key under `deny_unknown_fields`. Figment already renders the
+    /// offending profile/key, so the detail is passed through verbatim.
+    #[error("{0}")]
+    Load(String),
+    /// A required string field was absent or blank.
+    #[error("missing required field: {0}")]
+    Missing(&'static str),
+    /// `lease_ttl` is under [`MIN_LEASE_TTL`], so the TTL/3 renewal could not land inside it.
+    #[error(
+        "lease_ttl {ttl:?} is too short — renewal runs at TTL/3 and must land inside the TTL; \
+         use >= {minimum:?}"
+    )]
+    LeaseTtlTooShort { ttl: Duration, minimum: Duration },
+    /// A cadence that drives a loop was zero, which would make that loop spin instead of poll.
+    #[error("{0} must be greater than zero")]
+    ZeroInterval(&'static str),
+    /// The configured Tokio worker count is outside its documented `1..=64` bound. Keeps the typed
+    /// [`common::runtime::WorkerThreadsError`] so callers can recover the offending count.
+    #[error("worker_threads: {0}")]
+    WorkerThreads(#[from] common::runtime::WorkerThreadsError),
+}
 
 impl From<ConfigError> for common::Error {
     fn from(e: ConfigError) -> Self {
-        common::Error::Config(e.0)
+        common::Error::Config(e.to_string())
     }
 }
 

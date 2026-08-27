@@ -26,7 +26,7 @@ fn main() -> ExitCode {
     let cfg = match LoaderConfig::load() {
         Ok(cfg) => cfg,
         Err(e) => {
-            eprintln!("walrus-loader: {e}");
+            eprintln!("walrus-loader: invalid loader configuration: {e}");
             return common::ExitCode::Config.into();
         }
     };
