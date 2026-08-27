@@ -36,6 +36,21 @@ fn duck_with_preserves_the_typed_error_and_formatted_operation() {
     );
 }
 
+/// The defaulted `duck` is `duck_with` over a constant, so the two spellings cannot describe the
+/// same failure differently. An override that broke this would be caught here.
+#[test]
+fn defaulted_duck_agrees_with_the_required_duck_with() {
+    let via_duck = Err::<(), duckdb::Error>(a_duck_error())
+        .duck("attach catalog")
+        .unwrap_err();
+    let via_duck_with = Err::<(), duckdb::Error>(a_duck_error())
+        .duck_with(|| String::from("attach catalog"))
+        .unwrap_err();
+
+    assert_eq!(via_duck.to_string(), via_duck_with.to_string());
+    assert!(matches!(&via_duck, LoaderError::Duck { op, .. } if op.as_str() == "attach catalog"));
+}
+
 /// Adding context is expressible with the receiver as the *only* type variable: `R::Ok` names the
 /// payload. Turning `Ok` back into a trait parameter would force a second, free `T` here.
 fn add_context<R: DuckResultExt>(result: R, op: &str) -> Result<R::Ok, LoaderError> {
