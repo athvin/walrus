@@ -30,6 +30,19 @@ fn in_jail(body: impl FnOnce(&mut figment::Jail)) {
     });
 }
 
+/// Assert a ratio within a documented tolerance. `f64::EPSILON` is the ULP of 1.0, not a
+/// general-purpose margin, so it reads as a tolerance while behaving as bit equality. Config
+/// ratios are order-1 decimals, so a fixed absolute epsilon is adequate here (large-magnitude
+/// data would need relative error). Mirrors the helpers in `tests/reload_{ddl,metrics}.rs`.
+#[track_caller]
+fn assert_approx_eq(got: f64, want: f64) {
+    const EPSILON: f64 = 1e-9;
+    assert!(
+        (got - want).abs() < EPSILON,
+        "{got} != {want} (absolute tolerance {EPSILON})"
+    );
+}
+
 #[test]
 fn humantime_durations_parse_for_every_field() {
     in_jail(|jail| {
@@ -89,8 +102,8 @@ fn defaults_are_the_shipped_contract() {
     assert_eq!(cfg.max_rows.get(), 100_000);
     assert_eq!(cfg.max_bytes.get(), 128 * 1024 * 1024);
     assert_eq!(cfg.max_inflight_bytes.get(), 512 * 1024 * 1024);
-    assert!((cfg.backpressure_activate_ratio.as_f64() - 0.85).abs() < f64::EPSILON);
-    assert!((cfg.backpressure_resume_ratio.as_f64() - 0.75).abs() < f64::EPSILON);
+    assert_approx_eq(cfg.backpressure_activate_ratio.as_f64(), 0.85);
+    assert_approx_eq(cfg.backpressure_resume_ratio.as_f64(), 0.75);
     assert_eq!(cfg.startup_deadline, Duration::from_secs(60));
     assert_eq!(cfg.health_addr, SocketAddr::from(([0, 0, 0, 0], 8080)));
     assert_eq!(cfg.max_concurrent_reloads.get(), 2);
@@ -300,6 +313,6 @@ fn numeric_wire_names_and_shapes_are_unchanged() {
 
         let cfg = SinkConfig::load().expect("bare numeric environment values should parse");
         assert_eq!(cfg.max_rows.get(), 250_000);
-        assert!((cfg.backpressure_activate_ratio.as_f64() - 0.9).abs() < f64::EPSILON);
+        assert_approx_eq(cfg.backpressure_activate_ratio.as_f64(), 0.9);
     });
 }

@@ -411,7 +411,10 @@ async fn active_gauge_rises_and_returns_to_zero() {
     .await;
     assert!(rose.is_ok(), "reload_active never reached 1");
 
-    // Cancel: the parked exporter ends (Cancelled) and decrements the gauge back to 0.
+    // Cancel: the parked exporter ends (Cancelled) and decrements the gauge back to 0. The gauge
+    // is a balanced sum of ±1.0 steps seeded at 0.0, so every value it can hold is exact and the
+    // `== 0.0` below is a deliberate bit-exact drain check — a tolerance would swallow an
+    // unbalanced decrement, which is exactly the bug this waits to rule out.
     token.cancel();
     handle.await.unwrap();
     let fell = tokio::time::timeout(Duration::from_secs(10), async {
