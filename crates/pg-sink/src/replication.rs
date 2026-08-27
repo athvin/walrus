@@ -228,28 +228,27 @@ impl ReplicationStream {
             let budget = self
                 .feedback_deadline
                 .saturating_duration_since(Instant::now());
-            match tokio::time::timeout(budget, self.read_message()).await {
+            let Ok(frame) = tokio::time::timeout(budget, self.read_message()).await else {
                 // Feedback due — send it (received LSN as write) and keep waiting.
-                Err(_elapsed) => {
-                    self.send_received_feedback(false).await?;
-                }
-                Ok(Err(e)) => return Err(e),
-                Ok(Ok((tag, body))) => match tag {
-                    b'd' => {
-                        if let Some(msg) = self.handle_copy_data(body).await? {
-                            return Ok(Some(msg));
-                        }
+                self.send_received_feedback(false).await?;
+                continue;
+            };
+            let (tag, body) = frame?;
+            match tag {
+                b'd' => {
+                    if let Some(msg) = self.handle_copy_data(body).await? {
+                        return Ok(Some(msg));
                     }
-                    // CopyDone / ReadyForQuery — the stream ended.
-                    b'c' | b'Z' => return Ok(None),
-                    // CommandComplete / NoticeResponse / ParameterStatus — keep going.
-                    b'C' | b'N' | b'S' => {}
-                    b'E' => bail!("replication stream error: {}", error_message(&body)),
-                    other => bail!(
-                        "unexpected message '{}' on the CopyBoth stream",
-                        other as char
-                    ),
-                },
+                }
+                // CopyDone / ReadyForQuery — the stream ended.
+                b'c' | b'Z' => return Ok(None),
+                // CommandComplete / NoticeResponse / ParameterStatus — keep going.
+                b'C' | b'N' | b'S' => {}
+                b'E' => bail!("replication stream error: {}", error_message(&body)),
+                other => bail!(
+                    "unexpected message '{}' on the CopyBoth stream",
+                    other as char
+                ),
             }
         }
     }

@@ -45,13 +45,12 @@ pub async fn acquire(
     self_pod: &str,
     ttl: Duration,
 ) -> Result<control::Lease, LoaderError> {
-    match control::acquire_lease(pool, epoch, schema, table, self_pod, ttl_secs(ttl)).await? {
-        Some(lease) => Ok(lease),
-        None => Err(LoaderError::LeaseContended {
+    control::acquire_lease(pool, epoch, schema, table, self_pod, ttl_secs(ttl))
+        .await?
+        .ok_or_else(|| LoaderError::LeaseContended {
             table: format!("{schema}.{table}"),
             owner: "another live pod".to_string(),
-        }),
-    }
+        })
 }
 
 /// Renew every owned table's lease every `ttl/3`, off the apply-loop thread, until cancelled.
