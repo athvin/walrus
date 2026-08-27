@@ -244,6 +244,18 @@ impl ChunkExporter {
     /// silent mis-reconciliation, not visible waste. Revisit only if restart churn on DDL-heavy
     /// tables becomes a *measured* problem (`single-table-reload.md` H9).
     ///
+    /// ## Cancel safety
+    ///
+    /// **Not cancel-safe within a chunk; safe to drop between them.** The controller deliberately
+    /// races this future in [`lease_guarded_export`](crate::reload::lease_guarded_export), so a drop
+    /// mid-[`Self::export_next_chunk`] is a normal shutdown/lost-lease outcome rather than a bug: the
+    /// chunk's manifest row and its cursor advance share ONE control-pg transaction, so an
+    /// uncommitted chunk simply never happened and the row stays `exporting` at its previous cursor
+    /// for PR 6.9's adoption to resume. A drop between that chunk's S3 PUT and the commit orphans the
+    /// object exactly as [`crate::consume::flush_batch_kind`] does, and the re-export regenerates it.
+    /// What a drop can never recover is partial progress *inside* one chunk — those rows live in this
+    /// future's batcher — which is why the cursor only ever moves at a committed chunk boundary.
+    ///
     /// # Errors
     ///
     /// Returns [`anyhow::Error`] if schema checks, chunk export, echo handling, control transitions,

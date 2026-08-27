@@ -153,6 +153,13 @@ pub(crate) async fn drain_exporters(set: &mut JoinSet<()>, budget: Duration) {
 /// Drive `export` while renewing its lease every `renew_every`; the first failed renewal cancels
 /// the export. Pure orchestration — the lease action and the export are injected, so the
 /// cancel-on-lost-lease contract is unit-tested without a database.
+///
+/// `export` is pinned once and polled by `&mut`, so a renewal tick can never restart it from
+/// scratch; `renew()` likewise runs inside its selected branch body, where no sibling can tear it.
+/// The cancel and lost-lease arms, though, *do* drop `export` mid-flight — so whatever is passed
+/// here must be a future whose interrupted work is either already durable or safely replayable. The
+/// production one is [`ChunkExporter::run`](crate::reload_export::ChunkExporter::run), which commits
+/// each chunk atomically for exactly that reason.
 pub async fn lease_guarded_export<R, E>(
     token: CancellationToken,
     renew_every: Duration,

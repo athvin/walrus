@@ -202,6 +202,17 @@ impl<C: Clock + Clone> Backfill<C> {
     /// sharing `lsn_end = consistent_point`. Returns the row count copied. Output is chunked by the same
     /// `max_rows`/`max_bytes` caps as streamed batches (so a large table becomes many files).
     ///
+    /// ## Cancel safety
+    ///
+    /// **Not cancel-safe — never race this future in a `select!` branch.** The rows read so far
+    /// accumulate in a [`TableBatcher`] *inside* this future, and the exported snapshot is held by a
+    /// `REPEATABLE READ` transaction on `self.client`; dropping it discards every not-yet-flushed row
+    /// and abandons that transaction without its `COMMIT`. Already-flushed chunks stay durable, so
+    /// the loss is silent — the manifest then describes a backfill that is complete except for the
+    /// tail nothing will ever re-read, because streaming resumes from `consistent_point` rather than
+    /// re-copying. Bootstrap therefore awaits this directly, unraced: a fresh-slot backfill is
+    /// bounded by the process, never by cancellation.
+    ///
     /// # Errors
     ///
     /// Returns [`anyhow::Error`] if attaching the exported snapshot, mapping/reading rows, Arrow
