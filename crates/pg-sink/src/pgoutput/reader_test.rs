@@ -46,6 +46,24 @@ fn fixed_width_borrows_and_advances() {
 }
 
 #[test]
+fn byte1_at_the_end_is_a_one_byte_unexpected_eof() {
+    let mut reader = Reader::new(b"a");
+    assert_eq!(reader.byte1().unwrap(), b'a');
+
+    // `byte1` reads its width through `fixed::<1>`, so the payload is the same shape the wider
+    // readers report — `needed` is the const width, not a runtime length.
+    assert!(matches!(
+        reader.byte1(),
+        Err(DecodeError::UnexpectedEof {
+            needed: 1,
+            offset: 1,
+            remaining: 0,
+        })
+    ));
+    assert_eq!(reader.remaining(), 0);
+}
+
+#[test]
 fn fixed_width_short_read_preserves_cursor_and_payload() {
     let mut reader = Reader::new(&[0xaa, 0xbb]);
 

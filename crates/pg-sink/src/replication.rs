@@ -602,10 +602,11 @@ fn build_standby_status(s: StandbyStatus) -> [u8; STANDBY_STATUS_FRAME_BYTES] {
 /// NULL) and that many bytes (UTF-8 text values, since walrus never enables binary output).
 fn parse_data_row(body: &[u8]) -> anyhow::Result<Vec<Option<String>>> {
     let mut out = Vec::new();
-    if body.len() < 2 {
+    // The column count is a fixed `Int16` header; a body too short to hold it carries no columns.
+    let Some(&head) = body.first_chunk::<2>() else {
         return Ok(out);
-    }
-    let ncols = usize::from(u16::from_be_bytes([body[0], body[1]]));
+    };
+    let ncols = usize::from(u16::from_be_bytes(head));
     let mut i = 2;
     for _ in 0..ncols {
         if i + 4 > body.len() {
@@ -633,11 +634,11 @@ fn parse_data_row(body: &[u8]) -> anyhow::Result<Vec<Option<String>>> {
 /// Take one framed backend message (`tag` + 4-byte self-inclusive length + body) from `buf`, or
 /// `None` if a full message is not yet buffered.
 fn take_message(buf: &mut BytesMut) -> Option<(u8, Bytes)> {
-    if buf.len() < 5 {
-        return None;
-    }
-    let tag = buf[0];
-    let len = usize::try_from(u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]])).ok()?;
+    // The header is a compile-time width, so one `first_chunk` proves the tag and the length field
+    // together — `None` is a buffer too short to hold them. Only the body that follows is
+    // variable-width, which is what the runtime check below is for.
+    let [tag, len_be @ ..] = *buf.first_chunk::<5>()?;
+    let len = usize::try_from(u32::from_be_bytes(len_be)).ok()?;
     let total = len.checked_add(1)?; // tag + (length field + body)
     if buf.len() < total {
         return None;

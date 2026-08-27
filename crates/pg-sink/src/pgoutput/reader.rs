@@ -73,17 +73,15 @@ impl<'a> Reader<'a> {
         Ok(chunk)
     }
 
-    /// One byte (a `Byte1` type tag or an `Int8`).
+    /// One byte (a `Byte1` type tag or an `Int8`) — the `N = 1` case of the same width proof the
+    /// wider readers use, inferred from `from_be_bytes` rather than spelled out.
     ///
     /// # Errors
     ///
     /// Returns [`DecodeError::UnexpectedEof`] when no byte remains.
     #[inline]
     pub fn byte1(&mut self) -> Result<u8, DecodeError> {
-        // `need(1)` returns exactly one byte, so the total fallback cannot be reached.
-        let b = self.need(1)?.first().copied().unwrap_or_default();
-        self.pos += 1;
-        Ok(b)
+        Ok(u8::from_be_bytes(*self.fixed()?))
     }
 
     /// Big-endian `Int16`.
