@@ -7,6 +7,10 @@ use common::{ExitCode, FailureClass};
 /// Tries the classified [`common::Error`] first, then each typed pg-sink error that can escape the
 /// run loop, and finally the control crate's error. Anything unrecognised keeps the historical
 /// [`ExitCode::Internal`] fallback.
+///
+/// Each typed error is matched **exhaustively** — no `_` arm — because the numbers are a runbook
+/// contract (`common::error`): a new variant must pick its code here instead of inheriting one.
+#[deny(clippy::wildcard_enum_match_arm)]
 #[must_use]
 pub fn code_for(err: &anyhow::Error) -> ExitCode {
     if let Some(e) = err.downcast_ref::<common::Error>() {
@@ -30,7 +34,16 @@ pub fn code_for(err: &anyhow::Error) -> ExitCode {
     if let Some(e) = err.downcast_ref::<crate::preflight::PreflightError>() {
         return match e {
             crate::preflight::PreflightError::NoPrimaryKey { .. } => ExitCode::KeylessTable,
-            _ => ExitCode::Preflight,
+            // The rest of the taxonomy shares exit 13, listed rather than absorbed by a wildcard.
+            crate::preflight::PreflightError::WalLevel { .. }
+            | crate::preflight::PreflightError::ServerTooOld { .. }
+            | crate::preflight::PreflightError::NoHeadroom { .. }
+            | crate::preflight::PreflightError::PublicationMissing { .. }
+            | crate::preflight::PreflightError::PublicationGap { .. }
+            | crate::preflight::PreflightError::NoReplicationPriv
+            | crate::preflight::PreflightError::DdlCaptureMissing { .. }
+            | crate::preflight::PreflightError::ReloadSignalMissing { .. }
+            | crate::preflight::PreflightError::Query(_) => ExitCode::Preflight,
         };
     }
     if err

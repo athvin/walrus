@@ -55,6 +55,16 @@ fn keyless_preflight_failure_exits_14() {
     assert_eq!(code_for(&err), common::ExitCode::KeylessTable);
 }
 
+/// The other side of the exhaustive `PreflightError` match: everything that is not a keyless table
+/// shares exit 13, and each such variant is now listed rather than absorbed by a wildcard.
+#[test]
+fn a_non_keyless_preflight_failure_exits_13() {
+    let err = anyhow::Error::new(crate::preflight::PreflightError::WalLevel {
+        found: "replica".to_string(),
+    });
+    assert_eq!(code_for(&err), common::ExitCode::Preflight);
+}
+
 #[test]
 fn heartbeat_failure_exits_16() {
     let err = anyhow::Error::new(crate::heartbeat::HeartbeatError::Connect(postgres_error()));

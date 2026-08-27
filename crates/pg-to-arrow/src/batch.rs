@@ -908,15 +908,16 @@ where
     }
 }
 
-/// Extract the text of a value (for the text-format Tier-1 types).
+/// Extract the text of a value (for the text-format Tier-1 types). The non-text images are listed
+/// rather than absorbed by a wildcard, so a new `TupleValue` variant is a compile error here — the
+/// same rule its callers above already follow.
+#[deny(clippy::wildcard_enum_match_arm)]
 fn text<'a>(value: &'a TupleValue, col: &str, dt: &DataType) -> Result<&'a str, Error> {
     match value {
         TupleValue::Text(s) => Ok(s),
-        other => Err(Error::value_parse(
-            col,
-            format!("{other:?}"),
-            dt.to_string(),
-        )),
+        TupleValue::Null | TupleValue::UnchangedToast | TupleValue::Binary(_) => {
+            Err(Error::value_parse(col, format!("{value:?}"), dt.to_string()))
+        }
     }
 }
 

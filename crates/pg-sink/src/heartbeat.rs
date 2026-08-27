@@ -111,11 +111,15 @@ impl InternalTables {
     }
 
     /// Extract the returned `beat_seq` from a decoded `walrus.heartbeat` new-tuple (text format).
+    ///
+    /// The non-text images are listed rather than absorbed by a wildcard: a new `TupleValue` variant
+    /// must decide here whether it can carry a beat seq, instead of silently reading as "no beat".
+    #[deny(clippy::wildcard_enum_match_arm)]
     pub fn beat_seq_of(&self, new: &[TupleValue]) -> Option<i64> {
         let idx = self.heartbeat_beat_seq_col?;
         match new.get(idx)? {
             TupleValue::Text(s) => s.parse::<i64>().ok(),
-            _ => None,
+            TupleValue::Null | TupleValue::UnchangedToast | TupleValue::Binary(_) => None,
         }
     }
 }

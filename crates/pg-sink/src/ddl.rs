@@ -41,12 +41,15 @@ impl DdlEvent {
     ///
     /// Returns [`DdlError::MissingColumn`] when the required LSN is absent or invalid, and
     /// [`DdlError::Json`] when the optional structured column snapshot is malformed.
+    #[deny(clippy::wildcard_enum_match_arm)]
     pub fn from_tuple(rel: &PgRelation, values: &[TupleValue]) -> Result<Self, DdlError> {
         let text = |name: &str| -> Option<String> {
             let idx = rel.columns.iter().position(|c| c.name == name)?;
+            // Every `ddl_audit` column arrives as text; the other images are listed rather than
+            // absorbed by a wildcard, so a new TupleValue variant is decided here, not defaulted.
             match values.get(idx)? {
                 TupleValue::Text(s) => Some(s.clone()),
-                _ => None,
+                TupleValue::Null | TupleValue::UnchangedToast | TupleValue::Binary(_) => None,
             }
         };
         let c_lsn = text("c_lsn")

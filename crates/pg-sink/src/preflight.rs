@@ -89,13 +89,25 @@ pub enum PreflightError {
 }
 
 impl From<PreflightError> for common::Error {
+    /// The terminal class of a mismatch is data, never a guess — so this match is exhaustive (no
+    /// `_` arm): a new variant must choose its class here, and its exit code in
+    /// [`crate::exit::code_for`], instead of silently inheriting the generic ones.
+    #[deny(clippy::wildcard_enum_match_arm)]
     fn from(e: PreflightError) -> Self {
-        match e {
+        match &e {
             // A keyless table has its own dedicated terminal class + exit code.
             PreflightError::NoPrimaryKey { schema, table } => common::Error::KeylessTable {
                 table: format!("{schema}.{table}"),
             },
-            other => common::Error::Preflight(other.to_string()),
+            PreflightError::WalLevel { .. }
+            | PreflightError::ServerTooOld { .. }
+            | PreflightError::NoHeadroom { .. }
+            | PreflightError::PublicationMissing { .. }
+            | PreflightError::PublicationGap { .. }
+            | PreflightError::NoReplicationPriv
+            | PreflightError::DdlCaptureMissing { .. }
+            | PreflightError::ReloadSignalMissing { .. }
+            | PreflightError::Query(_) => common::Error::Preflight(e.to_string()),
         }
     }
 }
