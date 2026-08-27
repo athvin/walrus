@@ -278,7 +278,7 @@ async fn in_flight_full_rebuild_is_aborted_on_sigterm() {
             [],
         )
         .unwrap();
-    apply_transform(db.conn(), &t, &Lsn::ZERO).unwrap();
+    apply_transform(db.conn(), &t, Lsn::ZERO).unwrap();
 
     // Bloat raw with a LOT of wide rows across many keys (one fast bulk insert) so the rebuild's
     // CREATE OR REPLACE runs for well over a second — long enough to be reliably interrupted mid-flight

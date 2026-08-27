@@ -44,7 +44,7 @@ pub fn full_rebuild(
     }
     // Rebuild over ALL retained raw (from LSN 0) plus the mirror baseline; the truncate boundary comes
     // from the retained tail exactly as the incremental path resolves it.
-    let boundary = t.latest_truncate(db.conn(), &Lsn::ZERO)?;
+    let boundary = t.latest_truncate(db.conn(), Lsn::ZERO)?;
     let rebuild_op = format!("full rebuild {}", t.table());
     let rewrite = db.in_txn("rebuild", |conn| {
         conn.execute_batch(&t.render_rebuild(&boundary))
@@ -106,7 +106,7 @@ pub async fn full_rebuild_abortable(
 pub fn prune_raw(
     conn: &duckdb::Connection,
     t: &TransformSql,
-    floor: &Lsn,
+    floor: Lsn,
 ) -> Result<u64, LoaderError> {
     let n = conn
         .execute(

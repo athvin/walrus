@@ -117,7 +117,7 @@ async fn compact(ctx: &TableCtx, shutdown: &CancellationToken) -> Result<(), Loa
     // Prune only below `transformed_lsn - retention_lsn_lag` (always behind transformed_lsn) — the rebuild
     // just captured every current value into the mirror baseline, so pruned raw can lose nothing.
     let floor = crate::compaction::retention_floor(transformed, ctx.retention_lsn_lag);
-    let pruned = crate::compaction::prune_raw(ctx.db.conn(), &t, &floor)?;
+    let pruned = crate::compaction::prune_raw(ctx.db.conn(), &t, floor)?;
     tracing::info!(
         table = %format_args!("{}.{}", ctx.schema, ctx.table),
         floor = %floor,

@@ -82,7 +82,7 @@ fn transform(c: &Connection) {
     apply_transform(
         c,
         &TransformSql::from_relation(&orders_rel()),
-        &common::Lsn::ZERO,
+        common::Lsn::ZERO,
     )
     .unwrap();
 }
@@ -276,7 +276,7 @@ fn composite_pk_partition_and_join_expand_to_all_key_columns() {
         )
         .unwrap();
     }
-    apply_transform(&c, &TransformSql::from_relation(&rel), &common::Lsn::ZERO).unwrap();
+    apply_transform(&c, &TransformSql::from_relation(&rel), common::Lsn::ZERO).unwrap();
 
     let n: i64 = c
         .query_row("SELECT count(*) FROM kv", [], |r| r.get(0))
@@ -390,7 +390,7 @@ fn transformed_lsn_advances_past_a_truncate_only_tail() {
         "the max scan sees the truncate → watermark advances"
     );
     let b = TransformSql::from_relation(&orders_rel())
-        .latest_truncate(&c, &common::Lsn::ZERO)
+        .latest_truncate(&c, common::Lsn::ZERO)
         .unwrap();
     assert_eq!(
         b.ct,
@@ -480,7 +480,7 @@ fn docs_transform(c: &Connection) {
     apply_transform(
         c,
         &TransformSql::from_relation(&docs_rel()),
-        &common::Lsn::ZERO,
+        common::Lsn::ZERO,
     )
     .unwrap();
 }
@@ -621,7 +621,7 @@ fn equal_commit_lsn_snapshot_row_is_still_applied() {
         "a strict `>` bound would exclude the snapshot row"
     );
 
-    apply_transform(&c, &TransformSql::from_relation(&orders_rel()), &after).unwrap();
+    apply_transform(&c, &TransformSql::from_relation(&orders_rel()), after).unwrap();
     assert_eq!(
         status_of(&c, 1).as_deref(),
         Some("snap"),
@@ -737,7 +737,7 @@ fn no_stream_key_snapshot_row_at_boundary_is_applied() {
     let c = db();
     let after: common::Lsn = "0/64".parse().unwrap(); // consistent_point == transformed_lsn == 100
     seed(&c, &[(2, 'i', 100, 3, "only-snap")]);
-    apply_transform(&c, &TransformSql::from_relation(&orders_rel()), &after).unwrap();
+    apply_transform(&c, &TransformSql::from_relation(&orders_rel()), after).unwrap();
     assert_eq!(
         status_of(&c, 2).as_deref(),
         Some("only-snap"),

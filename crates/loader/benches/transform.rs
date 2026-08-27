@@ -168,7 +168,7 @@ fn bench_transform_scaling(c: &mut Criterion) {
                             seed_scaling(&db, n, k);
                             db
                         },
-                        |db| apply_transform(&db, &t, &Lsn::ZERO).unwrap(),
+                        |db| apply_transform(&db, &t, Lsn::ZERO).unwrap(),
                         BatchSize::PerIteration,
                     );
                 },
@@ -193,7 +193,7 @@ fn bench_toast_backscan(c: &mut Criterion) {
                     seed_toast(&db, n, pct);
                     db
                 },
-                |db| apply_transform(&db, &t, &Lsn::ZERO).unwrap(),
+                |db| apply_transform(&db, &t, Lsn::ZERO).unwrap(),
                 BatchSize::PerIteration,
             );
         });
@@ -219,7 +219,7 @@ fn bench_mirror_size(c: &mut Criterion) {
                     seed_scaling(&db, tail, 1);
                     db
                 },
-                |db| apply_transform(&db, &t, &Lsn::ZERO).unwrap(),
+                |db| apply_transform(&db, &t, Lsn::ZERO).unwrap(),
                 BatchSize::PerIteration,
             );
         });

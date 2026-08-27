@@ -222,7 +222,7 @@ async fn establish_stream(
     // hiccup (`Unreachable`) is NOT slot loss: exit so the orchestrator's backoff-restart reconnects,
     // never a total-restart (§1.8, the false-positive guard).
     let status = pg_sink::epoch::classify_slot(&ctx.source_client, &cfg.slot_name).await;
-    match pg_sink::epoch::decide(&status) {
+    match pg_sink::epoch::decide(status) {
         pg_sink::epoch::SlotAction::Retry => {
             anyhow::bail!(
                 "could not classify replication slot {} (source connection lost mid-bootstrap) — \

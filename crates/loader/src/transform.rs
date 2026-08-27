@@ -163,7 +163,7 @@ impl TransformSql {
     pub fn latest_truncate(
         &self,
         conn: &duckdb::Connection,
-        after_lsn: &Lsn,
+        after_lsn: Lsn,
     ) -> Result<TruncateBoundary, LoaderError> {
         let raw = self.table.raw();
         let sql = format!(
@@ -197,7 +197,7 @@ impl TransformSql {
     /// equal-`commit_lsn` snapshot straddle, §7 break face A; and — if the tail has a truncate — only
     /// rows STRICTLY after the `(Ct, Lt)` tuple). Composite-PK-aware.
     #[must_use]
-    pub fn render(&self, after_lsn: &Lsn, boundary: &TruncateBoundary) -> String {
+    pub fn render(&self, after_lsn: Lsn, boundary: &TruncateBoundary) -> String {
         let q = |c: &str| format!("\"{c}\"");
         let table = self.table.as_str();
         let pk = self.to_pk_names();
@@ -390,7 +390,7 @@ impl TransformSql {
 pub fn apply_transform(
     conn: &duckdb::Connection,
     t: &TransformSql,
-    after_lsn: &Lsn,
+    after_lsn: Lsn,
 ) -> Result<(), LoaderError> {
     let boundary = t.latest_truncate(conn, after_lsn)?;
     conn.execute_batch(&t.render(after_lsn, &boundary))

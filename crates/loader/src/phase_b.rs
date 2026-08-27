@@ -96,7 +96,7 @@ pub async fn run_phase_b(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     // bootstrap shape (and, PR 4.2, with the Tier-2 emit/recombine from the descriptors).
     let t = current_transform(ctx).await?;
     ctx.db
-        .in_txn("transform", |conn| apply_transform(conn, &t, &after))?;
+        .in_txn("transform", |conn| apply_transform(conn, &t, after))?;
 
     // Advance the watermark AFTER the DuckDB commit. The CHECK (transformed_lsn <= raw_appended_lsn)
     // holds because Phase A ran first this cycle. `max_lsn` can equal the prior `transformed_lsn` (a

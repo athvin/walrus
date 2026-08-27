@@ -88,7 +88,7 @@ fn full_rebuild_matches_incremental_mirror() {
 
     let inc = mem(&rel);
     seed_history(inc.conn());
-    apply_transform(inc.conn(), &t, &Lsn::ZERO).unwrap();
+    apply_transform(inc.conn(), &t, Lsn::ZERO).unwrap();
 
     let reb = mem(&rel);
     seed_history(reb.conn());
@@ -115,11 +115,11 @@ fn pruned_value_survives_via_mirror_baseline() {
 
     // Apply a change incrementally so the mirror holds it (with its `_applied_*` tuple).
     seed_raw(db.conn(), 1, "kept", 'i', 100, 1);
-    apply_transform(db.conn(), &t, &Lsn::ZERO).unwrap();
+    apply_transform(db.conn(), &t, Lsn::ZERO).unwrap();
     assert_eq!(status_of(db.conn(), 1).as_deref(), Some("kept"));
 
     // Prune ALL of raw (floor above the row) — its only raw evidence is gone.
-    let pruned = prune_raw(db.conn(), &t, &"0/C8".parse().unwrap()).unwrap();
+    let pruned = prune_raw(db.conn(), &t, "0/C8".parse().unwrap()).unwrap();
     assert_eq!(pruned, 1);
     assert_eq!(raw_count(db.conn()), 0, "raw evidence pruned");
 
@@ -210,7 +210,7 @@ fn rebuild_reclaims_space_and_prune_keeps_mirror_correct() {
     // so it also matches the raw row at the same tuple — the rebuild result is unambiguous.
     let wide = "z".repeat(2000);
     seed_raw(db.conn(), 1, &wide, 'i', 100, 1);
-    apply_transform(db.conn(), &t, &Lsn::ZERO).unwrap();
+    apply_transform(db.conn(), &t, Lsn::ZERO).unwrap();
     for _ in 0..4000 {
         db.conn()
             .execute("UPDATE orders SET status = ? WHERE id = 1", [&wide])
@@ -242,7 +242,7 @@ fn rebuild_reclaims_space_and_prune_keeps_mirror_correct() {
 
     // Prune the raw evidence, rebuild again — the mirror stays correct via the baseline.
     let floor = retention_floor("0/C8".parse().unwrap(), 0);
-    prune_raw(db.conn(), &t, &floor).unwrap();
+    prune_raw(db.conn(), &t, floor).unwrap();
     assert_eq!(raw_count(db.conn()), 0, "raw pruned below the floor");
     full_rebuild(&db, &t, &CancellationToken::new()).unwrap();
     assert_eq!(
