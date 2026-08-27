@@ -228,6 +228,27 @@ fn zero_lease_ttl_is_still_rejected() {
     ));
 }
 
+/// `TryFrom` is the standard hook onto the same floor `LeaseTtl::new` enforces; the two must not be
+/// able to disagree about which TTL the renewer may be handed.
+#[test]
+fn lease_ttl_try_from_is_the_constructor_under_the_standard_hook() {
+    let admitted: LeaseTtl = Duration::from_secs(30)
+        .try_into()
+        .expect("30s clears the floor");
+    assert_eq!(admitted.get(), Duration::from_secs(30));
+    assert_eq!(
+        LeaseTtl::try_from(MIN_LEASE_TTL)
+            .expect("MIN_LEASE_TTL is an inclusive floor")
+            .get(),
+        MIN_LEASE_TTL
+    );
+    assert!(matches!(
+        LeaseTtl::try_from(Duration::from_secs(1)),
+        Err(ConfigError::LeaseTtlTooShort { ttl, minimum })
+            if ttl == Duration::from_secs(1) && minimum == MIN_LEASE_TTL
+    ));
+}
+
 #[test]
 fn zero_max_files_per_cycle_is_rejected_during_deserialization() {
     use figment::providers::{Format, Toml};

@@ -134,6 +134,25 @@ impl SqlIdent {
     }
 }
 
+impl TryFrom<&str> for SqlIdent {
+    type Error = IdentError;
+
+    /// The standard spelling of [`SqlIdent::new`], so a call site can write `name.try_into()?` and a
+    /// generic bound can name this conversion.
+    ///
+    /// `TryFrom<&str>` rather than [`FromStr`](std::str::FromStr): an identifier *is* the text it
+    /// admits, not a rendering of some other value — and [`Display`](fmt::Display) emits the
+    /// **quoted** form, so a `FromStr` here would not round-trip its own output.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentError::Empty`] for an empty name or [`IdentError::InteriorNul`] when the name
+    /// contains a NUL byte.
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        SqlIdent::new(s)
+    }
+}
+
 impl fmt::Display for SqlIdent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_char('"')?;

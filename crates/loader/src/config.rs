@@ -48,6 +48,21 @@ impl LeaseTtl {
     }
 }
 
+impl TryFrom<Duration> for LeaseTtl {
+    type Error = ConfigError;
+
+    /// The standard spelling of [`LeaseTtl::new`], so the raw [`Duration`] the config carries reaches
+    /// the renewable type through `.try_into()?` and a generic bound can name this conversion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::LeaseTtlTooShort`] — carrying both the rejected value and the floor it
+    /// missed — when renewal at TTL/3 could not land inside `ttl`.
+    fn try_from(ttl: Duration) -> Result<Self, Self::Error> {
+        LeaseTtl::new(ttl)
+    }
+}
+
 const fn nonzero_i64(value: i64) -> NonZeroI64 {
     match NonZeroI64::new(value) {
         Some(value) => value,

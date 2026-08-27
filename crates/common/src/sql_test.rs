@@ -74,6 +74,19 @@ fn ident_rejects_the_unrepresentable() {
     ));
 }
 
+/// `TryFrom` is the standard hook, so it must admit and reject exactly what the constructor does —
+/// otherwise `.try_into()` would be a second, subtly different gate onto the same wire.
+#[test]
+fn try_from_is_the_constructor_under_the_standard_hook() {
+    let ident: SqlIdent = "plain".try_into().unwrap();
+    assert_eq!(ident, SqlIdent::new("plain").unwrap());
+    // The quoting behaviour travels with the value, whichever spelling built it.
+    assert_eq!(ident.to_string(), "\"plain\"");
+    for input in ["", "a\0b", "a\"b", "O'Brien", "ünïcode"] {
+        assert_eq!(SqlIdent::try_from(input), SqlIdent::new(input), "{input:?}");
+    }
+}
+
 #[test]
 fn as_raw_returns_the_unquoted_name() {
     assert_eq!(SqlIdent::new("a\"b").unwrap().as_raw(), "a\"b");
