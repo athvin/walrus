@@ -29,7 +29,7 @@ pub struct CachedRelation {
 /// `ddl_audit` is consumed for DDL events: never batched, never a Parquet file, never a manifest row.
 #[must_use]
 pub fn is_internal_table(schema: &str, table: &str) -> bool {
-    schema == "walrus" && (table == "ddl_audit" || table == "heartbeat" || table == "reload_signal")
+    schema == "walrus" && matches!(table, "ddl_audit" | "heartbeat" | "reload_signal")
 }
 
 #[derive(Debug, Default)]
