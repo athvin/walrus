@@ -93,7 +93,8 @@ impl From<Lsn> for u64 {
 /// **Defined for the ordered case only** (`self >= rhs`) — which is what the `(commit_lsn, lsn)`
 /// contract and the control DB's `CHECK (transformed_lsn <= raw_appended_lsn)` guarantee. A
 /// violation is a bug: it trips a `debug_assert!` in tests and saturates to 0 in release rather than
-/// wrapping. Callers whose inputs are genuinely unordered must branch first (see the loader's
+/// wrapping. Callers whose inputs are genuinely unordered must bound an operand into that domain
+/// first — `head.max(floor) - floor`, not a branch on the same comparison (see the loader's
 /// `phase_a::raw_append_lag_bytes`).
 impl std::ops::Sub<Lsn> for Lsn {
     type Output = u64;
