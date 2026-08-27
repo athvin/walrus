@@ -160,15 +160,20 @@ async fn pipeline(
     // aborts the survivors instead of detaching them.
     let mut workers = tokio::task::JoinSet::new();
     for o in owned {
+        // `apply_loop` consumes the ctx, so the failure report needs names of its own: these two
+        // locals are the `async move` block's captures. Only ONE side clones — `series` is built
+        // while both names are still borrowable, then the ctx takes `o`'s originals, because this
+        // `OwnedTable` dies with the iteration and has nothing left to keep them for.
         let schema = o.schema.clone();
         let table = o.table.clone();
+        let series = format!("{}.{}", o.schema, o.table);
         let ctx = loader::phase_a::TableCtx {
             pool: pool.clone(),
             epoch,
             epoch_rx: epoch_rx.clone(),
-            schema: o.schema.clone(),
-            table: o.table.clone(),
-            series: format!("{}.{}", o.schema, o.table),
+            schema: o.schema,
+            table: o.table,
+            series,
             rel: o.relation,
             db: o.db,
             state: Arc::clone(state),
