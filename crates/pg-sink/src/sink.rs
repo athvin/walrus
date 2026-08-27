@@ -115,18 +115,11 @@ impl ParquetSink {
         let buf_writer = BufWriter::new(Arc::clone(&self.store), key.clone());
         let props = pg_to_arrow::default_writer_properties();
         let mut writer =
-            AsyncArrowWriter::try_new(buf_writer, batch.record_batch.schema(), Some(props))
-                .map_err(|e| SinkError::Encode(e.to_string()))?;
-        writer
-            .write(&batch.record_batch)
-            .await
-            .map_err(|e| SinkError::Encode(e.to_string()))?;
+            AsyncArrowWriter::try_new(buf_writer, batch.record_batch.schema(), Some(props))?;
+        writer.write(&batch.record_batch).await?;
         // close() finalises the Parquet footer AND completes the multipart upload — the durability
         // point. Nothing downstream may observe this batch before this returns Ok.
-        writer
-            .close()
-            .await
-            .map_err(|e| SinkError::Encode(e.to_string()))?;
+        writer.close().await?;
         common::metrics::record_batch_flush(flush_start.elapsed().as_secs_f64(), rows);
 
         Ok(WrittenObject {
@@ -151,6 +144,16 @@ pub enum SinkError {
     Encode(String),
     #[error(transparent)]
     Store(#[from] object_store::Error),
+}
+
+/// Every Parquet failure on the writer path — builder, `write`, footer/multipart `close` — is the
+/// same class, so `?` does the wrapping instead of an identical closure at each call. `Encode`
+/// keeps the rendered message rather than the typed error because [`SinkError`] must stay usable
+/// from `common::Error`'s stringly variants.
+impl From<parquet::errors::ParquetError> for SinkError {
+    fn from(error: parquet::errors::ParquetError) -> Self {
+        SinkError::Encode(error.to_string())
+    }
 }
 
 impl From<SinkError> for common::Error {

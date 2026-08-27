@@ -60,6 +60,15 @@ pub enum PreflightOutcome {
     Infra(anyhow::Error),
 }
 
+/// An ad-hoc failure raised *inside* a preflight is always infrastructure. Owning that as a `From`
+/// impl rather than a per-site `map_err` means `?` cannot accidentally classify a dead connection
+/// as a rejection: a rejection is a typed [`PreflightRejection`], constructed explicitly.
+impl From<anyhow::Error> for PreflightOutcome {
+    fn from(error: anyhow::Error) -> Self {
+        PreflightOutcome::Infra(error)
+    }
+}
+
 /// H11's fail-fast request validation: why a request never becomes an export. The reason lands in
 /// `table_reload.error` verbatim, so the operator reads it off the row.
 /// This taxonomy is still growing; new variants must remain additive for downstream crates.
@@ -757,8 +766,7 @@ impl ReloadController {
             .map(|row| row.get::<_, bool>(0))
             .with_context(|| {
                 format!("publication check for {}.{}", req.source_schema, req.source_table)
-            })
-            .map_err(PreflightOutcome::Infra)?;
+            })?;
         if !published {
             return Err(PreflightOutcome::Rejected(
                 PreflightRejection::NotPublished(
@@ -779,8 +787,7 @@ impl ReloadController {
             .map(|row| row.get::<_, bool>(0))
             .with_context(|| {
                 format!("primary-key check for {}.{}", req.source_schema, req.source_table)
-            })
-            .map_err(PreflightOutcome::Infra)?;
+            })?;
         if !has_pk {
             return Err(PreflightOutcome::Rejected(
                 PreflightRejection::NoPrimaryKey(

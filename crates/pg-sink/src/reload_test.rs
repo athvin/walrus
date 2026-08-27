@@ -44,6 +44,18 @@ fn preflight_rejections_read_as_operator_reasons() {
     );
 }
 
+#[test]
+fn an_ad_hoc_preflight_failure_is_infra_never_a_rejection() {
+    // `preflight` propagates its catalog queries with `?`; the From impl is what keeps a dead
+    // connection out of `table_reload.error` as a false "not in the publication" reason.
+    let outcome = PreflightOutcome::from(anyhow::anyhow!("connection closed mid-query"));
+
+    match outcome {
+        PreflightOutcome::Infra(e) => assert_eq!(e.to_string(), "connection closed mid-query"),
+        PreflightOutcome::Rejected(r) => panic!("an infra failure must never reject: {r}"),
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn lost_lease_cancels_the_exporter() {
     let token = CancellationToken::new();

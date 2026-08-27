@@ -56,8 +56,7 @@ impl DdlEvent {
         let c_columns = text("c_columns")
             .filter(|s| !s.is_empty())
             .map(|s| serde_json::from_str(&s))
-            .transpose()
-            .map_err(DdlError::Json)?;
+            .transpose()?;
         Ok(DdlEvent {
             c_lsn,
             c_event: text("c_event").unwrap_or_default(),
@@ -147,8 +146,10 @@ impl DdlConsumer {
 pub enum DdlError {
     #[error("ddl_audit tuple missing/invalid column: {0}")]
     MissingColumn(&'static str),
+    /// `#[from]` (which implies `#[source]`): a malformed column snapshot has exactly one meaning
+    /// here, so `?` may carry the decode failure straight out of `from_tuple`.
     #[error("parse c_columns json: {0}")]
-    Json(#[source] serde_json::Error),
+    Json(#[from] serde_json::Error),
     #[error(transparent)]
     Control(#[from] control::ControlError),
 }

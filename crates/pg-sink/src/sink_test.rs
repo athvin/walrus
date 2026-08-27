@@ -22,3 +22,16 @@ fn object_key_is_epoch_namespaced_and_lsn_sortable() {
     let hi = s.object_key("public", "orders", "1/0".parse().unwrap(), "u");
     assert!(lo.as_ref() < hi.as_ref(), "keys sort by commit LSN");
 }
+
+#[test]
+fn a_parquet_failure_converts_into_the_encode_class() {
+    // The `?` on every writer call routes through this From impl, so the writer path must stay
+    // Encode (→ ExitCode::Internal) and must not lose the engine's own message.
+    let engine = parquet::errors::ParquetError::General("footer write failed".into());
+    let rendered = engine.to_string();
+
+    let error = SinkError::from(engine);
+
+    assert!(matches!(&error, SinkError::Encode(_)));
+    assert_eq!(error.to_string(), format!("parquet encode: {rendered}"));
+}
