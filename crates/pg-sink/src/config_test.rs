@@ -80,6 +80,41 @@ fn every_duration_field_carries_humantime() {
     assert_eq!(attrs, fields, "every Duration field needs humantime serde");
 }
 
+/// A misspelled `WALRUS_*` ConfigMap key must fail the load, not silently leave the shipped default
+/// in place — `#[serde(default)]` alone would make the typo invisible. `deny_unknown_fields` does
+/// **not** propagate into a nested container, so each struct a `SinkConfig` load traverses needs its
+/// own guard; one case per container proves all three are armed.
+#[test]
+fn a_misspelled_key_is_a_terminal_load_failure() {
+    for (key, value, offender) in [
+        ("WALRUS_NONSENSE", "boom", "nonsense"),
+        ("WALRUS_TELEMETRY__JSN", "true", "jsn"),
+        ("WALRUS_OBJECT_STORE__BUCKT", "b", "buckt"),
+    ] {
+        in_jail(|jail| {
+            for (k, v) in [
+                ("WALRUS_CONTROL_DB_URL", "postgres://x/y"),
+                ("WALRUS_SOURCE_DB_URL", "postgres://x/z"),
+                ("WALRUS_OBJECT_STORE__BUCKET", "b"),
+                ("WALRUS_INSTANCE", "walrus-pg-sink-0"),
+                ("WALRUS_SLOT_NAME", "walrus_slot"),
+                ("WALRUS_PUBLICATION_NAME", "walrus_pub"),
+            ] {
+                jail.set_env(k, v);
+            }
+            jail.set_env(key, value);
+
+            let err = SinkConfig::load().expect_err("a misspelled key must fail the load");
+            let ConfigError::Load(detail) = &err else {
+                panic!("{key}: expected a Load failure, got {err:?}");
+            };
+            // Naming the offending key is what makes the error actionable in a pod log.
+            assert!(detail.contains(offender), "{key}: {detail}");
+            assert!(common::Error::from(err).is_terminal(), "{key}");
+        });
+    }
+}
+
 /// `#[serde(default)]` makes these the shipped values for omitted fields; changing one is a
 /// deliberate product configuration change, not a test-maintenance detail.
 #[test]
