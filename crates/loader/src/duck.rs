@@ -10,6 +10,7 @@ use common::oids::{
     BOOL, BYTEA, DATE, FLOAT4, FLOAT8, INT2, INT4, INT8, JSON, JSONB, NUMERIC, TIMESTAMP,
     TIMESTAMPTZ, UUID,
 };
+use common::sql::SqlStrExt;
 use common::{EpochNo, PgRelation, ReloadId, SchemaVersionNo};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -232,7 +233,7 @@ impl TableDb {
             .collect::<Result<Vec<_>, LoaderError>>()?
             .join(", ");
         let commit_lsn_expr = match commit_lsn_override {
-            Some(lsn) => format!("'{}'", common::sql::sql_literal(lsn)),
+            Some(lsn) => lsn.quoted_literal(),
             None => "json_extract_string(walrus_pg_sink_meta, '$.commit_lsn')".to_string(),
         };
         let sql = APPEND_PARQUET

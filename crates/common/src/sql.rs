@@ -3,6 +3,10 @@
 use std::borrow::Cow;
 use std::fmt::{self, Write as _};
 
+mod private {
+    pub trait Sealed {}
+}
+
 /// Escape a string for interpolation as a **single-quoted SQL string literal** by doubling every
 /// `'`. The caller supplies the surrounding quotes (`format!("'{}'", sql_literal(s))`) — or
 /// substitutes the result into a template whose placeholder already sits inside quotes.
@@ -23,6 +27,55 @@ pub fn sql_literal(s: &str) -> Cow<'_, str> {
         Cow::Owned(s.replace('\'', "''"))
     } else {
         Cow::Borrowed(s)
+    }
+}
+
+/// SQL rendering for the borrowed text walrus interpolates into hand-built statements.
+///
+/// `str` belongs to `core`, so walrus cannot give it an inherent method; an extension trait is the
+/// orphan-rule-safe way to reach method syntax at the statement-building call sites. `&String` and
+/// `Cow<'_, str>` receivers reach it through deref.
+///
+/// This trait is sealed: `.quoted_literal()` is callable from anywhere `common` is a dependency, but
+/// only `common` can implement it. The method *name* is the safety claim — "this is already a
+/// complete, escaped literal" — so a foreign impl on another receiver could keep the name while
+/// emitting unescaped text into a statement, reintroducing exactly the per-call-site escaping drift
+/// this module exists to collapse.
+///
+/// ```compile_fail
+/// use common::sql::SqlStrExt;
+///
+/// struct Unescaped(String);
+///
+/// impl SqlStrExt for Unescaped {
+///     fn quoted_literal(&self) -> String {
+///         format!("'{}'", self.0)
+///     }
+/// }
+/// ```
+pub trait SqlStrExt: private::Sealed {
+    /// Render `self` as a **complete** single-quoted SQL string literal: [`sql_literal`]'s escaping
+    /// plus the surrounding `'`.
+    ///
+    /// Use this where the value stands alone in a statement (`… IS 'text'`, `current_setting('x')`);
+    /// use [`sql_literal`] where the template already carries the quotes, since this method would
+    /// double them.
+    ///
+    /// ```
+    /// use common::sql::SqlStrExt;
+    /// assert_eq!("O'Brien".quoted_literal(), "'O''Brien'");
+    /// assert_eq!("plain".quoted_literal(), "'plain'");
+    /// ```
+    #[must_use]
+    fn quoted_literal(&self) -> String;
+}
+
+/// The one receiver. The seal impl sits with the real impl so the pair is added or removed together.
+impl private::Sealed for str {}
+
+impl SqlStrExt for str {
+    fn quoted_literal(&self) -> String {
+        format!("'{}'", sql_literal(self))
     }
 }
 

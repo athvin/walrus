@@ -15,7 +15,7 @@
 //! `version()`.
 
 use crate::config::SinkConfig;
-use common::sql::SqlIdent;
+use common::sql::{SqlIdent, SqlStrExt};
 use std::collections::HashSet;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 
@@ -287,7 +287,7 @@ impl<'a> SourcePreflight<'a> {
         let exists = self
             .count(&format!(
                 "SELECT count(*) FROM pg_publication WHERE pubname = {}",
-                lit(pubname)
+                pubname.quoted_literal()
             ))
             .await?
             > 0;
@@ -354,7 +354,7 @@ impl<'a> SourcePreflight<'a> {
                JOIN pg_namespace n ON n.nspname = pt.schemaname
                JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = pt.tablename
                WHERE pt.pubname = {} AND pt.schemaname <> 'walrus'"#,
-            lit(&self.cfg.publication_name)
+            self.cfg.publication_name.quoted_literal()
         );
         let mut report = PkReport::default();
         for msg in self.query(&sql).await? {
@@ -419,7 +419,7 @@ impl<'a> SourcePreflight<'a> {
     }
 
     async fn setting(&self, name: &str) -> Result<String, PreflightError> {
-        self.first_text(&format!("SELECT current_setting({})", lit(name)))
+        self.first_text(&format!("SELECT current_setting({})", name.quoted_literal()))
             .await
     }
 
@@ -456,7 +456,7 @@ impl<'a> SourcePreflight<'a> {
     async fn published_tables(&self, pubname: &str) -> Result<HashSet<TableId>, PreflightError> {
         let sql = format!(
             "SELECT schemaname, tablename FROM pg_publication_tables WHERE pubname = {}",
-            lit(pubname)
+            pubname.quoted_literal()
         );
         let mut set = HashSet::new();
         for msg in self.query(&sql).await? {
@@ -469,11 +469,6 @@ impl<'a> SourcePreflight<'a> {
         }
         Ok(set)
     }
-}
-
-/// A SQL string literal (single-quoted, quotes doubled).
-fn lit(s: &str) -> String {
-    format!("'{}'", common::sql::sql_literal(s))
 }
 
 /// Validate a SQL identifier before its [`std::fmt::Display`] implementation quotes it.

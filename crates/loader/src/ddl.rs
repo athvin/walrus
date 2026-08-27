@@ -22,6 +22,7 @@ use crate::duck::{TableDb, duck_type, user_view_sql};
 use crate::duck_ext::DuckResultExt;
 use crate::error::LoaderError;
 use common::oids::{FLOAT4, FLOAT8, INT2, INT4, INT8};
+use common::sql::SqlStrExt;
 use common::{EpochNo, PgColumn, PgRelation, SchemaVersionNo};
 use std::fmt::Write as _;
 
@@ -255,7 +256,7 @@ pub fn apply_additive(
                 // Metadata only — mirror `<table>` never `<table>_raw`; does NOT set `structural`, so it
                 // neither recreates the view nor implies a data gate.
                 let lit = match text {
-                    Some(t) => format!("'{}'", common::sql::sql_literal(t)),
+                    Some(t) => t.quoted_literal(),
                     None => "NULL".to_string(),
                 };
                 match target {

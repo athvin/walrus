@@ -25,6 +25,7 @@
 use crate::reload_signal::WatermarkWaiters;
 use crate::sink::{FileKind, ParquetSink};
 use anyhow::Context;
+use common::sql::SqlStrExt;
 use common::{
     EpochNo, Kind, Lsn, Op, PgRelation, ReloadId, SchemaVersionNo, SinkMeta, TupleValue,
     UtcTimestamp,
@@ -559,8 +560,8 @@ fn continuation_sql(
         let literals: Vec<String> = values
             .iter()
             .map(|v| match v {
-                serde_json::Value::String(s) => sql_lit(s),
-                other => sql_lit(&other.to_string()),
+                serde_json::Value::String(s) => s.quoted_literal(),
+                other => other.to_string().quoted_literal(),
             })
             .collect();
         let _write_result = write!(
@@ -611,11 +612,6 @@ fn read_row_into(row: &tokio_postgres::Row, rel: &PgRelation, out: &mut Vec<Tupl
         Some(s) => TupleValue::Text(s),
         None => TupleValue::Null,
     }));
-}
-
-/// A SQL string literal (single-quoted, quotes doubled).
-fn sql_lit(s: &str) -> String {
-    format!("'{}'", common::sql::sql_literal(s))
 }
 
 #[cfg(test)]
