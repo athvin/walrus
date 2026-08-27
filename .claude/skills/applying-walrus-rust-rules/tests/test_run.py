@@ -136,8 +136,15 @@ class SafetyTests(unittest.TestCase):
     def test_claude_prompt_is_supplied_via_stdin_not_variadic_tool_args(self) -> None:
         options = loop.argparse.Namespace(model=None, max_budget_usd=None)
         command = loop.claude_command(options)
-        self.assertEqual(command[-2], "--disallowedTools")
         self.assertNotIn("--", command)
+        self.assertEqual(command[-1], "Read,Grep,Glob,Edit,Write")
+        self.assertNotIn("Bash", command[-1])
+
+    def test_repair_agents_receive_bash_with_mutation_denies(self) -> None:
+        options = loop.argparse.Namespace(model=None, max_budget_usd=None)
+        command = loop.claude_command(options, allow_bash=True)
+        self.assertIn("Read,Grep,Glob,Edit,Write,Bash", command)
+        self.assertIn("--disallowedTools", command)
 
     def test_archive_restore_keeps_untracked_recovery_copy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

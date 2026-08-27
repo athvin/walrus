@@ -45,6 +45,8 @@ the installed Claude Code defaults apply.
 ## Invariants
 
 - One fresh Claude session audits one rule across the whole repository.
+- Rule sessions use source-reading and edit tools only. They skip ignored build
+  artifacts and defer Cargo, Docker, and test execution to the final full gate.
 - `applied` and justified `no-change` results receive one `Rust-Rule` trailer;
   failed attempts receive `Rust-Rule-Attempt` and are retried only in the three
   cleanup passes.

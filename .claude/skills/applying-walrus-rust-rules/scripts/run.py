@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -382,15 +384,18 @@ correctness fix, and add or update focused tests when behavior changes.
 
 Do not delegate. Do not edit .claude/skills/rust-skills, this loop skill, docs/implementation/README.md,
 or docs/implementation/phase-*/pr-*.md. Do not commit, push, create/update PRs, switch branches,
-reset/restore/clean the tree, or run the repository-wide final gate. Run the smallest relevant
-validation for your edits. Return status=failed if you cannot leave a coherent rule-specific result.
+reset/restore/clean the tree, or inspect target/ or other ignored/generated artifacts. Do not run
+Cargo, rustc, Docker, tests, builds, formatters, linters, or the repository-wide final gate during
+the rule pass; all executable validation is deliberately deferred until every rule has been applied.
+Use source inspection and focused static searches to validate the rule-specific result. Return
+status=failed if you cannot leave a coherent rule-specific result.
 {prior}
 Report only the required structured result. In validation, list exact commands and outcomes.
 Use blocked_on as an empty string unless status is failed.
 """
 
 
-def claude_command(options: argparse.Namespace) -> list[str]:
+def claude_command(options: argparse.Namespace, *, allow_bash: bool = False) -> list[str]:
     command = [
         "claude",
         "-p",
@@ -402,16 +407,48 @@ def claude_command(options: argparse.Namespace) -> list[str]:
         "auto",
         "--no-session-persistence",
         "--tools",
-        "Read,Grep,Glob,Edit,Write,Bash",
-        "--disallowedTools",
-        "Bash(git push *),Bash(gh *),Bash(git commit *),Bash(git reset *),"
-        "Bash(git clean *),Bash(git checkout *),Bash(git switch *),Bash(git restore *),Bash(rm *)",
+        "Read,Grep,Glob,Edit,Write,Bash" if allow_bash else "Read,Grep,Glob,Edit,Write",
     ]
+    if allow_bash:
+        command.extend(
+            [
+                "--disallowedTools",
+                "Bash(git push *),Bash(gh *),Bash(git commit *),Bash(git reset *),"
+                "Bash(git clean *),Bash(git checkout *),Bash(git switch *),"
+                "Bash(git restore *),Bash(rm *)",
+            ]
+        )
     if options.model:
         command.extend(["--model", options.model])
     if options.max_budget_usd is not None:
         command.extend(["--max-budget-usd", str(options.max_budget_usd)])
     return command
+
+
+def run_claude(
+    command: Sequence[str], *, prompt: str, cwd: Path, timeout: int
+) -> subprocess.CompletedProcess[str]:
+    """Run Claude in its own process group so timeouts/interruption stop descendants."""
+    process = subprocess.Popen(
+        list(command),
+        cwd=cwd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(input=prompt, timeout=timeout)
+    except (subprocess.TimeoutExpired, KeyboardInterrupt):
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+        raise
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 def commit_record(
@@ -463,12 +500,10 @@ def invoke_rule(
     prompt = rule_prompt(root, rule, pass_name, archive)
     print(f"RULE_START={rule.slug} PASS={pass_name}", flush=True)
     try:
-        process = subprocess.run(
+        process = run_claude(
             claude_command(options),
+            prompt=prompt,
             cwd=root,
-            capture_output=True,
-            text=True,
-            input=prompt,
             timeout=options.agent_timeout_seconds,
         )
         (archive / "stdout.json").write_text(process.stdout)
@@ -524,6 +559,11 @@ def invoke_rule(
             [],
         )
         print(f"RULE_END={rule.slug} RESULT=failed COMMIT={commit[:12]} REASON=timeout", flush=True)
+    except KeyboardInterrupt:
+        paths = changed_paths(root)
+        archive_and_restore(root, archive, paths)
+        print(f"RULE_INTERRUPTED={rule.slug} RECOVERY={archive}", flush=True)
+        raise
 
 
 def print_status(rules: Sequence[Rule], state: Progress) -> None:
@@ -601,12 +641,10 @@ def invoke_repair(
     before = git_output(root, "rev-parse", "HEAD")
     archive = state_dir(root, start_commit) / "repairs" / kind.replace(" ", "-") / str(round_number)
     archive.mkdir(parents=True, exist_ok=True)
-    process = subprocess.run(
-        claude_command(options),
+    process = run_claude(
+        claude_command(options, allow_bash=True),
+        prompt=repair_prompt(kind, log),
         cwd=root,
-        capture_output=True,
-        text=True,
-        input=repair_prompt(kind, log),
         timeout=options.agent_timeout_seconds,
     )
     (archive / "stdout.json").write_text(process.stdout)
@@ -818,7 +856,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     mode.add_argument("--status", action="store_true")
     parser.add_argument("--model")
     parser.add_argument("--max-budget-usd", type=float)
-    parser.add_argument("--agent-timeout-seconds", type=int, default=1800)
+    parser.add_argument("--agent-timeout-seconds", type=int, default=600)
     parser.add_argument("--allow-other-branch", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args(argv)
 
