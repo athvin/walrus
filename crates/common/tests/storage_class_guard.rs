@@ -7,10 +7,15 @@
 )]
 //! Storage-class guard (PR 21.2). Two invariants no compiler lint covers:
 //! a mutable global is never declared, and every production global is a thread-safe one.
+//!
+//! A `thread_local!` static is exempt from the second invariant: it is one value per thread,
+//! never shared, so `Cell`/`RefCell` inside one is the safe replacement for a mutable global
+//! rather than a violation of it (`conc-thread-local`).
 
 use std::path::{Path, PathBuf};
 
 const MUTABLE_GLOBAL_NEEDLE: &str = concat!("static", " mut ");
+const THREAD_LOCAL_NEEDLE: &str = "thread_local!";
 const ALLOWED_STATIC_HEADS: [&str; 4] = ["OnceLock", "LazyLock", "Atomic", "Mutex"];
 
 /// Workspace root — this crate's manifest dir is `<root>/crates/common`.
@@ -83,6 +88,24 @@ fn static_declaration(line: &str) -> Option<(&str, &str)> {
     Some((name.trim(), type_name))
 }
 
+/// Per-line flag: `true` where a line sits inside a `thread_local!` block, tracked by brace depth
+/// from the macro invocation. Such a static is per-thread by construction, so the
+/// thread-safe-global rule below does not apply to it.
+fn thread_local_mask(source: &str) -> Vec<bool> {
+    let mut mask = Vec::new();
+    let mut depth = 0_usize;
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        let opens_here = !trimmed.starts_with("//") && trimmed.contains(THREAD_LOCAL_NEEDLE);
+        let inside = depth > 0 || opens_here;
+        mask.push(inside);
+        if inside {
+            depth = (depth + line.matches('{').count()).saturating_sub(line.matches('}').count());
+        }
+    }
+    mask
+}
+
 fn mutable_global_offences(path: &str, source: &str) -> Vec<String> {
     source
         .lines()
@@ -95,7 +118,8 @@ fn mutable_global_offences(path: &str, source: &str) -> Vec<String> {
             let name = name.strip_prefix("mut ")?;
             Some(format!(
                 "{path}:{}: mutable global {name} is banned; use an Atomic*, OnceLock, LazyLock, \
-                 or Mutex instead",
+                 or Mutex for shared state, or thread_local! with Cell/RefCell for per-thread \
+                 state",
                 index + 1
             ))
         })
@@ -117,15 +141,20 @@ fn allowed_static_type(type_name: &str) -> bool {
 fn plain_static_offences(path: &str, source: &str) -> Vec<String> {
     source
         .lines()
+        .zip(thread_local_mask(source))
         .enumerate()
-        .filter_map(|(index, line)| {
+        .filter_map(|(index, (line, in_thread_local))| {
+            if in_thread_local {
+                return None;
+            }
             let (name, type_name) = static_declaration(line)?;
             if name.starts_with("mut ") || allowed_static_type(type_name) {
                 return None;
             }
             Some(format!(
                 "{path}:{}: plain addressed global {name}: {type_name}; use const for a small \
-                 value, or OnceLock, LazyLock, an Atomic*, or Mutex for shared state",
+                 value, OnceLock, LazyLock, an Atomic*, or Mutex for shared state, or \
+                 thread_local! with Cell/RefCell for per-thread state",
                 index + 1
             ))
         })
@@ -149,7 +178,8 @@ fn no_mutable_global_is_declared_anywhere() {
 
     assert!(
         offences.is_empty(),
-        "mutable globals are banned — use an Atomic*, OnceLock, LazyLock, or Mutex instead:\n{}",
+        "mutable globals are banned — use an Atomic*, OnceLock, LazyLock, or Mutex for shared \
+         state, or thread_local! for per-thread state:\n{}",
         offences.join("\n")
     );
 }
@@ -169,7 +199,8 @@ fn every_production_static_is_a_thread_safe_global() {
 
     assert!(
         offences.is_empty(),
-        "plain addressed globals are banned — use const for small values or a thread-safe global:\n{}",
+        "plain addressed globals are banned — use const for small values, a thread-safe global, or \
+         thread_local! for per-thread state:\n{}",
         offences.join("\n")
     );
 }
@@ -184,6 +215,38 @@ fn synthetic_mutable_global_is_rejected() {
     assert!(diagnostic.contains("Atomic*"));
     assert!(diagnostic.contains("OnceLock"));
     assert!(diagnostic.contains("LazyLock"));
+    assert!(diagnostic.contains(THREAD_LOCAL_NEEDLE));
+}
+
+/// A per-thread static is not a shared global: the guard must accept `Cell`/`RefCell` inside a
+/// `thread_local!` block, and must resume flagging plain statics once the block closes.
+#[test]
+fn synthetic_thread_local_is_accepted() {
+    let source = concat!(
+        "thread_local! {\n",
+        "    static TS_SCRATCH: RefCell<String> = RefCell::new(String::new());\n",
+        "    static CALLS: Cell<u32> = const { Cell::new(0) };\n",
+        "}\n",
+        "static TIMEOUT_MS: u64 = 5_000;\n",
+    );
+    let offences = plain_static_offences("fixture/thread_local.rs", source);
+    let diagnostic = offences.join("\n");
+
+    assert_eq!(offences.len(), 1, "only the trailing plain static: {diagnostic}");
+    assert!(diagnostic.contains("fixture/thread_local.rs:5"));
+    assert!(diagnostic.contains("TIMEOUT_MS"));
+}
+
+/// The brace tracking must also survive a single-line `thread_local!` invocation.
+#[test]
+fn synthetic_inline_thread_local_is_accepted() {
+    let source = "thread_local! { static CALLS: Cell<u32> = const { Cell::new(0) }; }\n\
+                  static TIMEOUT_MS: u64 = 5_000;";
+    let offences = plain_static_offences("fixture/inline_thread_local.rs", source);
+    let diagnostic = offences.join("\n");
+
+    assert_eq!(offences.len(), 1, "one line opens and closes it: {diagnostic}");
+    assert!(diagnostic.contains("fixture/inline_thread_local.rs:2"));
 }
 
 #[test]
