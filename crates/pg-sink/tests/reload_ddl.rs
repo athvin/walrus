@@ -193,7 +193,7 @@ fn spawn_echo_resolver(
 /// Prove the resolver is live before the exporter signals through it (a handshake, not a sleep).
 async fn await_resolver_ready(
     admin: &tokio_postgres::Client,
-    waiters: &Arc<WatermarkWaiters>,
+    waiters: &WatermarkWaiters,
     epoch: EpochNo,
 ) {
     let sentinel = -epoch.0;

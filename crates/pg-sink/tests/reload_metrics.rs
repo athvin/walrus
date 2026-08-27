@@ -174,7 +174,7 @@ fn spawn_echo_resolver(
 
 async fn await_resolver_ready(
     admin: &tokio_postgres::Client,
-    waiters: &Arc<WatermarkWaiters>,
+    waiters: &WatermarkWaiters,
     epoch: EpochNo,
 ) {
     let sentinel = -epoch.0;

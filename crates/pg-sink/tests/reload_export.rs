@@ -209,7 +209,7 @@ fn spawn_echo_resolver(
 /// real signal would otherwise surface as a misleading echo timeout.
 async fn await_resolver_ready(
     admin: &tokio_postgres::Client,
-    waiters: &Arc<WatermarkWaiters>,
+    waiters: &WatermarkWaiters,
     epoch: EpochNo,
 ) {
     let sentinel = -epoch.0; // never collides with real (bigserial, positive) reload ids
