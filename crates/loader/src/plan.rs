@@ -26,6 +26,12 @@ pub struct RawCol {
     pub duckdb_type: String,
 }
 
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+    std::mem::size_of::<RawCol>() == 48,
+    "RawCol is stored once per emit column, and a range column emits five"
+);
+
 /// How a mirror column's value is produced from the winning raw row `s` (and, for a TOAST-resolvable
 /// scalar, the current mirror `t`).
 #[derive(Debug, Clone)]
@@ -45,6 +51,16 @@ pub struct MirrorCol {
     pub is_key: bool,
     pub value: MirrorValue,
 }
+
+/// Size budget for one [`TablePlan::mirror_cols`] entry. The [`TablePlan`] assertion below pins the
+/// three fat pointers — that the lists stay frozen — but not the payload behind them, which is the
+/// half that multiplies by column count.
+///
+/// A ceiling rather than an equality because whether [`MirrorValue`] borrows `String`'s niche for
+/// its discriminant is a compiler detail; either way a new owned field breaches this. If it trips,
+/// shrink the entry or raise the budget deliberately in review.
+const MIRROR_COL_MAX_BYTES: usize = 88;
+const _: () = assert!(std::mem::size_of::<MirrorCol>() <= MIRROR_COL_MAX_BYTES);
 
 /// The full plan for one table: the raw emit columns and the mirror columns.
 #[derive(Debug, Clone)]

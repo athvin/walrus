@@ -97,6 +97,17 @@ pub struct TypeDescriptor {
     pub meta: TypeMeta,
 }
 
+/// Size budget for the whole per-column descriptor — the [`TypeMeta`] assertion above pins only its
+/// tail. The sink caches a `Vec<TypeDescriptor>` per relation *per schema version*, and the loader
+/// rebuilds one from `schema_registry` on every plan build, so a new owned field here is paid once
+/// per source column of every cached shape.
+///
+/// A ceiling rather than an equality because the `Option`/`Vec` niches are a layout detail; the
+/// slack is under a word, so any added pointer- or word-sized field still breaches it. If this
+/// trips, shrink or box the growing field, or raise the budget deliberately in review.
+const TYPE_DESCRIPTOR_MAX_BYTES: usize = 192;
+const _: () = assert!(std::mem::size_of::<TypeDescriptor>() <= TYPE_DESCRIPTOR_MAX_BYTES);
+
 #[cfg(test)]
 #[path = "type_descriptor_test.rs"]
 mod tests;

@@ -100,6 +100,12 @@ pub struct Pt {
     pub y: f64,
 }
 
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+    std::mem::size_of::<Pt>() == 16,
+    "Pt is the element of the unbounded path/polygon vertex Vec built per value"
+);
+
 fn geo_err(text: &str) -> Error {
     Error::value_parse("geometric", text, "geometric")
 }
