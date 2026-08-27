@@ -1,7 +1,11 @@
-// Every serde-carrying enum in `common` currently has a bare-scalar JSON form. `Op`, `Kind`, and
-// `ReplicaIdentity` use serde's default external enum representation; `Tier` uses numeric
-// `into`/`try_from` conversion. Each expected value comes from an exhaustive match with no `_` arm,
-// making a new variant or payload a compile error before it can change the wire format.
+// Every serde-carrying enum in the workspace lives in `common` and has a bare-scalar JSON form.
+// `Op`, `Kind`, and `ReplicaIdentity` use serde's default external enum representation; `Tier` uses
+// numeric `into`/`try_from` conversion. Each expected value comes from an exhaustive match with no
+// `_` arm, making a new variant or payload a compile error before it can change the wire format.
+//
+// Because every variant is a unit variant, all four of serde's tagging strategies would produce a
+// *different* document, and only the default one produces the scalar the persisted contracts use.
+// The source guard at the bottom of the file is what keeps a later attribute from switching it.
 
 use common::{Kind, Op, ReplicaIdentity, Tier};
 use serde::{Serialize, de::DeserializeOwned};
@@ -103,8 +107,12 @@ fn tier_is_an_integer_scalar() {
     }
 }
 
-/// The serde-bearing modules, scanned as source text.
-const SERDE_MODULES: [(&str, &str); 3] = [
+/// The serde-bearing modules, scanned as source text. The last three hold the four enums above;
+/// `config.rs` and `telemetry.rs` are the operator-facing documents where the next enum would most
+/// likely land. The `flatten` guard in `src/lib_test.rs` audits the same five modules.
+const SERDE_MODULES: [(&str, &str); 5] = [
+    ("config.rs", include_str!("../src/config.rs")),
+    ("telemetry.rs", include_str!("../src/telemetry.rs")),
     ("sink_meta.rs", include_str!("../src/sink_meta.rs")),
     ("pg_shape.rs", include_str!("../src/pg_shape.rs")),
     (
@@ -113,14 +121,96 @@ const SERDE_MODULES: [(&str, &str); 3] = [
     ),
 ];
 
+/// The three arguments that select a non-default enum representation. Any one of them turns a
+/// variant from a bare scalar into an object.
+const TAGGING_ARGUMENTS: [&str; 3] = ["tag", "content", "untagged"];
+
+/// The argument text of one `#[serde(…)]`, from just past its `(` to the matching `)`.
+///
+/// Parenthesis-aware so a nested argument — `bound(deserialize = "…")` is the one serde spells that
+/// way — cannot close the list early and hide a tagging argument written after it.
+fn serde_arguments(after_open_paren: &str) -> &str {
+    let mut depth = 1usize;
+    for (index, ch) in after_open_paren.char_indices() {
+        if ch == '(' {
+            depth += 1;
+        } else if ch == ')' {
+            depth -= 1;
+            if depth == 0 {
+                return &after_open_paren[..index];
+            }
+        }
+    }
+    after_open_paren
+}
+
+/// The first tagging argument of any `#[serde(…)]` in `source`, or `None`.
+///
+/// Whitespace is stripped first, so neither argument order nor line breaks can hide one:
+/// `#[serde(rename_all = "lowercase", tag = "type")]` and the same attribute split over four lines
+/// both compact to one comma-separated list. Only text inside an attribute's parentheses is
+/// inspected, so prose about tagging in a doc comment is not a violation.
+fn tagging_violation(module: &str, source: &str) -> Option<String> {
+    let compact: String = source.chars().filter(|ch| !ch.is_whitespace()).collect();
+    let mut rest = compact.as_str();
+    while let Some(open) = rest.find("serde(") {
+        let after = &rest[open + "serde(".len()..];
+        let arguments = serde_arguments(after);
+        for argument in arguments.split(',') {
+            for tagging in TAGGING_ARGUMENTS {
+                // Either the bare `untagged` flag or a `name="value"` argument — never a longer
+                // identifier that merely starts the same way, such as `rename = "tag"`.
+                let selected = argument
+                    .strip_prefix(tagging)
+                    .is_some_and(|tail| tail.is_empty() || tail.starts_with('='));
+                if selected {
+                    return Some(format!(
+                        "{module} introduced enum tagging argument {tagging}, which reshapes the \
+                         scalar wire form into an object"
+                    ));
+                }
+            }
+        }
+        rest = &after[arguments.len()..];
+    }
+    None
+}
+
 #[test]
 fn no_enum_tagging_attribute_is_introduced() {
     for (module, source) in SERDE_MODULES {
-        for attribute in ["serde(tag", "serde(content", "serde(untagged"] {
-            assert!(
-                !source.contains(attribute),
-                "{module} introduced enum tagging attribute {attribute}"
-            );
-        }
+        assert_eq!(tagging_violation(module, source), None, "{module}");
+    }
+}
+
+#[test]
+fn the_tagging_guard_catches_every_spelling() {
+    // The literals are split so walrus source never carries a contiguous tagging attribute, the
+    // same care `src/lib_test.rs` takes with its `flatten` fixture.
+    let fixtures = [
+        concat!("#[serde(", r#"tag = "type")] enum E {}"#),
+        concat!("#[serde(rename_all = \"lowercase\", ", r#"tag = "type")]"#),
+        concat!("#[serde(\n    ", "tag = \"t\",\n    content = \"c\",\n)]"),
+        concat!("#[serde(bound(deserialize = \"T: Copy\"), ", "untagged)]"),
+    ];
+    for fixture in fixtures {
+        assert!(
+            tagging_violation("fixture.rs", fixture).is_some(),
+            "guard missed {fixture}"
+        );
+    }
+}
+
+#[test]
+fn the_tagging_guard_leaves_the_attributes_walrus_actually_uses_alone() {
+    let benign = [
+        "/// Internally tagged, adjacently tagged and untagged all reshape this into an object.",
+        r#"#[serde(rename_all = "lowercase")]"#,
+        r#"#[serde(rename = "tag")]"#,
+        "#[serde(deny_unknown_fields, default)]",
+        r#"#[serde(try_from = "u8", into = "u8")]"#,
+    ];
+    for source in benign {
+        assert_eq!(tagging_violation("fixture.rs", source), None, "{source}");
     }
 }
