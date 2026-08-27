@@ -48,9 +48,25 @@ fn humantime_durations_parse_for_every_field() {
     });
 }
 
+/// Serde-deserialized duration knobs, counted in both shapes `humantime_serde` supports. A needle
+/// spelled only `": Duration,"` would miss an `Option<Duration>` knob entirely — it would be neither
+/// counted as a field nor caught by the expected-count check below, so an optional timeout could
+/// skip its attribute in silence.
+fn duration_fields(src: &str) -> usize {
+    src.matches(": Duration,").count() + src.matches(": Option<Duration>,").count()
+}
+
+/// `#[serde(with = "humantime_serde")]` occurrences, matched as the attribute rather than the bare
+/// crate name so prose naming the crate cannot pad the count over a missing attribute. Whitespace
+/// is stripped first, so the attribute counts the same however rustfmt wraps it.
+fn humantime_attributes(src: &str) -> usize {
+    let compact: String = src.chars().filter(|ch| !ch.is_whitespace()).collect();
+    compact.matches(r#"with="humantime_serde""#).count()
+}
+
 fn duration_attribute_mismatch(src: &str, expected_fields: usize) -> Option<String> {
-    let fields = src.matches(": Duration,").count();
-    let attrs = src.matches("humantime_serde").count();
+    let fields = duration_fields(src);
+    let attrs = humantime_attributes(src);
     if fields == expected_fields && attrs == fields {
         None
     } else {
@@ -87,14 +103,24 @@ fn the_struct_slice_excludes_the_error_taxonomy() {
     assert!(!body.contains("LeaseTtlTooShort"), "{body}");
 }
 
+/// Both duration shapes are seen, and a doc comment naming the crate is not an attribute — without
+/// either refinement the matching fixture reports no fields (or a satisfied count) and slips past.
 #[test]
 fn every_duration_field_rejects_missing_attribute_fixture() {
-    const FIXTURE: &str = "struct Config { missing: Duration, }";
-    let mismatch = duration_attribute_mismatch(FIXTURE, 1);
-    assert_eq!(
-        mismatch.as_deref(),
-        Some("1 Duration fields but 0 humantime attributes")
-    );
+    for fixture in [
+        "struct Config { missing: Duration, }",
+        "struct Config { missing: Option<Duration>, }",
+        "/// Parsed by humantime_serde.\n    missing: Duration,",
+    ] {
+        assert_eq!(
+            duration_attribute_mismatch(fixture, 1).as_deref(),
+            Some("1 Duration fields but 0 humantime attributes"),
+            "{fixture}"
+        );
+    }
+
+    let attributed = "#[serde(with = \"humantime_serde\")]\n    present: Option<Duration>,";
+    assert_eq!(duration_attribute_mismatch(attributed, 1), None);
 }
 
 /// `#[serde(default)]` makes these the shipped values for omitted fields; changing one is a

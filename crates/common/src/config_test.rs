@@ -99,13 +99,49 @@ fn humantime_durations_parse() {
     });
 }
 
+/// Serde-deserialized duration knobs, counted in both shapes `humantime_serde` supports. A needle
+/// spelled only `": Duration,"` would miss an `Option<Duration>` knob entirely — it would be neither
+/// counted as a field nor caught by the field-count assertion, so an optional timeout could skip its
+/// attribute in silence.
+fn duration_fields(src: &str) -> usize {
+    src.matches(": Duration,").count() + src.matches(": Option<Duration>,").count()
+}
+
+/// `#[serde(with = "humantime_serde")]` occurrences, matched as the attribute rather than the bare
+/// crate name so prose naming the crate cannot pad the count over a missing attribute. Whitespace
+/// is stripped first, so the attribute counts the same however rustfmt wraps it.
+fn humantime_attributes(src: &str) -> usize {
+    let compact: String = src.chars().filter(|ch| !ch.is_whitespace()).collect();
+    compact.matches(r#"with="humantime_serde""#).count()
+}
+
 #[test]
 fn every_duration_field_carries_humantime() {
     const SRC: &str = include_str!("config.rs");
-    let fields = SRC.matches(": Duration,").count();
-    let attrs = SRC.matches("humantime_serde").count();
+    let fields = duration_fields(SRC);
     assert_eq!(fields, 1, "CommonConfig Duration field count changed");
-    assert_eq!(attrs, fields, "every Duration field needs humantime serde");
+    assert_eq!(
+        humantime_attributes(SRC),
+        fields,
+        "every Duration field needs humantime serde"
+    );
+}
+
+/// The guard must see both duration shapes and must not accept a mention for an attribute.
+#[test]
+fn the_humantime_guard_bites_on_both_duration_shapes() {
+    for fixture in [
+        "struct C { missing: Duration, }",
+        "struct C { missing: Option<Duration>, }",
+        "/// Parsed by humantime_serde.\n    missing: Duration,",
+    ] {
+        assert_eq!(duration_fields(fixture), 1, "{fixture}");
+        assert_eq!(humantime_attributes(fixture), 0, "{fixture}");
+    }
+
+    let attributed = "#[serde(with = \"humantime_serde\")]\n    present: Option<Duration>,";
+    assert_eq!(duration_fields(attributed), 1);
+    assert_eq!(humantime_attributes(attributed), 1);
 }
 
 #[test]
