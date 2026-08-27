@@ -216,7 +216,18 @@ async fn pipeline(
     if let Err(error) = epoch_watch.await {
         tracing::error!(%error, "epoch watch task panicked");
     }
-    renewer.abort();
+    // Cancel-then-join, never `abort()`: the renewer already observes this token, and `abort()` only
+    // *requests* a stop — it returns while an in-flight renewal may still be on the wire. That matters
+    // because `release_lease` merely pushes `lease_expiry` into the past and leaves `owner_pod` set,
+    // while `renew_lease` is guarded on the owner alone: a renewal landing AFTER the release would
+    // push the expiry a whole TTL forward, and the successor's `acquire` reads that as a live owner —
+    // a terminal `LeaseContended`, not a wait. Awaiting the cancelled renewer is what proves no
+    // renewal can outlive this line. It is bounded by the same control-DB latency `release_all` is
+    // about to pay anyway (the renewer's cancellation arm is `biased`, so at most the current round).
+    token.cancel();
+    if let Err(error) = renewer.await {
+        tracing::error!(%error, "lease renewer task panicked");
+    }
     lease::release_all(&pool, epoch, &keys, &cfg.instance).await;
     if let Some(failure) = first_failure {
         return Err(failure.error);
