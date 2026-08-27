@@ -95,20 +95,32 @@ pub struct HealthState {
     live: AtomicBool,
 }
 
+/// A fresh state: `Bootstrapping`, live, neither terminating nor degraded.
+///
+/// Hand-written rather than derived because `live` starts **`true`** — liveness is deadlock-only, so
+/// a state that has not yet been told otherwise is alive, whereas `AtomicBool::default()` is `false`.
+/// Having it means `Arc::<HealthState>::default()` and `..Default::default()` work like they do for
+/// the loader's `LoaderState`; [`HealthState::new`] is the `Arc`-returning shorthand over it.
+impl Default for HealthState {
+    fn default() -> Self {
+        HealthState {
+            phase: AtomicPhase::default(),
+            terminating: AtomicBool::new(false),
+            degraded: AtomicBool::new(false),
+            live: AtomicBool::new(true),
+        }
+    }
+}
+
 impl HealthState {
-    /// A fresh state (`Bootstrapping`, live, not terminating), shared across the handlers and the loop.
+    /// A fresh state (see [`HealthState::default`]), shared across the handlers and the loop.
     #[allow(
         clippy::new_ret_no_self,
         reason = "intentionally returns the shared handle used by probes and the loop"
     )]
     #[must_use]
     pub fn new() -> Arc<Self> {
-        Arc::new(HealthState {
-            phase: AtomicPhase::default(),
-            terminating: AtomicBool::new(false),
-            degraded: AtomicBool::new(false),
-            live: AtomicBool::new(true),
-        })
+        Arc::new(HealthState::default())
     }
 
     /// Bootstrap finished → `/startup` and `/ready` may now answer 200.

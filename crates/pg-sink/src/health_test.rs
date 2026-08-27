@@ -25,6 +25,19 @@ fn phase_gates_readiness() {
 }
 
 #[test]
+fn default_matches_the_shared_constructor() {
+    let owned = HealthState::default();
+    let shared = HealthState::new();
+
+    // `live` is the one field a bare `#[derive(Default)]` would silently flip to `false`.
+    assert!(owned.is_live(), "a fresh state is alive (deadlock-only)");
+    assert_eq!(owned.phase(), shared.phase());
+    assert_eq!(owned.is_live(), shared.is_live());
+    assert_eq!(owned.is_ready(), shared.is_ready());
+    assert_eq!(owned.is_degraded(), shared.is_degraded());
+}
+
+#[test]
 fn degraded_does_not_affect_liveness() {
     let s = HealthState::new();
     s.mark_ready();
