@@ -13,7 +13,7 @@
 
 use crate::duck_ext::DuckResultExt;
 use crate::error::LoaderError;
-use crate::table_name::{DuckTable, Mirror};
+use crate::table_name::{DuckTable, Mirror, Raw};
 use common::{Lsn, PgRelation};
 use duckdb::OptionalExt;
 
@@ -277,6 +277,15 @@ impl TransformSql {
     #[must_use]
     pub fn table(&self) -> &str {
         self.table.as_str()
+    }
+
+    /// This table's CDC log `<table>_raw`, tagged [`Raw`] so it cannot land where a mirror name
+    /// belongs. [`crate::compaction::prune_raw`] `DELETE`s from it — the same statement aimed at the
+    /// mirror would erase every current row — so it takes the name from the typed layer rather than
+    /// re-deriving the suffix beside its own SQL.
+    #[must_use]
+    pub fn raw(&self) -> DuckTable<Raw> {
+        self.table.raw()
     }
 
     /// Render the atomic full-rebuild (PR 3.11): `CREATE OR REPLACE TABLE <table>` over **retained raw ∪

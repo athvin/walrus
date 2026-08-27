@@ -108,15 +108,19 @@ pub fn prune_raw(
     t: &TransformSql,
     floor: Lsn,
 ) -> Result<u64, LoaderError> {
+    // The delete target comes back from `TransformSql::raw` tagged `DuckTable<Raw>` rather than being
+    // re-suffixed here: this `DELETE` pointed at the mirror would erase every current row, so the one
+    // place that derives `<table>_raw` is the typed-name layer.
+    let raw = t.raw();
     let n = conn
         .execute(
             &format!(
-                "DELETE FROM \"{}_raw\" WHERE \"_walrus_commit_lsn\" < ?",
-                t.table()
+                "DELETE FROM \"{}\" WHERE \"_walrus_commit_lsn\" < ?",
+                raw.as_str()
             ),
             duckdb::params![floor.to_string()],
         )
-        .duck_with(|| format!("prune {}_raw", t.table()))?;
+        .duck_with(|| format!("prune {}", raw.as_str()))?;
     conn.execute_batch("CHECKPOINT;")
         .duck_with(|| format!("checkpoint after prune {}", t.table()))?;
     Ok(u64::try_from(n).unwrap_or(u64::MAX))

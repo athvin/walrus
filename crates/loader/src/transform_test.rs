@@ -64,6 +64,18 @@ fn the_wipe_and_tuple_bound_render_only_for_a_present_boundary() {
 }
 
 #[test]
+fn the_prune_target_is_the_typed_cdc_log_not_the_mirror() {
+    // `compaction::prune_raw` DELETEs from whatever this names, so handing it the mirror would erase
+    // every current row. The name comes back tagged `Raw`, which makes that swap a type error rather
+    // than a review question — and it is the only suffix derivation on the path.
+    let transform = TransformSql::from_relation(&relation());
+
+    let raw: DuckTable<Raw> = transform.raw();
+    assert_eq!(transform.table(), "orders");
+    assert_eq!(raw.as_str(), "orders_raw");
+}
+
+#[test]
 fn a_broken_raw_table_is_an_error_not_an_absent_truncate_boundary() {
     let conn = duckdb::Connection::open_in_memory().unwrap();
     let transform = TransformSql::from_relation(&relation());
