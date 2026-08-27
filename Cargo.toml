@@ -119,6 +119,9 @@ panic_in_result_fn = "deny" # a function that can return failure must not panic 
 significant_drop_in_scrutinee = "deny"
 significant_drop_tightening = "deny"
 # Async guards and RefCell borrows must never remain live across a suspension point (PR 14.3).
+# The first two know their guard types; `await_holding_invalid_type` reads its list from
+# `clippy.toml`'s `await-holding-invalid-types`, which names the lock-shaped guards the other two
+# miss (today: `tokio::sync::watch::Ref`).
 await_holding_lock = "deny"
 await_holding_refcell_ref = "deny"
 await_holding_invalid_type = "deny"

@@ -16,3 +16,13 @@ disallowed-methods = [
   { path = "tokio::sync::mpsc::unbounded_channel", reason = "use mpsc::channel(N) with an explicit capacity and full-channel policy" },
   { path = "tokio::sync::broadcast::channel", reason = "no multi-consumer event stream exists; see docs/implementation/notes/rust-skills/async-broadcast-pubsub.md" },
 ]
+
+# `await_holding_lock` knows `std::sync` and `parking_lot` guards; it does not know `watch::Ref`,
+# which IS a read guard on the channel's inner lock. The loader's apply loop borrows the epoch watch
+# inside an `async fn`, so a `Ref` retained across an `.await` would block every `Sender::send` — the
+# same starvation `await_holding_lock` exists to stop. The loop already copies the `EpochNo` out in
+# the borrowing statement; this list is what gives the `await_holding_invalid_type` deny (Cargo.toml)
+# something to enforce, so a later edit cannot quietly widen that scope.
+await-holding-invalid-types = [
+  { path = "tokio::sync::watch::Ref", reason = "a read guard on the watch value; copy the value out of the borrow before awaiting" },
+]
