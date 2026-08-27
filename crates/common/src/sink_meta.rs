@@ -91,9 +91,14 @@ impl UtcTimestamp {
         UtcTimestamp(jiff::Timestamp::now())
     }
 
-    /// Borrow the underlying UTC instant.
+    /// Borrow the underlying UTC instant — free, no allocation.
+    ///
+    /// `as_` marks that borrow against the owning [`into_inner`](Self::into_inner) below, the way
+    /// every other walrus newtype spells its free projection ([`Lsn::as_u64`](crate::Lsn::as_u64),
+    /// [`SqlIdent::as_raw`](crate::sql::SqlIdent::as_raw)). The inner type is `Copy`, so a bare
+    /// `inner()` would not say which of the two a call site gets.
     #[must_use]
-    pub const fn inner(&self) -> &jiff::Timestamp {
+    pub const fn as_inner(&self) -> &jiff::Timestamp {
         &self.0
     }
 

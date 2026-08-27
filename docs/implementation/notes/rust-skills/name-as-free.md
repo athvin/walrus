@@ -103,6 +103,17 @@ All four enums derive `Copy`. Their generated match arms return the persisted `&
 literals named directly by each invocation, so none formats, clones, allocates, or performs other
 work. Macro expansions are not extra textual definition sites.
 
+### Later addition: `UtcTimestamp::as_inner`
+
+A re-audit against the raw rule added a sixth site by renaming, not by introducing a conversion:
+`UtcTimestamp::inner(&self) -> &jiff::Timestamp` became `UtcTimestamp::as_inner`. The census above
+only asked whether an existing `as_*` name overstated its cost; it did not ask the converse, whether
+a free borrow was hiding under a name that does not say so. This one was: the method sits directly
+beside `into_inner`, and `jiff::Timestamp` is `Copy`, so `inner()` read as ambiguous between the
+borrow it is and the copy its neighbour returns. The rename makes the pair state the rule's
+`as_`/`into_` cost distinction and matches the five sites above. It borrows a field and allocates
+nothing, so the reversal condition below is untouched.
+
 ## Existing regression coverage
 
 The sibling `crates/loader/src/error_test.rs` suite exercises representative mapping and source
