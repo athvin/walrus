@@ -1,4 +1,5 @@
 use super::*;
+use proptest::prelude::*;
 
 #[test]
 fn lsn_is_layout_identical_to_its_inner_u64() {
@@ -230,4 +231,68 @@ fn a_rejection_compares_as_a_whole_result() {
             reason: "X/Y half is not a valid hex u32",
         })
     );
+}
+
+// `round_trips_through_display_and_from_str` and `text_sort_equals_numeric_sort` state their claims
+// over a handful of hand-picked positions. Both are really claims about *every* position — the
+// padded form exists only because they hold — and 64 bits is the one space an example set cannot
+// cover. Generating the input is what turns those samples into properties.
+//
+// `cases` is stated here rather than inherited from `PROPTEST_CASES`, so every run exercises the
+// same number of positions; each case is one `format!` and one parse, so 2× the default costs
+// microseconds. Failure persistence is off deliberately — a red case must not drop a
+// `proptest-regressions/` file into a tree that does not ignore one. The shrunk position proptest
+// prints IS the reproduction: paste it into the example above it and the case is pinned forever.
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 512,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+
+    /// `round_trips_through_display_and_from_str` over the whole space, including the upper half
+    /// that only `bit_pattern_roundtrips_above_i64_max` reaches by hand.
+    #[test]
+    fn display_round_trips_through_from_str(raw in any::<u64>()) {
+        let lsn = Lsn::new(raw);
+
+        let parsed = lsn.to_string().parse::<Lsn>();
+
+        prop_assert_eq!(parsed, Ok(lsn));
+    }
+
+    /// The rendering the ordering below rests on: exactly 16 hex digits, never lowercase, for every
+    /// position — and the lowercase spelling Postgres prints still parses back to the same one.
+    #[test]
+    fn display_is_16_upper_hex_digits_and_parses_in_either_case(raw in any::<u64>()) {
+        let text = Lsn::new(raw).to_string();
+
+        prop_assert_eq!(text.len(), 16);
+        prop_assert!(text.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_lowercase()));
+        prop_assert_eq!(text.to_lowercase().parse::<Lsn>(), Ok(Lsn::new(raw)));
+    }
+
+    /// The load-bearing invariant `text_sort_equals_numeric_sort` samples with nine values: for
+    /// *every* pair, comparing the padded text agrees with comparing the numbers, so a control-table
+    /// or JSON sort over the text is a WAL-position sort.
+    #[test]
+    fn text_order_equals_numeric_order(a in any::<u64>(), b in any::<u64>()) {
+        let (left, right) = (Lsn::new(a), Lsn::new(b));
+
+        let by_text = left.to_string().cmp(&right.to_string());
+
+        prop_assert_eq!(by_text, a.cmp(&b));
+        prop_assert_eq!(left.cmp(&right), a.cmp(&b));
+    }
+
+    /// The other accepted dialect, over every pair of halves: Postgres's `X/Y` is two unpadded hex
+    /// `u32`s meaning `(high << 32) | low`.
+    #[test]
+    fn x_slash_y_form_parses_as_its_two_halves(high in any::<u32>(), low in any::<u32>()) {
+        let text = format!("{high:X}/{low:X}");
+
+        let parsed = text.parse::<Lsn>();
+
+        prop_assert_eq!(parsed, Ok(Lsn::new((u64::from(high) << 32) | u64::from(low))));
+    }
 }

@@ -38,3 +38,6 @@ sqlx = { workspace = true, optional = true, features = [
 [dev-dependencies]
 # `test` feature adds figment::Jail for hermetic env/file config tests (dev-only).
 figment = { workspace = true, features = ["test"] }
+# Generated LSN positions for the `Lsn` properties in src/lsn_test.rs. Dev-only by construction:
+# `common` is a library, so nothing a walrus binary links can reach a test-profile dependency.
+proptest = { workspace = true }
