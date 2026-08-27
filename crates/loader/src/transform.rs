@@ -58,7 +58,9 @@ struct MirrorCol {
 #[derive(Debug)]
 pub struct TransformSql {
     table: DuckTable<Mirror>,
-    mirror: Vec<MirrorCol>,
+    /// Frozen like the [`crate::plan::TablePlan::mirror_cols`] it is derived from: the layout is
+    /// settled once per Phase-B poll and only ever read back to render SQL.
+    mirror: Box<[MirrorCol]>,
 }
 
 impl TransformSql {

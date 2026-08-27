@@ -35,18 +35,22 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 
 /// One streamed change, tagged with **its** sub-transaction xid (proto §7).
+///
+/// `values` is the decoded tuple, fixed at its source relation's width the moment the row is
+/// buffered — nothing ever appends to it — so it is frozen into a `Box<[_]>`: the capacity word a
+/// `Vec` would carry is dead weight repeated once per buffered row.
 #[derive(Clone, Debug)]
 struct StreamedChange {
     sub_xid: u32,
     oid: u32,
     op: Op,
-    values: Vec<TupleValue>,
+    values: Box<[TupleValue]>,
     lsn: Lsn,
 }
 
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(
-    std::mem::size_of::<StreamedChange>() == 48,
+    std::mem::size_of::<StreamedChange>() == 40,
     "StreamedChange buffers every row of an open streamed transaction"
 );
 
@@ -209,24 +213,41 @@ impl<C: Clock + Clone> StreamDemux<C> {
         let top = self
             .current_top
             .context("streamed change arrived outside a Stream Start block")?;
+        // `clone().into_boxed_slice()` freezes the tuple at its decoded width; the clone already
+        // allocates exactly `len`, so the conversion is a header change, not a second allocation.
         let (oid, op, values, sub_xid) = match msg {
             Message::Insert {
                 relation_oid,
                 new,
                 xid,
-            } => (*relation_oid, Op::Insert, new.clone(), xid.unwrap_or(top)),
+            } => (
+                *relation_oid,
+                Op::Insert,
+                new.clone().into_boxed_slice(),
+                xid.unwrap_or(top),
+            ),
             Message::Update {
                 relation_oid,
                 new,
                 xid,
                 ..
-            } => (*relation_oid, Op::Update, new.clone(), xid.unwrap_or(top)),
+            } => (
+                *relation_oid,
+                Op::Update,
+                new.clone().into_boxed_slice(),
+                xid.unwrap_or(top),
+            ),
             Message::Delete {
                 relation_oid,
                 old,
                 xid,
                 ..
-            } => (*relation_oid, Op::Delete, old.clone(), xid.unwrap_or(top)),
+            } => (
+                *relation_oid,
+                Op::Delete,
+                old.clone().into_boxed_slice(),
+                xid.unwrap_or(top),
+            ),
             // Wildcard is deliberate: Message is #[non_exhaustive], and this dispatcher ignores other families.
             _ => return Ok(()),
         };

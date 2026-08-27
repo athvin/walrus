@@ -60,7 +60,10 @@ impl Emit {
 
 /// Arrow's erased builders do not implement [`Debug`](fmt::Debug); report only their arity so the
 /// public [`BatchBuilder`] can derive `Debug` without inspecting foreign trait-object contents.
-struct Builders(Vec<Box<dyn ArrayBuilder>>);
+///
+/// `Box<[_]>`, not `Vec`: the flat builder list is fixed by the schema in [`BatchBuilder::new`], and
+/// `append_row`'s width proofs hold only because nothing can add or remove a builder afterwards.
+struct Builders(Box<[Box<dyn ArrayBuilder>]>);
 
 impl fmt::Debug for Builders {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -106,9 +109,9 @@ fn emit_kind(col: &PgColumn) -> Result<Emit, Error> {
 #[derive(Debug)]
 pub struct BatchBuilder {
     schema: SchemaRef,
-    builders: Builders,  // one per EMITTED field, flat, in schema order
-    plan: Vec<Emit>,     // one per SOURCE column: how its value fans out
-    meta: StringBuilder, // the trailing walrus_pg_sink_meta column
+    builders: Builders,   // one per EMITTED field, flat, in schema order
+    plan: Box<[Emit]>,    // one per SOURCE column: how its value fans out
+    meta: StringBuilder,  // the trailing walrus_pg_sink_meta column
     rows: usize,
     /// The batch-constant meta JSON fragment, serialized once from the first row (PR 5.7).
     meta_const: Option<String>,
@@ -140,8 +143,8 @@ impl BatchBuilder {
         }
         Ok(BatchBuilder {
             schema,
-            builders: Builders(builders),
-            plan,
+            builders: Builders(builders.into_boxed_slice()),
+            plan: plan.into_boxed_slice(),
             meta: StringBuilder::new(),
             rows: 0,
             meta_const: None,
@@ -277,7 +280,7 @@ impl BatchBuilder {
     /// Returns [`Error::Arrow`] if the finished arrays do not match the planned schema or row count.
     pub fn into_record_batch(mut self) -> Result<RecordBatch, Error> {
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(self.builders.0.len() + 1);
-        for builder in &mut self.builders.0 {
+        for builder in self.builders.0.iter_mut() {
             arrays.push(builder.finish());
         }
         arrays.push(Arc::new(self.meta.finish()));

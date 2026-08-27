@@ -135,8 +135,10 @@ pub struct TableBatcher<C> {
     clock: C,
     /// Committed (flush-eligible) rows.
     builder: BatchBuilder,
-    /// Rows of the currently-open transaction — not yet flush-eligible.
-    pending: Vec<(SinkMeta, Vec<TupleValue>)>,
+    /// Rows of the currently-open transaction — not yet flush-eligible. The outer `Vec` is reused
+    /// across transactions (see [`Self::on_commit`]), but each buffered tuple is frozen at its
+    /// decoded width, so it carries no capacity word.
+    pending: Vec<(SinkMeta, Box<[TupleValue]>)>,
     pending_bytes: u64,
     committed_rows: u64,
     committed_bytes: u64,
@@ -186,7 +188,7 @@ impl<C: Clock> TableBatcher<C> {
             format!("{}.{}-{}", meta.source_schema, meta.source_table, meta.lsn)
         });
         self.pending_bytes += estimate_row_bytes(values);
-        self.pending.push((meta, values.to_vec()));
+        self.pending.push((meta, values.into()));
     }
 
     /// Whether an open transaction's rows are buffered (not a commit boundary).
