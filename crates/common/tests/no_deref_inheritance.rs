@@ -27,11 +27,12 @@ const DECISION_NOTE: &str = "docs/implementation/notes/rust-skills/type-deref-co
 /// A real smart pointer, an owned→borrowed container (`String` → `str`) or an RAII guard belongs
 /// here. A domain newtype (`Lsn`, `ManifestId`, `EpochNo`, `SchemaVersionNo`, `ReloadId`,
 /// `DuckTable<K>`) does **not** — that is exactly what this guard exists to catch.
-const ALLOWED: &[(&str, &str, &str)] = &[(
-    "crates/pg-sink/src/reload_signal.rs",
-    "SubscribeGuard",
-    "RAII guard: Drop unregisters the in-flight watermark subscription",
-)];
+///
+/// Empty: `SubscribeGuard` was the one entry until it replaced its receiver `Deref` with an
+/// inherent `try_recv`. An RAII guard still qualifies — but only when handing out the inner type's
+/// whole API is the access it means to grant, which a subscription awaited through `Future` and
+/// `try_recv` does not need.
+const ALLOWED: &[(&str, &str, &str)] = &[];
 
 #[test]
 fn no_walrus_type_implements_deref() {
@@ -87,19 +88,30 @@ impl std::ops::Deref for ManifestId {
     assert!(!rejection.contains(":3"));
 }
 
+/// The lookup is exercised against a fixture list because the live [`ALLOWED`] is empty: a future
+/// entry must still match on BOTH the repo-relative path and the exact wrapper name, so a
+/// same-named type in another module — or a longer name in the listed one — stays an offence.
 #[test]
 fn allow_list_requires_the_path_and_exact_type() {
+    let allowed: &[(&str, &str, &str)] = &[(
+        "crates/pg-sink/src/reload_signal.rs",
+        "SubscribeGuard",
+        "fixture: a hypothetical RAII guard entry",
+    )];
     let implementation = "impl std::ops::Deref for SubscribeGuard<'_> {";
 
-    assert!(is_allowed(
+    assert!(is_allowed_in(
+        allowed,
         "crates/pg-sink/src/reload_signal.rs",
         implementation
     ));
-    assert!(!is_allowed(
+    assert!(!is_allowed_in(
+        allowed,
         "crates/pg-sink/src/another_module.rs",
         implementation
     ));
-    assert!(!is_allowed(
+    assert!(!is_allowed_in(
+        allowed,
         "crates/pg-sink/src/reload_signal.rs",
         "impl std::ops::Deref for SubscribeGuardAdapter<'_> {"
     ));
@@ -162,11 +174,16 @@ fn is_deref_impl(line: &str) -> bool {
 
 /// The allow-list lookup, by repo-relative path and the exact wrapper named on the impl line.
 fn is_allowed(rel: &str, line: &str) -> bool {
+    is_allowed_in(ALLOWED, rel, line)
+}
+
+/// The lookup itself, over an explicit list so it stays testable while [`ALLOWED`] is empty.
+fn is_allowed_in(allowed: &[(&str, &str, &str)], rel: &str, line: &str) -> bool {
     let Some(type_name) = impl_type_name(line) else {
         return false;
     };
 
-    ALLOWED
+    allowed
         .iter()
         .any(|(path, allowed_type, _reason)| *path == rel && *allowed_type == type_name)
 }

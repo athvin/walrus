@@ -31,14 +31,25 @@ for encoding boundaries; it does not promise that the wrapper has the inner type
 `EpochNo` and `SchemaVersionNo` exist precisely because two layout-identical `i64` values must not
 be interchangeable in Rust. Explicit accessors preserve that distinction.
 
+## RAII guard is a reason, not a licence
+
+`crates/pg-sink/src/reload_signal.rs`'s `SubscribeGuard` was the one allow-list entry, on the
+grounds that its `Drop` unregisters the in-flight watermark subscription. Being a guard is what made
+a `Deref` *arguable*; it is not what made it right. `MutexGuard<T>` derefs because handing out `&T`
+IS what the guard is for, whereas `SubscribeGuard` exists to be awaited — it already implements
+`Future`, and the only thing the `Deref`/`DerefMut` pair ever reached was `try_recv` in the module's
+unit tests. Everything else it published — `close`, `blocking_recv` — was inherited API nobody asked
+for: closing the channel behind the registry's back, or blocking a runtime thread.
+
+It now exposes an inherent `try_recv` instead, so the guard's surface is exactly `.await`,
+`try_recv`, and `Drop`. `ALLOWED` in `no_deref_inheritance.rs` is consequently empty; its matching
+logic stays covered by a fixture list, so the mechanism still works the day an entry is earned.
+
 ## How to add an allow-list entry
 
-The current exception is `crates/pg-sink/src/reload_signal.rs`'s `SubscribeGuard`. It temporarily
-exposes its oneshot receiver while `Drop` unregisters the matching in-flight watermark
-subscription, so it is a genuine RAII guard rather than a domain newtype. Both its `Deref` and
-`DerefMut` implementations are covered by the one exact path-and-wrapper entry.
-
-If another legitimate implementation appears, add its repo-relative path, exact wrapper name, and
-one-line reason to `ALLOWED` in `crates/common/tests/no_deref_inheritance.rs`. Also add a sentence
-here establishing why the wrapper is a genuine smart pointer, owned→borrowed container, or RAII
-guard. An entry for a domain newtype is not permitted; such a type must keep an explicit accessor.
+Add the repo-relative path, exact wrapper name, and one-line reason to `ALLOWED` in
+`crates/common/tests/no_deref_inheritance.rs`, and a paragraph here establishing that handing out
+the inner type's *whole* API is the access the wrapper means to grant — a smart pointer, an
+owned→borrowed container, or a guard in the `MutexGuard` sense. "It is a guard" and "the tests are
+shorter that way" are not that argument; an inherent method covers the second. An entry for a domain
+newtype is not permitted; such a type must keep an explicit accessor.

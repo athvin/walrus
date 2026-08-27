@@ -138,6 +138,13 @@ impl WatermarkWaiters {
 
 /// An in-flight watermark subscription. Awaiting the guard awaits its echo; dropping it removes
 /// the matching registry entry.
+///
+/// The receiver stays private: the two ways to take an echo are `.await` (the
+/// [`std::future::Future`] impl the exporter uses) and [`Self::try_recv`]. A `Deref` to the inner
+/// [`oneshot::Receiver`] would additionally publish `close` and `blocking_recv` — a caller closing
+/// the channel behind the registry's back, or blocking a runtime thread, is not part of what a
+/// subscription offers (API guideline C-DEREF: a guard exposes the access it means to grant, not
+/// its whole innards).
 #[derive(Debug)]
 pub struct SubscribeGuard<'a> {
     waiters: &'a WatermarkWaiters,
@@ -146,17 +153,16 @@ pub struct SubscribeGuard<'a> {
     rx: oneshot::Receiver<Echo>,
 }
 
-impl std::ops::Deref for SubscribeGuard<'_> {
-    type Target = oneshot::Receiver<Echo>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.rx
-    }
-}
-
-impl std::ops::DerefMut for SubscribeGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.rx
+impl SubscribeGuard<'_> {
+    /// Take the echo if it has already been resolved, without awaiting.
+    ///
+    /// # Errors
+    ///
+    /// [`oneshot::error::TryRecvError::Empty`] while the echo is still in flight;
+    /// [`oneshot::error::TryRecvError::Closed`] once the sender is gone — the subscription was
+    /// superseded by a later `subscribe` on the same key.
+    pub fn try_recv(&mut self) -> Result<Echo, oneshot::error::TryRecvError> {
+        self.rx.try_recv()
     }
 }
 
