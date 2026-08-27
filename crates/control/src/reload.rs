@@ -90,11 +90,14 @@ pub struct ReloadRow {
 ///
 /// `expr_2021` holds the capture to the 2021 expression grammar rather than edition 2024's wider
 /// `expr`, and the `let` binds the argument once so a caller's expression is never re-evaluated
-/// per field.
+/// per field. That binding is hygienic, so the `|row| typed_reload_row!(row)` closures below pass
+/// their own `row` in without the macro's `row` capturing or shadowing it.
 macro_rules! typed_reload_row {
     ($row:expr_2021) => {{
         let row = $row;
-        ReloadRow {
+        // `$crate::reload::` — not a bare `ReloadRow` — so the struct resolves in its defining
+        // module rather than through whatever the expansion site happens to have imported.
+        $crate::reload::ReloadRow {
             reload_id: row.reload_id.into(),
             epoch: row.epoch.into(),
             source_schema: row.source_schema,
