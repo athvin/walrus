@@ -223,7 +223,7 @@ fn latest_for_respects_neighbour_and_full_integer_range_edges() {
 }
 
 #[test]
-fn btree_iterators_preserve_items_and_follow_key_order() {
+fn named_iterators_preserve_items_and_follow_key_order() {
     let entries = [
         build_cached(table_at(9, "nine"), SchemaVersionNo(3)).unwrap(),
         build_cached(table_at(2, "two"), SchemaVersionNo(7)).unwrap(),
@@ -238,11 +238,9 @@ fn btree_iterators_preserve_items_and_follow_key_order() {
         (9, SchemaVersionNo(3)),
     ];
 
-    let values: std::collections::btree_map::Values<
-        '_,
-        (u32, SchemaVersionNo),
-        Arc<CachedRelation>,
-    > = cache.iter();
+    // The annotations are the assertion: each iterator is named after the method that builds it,
+    // and none of them spell the private `(u32, SchemaVersionNo)` key or the backing `BTreeMap`.
+    let values: Iter<'_> = cache.iter();
     assert_eq!(
         values
             .map(|cached| (cached.relation.oid, cached.schema_version))
@@ -250,11 +248,7 @@ fn btree_iterators_preserve_items_and_follow_key_order() {
         expected
     );
 
-    let shared: std::collections::btree_map::Values<
-        '_,
-        (u32, SchemaVersionNo),
-        Arc<CachedRelation>,
-    > = (&cache).into_iter();
+    let shared: Iter<'_> = (&cache).into_iter();
     assert_eq!(
         shared
             .map(|cached| (cached.relation.oid, cached.schema_version))
@@ -262,11 +256,7 @@ fn btree_iterators_preserve_items_and_follow_key_order() {
         expected
     );
 
-    let mutable: std::collections::btree_map::ValuesMut<
-        '_,
-        (u32, SchemaVersionNo),
-        Arc<CachedRelation>,
-    > = (&mut cache).into_iter();
+    let mutable: IterMut<'_> = (&mut cache).into_iter();
     assert_eq!(
         mutable
             .map(|cached| (cached.relation.oid, cached.schema_version))
@@ -274,10 +264,7 @@ fn btree_iterators_preserve_items_and_follow_key_order() {
         expected
     );
 
-    let owned: std::collections::btree_map::IntoValues<
-        (u32, SchemaVersionNo),
-        Arc<CachedRelation>,
-    > = cache.into_iter();
+    let owned: IntoIter = cache.into_iter();
     assert_eq!(
         owned
             .map(|cached| (cached.relation.oid, cached.schema_version))

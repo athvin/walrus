@@ -70,7 +70,7 @@ impl RelationCache {
     /// The cached relations in ascending `(relation_oid, schema_version)` key order. The map key is
     /// a projection of each value, so iteration yields values directly.
     #[must_use = "iterators are lazy and do nothing unless consumed"]
-    pub fn iter(&self) -> btree_map::Values<'_, (u32, SchemaVersionNo), Arc<CachedRelation>> {
+    pub fn iter(&self) -> Iter<'_> {
         <&Self as IntoIterator>::into_iter(self)
     }
 
@@ -154,28 +154,104 @@ impl Extend<CachedRelation> for RelationCache {
 
 impl IntoIterator for RelationCache {
     type Item = Arc<CachedRelation>;
-    type IntoIter = btree_map::IntoValues<(u32, SchemaVersionNo), Arc<CachedRelation>>;
+    type IntoIter = IntoIter;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.by_key.into_values()
+        IntoIter {
+            inner: self.by_key.into_values(),
+        }
     }
 }
 
 impl<'a> IntoIterator for &'a RelationCache {
     type Item = &'a Arc<CachedRelation>;
-    type IntoIter = btree_map::Values<'a, (u32, SchemaVersionNo), Arc<CachedRelation>>;
+    type IntoIter = Iter<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.by_key.values()
+        Iter {
+            inner: self.by_key.values(),
+        }
     }
 }
 
 impl<'a> IntoIterator for &'a mut RelationCache {
     type Item = &'a mut Arc<CachedRelation>;
-    type IntoIter = btree_map::ValuesMut<'a, (u32, SchemaVersionNo), Arc<CachedRelation>>;
+    type IntoIter = IterMut<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.by_key.values_mut()
+        IterMut {
+            inner: self.by_key.values_mut(),
+        }
+    }
+}
+
+// The three types below are named after the method that builds them — `iter` → `Iter`, `iter_mut` →
+// `IterMut`, `into_iter` → `IntoIter` — rather than handing back the map's own `Values`/`ValuesMut`/
+// `IntoValues`. Those spellings name the return of a `values()` this cache does not have, and they
+// put the private `(relation_oid, schema_version)` key and the choice of `BTreeMap` in every public
+// signature, so the `IndexMap` question recorded on `by_key` stays an implementation detail only
+// while it is wrapped. Each forwards `next` plus `size_hint`, so `collect` still preallocates;
+// `ExactSizeIterator`, `DoubleEndedIterator`, and `Clone` are left off until a caller needs them.
+
+/// The shared iterator over a [`RelationCache`], returned by [`RelationCache::iter`] and by
+/// `IntoIterator for &RelationCache`.
+#[derive(Debug)]
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+pub struct Iter<'a> {
+    inner: btree_map::Values<'a, (u32, SchemaVersionNo), Arc<CachedRelation>>,
+}
+
+impl<'a> Iterator for Iter<'a> {
+    type Item = &'a Arc<CachedRelation>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+/// The exclusive iterator over a [`RelationCache`], returned by
+/// `IntoIterator for &mut RelationCache`.
+///
+/// The cache has no inherent `iter_mut`: nothing rewrites an entry in place, so the `&mut` form
+/// exists only to complete the `IntoIterator` trio.
+#[derive(Debug)]
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+pub struct IterMut<'a> {
+    inner: btree_map::ValuesMut<'a, (u32, SchemaVersionNo), Arc<CachedRelation>>,
+}
+
+impl<'a> Iterator for IterMut<'a> {
+    type Item = &'a mut Arc<CachedRelation>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+/// The owning iterator over a [`RelationCache`], returned by `IntoIterator for RelationCache`.
+#[derive(Debug)]
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+pub struct IntoIter {
+    inner: btree_map::IntoValues<(u32, SchemaVersionNo), Arc<CachedRelation>>,
+}
+
+impl Iterator for IntoIter {
+    type Item = Arc<CachedRelation>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
     }
 }
 
