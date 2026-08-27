@@ -16,8 +16,7 @@ use loader::config::{LeaseTtl, LoaderConfig};
 use loader::error::LoaderError;
 use loader::health::{self, LoaderState};
 use loader::lease;
-use object_store::ObjectStore;
-use object_store::aws::AmazonS3Builder;
+use object_store::aws::{AmazonS3, AmazonS3Builder};
 use std::process::ExitCode;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -105,9 +104,11 @@ async fn pipeline(
     state: &Arc<LoaderState>,
 ) -> Result<(), LoaderError> {
     let pool = control::connect(&cfg.control_db_url).await?;
-    let store: Arc<dyn ObjectStore> = build_store(cfg)?;
+    let store = build_store(cfg)?;
 
-    let owned = bootstrap::bootstrap(cfg, &pool, store.as_ref(), state).await?;
+    // `&store` unsize-coerces to the `&dyn ObjectStore` bootstrap takes, so the concrete client is
+    // erased at that one boundary and nowhere else.
+    let owned = bootstrap::bootstrap(cfg, &pool, &store, state).await?;
     state.mark_ready();
     let keys: Vec<(String, String)> = owned.iter().map(bootstrap::OwnedTable::key).collect();
     // Zero-init every per-table loader series so /metrics lists the owned tables from the first scrape,
@@ -245,7 +246,14 @@ async fn pipeline(
     Ok(())
 }
 
-fn build_store(cfg: &LoaderConfig) -> Result<Arc<dyn ObjectStore>, LoaderError> {
+/// The loader's one object-store client.
+///
+/// Returns the concrete `AmazonS3`, not an `Arc<dyn ObjectStore>`: the loader builds exactly one
+/// store, spends it on a single `head` probe in [`bootstrap::bootstrap`], and never clones, shares,
+/// or stores it — so the `Arc` allocation and the vtable would both buy nothing here. `pg-sink`
+/// keeps its `Arc<dyn ObjectStore>` for the opposite reason: `object_store::buffered::BufWriter::new`
+/// takes one by value, so the erasure there is the upstream API's, not a choice.
+fn build_store(cfg: &LoaderConfig) -> Result<AmazonS3, LoaderError> {
     // `from_env` so the AWS credential env (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`) is honoured —
     // `new()` alone falls back to the EC2 IMDS credential chain, which hangs/fails off-EC2 (e.g. MinIO).
     let mut b = AmazonS3Builder::from_env()
@@ -254,10 +262,8 @@ fn build_store(cfg: &LoaderConfig) -> Result<Arc<dyn ObjectStore>, LoaderError> 
     if let Some(endpoint) = &cfg.object_store.endpoint {
         b = b.with_endpoint(endpoint).with_allow_http(true);
     }
-    let store = b
-        .build()
-        .map_err(|e| LoaderError::ObjectStore(format!("build S3 client: {e}")))?;
-    Ok(Arc::new(store))
+    b.build()
+        .map_err(|e| LoaderError::ObjectStore(format!("build S3 client: {e}")))
 }
 
 /// DuckDB httpfs credentials for `read_parquet('s3://…')`, from the object-store config + the AWS env

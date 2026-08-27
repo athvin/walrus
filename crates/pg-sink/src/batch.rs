@@ -14,8 +14,13 @@
 //! | Site | Dispatch | Why |
 //! |---|---|---|
 //! | `Clock` (this module) | **static** (`C: Clock`) | one production impl on a per-commit path |
-//! | `Arc<dyn ObjectStore>` (`sink.rs`) | dynamic | backend is chosen from config at runtime |
+//! | `Arc<dyn ObjectStore>` (`sink.rs`) | dynamic | `BufWriter::new` takes `Arc<dyn ObjectStore>` |
 //! | `Box<dyn ArrayBuilder>` (`pg-to-arrow`) | dynamic | one heterogeneous builder per column |
+//!
+//! Only one concrete store (`AmazonS3`) is ever built, so the middle row is *not* "flexibility": it
+//! is the shape `object_store::buffered::BufWriter::new` demands by value, which `put_with_kind`
+//! calls per file. Where nothing upstream demands it — the loader, which spends its store on one
+//! `head` — the client stays concrete (`loader::main::build_store`).
 
 use crate::relcache::CachedRelation;
 use arrow::record_batch::RecordBatch;

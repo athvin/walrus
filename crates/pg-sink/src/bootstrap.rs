@@ -147,6 +147,12 @@ async fn bootstrap_object_store(
 /// Build the S3/MinIO client from config. Credentials come from the environment
 /// (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`); a `Some(endpoint)` selects MinIO/localstack and
 /// allows plain HTTP.
+///
+/// The `Arc<dyn ObjectStore>` is not a flexibility hedge — only `AmazonS3` is ever built. It is the
+/// shape [`object_store::buffered::BufWriter::new`] takes **by value**, so
+/// [`ParquetSink`](crate::sink::ParquetSink) has to hold one to clone per file; erasing here rather
+/// than at each writer is what keeps that a single `Arc` for the process. (Contrast the loader,
+/// which needs no writer and so keeps its client concrete.)
 fn build_object_store(cfg: &ObjectStoreConfig) -> anyhow::Result<Arc<dyn ObjectStore>> {
     use object_store::aws::AmazonS3Builder;
     let mut builder = AmazonS3Builder::from_env()

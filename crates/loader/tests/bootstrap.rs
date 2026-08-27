@@ -16,9 +16,7 @@ use loader::bootstrap::bootstrap;
 use loader::config::LoaderConfig;
 use loader::error::LoaderError;
 use loader::health::LoaderState;
-use object_store::ObjectStore;
-use object_store::aws::AmazonS3Builder;
-use std::sync::Arc;
+use object_store::aws::{AmazonS3, AmazonS3Builder};
 use std::time::Duration;
 
 static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -29,18 +27,18 @@ fn control_url() -> String {
     })
 }
 
-fn store() -> Arc<dyn ObjectStore> {
-    Arc::new(
-        AmazonS3Builder::new()
-            .with_bucket_name("walrus")
-            .with_region("us-east-1")
-            .with_endpoint("http://localhost:9000")
-            .with_access_key_id("minioadmin")
-            .with_secret_access_key("minioadmin")
-            .with_allow_http(true)
-            .build()
-            .unwrap(),
-    )
+/// The concrete MinIO client, matching what `main::build_store` hands `bootstrap`; `&store()`
+/// coerces to the `&dyn ObjectStore` parameter at the call site, exactly as production does.
+fn store() -> AmazonS3 {
+    AmazonS3Builder::new()
+        .with_bucket_name("walrus")
+        .with_region("us-east-1")
+        .with_endpoint("http://localhost:9000")
+        .with_access_key_id("minioadmin")
+        .with_secret_access_key("minioadmin")
+        .with_allow_http(true)
+        .build()
+        .unwrap()
 }
 
 fn orders() -> PgRelation {
@@ -145,9 +143,7 @@ async fn bootstrap_creates_duckdb_with_both_tables_and_takes_the_lease() {
     let cfg = cfg("loader-a", &dir, Duration::from_secs(30));
     let state = LoaderState::new();
 
-    let owned = bootstrap(&cfg, &pool, store().as_ref(), &state)
-        .await
-        .unwrap();
+    let owned = bootstrap(&cfg, &pool, &store(), &state).await.unwrap();
     assert_eq!(owned.len(), 1, "owns the one registered table");
     let orders = &owned[0];
     assert!(table_exists(&orders.db, "orders"), "mirror table exists");
@@ -196,7 +192,7 @@ async fn second_instance_with_live_lease_exits_terminal() {
     let _owned_a = bootstrap(
         &cfg("loader-a", &dir_a, Duration::from_secs(30)),
         &pool,
-        store().as_ref(),
+        &store(),
         &state,
     )
     .await
@@ -207,7 +203,7 @@ async fn second_instance_with_live_lease_exits_terminal() {
     let res = bootstrap(
         &cfg("loader-b", &dir_b, Duration::from_secs(30)),
         &pool,
-        store().as_ref(),
+        &store(),
         &LoaderState::new(),
     )
     .await;
@@ -238,7 +234,7 @@ async fn stale_lock_expired_lease_is_reclaimed_and_opened() {
         let owned_a = bootstrap(
             &cfg("loader-dead", &dir, Duration::from_millis(500)),
             &pool,
-            store().as_ref(),
+            &store(),
             &state,
         )
         .await
@@ -252,7 +248,7 @@ async fn stale_lock_expired_lease_is_reclaimed_and_opened() {
     let owned_b = bootstrap(
         &cfg("loader-b", &dir, Duration::from_secs(30)),
         &pool,
-        store().as_ref(),
+        &store(),
         &LoaderState::new(),
     )
     .await
