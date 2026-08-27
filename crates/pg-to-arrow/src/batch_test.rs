@@ -123,6 +123,27 @@ fn builds_a_batch_from_an_orders_insert() {
     assert_eq!(note.value(0), "hi");
 }
 
+/// The `timestamptz` parse borrows the SAME RFC-3339 scratch every other temporal parse uses, so it
+/// must refill it rather than append to it: whole-hour offsets still gain their `:00`, an explicit
+/// `+HH:MM` is left alone, and a short value parsed after a longer one is not contaminated by the
+/// previous contents.
+#[test]
+fn timestamptz_offsets_parse_through_the_reused_scratch() {
+    let mut scratch = String::new();
+    for (text, expected) in [
+        ("2024-01-02 03:04:05.678901+05:30", 1_704_144_845_678_901),
+        ("2024-01-02 03:04:05.678901+00", 1_704_164_645_678_901),
+        ("2024-01-02 03:04:05-05", 1_704_182_645_000_000),
+        ("2024-01-02 03:04:05+00", 1_704_164_645_000_000),
+    ] {
+        assert_eq!(
+            parse_timestamptz_micros(text, "created_at", &mut scratch).unwrap(),
+            expected,
+            "{text} must parse the same however the scratch was left"
+        );
+    }
+}
+
 #[test]
 fn null_value_sets_validity_false() {
     let mut b = BatchBuilder::new(&orders()).unwrap();

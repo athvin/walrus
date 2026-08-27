@@ -232,11 +232,12 @@ impl<C: Clock + Clone> Backfill<C> {
             .context("backfill SELECT under snapshot")?;
 
         let mut copied = 0u64;
+        // One tuple buffer for the whole table: `push` copies the row into the batcher, so refilling
+        // this scratch keeps its capacity instead of allocating (and dropping) a `Vec` per row.
+        let mut tuple: Vec<TupleValue> = Vec::with_capacity(rel.columns.len());
         for row in &rows {
-            batcher.push(
-                self.snapshot_meta(rel, snap, schema_version),
-                &row_to_tuple(row, rel.columns.len()),
-            );
+            read_row_into(row, rel.columns.len(), &mut tuple);
+            batcher.push(self.snapshot_meta(rel, snap, schema_version), &tuple);
             // Snapshot rows have no per-row commit boundary: promote them all at the shared
             // consistent_point so the loader's (commit_lsn, lsn) dedup lets any later stream change win.
             // They also have no real commit *time* (pre-existing data), so commit_ts is the
@@ -328,13 +329,14 @@ fn select_text_sql(rel: &PgRelation) -> String {
     )
 }
 
-fn row_to_tuple(row: &tokio_postgres::Row, ncols: usize) -> Vec<TupleValue> {
-    (0..ncols)
-        .map(|i| match row.get::<_, Option<String>>(i) {
-            Some(s) => TupleValue::Text(s),
-            None => TupleValue::Null,
-        })
-        .collect()
+/// Refill `out` with one row's text values. Takes the buffer rather than returning a fresh `Vec` so
+/// the backfill loop reuses one allocation across every row of the table.
+fn read_row_into(row: &tokio_postgres::Row, ncols: usize, out: &mut Vec<TupleValue>) {
+    out.clear();
+    out.extend((0..ncols).map(|i| match row.get::<_, Option<String>>(i) {
+        Some(s) => TupleValue::Text(s),
+        None => TupleValue::Null,
+    }));
 }
 
 /// Every published **user** table (`schema ≠ walrus`) — the walrus-internal `heartbeat`/`ddl_audit`

@@ -403,8 +403,12 @@ impl ChunkExporter {
             Arc::new(crate::batch::SystemClock),
         )
         .context("create reload chunk batcher")?;
+        // One tuple buffer for the whole chunk: `push` copies the row into the batcher, so refilling
+        // this scratch keeps its capacity instead of allocating (and dropping) a `Vec` per row.
+        let mut tuple: Vec<TupleValue> = Vec::with_capacity(self.rel.columns.len());
         for row in &rows {
-            batcher.push(self.chunk_meta(watermark), &row_to_tuple(row, &self.rel));
+            read_row_into(row, &self.rel, &mut tuple);
+            batcher.push(self.chunk_meta(watermark), &tuple);
         }
         batcher
             .on_commit(watermark, UtcTimestamp::now())
@@ -599,13 +603,14 @@ fn cursor_from_row(
     Ok(serde_json::Value::Array(values))
 }
 
-fn row_to_tuple(row: &tokio_postgres::Row, rel: &PgRelation) -> Vec<TupleValue> {
-    (0..rel.columns.len())
-        .map(|i| match row.get::<_, Option<String>>(i) {
-            Some(s) => TupleValue::Text(s),
-            None => TupleValue::Null,
-        })
-        .collect()
+/// Refill `out` with one row's text values. Takes the buffer rather than returning a fresh `Vec` so
+/// the chunk loop reuses one allocation across every row it exports.
+fn read_row_into(row: &tokio_postgres::Row, rel: &PgRelation, out: &mut Vec<TupleValue>) {
+    out.clear();
+    out.extend((0..rel.columns.len()).map(|i| match row.get::<_, Option<String>>(i) {
+        Some(s) => TupleValue::Text(s),
+        None => TupleValue::Null,
+    }));
 }
 
 /// A SQL string literal (single-quoted, quotes doubled).

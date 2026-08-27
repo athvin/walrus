@@ -410,7 +410,7 @@ fn append_value(
             } else {
                 let s = text(value, col, dt)?;
                 let micros = if tz.is_some() {
-                    parse_timestamptz_micros(s, col)?
+                    parse_timestamptz_micros(s, col, scratch)?
                 } else {
                     parse_timestamp_micros(s, col, scratch)?
                 };
@@ -666,7 +666,7 @@ fn append_struct_bound(
         }
         DataType::Timestamp(TimeUnit::Microsecond, tz) => {
             let micros = match bound {
-                Some(s) if tz.is_some() => Some(parse_timestamptz_micros(s, col)?),
+                Some(s) if tz.is_some() => Some(parse_timestamptz_micros(s, col, scratch)?),
                 Some(s) => Some(parse_timestamp_micros(s, col, scratch)?),
                 None => None,
             };
@@ -999,19 +999,25 @@ fn parse_timestamp_micros(s: &str, col: &str, scratch: &mut String) -> Result<i6
     rfc3339_micros(scratch).ok_or_else(|| Error::value_parse(col, s, "Timestamp"))
 }
 
-/// Canonical Postgres `timestamptz` (`"…+00"`, already UTC upstream) → micros since epoch.
-fn parse_timestamptz_micros(s: &str, col: &str) -> Result<i64, Error> {
-    let mut n = s.replacen(' ', "T", 1);
+/// Canonical Postgres `timestamptz` (`"…+00"`, already UTC upstream) → micros since epoch, through
+/// the same cleared and reused scratch its offset-less sibling uses — a `replacen` here would mean a
+/// fresh `String` per timestamptz cell, i.e. once per row per column.
+fn parse_timestamptz_micros(s: &str, col: &str, scratch: &mut String) -> Result<i64, Error> {
+    scratch.clear();
+    scratch.push_str(s);
+    if let Some(i) = scratch.find(' ') {
+        scratch.replace_range(i..i + 1, "T");
+    }
     // Postgres prints whole-hour offsets as `+HH`; jiff wants `+HH:MM`.
-    if let Some(t) = n.find('T')
-        && let Some(sign) = n.get(t..).and_then(|suffix| suffix.rfind(['+', '-']))
+    if let Some(t) = scratch.find('T')
+        && let Some(sign) = scratch.get(t..).and_then(|suffix| suffix.rfind(['+', '-']))
         && t.checked_add(sign)
-            .and_then(|start| n.get(start..))
+            .and_then(|start| scratch.get(start..))
             .is_some_and(|offset| offset.len() == 3)
     {
-        n.push_str(":00");
+        scratch.push_str(":00");
     }
-    rfc3339_micros(&n).ok_or_else(|| Error::value_parse(col, s, "TimestampTz"))
+    rfc3339_micros(scratch).ok_or_else(|| Error::value_parse(col, s, "TimestampTz"))
 }
 
 #[cfg(test)]
