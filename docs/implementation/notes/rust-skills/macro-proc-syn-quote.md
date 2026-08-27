@@ -100,15 +100,18 @@ one helper that downstream expansions must resolve.
 
 ### Current candidate census
 
-Walrus has exactly three declarative macro definitions, and each consumes all the tokens its output
+Walrus has exactly two declarative macro definitions, and each consumes all the tokens its output
 requires:
 
 - `string_enum!` has seven invocations. Each supplies the enum name, attributes, error path, column
   literal, and complete variant-to-string table, so no already-declared item needs inspection.
 - `typed_reload_row!` has four invocations. It accepts a row expression and expands the one fixed,
   known conversion into `ReloadRow`; it does not discover fields from a type definition.
-- `num_builder!` has five invocations. Each supplies a builder type and scalar type and expands the
-  corresponding `ArrowNumBuilder` implementation directly.
+
+`num_builder!` was the third until the `trait-blanket-impl` audit retired it: its five invocations
+named `PrimitiveBuilder<T>` aliases, so one blanket impl bounded on `T: ArrowPrimitiveType` where
+`T::Native: FromStr` emits the same `ArrowNumBuilder` bodies with no tokens to supply
+(`crates/pg-to-arrow/src/batch.rs`).
 
 The transparent integer IDs are also current implementations, not deferred candidates.
 `ManifestId`, `EpochNo`, `SchemaVersionNo`, and `ReloadId` already have their representation checks,

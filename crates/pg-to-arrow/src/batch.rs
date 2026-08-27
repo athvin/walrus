@@ -17,10 +17,10 @@ use crate::schema::{SINK_META_COLUMN, build_schema, tier1_data_type};
 use arrow::array::{
     ArrayBuilder, ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder,
     FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder,
-    Int64Builder, ListBuilder, RecordBatch, StringBuilder, StructBuilder, Time64MicrosecondBuilder,
-    TimestampMicrosecondBuilder, make_builder,
+    Int64Builder, ListBuilder, PrimitiveBuilder, RecordBatch, StringBuilder, StructBuilder,
+    Time64MicrosecondBuilder, TimestampMicrosecondBuilder, make_builder,
 };
-use arrow::datatypes::{DataType, Field, FieldRef, SchemaRef, TimeUnit};
+use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, FieldRef, SchemaRef, TimeUnit};
 use common::{PgColumn, PgRelation, SinkMeta, TupleValue};
 use std::fmt;
 use std::sync::Arc;
@@ -878,31 +878,35 @@ trait ArrowNumBuilder {
     fn append_null_val(&mut self);
 }
 
-// KEPT DELIBERATELY (PR 24.1, rule `macro-prefer-functions`). The rule's table sanctions a macro
-// for "implementing a trait for many unrelated types" — exactly this: five Arrow builder types
-// that share no upstream trait carrying the needed inherent `append_value`/`append_null`
-// operations, so neither a blanket impl nor a generic function can emit these bodies. `downcast!`
-// had a fixed arity, one type parameter, and no impl to emit, so it became `fn downcast<T>` in the
-// same PR. Arms stay `:ty`-precise — never `:tt`.
-macro_rules! num_builder {
-    ($b:ty, $t:ty) => {
-        impl ArrowNumBuilder for $b {
-            type Val = $t;
+/// One impl for every Arrow primitive builder whose native scalar parses from text.
+///
+/// `Int16Builder` … `Float64Builder` are not five unrelated types needing five hand-written (or
+/// macro-expanded) impls: each is an alias for `PrimitiveBuilder<T>`, whose inherent
+/// `append_value`/`append_null` are themselves generic over `T: ArrowPrimitiveType`. The bound is
+/// therefore all the bodies below need, and a numeric Arrow type added to [`append_value`]'s
+/// dispatch gets its impl for free.
+///
+/// `T::Native: FromStr` is the gate: it excludes the builders whose native scalar has no text
+/// parse (`i256`, the interval structs) and it is what lets `Val` satisfy the trait's own bound.
+/// The impl does cover more builders than [`append_num`] is called with — `Date32Builder` is also
+/// `PrimitiveBuilder<_>` over an `i32` — but which builder a column reaches is decided by the
+/// `DataType` arm in [`append_value`], and the temporal/decimal arms bind their own converters
+/// instead of `str::parse`. Being blanket, this also forecloses a per-builder override (E0119),
+/// which is the intent: every numeric builder appends through the same two forwarding calls.
+impl<T> ArrowNumBuilder for PrimitiveBuilder<T>
+where
+    T: ArrowPrimitiveType,
+    T::Native: std::str::FromStr,
+{
+    type Val = T::Native;
 
-            fn append_val(&mut self, v: Self::Val) {
-                self.append_value(v);
-            }
-            fn append_null_val(&mut self) {
-                self.append_null();
-            }
-        }
-    };
+    fn append_val(&mut self, v: Self::Val) {
+        self.append_value(v);
+    }
+    fn append_null_val(&mut self) {
+        self.append_null();
+    }
 }
-num_builder!(Int16Builder, i16);
-num_builder!(Int32Builder, i32);
-num_builder!(Int64Builder, i64);
-num_builder!(Float32Builder, f32);
-num_builder!(Float64Builder, f64);
 
 /// Extract the text of a value (for the text-format Tier-1 types).
 fn text<'a>(value: &'a TupleValue, col: &str, dt: &DataType) -> Result<&'a str, Error> {
