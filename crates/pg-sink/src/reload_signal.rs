@@ -45,7 +45,7 @@ type WaiterEntry = (u64, oneshot::Sender<Echo>);
 /// guard after a re-subscribe cannot evict the replacement waiter.
 #[derive(Debug, Default)]
 pub struct WatermarkWaiters {
-    // LOCK-CHOICE: parking_lot::Mutex — subscribe and resolve are both one-operation writes; see docs/implementation/notes/rust-skills/own-rwlock-readers.md.
+    // LOCK-CHOICE: parking_lot::Mutex — every production access is a one-operation write; the lone reader is a test-facing `len()`. See docs/implementation/notes/rust-skills/own-rwlock-readers.md.
     waiters: Mutex<HashMap<WaiterKey, WaiterEntry>>,
     next_generation: AtomicU64,
     /// Cross-check violations observed (mirrors the Prometheus counter so unit tests — which run

@@ -12,25 +12,32 @@ better choice. Both remaining walrus locks fall on that side of the boundary.
 
 ## The two locks, measured
 
+Line numbers are deliberately omitted: cite the field, not a line that drifts.
+
 | Field | Accessor | Access | Guard hold time |
 |---|---|---|---|
-| `WatermarkWaiters::waiters` (`crates/pg-sink/src/reload_signal.rs:46`) | `subscribe` | Write: one `HashMap::insert` | One map operation |
-| `WatermarkWaiters::waiters` (`crates/pg-sink/src/reload_signal.rs:46`) | `resolve` | Write: one `HashMap::remove` | One map operation; the guard drops before notification or logging |
-| `LoaderState::last_poll_completed_at` (`crates/loader/src/health.rs:29`) | `stamp_poll` | Write: replace the timestamp after every apply-worker poll cycle | One assignment |
-| `LoaderState::last_poll_completed_at` (`crates/loader/src/health.rs:29`) | `is_live` | Read: the kubelet `/healthz` probe checks `is_some()` | One predicate |
+| `WatermarkWaiters::waiters` (`crates/pg-sink/src/reload_signal.rs`) | `subscribe` | Write: one `HashMap::insert` | One map operation |
+| `WatermarkWaiters::waiters` | `unsubscribe` (the guard's `Drop`) | Write: one generation-checked `HashMap::remove` | One lookup plus its removal |
+| `WatermarkWaiters::waiters` | `resolve` | Write: one `HashMap::remove` | One map operation; the guard drops before notification or logging |
+| `WatermarkWaiters::waiters` | `waiter_count` | Read: one `HashMap::len` — the registry's only reader, and only `reload_signal_test.rs` calls it | One length query |
+| `LoaderState::last_poll_completed_at` (`crates/loader/src/health.rs`) | `stamp_poll` | Write: replace the timestamp after every apply-worker poll cycle | One assignment |
+| `LoaderState::last_poll_completed_at` | `is_live` | Read: the kubelet `/healthz` probe checks `is_some()` | One predicate |
 
-The reload registry is 100% writes: it has no read-only accessor. The health timestamp is also
-write-dominated because every apply worker stamps every poll cycle while only the kubelet health
-probe reads it. Neither field has multiple concurrent readers doing enough work to amortize reader
-tracking.
+Every production access to the reload registry mutates it; the lone read-only accessor,
+`waiter_count`, exists so unit tests can assert the in-flight count. The health timestamp is
+write-dominated too: one apply worker per owned table stamps every cycle (`poll_interval` defaults
+to 5s) against a single kubelet probe at `periodSeconds: 10`. Neither field has multiple concurrent
+readers doing enough work to amortize reader tracking.
 
 ## Why RwLock loses (twice)
 
-`RwLock` would add reader bookkeeping to the reload registry despite having zero reads. On the
-health timestamp it would optimize the less-frequent probe while charging every poll-cycle write.
-All four critical sections are a single map operation, assignment, or predicate, so there is no
-long read-side work for concurrent readers to overlap. A mutex keeps the shorter and more accurate
-API for both access patterns.
+`RwLock` would add reader bookkeeping to the reload registry to serve one test-only `len()`. On the
+health timestamp it would optimize the less-frequent probe while charging every poll-cycle write —
+and there is nothing to overlap: the stampers all run on the loader's single `LocalSet` thread and
+`/healthz` is the only reader, so two read guards never even coexist. Every critical section above
+is a single map operation, assignment, or predicate, so there is no long read-side work for
+concurrent readers to overlap. A mutex keeps the shorter and more accurate API for both access
+patterns.
 
 ## Why parking_lot, not std::sync
 
