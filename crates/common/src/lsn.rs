@@ -121,6 +121,12 @@ impl std::ops::Sub<&Lsn> for &Lsn {
 }
 
 /// Advance a WAL position by `bytes`.
+///
+/// **Saturates at [`u64::MAX`]** rather than wrapping or panicking, so the operator's overflow
+/// behaviour is stated where a reader meets it — as the `Sub` above states its own clamp. This end
+/// needs no named spelling the way [`Lsn::saturating_sub_bytes`] does: a real WAL position is
+/// nowhere near 2^64, so the ceiling guards a corrupt operand instead of encoding the reachable
+/// policy decision the retention floor makes.
 impl std::ops::Add<u64> for Lsn {
     type Output = Lsn;
 
@@ -129,6 +135,8 @@ impl std::ops::Add<u64> for Lsn {
     }
 }
 
+/// The in-place spelling of the [`Add`](std::ops::Add) above, saturation included — a compound
+/// assignment must never mean something its binary form does not.
 impl std::ops::AddAssign<u64> for Lsn {
     fn add_assign(&mut self, bytes: u64) {
         *self = *self + bytes;

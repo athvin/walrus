@@ -125,6 +125,16 @@ fn addition_advances_a_position() {
     assert_eq!(lsn, Lsn::new(124));
 }
 
+/// The documented ceiling: `+` clamps at `u64::MAX` instead of wrapping or panicking, and the
+/// compound form means exactly the same thing.
+#[test]
+fn addition_saturates_instead_of_wrapping() {
+    assert_eq!(Lsn::new(u64::MAX) + 1, Lsn::new(u64::MAX));
+    let mut lsn = Lsn::new(u64::MAX - 1);
+    lsn += 5;
+    assert_eq!(lsn, Lsn::new(u64::MAX));
+}
+
 #[test]
 fn saturating_sub_bytes_bottoms_out_at_zero() {
     assert_eq!(Lsn::new(300).saturating_sub_bytes(100), Lsn::new(200));
