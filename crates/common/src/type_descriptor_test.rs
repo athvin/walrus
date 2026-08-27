@@ -19,6 +19,18 @@ const DOCS_DESCRIPTOR: &str = r#"{
         }
     }"#;
 
+/// A tier-1 scalar descriptor as an older sink wrote it: no `recombine`, no `meta`. `schema_registry`
+/// is never pruned, so rows in this shape stay readable forever.
+const LEGACY_SCALAR_DESCRIPTOR: &str = r#"{
+        "column": "id",
+        "pg_type_oid": 23,
+        "pg_type": "int4",
+        "tier": 1,
+        "arrow": "Int32",
+        "duckdb": "INTEGER",
+        "emit": ["id:INT32"]
+    }"#;
+
 #[test]
 fn tier_serializes_as_integer() {
     assert_eq!(serde_json::to_string(&Tier::One).unwrap(), "1");
@@ -91,6 +103,45 @@ fn tier_one_scalar_descriptor_round_trips() {
 
     let back: TypeDescriptor = serde_json::from_value(v).unwrap();
     assert_eq!(back, d);
+}
+
+#[test]
+fn descriptor_without_meta_loads_as_no_metadata() {
+    let d: TypeDescriptor = serde_json::from_str(LEGACY_SCALAR_DESCRIPTOR).unwrap();
+
+    assert_eq!(d.meta, TypeMeta::default());
+    assert_eq!(d.recombine, None);
+    assert_eq!(d.tier, Tier::One);
+
+    // The omitted key is a read-side allowance only: writing it back restores the §2.6 shape.
+    let v: serde_json::Value = serde_json::to_value(&d).unwrap();
+    assert_eq!(v["meta"]["enum_labels"], serde_json::Value::Null);
+}
+
+#[test]
+fn a_missing_mapping_key_is_still_a_hard_error() {
+    // Only `meta` defaults — dropping a mapping key must stay a loud decode failure, never a
+    // silently wrong plan.
+    for key in ["column", "pg_type_oid", "pg_type", "tier", "arrow", "duckdb", "emit"] {
+        let mut doc: serde_json::Value = serde_json::from_str(LEGACY_SCALAR_DESCRIPTOR).unwrap();
+        doc.as_object_mut().unwrap().remove(key);
+
+        let error = serde_json::from_value::<TypeDescriptor>(doc).unwrap_err();
+        assert!(
+            error.to_string().contains(&format!("missing field `{key}`")),
+            "missing {key} must remain a hard error: {error}"
+        );
+    }
+}
+
+#[test]
+fn type_meta_defaults_every_key() {
+    // The all-optional metadata bag: an empty object is `TypeMeta::default()`, so a registry row
+    // that predates a metadata key still loads.
+    assert_eq!(
+        serde_json::from_str::<TypeMeta>("{}").unwrap(),
+        TypeMeta::default()
+    );
 }
 
 #[test]

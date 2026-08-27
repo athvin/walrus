@@ -60,7 +60,14 @@ impl From<Tier> for u8 {
 
 /// Metadata that Parquet/DuckDB lose on read; the loader re-applies it (§2.6). Each field is
 /// `None` unless the column's type needs it.
+///
+/// Every key is optional on the wire, so the whole container defaults. `schema_registry` is history
+/// and is **never pruned** (see `control::schema_registry`), so a descriptor written by an older
+/// sink must still load into a newer build: a metadata key that row predates fills from
+/// [`Default`] instead of failing the read. `#[serde(default)]` affects deserialization only — the
+/// §2.6 document still carries every key on the way out.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TypeMeta {
     /// Ordered label set for an `enum`.
     pub enum_labels: Option<Vec<String>>,
@@ -80,6 +87,9 @@ const _: () = assert!(
 );
 
 /// Per-column mapping descriptor written to `schema_registry` (§2.6).
+///
+/// Only [`meta`](Self::meta) defaults on read; every identity and mapping key stays required, so a
+/// truncated registry row is still a loud decode failure rather than a silently wrong plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypeDescriptor {
     pub column: String,
@@ -94,6 +104,10 @@ pub struct TypeDescriptor {
     pub emit: Vec<String>,
     /// The loader-side recombine expression; `None` for a tier-1 scalar that needs none.
     pub recombine: Option<String>,
+    /// The metadata the loader re-applies. A default [`TypeMeta`] — every key `None` — means
+    /// "nothing to re-apply", which is exactly what a tier-1 scalar carries, so a registry row that
+    /// omits the key loads as "no metadata" instead of failing the loader's decode.
+    #[serde(default)]
     pub meta: TypeMeta,
 }
 
