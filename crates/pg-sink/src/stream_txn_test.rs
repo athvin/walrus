@@ -273,7 +273,7 @@ fn survivors_borrows_only_the_aborted_set() {
         values: Box::default(),
         lsn: "0/101".parse().unwrap(),
     });
-    let survivors = txn.survivors();
+    let survivors = txn.iter_survivors();
     let begin_lsn = txn.begin_lsn;
     let staged_len = txn.staged.len();
 

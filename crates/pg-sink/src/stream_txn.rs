@@ -19,7 +19,7 @@
 //!
 //! **top vs sub xid (proto §7).** `Stream Start` carries the **top-level** xid; every streamed change
 //! carries its **sub**-xid. The abort names the sub-xid — each buffered/spilled row is tagged with its
-//! sub-xid so `survivors` excludes exactly the aborted ones. *Freeing memory (the spill) is NOT
+//! sub-xid so `iter_survivors` excludes exactly the aborted ones. *Freeing memory (the spill) is NOT
 //! advancing the slot or making data visible (the `ready` row).*
 
 use crate::batch::{BatchTriggers, Clock, SystemClock, TableBatcher};
@@ -72,7 +72,7 @@ struct StreamedTxn {
     keys: HashSet<(TableId, u32)>,
     /// Speculatively-spilled files, each homogeneous in one sub-xid (droppable on that sub-xid's abort).
     staged: Vec<StagedSpill>,
-    /// Sub-xids that rolled back (`Stream Abort {sub != top}`) — excluded from `survivors`.
+    /// Sub-xids that rolled back (`Stream Abort {sub != top}`) — excluded from `iter_survivors`.
     aborted: HashSet<u32>,
 }
 
@@ -113,7 +113,7 @@ impl StreamedTxn {
     ///
     /// `aborted` is bound to a local first: a `move` closure reading `self.aborted` would truncate
     /// the capture path at the `*self` deref and capture the whole `&StreamedTxn` (RFC 2229).
-    fn survivors(&self) -> impl Iterator<Item = &StreamedChange> {
+    fn iter_survivors(&self) -> impl Iterator<Item = &StreamedChange> {
         let aborted = &self.aborted;
         self.changes
             .iter()
@@ -460,7 +460,7 @@ impl<C: Clock + Clone> StreamDemux<C> {
         self.release_txn_meter(&txn);
         let mut out = Vec::new();
         // Publish speculative spills whose sub-xid did NOT abort, stamped with the real commit LSN.
-        // `take` moves the spill vector out without moving `txn`, so `txn.survivors()` remains usable.
+        // `take` moves the spill vector out without moving `txn`, so `txn.iter_survivors()` remains usable.
         for spill in std::mem::take(&mut txn.staged) {
             if txn.aborted.contains(&spill.sub_xid) {
                 if let Err(error) = sink.delete(&spill.written.key).await {
@@ -484,7 +484,7 @@ impl<C: Clock + Clone> StreamDemux<C> {
             self.sink_instance.clone(),
         );
         let mut batchers: HashMap<TableId, TableBatcher<C>> = HashMap::new();
-        for c in txn.survivors() {
+        for c in txn.iter_survivors() {
             let Some(cached) = cache.latest_for(c.oid.0) else {
                 continue;
             };
@@ -557,7 +557,7 @@ impl<C: Clock + Clone> StreamDemux<C> {
     fn survivor_count(&self, top_xid: u32) -> usize {
         self.open
             .get(&top_xid)
-            .map(|t| t.survivors().count())
+            .map(|t| t.iter_survivors().count())
             .unwrap_or(0)
     }
 }

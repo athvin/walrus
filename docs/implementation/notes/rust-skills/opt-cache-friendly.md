@@ -27,7 +27,7 @@ subset of each element's fields — does not occur. The three row-shaped arrays 
   iteration. Splitting the pair into parallel vectors would turn one sequential stream into two for
   no fewer bytes read.
 - `StreamedTxn::changes: Vec<StreamedChange>` (`crates/pg-sink/src/stream_txn.rs:37-55`) is filtered
-  by `sub_xid` in `survivors` (`:110-121`) and by `(oid, sub_xid)` in `take_stream` (`:96-104`) — but
+  by `sub_xid` in `iter_survivors` (`:110-121`) and by `(oid, sub_xid)` in `take_stream` (`:96-104`) — but
   in both cases the *matching* element is then read or moved in full. The predicate's bytes and the
   consumer's bytes share a cache line, which is precisely the AoS advantage; an SoA split would pay
   a second stream to avoid loading bytes it is about to need. `StreamedChange` carries an exact 40 B
