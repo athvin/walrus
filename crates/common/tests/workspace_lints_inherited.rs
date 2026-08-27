@@ -188,6 +188,25 @@ fn the_workspace_lint_table_denies_redundant_method_closures() {
     );
 }
 
+/// `extern` blocks are the one FFI surface walrus does not own: the native engine arrives through
+/// `duckdb`'s pinned `libduckdb-sys`, so first-party sources declare none. Edition 2024 already
+/// makes the pre-2024 `extern "C" { … }` spelling a hard error — but only for a member on that
+/// edition. A crate added with `edition = "2021"` gets nothing but this named deny, which is
+/// allow-by-default and so out of reach of `warnings = "deny"`.
+#[test]
+fn the_workspace_lint_table_still_denies_pre_2024_extern_blocks() {
+    let root_manifest = std::fs::read_to_string(repo_root().join("Cargo.toml")).unwrap();
+    let rust = section(&root_manifest, "[workspace.lints.rust]")
+        .expect("root manifest must define [workspace.lints.rust]");
+    assert_eq!(
+        rust.lines()
+            .filter(|line| line.trim() == r#"missing_unsafe_on_extern = "deny""#)
+            .count(),
+        1,
+        "workspace policy must reject un-`unsafe` extern blocks exactly once"
+    );
+}
+
 #[test]
 fn the_clippy_carve_out_is_still_scoped_to_tests() {
     let cfg = std::fs::read_to_string(repo_root().join("clippy.toml")).unwrap();
