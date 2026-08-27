@@ -239,7 +239,7 @@ impl PendingSignal {
         xid: Option<u32>,
     ) -> Result<Self, SignalTupleError> {
         Ok(PendingSignal {
-            reload_id: ReloadId(signal_field(rel, new, "reload_id")?),
+            reload_id: signal_field(rel, new, "reload_id")?,
             chunk_no: signal_field(rel, new, "chunk_no")?,
             embedded_lsn: signal_field(rel, new, "wal_insert_lsn")?,
             xid,

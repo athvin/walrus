@@ -17,6 +17,12 @@
 //! positive.) `Octal` and `Binary` are deliberately absent: a `bigserial` key, a generation counter,
 //! and a schema version have no base-8 or base-2 reading. [`Lsn`](crate::Lsn) implements all four
 //! because a WAL byte address does.
+//!
+//! Reading text back is a separate question from printing it, and the answer is not shared:
+//! [`ReloadId`] alone implements [`FromStr`](std::str::FromStr), because it is the only one of the
+//! five that ever arrives as a *string* — the sink decodes `walrus.reload_signal.reload_id` out of a
+//! pgoutput tuple, whose columns are text. The other four reach Rust as `int8` through SQLx, so a
+//! parser for them would be an unused second way to build an id out of untrusted text.
 
 use std::fmt;
 use std::mem::{align_of, size_of};
@@ -196,6 +202,30 @@ impl From<i64> for ReloadId {
 impl From<ReloadId> for i64 {
     fn from(value: ReloadId) -> Self {
         value.0
+    }
+}
+
+/// The inverse of the [`Display`](fmt::Display) above — exactly `i64`'s decimal grammar, so
+/// `id.to_string().parse()` round-trips.
+///
+/// This is the standard hook, not a named `parse_reload_id`, because the one caller is *generic*:
+/// `pg_sink::reload_signal` pulls every signal column out of a text pgoutput tuple through one
+/// helper bound by `T: FromStr`, so without this impl the id — alone among the three columns — has
+/// to be parsed as a bare `i64` and re-wrapped at the call site.
+///
+/// The `Err` type is `i64`'s own [`ParseIntError`](std::num::ParseIntError) rather than a bespoke
+/// error: this parse *is* the inner integer's, so forwarding its rejection keeps the two text
+/// directions as symmetric as the formatting delegation above. Contrast [`Lsn`](crate::Lsn), whose
+/// dual-dialect hex grammar is walrus's own and therefore owns a walrus error.
+impl std::str::FromStr for ReloadId {
+    type Err = std::num::ParseIntError;
+
+    /// # Errors
+    ///
+    /// Returns [`ParseIntError`](std::num::ParseIntError) when `s` is not a decimal `i64` — empty,
+    /// non-numeric, surrounded by whitespace, or out of range.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        s.parse().map(ReloadId)
     }
 }
 

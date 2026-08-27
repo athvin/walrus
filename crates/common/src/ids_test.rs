@@ -136,6 +136,29 @@ fn reload_id_from_i64_and_back_round_trips() {
     assert_eq!(i64::from(reload_id), 11);
 }
 
+/// `ReloadId` is the one id decoded from *text* (a `reload_signal` pgoutput tuple), so its parse
+/// must be exactly the inverse of the `Display` above — no bespoke dialect, no silent trimming.
+#[test]
+fn reload_id_parses_back_from_its_display_form() {
+    assert_eq!("11".parse::<ReloadId>().unwrap(), ReloadId(11));
+    assert_eq!("-1".parse::<ReloadId>().unwrap(), ReloadId(-1));
+    for id in [ReloadId(0), ReloadId(990_042), ReloadId(i64::MIN)] {
+        assert_eq!(id.to_string().parse::<ReloadId>().unwrap(), id);
+    }
+}
+
+/// A malformed signal column must reject rather than land some default id on a waiter key, so the
+/// rejected shapes are pinned as `i64`'s exactly — including the range edge a `bigserial` can reach.
+#[test]
+fn reload_id_rejects_everything_the_inner_integer_rejects() {
+    assert!("".parse::<ReloadId>().is_err());
+    assert!("nine".parse::<ReloadId>().is_err());
+    assert!(" 7".parse::<ReloadId>().is_err());
+    assert!("7 ".parse::<ReloadId>().is_err());
+    assert!("7.0".parse::<ReloadId>().is_err());
+    assert!("9223372036854775808".parse::<ReloadId>().is_err()); // i64::MAX + 1
+}
+
 #[test]
 fn reload_id_ordering_matches_the_inner_integer() {
     assert!(ReloadId(1) < ReloadId(2));

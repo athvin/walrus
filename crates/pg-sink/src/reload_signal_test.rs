@@ -216,6 +216,25 @@ fn non_insert_ops_on_signal_table_are_ignored() {
     );
 }
 
+/// The id column is parsed as a `ReloadId`, not as a bare `i64` the caller re-wraps, so this pins
+/// that the typed parse still accepts the wire's decimal text and still names `reload_id` when it
+/// does not — a signal whose id silently defaulted would resolve some other exporter's waiter.
+#[test]
+fn reload_id_column_parses_as_the_typed_id_or_names_itself() {
+    let rel = signal_rel();
+    let parsed = PendingSignal::from_tuple(&rel, &tuple("990042", "1", "0/100"), None)
+        .expect("well-formed tuple");
+    assert_eq!(parsed.reload_id, reload(990_042));
+
+    for bad in ["", "nine", "9223372036854775808"] {
+        assert_eq!(
+            PendingSignal::from_tuple(&rel, &tuple(bad, "1", "0/100"), None),
+            Err(SignalTupleError("reload_id")),
+            "reload_id {bad:?}"
+        );
+    }
+}
+
 #[test]
 fn subtransaction_aborted_signal_never_resolves_the_waiter() {
     // proto-version.md §9b: a rolled-back savepoint's rows ARE streamed; only the Stream
