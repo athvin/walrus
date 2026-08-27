@@ -128,7 +128,11 @@ version skew to hide, so walrus does not add a seventh, host-compiled crate. The
 from PR 24.7 remains unchanged: when walrus needs a derive that must inspect fields or types from an
 already-declared item, use the rule's proc-macro implementation crate plus ordinary facade split.
 
-Guard invariant 2 rejects a `proc-macro` library setting in any workspace manifest. Invariant 3
+Guard invariant 2 rejects a `proc-macro` library setting in any workspace manifest, in each spelling
+Cargo accepts: the documented `[lib] proc-macro` key, its historical `proc_macro` alias, and a
+`crate-type` entry naming `proc-macro` inline or as an array element. The alternative spellings are
+the ones invariant 3 cannot see — converting an existing member leaves the package count at six, and
+`proc_macro` ships with the toolchain, so invariant 1 finds no new dependency either. Invariant 3
 uses locked, offline `cargo metadata --no-deps` output to require exactly six packages. The existing
 always-on `supply-chain` step runs those checks together with PR 24.7's direct-dependency invariant,
 so changing the workspace shape requires updating this decision and its guard in the same review.

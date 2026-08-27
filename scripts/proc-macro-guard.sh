@@ -37,7 +37,15 @@ check_proc_macro_setting() {
   local declared
   # No match is the success case. Preserve grep's exit 1 under `set -e`, then decide from the
   # captured diagnostics so whitespace variants such as `proc-macro=true` are still rejected.
-  declared=$(grep -nEH -- '^[[:space:]]*proc-macro[[:space:]]*=' "$@" || true)
+  #
+  # Three spellings declare the same host-compiled target, so all three are rejected: the documented
+  # `[lib] proc-macro` key, the `proc_macro` alias Cargo still honours (as it does `crate_type`), and
+  # a `crate-type` entry naming `proc-macro` — inline, or as one element of a multi-line array. The
+  # last two matter because invariant 3 only sees a *new* member: converting an existing crate keeps
+  # the count at six, and `proc_macro` ships with the toolchain, so invariant 1 sees no new dependency.
+  declared=$(grep -nEH -- \
+    '^[[:space:]]*proc[-_]macro[[:space:]]*=|^[[:space:]]*crate[-_]type[[:space:]]*=.*proc-macro|^[[:space:]]*"proc-macro"' \
+    "$@" || true)
 
   if [ -n "$declared" ]; then
     echo "::error::a workspace manifest declares a proc-macro library setting — read docs/implementation/notes/rust-skills/macro-proc-syn-quote.md (§ The two-crate split) before adding one"
@@ -82,6 +90,12 @@ self_test() {
     >"$PROC_MACRO_GUARD_FIXTURE_DIR/fixture/dependency-tables.toml"
   printf '%s\n' '[lib]' '  proc-macro=true' \
     >"$PROC_MACRO_GUARD_FIXTURE_DIR/fixture/proc-macro.toml"
+  printf '%s\n' '[lib]' 'proc_macro = true' \
+    >"$PROC_MACRO_GUARD_FIXTURE_DIR/fixture/proc-macro-underscore.toml"
+  printf '%s\n' '[lib]' 'crate-type = ["proc-macro"]' \
+    >"$PROC_MACRO_GUARD_FIXTURE_DIR/fixture/crate-type-inline.toml"
+  printf '%s\n' '[lib]' 'crate_type = [' '  "proc-macro",' ']' \
+    >"$PROC_MACRO_GUARD_FIXTURE_DIR/fixture/crate-type-array.toml"
 
   mkdir -p "$PROC_MACRO_GUARD_FIXTURE_DIR/seven-member-workspace"
   printf '%s\n' '[workspace]' 'resolver = "3"' \
@@ -129,8 +143,9 @@ self_test() {
   done
 
   if output=$(check_proc_macro_setting \
-    "$PROC_MACRO_GUARD_FIXTURE_DIR/fixture/proc-macro.toml" 2>&1); then
-    echo "::error::proc-macro guard self-test expected the proc-macro manifest fixture to be rejected"
+    "$PROC_MACRO_GUARD_FIXTURE_DIR"/fixture/proc-macro*.toml \
+    "$PROC_MACRO_GUARD_FIXTURE_DIR"/fixture/crate-type*.toml 2>&1); then
+    echo "::error::proc-macro guard self-test expected every proc-macro manifest fixture to be rejected"
     echo "$output"
     new_controls_failed=1
   else
@@ -138,7 +153,13 @@ self_test() {
     for expected in \
       '::error::a workspace manifest declares a proc-macro library setting' \
       'fixture/proc-macro.toml' \
-      'proc-macro=true'; do
+      'proc-macro=true' \
+      'fixture/proc-macro-underscore.toml' \
+      'proc_macro = true' \
+      'fixture/crate-type-inline.toml' \
+      'crate-type = ["proc-macro"]' \
+      'fixture/crate-type-array.toml' \
+      '"proc-macro",'; do
       if ! grep -Fq -- "$expected" <<<"$output"; then
         echo "::error::proc-macro guard self-test did not report expected proc-macro fixture detail: $expected"
         exit 1
