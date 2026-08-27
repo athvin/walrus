@@ -41,12 +41,19 @@ impl<'a> Reader<'a> {
         self.buf.get(self.pos).copied()
     }
 
+    // The three private helpers below carry `#[inline]` for the same reason the public accessors do:
+    // an `#[inline]` body is exported for downstream crates to inline, but the non-generic items it
+    // *calls* are not. Without the hint a caller inlines `byte1`/`slice` and still emits a call back
+    // into `need`, which is where the whole bounds proof lives. Each body is ≤ 5 lines, and the
+    // error branch stays out of line in the `#[cold] #[inline(never)]` `eof` below.
     /// The unread tail. Successful reads are the only way `pos` advances, so the fallback is dead.
+    #[inline]
     fn rest(&self) -> &'a [u8] {
         self.buf.get(self.pos..).unwrap_or_default()
     }
 
     /// Error unless at least `n` bytes remain, returning exactly the checked head.
+    #[inline]
     fn need(&self, n: usize) -> Result<&'a [u8], DecodeError> {
         self.rest()
             .get(..n)
@@ -54,6 +61,7 @@ impl<'a> Reader<'a> {
     }
 
     /// Borrow `N` bytes at the cursor, advancing only after a successful width proof.
+    #[inline]
     fn fixed<const N: usize>(&mut self) -> Result<&'a [u8; N], DecodeError> {
         let head = self.need(N)?;
         // `need(N)` returned exactly N bytes, so this branch is unreachable. Keep it modelled
@@ -83,6 +91,7 @@ impl<'a> Reader<'a> {
     /// # Errors
     ///
     /// Returns [`DecodeError::UnexpectedEof`] when fewer than two bytes remain.
+    #[inline]
     pub fn int16(&mut self) -> Result<u16, DecodeError> {
         Ok(u16::from_be_bytes(*self.fixed()?))
     }
@@ -92,6 +101,7 @@ impl<'a> Reader<'a> {
     /// # Errors
     ///
     /// Returns [`DecodeError::UnexpectedEof`] when fewer than four bytes remain.
+    #[inline]
     pub fn int32(&mut self) -> Result<u32, DecodeError> {
         Ok(u32::from_be_bytes(*self.fixed()?))
     }
@@ -102,6 +112,7 @@ impl<'a> Reader<'a> {
     /// # Errors
     ///
     /// Returns [`DecodeError::UnexpectedEof`] when fewer than eight bytes remain.
+    #[inline]
     pub fn int64(&mut self) -> Result<i64, DecodeError> {
         Ok(i64::from_be_bytes(*self.fixed()?))
     }
