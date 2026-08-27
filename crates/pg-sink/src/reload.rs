@@ -636,16 +636,15 @@ impl ReloadController {
             let end = lease_guarded_export(
                 child,
                 ttl / 3,
-                move || {
-                    let pool = renew_pool.clone();
-                    let holder = holder.clone();
+                // An `async` closure, not `move || { .. async move { .. } }`: the `AsyncFnMut`
+                // bound links the renewal future's lifetime to the call, so the body borrows the
+                // pool and the holder straight from the closure — no per-tick clone of either.
+                async move || {
                     // Acquire pairs with the DDL-restart Release that repoints lease renewal.
                     let reload_id = common::ReloadId(renew_id.load(Ordering::Acquire));
-                    async move {
-                        control::reload::renew_lease(&pool, reload_id, &holder, ttl_secs(ttl))
-                            .await
-                            .with_context(|| format!("renew lease for reload {reload_id}"))
-                    }
+                    control::reload::renew_lease(&renew_pool, reload_id, &holder, ttl_secs(ttl))
+                        .await
+                        .with_context(|| format!("renew lease for reload {reload_id}"))
                 },
                 export,
             )

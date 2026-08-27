@@ -79,15 +79,16 @@ fn an_ad_hoc_preflight_failure_is_infra_never_a_rejection() {
 #[tokio::test(start_paused = true)]
 async fn lost_lease_cancels_the_exporter() {
     let token = CancellationToken::new();
-    // First renewal succeeds, second reports the lease gone.
-    let calls = Arc::new(AtomicUsize::new(0));
-    let calls_in = Arc::clone(&calls);
+    // First renewal succeeds, second reports the lease gone. The `AsyncFnMut` bound lets the
+    // attempt mutate a plain local counter — no `Arc<AtomicUsize>` to smuggle it out of the
+    // closure, which the old `R: FnMut() -> Fut` bound would have forced.
+    let mut calls = 0_usize;
     let end = lease_guarded_export(
         token,
         Duration::from_secs(20),
-        move || {
-            let n = calls_in.fetch_add(1, Ordering::SeqCst);
-            async move { Ok(n == 0) }
+        async || {
+            calls += 1;
+            Ok(calls == 1)
         },
         async {
             std::future::pending::<()>().await;
@@ -96,15 +97,14 @@ async fn lost_lease_cancels_the_exporter() {
     )
     .await;
     assert!(matches!(end, ExporterEnd::LostLease), "got {end:?}");
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(calls, 2);
 }
 
 #[tokio::test(start_paused = true)]
 async fn transient_renewal_errors_do_not_cancel() {
     let token = CancellationToken::new();
     let cancel = token.clone();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let calls_in = Arc::clone(&calls);
+    let mut calls = 0_usize;
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(70)).await;
         cancel.cancel();
@@ -112,9 +112,9 @@ async fn transient_renewal_errors_do_not_cancel() {
     let end = lease_guarded_export(
         token,
         Duration::from_secs(20),
-        move || {
-            calls_in.fetch_add(1, Ordering::SeqCst);
-            async move { Err(anyhow::anyhow!("control-pg blinked")) }
+        async || {
+            calls += 1;
+            Err(anyhow::anyhow!("control-pg blinked"))
         },
         async {
             std::future::pending::<()>().await;
@@ -124,7 +124,7 @@ async fn transient_renewal_errors_do_not_cancel() {
     .await;
     // Errors are retried (the lease expiry is the real deadline); only cancellation ends it.
     assert!(matches!(end, ExporterEnd::Cancelled), "got {end:?}");
-    assert!(calls.load(Ordering::SeqCst) >= 3);
+    assert!(calls >= 3);
 }
 
 #[tokio::test]
