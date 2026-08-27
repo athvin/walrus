@@ -108,10 +108,10 @@ pub fn prune_raw(
     t: &TransformSql,
     floor: Lsn,
 ) -> Result<u64, LoaderError> {
-    // The delete target comes back from `TransformSql::raw` tagged `DuckTable<Raw>` rather than being
-    // re-suffixed here: this `DELETE` pointed at the mirror would erase every current row, so the one
-    // place that derives `<table>_raw` is the typed-name layer.
-    let raw = t.raw();
+    // The delete target comes back from `TransformSql::to_raw` tagged `DuckTable<Raw>` rather than
+    // being re-suffixed here: this `DELETE` pointed at the mirror would erase every current row, so
+    // the one place that derives `<table>_raw` is the typed-name layer.
+    let raw = t.to_raw();
     let n = conn
         .execute(
             &format!(

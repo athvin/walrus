@@ -587,8 +587,8 @@ fn continuation_sql(
         let literals: Vec<String> = values
             .iter()
             .map(|v| match v {
-                serde_json::Value::String(s) => s.quoted_literal(),
-                other => other.to_string().quoted_literal(),
+                serde_json::Value::String(s) => s.to_quoted_literal(),
+                other => other.to_string().to_quoted_literal(),
             })
             .collect();
         let _write_result = write!(

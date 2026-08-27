@@ -233,7 +233,7 @@ impl TableDb {
             .collect::<Result<Vec<_>, LoaderError>>()?
             .join(", ");
         let commit_lsn_expr = match commit_lsn_override {
-            Some(lsn) => lsn.quoted_literal(),
+            Some(lsn) => lsn.to_quoted_literal(),
             None => "json_extract_string(walrus_pg_sink_meta, '$.commit_lsn')".to_string(),
         };
         let sql = APPEND_PARQUET

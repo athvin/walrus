@@ -13,9 +13,10 @@ pub struct WorkerFailure {
 }
 
 impl WorkerFailure {
-    /// Return the operator-facing `schema.table` key.
+    /// Return the operator-facing `schema.table` key. Formats a fresh `String` per call — hence
+    /// `to_`; the two names themselves are borrowable fields.
     #[must_use]
-    pub fn table_key(&self) -> String {
+    pub fn to_table_key(&self) -> String {
         format!("{}.{}", self.schema, self.table)
     }
 }
@@ -34,14 +35,14 @@ pub fn report(tx: &mpsc::Sender<WorkerFailure>, failure: WorkerFailure) {
         Ok(()) => {}
         Err(mpsc::error::TrySendError::Full(failure)) => {
             tracing::warn!(
-                table = %failure.table_key(),
+                table = %failure.to_table_key(),
                 error = %failure.error,
                 "worker failure channel full; dropping additional failure"
             );
         }
         Err(mpsc::error::TrySendError::Closed(failure)) => {
             tracing::warn!(
-                table = %failure.table_key(),
+                table = %failure.to_table_key(),
                 error = %failure.error,
                 "worker failure channel closed; supervisor already exited"
             );
@@ -70,7 +71,7 @@ where
             Some(failure) = rx.recv() => {
                 if first.is_none() {
                     tracing::error!(
-                        table = %failure.table_key(),
+                        table = %failure.to_table_key(),
                         error = %failure.error,
                         "apply worker failed; cancelling loader"
                     );
@@ -78,7 +79,7 @@ where
                     first = Some(failure);
                 } else {
                     tracing::error!(
-                        table = %failure.table_key(),
+                        table = %failure.to_table_key(),
                         error = %failure.error,
                         "additional apply worker failed during drain"
                     );

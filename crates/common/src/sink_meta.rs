@@ -297,10 +297,14 @@ impl SinkMeta {
     /// The batch-constant fields as a brace-less JSON fragment (e.g. `"epoch":7,"batch_id":"…",…`),
     /// serialized once per sealed batch and cached by the batcher.
     ///
+    /// Serializes and allocates on every call — hence `to_`, unlike the appending
+    /// [`Self::write_row_json_inner`]. Amortizing this cost is the entire point of the split, so a
+    /// caller that invokes it per row has undone it.
+    ///
     /// # Errors
     ///
     /// Returns [`serde_json::Error`] if a batch-constant provenance field cannot be serialized.
-    pub fn const_json_inner(&self) -> std::result::Result<String, serde_json::Error> {
+    pub fn to_const_json_inner(&self) -> std::result::Result<String, serde_json::Error> {
         let s = serde_json::to_string(&MetaConst {
             epoch: self.epoch,
             batch_id: &self.batch_id,

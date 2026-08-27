@@ -99,8 +99,11 @@ impl InflightMeter {
     /// meter and owner index.
     ///
     /// Tuple ordering provides a deterministic total order: bytes, then table id, then xid.
+    ///
+    /// Allocates and heapifies one entry per open stream — hence `to_`: build it once per shed
+    /// episode, never per candidate.
     #[must_use = "the heap snapshot must be drained to select spill candidates"]
-    pub fn spill_order(&self) -> BinaryHeap<(u64, TableId, u32)> {
+    pub fn to_spill_order(&self) -> BinaryHeap<(u64, TableId, u32)> {
         self.by_stream
             .iter()
             .map(|(&(table_id, xid), &bytes)| (bytes, table_id, xid))
@@ -108,7 +111,7 @@ impl InflightMeter {
     }
 
     /// The largest in-flight `(table, xid)` stream — the best spill candidate. Uses the same
-    /// deterministic tie-break as [`Self::spill_order`].
+    /// deterministic tie-break as [`Self::to_spill_order`].
     #[must_use]
     pub fn largest_open(&self) -> Option<(TableId, u32)> {
         self.by_stream

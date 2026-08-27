@@ -70,7 +70,7 @@ fn the_prune_target_is_the_typed_cdc_log_not_the_mirror() {
     // than a review question — and it is the only suffix derivation on the path.
     let transform = TransformSql::from_relation(&relation());
 
-    let raw: DuckTable<Raw> = transform.raw();
+    let raw: DuckTable<Raw> = transform.to_raw();
     assert_eq!(transform.table(), "orders");
     assert_eq!(raw.as_str(), "orders_raw");
 }

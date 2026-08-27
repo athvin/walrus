@@ -14,8 +14,8 @@ fn the_tag_is_free() {
 }
 
 #[test]
-fn raw_derives_the_suffix_exactly_once() {
+fn to_raw_derives_the_suffix_exactly_once() {
     let mirror = DuckTable::<Mirror>::new("t");
     assert_eq!(mirror.as_str(), "t");
-    assert_eq!(mirror.raw().as_str(), "t_raw");
+    assert_eq!(mirror.to_raw().as_str(), "t_raw");
 }

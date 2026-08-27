@@ -42,8 +42,8 @@ fn preflight_errors_map_to_exit_codes() {
 
 #[test]
 fn sql_quoting_escapes() {
-    assert_eq!("wal_level".quoted_literal(), "'wal_level'");
-    assert_eq!("a'b".quoted_literal(), "'a''b'");
+    assert_eq!("wal_level".to_quoted_literal(), "'wal_level'");
+    assert_eq!("a'b".to_quoted_literal(), "'a''b'");
     assert_eq!(ident("walrus_pub").unwrap().to_string(), "\"walrus_pub\"");
     assert_eq!(ident("a\"b").unwrap().to_string(), "\"a\"\"b\"");
 

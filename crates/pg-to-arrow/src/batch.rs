@@ -226,7 +226,7 @@ impl BatchBuilder {
         let meta_err =
             |e: serde_json::Error| Error::value_parse(SINK_META_COLUMN, e.to_string(), "json");
         if self.meta_const.is_none() {
-            self.meta_const = Some(meta.const_json_inner().map_err(meta_err)?);
+            self.meta_const = Some(meta.to_const_json_inner().map_err(meta_err)?);
         }
         self.meta_buf.clear();
         self.meta_buf.push('{');

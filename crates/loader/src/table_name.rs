@@ -44,8 +44,11 @@ impl DuckTable<Mirror> {
     }
 
     /// This mirror's CDC log. The typed-name layer's single production suffix construction.
+    ///
+    /// Formats a fresh name per call — hence `to_`, next to the free [`Self::as_str`]. A caller that
+    /// needs the raw name twice should bind it once rather than re-deriving the suffix.
     #[must_use]
-    pub fn raw(&self) -> DuckTable<Raw> {
+    pub fn to_raw(&self) -> DuckTable<Raw> {
         DuckTable {
             name: format!("{}_raw", self.name),
             _kind: PhantomData,

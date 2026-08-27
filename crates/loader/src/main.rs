@@ -110,7 +110,7 @@ async fn pipeline(
     // erased at that one boundary and nowhere else.
     let owned = bootstrap::bootstrap(cfg, &pool, &store, state).await?;
     state.mark_ready();
-    let keys: Vec<(String, String)> = owned.iter().map(bootstrap::OwnedTable::key).collect();
+    let keys: Vec<(String, String)> = owned.iter().map(bootstrap::OwnedTable::to_key).collect();
     // Zero-init every per-table loader series so /metrics lists the owned tables from the first scrape,
     // before any apply cycle has moved a needle (PR 4.10).
     for (schema, table) in &keys {

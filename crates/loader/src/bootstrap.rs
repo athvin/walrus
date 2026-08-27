@@ -33,7 +33,10 @@ pub struct OwnedTable {
 }
 
 impl OwnedTable {
-    pub fn key(&self) -> (String, String) {
+    /// The `(schema, table)` identity as an owned pair. Clones both names — hence `to_`; callers
+    /// that only need to read them can borrow the fields directly.
+    #[must_use]
+    pub fn to_key(&self) -> (String, String) {
         (self.schema.clone(), self.table.clone())
     }
 }

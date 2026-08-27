@@ -73,7 +73,7 @@ pub async fn run_phase_b(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     // (`max()` is NULL only when `<table>_raw` is empty). A source that sits idle at the boundary re-scans
     // that one commit's rows each poll; normal streaming advances `transformed_lsn` past it immediately.
     let conn = ctx.db.conn();
-    let raw = DuckTable::<Mirror>::new(&ctx.table).raw();
+    let raw = DuckTable::<Mirror>::new(&ctx.table).to_raw();
     let max_hex: Option<String> = conn
         .query_row(
             &format!(

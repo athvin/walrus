@@ -31,13 +31,13 @@ fn largest_open_picks_the_biggest_stream() {
 }
 
 #[test]
-fn spill_order_pops_strictly_descending_by_bytes() {
+fn to_spill_order_pops_strictly_descending_by_bytes() {
     let mut m = InflightMeter::new(nz(10_000));
     m.add((TableId(1), 100), 200);
     m.add((TableId(2), 101), 900);
     m.add((TableId(3), 102), 500);
 
-    let mut candidates = m.spill_order();
+    let mut candidates = m.to_spill_order();
     assert_eq!(candidates.pop(), Some((900, TableId(2), 101)));
     assert_eq!(candidates.pop(), Some((500, TableId(3), 102)));
     assert_eq!(candidates.pop(), Some((200, TableId(1), 100)));
@@ -45,14 +45,14 @@ fn spill_order_pops_strictly_descending_by_bytes() {
 }
 
 #[test]
-fn spill_order_breaks_an_exact_byte_tie_deterministically() {
+fn to_spill_order_breaks_an_exact_byte_tie_deterministically() {
     let mut m = InflightMeter::new(nz(10_000));
     m.add((TableId(3), 9), 500);
     m.add((TableId(7), 1), 500);
     m.add((TableId(7), 2), 500);
 
     let drain = || {
-        let mut candidates = m.spill_order();
+        let mut candidates = m.to_spill_order();
         std::iter::from_fn(|| candidates.pop()).collect::<Vec<_>>()
     };
     let expected = vec![
@@ -72,7 +72,7 @@ fn peek_agrees_with_largest_open() {
     m.add((TableId(7), 2), 500);
 
     assert_eq!(
-        m.spill_order()
+        m.to_spill_order()
             .peek()
             .map(|&(_bytes, table_id, xid)| (table_id, xid)),
         m.largest_open()
@@ -80,9 +80,9 @@ fn peek_agrees_with_largest_open() {
 }
 
 #[test]
-fn spill_order_of_an_empty_meter_is_empty() {
+fn to_spill_order_of_an_empty_meter_is_empty() {
     let m = InflightMeter::new(nz(1));
-    assert!(m.spill_order().is_empty());
+    assert!(m.to_spill_order().is_empty());
     assert_eq!(m.largest_open(), None);
 }
 

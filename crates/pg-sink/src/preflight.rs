@@ -299,7 +299,7 @@ impl<'a> SourcePreflight<'a> {
         let exists = self
             .count(&format!(
                 "SELECT count(*) FROM pg_publication WHERE pubname = {}",
-                pubname.quoted_literal()
+                pubname.to_quoted_literal()
             ))
             .await?
             > 0;
@@ -366,7 +366,7 @@ impl<'a> SourcePreflight<'a> {
                JOIN pg_namespace n ON n.nspname = pt.schemaname
                JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = pt.tablename
                WHERE pt.pubname = {} AND pt.schemaname <> 'walrus'"#,
-            self.cfg.publication_name.quoted_literal()
+            self.cfg.publication_name.to_quoted_literal()
         );
         let mut report = PkReport::default();
         for msg in self.query(&sql).await? {
@@ -431,7 +431,7 @@ impl<'a> SourcePreflight<'a> {
     }
 
     async fn setting(&self, name: &str) -> Result<String, PreflightError> {
-        self.first_text(&format!("SELECT current_setting({})", name.quoted_literal()))
+        self.first_text(&format!("SELECT current_setting({})", name.to_quoted_literal()))
             .await
     }
 
@@ -468,7 +468,7 @@ impl<'a> SourcePreflight<'a> {
     async fn published_tables(&self, pubname: &str) -> Result<HashSet<TableId>, PreflightError> {
         let sql = format!(
             "SELECT schemaname, tablename FROM pg_publication_tables WHERE pubname = {}",
-            pubname.quoted_literal()
+            pubname.to_quoted_literal()
         );
         let mut set = HashSet::new();
         for msg in self.query(&sql).await? {

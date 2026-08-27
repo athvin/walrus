@@ -260,7 +260,7 @@ pub fn apply_additive(
                 // Metadata only — mirror `<table>` never `<table>_raw`; does NOT set `structural`, so it
                 // neither recreates the view nor implies a data gate.
                 let lit = match text {
-                    Some(t) => t.quoted_literal(),
+                    Some(t) => t.to_quoted_literal(),
                     None => "NULL".to_string(),
                 };
                 match target {

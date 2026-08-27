@@ -32,29 +32,29 @@ fn quoted_input_is_owned() {
 }
 
 #[test]
-fn quoted_literal_adds_the_surrounding_quotes() {
-    assert_eq!("wal_level".quoted_literal(), "'wal_level'");
-    assert_eq!("O'Brien".quoted_literal(), "'O''Brien'");
+fn to_quoted_literal_adds_the_surrounding_quotes() {
+    assert_eq!("wal_level".to_quoted_literal(), "'wal_level'");
+    assert_eq!("O'Brien".to_quoted_literal(), "'O''Brien'");
     // An empty value is still a well-formed literal, not an empty statement fragment.
-    assert_eq!("".quoted_literal(), "''");
+    assert_eq!("".to_quoted_literal(), "''");
 }
 
 #[test]
-fn quoted_literal_matches_the_wrappers_it_replaced() {
+fn to_quoted_literal_matches_the_wrappers_it_replaced() {
     // `preflight::lit` and `reload_export::sql_lit` were both exactly this expression.
     for input in ["wal_level", "O'Brien", "''", "", "a\"b"] {
         let expected = format!("'{}'", input.replace('\'', "''"));
-        assert_eq!(input.quoted_literal(), expected, "input {input:?}");
+        assert_eq!(input.to_quoted_literal(), expected, "input {input:?}");
     }
 }
 
 #[test]
-fn quoted_literal_reaches_owned_and_borrowed_receivers() {
+fn to_quoted_literal_reaches_owned_and_borrowed_receivers() {
     // `&String` and `Cow<'_, str>` call sites resolve through deref, so no caller needs `as_str()`.
     let owned = String::from("a'b");
     let borrowed: Cow<'_, str> = Cow::Borrowed("a'b");
-    assert_eq!(owned.quoted_literal(), "'a''b'");
-    assert_eq!(borrowed.quoted_literal(), "'a''b'");
+    assert_eq!(owned.to_quoted_literal(), "'a''b'");
+    assert_eq!(borrowed.to_quoted_literal(), "'a''b'");
 }
 
 #[test]

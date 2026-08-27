@@ -36,8 +36,8 @@ pub fn sql_literal(s: &str) -> Cow<'_, str> {
 /// orphan-rule-safe way to reach method syntax at the statement-building call sites. `&String` and
 /// `Cow<'_, str>` receivers reach it through deref.
 ///
-/// This trait is sealed: `.quoted_literal()` is callable from anywhere `common` is a dependency, but
-/// only `common` can implement it. The method *name* is the safety claim — "this is already a
+/// This trait is sealed: `.to_quoted_literal()` is callable from anywhere `common` is a dependency,
+/// but only `common` can implement it. The method *name* is the safety claim — "this is already a
 /// complete, escaped literal" — so a foreign impl on another receiver could keep the name while
 /// emitting unescaped text into a statement, reintroducing exactly the per-call-site escaping drift
 /// this module exists to collapse.
@@ -48,7 +48,7 @@ pub fn sql_literal(s: &str) -> Cow<'_, str> {
 /// struct Unescaped(String);
 ///
 /// impl SqlStrExt for Unescaped {
-///     fn quoted_literal(&self) -> String {
+///     fn to_quoted_literal(&self) -> String {
 ///         format!("'{}'", self.0)
 ///     }
 /// }
@@ -61,20 +61,23 @@ pub trait SqlStrExt: private::Sealed {
     /// use [`sql_literal`] where the template already carries the quotes, since this method would
     /// double them.
     ///
+    /// Always allocates a new `String` — hence `to_`, matching `str::to_uppercase` and unlike
+    /// [`sql_literal`], which borrows when there is nothing to escape.
+    ///
     /// ```
     /// use common::sql::SqlStrExt;
-    /// assert_eq!("O'Brien".quoted_literal(), "'O''Brien'");
-    /// assert_eq!("plain".quoted_literal(), "'plain'");
+    /// assert_eq!("O'Brien".to_quoted_literal(), "'O''Brien'");
+    /// assert_eq!("plain".to_quoted_literal(), "'plain'");
     /// ```
     #[must_use]
-    fn quoted_literal(&self) -> String;
+    fn to_quoted_literal(&self) -> String;
 }
 
 /// The one receiver. The seal impl sits with the real impl so the pair is added or removed together.
 impl private::Sealed for str {}
 
 impl SqlStrExt for str {
-    fn quoted_literal(&self) -> String {
+    fn to_quoted_literal(&self) -> String {
         format!("'{}'", sql_literal(self))
     }
 }

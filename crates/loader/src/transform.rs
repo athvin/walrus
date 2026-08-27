@@ -71,7 +71,7 @@ impl TransformSql {
         use crate::plan::MirrorValue;
         let q = |c: &str| format!("\"{c}\"");
         let table = DuckTable::<Mirror>::new(plan.table.as_ref());
-        let raw_table = table.raw();
+        let raw_table = table.to_raw();
         let pk: Vec<&str> = plan
             .mirror_cols
             .iter()
@@ -160,7 +160,7 @@ impl TransformSql {
         conn: &duckdb::Connection,
         after_lsn: Lsn,
     ) -> Result<Option<TruncateBoundary>, LoaderError> {
-        let raw = self.table.raw();
+        let raw = self.table.to_raw();
         let sql = format!(
             "SELECT \"_walrus_commit_lsn\", \"_walrus_lsn\" FROM \"{}\" \
              WHERE \"_walrus_op\" = 't' AND \"_walrus_commit_lsn\" > '{}' \
@@ -283,9 +283,11 @@ impl TransformSql {
     /// belongs. [`crate::compaction::prune_raw`] `DELETE`s from it — the same statement aimed at the
     /// mirror would erase every current row — so it takes the name from the typed layer rather than
     /// re-deriving the suffix beside its own SQL.
+    ///
+    /// Formats a fresh name per call — hence `to_`, next to the free [`Self::table`].
     #[must_use]
-    pub fn raw(&self) -> DuckTable<Raw> {
-        self.table.raw()
+    pub fn to_raw(&self) -> DuckTable<Raw> {
+        self.table.to_raw()
     }
 
     /// Render the atomic full-rebuild (PR 3.11): `CREATE OR REPLACE TABLE <table>` over **retained raw ∪
@@ -304,7 +306,7 @@ impl TransformSql {
     pub fn render_rebuild(&self, boundary: Option<TruncateBoundary>) -> String {
         let q = |c: &str| format!("\"{c}\"");
         let t = self.table.as_str();
-        let raw_table = self.table.raw();
+        let raw_table = self.table.to_raw();
         let pk = self.to_pk_names();
         let pk_list = pk.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
         let pk_join = pk

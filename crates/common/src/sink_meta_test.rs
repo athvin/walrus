@@ -241,7 +241,7 @@ fn amortized_meta_matches_full() {
             ..base.clone()
         };
         let mut buf = String::from("{");
-        buf.push_str(&meta.const_json_inner().unwrap());
+        buf.push_str(&meta.to_const_json_inner().unwrap());
         buf.push(',');
         meta.write_row_json_inner(&mut buf).unwrap();
         buf.push('}');

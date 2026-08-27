@@ -26,7 +26,7 @@ async fn first_failure_names_its_table_and_cancels_the_token() {
 
     assert_eq!(got.schema, "public");
     assert_eq!(got.table, "orders");
-    assert_eq!(got.table_key(), "public.orders");
+    assert_eq!(got.to_table_key(), "public.orders");
     assert!(matches!(got.error, LoaderError::Quarantine { .. }));
     assert!(token.is_cancelled());
 }
