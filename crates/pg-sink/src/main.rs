@@ -234,23 +234,34 @@ async fn establish_stream(
             // Resume: stream from confirmed_flush_lsn; hydrate the relation cache from schema_registry.
             let epoch =
                 current_or_new_epoch(&ctx.control_pool, &cfg.slot_name, confirmed_flush).await?;
-            let rows = control::read_all_latest_registry(&ctx.control_pool, epoch)
-                .await
-                .context("read schema_registry for hydration")?;
+            // The hydration read (control PG) and START_REPLICATION (the source) touch different
+            // servers and neither consumes the other's output, so a resume costs the slower of the
+            // two instead of their sum — the same 503-window argument as `bootstrap::run_shared`.
+            // Opening the stream before the cache is hydrated is safe: nothing polls it until the
+            // decode loop, so no frame can arrive ahead of the shapes it needs.
+            let (rows, stream) = tokio::try_join!(
+                async {
+                    control::read_all_latest_registry(&ctx.control_pool, epoch)
+                        .await
+                        .context("read schema_registry for hydration")
+                },
+                async {
+                    ReplicationStream::start(
+                        &cfg.source_db_url,
+                        &cfg.slot_name,
+                        confirmed_flush,
+                        &cfg.publication_name,
+                    )
+                    .await
+                    .context("START_REPLICATION (resume)")
+                },
+            )?;
             cache.hydrate(rows).context("hydrate relation cache")?;
             tracing::info!(
                 epoch = %epoch,
                 cached_relations = cache.len(),
                 "relation cache hydrated (resume)"
             );
-            let stream = ReplicationStream::start(
-                &cfg.source_db_url,
-                &cfg.slot_name,
-                confirmed_flush,
-                &cfg.publication_name,
-            )
-            .await
-            .context("START_REPLICATION (resume)")?;
             return Ok(Bootstrapped {
                 stream,
                 epoch,
@@ -298,19 +309,27 @@ async fn establish_stream(
 
     // Backfill every published user table under the exported snapshot, registering each shape so the
     // subsequent streaming decode (and the loader) have it. Internal walrus tables are excluded.
-    let tables =
-        pg_sink::snapshot::published_user_tables(&ctx.source_client, &cfg.publication_name)
+    // The listing rides the already-preflighted source connection while the backfill session dials
+    // its own, so the dial + `SET statement_timeout` overlaps the catalog read instead of following
+    // it. Independent by construction: two connections, and neither input feeds the other.
+    let (tables, mut backfill) = tokio::try_join!(
+        async {
+            pg_sink::snapshot::published_user_tables(&ctx.source_client, &cfg.publication_name)
+                .await
+                .context("list published user tables")
+        },
+        async {
+            pg_sink::snapshot::Backfill::connect(
+                &cfg.source_db_url,
+                epoch,
+                &cfg.instance,
+                triggers,
+                cfg.backfill_statement_timeout,
+            )
             .await
-            .context("list published user tables")?;
-    let mut backfill = pg_sink::snapshot::Backfill::connect(
-        &cfg.source_db_url,
-        epoch,
-        &cfg.instance,
-        triggers,
-        cfg.backfill_statement_timeout,
-    )
-    .await
-    .context("open backfill connection")?;
+            .context("open backfill connection")
+        },
+    )?;
     let mut total = 0u64;
     for (schema, table) in &tables {
         let rel = pg_sink::snapshot::describe_source_relation(&ctx.source_client, schema, table)

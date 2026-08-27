@@ -390,12 +390,17 @@ pub async fn reconcile_to_version(
     let mut cur = db.schema_version()?;
     while cur < target {
         let next = SchemaVersionNo(cur.0 + 1);
+        // Both rows are read unconditionally and neither consumes the other's output, so one step
+        // costs the slower round trip instead of their sum — and a reconcile can walk many steps.
+        // Same caveat as `phase_a::read_lag_inputs`: each read may hold one pool connection while the
+        // other runs, which cannot deadlock here because no transaction is open across either await.
+        let (old, new) = tokio::try_join!(
+            load_version(pool, epoch, schema, table, cur),
+            load_version(pool, epoch, schema, table, next),
+        )?;
         // A version with no registry pair to diff (e.g. a metadata-only revision that did not persist a
         // new `columns` snapshot) applies nothing structural — we still advance the watermark below.
-        if let (Some(old), Some(new)) = (
-            load_version(pool, epoch, schema, table, cur).await?,
-            load_version(pool, epoch, schema, table, next).await?,
-        ) {
+        if let (Some(old), Some(new)) = (old, new) {
             let d = diff(&old, &new)?;
             apply_additive(db.conn(), table, &d.additive)?;
             // Destructive changes (PR 3.9) apply after additive ones; a lossy cast failure short-circuits
