@@ -134,17 +134,19 @@ async fn cap_of_two_schedules_third_request_only_after_a_permit_frees() {
     let semaphore = Arc::new(Semaphore::new(2));
     let started: Vec<Arc<AtomicUsize>> = (0..3).map(|_| Arc::new(AtomicUsize::new(0))).collect();
     let mut releases = Vec::new();
-    let mut handles = Vec::new();
+    // A `JoinSet`, like the controller's own exporter set — the fake exporters are held and drained
+    // exactly the way `spawn_exporter` / `drain_exporters` hold and drain the real ones.
+    let mut exporters = tokio::task::JoinSet::new();
     for flag in &started {
         let sem = Arc::clone(&semaphore);
         let flag = Arc::clone(flag);
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         releases.push(Some(tx));
-        handles.push(tokio::spawn(async move {
+        exporters.spawn(async move {
             let _permit = sem.acquire_owned().await.unwrap();
             flag.store(1, Ordering::SeqCst);
             let _ = rx.await; // park like the PR 6.5 stub, holding the permit
-        }));
+        });
     }
 
     // Two acquire; the third is parked on the semaphore.
@@ -169,8 +171,8 @@ async fn cap_of_two_schedules_third_request_only_after_a_permit_frees() {
     for tx in releases.into_iter().flatten() {
         let _ = tx.send(());
     }
-    for h in handles {
-        h.await.unwrap();
+    while let Some(joined) = exporters.join_next().await {
+        joined.unwrap(); // a panicking fake exporter must fail the test, not be swallowed
     }
     assert_eq!(semaphore.available_permits(), 2, "permits returned on exit");
 }

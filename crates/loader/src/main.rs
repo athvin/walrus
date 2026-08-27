@@ -152,31 +152,38 @@ async fn pipeline(
     // docs/implementation/notes/rust-skills/async-spawn-blocking.md.
     let local = tokio::task::LocalSet::new();
     let (failures_tx, failures_rx) = loader::supervisor::failure_channel(keys.len());
-    let handles: Vec<_> = owned
-        .into_iter()
-        .map(|o| {
-            let schema = o.schema.clone();
-            let table = o.table.clone();
-            let ctx = loader::phase_a::TableCtx {
-                pool: pool.clone(),
-                epoch,
-                epoch_rx: epoch_rx.clone(),
-                schema: o.schema.clone(),
-                table: o.table.clone(),
-                series: format!("{}.{}", o.schema, o.table),
-                rel: o.relation,
-                db: o.db,
-                state: Arc::clone(state),
-                max_files: cfg.max_files_per_cycle,
-                poll_interval: cfg.poll_interval,
-                compaction_interval: cfg.compaction_interval,
-                retention_lsn_lag: cfg.retention_lsn_lag,
-                pause_logged: Default::default(),
-                resync_ids: Default::default(),
-            };
-            let worker_token = token.clone();
-            let failures_tx = failures_tx.clone();
-            local.spawn_local(async move {
+    // A `JoinSet` rather than a `Vec<JoinHandle>`: the worker count is whatever bootstrap owns, so
+    // this is a dynamic collection, and the set owns the whole fleet as one value. The drain below
+    // then reaps each worker in COMPLETION order instead of index order (a panic is logged when it
+    // happens, not after every earlier worker has stopped), and an early exit out of this function
+    // aborts the survivors instead of detaching them.
+    let mut workers = tokio::task::JoinSet::new();
+    for o in owned {
+        let schema = o.schema.clone();
+        let table = o.table.clone();
+        let ctx = loader::phase_a::TableCtx {
+            pool: pool.clone(),
+            epoch,
+            epoch_rx: epoch_rx.clone(),
+            schema: o.schema.clone(),
+            table: o.table.clone(),
+            series: format!("{}.{}", o.schema, o.table),
+            rel: o.relation,
+            db: o.db,
+            state: Arc::clone(state),
+            max_files: cfg.max_files_per_cycle,
+            poll_interval: cfg.poll_interval,
+            compaction_interval: cfg.compaction_interval,
+            retention_lsn_lag: cfg.retention_lsn_lag,
+            pause_logged: Default::default(),
+            resync_ids: Default::default(),
+        };
+        let worker_token = token.clone();
+        let failures_tx = failures_tx.clone();
+        // `spawn_local_on`, not `spawn_local`: this `LocalSet` is not running yet — these tasks
+        // start when `run_until` below first drives it, exactly as they did before.
+        workers.spawn_local_on(
+            async move {
                 if let Err(error) = loader::apply_loop::apply_loop(ctx, worker_token).await {
                     loader::supervisor::report(
                         &failures_tx,
@@ -187,26 +194,29 @@ async fn pipeline(
                         },
                     );
                 }
-            })
-        })
-        .collect();
+            },
+            &local,
+        );
+    }
     // Only workers own receivers now; with zero workers, this also stops the poller immediately.
     drop(epoch_rx);
     // The receiver closes when the final worker exits; main must not keep an extra sender alive.
     drop(failures_tx);
     let first_failure = local
-        .run_until(loader::supervisor::supervise(failures_rx, token, async {
+        .run_until(loader::supervisor::supervise(failures_rx, token, async move {
             // Once the supervisor sees a failure it cancels `token`, so healthy workers leave
-            // their loops and this deliberately sequential drain always makes progress.
-            for h in handles {
-                if let Err(error) = h.await {
+            // their loops and this drain always makes progress. It must run to completion:
+            // `supervise` only returns when this future does, and the lease release below depends
+            // on every worker having been joined (see the drop-order note).
+            while let Some(joined) = workers.join_next().await {
+                if let Err(error) = joined {
                     tracing::error!(%error, "apply worker panicked");
                 }
             }
         }))
         .await;
 
-    // DROP ORDER, load-bearing (see `loader::shutdown` steps 4-5): every `h.await` above ended a
+    // DROP ORDER, load-bearing (see `loader::shutdown` steps 4-5): each `join_next` above joined a
     // worker task, which dropped its `TableCtx` — and with it the `TableDb` whose drop closes the
     // `.duckdb` and releases DuckDB's writer lock. Only then is the lease released, so the two fences
     // come off in the reverse of their bootstrap order (lease → file lock, so file lock → lease).
