@@ -64,7 +64,7 @@ fn demux(ceiling: u64) -> StreamDemux {
 fn mem_sink() -> ParquetSink {
     ParquetSink::new(
         Arc::new(object_store::memory::InMemory::new()),
-        "walrus".into(),
+        "walrus",
         common::EpochNo(1),
     )
 }

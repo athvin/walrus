@@ -364,7 +364,7 @@ async fn chunks_cover_the_table_exactly_with_per_chunk_stamps() {
         &source_url(),
         pool.clone(),
         Arc::clone(&waiters),
-        ParquetSink::new(store(), "walrus".to_string(), epoch),
+        ParquetSink::new(store(), "walrus", epoch),
         export_cfg(epoch, 1000, Duration::from_secs(20)),
         &req,
     )
@@ -488,7 +488,7 @@ async fn resume_from_cursor_never_reexports_completed_chunks() {
 
     let req = request_and_claim(&pool, epoch).await;
     let reload_id = req.reload_id;
-    let sink = ParquetSink::new(store(), "walrus".to_string(), epoch);
+    let sink = ParquetSink::new(store(), "walrus", epoch);
 
     // Chunk 1, then "crash" (drop the exporter).
     let mut first = ChunkExporter::connect(
@@ -607,7 +607,7 @@ async fn echo_timeout_fails_the_reload_with_publication_hint() {
         &source_url(),
         pool.clone(),
         waiters,
-        ParquetSink::new(store(), "walrus".to_string(), epoch),
+        ParquetSink::new(store(), "walrus", epoch),
         export_cfg(epoch, 1000, Duration::from_secs(2)),
         &req,
     )

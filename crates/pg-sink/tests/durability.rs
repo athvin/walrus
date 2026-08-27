@@ -106,7 +106,7 @@ async fn slot_advances_only_after_s3_and_manifest_durable() {
             .await
             .unwrap();
     let epoch = EpochNo(2_260_001);
-    let sink = ParquetSink::new(minio(), "walrus".to_string(), epoch);
+    let sink = ParquetSink::new(minio(), "walrus", epoch);
     let pool = control_pool().await;
     let mut tx = pool.begin().await.unwrap();
     let mut checkpoint = DurabilityCheckpoint::new(resume.start_lsn());
@@ -204,7 +204,7 @@ async fn crash_between_put_and_standby_restreams_without_loss() {
     let resume = verify_or_create_slot(&admin, slot).await.unwrap();
 
     let epoch = EpochNo(2_260_002);
-    let sink = ParquetSink::new(minio(), "walrus".to_string(), epoch);
+    let sink = ParquetSink::new(minio(), "walrus", epoch);
     let pool = control_pool().await;
     let mut cache = RelationCache::default();
     let mut router = BatchRouter::new(

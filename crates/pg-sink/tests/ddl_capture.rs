@@ -102,7 +102,7 @@ async fn alter_add_column_bumps_version_and_cuts_file() {
         ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
             .await
             .unwrap();
-    let sink = ParquetSink::new(minio(), "walrus".to_string(), epoch);
+    let sink = ParquetSink::new(minio(), "walrus", epoch);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     for tbl in ["file_manifest", "ddl_manifest", "schema_registry"] {

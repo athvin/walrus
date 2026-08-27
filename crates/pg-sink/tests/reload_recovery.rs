@@ -287,7 +287,7 @@ async fn kill_mid_export_resumes_from_cursor_and_completes() {
         &source_url(),
         pool.clone(),
         Arc::clone(&waiters),
-        ParquetSink::new(store(), "walrus".to_string(), epoch),
+        ParquetSink::new(store(), "walrus", epoch),
         export_cfg(epoch, 2),
         &req,
     )
@@ -314,7 +314,7 @@ async fn kill_mid_export_resumes_from_cursor_and_completes() {
         &source_url(),
         pool.clone(),
         Arc::clone(&waiters),
-        ParquetSink::new(store(), "walrus".to_string(), epoch),
+        ParquetSink::new(store(), "walrus", epoch),
         export_cfg(epoch, 2),
         &row,
     )
@@ -398,7 +398,7 @@ async fn complete_waits_for_transformed_lsn_to_reach_h() {
         &source_url(),
         pool.clone(),
         Arc::clone(&waiters),
-        ParquetSink::new(store(), "walrus".to_string(), epoch),
+        ParquetSink::new(store(), "walrus", epoch),
         export_cfg(epoch, 10),
         &req,
     )

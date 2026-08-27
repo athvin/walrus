@@ -370,7 +370,7 @@ async fn mid_export_ddl_restarts_fresh_attempt_at_new_schema() {
         &source_url(),
         pool.clone(),
         Arc::clone(&waiters),
-        ParquetSink::new(store(), "walrus".to_string(), epoch),
+        ParquetSink::new(store(), "walrus", epoch),
         export_cfg(epoch, 2),
         &req,
     )
@@ -445,7 +445,7 @@ async fn mid_export_ddl_restarts_fresh_attempt_at_new_schema() {
         &source_url(),
         pool.clone(),
         Arc::clone(&waiters),
-        ParquetSink::new(store(), "walrus".to_string(), epoch),
+        ParquetSink::new(store(), "walrus", epoch),
         export_cfg(epoch, 2),
         &new,
     )
@@ -508,7 +508,7 @@ async fn restart_cap_exhaustion_fails_loudly() {
         &source_url(),
         pool.clone(),
         Arc::clone(&waiters),
-        ParquetSink::new(store(), "walrus".to_string(), epoch),
+        ParquetSink::new(store(), "walrus", epoch),
         export_cfg(epoch, 2),
         &req,
     )

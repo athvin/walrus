@@ -119,7 +119,7 @@ async fn backfill_preloaded_rows_then_streams_post_consistent_point() {
         .unwrap();
 
     // Backfill every published user table under the exported snapshot.
-    let sink = pg_sink::sink::ParquetSink::new(minio(), "walrus".to_string(), epoch);
+    let sink = pg_sink::sink::ParquetSink::new(minio(), "walrus", epoch);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     let mut backfill = Backfill::connect(

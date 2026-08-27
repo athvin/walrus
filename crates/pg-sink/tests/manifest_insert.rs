@@ -114,7 +114,7 @@ async fn object_and_manifest_row_both_exist_after_flush() {
     let pool = control_pool().await;
     let mut tx = pool.begin().await.unwrap();
     let epoch = EpochNo(2_250_001);
-    let sink = ParquetSink::new(Arc::clone(&store), "walrus".to_string(), epoch);
+    let sink = ParquetSink::new(Arc::clone(&store), "walrus", epoch);
 
     let obj = flush_batch(&sink, &mut *tx, epoch, sealed("0/A100"))
         .await
@@ -143,7 +143,7 @@ async fn manifest_lsn_end_equals_commit_lsn_not_row_lsn() {
     let pool = control_pool().await;
     let mut tx = pool.begin().await.unwrap();
     let epoch = EpochNo(2_250_002);
-    let sink = ParquetSink::new(Arc::clone(&store), "walrus".to_string(), epoch);
+    let sink = ParquetSink::new(Arc::clone(&store), "walrus", epoch);
 
     // Commit LSN 0/A100; the batch's rows carry row LSN 0/10.
     let obj = flush_batch(&sink, &mut *tx, epoch, sealed("0/A100"))
@@ -172,7 +172,7 @@ async fn row_is_ready_kind_stream_and_epoch_stamped() {
     let pool = control_pool().await;
     let mut tx = pool.begin().await.unwrap();
     let epoch = EpochNo(2_250_003);
-    let sink = ParquetSink::new(Arc::clone(&store), "walrus".to_string(), epoch);
+    let sink = ParquetSink::new(Arc::clone(&store), "walrus", epoch);
 
     let obj = flush_batch(&sink, &mut *tx, epoch, sealed("0/B200"))
         .await

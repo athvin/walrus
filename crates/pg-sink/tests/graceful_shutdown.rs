@@ -128,7 +128,7 @@ async fn sigterm_mid_stream_drains_commits_and_resumes() {
             .await
             .unwrap();
     let mut checkpoint = DurabilityCheckpoint::new(resume.start_lsn());
-    let sink = ParquetSink::new(minio(), "walrus".to_string(), epoch);
+    let sink = ParquetSink::new(minio(), "walrus", epoch);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     // Thresholds so high nothing auto-flushes: the batch is committed but stays in flight.

@@ -93,7 +93,7 @@ async fn savepoint_rollback_ready_file_has_exactly_6000_rows() {
         ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
             .await
             .unwrap();
-    let sink = ParquetSink::new(minio(), "walrus".to_string(), epoch);
+    let sink = ParquetSink::new(minio(), "walrus", epoch);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     // Start clean: a prior failed run may have left ready rows for this epoch.

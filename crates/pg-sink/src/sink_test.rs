@@ -3,9 +3,21 @@ use super::*;
 fn sink() -> ParquetSink {
     ParquetSink::new(
         Arc::new(object_store::memory::InMemory::new()),
-        "walrus".into(),
+        "walrus",
         common::EpochNo(5),
     )
+}
+
+#[test]
+fn the_bucket_name_is_taken_as_str_or_string() {
+    // `new` converts once internally, so a `&str` literal and an owned `String` are interchangeable
+    // at the call site and land as the same stored bucket.
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let borrowed = ParquetSink::new(Arc::clone(&store), "walrus", common::EpochNo(5));
+    let owned = ParquetSink::new(store, String::from("walrus"), common::EpochNo(5));
+
+    assert_eq!(borrowed.bucket, "walrus");
+    assert_eq!(owned.bucket, borrowed.bucket);
 }
 
 #[test]

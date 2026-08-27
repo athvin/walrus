@@ -103,7 +103,7 @@ fn sealed(lsn_end: &str) -> SealedBatch {
 #[ignore = "requires docker compose up --wait (MinIO)"]
 async fn flush_writes_object_at_expected_key() {
     let store = minio_store();
-    let sink = ParquetSink::new(Arc::clone(&store), "walrus".to_string(), common::EpochNo(7));
+    let sink = ParquetSink::new(Arc::clone(&store), "walrus", common::EpochNo(7));
     let written = sink.put(sealed("0/2A0")).await.unwrap();
 
     let lsn_end: common::Lsn = "0/2A0".parse().unwrap();
@@ -124,7 +124,7 @@ async fn flush_writes_object_at_expected_key() {
 #[ignore = "requires docker compose up --wait (MinIO)"]
 async fn object_reads_back_with_micros_temporals_and_values() {
     let store = minio_store();
-    let sink = ParquetSink::new(Arc::clone(&store), "walrus".to_string(), common::EpochNo(7));
+    let sink = ParquetSink::new(Arc::clone(&store), "walrus", common::EpochNo(7));
     let written = sink.put(sealed("0/300")).await.unwrap();
 
     let bytes = store
@@ -177,7 +177,7 @@ async fn object_reads_back_with_micros_temporals_and_values() {
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (grouped; pure)"]
 async fn key_is_epoch_namespaced_and_lsn_sortable() {
-    let sink = ParquetSink::new(minio_store(), "walrus".to_string(), common::EpochNo(9));
+    let sink = ParquetSink::new(minio_store(), "walrus", common::EpochNo(9));
     let a = sink.object_key("public", "orders", "0/100".parse().unwrap(), "u1");
     let b = sink.object_key("public", "orders", "1/0".parse().unwrap(), "u2");
     assert!(a.as_ref().starts_with("9/public/orders/"));

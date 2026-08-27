@@ -92,7 +92,7 @@ async fn large_txn_low_ceiling_spills_and_stays_bounded() {
         ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
             .await
             .unwrap();
-    let sink = ParquetSink::new(minio(), "walrus".to_string(), epoch);
+    let sink = ParquetSink::new(minio(), "walrus", epoch);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     sqlx::query("DELETE FROM walrus.file_manifest WHERE epoch = $1")

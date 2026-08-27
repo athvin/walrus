@@ -52,10 +52,13 @@ pub struct ParquetSink {
 }
 
 impl ParquetSink {
-    pub fn new(store: Arc<dyn ObjectStore>, bucket: String, epoch: EpochNo) -> Self {
+    /// `bucket` is *stored*, so it is taken as `impl Into<String>` and converted exactly once here:
+    /// `main` hands over the owned name from its `SinkConfig`, fixtures pass a `&str` literal, and
+    /// no call site has to spell `.to_string()` to reach an owned `String`.
+    pub fn new(store: Arc<dyn ObjectStore>, bucket: impl Into<String>, epoch: EpochNo) -> Self {
         ParquetSink {
             store,
-            bucket,
+            bucket: bucket.into(),
             epoch,
         }
     }

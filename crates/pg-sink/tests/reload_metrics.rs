@@ -75,7 +75,7 @@ fn minio(epoch: EpochNo) -> ParquetSink {
                 .build()
                 .unwrap(),
         ),
-        "walrus".to_string(),
+        "walrus",
         epoch,
     )
 }
