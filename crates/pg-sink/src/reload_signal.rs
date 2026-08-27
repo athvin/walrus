@@ -188,26 +188,54 @@ pub struct PendingSignal {
     pub xid: Option<u32>,
 }
 
+/// Why a decoded `walrus.reload_signal` tuple is not a [`PendingSignal`] — the column that failed.
+///
+/// A dropped signal costs the exporter its echo, and its only other symptom is a chunk wait that
+/// times out much later, so naming the column is what turns "something is malformed" into the
+/// shape drift an operator can act on. Mirrors [`crate::ddl::DdlError::MissingColumn`], the same
+/// decode-an-internal-table's-tuple failure on the DDL side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("reload_signal tuple missing/invalid column: {0}")]
+pub struct SignalTupleError(pub &'static str);
+
+/// The value of `name` in a decoded signal tuple, located by the noted relation shape and parsed
+/// into the id / chunk number / LSN that column carries. Every way it can fail — absent from the
+/// shape, absent from the tuple, non-text (a Delete's old-key image carries NULLs for the non-key
+/// columns), or unparseable — names the same column.
+fn signal_field<T: std::str::FromStr>(
+    rel: &common::PgRelation,
+    new: &[common::TupleValue],
+    name: &'static str,
+) -> Result<T, SignalTupleError> {
+    let idx = rel
+        .columns
+        .iter()
+        .position(|c| c.name == name)
+        .ok_or(SignalTupleError(name))?;
+    let common::TupleValue::Text(text) = new.get(idx).ok_or(SignalTupleError(name))? else {
+        return Err(SignalTupleError(name));
+    };
+    text.parse().map_err(|_| SignalTupleError(name))
+}
+
 impl PendingSignal {
     /// Parse a decoded signal tuple by column NAME from the noted relation shape (internal tables
-    /// are never in the `RelationCache`, so the shape comes from `InternalTables`). A malformed
-    /// tuple returns `None` — the caller logs and drops it; it can never wedge the loop.
+    /// are never in the `RelationCache`, so the shape comes from `InternalTables`). The caller logs
+    /// a malformed tuple and drops it; it can never wedge the loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SignalTupleError`] naming the first column that is absent, non-text, or does not
+    /// parse as the value it carries.
     pub fn from_tuple(
         rel: &common::PgRelation,
         new: &[common::TupleValue],
         xid: Option<u32>,
-    ) -> Option<Self> {
-        let text = |name: &str| -> Option<&str> {
-            let idx = rel.columns.iter().position(|c| c.name == name)?;
-            match new.get(idx)? {
-                common::TupleValue::Text(s) => Some(s.as_str()),
-                _ => None,
-            }
-        };
-        Some(PendingSignal {
-            reload_id: ReloadId(text("reload_id")?.parse().ok()?),
-            chunk_no: text("chunk_no")?.parse().ok()?,
-            embedded_lsn: text("wal_insert_lsn")?.parse().ok()?,
+    ) -> Result<Self, SignalTupleError> {
+        Ok(PendingSignal {
+            reload_id: ReloadId(signal_field(rel, new, "reload_id")?),
+            chunk_no: signal_field(rel, new, "chunk_no")?,
+            embedded_lsn: signal_field(rel, new, "wal_insert_lsn")?,
             xid,
         })
     }

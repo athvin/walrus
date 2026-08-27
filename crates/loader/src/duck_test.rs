@@ -157,6 +157,27 @@ fn table_db_moves_across_a_thread() {
     );
 }
 
+/// Bootstrap reads the watermark BEFORE the seeding `ensure_tables*`, so "no watermark yet" must be
+/// a value and not an error the caller has to paper over with a fallback version — a papered-over
+/// read failure would answer with the registry version the pending-rebuild branch exists to avoid.
+#[test]
+fn stored_schema_version_reports_absence_without_an_error() {
+    let db = TableDb::open(":memory:").unwrap();
+    assert_eq!(
+        db.stored_schema_version().unwrap(),
+        None,
+        "a brand-new file has no _walrus_meta to read"
+    );
+
+    db.ensure_tables(&orders(), common::SchemaVersionNo(4))
+        .unwrap();
+    assert_eq!(
+        db.stored_schema_version().unwrap(),
+        Some(common::SchemaVersionNo(4)),
+        "the seeded watermark reads back"
+    );
+}
+
 #[test]
 fn owned_duckdb_handles_meet_the_blocking_pool_send_bound() {
     requires_send::<duckdb::Connection>();

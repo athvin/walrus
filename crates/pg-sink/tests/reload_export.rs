@@ -172,7 +172,7 @@ fn spawn_echo_resolver(
                     xid,
                 } if internal.is_reload_signal(*relation_oid) => {
                     let rel = internal.reload_signal_rel().unwrap();
-                    if let Some(sig) = PendingSignal::from_tuple(rel, new, *xid) {
+                    if let Ok(sig) = PendingSignal::from_tuple(rel, new, *xid) {
                         pending.push(sig);
                     }
                 }

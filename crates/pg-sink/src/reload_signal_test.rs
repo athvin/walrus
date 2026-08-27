@@ -209,7 +209,11 @@ fn non_insert_ops_on_signal_table_are_ignored() {
         TupleValue::Null, // wal_insert_lsn not in the old-key image
         TupleValue::Null,
     ];
-    assert!(PendingSignal::from_tuple(&rel, &delete_old_key, None).is_none());
+    // The error names the column that failed, so the consume loop's warning says which one drifted.
+    assert_eq!(
+        PendingSignal::from_tuple(&rel, &delete_old_key, None),
+        Err(SignalTupleError("wal_insert_lsn"))
+    );
 }
 
 #[test]

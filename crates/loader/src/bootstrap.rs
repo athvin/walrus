@@ -110,7 +110,11 @@ pub async fn bootstrap(
                 .await?
                 .is_some();
         if pending_rebuild {
-            let cur = db.schema_version().unwrap_or(version);
+            // A brand-new `.duckdb` has no persisted version to hold at, so it falls back to the
+            // registry's. A *failed* read must not answer with that same fallback: it would send
+            // this branch to the exact reconcile target the branch exists to avoid, so the DuckDB
+            // error propagates and fails the bootstrap instead.
+            let cur = db.stored_schema_version()?.unwrap_or(version);
             let cur_plan =
                 match control::read_registry(pool, epoch, &rel.schema, &rel.name, cur).await? {
                     Some(r) => {

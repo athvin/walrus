@@ -350,6 +350,41 @@ impl TableDb {
         Ok(SchemaVersionNo(version))
     }
 
+    /// The persisted watermark read **before** the seeding `ensure_tables*`, or `None` when this
+    /// `.duckdb` has none yet (a brand-new file has no `_walrus_meta` at all). Only bootstrap needs
+    /// this: it asks what version a file is already at while deciding whether to reconcile it
+    /// forward, so it meets both a fresh and a resumed file. Every later caller runs after the seed
+    /// and uses the probe-free [`TableDb::schema_version`], which Phase A reads per file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] if the metadata table probe or the watermark read fails — a
+    /// real DuckDB fault, kept distinct from the absent watermark `Ok(None)` reports.
+    pub fn stored_schema_version(&self) -> Result<Option<SchemaVersionNo>, LoaderError> {
+        // A brand-new file has no `_walrus_meta` yet — probe first, exactly as `built_epoch` does.
+        let has_meta: i64 = self
+            .conn
+            .query_row(
+                "SELECT count(*) FROM information_schema.tables WHERE table_name = '_walrus_meta'",
+                [],
+                |r| r.get(0),
+            )
+            .duck("probe _walrus_meta")?;
+        if has_meta == 0 {
+            return Ok(None);
+        }
+        // `max(v)` yields one row with NULL (→ `None`) when the key is absent, as in `built_epoch`.
+        let v: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT max(v) FROM \"_walrus_meta\" WHERE k = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .duck("read stored schema_version")?;
+        Ok(v.map(SchemaVersionNo))
+    }
+
     /// Advance the reconcile watermark after the additive DDL for `v` has been applied to both tables.
     ///
     /// # Errors

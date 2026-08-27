@@ -269,8 +269,9 @@ impl<C: Clock + Clone> DecodeLoop<'_, C> {
                                             match crate::reload_signal::PendingSignal::from_tuple(
                                                 rel, new, *xid,
                                             ) {
-                                                Some(sig) => pending_signals.push(sig),
-                                                None => tracing::warn!(
+                                                Ok(sig) => pending_signals.push(sig),
+                                                Err(error) => tracing::warn!(
+                                                    %error,
                                                     "malformed walrus.reload_signal tuple; ignoring"
                                                 ),
                                             }
