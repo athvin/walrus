@@ -87,6 +87,25 @@ fn parse_err(kind: &str, text: &str) -> Error {
     Error::value_parse(kind, text, kind)
 }
 
+/// A fractional-seconds run (`"5"`, `"789"`, `"678901"`) as microseconds — scaling the BORROWED digits
+/// rather than collecting a zero-padded `String` for every cell that carries a clock.
+///
+/// Only the first six digits are representable at microsecond resolution, so the rest is truncated; a
+/// shorter run scales by `10^(6 - len)`. Digits are ASCII, so a six-byte prefix that is not a char
+/// boundary already holds a non-digit and fails to parse either way — as does a run longer than six
+/// bytes reaching the `unwrap_or` fallback, which has no scale.
+fn frac_to_micros(frac: &str) -> Option<i64> {
+    // `10^(6 - n)` for an `n`-digit run: the µs scale, indexed rather than computed.
+    const SCALE: [i64; 7] = [1_000_000, 100_000, 10_000, 1_000, 100, 10, 1];
+
+    let digits = frac.get(..6).unwrap_or(frac);
+    if digits.is_empty() {
+        return Some(0);
+    }
+    let scale = SCALE.get(digits.len())?;
+    digits.parse::<i64>().ok()?.checked_mul(*scale)
+}
+
 /// Parse a `HH:MM:SS[.ffffff]` clock (no sign) into microseconds. Fractional seconds are padded /
 /// truncated to microsecond resolution. Returns `None` for malformed input or integer overflow.
 fn hms_to_micros(body: &str) -> Option<i64> {
@@ -99,8 +118,7 @@ fn hms_to_micros(body: &str) -> Option<i64> {
     }
     let (sec, frac) = s.split_once('.').unwrap_or((s, ""));
     let sec: i64 = sec.parse().ok()?;
-    let frac_digits: String = frac.chars().chain(std::iter::repeat('0')).take(6).collect();
-    let frac_micros: i64 = frac_digits.parse().ok()?;
+    let frac_micros = frac_to_micros(frac)?;
     h.checked_mul(3600)?
         .checked_add(m.checked_mul(60)?)?
         .checked_add(sec)?

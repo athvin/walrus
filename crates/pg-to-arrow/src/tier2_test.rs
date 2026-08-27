@@ -11,6 +11,17 @@ fn interval_years_months_days_time_split() {
 }
 
 #[test]
+fn fractional_seconds_scale_by_position_and_truncate_past_micros() {
+    // The fractional run is scaled by its digit count rather than zero-padded into a buffer, so pin
+    // all three edges: a short run, an exact six digits, and a longer run (truncated, never rounded).
+    assert_eq!(parse_interval("00:00:00.5").unwrap(), (0, 0, 500_000));
+    assert_eq!(parse_interval("00:00:00.000001").unwrap(), (0, 0, 1));
+    assert_eq!(parse_interval("00:00:00.1234567").unwrap(), (0, 0, 123_456));
+    // No fractional part at all is the same zero, through the empty-run branch.
+    assert_eq!(parse_interval("00:00:01").unwrap(), (0, 0, 1_000_000));
+}
+
+#[test]
 fn interval_1_month_ne_30_days_ne_720_hours() {
     // The three fields stay independent: none of these collapses into another.
     let a = parse_interval("1 mon").unwrap();

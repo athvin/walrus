@@ -152,10 +152,10 @@ fn plan_column(
     // can't drift from the staged file.
     // Tier-2 that recombines to a single DuckDB scalar (interval / timetz).
     if let Some(expr) = recombine_expr(d.pg_type_oid, &emit) {
-        for (n, t) in &emit {
+        for &(n, t) in &emit {
             raw_cols.push(RawCol {
-                name: n.clone(),
-                duckdb_type: t.clone(),
+                name: n.to_string(),
+                duckdb_type: t.to_string(),
             });
         }
         mirror_cols.push(MirrorCol {
@@ -172,7 +172,7 @@ fn plan_column(
         // for a Tier-3 jsonb) — read_parquet yields it. The one exception is `numeric`, whose descriptor
         // `duckdb` is the bare `DECIMAL`; the precise `DECIMAL(p,s)` lives in the emit type, so prefer it.
         let ty = match emit.first() {
-            Some((_, t)) if t.starts_with("DECIMAL(") => t.clone(),
+            Some(&(_, t)) if t.starts_with("DECIMAL(") => t.to_string(),
             _ => d.duckdb.clone(),
         };
         raw_cols.push(RawCol {
@@ -191,14 +191,14 @@ fn plan_column(
     }
     // Tier-2 flat (range / geometric): the emit columns pass through as several mirror columns — DuckDB
     // has no range/geo type, so a range IS its 5 flat siblings.
-    for (n, t) in &emit {
+    for &(n, t) in &emit {
         raw_cols.push(RawCol {
-            name: n.clone(),
-            duckdb_type: t.clone(),
+            name: n.to_string(),
+            duckdb_type: t.to_string(),
         });
         mirror_cols.push(MirrorCol {
-            name: n.clone(),
-            duckdb_type: t.clone(),
+            name: n.to_string(),
+            duckdb_type: t.to_string(),
             is_key: false,
             value: MirrorValue::Passthrough {
                 toast_resolvable: false,
@@ -208,18 +208,23 @@ fn plan_column(
 }
 
 /// Parse the descriptor `emit` list (`"name:ARROW_TYPE"`) into `(name, duckdb_type)` pairs.
-fn parse_emit(emit: &[String]) -> Vec<(String, String)> {
+///
+/// Both halves BORROW the descriptor: the name is a slice of the emit entry, and the DuckDB type is a
+/// fixed name (or, for `DECIMAL(p,s)`, another slice of that same entry). The pairs are scratch for
+/// [`plan_column`]'s emit-shape dispatch, so the owned `String`s are built once — where they are stored
+/// on the plan — instead of here and again on the way in.
+fn parse_emit(emit: &[String]) -> Vec<(&str, &str)> {
     emit.iter()
         .filter_map(|e| {
             let (n, arrow) = e.rsplit_once(':')?;
-            Some((n.to_string(), emit_arrow_to_duck(arrow)))
+            Some((n, emit_arrow_to_duck(arrow)))
         })
         .collect()
 }
 
 /// The loader recombine expression for a type that collapses to one DuckDB scalar — over the winning raw
 /// row `s`. `None` for anything that stays flat (Tier-1, range, geometric).
-fn recombine_expr(pg_type_oid: u32, emit: &[(String, String)]) -> Option<String> {
+fn recombine_expr(pg_type_oid: u32, emit: &[(&str, &str)]) -> Option<String> {
     match pg_type_oid {
         INTERVAL if emit.len() == 3 => Some(format!(
             "to_months(s.\"{}\") + to_days(s.\"{}\") + to_microseconds(s.\"{}\")",
@@ -236,7 +241,11 @@ fn recombine_expr(pg_type_oid: u32, emit: &[(String, String)]) -> Option<String>
 /// Map an emit Arrow type name ([`pg_to_arrow`'s `arrow_emit_name`]) to a DuckDB storage type for the
 /// raw column. `DECIMAL(p,s)` passes through; `FIXEDBINARY`/`STRUCT`/`LIST` (only ever Tier-1 uuid, which
 /// uses the descriptor `duckdb` string instead) fall back to `BLOB`/`VARCHAR`.
-fn emit_arrow_to_duck(arrow: &str) -> String {
+///
+/// Every fixed name is a `&'static str` and the one parameterised form (`DECIMAL(p,s)`) is returned as a
+/// slice of `arrow` itself, so the mapping never allocates — the mirror image of the sibling that produced
+/// these names, `pg_to_arrow::descriptor::arrow_emit_name`.
+fn emit_arrow_to_duck(arrow: &str) -> &str {
     match arrow {
         "BOOLEAN" => "BOOLEAN",
         "INT16" => "SMALLINT",
@@ -254,5 +263,4 @@ fn emit_arrow_to_duck(arrow: &str) -> String {
         other if other.starts_with("FIXEDBINARY(") => "BLOB",
         _ => "VARCHAR",
     }
-    .to_string()
 }
