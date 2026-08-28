@@ -134,6 +134,14 @@ static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 /// Install the process-wide Prometheus recorder and register every global series. Idempotent: safe to
 /// call from `main` and from each scrape test; later calls are no-ops. Until this runs, the call-site
 /// helpers below do nothing.
+///
+/// # Panics
+///
+/// Panics if some *other* global `metrics` recorder was already installed. That is a programming
+/// error rather than a runtime condition, so it aborts loudly instead of returning a `Result` no
+/// caller could act on — contrast [`crate::telemetry::init_tracing`], whose already-installed case
+/// is a legitimate outcome and is therefore swallowed. The `OnceLock` below runs the install at most
+/// once, so repeated `init` calls never reach it; only a foreign recorder can.
 pub fn init() {
     HANDLE.get_or_init(|| {
         // Install-once at process init: `install_recorder` only errors if a *different* global

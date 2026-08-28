@@ -118,6 +118,12 @@ impl<C: Clock + Clone> DecodeLoop<'_, C> {
     /// Returns [`anyhow::Error`] when replication I/O or decoding fails, a relation/DDL/reload
     /// invariant is invalid, Arrow batching or S3/manifest durability fails, or a control-plane
     /// operation cannot complete. Context on the returned chain identifies the failed stage.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the wired [`Heartbeat`]'s `idle_after` is zero: it is this loop's idle-check
+    /// cadence, and [`tokio::time::interval`] rejects a zero period. `config.rs` bounds the
+    /// configured value above zero.
     pub async fn run(self) -> anyhow::Result<()> {
         let DecodeLoop {
             stream,

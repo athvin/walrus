@@ -160,6 +160,11 @@ pub(crate) async fn drain_exporters(set: &mut JoinSet<()>, budget: Duration) {
 /// here must be a future whose interrupted work is either already durable or safely replayable. The
 /// production one is [`ChunkExporter::run`](crate::reload_export::ChunkExporter::run), which commits
 /// each chunk atomically for exactly that reason.
+///
+/// # Panics
+///
+/// Panics if `renew_every` is zero — [`tokio::time::interval`] rejects a zero period. The
+/// controller passes `ttl / 3`, and config bounds `reload_lease_ttl` at ≥ 15s, so it cannot.
 pub async fn lease_guarded_export<R, E>(
     token: CancellationToken,
     renew_every: Duration,
@@ -413,6 +418,13 @@ enum ControllerEvent {
 impl ReloadController {
     /// Spawn the controller task next to the heartbeat. Failures inside the task are logged and
     /// retried next tick — the controller can degrade, never take the sink down.
+    ///
+    /// # Panics
+    ///
+    /// The spawned task panics if `cfg.poll_interval` is zero — [`tokio::time::interval`] rejects a
+    /// zero period. That one failure is not a degradation the tick loop can absorb: it surfaces on
+    /// the returned [`JoinHandle`](tokio::task::JoinHandle), since the interval is built before the
+    /// loop starts.
     pub fn spawn(
         pool: sqlx::PgPool,
         source_db_url: &str,

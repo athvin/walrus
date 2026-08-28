@@ -136,6 +136,11 @@ impl From<Lsn> for u64 {
 impl std::ops::Sub<Lsn> for Lsn {
     type Output = u64;
 
+    /// # Panics
+    ///
+    /// In debug builds, panics if `self < rhs`: the ordered domain above is a caller invariant, so a
+    /// violation is a bug worth failing on where it happens rather than a distance to hand back.
+    /// Release builds carry no assertion and saturate to 0 instead of wrapping.
     fn sub(self, rhs: Lsn) -> u64 {
         debug_assert!(
             self.0 >= rhs.0,
@@ -149,6 +154,9 @@ impl std::ops::Sub<Lsn> for Lsn {
 impl std::ops::Sub<&Lsn> for &Lsn {
     type Output = u64;
 
+    /// # Panics
+    ///
+    /// Carries the by-value operator's debug-only ordered-domain assertion, which this forwards to.
     fn sub(self, rhs: &Lsn) -> u64 {
         *self - *rhs
     }

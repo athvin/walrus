@@ -37,6 +37,11 @@ pub(crate) fn epoch_guard(
 /// Returns [`LoaderError::EpochBumped`] when the control generation advances while this worker is
 /// running. Control-plane, DuckDB, registry, quarantine, and watermark failures from the two phases
 /// or compaction propagate through their corresponding [`LoaderError`] variants and are terminal.
+///
+/// # Panics
+///
+/// Panics if `ctx.poll_interval` is zero — [`tokio::time::interval`] rejects a zero period. The
+/// loader's config admits no zero cadence, so only a hand-built [`TableCtx`] can reach this.
 pub async fn apply_loop(ctx: TableCtx, shutdown: CancellationToken) -> Result<(), LoaderError> {
     let mut tick = tokio::time::interval(ctx.poll_interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

@@ -51,6 +51,12 @@ pub fn rebuild_for_new_epoch(
 /// Poll the control plane's current epoch once per `period` and publish its latest value to every
 /// apply loop. A failed read is only a delayed guard observation, so it is logged and retried on the
 /// next tick. The task stops on shutdown or when its final receiver is dropped.
+///
+/// # Panics
+///
+/// The spawned task panics if `period` is zero — [`tokio::time::interval`] rejects a zero period.
+/// The failure surfaces on the returned [`JoinHandle`](tokio::task::JoinHandle), not at this call,
+/// because the interval is built on the task's first poll.
 #[must_use]
 pub fn spawn_epoch_watch(
     pool: sqlx::PgPool,
