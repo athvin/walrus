@@ -63,6 +63,21 @@ fn second_init_is_handled_not_fatal() {
     );
 }
 
+/// The `log` -> `tracing` bridge that [`init_tracing`] installs is a *feature* of
+/// `tracing-subscriber`, not code walrus owns. Dropping it silences every `log` record our
+/// dependencies emit — with no compile error and nothing else in the suite going red — so naming
+/// `tracing-log` in the manifest is the contract, and this is what notices when it goes away.
+#[test]
+fn the_log_to_tracing_bridge_feature_stays_enabled() {
+    const MANIFEST: &str = include_str!("../Cargo.toml");
+
+    assert!(
+        MANIFEST.contains("\"tracing-log\""),
+        "crates/common/Cargo.toml must keep naming tracing-subscriber's `tracing-log` feature, or \
+         the log records tokio-postgres/sqlx/reqwest emit stop reaching the subscriber"
+    );
+}
+
 #[test]
 fn default_config_is_pretty_info() {
     let cfg = TelemetryConfig::default();

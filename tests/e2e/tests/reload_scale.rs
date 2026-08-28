@@ -1,7 +1,9 @@
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
-    reason = "integration test — unwrap/expect fine in setup + helpers"
+    clippy::print_stderr,
+    reason = "integration test — unwrap/expect fine in setup + helpers; the concurrency \
+              high-water mark is reported, not asserted, so stderr is its destination"
 )]
 //! End-to-end: N-table reloads at scale on ONE slot (PR 6.12, reload §2/§5). Three tables are
 //! seeded and streamed by the real sink+loader, then reloaded concurrently with the sink's

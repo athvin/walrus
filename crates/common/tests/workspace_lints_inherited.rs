@@ -257,6 +257,29 @@ fn the_workspace_lint_table_still_polices_safety_doc_sections() {
     }
 }
 
+/// Diagnostics are `tracing` events, never raw stream writes. That was prose in
+/// `crates/common/src/telemetry.rs` before these two lints backed it: `println!` and `eprintln!`
+/// compile cleanly under every other entry in the table, so nothing went red when one
+/// appeared. Both are `clippy::restriction` lints, outside the `clippy::all` group denied above,
+/// so that group entry does not reach them either — only these named denies do.
+#[test]
+fn the_workspace_lint_table_still_denies_raw_stream_prints() {
+    let synthetic = "print_stdout = \"warn\"\n  print_stderr = \"deny\"\n";
+    assert_eq!(clippy_deny_count(synthetic, "print_stdout"), 0);
+    assert_eq!(clippy_deny_count(synthetic, "print_stderr"), 1);
+
+    let root_manifest = std::fs::read_to_string(repo_root().join("Cargo.toml")).unwrap();
+    let clippy = section(&root_manifest, "[workspace.lints.clippy]")
+        .expect("root manifest must define [workspace.lints.clippy]");
+    for lint in ["print_stdout", "print_stderr"] {
+        assert_eq!(
+            clippy_deny_count(clippy, lint),
+            1,
+            "workspace policy must pin {lint} = \"deny\" exactly once"
+        );
+    }
+}
+
 #[test]
 fn the_clippy_carve_out_is_still_scoped_to_tests() {
     let cfg = std::fs::read_to_string(repo_root().join("clippy.toml")).unwrap();

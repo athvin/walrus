@@ -1,8 +1,10 @@
 //! Tracing setup and the structured-field convention.
 //!
-//! walrus never `println!`s. Every log line is a [`tracing`] event with **structured fields** so a
-//! Grafana/Loki query can follow one transaction through both services. [`init_tracing`] installs
-//! the process-wide subscriber once at the top of `main`; the [`fields`] module fixes the canonical
+//! walrus never `println!`s — `clippy::print_stdout`/`print_stderr` are denied workspace-wide, and
+//! the only production carve-out is each binary's `main`, for the window before a subscriber
+//! exists. Every log line is a [`tracing`] event with **structured fields** so a Grafana/Loki query
+//! can follow one transaction through both services. [`init_tracing`] installs the
+//! process-wide subscriber once at the top of `main`; the [`fields`] module fixes the canonical
 //! field-key spellings (`xid`, `commit_lsn`, `lsn`, `batch_uuid`, …) that every later PR must use
 //! at its call sites — e.g. `info!({XID} = xid, {COMMIT_LSN} = %commit_lsn, "flushed batch")`.
 
@@ -68,6 +70,12 @@ fn build_env_filter(cfg: &TelemetryConfig) -> EnvFilter {
 
 /// Build the `EnvFilter` + fmt layer (pretty or JSON per `cfg.json`) and install it as the global
 /// default subscriber.
+///
+/// Installing through `SubscriberInitExt::try_init` — rather than `set_global_default` — is what
+/// also registers `tracing_log::LogTracer`, so the dependencies that still emit through the `log`
+/// facade (`tokio-postgres`, `sqlx` and `object_store`'s HTTP client among them) arrive here as
+/// events instead of being dropped. That bridge rides `tracing-subscriber`'s `tracing-log`
+/// feature, which `crates/common/Cargo.toml` names explicitly for exactly this reason.
 ///
 /// Idempotent: a global subscriber can only be installed once per process, so a second call is a
 /// **handled outcome** — it logs at `debug` and returns `Ok(())` rather than panicking, keeping

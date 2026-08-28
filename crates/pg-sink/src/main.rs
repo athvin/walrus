@@ -15,6 +15,13 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use tokio::time::Instant;
 
+// The pre-subscriber window, and the only stderr in this binary: config validation and
+// `init_tracing` both run before any `tracing` event has a subscriber to reach, so their failures
+// would be silent as events. Everything from the runtime build down is a `tracing` event.
+#[allow(
+    clippy::print_stderr,
+    reason = "config and tracing-init failures precede the subscriber they would otherwise log to"
+)]
 fn main() -> ExitCode {
     // Step 1: config. Terminal on failure — before tracing exists, so report on stderr.
     let Ok(cfg) =

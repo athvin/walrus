@@ -76,6 +76,14 @@ trivially_copy_pass_by_ref = "deny"
 # and integration `tests/`; benches (`harness = false`) and the e2e harness lib carry a file-level allow.
 unwrap_used = "deny"
 expect_used = "deny"
+# Diagnostics go through `tracing`, never a raw stream. `println!`/`eprintln!` carry no level, no
+# target and no structured fields, so nothing downstream can filter, route or key on them — the
+# convention `crates/common/src/telemetry.rs` documents, made a build failure here. Both are
+# `clippy::restriction` lints outside `clippy::all`, so no `priority` juggling is needed. The only
+# production carve-out is each binary's `main`, which reports a config or subscriber-init failure on
+# stderr in the window before a subscriber exists; every carve-out is a scoped allow with a reason.
+print_stdout = "deny"
+print_stderr = "deny"
 # This nursery lint is outside `clippy::all`, so no `priority` juggling is needed. It is the
 # mutable-borrow gate walrus lacked; see docs/implementation/notes/rust-skills/conv-asmut-mutable.md.
 needless_pass_by_ref_mut = "deny"
