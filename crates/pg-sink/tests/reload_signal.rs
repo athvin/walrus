@@ -214,11 +214,11 @@ async fn missing_signal_table_is_terminal_and_manage_publication_heals_the_gap()
         .await
         .unwrap();
     let cfg = SinkConfig {
-        source_db_url: source_url(),
+        source_db_url: source_url().into(),
         publication_name: "walrus_pub".to_string(),
         ..SinkConfig::default()
     };
-    let client = connect_source(&cfg.source_db_url).await.unwrap();
+    let client = connect_source(cfg.source_db_url.expose()).await.unwrap();
     let pf = SourcePreflight::new(&client, &cfg);
     let err = pf.assert_reload_signal().await.unwrap_err();
     assert!(
@@ -240,7 +240,7 @@ async fn missing_signal_table_is_terminal_and_manage_publication_heals_the_gap()
         .await
         .unwrap();
     let cfg_gap = SinkConfig {
-        source_db_url: source_url(),
+        source_db_url: source_url().into(),
         publication_name: "walrus_pf62".to_string(),
         ..SinkConfig::default()
     };
@@ -257,7 +257,7 @@ async fn missing_signal_table_is_terminal_and_manage_publication_heals_the_gap()
 
     // (c) The same gap under manage_publication=true self-heals via the existing auto-add path.
     let cfg_manage = SinkConfig {
-        source_db_url: source_url(),
+        source_db_url: source_url().into(),
         publication_name: "walrus_pf62".to_string(),
         manage_publication: true,
         ..SinkConfig::default()

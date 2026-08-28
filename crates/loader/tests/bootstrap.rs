@@ -59,7 +59,7 @@ fn orders() -> PgRelation {
 
 fn cfg(pod: &str, dir: &std::path::Path, ttl: Duration) -> LoaderConfig {
     LoaderConfig {
-        control_db_url: control_url(),
+        control_db_url: control_url().into(),
         object_store: common::ObjectStoreConfig {
             bucket: "walrus".into(),
             endpoint: Some("http://localhost:9000".into()),

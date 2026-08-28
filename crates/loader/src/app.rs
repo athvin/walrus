@@ -68,7 +68,7 @@ async fn pipeline(
     token: &CancellationToken,
     state: &Arc<LoaderState>,
 ) -> Result<(), LoaderError> {
-    let pool = control::connect(&cfg.control_db_url).await?;
+    let pool = control::connect(cfg.control_db_url.expose()).await?;
     let store = build_store(cfg)?;
 
     // `&store` unsize-coerces to the `&dyn ObjectStore` bootstrap takes, so the concrete client is
@@ -252,7 +252,7 @@ fn duck_s3_access(cfg: &LoaderConfig) -> crate::duck::S3Access {
         endpoint: endpoint.to_string(),
         region: cfg.object_store.region.clone(),
         access_key_id: aws_credential("AWS_ACCESS_KEY_ID"),
-        secret_access_key: aws_credential("AWS_SECRET_ACCESS_KEY"),
+        secret_access_key: aws_credential("AWS_SECRET_ACCESS_KEY").into(),
         use_ssl,
     }
 }
@@ -265,13 +265,22 @@ fn duck_s3_access(cfg: &LoaderConfig) -> crate::duck::S3Access {
 /// `scripts/bench-e2e.sh`, the e2e harness), so an unset one is almost always the cause of the
 /// opaque 403 a worker meets much later, on its first `read_parquet('s3://…')` — with nothing on
 /// disk connecting the two. `unwrap_or_default` dropped exactly the `VarError` that names it.
+///
+/// What reaches the log is the *variant*, not the error: `VarError::NotUnicode`'s `Display` renders
+/// the offending `OsString`, and for `AWS_SECRET_ACCESS_KEY` that string is the credential itself
+/// (`obs-no-sensitive-data`). Which of the two happened is the whole diagnostic anyway — it tells an
+/// operator whether to set the variable or to fix its encoding.
 fn aws_credential(var: &'static str) -> String {
     match std::env::var(var) {
         Ok(value) => value,
         Err(error) => {
+            let reason = match error {
+                std::env::VarError::NotPresent => "not set",
+                std::env::VarError::NotUnicode(_) => "not valid unicode",
+            };
             tracing::warn!(
                 var,
-                %error,
+                reason,
                 "AWS credential unreadable from the environment; DuckDB will read the staging \
                  bucket without one — expect an S3 authentication failure unless it is public"
             );

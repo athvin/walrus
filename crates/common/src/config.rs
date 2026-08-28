@@ -6,6 +6,7 @@
 //! terminal [`Error::Config`] *at the edge* — never a panic three modules later. Service-specific
 //! knobs (`SinkConfig`, `LoaderConfig`) embed [`CommonConfig`] in their own crates.
 
+use crate::redact::Redacted;
 use crate::telemetry::TelemetryConfig;
 use crate::{Error, Result};
 use serde::Deserialize;
@@ -20,8 +21,10 @@ const MAX_STARTUP_DEADLINE: Duration = Duration::from_secs(60 * 60);
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct CommonConfig {
-    /// Control Postgres connection string (holds manifest/checkpoint/registry).
-    pub control_db_url: String,
+    /// Control Postgres connection string (holds manifest/checkpoint/registry). [`Redacted`]
+    /// because a libpq URL carries its password inline and this struct derives `Debug`, so one
+    /// `?cfg` would otherwise ship the credential to the log aggregator.
+    pub control_db_url: Redacted<String>,
     /// S3/MinIO staging bucket + endpoint.
     pub object_store: ObjectStoreConfig,
     /// Logging setup (PR 0.4).
@@ -48,7 +51,7 @@ pub struct ObjectStoreConfig {
 impl Default for CommonConfig {
     fn default() -> Self {
         CommonConfig {
-            control_db_url: String::new(),
+            control_db_url: Redacted::default(),
             object_store: ObjectStoreConfig::default(),
             telemetry: TelemetryConfig::default(),
             startup_deadline: Duration::from_secs(60),
@@ -131,7 +134,7 @@ impl CommonConfig {
             );
         }
 
-        if self.control_db_url.trim().is_empty() {
+        if self.control_db_url.expose().trim().is_empty() {
             return Err(Error::Config(
                 "control_db_url must not be empty".to_string(),
             ));

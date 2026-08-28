@@ -37,7 +37,7 @@ fn control_url() -> String {
 
 fn cfg_for(url: &str) -> SinkConfig {
     SinkConfig {
-        source_db_url: url.to_string(),
+        source_db_url: url.into(),
         publication_name: "walrus_pub".to_string(),
         ..SinkConfig::default()
     }
@@ -67,7 +67,7 @@ async fn good_source_passes_all_assertions() {
         .unwrap();
 
     let cfg = cfg_for(&source_url());
-    let client = connect_source(&cfg.source_db_url)
+    let client = connect_source(cfg.source_db_url.expose())
         .await
         .expect("replication connect to source-pg");
     let pf = SourcePreflight::new(&client, &cfg);
@@ -101,7 +101,7 @@ async fn wrong_wal_level_is_terminal() {
     let _guard = SOURCE_LOCK.lock().await;
     // control-pg runs with the default wal_level = replica, so the assertion is terminal.
     let cfg = cfg_for(&control_url());
-    let client = connect_source(&cfg.source_db_url)
+    let client = connect_source(cfg.source_db_url.expose())
         .await
         .expect("replication connect to control-pg");
     let pf = SourcePreflight::new(&client, &cfg);
@@ -132,7 +132,7 @@ async fn keyless_table_is_terminal_in_strict_and_quarantined_in_lenient() {
         .unwrap();
 
     let cfg = cfg_for(&source_url());
-    let client = connect_source(&cfg.source_db_url).await.unwrap();
+    let client = connect_source(cfg.source_db_url.expose()).await.unwrap();
     let pf = SourcePreflight::new(&client, &cfg);
 
     // Strict → terminal on the offender.
@@ -174,7 +174,7 @@ async fn publication_missing_heartbeat_is_terminal() {
         .unwrap();
 
     let cfg = cfg_for(&source_url());
-    let client = connect_source(&cfg.source_db_url).await.unwrap();
+    let client = connect_source(cfg.source_db_url.expose()).await.unwrap();
     let pf = SourcePreflight::new(&client, &cfg);
 
     let err = pf.assert_publication_covers().await.unwrap_err();

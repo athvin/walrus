@@ -5,7 +5,7 @@ use crate::FailureClass;
 /// bound it targets.
 fn valid_config() -> CommonConfig {
     CommonConfig {
-        control_db_url: "postgres://localhost/walrus".to_string(),
+        control_db_url: "postgres://localhost/walrus".into(),
         object_store: ObjectStoreConfig {
             bucket: "walrus".to_string(),
             endpoint: None,
@@ -22,7 +22,7 @@ fn valid_config() -> CommonConfig {
 #[test]
 fn defaults_are_the_shipped_contract() {
     let cfg = CommonConfig::default();
-    assert_eq!(cfg.control_db_url, "");
+    assert_eq!(cfg.control_db_url.expose(), "");
     assert_eq!(cfg.object_store.bucket, "");
     assert_eq!(cfg.object_store.endpoint, None);
     assert_eq!(cfg.object_store.region, "us-east-1");
@@ -78,7 +78,7 @@ fn loads_from_env_over_file() {
         jail.set_env("WALRUS_OBJECT_STORE__BUCKET", "env-bucket");
 
         let cfg = CommonConfig::load().expect("valid config should load");
-        assert_eq!(cfg.control_db_url, "postgres://env/db"); // env wins
+        assert_eq!(cfg.control_db_url.expose(), "postgres://env/db"); // env wins
         assert_eq!(cfg.object_store.bucket, "env-bucket"); // env wins (nested, deep-merged)
         assert_eq!(cfg.object_store.region, "eu-west-1"); // untouched → from file
         assert_eq!(cfg.instance, "from-file"); // from file
@@ -163,9 +163,25 @@ fn unknown_key_is_rejected() {
 #[test]
 fn empty_control_db_url_is_config_error() {
     let mut cfg = valid_config();
-    cfg.control_db_url = String::new();
+    cfg.control_db_url = Redacted::default();
     let err = cfg.validate().unwrap_err();
     assert!(matches!(err, Error::Config(_)) && err.is_terminal());
+}
+
+/// The DSN carries its password inline and `CommonConfig` derives `Debug`, so a single `?cfg`
+/// anywhere would put the control-plane credential in the log aggregator. Wrapping the field is
+/// what makes that impossible; this pins it against a future unwrapping.
+#[test]
+fn debug_does_not_render_the_control_dsn() {
+    let cfg = CommonConfig {
+        control_db_url: "postgres://walrus:hunter2@control-pg/walrus".into(),
+        ..valid_config()
+    };
+
+    let rendered = format!("{cfg:?}");
+
+    assert!(!rendered.contains("hunter2"), "{rendered}");
+    assert!(rendered.contains(crate::REDACTED), "{rendered}");
 }
 
 #[test]

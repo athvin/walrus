@@ -1,16 +1,24 @@
 //! `pg-to-arrow` error taxonomy.
 
+use common::Redacted;
+
 /// Cold parse-error detail boxed inside [`Error`] so successful per-cell conversions stay compact.
 ///
 /// [`Error`] itself cannot be `Clone`/`PartialEq` (it carries opaque arrow/parquet sources), but this
-/// payload is three owned strings, so a caller that destructures [`Error::ValueParse`] can compare or
-/// keep the detail. Derives do not change the boxed layout the size assertion below pins.
+/// payload is three owned strings — one of them wrapped — so a caller that destructures
+/// [`Error::ValueParse`] can compare or keep the detail, and is the only thing that can read the
+/// offending value back. Derives do not change the boxed layout the size assertion below pins.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValueParseDetail {
     /// Name of the column whose value failed to parse.
     pub column: String,
-    /// The offending wire text, as received.
-    pub value: String,
+    /// The offending wire text, as received — a **verbatim cell of a source table**, so it is
+    /// whatever the customer stored there. This error rides `?` out of the per-row append, through
+    /// `pg_sink::batch::BatchError` and `anyhow`, to the sink's one `tracing::error!`: rendering it
+    /// there would ship a customer's row to the log aggregator. [`Redacted`] keeps the text
+    /// reachable by a caller that destructures the detail while removing it from every formatter —
+    /// this struct's own derived `Debug` included.
+    pub value: Redacted<String>,
     /// The Arrow type it was being parsed as, rendered for the message.
     pub data_type: String,
 }
@@ -31,7 +39,9 @@ pub enum Error {
     EmptyRelation { relation: String },
     /// One cell's wire text did not parse as its planned type — a bad range literal, a malformed
     /// point. The detail is boxed so the success path stays cheap; see [`ValueParseDetail`].
-    #[error("column {}: cannot parse {:?} as {}", .0.column, .0.value, .0.data_type)]
+    /// Names the column and the target type; the offending value renders as `[redacted]`, because
+    /// it is a source-table cell — see [`ValueParseDetail::value`].
+    #[error("column {}: cannot parse {} as {}", .0.column, .0.value, .0.data_type)]
     ValueParse(Box<ValueParseDetail>),
     /// A tuple's value count disagrees with the relation's column count, which means the row is
     /// being read against the wrong schema version.
@@ -62,7 +72,8 @@ impl From<parquet::errors::ParquetError> for Error {
 }
 
 impl Error {
-    /// Build a boxed parse error without exposing its storage choice to call sites.
+    /// Build a boxed parse error without exposing its storage choice to call sites. `value` is
+    /// wrapped on the way in, so no call site can forget the redaction.
     ///
     /// Cold because a well-formed cell never constructs this diagnostic payload.
     ///
@@ -81,7 +92,7 @@ impl Error {
     ) -> Self {
         Self::ValueParse(Box::new(ValueParseDetail {
             column: column.into(),
-            value: value.into(),
+            value: Redacted::new(value.into()),
             data_type: data_type.into(),
         }))
     }

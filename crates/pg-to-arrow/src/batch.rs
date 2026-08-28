@@ -224,8 +224,13 @@ impl BatchBuilder {
     /// buffer. Byte-equivalent to `serde_json::to_string(meta)` (key order aside) — see
     /// `common::sink_meta`'s `amortized_meta_matches_full` test.
     fn append_meta(&mut self, meta: &SinkMeta) -> Result<(), Error> {
-        let meta_err =
-            |e: serde_json::Error| Error::value_parse(SINK_META_COLUMN, e.to_string(), "json");
+        // The meta column is walrus's own JSON, never a source cell, so the serde reason is safe to
+        // print — but `value_parse` withholds its value slot from every formatter for every caller
+        // (that is the point), so the reason rides `data_type`, the slot `Display` still renders.
+        let meta_err = |e: serde_json::Error| {
+            let target = format!("json ({e})");
+            Error::value_parse(SINK_META_COLUMN, "", target)
+        };
         if self.meta_const.is_none() {
             self.meta_const = Some(meta.to_const_json_inner().map_err(meta_err)?);
         }
@@ -915,14 +920,20 @@ where
 /// Extract the text of a value (for the text-format Tier-1 types). The non-text images are listed
 /// rather than absorbed by a wildcard, so a new `TupleValue` variant is a compile error here — the
 /// same rule its callers above already follow.
+///
+/// The image *kind* is walrus's own wire vocabulary and is the whole diagnostic here, so it rides
+/// `data_type` next to the target type; `{value:?}` no longer names it, because the payload behind
+/// `Binary` is a verbatim source cell and the value slot is withheld from every formatter.
 #[deny(clippy::wildcard_enum_match_arm)]
 fn text<'a>(value: &'a TupleValue, col: &str, dt: &DataType) -> Result<&'a str, Error> {
-    match value {
-        TupleValue::Text(s) => Ok(s),
-        TupleValue::Null | TupleValue::UnchangedToast | TupleValue::Binary(_) => {
-            Err(Error::value_parse(col, format!("{value:?}"), dt.to_string()))
-        }
-    }
+    let kind = match value {
+        TupleValue::Text(s) => return Ok(s),
+        TupleValue::Null => "null",
+        TupleValue::UnchangedToast => "unchanged-toast",
+        TupleValue::Binary(_) => "binary",
+    };
+    let target = format!("{dt} (from a {kind} image)");
+    Err(Error::value_parse(col, "", target))
 }
 
 fn parse_bool(s: &str, col: &str) -> Result<bool, Error> {

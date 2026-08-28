@@ -7,7 +7,7 @@
 //! three modules later. Connectivity (control PG, S3) is a *separate, transient* bootstrap check.
 
 use crate::memory::{HysteresisBand, Ratio};
-use common::{ObjectStoreConfig, TelemetryConfig};
+use common::{ObjectStoreConfig, Redacted, TelemetryConfig};
 use serde::Deserialize;
 use std::fmt;
 use std::net::SocketAddr;
@@ -101,10 +101,12 @@ const fn nz(value: u64) -> NonZeroU64 {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct SinkConfig {
-    /// Control Postgres (manifest/checkpoint/registry).
-    pub control_db_url: String,
-    /// Source Postgres (the logical-replication origin).
-    pub source_db_url: String,
+    /// Control Postgres (manifest/checkpoint/registry). [`Redacted`] because a libpq URL carries
+    /// its password inline and this struct derives `Debug`.
+    pub control_db_url: Redacted<String>,
+    /// Source Postgres (the logical-replication origin). Redacted for the same reason, and this one
+    /// holds the *replication* role's credential — the most privileged the sink is given.
+    pub source_db_url: Redacted<String>,
     /// S3/MinIO staging bucket + endpoint + region.
     pub object_store: ObjectStoreConfig,
     /// Logging setup.
@@ -183,8 +185,8 @@ pub struct SinkConfig {
 impl Default for SinkConfig {
     fn default() -> Self {
         SinkConfig {
-            control_db_url: String::new(),
-            source_db_url: String::new(),
+            control_db_url: Redacted::default(),
+            source_db_url: Redacted::default(),
             object_store: ObjectStoreConfig::default(),
             telemetry: TelemetryConfig::default(),
             worker_threads: None,
@@ -345,8 +347,8 @@ impl SinkConfig {
     /// documented bound. All configuration failures are terminal.
     pub fn validate(&self) -> Result<(), ConfigError> {
         for (field, value) in [
-            ("control_db_url", &self.control_db_url),
-            ("source_db_url", &self.source_db_url),
+            ("control_db_url", self.control_db_url.expose()),
+            ("source_db_url", self.source_db_url.expose()),
             ("instance", &self.instance),
             ("slot_name", &self.slot_name),
             ("publication_name", &self.publication_name),

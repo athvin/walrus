@@ -29,6 +29,26 @@ fn orders() -> PgRelation {
     }
 }
 
+/// `S3Access` derives `Debug` and is carried by every worker, so a stray `?s3` in a diagnostic
+/// would ship the bucket credential to the log aggregator. The endpoint, region and key id stay
+/// legible — they are identifiers an operator needs; only the secret half is withheld.
+#[test]
+fn debug_renders_the_bucket_secret_but_not_its_neighbours() {
+    let access = S3Access {
+        endpoint: "minio:9000".to_string(),
+        region: "eu-west-2".to_string(),
+        access_key_id: "AKIAEXAMPLE".to_string(),
+        secret_access_key: "wJalrXUtnFEMI".into(),
+        use_ssl: false,
+    };
+
+    let rendered = format!("{access:?}");
+
+    assert!(!rendered.contains("wJalrXUtnFEMI"), "{rendered}");
+    assert!(rendered.contains("AKIAEXAMPLE"), "{rendered}");
+    assert!(rendered.contains(common::REDACTED), "{rendered}");
+}
+
 #[test]
 fn in_txn_commits_on_ok() {
     let db = TableDb::open(":memory:").unwrap();

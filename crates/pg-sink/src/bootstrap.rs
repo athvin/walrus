@@ -82,7 +82,7 @@ pub async fn run_shared(cfg: &SinkConfig, deadline: Instant) -> Result<Bootstrap
     // Step 6: source-side preflight. The connect is transient (server may be coming up); every
     // assertion is terminal — a wrong wal_level / missing publication / keyless table can't self-heal.
     let source_client = retry_transient(deadline, "source database", async || {
-        preflight::connect_source(&cfg.source_db_url).await
+        preflight::connect_source(cfg.source_db_url.expose()).await
     })
     .await?;
     let pf = SourcePreflight::new(&source_client, cfg);
@@ -113,7 +113,7 @@ async fn bootstrap_control(cfg: &SinkConfig, deadline: Instant) -> Result<PgPool
     // startup deadline.
     let control_pool = retry_transient(deadline, "control database", async || {
         let budget = attempt_budget(deadline);
-        match tokio::time::timeout(budget, control::connect(&cfg.control_db_url)).await {
+        match tokio::time::timeout(budget, control::connect(cfg.control_db_url.expose())).await {
             Ok(Ok(pool)) => Ok(pool),
             Ok(Err(e)) => Err(Error::ControlDb(e.to_string())),
             Err(_) => Err(Error::ControlDb(format!(

@@ -3,7 +3,7 @@
 //! bounds-check.
 //! Invalid config is a **terminal** bootstrap error → [`common::ExitCode::Config`].
 
-use common::{ObjectStoreConfig, TelemetryConfig};
+use common::{ObjectStoreConfig, Redacted, TelemetryConfig};
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::num::NonZeroI64;
@@ -78,8 +78,9 @@ const fn nonzero_i64(value: i64) -> NonZeroI64 {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct LoaderConfig {
-    /// Control Postgres (leases / manifest / checkpoints).
-    pub control_db_url: String,
+    /// Control Postgres (leases / manifest / checkpoints). [`Redacted`] because a libpq URL carries
+    /// its password inline and this struct derives `Debug`.
+    pub control_db_url: Redacted<String>,
     /// S3/MinIO staging bucket the sink writes and the loader reads.
     pub object_store: ObjectStoreConfig,
     /// Log format and filter; see [`TelemetryConfig`].
@@ -122,7 +123,7 @@ pub struct LoaderConfig {
 impl Default for LoaderConfig {
     fn default() -> Self {
         LoaderConfig {
-            control_db_url: String::new(),
+            control_db_url: Redacted::default(),
             object_store: ObjectStoreConfig::default(),
             telemetry: TelemetryConfig::default(),
             worker_threads: None,
@@ -187,7 +188,7 @@ impl LoaderConfig {
     /// documented bound. These are terminal failures.
     pub fn validate(&self) -> Result<(), ConfigError> {
         for (field, v) in [
-            ("control_db_url", &self.control_db_url),
+            ("control_db_url", self.control_db_url.expose()),
             ("instance", &self.instance),
             ("duckdb_dir", &self.duckdb_dir),
             ("object_store.bucket", &self.object_store.bucket),

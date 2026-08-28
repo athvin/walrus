@@ -84,7 +84,7 @@ fn write_row(
         "INSTALL httpfs; LOAD httpfs; SET s3_region='{}'; SET s3_endpoint='{}'; \
          SET s3_url_style='path'; SET s3_use_ssl=false; \
          SET s3_access_key_id='{}'; SET s3_secret_access_key='{}';",
-        a.region, a.endpoint, a.access_key_id, a.secret_access_key
+        a.region, a.endpoint, a.access_key_id, a.secret_access_key.expose()
     ))
     .unwrap();
     w.execute_batch(

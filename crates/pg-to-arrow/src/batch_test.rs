@@ -260,6 +260,47 @@ fn bad_int_text_reports_the_column_name() {
     }
 }
 
+/// The offending cell is customer data, and this error rides `?` to the sink's one
+/// `tracing::error!`. Both formatters must name the column and the target type and nothing else —
+/// `Debug` included, because the services log their own errors with `?e` as well as `{e:#}`. The
+/// value stays reachable for a caller that destructures the detail, which no log line does.
+#[test]
+fn a_bad_cell_is_diagnosed_without_reproducing_its_value() {
+    let mut b = BatchBuilder::new(&orders()).unwrap();
+    let cell = "alice@example.com";
+
+    let err = b
+        .append_row(
+            &text_vals(&[cell, "1.00", "2024-01-02 03:04:05+00", "hi"]),
+            &meta(vec![]),
+        )
+        .unwrap_err();
+
+    assert_eq!(err.to_string(), "column id: cannot parse [redacted] as Int32");
+    assert!(!format!("{err:?}").contains(cell), "{err:?}");
+    match err {
+        Error::ValueParse(detail) => assert_eq!(detail.value.expose(), cell),
+        other => panic!("expected ValueParse, got {other:?}"),
+    }
+}
+
+/// A non-text image fails the same conversion, and *which* image it was is walrus's own wire
+/// vocabulary — so that much stays in the message even though the payload behind it does not.
+#[test]
+fn a_non_text_image_names_its_kind_but_not_its_payload() {
+    let mut b = BatchBuilder::new(&orders()).unwrap();
+    let mut vals = text_vals(&["1", "1.00", "2024-01-02 03:04:05+00", "hi"]);
+    vals[3] = TupleValue::Binary(bytes::Bytes::from_static(b"\xde\xad\xbe\xef"));
+
+    let err = b.append_row(&vals, &meta(vec![])).unwrap_err();
+
+    let rendered = err.to_string();
+
+    assert!(rendered.starts_with("column note: cannot parse "), "{rendered}");
+    assert!(rendered.ends_with(" as Utf8 (from a binary image)"), "{rendered}");
+    assert!(rendered.contains(common::REDACTED), "{rendered}");
+}
+
 #[test]
 fn meta_column_holds_serialized_sink_meta_json() {
     let mut b = BatchBuilder::new(&orders()).unwrap();

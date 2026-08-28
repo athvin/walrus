@@ -20,7 +20,7 @@
 
 use crate::reload_signal::WatermarkWaiters;
 use anyhow::Context as _;
-use common::EpochNo;
+use common::{EpochNo, Redacted};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::ops::AsyncFnMut;
 use std::sync::Arc;
@@ -297,7 +297,8 @@ fn classify_target(
 
 /// The connections + config an exporter needs, bundled so the restart loop takes few args.
 struct ExportDeps {
-    source_db_url: String,
+    /// Wrapped for `ReloadController::source_db_url`'s reason — this is a clone of it.
+    source_db_url: Redacted<String>,
     pool: sqlx::PgPool,
     waiters: Arc<WatermarkWaiters>,
     sink: crate::sink::ParquetSink,
@@ -321,7 +322,7 @@ async fn export_with_ddl_restarts(
     let pool = deps.pool;
     loop {
         let mut exporter = ChunkExporter::connect(
-            &deps.source_db_url,
+            deps.source_db_url.expose(),
             pool.clone(),
             Arc::clone(&deps.waiters),
             deps.sink.clone(),
@@ -406,7 +407,10 @@ pub struct ReloadController {
     /// Catalog preflight dials a FRESH ordinary source connection per non-empty tick: reloads are
     /// rare operator events, and a held-forever idle client is exactly what proxies/failovers
     /// silently kill — a dead connection must never masquerade as a preflight rejection.
-    source_db_url: String,
+    ///
+    /// Wrapped in [`Redacted`] because this struct derives `Debug` and a libpq URL carries its
+    /// password inline.
+    source_db_url: Redacted<String>,
     /// Exporters subscribe here before signalling; the decode loop resolves (PR 6.3).
     waiters: Arc<WatermarkWaiters>,
     /// Each exporter clones a handle: chunk Parquet lands in the same epoch-prefixed layout.
@@ -451,7 +455,7 @@ impl ReloadController {
     ) -> tokio::task::JoinHandle<()> {
         let controller = ReloadController {
             pool,
-            source_db_url: source_db_url.to_string(),
+            source_db_url: source_db_url.into(),
             waiters,
             sink,
             semaphore: Arc::new(Semaphore::new(cfg.max_concurrent_reloads.get())),
@@ -556,7 +560,7 @@ impl ReloadController {
         }
         // Fresh preflight connection per non-empty tick (see the field doc). If the SOURCE is
         // unreachable, no preflight can be trusted: release every claim and retry next tick.
-        let connected = crate::preflight::connect_source(&self.source_db_url).await;
+        let connected = crate::preflight::connect_source(self.source_db_url.expose()).await;
         let Ok(source) = connected.inspect_err(|e| {
             tracing::warn!(
                 error = %e,

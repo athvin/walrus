@@ -7,7 +7,7 @@
 )]
 
 //! Shared primitives for walrus: errors + exit codes, [`Lsn`], telemetry, config,
-//! [`SinkMeta`], and the neutral Postgres shape types. Populated PR by PR (0.2 →).
+//! [`SinkMeta`], [`Redacted`], and the neutral Postgres shape types. Populated PR by PR (0.2 →).
 //!
 //! # Features
 //!
@@ -39,6 +39,7 @@ pub mod lsn;
 pub mod metrics;
 pub mod oids;
 pub mod pg_shape;
+pub mod redact;
 pub mod runtime;
 pub mod sink_meta;
 pub mod sql;
@@ -61,6 +62,7 @@ pub use failure_class::FailureClass;
 pub use ids::{DdlId, EpochNo, ManifestId, ReloadId, SchemaVersionNo};
 pub use lsn::Lsn;
 pub use pg_shape::{PgColumn, PgRelation, ReplicaIdentity, TupleValue};
+pub use redact::{REDACTED, Redacted};
 pub use sink_meta::{Kind, Op, PG_EPOCH_UNIX_MICROS, PG_EPOCH_UNIX_SECS, SinkMeta, UtcTimestamp};
 pub use telemetry::{TelemetryConfig, init_tracing};
 pub use type_descriptor::{Tier, TypeDescriptor, TypeMeta};

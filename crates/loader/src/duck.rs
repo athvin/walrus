@@ -11,7 +11,7 @@ use common::oids::{
     TIMESTAMPTZ, UUID,
 };
 use common::sql::SqlStrExt;
-use common::{EpochNo, PgRelation, ReloadId, SchemaVersionNo};
+use common::{EpochNo, PgRelation, Redacted, ReloadId, SchemaVersionNo};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
@@ -186,7 +186,7 @@ impl TableDb {
             .replace("{endpoint}", &esc(&s3.endpoint))
             .replace("{use_ssl}", use_ssl)
             .replace("{access_key}", &esc(&s3.access_key_id))
-            .replace("{secret_key}", &esc(&s3.secret_access_key));
+            .replace("{secret_key}", &esc(s3.secret_access_key.expose()));
         self.conn.execute_batch(&sql).duck("configure S3")
     }
 
@@ -552,6 +552,10 @@ pub(crate) fn user_view_sql(table: &str) -> String {
 }
 
 /// DuckDB S3/httpfs credentials for reading the staging bucket.
+///
+/// Only the secret half is [`Redacted`]: an access key id is an identifier that already appears in
+/// bucket policies and audit trails, while `secret_access_key` *is* the credential — and this
+/// struct derives `Debug`, which would otherwise put it one `?s3` away from a log line.
 #[derive(Debug, Clone)]
 pub struct S3Access {
     /// Host:port DuckDB's httpfs extension should talk to (MinIO in dev, S3 in production).
@@ -560,8 +564,9 @@ pub struct S3Access {
     pub region: String,
     /// Access key id.
     pub access_key_id: String,
-    /// Secret access key. Held only long enough to configure the connection; never logged.
-    pub secret_access_key: String,
+    /// Secret access key. Held only long enough to configure the connection; the wrapper is what
+    /// keeps "never logged" a property of the type rather than a promise in a doc comment.
+    pub secret_access_key: Redacted<String>,
     /// Whether to reach the endpoint over TLS. `false` for a plain-HTTP local MinIO.
     pub use_ssl: bool,
 }

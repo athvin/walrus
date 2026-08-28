@@ -3,8 +3,8 @@ use common::FailureClass;
 
 fn valid() -> SinkConfig {
     SinkConfig {
-        control_db_url: "postgres://localhost/walrus_control".to_string(),
-        source_db_url: "postgres://localhost/walrus".to_string(),
+        control_db_url: "postgres://localhost/walrus_control".into(),
+        source_db_url: "postgres://localhost/walrus".into(),
         object_store: ObjectStoreConfig {
             bucket: "walrus".to_string(),
             endpoint: Some("http://localhost:9000".to_string()),
@@ -161,8 +161,8 @@ fn a_misspelled_key_is_a_terminal_load_failure() {
 #[test]
 fn defaults_are_the_shipped_contract() {
     let cfg = SinkConfig::default();
-    assert_eq!(cfg.control_db_url, "");
-    assert_eq!(cfg.source_db_url, "");
+    assert_eq!(cfg.control_db_url.expose(), "");
+    assert_eq!(cfg.source_db_url.expose(), "");
     assert_eq!(cfg.object_store.bucket, "");
     assert_eq!(cfg.object_store.endpoint, None);
     assert_eq!(cfg.object_store.region, "us-east-1");
@@ -195,6 +195,24 @@ fn defaults_are_the_shipped_contract() {
 #[test]
 fn a_fully_valid_config_passes() {
     assert!(valid().validate().is_ok());
+}
+
+/// Both DSNs carry a password inline, and `source_db_url` carries the replication role's — the most
+/// privileged credential the sink holds. `SinkConfig` derives `Debug`, so a single `?cfg` anywhere
+/// would ship both to the log aggregator; the wrappers are what make that impossible.
+#[test]
+fn debug_renders_neither_dsn() {
+    let cfg = SinkConfig {
+        control_db_url: "postgres://walrus:hunter2@control-pg/walrus".into(),
+        source_db_url: "postgres://replicator:s3cr3t@source-pg/walrus".into(),
+        ..valid()
+    };
+
+    let rendered = format!("{cfg:?}");
+
+    assert!(!rendered.contains("hunter2"), "{rendered}");
+    assert!(!rendered.contains("s3cr3t"), "{rendered}");
+    assert_eq!(rendered.matches(common::REDACTED).count(), 2, "{rendered}");
 }
 
 #[test]

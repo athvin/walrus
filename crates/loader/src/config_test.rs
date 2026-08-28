@@ -4,7 +4,7 @@ use common::runtime::WorkerThreadsError;
 
 fn valid() -> LoaderConfig {
     LoaderConfig {
-        control_db_url: "postgres://localhost/walrus_control".to_string(),
+        control_db_url: "postgres://localhost/walrus_control".into(),
         object_store: ObjectStoreConfig {
             bucket: "walrus".to_string(),
             ..ObjectStoreConfig::default()
@@ -128,7 +128,7 @@ fn every_duration_field_rejects_missing_attribute_fixture() {
 #[test]
 fn defaults_are_the_shipped_contract() {
     let cfg = LoaderConfig::default();
-    assert_eq!(cfg.control_db_url, "");
+    assert_eq!(cfg.control_db_url.expose(), "");
     assert_eq!(cfg.object_store.bucket, "");
     assert_eq!(cfg.object_store.endpoint, None);
     assert_eq!(cfg.object_store.region, "us-east-1");
@@ -203,7 +203,7 @@ fn every_missing_required_field_is_named_by_the_variant() {
 
     // Whitespace-only counts as blank, so this first case also pins the `trim()`.
     let mut cfg = valid();
-    cfg.control_db_url = "   ".to_string();
+    cfg.control_db_url = "   ".into();
     expect_missing(&cfg, "control_db_url");
 
     let mut cfg = valid();
@@ -217,6 +217,21 @@ fn every_missing_required_field_is_named_by_the_variant() {
     let mut cfg = valid();
     cfg.object_store.bucket = String::new();
     expect_missing(&cfg, "object_store.bucket");
+}
+
+/// The DSN carries its password inline and `LoaderConfig` derives `Debug`, so a single `?cfg`
+/// anywhere would put the control-plane credential in the log aggregator.
+#[test]
+fn debug_does_not_render_the_control_dsn() {
+    let cfg = LoaderConfig {
+        control_db_url: "postgres://walrus:hunter2@control-pg/walrus".into(),
+        ..valid()
+    };
+
+    let rendered = format!("{cfg:?}");
+
+    assert!(!rendered.contains("hunter2"), "{rendered}");
+    assert!(rendered.contains(common::REDACTED), "{rendered}");
 }
 
 #[test]

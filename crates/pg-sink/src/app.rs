@@ -106,7 +106,7 @@ async fn pipeline(
     // beat writes the published `walrus.heartbeat`, whose round-trip through the stream advances the
     // slot on an otherwise-idle publication (§1.9).
     let mut heartbeat = crate::heartbeat::Heartbeat::connect(
-        &cfg.source_db_url,
+        cfg.source_db_url.expose(),
         &cfg.instance,
         cfg.heartbeat_config(),
     )
@@ -124,7 +124,7 @@ async fn pipeline(
     // table_reload on the heartbeat cadence, schedules exporters under max_concurrent_reloads.
     let reload_controller = crate::reload::ReloadController::spawn(
         ctx.control_pool.clone(),
-        &cfg.source_db_url,
+        cfg.source_db_url.expose(),
         Arc::clone(&waiters),
         sink.clone(),
         crate::reload::ReloadControllerConfig {
@@ -233,7 +233,7 @@ async fn establish_stream(
                 },
                 async {
                     ReplicationStream::start(
-                        &cfg.source_db_url,
+                        cfg.source_db_url.expose(),
                         slot.as_str(),
                         confirmed_flush,
                         &cfg.publication_name,
@@ -264,7 +264,7 @@ async fn establish_stream(
     // bootstrap when no prior epoch exists, or a TOTAL-RESTART (§1.8) when the slot was lost/absent while
     // a generation was running — `bump_epoch` yields `1` on an empty table and `MAX+1` otherwise, so a
     // single path serves both; we distinguish them only to alert loudly on the disaster case.
-    let (snap, snapshot) = crate::snapshot::SnapshotConn::connect(&cfg.source_db_url)
+    let (snap, snapshot) = crate::snapshot::SnapshotConn::connect(cfg.source_db_url.expose())
         .await
         .context("open snapshot replication connection")?
         .create_slot_with_snapshot(&slot)
@@ -307,7 +307,7 @@ async fn establish_stream(
         },
         async {
             crate::snapshot::Backfill::connect(
-                &cfg.source_db_url,
+                cfg.source_db_url.expose(),
                 epoch,
                 &cfg.instance,
                 triggers,
