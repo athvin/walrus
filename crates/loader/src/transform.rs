@@ -72,15 +72,14 @@ impl TransformSql {
         let q = |c: &str| format!("\"{c}\"");
         let table = DuckTable::<Mirror>::new(plan.table.as_ref());
         let raw_table = table.to_raw();
-        let pk: Vec<&str> = plan
+        // The TOAST back-scan's key predicate is the only thing the key names feed here, so the
+        // filter streams straight into the rendered equalities — the join needs a slice, nothing
+        // upstream of it does.
+        let r_pk_eq_s = plan
             .mirror_cols
             .iter()
             .filter(|c| c.is_key)
-            .map(|c| c.name.as_str())
-            .collect();
-        let r_pk_eq_s = pk
-            .iter()
-            .map(|k| format!("r.{} = s.{}", q(k), q(k)))
+            .map(|c| format!("r.{} = s.{}", q(&c.name), q(&c.name)))
             .collect::<Vec<_>>()
             .join(" AND ");
         let mirror = plan
