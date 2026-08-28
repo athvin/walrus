@@ -20,6 +20,7 @@
 use common::{Lsn, ReloadId};
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::oneshot;
 
@@ -72,13 +73,15 @@ impl WatermarkWaiters {
 
     /// Remove `key` only if it still holds `generation`; a stale guard must not evict the live
     /// waiter that replaced it.
+    ///
+    /// The occupied entry holds the slot the lookup found, so the generation check and the eviction
+    /// share one hash — a `get`-then-`remove` pair would hash twice while holding the registry lock.
     fn unsubscribe(&self, key: WaiterKey, generation: u64) {
         let mut waiters = self.waiters.lock();
-        if waiters
-            .get(&key)
-            .is_some_and(|(stored_generation, _)| *stored_generation == generation)
+        if let Entry::Occupied(entry) = waiters.entry(key)
+            && entry.get().0 == generation
         {
-            waiters.remove(&key);
+            entry.remove();
         }
     }
 

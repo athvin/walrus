@@ -255,6 +255,8 @@ impl TableDb {
         uri: &str,
         schema_version: SchemaVersionNo,
     ) -> Result<Arc<[String]>, LoaderError> {
+        // The shared borrow is released before the miss path: an `entry` call would hold the
+        // `RefCell` across the DESCRIBE below, and one saved hash is nothing beside that query.
         let cached = { self.parquet_cols.borrow().get(&schema_version).cloned() };
         if let Some(columns) = cached {
             return Ok(columns);
