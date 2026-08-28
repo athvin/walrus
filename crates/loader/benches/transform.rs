@@ -233,7 +233,8 @@ fn bench_keycols(c: &mut Criterion) {
     let mut g = c.benchmark_group("loader/keycols");
     for (label, relation) in [("one_key", one_key), ("three_keys", three_keys)] {
         g.bench_with_input(BenchmarkId::from_parameter(label), &relation, |b, rel| {
-            b.iter(|| black_box(rel.to_key_columns()));
+            // Input guarded too — the only non-FFI bench here, so it *can* be const-folded.
+            b.iter(|| black_box(black_box(rel).to_key_columns()));
         });
     }
     g.finish();

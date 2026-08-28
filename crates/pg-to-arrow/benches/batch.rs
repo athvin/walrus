@@ -131,6 +131,10 @@ const SHAPES: [Shape; 4] = [
     Shape::Tier2Fanout,
 ];
 
+/// Per-row `append_row` cost. Both operands are `black_box`ed *inside* the loop: they are captured
+/// loop-invariants (criterion only guards `setup()` output and the closure's return), and under the
+/// bench profile's thin LTO the optimiser could otherwise hoist the per-row text parse and meta
+/// serialisation out and measure `ROWS` copies of a single result.
 fn bench_append_row(c: &mut Criterion) {
     let m = meta();
     let mut g = c.benchmark_group("arrow/append_row");
@@ -143,7 +147,7 @@ fn bench_append_row(c: &mut Criterion) {
                 || BatchBuilder::new(&rel).unwrap(),
                 |mut bb| {
                     for _ in 0..ROWS {
-                        bb.append_row(&row, &m).unwrap();
+                        bb.append_row(black_box(&row), black_box(&m)).unwrap();
                     }
                     black_box(bb.len());
                 },
