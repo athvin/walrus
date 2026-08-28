@@ -45,6 +45,15 @@ missing_copy_implementations = "deny"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
+# `clippy::all` carries the correctness group today — the lints for code that is simply wrong
+# (`unit_cmp`, `never_loop`, `unused_io_amount`, `iter_next_loop`). Which lints that group carries is
+# clippy's to redraw, so pin correctness by name, exactly as `ptr_arg` and `missing_safety_doc` are
+# pinned below. The explicit `priority = -1` is load-bearing rather than decoration: a group entry at
+# or above a named lint's priority overrides that lint, and every named entry here sits at the
+# default 0 — so the bare `correctness = "deny"` spelling would itself go red under
+# `clippy::lint_groups_priority`, which is a correctness lint. No source file changes either way,
+# so crates/common/tests/workspace_lints_inherited.rs is what notices if this entry drifts.
+correctness = { level = "deny", priority = -1 }
 # Phase 26 keeps ordered sequences contiguous. `linkedlist` is pedantic (outside `clippy::all`),
 # so this named deny needs no group-priority adjustment.
 linkedlist = "deny"

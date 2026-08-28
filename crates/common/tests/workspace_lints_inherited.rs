@@ -122,6 +122,13 @@ fn clippy_deny_count(table: &str, lint: &str) -> usize {
     table.lines().filter(|line| line.trim() == entry).count()
 }
 
+/// How many entries pin the lint *group* `group` at `deny` with `priority = -1` — the only spelling
+/// a group may take in a table whose named lints sit at the default priority.
+fn clippy_group_deny_count(table: &str, group: &str) -> usize {
+    let entry = format!(r#"{group} = {{ level = "deny", priority = -1 }}"#);
+    table.lines().filter(|line| line.trim() == entry).count()
+}
+
 #[test]
 fn every_member_opts_into_the_workspace_lint_table() {
     let wrapped_members = r#"[workspace]
@@ -177,6 +184,42 @@ fn the_workspace_lint_table_still_denies_unwrap_and_expect() {
     assert!(rust.contains(r#"warnings = "deny""#));
     assert!(clippy.contains(r#"unwrap_used = "deny""#));
     assert!(clippy.contains(r#"expect_used = "deny""#));
+}
+
+/// `clippy::correctness` is the group for code that is outright wrong — `unit_cmp`, `never_loop`,
+/// `unused_io_amount`, `iter_next_loop`. Its named entry has no site to go red: every one of those
+/// lints also arrives through the `clippy::all` deny above, so dropping it changes no diagnostic
+/// today. What it changes is what a regrouping of `clippy::all` — or a member downgrading that one
+/// entry — can quietly take away, which is why this test exists at all.
+///
+/// The `priority = -1` half is not cosmetic. A lint group at or above a named lint's priority
+/// overrides that lint, so the plain `correctness = "deny"` spelling would go red under
+/// `clippy::lint_groups_priority` — itself a correctness lint — against every named entry below it,
+/// all of which sit at the default 0.
+#[test]
+fn the_workspace_lint_table_still_denies_the_correctness_group() {
+    let synthetic = "correctness = \"deny\"\n";
+    assert_eq!(clippy_group_deny_count(synthetic, "correctness"), 0);
+    assert_eq!(clippy_deny_count(synthetic, "correctness"), 1);
+
+    let root_manifest = std::fs::read_to_string(repo_root().join("Cargo.toml")).unwrap();
+    let clippy = section(&root_manifest, "[workspace.lints.clippy]")
+        .expect("root manifest must define [workspace.lints.clippy]");
+    assert_eq!(
+        clippy_group_deny_count(clippy, "correctness"),
+        1,
+        "workspace policy must pin the correctness group at deny with priority = -1"
+    );
+    assert_eq!(
+        clippy_deny_count(clippy, "correctness"),
+        0,
+        "a priority-less `correctness = \"deny\"` collides with the named lints below it"
+    );
+    assert_eq!(
+        clippy_group_deny_count(clippy, "all"),
+        1,
+        "correctness is pinned alongside clippy::all, never instead of it"
+    );
 }
 
 #[test]
