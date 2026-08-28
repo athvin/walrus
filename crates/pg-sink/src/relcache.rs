@@ -270,7 +270,7 @@ fn build_cached(
     schema_version: SchemaVersionNo,
 ) -> Result<CachedRelation, RelationError> {
     let arrow_schema = build_arrow(&relation)?;
-    let descriptors = pg_to_arrow::descriptor::describe_relation(&relation).map_err(|source| {
+    let descriptors = pg_to_arrow::describe_relation(&relation).map_err(|source| {
         RelationError::Schema {
             schema: relation.schema.clone(),
             table: relation.name.clone(),

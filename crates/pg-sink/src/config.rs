@@ -7,8 +7,7 @@
 //! three modules later. Connectivity (control PG, S3) is a *separate, transient* bootstrap check.
 
 use crate::memory::{HysteresisBand, Ratio};
-use common::TelemetryConfig;
-use common::config::ObjectStoreConfig;
+use common::{ObjectStoreConfig, TelemetryConfig};
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::num::NonZeroU64;

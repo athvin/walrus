@@ -49,7 +49,7 @@ pub mod type_descriptor;
 // private: `use common::string_enum;` resolves the macro, not the module.
 mod string_enum;
 
-pub use config::CommonConfig;
+pub use config::{CommonConfig, ObjectStoreConfig};
 pub use error::{Error, ExitCode, Result};
 pub use failure_class::FailureClass;
 pub use ids::{DdlId, EpochNo, ManifestId, ReloadId, SchemaVersionNo};

@@ -17,7 +17,7 @@
 
 use common::{PgColumn, PgRelation, ReplicaIdentity, SchemaVersionNo};
 use control::{RegistryRow, connect, read_registry, run_migrations, upsert_registry};
-use pg_to_arrow::descriptor::describe_relation;
+use pg_to_arrow::describe_relation;
 
 fn control_dsn() -> String {
     std::env::var("WALRUS_CONTROL_DB_URL").unwrap_or_else(|_| {

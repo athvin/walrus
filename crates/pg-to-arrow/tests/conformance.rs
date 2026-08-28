@@ -15,8 +15,7 @@
 
 use common::{Kind, Op, PgColumn, PgRelation, ReplicaIdentity, SinkMeta, TupleValue, UtcTimestamp};
 use duckdb::Connection;
-use pg_to_arrow::batch::BatchBuilder;
-use pg_to_arrow::{oids, write_parquet_bytes};
+use pg_to_arrow::{BatchBuilder, oids, write_parquet_bytes};
 use std::io::Write;
 
 fn meta() -> SinkMeta {

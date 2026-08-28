@@ -2,8 +2,7 @@
 //! pattern: `WALRUS_`-prefixed env (optional file underneath) → typed serde struct → bounds-check.
 //! Invalid config is a **terminal** bootstrap error → [`common::ExitCode::Config`].
 
-use common::TelemetryConfig;
-use common::config::ObjectStoreConfig;
+use common::{ObjectStoreConfig, TelemetryConfig};
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::num::NonZeroI64;

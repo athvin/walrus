@@ -54,7 +54,7 @@ fn caches_arrow_schema_and_descriptors_by_versioned_key() {
 fn hydrate_round_trips_through_a_registry_row() {
     // Simulate what on_relation persists, then hydrate a fresh cache from it.
     let relation = orders();
-    let descriptors = pg_to_arrow::descriptor::describe_relation(&relation).unwrap();
+    let descriptors = pg_to_arrow::describe_relation(&relation).unwrap();
     let row = control::RegistryRow {
         epoch: common::EpochNo(1),
         source_schema: "public".to_string(),
@@ -134,7 +134,7 @@ fn hydrate_message_is_unchanged_on_a_malformed_snapshot() {
         source_schema: "public".to_string(),
         source_table: "orders".to_string(),
         schema_version: SchemaVersionNo(1),
-        descriptors: pg_to_arrow::descriptor::describe_relation(&relation).unwrap(),
+        descriptors: pg_to_arrow::describe_relation(&relation).unwrap(),
         columns: serde_json::to_value(relation).unwrap(),
     };
     let malformed = serde_json::json!({"not": "a PgRelation"});

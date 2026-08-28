@@ -14,8 +14,7 @@
 
 use crate::config::SinkConfig;
 use crate::preflight::{self, SourcePreflight};
-use common::config::ObjectStoreConfig;
-use common::{Error, FailureClass};
+use common::{Error, FailureClass, ObjectStoreConfig};
 use object_store::path::Path;
 use object_store::{ObjectStore, PutPayload};
 use sqlx::PgPool;

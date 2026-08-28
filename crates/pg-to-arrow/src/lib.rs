@@ -25,6 +25,11 @@ pub mod uuid_enum;
 mod approx;
 
 pub use batch::BatchBuilder;
+// Only the whole-relation entry point goes flat. The per-column pair (`describe_column`,
+// `describe_column_with_labels`) stays module-qualified: a bare `describe_column` at the crate
+// root reads like a peer of `build_schema` when it is really the inner step `describe_relation`
+// maps over.
+pub use descriptor::describe_relation;
 pub use error::Error;
 pub use parquet::{default_writer_properties, write_parquet, write_parquet_bytes};
 pub use schema::{SINK_META_COLUMN, build_schema, emit_fields, tier1_data_type};
