@@ -21,9 +21,9 @@ use common::{PgRelation, TypeDescriptor};
 
 /// A `<table>_raw` column: the verbatim emit column the sink wrote to Parquet.
 #[derive(Debug, Clone)]
-pub struct RawCol {
-    pub name: String,
-    pub duckdb_type: String,
+pub(crate) struct RawCol {
+    pub(crate) name: String,
+    pub(crate) duckdb_type: String,
 }
 
 #[cfg(target_pointer_width = "64")]
@@ -35,7 +35,7 @@ const _: () = assert!(
 /// How a mirror column's value is produced from the winning raw row `s` (and, for a TOAST-resolvable
 /// scalar, the current mirror `t`).
 #[derive(Debug, Clone)]
-pub enum MirrorValue {
+pub(crate) enum MirrorValue {
     /// `s."<name>"` — a direct copy of the like-named raw column. `toast_resolvable` marks a Tier-1
     /// non-key scalar that may carry the unchanged-TOAST sentinel (resolved by the raw back-scan, §5.6).
     Passthrough { toast_resolvable: bool },
@@ -45,11 +45,11 @@ pub enum MirrorValue {
 
 /// A `<table>` mirror column: name, DuckDB type, key flag, and how its value is computed.
 #[derive(Debug, Clone)]
-pub struct MirrorCol {
-    pub name: String,
-    pub duckdb_type: String,
-    pub is_key: bool,
-    pub value: MirrorValue,
+pub(crate) struct MirrorCol {
+    pub(crate) name: String,
+    pub(crate) duckdb_type: String,
+    pub(crate) is_key: bool,
+    pub(crate) value: MirrorValue,
 }
 
 /// Size budget for one [`TablePlan::mirror_cols`] entry. The [`TablePlan`] assertion below pins the
@@ -64,10 +64,10 @@ const _: () = assert!(std::mem::size_of::<MirrorCol>() <= MIRROR_COL_MAX_BYTES);
 
 /// The full plan for one table: the raw emit columns and the mirror columns.
 #[derive(Debug, Clone)]
-pub struct TablePlan {
-    pub table: Box<str>,
-    pub raw_cols: Box<[RawCol]>,
-    pub mirror_cols: Box<[MirrorCol]>,
+pub(crate) struct TablePlan {
+    pub(crate) table: Box<str>,
+    pub(crate) raw_cols: Box<[RawCol]>,
+    pub(crate) mirror_cols: Box<[MirrorCol]>,
 }
 
 #[cfg(target_pointer_width = "64")]
@@ -80,7 +80,7 @@ impl TablePlan {
     /// The Tier-1 (scalar-only) plan from a bare relation — one emit column == source column via
     /// `crate::duck::duck_type`, mirror = same. Reproduces the pre-descriptor behaviour exactly.
     #[must_use]
-    pub fn tier1(rel: &PgRelation) -> Self {
+    pub(crate) fn tier1(rel: &PgRelation) -> Self {
         // Tier-1 exact one raw + one mirror per source column.
         let mut raw_cols = Vec::with_capacity(rel.columns.len());
         let mut mirror_cols = Vec::with_capacity(rel.columns.len());
@@ -109,7 +109,7 @@ impl TablePlan {
     /// The full plan from the registry: descriptors (Tier-1/2/3) aligned with the relation's columns (for
     /// the key flags). Falls back to the Tier-1 shape for any column without a descriptor.
     #[must_use]
-    pub fn from_registry(rel: &PgRelation, descriptors: &[TypeDescriptor]) -> Self {
+    pub(crate) fn from_registry(rel: &PgRelation, descriptors: &[TypeDescriptor]) -> Self {
         let by_name: std::collections::HashMap<&str, &TypeDescriptor> =
             descriptors.iter().map(|d| (d.column.as_str(), d)).collect();
         // Lower bound because a Tier-2 range fans out to five raw columns.

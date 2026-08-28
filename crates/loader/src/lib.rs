@@ -37,7 +37,11 @@ pub mod lease;
 pub mod ownership;
 pub mod phase_a;
 pub mod phase_b;
-pub mod plan;
+// The registry → DuckDB schema plan is an implementation detail of `duck`, `transform` and the three
+// drivers (`bootstrap`, `phase_a`, `phase_b`): no binary, integration test or bench names it. Crate
+// visibility keeps `TablePlan`'s shape free to move with the type system it bridges, and is why the
+// four entry points that build or consume one are `pub(crate)` too.
+pub(crate) mod plan;
 pub mod shutdown;
 pub mod supervisor;
 pub mod table_name;

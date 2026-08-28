@@ -24,7 +24,7 @@ use common::{Lsn, PgRelation};
 /// Returns [`LoaderError::Duck`] if the local schema watermark cannot be read,
 /// [`LoaderError::Control`] if the registry lookup fails, or [`LoaderError::RegistryDecode`] if the
 /// stored relation shape is invalid.
-pub async fn current_transform(ctx: &TableCtx) -> Result<TransformSql, LoaderError> {
+pub(crate) async fn current_transform(ctx: &TableCtx) -> Result<TransformSql, LoaderError> {
     let ver = ctx.db.schema_version()?;
     match control::read_registry(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table, ver).await? {
         Some(r) => {

@@ -5,15 +5,21 @@
 //! models (manifest claim/insert, checkpoint upsert, registry) land in PRs 1.4–1.6; this PR is
 //! just the schema, the ability to apply it, and the connect path every later model reuses.
 
-pub mod checkpoint;
-pub mod db;
-pub mod ddl_manifest;
-pub mod manifest;
-pub mod parse;
+// Every item these eight modules declare is published by the `pub use` block below, so `pub` on the
+// modules themselves would only mint a second public path for each one. Crate visibility makes that
+// flat block the whole API, which leaves the row models, their queries and the module boundaries
+// between them free to move without breaking a consumer. `reload` is the documented exception: its
+// transition functions stay module-qualified (see the note on its re-export), so it must stay
+// reachable as a path.
+pub(crate) mod checkpoint;
+pub(crate) mod db;
+pub(crate) mod ddl_manifest;
+pub(crate) mod manifest;
+pub(crate) mod parse;
 pub mod reload;
-pub mod replication_state;
-pub mod schema_registry;
-pub mod table_ownership;
+pub(crate) mod replication_state;
+pub(crate) mod schema_registry;
+pub(crate) mod table_ownership;
 
 pub use checkpoint::{
     Checkpoint, advance_raw_appended, advance_transformed, ensure_checkpoint, read_checkpoint,

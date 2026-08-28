@@ -46,12 +46,14 @@ struct MirrorCol {
     value_expr: String,
 }
 
-/// A table's mirror-column layout for rendering the transform (order preserved). Built from a
-/// [`crate::plan::TablePlan`] — the Tier-1 plan reproduces the pre-descriptor scalar SQL exactly.
+/// A table's mirror-column layout for rendering the transform (order preserved). Built from the
+/// crate-internal `plan::TablePlan` — the Tier-1 plan reproduces the pre-descriptor scalar SQL
+/// exactly. The public constructor ([`Self::from_relation`]) takes the shape callers already hold,
+/// so the plan type stays free to change with the type system it bridges.
 #[derive(Debug)]
 pub struct TransformSql {
     table: DuckTable<Mirror>,
-    /// Frozen like the [`crate::plan::TablePlan::mirror_cols`] it is derived from: the layout is
+    /// Frozen like the `plan::TablePlan::mirror_cols` it is derived from: the layout is
     /// settled once per Phase-B poll and only ever read back to render SQL.
     mirror: Box<[MirrorCol]>,
 }
@@ -67,7 +69,7 @@ impl TransformSql {
     /// over the winner `s` — a recombine expression (Tier-2), an unchanged-TOAST-resolved back-scan
     /// (Tier-1 non-key, §5.6), or a plain `s."col"` (keys / flat siblings).
     #[must_use]
-    pub fn from_plan(plan: &crate::plan::TablePlan) -> Self {
+    pub(crate) fn from_plan(plan: &crate::plan::TablePlan) -> Self {
         use crate::plan::MirrorValue;
         let q = |c: &str| format!("\"{c}\"");
         let table = DuckTable::<Mirror>::new(plan.table.as_ref());

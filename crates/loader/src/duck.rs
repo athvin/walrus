@@ -106,7 +106,7 @@ impl TableDb {
     /// # Errors
     ///
     /// Returns [`LoaderError::Duck`] if any mirror, raw-table, view, or metadata DDL statement fails.
-    pub fn ensure_tables_planned(
+    pub(crate) fn ensure_tables_planned(
         &self,
         plan: &TablePlan,
         schema_version: SchemaVersionNo,
@@ -513,7 +513,7 @@ impl TableDb {
     /// # Errors
     ///
     /// Returns [`LoaderError::Duck`] if dropping, recreating, or stamping either table fails.
-    pub fn rebuild_for_reload(
+    pub(crate) fn rebuild_for_reload(
         &self,
         plan: &TablePlan,
         schema_version: SchemaVersionNo,

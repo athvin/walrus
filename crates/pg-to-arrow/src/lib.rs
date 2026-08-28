@@ -8,12 +8,18 @@
 //! PR 2.9 builds the Tier-1 (native 1:1) Arrow schema; values (2.10), Parquet + DuckDB conformance
 //! (2.11), and the Tier-2/3 types (2.12+) follow.
 
-pub mod batch;
+// `batch` and `parquet` declare nothing the `pub use` block below does not already publish —
+// `BatchBuilder`, and the three writer entry points — so `pub` on either module would only add a
+// second public path to each item. Keeping `parquet` crate-internal also spares readers a
+// `pg_to_arrow::parquet` that shadows the `parquet` crate it wraps. The rest stay public: `oids` and
+// `uuid_enum` are named as paths by consumers, and `descriptor`, `error`, `geometric`, `range`,
+// `schema`, `tier2` and `tier3` each declare items the flat block deliberately leaves qualified.
+pub(crate) mod batch;
 pub mod descriptor;
 pub mod error;
 pub mod geometric;
 pub mod oids;
-pub mod parquet;
+pub(crate) mod parquet;
 pub mod range;
 pub mod schema;
 pub mod tier2;
