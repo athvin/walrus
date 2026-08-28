@@ -40,7 +40,8 @@ manually mark a rule complete while it is active.
 
 Use `--status` for a non-mutating progress report. Optional `--model` and
 `--max-budget-usd` values are forwarded to each Claude invocation; otherwise
-the installed Claude Code defaults apply.
+the installed Claude Code defaults apply. Rule and repair agents receive a
+30-minute timeout by default; `--agent-timeout-seconds` can override it.
 
 ## Invariants
 

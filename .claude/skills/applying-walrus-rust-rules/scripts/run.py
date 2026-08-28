@@ -856,7 +856,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     mode.add_argument("--status", action="store_true")
     parser.add_argument("--model")
     parser.add_argument("--max-budget-usd", type=float)
-    parser.add_argument("--agent-timeout-seconds", type=int, default=900)
+    parser.add_argument("--agent-timeout-seconds", type=int, default=1800)
     parser.add_argument("--allow-other-branch", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args(argv)
 
@@ -909,7 +909,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("VERDICT=COMPLETE")
         print(f"PR={url}")
         return 0
-    except (LoopError, subprocess.CalledProcessError, FileNotFoundError) as error:
+    except (
+        LoopError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        FileNotFoundError,
+    ) as error:
         print("VERDICT=STOP")
         print(f"ERROR={error}")
         return 1

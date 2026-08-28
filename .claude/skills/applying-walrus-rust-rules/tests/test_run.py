@@ -105,7 +105,7 @@ class ManifestTests(unittest.TestCase):
 
 class SafetyTests(unittest.TestCase):
     def test_default_agent_timeout_allows_opus_source_synthesis(self) -> None:
-        self.assertEqual(loop.parse_args([]).agent_timeout_seconds, 900)
+        self.assertEqual(loop.parse_args([]).agent_timeout_seconds, 1800)
 
     def test_protects_rule_sources_runner_and_roadmap_completion_files(self) -> None:
         protected = [
