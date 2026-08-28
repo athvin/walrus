@@ -25,6 +25,7 @@
 //! `START_REPLICATION`'s `CopyBothResponse`. "Forgot to `START_REPLICATION`" is a compile error, not
 //! a torn stream.
 
+use crate::config::SlotName;
 use anyhow::{Context, anyhow, bail};
 use bytes::{Bytes, BytesMut};
 use common::{Lsn, PG_EPOCH_UNIX_MICROS};
@@ -176,13 +177,17 @@ impl ReplicationStream<Idle> {
     /// `pg_create_logical_replication_slot()` (the SQL helper), the replication command is the *only*
     /// way to export a `snapshot_name`.
     ///
+    /// The name is interpolated **unquoted** into the command, so this takes a parsed [`SlotName`]
+    /// rather than a bare `&str`: the parameter *is* the proof that the text is one Postgres accepts,
+    /// checked once at the config edge instead of hoped for here.
+    ///
     /// # Errors
     ///
     /// Returns [`anyhow::Error`] for socket/protocol failures, a PostgreSQL error response, a missing
     /// result column, or an invalid `consistent_point` LSN.
     pub async fn create_replication_slot_export(
         &mut self,
-        slot: &str,
+        slot: &SlotName,
     ) -> anyhow::Result<(Lsn, String)> {
         // `NOEXPORT_SNAPSHOT`/`USE_SNAPSHOT` are the alternatives; `EXPORT` is what backfill needs.
         let sql = format!("CREATE_REPLICATION_SLOT {slot} LOGICAL pgoutput (SNAPSHOT 'export')");

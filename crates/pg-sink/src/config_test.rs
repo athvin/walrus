@@ -202,6 +202,55 @@ fn a_missing_field_is_terminal() {
     assert!(common::Error::from(err).is_terminal());
 }
 
+/// The slot name reaches `CREATE_REPLICATION_SLOT` unquoted, so a name Postgres could only reject
+/// must not survive config load: the parse is the check, and it happens at the edge.
+#[test]
+fn a_slot_name_postgres_would_reject_is_terminal_at_config_time() {
+    for bad in ["Walrus_Slot", "walrus-slot", "walrus slot", "walrus.slot"] {
+        let mut cfg = valid();
+        cfg.slot_name = bad.to_string();
+
+        let err = cfg.validate().unwrap_err();
+
+        assert!(
+            matches!(&err, ConfigError::InvalidSlotName { slot, .. } if slot == bad),
+            "{bad:?} should be rejected as a slot name, got {err:?}"
+        );
+        assert!(common::Error::from(err).is_terminal(), "{bad:?}");
+    }
+}
+
+/// The bounds are Postgres' own (`ReplicationSlotValidateName`): `NAMEDATALEN - 1` bytes, and a
+/// non-empty name. An empty `slot_name` still reports [`ConfigError::Missing`] because the
+/// required-field loop runs first.
+#[test]
+fn slot_name_bounds_are_postgres_bounds() {
+    assert!(matches!(
+        SlotName::new(""),
+        Err(ConfigError::InvalidSlotName { .. })
+    ));
+    assert!(SlotName::new(&"s".repeat(MAX_SLOT_NAME_LEN)).is_ok());
+    assert!(SlotName::new(&"s".repeat(MAX_SLOT_NAME_LEN + 1)).is_err());
+
+    let mut cfg = valid();
+    cfg.slot_name = String::new();
+    assert!(matches!(
+        cfg.validate().unwrap_err(),
+        ConfigError::Missing("slot_name")
+    ));
+}
+
+/// A parsed name renders bare — it needs no quoting by construction — and round-trips its text.
+#[test]
+fn a_parsed_slot_name_renders_bare() {
+    let slot = valid().slot().unwrap();
+
+    assert_eq!(slot.as_str(), "walrus_slot");
+    assert_eq!(slot.to_string(), "walrus_slot");
+    assert_eq!(slot, SlotName::new("walrus_slot").unwrap());
+    assert_eq!(SlotName::new("s_9_0").unwrap().as_str(), "s_9_0");
+}
+
 #[test]
 fn out_of_bounds_thresholds_are_terminal() {
     let mut cfg = valid();

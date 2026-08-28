@@ -19,6 +19,7 @@
 //! that attaches after it closes is a terminal error (`ERROR: invalid snapshot identifier`).
 
 use crate::batch::{BatchTriggers, Clock, SystemClock, TableBatcher};
+use crate::config::SlotName;
 use crate::relcache::RelationCache;
 use crate::replication::{Idle, ReplicationStream};
 use crate::sink::{FileKind, ParquetSink};
@@ -99,13 +100,17 @@ impl SnapshotConn<NotExported> {
     /// connection and returns its exported state with the snapshot value; do **not** run anything else
     /// on the connection until backfill is done.
     ///
+    /// Takes a parsed [`SlotName`] because the name reaches the command unquoted; the handoff
+    /// [`into_stream`](SnapshotConn::into_stream) below names the slot this call just created, so it
+    /// keeps taking a bare `&str`.
+    ///
     /// # Errors
     ///
     /// Returns [`anyhow::Error`] if PostgreSQL rejects slot creation or its exported snapshot response
     /// is missing or malformed.
     pub async fn create_slot_with_snapshot(
         mut self,
-        slot: &str,
+        slot: &SlotName,
     ) -> anyhow::Result<(SnapshotConn<Exported>, ExportedSnapshot)> {
         let (consistent_point, snapshot_name) =
             self.stream.create_replication_slot_export(slot).await?;
@@ -114,7 +119,7 @@ impl SnapshotConn<NotExported> {
             snapshot_name,
         };
         tracing::info!(
-            slot,
+            slot = %slot,
             consistent_point = %snap.consistent_point,
             snapshot_name = %snap.snapshot_name,
             "created replication slot with exported snapshot"

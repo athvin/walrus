@@ -296,6 +296,10 @@ impl<'a> SourcePreflight<'a> {
     /// or an authorized create/alter statement fails.
     pub async fn assert_publication_covers(&self) -> Result<(), PreflightError> {
         let pubname = &self.cfg.publication_name;
+        // Parse once, up front: both statements below that name the publication as an *identifier*
+        // reuse this proven value instead of re-running `SqlIdent::new` per call site (the create
+        // path plus one per missing table — up to four validations of the same string).
+        let pub_ident = ident(pubname)?;
         let exists = self
             .count(&format!(
                 "SELECT count(*) FROM pg_publication WHERE pubname = {}",
@@ -306,9 +310,8 @@ impl<'a> SourcePreflight<'a> {
         if !exists {
             if self.cfg.manage_publication {
                 self.exec(&format!(
-                    "CREATE PUBLICATION {} FOR TABLE walrus.heartbeat, walrus.ddl_audit, \
-                     walrus.reload_signal WITH (publish_via_partition_root = true)",
-                    ident(pubname)?
+                    "CREATE PUBLICATION {pub_ident} FOR TABLE walrus.heartbeat, walrus.ddl_audit, \
+                     walrus.reload_signal WITH (publish_via_partition_root = true)"
                 ))
                 .await?;
             } else {
@@ -331,8 +334,7 @@ impl<'a> SourcePreflight<'a> {
             if !published.contains(&id) {
                 if self.cfg.manage_publication {
                     self.exec(&format!(
-                        "ALTER PUBLICATION {} ADD TABLE {}.{}",
-                        ident(pubname)?,
+                        "ALTER PUBLICATION {pub_ident} ADD TABLE {}.{}",
                         ident(schema)?,
                         ident(table)?
                     ))

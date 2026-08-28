@@ -227,23 +227,29 @@ async fn establish_stream(
         )
     };
 
+    // One parse, at the top of the one function that names the slot: every use below reads this
+    // proven value rather than the raw config text. `SinkConfig::validate` ran the same gate at load,
+    // so a config that booted cannot fail here — this is the handoff, not a second check.
+    let slot = cfg
+        .slot()
+        .context("parse slot_name for the replication commands")?;
+
     // Classify the slot on the (already-connected) source before deciding: resume a healthy slot, or —
     // only when the catalog authoritatively says the slot is gone — open a fresh one. A connection
     // hiccup (`Unreachable`) is NOT slot loss: exit so the orchestrator's backoff-restart reconnects,
     // never a total-restart (§1.8, the false-positive guard).
-    let status = pg_sink::epoch::classify_slot(&ctx.source_client, &cfg.slot_name).await;
+    let status = pg_sink::epoch::classify_slot(&ctx.source_client, slot.as_str()).await;
     match pg_sink::epoch::decide(status) {
         pg_sink::epoch::SlotAction::Retry => {
             anyhow::bail!(
-                "could not classify replication slot {} (source connection lost mid-bootstrap) — \
-                 exiting to retry via backoff; this is NOT slot loss and does NOT bump the epoch",
-                cfg.slot_name
+                "could not classify replication slot {slot} (source connection lost mid-bootstrap) \
+                 — exiting to retry via backoff; this is NOT slot loss and does NOT bump the epoch"
             );
         }
         pg_sink::epoch::SlotAction::Resume { confirmed_flush } => {
             // Resume: stream from confirmed_flush_lsn; hydrate the relation cache from schema_registry.
             let epoch =
-                current_or_new_epoch(&ctx.control_pool, &cfg.slot_name, confirmed_flush).await?;
+                current_or_new_epoch(&ctx.control_pool, slot.as_str(), confirmed_flush).await?;
             // The hydration read (control PG) and START_REPLICATION (the source) touch different
             // servers and neither consumes the other's output, so a resume costs the slower of the
             // two instead of their sum — the same 503-window argument as `bootstrap::run_shared`.
@@ -258,7 +264,7 @@ async fn establish_stream(
                 async {
                     ReplicationStream::start(
                         &cfg.source_db_url,
-                        &cfg.slot_name,
+                        slot.as_str(),
                         confirmed_flush,
                         &cfg.publication_name,
                     )
@@ -290,7 +296,7 @@ async fn establish_stream(
     let (snap, snapshot) = pg_sink::snapshot::SnapshotConn::connect(&cfg.source_db_url)
         .await
         .context("open snapshot replication connection")?
-        .create_slot_with_snapshot(&cfg.slot_name)
+        .create_slot_with_snapshot(&slot)
         .await
         .context("CREATE_REPLICATION_SLOT with exported snapshot")?;
     let prior = control::read_current_epoch(&ctx.control_pool)
@@ -298,7 +304,7 @@ async fn establish_stream(
         .context("read prior epoch")?;
     let epoch = control::bump_epoch(
         &ctx.control_pool,
-        &cfg.slot_name,
+        slot.as_str(),
         snapshot.consistent_point,
         "streaming",
     )
@@ -308,7 +314,7 @@ async fn establish_stream(
         Some(p) => tracing::error!(
             old_epoch = %p.epoch,
             new_epoch = %epoch,
-            slot = %cfg.slot_name,
+            slot = %slot,
             slot_status = ?status,
             "TOTAL-RESTART: the replication slot was lost/absent — bumping the epoch and re-snapshotting \
              ALL tables under the new generation; old-epoch S3 is left to its lifecycle TTL"
@@ -363,7 +369,7 @@ async fn establish_stream(
 
     // Hand off: START_REPLICATION from consistent_point on the (now snapshot-done) connection.
     let stream = snap
-        .into_stream(&cfg.slot_name, &snapshot, &cfg.publication_name)
+        .into_stream(slot.as_str(), &snapshot, &cfg.publication_name)
         .await
         .context("hand off snapshot → streaming")?;
     Ok(Bootstrapped {

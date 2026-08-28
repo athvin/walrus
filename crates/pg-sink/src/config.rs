@@ -9,12 +9,85 @@
 use crate::memory::{HysteresisBand, Ratio};
 use common::{ObjectStoreConfig, TelemetryConfig};
 use serde::Deserialize;
+use std::fmt;
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
 use std::time::Duration;
 
 /// A cadence/deadline longer than an hour is almost certainly a misconfig, not an intent.
 const MAX_DURATION: Duration = Duration::from_secs(60 * 60);
+
+/// Postgres' own ceiling on a replication slot name: `NAMEDATALEN - 1`.
+const MAX_SLOT_NAME_LEN: usize = 63;
+
+/// The whole alphabet `ReplicationSlotValidateName` (`backend/replication/slot.c`) admits.
+const fn is_slot_char(c: char) -> bool {
+    matches!(c, 'a'..='z' | '0'..='9' | '_')
+}
+
+/// A replication slot name proven to satisfy Postgres' own rule: 1–[`MAX_SLOT_NAME_LEN`] bytes drawn
+/// from `[a-z0-9_]` (`ReplicationSlotValidateName`).
+///
+/// [`SinkConfig::slot_name`] stays a bare [`String`] because that is its *wire* shape: a `slot_name`
+/// key in a config file or a `WALRUS_SLOT_NAME` variable. [`SlotName::new`] is the single gate that
+/// turns that raw text into a name the server can accept, and slot creation
+/// ([`crate::replication::ReplicationStream::create_replication_slot_export`]) takes nothing else —
+/// so the one command that interpolates the name **unquoted** cannot be handed text Postgres would
+/// reject. `START_REPLICATION` keeps taking a plain `&str`: it names a slot the catalog has already
+/// shown to exist, and an existing slot's name is legal by construction. The catalog lookups in
+/// [`crate::slot`] and [`crate::epoch`] bind the name as a query *parameter* and likewise stay on
+/// `&str`.
+///
+/// This is the loader's `LeaseTtl` shape: a raw configured value, one parse at the edge, and a
+/// consumer whose precondition the type *is*.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotName(String);
+
+impl SlotName {
+    /// Parse raw configured text into a name `CREATE_REPLICATION_SLOT` will accept.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::InvalidSlotName`] — carrying the rejected text — when `raw` is empty,
+    /// longer than [`MAX_SLOT_NAME_LEN`] bytes, or contains anything outside `[a-z0-9_]`. The
+    /// failure is terminal, and [`SinkConfig::validate`] runs this gate at load so it lands there
+    /// rather than after bootstrap has already connected and preflighted the source.
+    pub fn new(raw: &str) -> Result<Self, ConfigError> {
+        let reject = |detail: String| ConfigError::InvalidSlotName {
+            slot: raw.to_string(),
+            detail,
+        };
+        if raw.is_empty() {
+            return Err(reject("must not be empty".to_string()));
+        }
+        if raw.len() > MAX_SLOT_NAME_LEN {
+            return Err(reject(format!(
+                "is {} bytes; Postgres accepts at most {MAX_SLOT_NAME_LEN}",
+                raw.len()
+            )));
+        }
+        if let Some(bad) = raw.chars().find(|&c| !is_slot_char(c)) {
+            return Err(reject(format!(
+                "contains {bad:?}; a slot name may only contain lower case letters, numbers, \
+                 and the underscore character"
+            )));
+        }
+        Ok(SlotName(raw.to_string()))
+    }
+
+    /// The bare name, for the catalog queries that bind it as a parameter.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SlotName {
+    /// The bare name — a slot name needs no quoting *by construction*, which is this type's point.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 /// Construct a non-zero shipped default without using runtime-only unwrap/expect APIs.
 const fn nz(value: u64) -> NonZeroU64 {
@@ -151,6 +224,10 @@ pub enum ConfigError {
     Missing(&'static str),
     #[error("field {field} out of bounds: {detail}")]
     OutOfBounds { field: &'static str, detail: String },
+    /// `slot_name` is not a name Postgres would accept for a replication slot, so
+    /// `CREATE_REPLICATION_SLOT` could only fail. The rejected text is kept as data.
+    #[error("invalid slot_name {slot:?}: {detail}")]
+    InvalidSlotName { slot: String, detail: String },
 }
 
 impl From<ConfigError> for common::Error {
@@ -166,7 +243,8 @@ impl SinkConfig {
     /// # Errors
     ///
     /// Returns [`ConfigError::Load`] when file or environment values cannot be deserialized, or the
-    /// [`ConfigError::Missing`] / [`ConfigError::OutOfBounds`] produced by [`Self::validate`].
+    /// [`ConfigError::Missing`] / [`ConfigError::InvalidSlotName`] / [`ConfigError::OutOfBounds`]
+    /// produced by [`Self::validate`].
     pub fn load() -> Result<Self, ConfigError> {
         use figment::Figment;
         use figment::providers::{Env, Format, Toml, Yaml};
@@ -220,6 +298,17 @@ impl SinkConfig {
         Ok(crate::memory::Backpressure::new(self.hysteresis_band()?))
     }
 
+    /// The parsed replication slot name — `CREATE_REPLICATION_SLOT`'s precondition (PR 2.29).
+    /// [`Self::validate`] runs the same gate at load, so a config that booted cannot fail here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::InvalidSlotName`] when `slot_name` is not a name Postgres would accept
+    /// for a replication slot.
+    pub fn slot(&self) -> Result<SlotName, ConfigError> {
+        SlotName::new(&self.slot_name)
+    }
+
     /// The validated idle-heartbeat settings (PR 2.27).
     #[must_use]
     pub const fn heartbeat_config(&self) -> crate::heartbeat::HeartbeatConfig {
@@ -243,7 +332,8 @@ impl SinkConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError::Missing`] for an empty required string, or
+    /// Returns [`ConfigError::Missing`] for an empty required string,
+    /// [`ConfigError::InvalidSlotName`] when `slot_name` is not a legal Postgres slot name, or
     /// [`ConfigError::OutOfBounds`] when a duration, count, ratio, or reload setting violates its
     /// documented bound. All configuration failures are terminal.
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -259,6 +349,9 @@ impl SinkConfig {
                 return Err(ConfigError::Missing(field));
             }
         }
+        // The same gate slot creation demands, run at the edge: an illegal name fails here rather
+        // than at `CREATE_REPLICATION_SLOT`, after bootstrap has connected and preflighted a source.
+        self.slot()?;
         common::runtime::validate_worker_threads(self.worker_threads).map_err(|e| {
             ConfigError::OutOfBounds {
                 field: "worker_threads",

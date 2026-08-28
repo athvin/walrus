@@ -16,6 +16,7 @@ use common::{EpochNo, Lsn, TupleValue};
 use object_store::ObjectStore;
 use object_store::path::Path;
 use pg_sink::batch::BatchTriggers;
+use pg_sink::config::SlotName;
 use pg_sink::consume::on_frame;
 use pg_sink::pgoutput::{Message, StreamCtx};
 use pg_sink::replication::ReplicationMessage;
@@ -101,11 +102,12 @@ async fn backfill_preloaded_rows_then_streams_post_consistent_point() {
         .unwrap();
     drop_slot(&admin, slot).await;
 
-    // Create the slot with an exported snapshot — this fixes consistent_point.
+    // Create the slot with an exported snapshot — this fixes consistent_point. Creation takes the
+    // parsed name; the catalog helpers and the streaming handoff keep taking the bare `&str`.
     let (snap_conn, snapshot) = SnapshotConn::connect(&source_url())
         .await
         .unwrap()
-        .create_slot_with_snapshot(slot)
+        .create_slot_with_snapshot(&SlotName::new(slot).unwrap())
         .await
         .unwrap();
 
