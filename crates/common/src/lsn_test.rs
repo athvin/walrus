@@ -118,6 +118,17 @@ fn subtraction_is_the_byte_distance() {
     assert_eq!(&Lsn::new(500) - &Lsn::new(200), 300);
 }
 
+/// The other half of the `Sub` contract: outside its documented domain (`self >= rhs`) the
+/// operator is a caller bug, and the `debug_assert!` names it rather than hand back a distance a
+/// caller would read as real. Without debug assertions that check is compiled out and the same
+/// call saturates to 0, so the `cfg` gate sits on the *test*: `--release` skips it, never fails it.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "Lsn subtraction is defined for the ordered case only")]
+fn unordered_subtraction_trips_the_debug_assert() {
+    let _distance = Lsn::new(100) - Lsn::new(300);
+}
+
 #[test]
 fn addition_advances_a_position() {
     assert_eq!(Lsn::new(100) + 24, Lsn::new(124));
