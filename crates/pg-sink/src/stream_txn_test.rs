@@ -387,7 +387,11 @@ async fn low_ceiling_spills_yet_still_excludes_the_aborted_subxid() {
 
 #[tokio::test]
 async fn spill_preserves_commit_order_of_the_surviving_rows() {
-    assert!(include_str!("stream_txn.rs").contains("std::mem::take(&mut self.changes)"));
+    // The spill drain still moves rows instead of cloning them, and now leaves the
+    // survivors in the buffer's own allocation rather than rebuilding one per shed.
+    let source = include_str!("stream_txn.rs");
+    assert!(source.contains(".extract_if(.., |c| c.oid == oid"));
+    assert!(!source.contains("std::mem::take(&mut self.changes)"));
 
     let (cache, sink) = (cache(), mem_sink());
     let mut d = demux(250);
@@ -421,8 +425,46 @@ async fn spill_preserves_commit_order_of_the_surviving_rows() {
     assert_eq!(
         surviving_lsns,
         vec!["0/101".parse().unwrap(), "0/103".parse().unwrap()],
-        "partitioning the spill candidate must preserve survivor commit order"
+        "draining the spill candidate must preserve survivor commit order"
     );
+}
+
+/// The shed loop drains one `(table, sub-xid)` stream out of a transaction that keeps buffering, so
+/// the survivors must hold both their order and the allocation the next `push_change` refills.
+#[test]
+fn take_stream_drains_in_place_and_keeps_both_relative_orders() {
+    let lsn = |raw: &str| raw.parse::<Lsn>().unwrap();
+    let mut txn = StreamedTxn::new(lsn("0/100"));
+    txn.changes.reserve(64);
+    for (sub_xid, at) in [
+        (857, "0/101"),
+        (858, "0/102"),
+        (857, "0/103"),
+        (859, "0/104"),
+        (857, "0/105"),
+    ] {
+        txn.push_change(StreamedChange {
+            sub_xid,
+            oid: TableId(42),
+            op: Op::Insert,
+            values: Box::default(),
+            lsn: lsn(at),
+        });
+    }
+    let capacity = txn.changes.capacity();
+
+    let rows = txn.take_stream(TableId(42), 857);
+
+    let drained: Vec<Lsn> = rows.iter().map(|c| c.lsn).collect();
+    let survivors: Vec<Lsn> = txn.changes.iter().map(|c| c.lsn).collect();
+    assert_eq!(drained, [lsn("0/101"), lsn("0/103"), lsn("0/105")]);
+    assert_eq!(survivors, [lsn("0/102"), lsn("0/104")]);
+    assert_eq!(
+        txn.changes.capacity(),
+        capacity,
+        "the survivors keep the allocation the next push_change refills"
+    );
+    assert!(!txn.keys.contains(&(TableId(42), 857)));
 }
 
 // Regression note (PR 26.2): the existing HashSet/BTreeSet membership indexes in loader/ddl.rs,

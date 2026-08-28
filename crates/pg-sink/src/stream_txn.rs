@@ -93,12 +93,18 @@ impl StreamedTxn {
     }
 
     /// Move one stream out without cloning and preserve the relative order of rows and survivors.
+    ///
+    /// PR 11.7 made this linear with `mem::take` + `partition`; `extract_if` keeps that complexity
+    /// and ordering while avoiding a fresh survivor buffer. The txn is still open and still
+    /// buffering when the ceiling sheds one of its streams, so the survivors stay in `changes`'s
+    /// own allocation — the very one the next `push_change` refills. Taking first handed that
+    /// allocation to `IntoIter`, grew a second vector for the survivors, and freed the original on
+    /// every spill. Only the returned rows allocate.
     fn take_stream(&mut self, oid: TableId, sub_xid: u32) -> Vec<StreamedChange> {
-        let (rows, keep): (Vec<StreamedChange>, Vec<StreamedChange>) =
-            std::mem::take(&mut self.changes)
-                .into_iter()
-                .partition(|c| c.oid == oid && c.sub_xid == sub_xid);
-        self.changes = keep;
+        let rows: Vec<StreamedChange> = self
+            .changes
+            .extract_if(.., |c| c.oid == oid && c.sub_xid == sub_xid)
+            .collect();
         self.keys.remove(&(oid, sub_xid));
         rows
     }
@@ -404,21 +410,20 @@ impl<C: Clock + Clone> StreamDemux<C> {
         let doomed: Vec<_> = match self.open.get_mut(&top_xid) {
             Some(txn) => {
                 txn.abort_subtxn(sub_xid);
-                let doomed = txn
-                    .staged
-                    .iter()
-                    .filter(|s| s.sub_xid == sub_xid)
-                    .map(|s| s.written.key.clone())
-                    .collect::<Vec<_>>();
-                txn.staged.retain(|s| s.sub_xid != sub_xid);
-                doomed
+                // One predicate pass both removes the rolled-back spills and hands them over: the
+                // survivors compact inside `staged`'s allocation (the txn stays open and keeps
+                // spilling), and the doomed entries move out instead of their keys being cloned
+                // to outlive the borrow the awaited deletes cannot hold.
+                txn.staged
+                    .extract_if(.., |s| s.sub_xid == sub_xid)
+                    .collect::<Vec<_>>()
             }
             None => return,
         };
-        for key in &doomed {
-            if let Err(error) = sink.delete(key).await {
+        for spill in &doomed {
+            if let Err(error) = sink.delete(&spill.written.key).await {
                 tracing::warn!(
-                    key = %key,
+                    key = %spill.written.key,
                     error = %error,
                     "failed to delete rolled-back speculative spill; object orphaned in staging"
                 );
