@@ -703,6 +703,43 @@ fn the_workspace_lint_table_still_denies_raw_stream_prints() {
     }
 }
 
+/// The third member of that family, and the one the two denies above cannot reach. `dbg!` expands
+/// to `eprintln!` inside std, but clippy attributes a macro to its outermost call in first-party
+/// code — so `print_stderr` is handed `dbg!` and stays quiet, which is why clippy ships a separate
+/// lint for it at all. It is `clippy::restriction` like that pair, outside the `clippy::all` group
+/// denied above, so nothing but the named entry reaches it; unlike that pair it carries no
+/// carve-out, in production or in tests. Zero sites means no source file goes red if the entry is
+/// dropped, so this test is the thing that does — along with the one key that could hollow it out
+/// from the other side. `allow-dbg-in-tests` would exempt every `#[cfg(test)]` module and every
+/// integration target with the deny still in place and nothing in the manifest moved, exactly as a
+/// raised perf threshold would; walrus leaves it at clippy's default of false by not stating it.
+#[test]
+fn the_workspace_lint_table_still_denies_the_debug_macro() {
+    let synthetic = "dbg_macro = \"warn\"\n  print_stderr = \"deny\"\n";
+    assert_eq!(clippy_deny_count(synthetic, "dbg_macro"), 0);
+    assert_eq!(clippy_deny_count(synthetic, "print_stderr"), 1);
+
+    let root_manifest = std::fs::read_to_string(repo_root().join("Cargo.toml")).unwrap();
+    let clippy = section(&root_manifest, "[workspace.lints.clippy]")
+        .expect("root manifest must define [workspace.lints.clippy]");
+    assert_eq!(
+        clippy_deny_count(clippy, "dbg_macro"),
+        1,
+        "workspace policy must pin dbg_macro = \"deny\" exactly once"
+    );
+
+    let cfg = std::fs::read_to_string(repo_root().join("clippy.toml")).unwrap();
+    assert!(
+        cfg.contains("allow-unwrap-in-tests"),
+        "the clippy.toml scan must not be vacuous"
+    );
+    let key = "allow-dbg-in-tests";
+    assert!(
+        !cfg.lines().any(|line| line.trim_start().starts_with(key)),
+        "clippy.toml sets {key}, which exempts every test target from the deny above"
+    );
+}
+
 /// Multi-file module layout is a convention with nothing behind it: `foo.rs` + `foo/` and
 /// `foo/mod.rs` both compile, so a second style can arrive one directory at a time. walrus has
 /// exactly one such directory (`crates/pg-sink/src/pgoutput/`) and it uses `mod.rs`, which means

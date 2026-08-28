@@ -187,6 +187,16 @@ expect_used = "deny"
 # stderr in the window before a subscriber exists; every carve-out is a scoped allow with a reason.
 print_stdout = "deny"
 print_stderr = "deny"
+# `dbg!` is that same mistake in a third spelling, and the one the pair above cannot see: it
+# expands to `eprintln!` inside std, but clippy attributes a macro to its outermost call in
+# first-party code, so `print_stderr` is handed `dbg!` and stays quiet — which is why clippy ships
+# a separate lint for it at all. `clippy::restriction` like that pair, outside `clippy::all`, so
+# only this named entry reaches it; unlike that pair it needs no carve-out anywhere, because a
+# `dbg!` in a committed test is the same debugging leftover as one in a binary. Zero sites today,
+# so crates/common/tests/workspace_lints_inherited.rs is what notices if the entry is dropped — as
+# it does for the key that would hollow it out from the other side: `clippy.toml`'s
+# `allow-dbg-in-tests`, left unstated there for the reason the perf thresholds are.
+dbg_macro = "deny"
 # This nursery lint is outside `clippy::all`, so no `priority` juggling is needed. It is the
 # mutable-borrow gate walrus lacked; see docs/implementation/notes/rust-skills/conv-asmut-mutable.md.
 needless_pass_by_ref_mut = "deny"
