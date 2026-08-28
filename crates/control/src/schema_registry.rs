@@ -13,9 +13,14 @@ use sqlx::{PgExecutor, Row};
 /// One `schema_version` of a table's type mapping.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistryRow {
+    /// Generation this mapping was registered under.
     pub epoch: EpochNo,
+    /// Schema of the table this version describes.
     pub source_schema: String,
+    /// Table this version describes.
     pub source_table: String,
+    /// The structural version these descriptors describe. Manifest rows name this value, which is
+    /// how a Parquet file finds the mapping it was written against.
     pub schema_version: SchemaVersionNo,
     /// The per-column descriptors (stored as `jsonb`).
     pub descriptors: Vec<TypeDescriptor>,

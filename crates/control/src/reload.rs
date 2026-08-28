@@ -55,11 +55,17 @@ string_enum! {
 /// happens in SQL (`now()`), like `table_ownership`, so the Rust side never holds a clock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReloadRow {
+    /// This attempt's identity — the `bigserial` "latest wins" key described in the module docs.
     pub reload_id: ReloadId,
+    /// Generation the attempt belongs to; part of the one-live-reload uniqueness key.
     pub epoch: EpochNo,
+    /// Schema of the table being reloaded.
     pub source_schema: String,
+    /// Table being reloaded.
     pub source_table: String,
+    /// Rebuild (`reload`) or merge-over-live (`resync`); see [`ReloadFlavor`].
     pub flavor: ReloadFlavor,
+    /// Where the attempt sits in the state walk; see [`ReloadStatus`].
     pub status: ReloadStatus,
     /// Last COMPLETED chunk; 0 = none exported yet.
     pub chunk_no: i64,
@@ -73,7 +79,10 @@ pub struct ReloadRow {
     pub schema_version: Option<SchemaVersionNo>,
     /// DDL restarts consumed so far (PR 6.8 caps it at `reload_max_restarts`).
     pub restart_count: i32,
+    /// The instance currently holding the exporter lease; `None` when unclaimed. Compared only in
+    /// SQL against `now()`, so this side never decides whether the lease is live.
     pub lease_holder: Option<String>,
+    /// Why the attempt reached `failed` — an operator-facing reason, set only on that transition.
     pub error: Option<String>,
 }
 

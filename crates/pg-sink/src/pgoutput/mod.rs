@@ -28,6 +28,8 @@ fn wire_usize(raw: u32) -> usize {
 /// [`parse_stream`] so context carries across messages.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StreamCtx {
+    /// Whether a Stream Start has been seen without its matching Stream Stop. While true, every
+    /// message carries an xid prefix, so the decoder must read one.
     pub in_stream: bool,
 }
 
@@ -35,7 +37,9 @@ pub struct StreamCtx {
 /// row (FULL identity).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OldTupleKind {
+    /// `'K'` — only the replica-identity key columns are present; every other value is absent.
     Key,
+    /// `'O'` — the complete old row, which the source sends only under `REPLICA IDENTITY FULL`.
     Full,
 }
 

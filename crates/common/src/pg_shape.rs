@@ -87,7 +87,10 @@ impl std::str::FromStr for ReplicaIdentity {
 /// One column of a relation, as seen in a Relation `'R'` message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PgColumn {
+    /// Column name as the source spells it — unquoted, exactly as it arrives on the wire.
     pub name: String,
+    /// The column's `pg_catalog` type OID (see [`crate::oids`]); with `type_modifier`, this is what
+    /// selects the Arrow mapping.
     pub type_oid: u32,
     /// `atttypmod`; `-1` = no modifier. For `numeric` it packs `(precision, scale)`.
     pub type_modifier: i32,
@@ -140,10 +143,18 @@ impl PgColumn {
 /// The shape of a source table at one `schema_version`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PgRelation {
+    /// The relation's OID — the identity pgoutput uses in every later message, so it is the
+    /// relation-cache key rather than the `(schema, name)` pair below.
     pub oid: u32,
+    /// Source schema name.
     pub schema: String,
+    /// Source table name.
     pub name: String,
+    /// What the source publishes in the *old* tuple of an UPDATE/DELETE, which is what decides
+    /// whether a change can be keyed at all; see [`ReplicaIdentity`].
     pub replica_identity: ReplicaIdentity,
+    /// The columns in wire order. Position is significant: a tuple's values arrive in this order,
+    /// so this vector is the only thing that pairs a value with its column.
     pub columns: Vec<PgColumn>,
 }
 

@@ -7,8 +7,11 @@
 /// keep the detail. Derives do not change the boxed layout the size assertion below pins.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValueParseDetail {
+    /// Name of the column whose value failed to parse.
     pub column: String,
+    /// The offending wire text, as received.
     pub value: String,
+    /// The Arrow type it was being parsed as, rendered for the message.
     pub data_type: String,
 }
 
@@ -22,16 +25,26 @@ pub enum Error {
     /// wrong-but-compiling field, which is exactly the bug the PR 2.11 conformance tests exist to catch.
     #[error("type oid {oid} (typmod {typmod}) is not a Tier-1 type")]
     NotTier1 { oid: u32, typmod: i32 },
+    /// A relation arrived with no columns at all. Arrow tolerates an empty schema; walrus does not,
+    /// because a file with no columns can never be reconciled against a later version of the table.
     #[error("relation {relation} has no columns")]
     EmptyRelation { relation: String },
+    /// One cell's wire text did not parse as its planned type — a bad range literal, a malformed
+    /// point. The detail is boxed so the success path stays cheap; see [`ValueParseDetail`].
     #[error("column {}: cannot parse {:?} as {}", .0.column, .0.value, .0.data_type)]
     ValueParse(Box<ValueParseDetail>),
+    /// A tuple's value count disagrees with the relation's column count, which means the row is
+    /// being read against the wrong schema version.
     #[error("row has {got} values, relation has {expected} columns")]
     RowLenMismatch { expected: usize, got: usize },
+    /// A planned Arrow builder did not have the concrete type the plan recorded for it. This is a
+    /// walrus bug rather than bad input.
     #[error("internal: builder downcast failed for column {column}")]
     Downcast { column: String },
+    /// Arrow itself rejected the operation. Boxed to keep this enum small.
     #[error("arrow error: {0}")]
     Arrow(#[source] Box<arrow::error::ArrowError>),
+    /// Parquet encoding or footer writing failed. Boxed for the same reason as `Arrow`.
     #[error("parquet error: {0}")]
     Parquet(#[source] Box<parquet::errors::ParquetError>),
 }

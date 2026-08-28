@@ -24,28 +24,38 @@ use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 /// A published table, `schema.table`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TableId {
+    /// Schema name.
     pub schema: String,
+    /// Table name.
     pub table: String,
 }
 
 /// What the server reported for the two headline settings.
 #[derive(Debug, Clone)]
 pub struct ServerInfo {
+    /// `server_version_num`, e.g. `140009`. Compared numerically, never against the version string.
     pub version_num: i32,
+    /// `wal_level`, which must be `logical` for logical replication to be possible at all.
     pub wal_level: String,
 }
 
 /// Strict rejects a keyless table; lenient quarantines and continues.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PkMode {
+    /// A keyless published table fails preflight, so the sink refuses to start.
     Strict,
+    /// A keyless table is quarantined and the sink starts without it, so one bad table does not
+    /// block every other one.
     Lenient,
 }
 
 /// Outcome of the per-table PK preflight.
 #[derive(Debug, Default, Clone)]
 pub struct PkReport {
+    /// Tables with a usable replica-identity key — the set that will be replicated.
     pub ok: Vec<TableId>,
+    /// Keyless tables skipped under [`PkMode::Lenient`]. Always empty under
+    /// [`PkMode::Strict`], which errors instead of reporting.
     pub quarantined: Vec<TableId>,
 }
 
@@ -55,18 +65,27 @@ pub struct PkReport {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum PreflightError {
+    /// `wal_level` is not `logical`, so no logical slot can stream. Changing it needs a restart of
+    /// the source, which is why this is terminal rather than retried.
     #[error("wal_level is {found}, need 'logical'")]
     WalLevel { found: String },
+    /// The source predates PG14 and cannot speak pgoutput protocol v2, which walrus requires for
+    /// streamed transactions.
     #[error("server_version_num {found} < 140000 (proto v2 needs PG14+)")]
     ServerTooOld { found: i32 },
+    /// The source is already at its `max_replication_slots` or `max_wal_senders` limit, so creating
+    /// walrus's slot would fail later, in a worse place.
     #[error("no headroom: {kind} {used}/{max}")]
     NoHeadroom {
         kind: &'static str,
         used: i32,
         max: i32,
     },
+    /// The configured publication does not exist on the source.
     #[error("publication {pub_name} does not exist")]
     PublicationMissing { pub_name: String },
+    /// The publication exists but does not cover a table walrus was told to replicate. The message
+    /// carries the `ALTER PUBLICATION` that fixes it, since that is the operator's next action.
     #[error(
         "publication {pub_name} missing table {schema}.{table} \
          (fix: ALTER PUBLICATION {pub_name} ADD TABLE {schema}.{table})"
@@ -76,12 +95,19 @@ pub enum PreflightError {
         schema: String,
         table: String,
     },
+    /// A published table has no key, so its updates and deletes could not be applied downstream.
+    /// Raised only under [`PkMode::Strict`]; [`PkMode::Lenient`] reports it in a [`PkReport`].
     #[error("table {schema}.{table} has no PRIMARY KEY / usable replica identity")]
     NoPrimaryKey { schema: String, table: String },
+    /// The connecting role lacks `REPLICATION`, so it cannot open a replication connection.
     #[error("missing REPLICATION privilege")]
     NoReplicationPriv,
+    /// The `walrus.ddl_audit` tap is absent or incomplete, so schema changes would drift silently.
+    /// `detail` names which half is missing (the table or an event trigger).
     #[error("DDL capture not installed: {detail} (apply migrations/source/0002_ddl_triggers.sql)")]
     DdlCaptureMissing { detail: &'static str },
+    /// The `walrus.reload_signal` table is absent, so no chunk export could ever learn its
+    /// watermark. `detail` names what was missing.
     #[error(
         "reload signal table not installed: {detail} \
          (apply migrations/source/0003_reload_signal.sql)"
@@ -170,6 +196,8 @@ pub struct SourcePreflight<'a> {
 }
 
 impl<'a> SourcePreflight<'a> {
+    /// Borrow a connected source client and the config whose expectations will be asserted against
+    /// it. Borrows rather than owns: preflight runs once and the caller keeps using both.
     #[must_use]
     pub const fn new(client: &'a Client, cfg: &'a SinkConfig) -> Self {
         SourcePreflight { client, cfg }

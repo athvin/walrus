@@ -23,11 +23,16 @@ use std::time::Duration;
 /// table, never shared), so it can move into a `spawn_local`'d [`crate::apply_loop::apply_loop`].
 #[derive(Debug)]
 pub struct TableCtx {
+    /// Control-Postgres handle. Cloning a pool shares the same connections, so every worker's copy
+    /// draws on one set.
     pub pool: sqlx::PgPool,
+    /// The generation this worker was started for. Compared against `epoch_rx` to detect a bump.
     pub epoch: EpochNo,
     /// Latest global control-plane epoch, broadcast by the loader's one shared poller.
     pub epoch_rx: tokio::sync::watch::Receiver<EpochNo>,
+    /// Source schema of the table this worker owns.
     pub schema: String,
+    /// Source table this worker owns.
     pub table: String,
     /// The `table` metric label (`"<schema>.<table>"`), precomputed at construction. Cardinality is
     /// bounded by the tables this pod owns, and the value is constant per worker.
@@ -39,6 +44,7 @@ pub struct TableCtx {
     /// lock, which is the "close" step of the drain contract (see [`crate::shutdown`]).
     /// `app::pipeline` therefore joins every worker — dropping each ctx — before releasing the leases.
     pub db: TableDb,
+    /// The process-wide probe state. Shared, not owned: one table's quarantine degrades the pod.
     pub state: Arc<LoaderState>,
     /// Files claimed per cycle.
     pub max_files: NonZeroI64,

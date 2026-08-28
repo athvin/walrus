@@ -18,15 +18,24 @@ use std::borrow::Cow;
 /// canonicalization — differ per family, but the wire form the sink parses is uniform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RangeFamily {
+    /// `int4range` / `int4multirange` — elements are `integer`.
     Int4,
+    /// `int8range` / `int8multirange` — elements are `bigint`.
     Int8,
+    /// `numrange` / `nummultirange` — elements are `numeric`; the only family whose element type
+    /// depends on a typmod, and in practice always the text carrier (see `elem_data_type`).
     Num,
+    /// `tsrange` / `tsmultirange` — elements are `timestamp without time zone`.
     Ts,
+    /// `tstzrange` / `tstzmultirange` — elements are `timestamp with time zone`.
     TsTz,
+    /// `daterange` / `datemultirange` — elements are `date`.
     Date,
 }
 
 impl RangeFamily {
+    /// The family behind a *range* OID (`int4range`, `tstzrange`, …), or `None` if the OID is not
+    /// one of the six built-in range types.
     #[must_use]
     pub const fn from_range_oid(oid: u32) -> Option<Self> {
         Some(match oid {
@@ -40,6 +49,9 @@ impl RangeFamily {
         })
     }
 
+    /// The same, for a *multirange* OID (PG14+). Kept separate from
+    /// [`from_range_oid`](Self::from_range_oid) rather than merged into one lookup, because a
+    /// column's OID says which of the two shapes it is and the caller must not lose that.
     #[must_use]
     pub const fn from_multirange_oid(oid: u32) -> Option<Self> {
         Some(match oid {
@@ -82,10 +94,17 @@ impl RangeFamily {
 /// [`Cow`] condition. Read a bound through `as_deref()`; the borrow is invisible to callers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedRange<'a> {
+    /// Postgres's `isempty`. When set, both bounds are `None` and the inclusivity flags are
+    /// meaningless — an empty range is not "unbounded on both sides".
     pub empty: bool,
+    /// Lower bound literal, or `None` for unbounded below. Borrowed from the wire text unless
+    /// unescaping forced a copy.
     pub lower: Option<Cow<'a, str>>,
+    /// Upper bound literal, or `None` for unbounded above; same borrowing rule as `lower`.
     pub upper: Option<Cow<'a, str>>,
+    /// Whether the lower bound is inclusive — the `[` of `[a,b)`.
     pub lower_inc: bool,
+    /// Whether the upper bound is inclusive — the `]` of `(a,b]`.
     pub upper_inc: bool,
 }
 

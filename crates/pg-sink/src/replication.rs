@@ -61,9 +61,15 @@ pub enum ReplicationMessage {
 /// (the received LSN); durability (PR 2.26) is the only thing that advances `flush`/`apply`.
 #[derive(Clone, Copy, Debug)]
 pub struct StandbyStatus {
+    /// Highest LSN received. Moved by the keepalive path, and it does **not** free WAL.
     pub write: Lsn,
+    /// Highest LSN made durable. This is what lets the source discard WAL, so only a completed
+    /// durability step may advance it.
     pub flush: Lsn,
+    /// Highest LSN applied. walrus keeps it equal to `flush`; it has no separate apply stage.
     pub apply: Lsn,
+    /// Ask the server to reply immediately rather than at its own cadence — set when the server
+    /// demanded a reply, or when a prompt answer keeps the connection from timing out.
     pub reply_requested: bool,
 }
 

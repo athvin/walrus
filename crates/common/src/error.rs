@@ -124,15 +124,26 @@ impl FailureClass for Error {
 #[repr(i32)]
 #[non_exhaustive]
 pub enum ExitCode {
+    /// Clean shutdown — the drain completed and nothing was lost.
     Success = 0,
+    /// Configuration was rejected before any connection was opened. Restarting will not help.
     Config = 10,
+    /// Control Postgres was unreachable, or a migration failed against it.
     ControlDb = 11,
+    /// Object storage rejected or could not serve a request.
     ObjectStore = 12,
+    /// A source-side prerequisite is missing (`wal_level`, publication coverage, DDL capture).
     Preflight = 13,
+    /// A published table has no usable replica-identity key, so its updates cannot be keyed.
     KeylessTable = 14,
+    /// Another live pod holds the table lease. Expected during a rolling restart, not a fault.
     LeaseContended = 15,
+    /// Source Postgres was unreachable, or refused the replication connection.
     SourceDb = 16,
+    /// A change could not be applied without data loss, so the table was quarantined instead.
     Quarantine = 17,
+    /// A walrus invariant was violated — the catch-all, and the only code that means "bug".
+    /// `70` is `EX_SOFTWARE` from `sysexits.h`, kept for that convention.
     Internal = 70,
 }
 

@@ -41,7 +41,11 @@ fn catalog_oid(raw: i64) -> anyhow::Result<u32> {
 /// `lsn_end = consistent_point`.
 #[derive(Debug, Clone)]
 pub struct ExportedSnapshot {
+    /// The LSN the snapshot is consistent at. Every file the backfill produces carries this as its
+    /// `lsn_end`, which is why the loader's claim order cannot filter snapshot rows with a `>`.
     pub consistent_point: Lsn,
+    /// The snapshot's server-side name, to be passed to `SET TRANSACTION SNAPSHOT`. Valid only
+    /// while the exporting connection stays open.
     pub snapshot_name: String,
 }
 

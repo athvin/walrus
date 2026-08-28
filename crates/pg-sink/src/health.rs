@@ -25,8 +25,11 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum Phase {
+    /// Connections, preflight and slot setup are still in progress; every probe answers 503. The
+    /// default, and byte `0`, which the phase atomic's zero default depends on.
     #[default]
     Bootstrapping = 0,
+    /// Bootstrap finished, so `/startup` and `/ready` may answer 200.
     Ready = 1,
 }
 
@@ -159,17 +162,23 @@ impl HealthState {
         self.phase.load()
     }
 
+    /// Whether `/ready` should answer 200: bootstrap finished **and** no SIGTERM has arrived. Being
+    /// degraded does not clear this — a lagging sink is still worth routing traffic to.
     #[must_use]
     pub fn is_ready(&self) -> bool {
         // Acquire pairs with mark_terminating; phase and termination are independent probe latches.
         self.phase() == Phase::Ready && !self.terminating.load(Ordering::Acquire)
     }
 
+    /// Whether `/healthz` should answer 200. This is the only probe that can get the pod killed, so
+    /// it is driven solely by the deadlock detector and never by lag.
     #[must_use]
     pub fn is_live(&self) -> bool {
         self.live.load(Ordering::Relaxed) // independent deadlock latch; no payload
     }
 
+    /// Whether the sink is behind or its heartbeat is stale. Reported on readiness and health for
+    /// alerting, and **never** a liveness kill.
     #[must_use]
     pub fn is_degraded(&self) -> bool {
         self.degraded.load(Ordering::Relaxed) // report-only; no payload is observed

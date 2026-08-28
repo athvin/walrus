@@ -226,8 +226,11 @@ pub enum ConfigError {
     /// `clippy::result_large_err`.
     #[error("config load/parse failed: {0}")]
     Load(#[source] Box<figment::Error>),
+    /// A required string field was absent or blank. Names the field, since that is the fix.
     #[error("missing required field: {0}")]
     Missing(&'static str),
+    /// A field parsed but sits outside its documented range. `detail` states the bound, so the
+    /// message is actionable without opening the config reference.
     #[error("field {field} out of bounds: {detail}")]
     OutOfBounds { field: &'static str, detail: String },
     /// `slot_name` is not a name Postgres would accept for a replication slot, so

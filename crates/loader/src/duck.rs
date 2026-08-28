@@ -554,10 +554,15 @@ pub(crate) fn user_view_sql(table: &str) -> String {
 /// DuckDB S3/httpfs credentials for reading the staging bucket.
 #[derive(Debug, Clone)]
 pub struct S3Access {
+    /// Host:port DuckDB's httpfs extension should talk to (MinIO in dev, S3 in production).
     pub endpoint: String,
+    /// Region used to sign requests.
     pub region: String,
+    /// Access key id.
     pub access_key_id: String,
+    /// Secret access key. Held only long enough to configure the connection; never logged.
     pub secret_access_key: String,
+    /// Whether to reach the endpoint over TLS. `false` for a plain-HTTP local MinIO.
     pub use_ssl: bool,
 }
 

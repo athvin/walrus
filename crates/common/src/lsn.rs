@@ -193,7 +193,10 @@ impl std::ops::AddAssign<u64> for Lsn {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("invalid LSN {input:?}: {reason}")]
 pub struct LsnParseError {
+    /// The text that was rejected, preserved verbatim so the message can quote it.
     pub input: String,
+    /// Why it was rejected, as a fixed phrase — one of a closed set the parser owns, never
+    /// user-supplied text.
     pub reason: &'static str,
 }
 

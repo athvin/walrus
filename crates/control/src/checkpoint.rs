@@ -14,8 +14,11 @@ use sqlx::PgExecutor;
 /// Per-table, per-epoch progress. **Invariant (DB-enforced):** `transformed_lsn <= raw_appended_lsn`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Checkpoint {
+    /// Generation these watermarks belong to — they reset with a new one, they do not carry over.
     pub epoch: EpochNo,
+    /// Schema of the table being tracked.
     pub source_schema: String,
+    /// Table being tracked. With `epoch` and `source_schema`, the row's identity.
     pub source_table: String,
     /// Phase A frontier — the CDC log is durable up to this commit LSN.
     pub raw_appended_lsn: Lsn,

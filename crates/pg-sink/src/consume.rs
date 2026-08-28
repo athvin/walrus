@@ -104,6 +104,8 @@ impl<C> Default for DecodeLoopBuilder<'_, C> {
 }
 
 impl<'a, C> DecodeLoop<'a, C> {
+    /// An empty [`DecodeLoopBuilder`]. Every field is required, so this is the only constructor —
+    /// there is no `new` that could leave a collaborator unwired.
     pub fn builder() -> DecodeLoopBuilder<'a, C> {
         DecodeLoopBuilder::default()
     }
@@ -469,36 +471,46 @@ impl<C: Clock + Clone> DecodeLoop<'_, C> {
 }
 
 impl<'a, C> DecodeLoopBuilder<'a, C> {
+    /// The started replication stream the loop pulls CopyBoth frames from. Required.
     #[must_use = "builder methods return the modified builder — chain or assign"]
     pub const fn stream(mut self, stream: &'a mut ReplicationStream) -> Self {
         self.stream = Some(stream);
         self
     }
 
+    /// The shutdown token. Cancelling it makes the loop return after the current frame rather than
+    /// mid-message, which is what lets the drain publish what is already committed. Required.
     #[must_use = "builder methods return the modified builder — chain or assign"]
     pub fn token(mut self, token: CancellationToken) -> Self {
         self.token = Some(token);
         self
     }
 
+    /// The relation cache the loop resolves each message's OID against, and updates when a Relation
+    /// message announces a new shape. Required.
     #[must_use = "builder methods return the modified builder — chain or assign"]
     pub const fn cache(mut self, cache: &'a mut RelationCache) -> Self {
         self.cache = Some(cache);
         self
     }
 
+    /// The per-table batcher set that decoded rows are routed into. Required.
     #[must_use = "builder methods return the modified builder — chain or assign"]
     pub const fn router(mut self, router: &'a mut BatchRouter<C>) -> Self {
         self.router = Some(router);
         self
     }
 
+    /// Where sealed batches are written as Parquet. Shared (`&`) rather than exclusive: the object
+    /// store handles concurrent PUTs itself. Required.
     #[must_use = "builder methods return the modified builder — chain or assign"]
     pub const fn sink(mut self, sink: &'a crate::sink::ParquetSink) -> Self {
         self.sink = Some(sink);
         self
     }
 
+    /// The durability checkpoint that decides what LSN may be confirmed back to the source. Only it
+    /// may advance `confirmed_flush`, and only after a batch is durable. Required.
     #[must_use = "builder methods return the modified builder — chain or assign"]
     pub const fn checkpoint(
         mut self,
@@ -508,42 +520,53 @@ impl<'a, C> DecodeLoopBuilder<'a, C> {
         self
     }
 
+    /// The streamed-transaction demultiplexer, which buffers in-progress transactions separately so
+    /// an uncommitted one is never published. Required.
     #[must_use = "builder methods return the modified builder — chain or assign"]
     pub const fn demux(mut self, demux: &'a mut crate::stream_txn::StreamDemux<C>) -> Self {
         self.demux = Some(demux);
         self
     }
 
+    /// The DDL consumer that turns `ddl_audit` rows into schema-version bumps. Required.
     #[must_use = "builder methods return the modified builder — chain or assign"]
     pub const fn ddl(mut self, ddl: &'a mut crate::ddl::DdlConsumer) -> Self {
         self.ddl = Some(ddl);
         self
     }
 
+    /// The heartbeat, which both fires beats while the source is idle and observes their return.
+    /// Required.
     #[must_use = "builder methods return the modified builder — chain or assign"]
     pub const fn heartbeat(mut self, heartbeat: &'a mut Heartbeat) -> Self {
         self.heartbeat = Some(heartbeat);
         self
     }
 
+    /// The probe state the loop marks degraded or live. Shared, since the health server reads it
+    /// concurrently. Required.
     #[must_use = "builder methods return the modified builder — chain or assign"]
     pub const fn health(mut self, health: &'a HealthState) -> Self {
         self.health = Some(health);
         self
     }
 
+    /// Control-Postgres handle for manifest and registry writes. Required.
     #[must_use = "builder methods return the modified builder — chain or assign"]
     pub const fn pool(mut self, pool: &'a sqlx::PgPool) -> Self {
         self.pool = Some(pool);
         self
     }
 
+    /// The generation every row and manifest row this loop produces is stamped with. Required.
     #[must_use = "builder methods return the modified builder — chain or assign"]
     pub const fn epoch(mut self, epoch: EpochNo) -> Self {
         self.epoch = Some(epoch);
         self
     }
 
+    /// The watermark waiters a decoded reload signal resolves, which is how a chunk export learns
+    /// its commit LSN. Required.
     #[must_use = "builder methods return the modified builder — chain or assign"]
     pub const fn waiters(mut self, waiters: &'a crate::reload_signal::WatermarkWaiters) -> Self {
         self.waiters = Some(waiters);

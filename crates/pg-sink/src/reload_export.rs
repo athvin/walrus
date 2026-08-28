@@ -80,9 +80,14 @@ fn version_changed(
 /// Everything the exporter needs beyond the reload row itself.
 #[derive(Clone, Debug)]
 pub struct ChunkExportConfig {
+    /// Rows per chunk SELECT. Non-zero, or the export would make no progress.
     pub chunk_rows: NonZeroU64,
+    /// How long a chunk waits for its watermark echo to come back through the decode loop before
+    /// the attempt fails loudly.
     pub echo_timeout: Duration,
+    /// This pod's identity, written as the reload's `lease_holder`.
     pub instance: String,
+    /// The generation the exported chunks are stamped with.
     pub epoch: EpochNo,
 }
 

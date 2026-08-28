@@ -13,7 +13,10 @@ use sqlx::PgExecutor;
 /// A held lease. The `fencing_token` bumps only when ownership changes hands (dormant at `replicas=1`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lease {
+    /// Monotonic token, bumped by 1 only when the lease changes hands. A holder that stalls past
+    /// its TTL and comes back can tell it was fenced by comparing this against what it acquired.
     pub fencing_token: i64,
+    /// The instance identity holding the lease — the loader's configured `instance`.
     pub owner_pod: String,
 }
 

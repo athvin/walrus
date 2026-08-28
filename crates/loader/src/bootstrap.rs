@@ -17,18 +17,26 @@ use std::path::Path;
 /// The two commit-LSN watermarks for one table.
 #[derive(Debug, Clone, Copy)]
 pub struct Checkpoints {
+    /// Phase A frontier — the `<table>_raw` CDC log is durable up to this commit LSN.
     pub raw_appended_lsn: Lsn,
+    /// Phase B frontier — the mirror is derived up to this commit LSN. Never ahead of the above.
     pub transformed_lsn: Lsn,
 }
 
 /// One table this loader instance owns after bootstrap.
 #[derive(Debug)]
 pub struct OwnedTable {
+    /// Source schema of the owned table.
     pub schema: String,
+    /// Source table name.
     pub table: String,
+    /// The table's shape at the version bootstrap resolved, used to render the transform SQL.
     pub relation: PgRelation,
+    /// The lease token held for this table — the first of the two fences, taken before the file.
     pub fencing_token: i64,
+    /// The open DuckDB handle. Holding it *is* the second fence: DuckDB's read-write file lock.
     pub db: TableDb,
+    /// Where the two phases had reached when bootstrap read them.
     pub checkpoints: Checkpoints,
 }
 

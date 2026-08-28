@@ -41,6 +41,11 @@ pub struct InflightMeter {
 }
 
 impl InflightMeter {
+    /// An empty meter with the ceiling shedding is measured against.
+    ///
+    /// `NonZeroU64` rather than `u64` because a zero ceiling would put the meter permanently over
+    /// the limit before a single row arrived; the config layer rejects it, and the type keeps that
+    /// rejection from having to be re-checked here.
     #[must_use]
     pub fn new(ceiling_bytes: NonZeroU64) -> Self {
         InflightMeter {
@@ -78,16 +83,20 @@ impl InflightMeter {
         }
     }
 
+    /// Aggregate buffered bytes across every open stream. Saturating, so at `u64::MAX` this is a
+    /// floor on the true figure rather than the figure itself — which is all the ceiling test needs.
     #[must_use]
     pub const fn total(&self) -> u64 {
         self.total
     }
 
+    /// The configured ceiling this meter was built with. Constant for the meter's lifetime.
     #[must_use]
     pub const fn ceiling(&self) -> NonZeroU64 {
         self.ceiling_bytes
     }
 
+    /// Whether the aggregate has passed the ceiling — the single question shedding is driven by.
     #[must_use = "the ceiling check drives shedding — ignoring it silently disables backpressure"]
     pub const fn is_over_ceiling(&self) -> bool {
         self.total > self.ceiling_bytes.get()
@@ -202,6 +211,7 @@ impl Ratio {
         }
     }
 
+    /// The validated ratio as a plain `f64`, for the one arithmetic comparison it exists for.
     #[must_use]
     pub const fn as_f64(self) -> f64 {
         self.0
@@ -235,7 +245,10 @@ pub struct HysteresisBand {
 #[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
 #[error("require 0 < resume ({resume}) < activate ({activate}) < 1.0")]
 pub struct BandError {
+    /// The rejected activation ratio, as supplied.
     pub activate: f64,
+    /// The rejected resume ratio, as supplied. Kept alongside `activate` because the constraint is
+    /// between the two, so neither number explains the rejection alone.
     pub resume: f64,
 }
 
@@ -265,11 +278,14 @@ impl HysteresisBand {
         }
     }
 
+    /// The high ratio at which intake pauses.
     #[must_use]
     pub const fn activate(self) -> Ratio {
         self.activate
     }
 
+    /// The low ratio at which intake resumes. Strictly below [`activate`](Self::activate) — that
+    /// gap is the hysteresis.
     #[must_use]
     pub const fn resume(self) -> Ratio {
         self.resume
@@ -289,6 +305,7 @@ pub struct Backpressure {
 }
 
 impl Backpressure {
+    /// A backpressure latch over `band`, starting un-paused.
     #[must_use]
     pub const fn new(band: HysteresisBand) -> Self {
         Backpressure {
@@ -314,6 +331,8 @@ impl Backpressure {
         self.paused
     }
 
+    /// The latch's current state, without advancing it. Read this to decide whether to poll the
+    /// replication stream; call [`tick`](Self::tick) to update it.
     #[must_use]
     pub const fn is_paused(&self) -> bool {
         self.paused

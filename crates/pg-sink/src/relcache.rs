@@ -16,11 +16,14 @@ use std::sync::Arc;
 /// `Arc` so it is read without cloning per row.
 #[derive(Debug)]
 pub struct CachedRelation {
+    /// The source shape this entry caches, exactly as the Relation message announced it.
     pub relation: PgRelation,
     /// Built by `pg-to-arrow`: one field per source column + the trailing `walrus_pg_sink_meta` Utf8.
     pub arrow_schema: SchemaRef,
     /// Per source column, for the loader to rebuild the exact types (§2.6).
     pub descriptors: Vec<TypeDescriptor>,
+    /// The version this shape *is*. Half of the cache key, and stamped onto every row encoded
+    /// against it, which is how the loader later finds the matching registry entry.
     pub schema_version: SchemaVersionNo,
 }
 
@@ -32,6 +35,10 @@ pub fn is_internal_table(schema: &str, table: &str) -> bool {
     schema == "walrus" && matches!(table, "ddl_audit" | "heartbeat" | "reload_signal")
 }
 
+/// Every relation shape the decode loop has seen, keyed by OID **and** schema version.
+///
+/// Versions are kept rather than overwritten: a file already in flight was encoded against an
+/// older shape, so evicting it on a DDL bump would strand rows that still need to be sealed.
 #[derive(Debug, Default)]
 pub struct RelationCache {
     /// Ordered by `(relation_oid, schema_version)`: tuple ordering makes all versions of one oid a
@@ -43,6 +50,8 @@ pub struct RelationCache {
 }
 
 impl RelationCache {
+    /// The shape cached for exactly this `(oid, schema_version)`, or `None` if that pair was never
+    /// hydrated. Use [`latest_for`](Self::latest_for) when any version of the relation will do.
     #[must_use]
     pub fn get(&self, oid: u32, schema_version: SchemaVersionNo) -> Option<Arc<CachedRelation>> {
         self.by_key.get(&(oid, schema_version)).cloned()
@@ -74,11 +83,14 @@ impl RelationCache {
         <&Self as IntoIterator>::into_iter(self)
     }
 
+    /// Cached entries — `(oid, schema_version)` pairs, so several versions of one relation each
+    /// count once.
     #[must_use]
     pub fn len(&self) -> usize {
         self.by_key.len()
     }
 
+    /// Whether nothing has been cached yet, which before hydration means no relation can be decoded.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.by_key.is_empty()
@@ -290,6 +302,8 @@ fn build_cached(
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RelationError {
+    /// The relation's shape could not be mapped to an Arrow schema — a column type walrus does not
+    /// yet handle at any tier. `Display` inlines the cause so a log line names the column.
     #[error("build Arrow schema for {schema}.{table}: {source}")]
     Schema {
         schema: String,

@@ -244,11 +244,14 @@ impl BatchBuilder {
         Ok(())
     }
 
+    /// Rows appended so far. This is the batch's *fill*, which the sink's size triggers read; it is
+    /// not the length of any one column builder.
     #[must_use]
     pub const fn len(&self) -> usize {
         self.rows
     }
 
+    /// Whether no row has been appended yet — so sealing would produce an empty file.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.rows == 0

@@ -17,14 +17,23 @@ pub enum DecodeError {
         offset: u32,
         remaining: u32,
     },
+    /// The leading type byte is not one this decoder knows. Either the source speaks a newer
+    /// pgoutput version, or the stream is misaligned.
     #[error("unknown message type byte {byte:#04x}")]
     UnknownMessage { byte: u8 },
+    /// A `TupleData` column marker was none of `n`/`u`/`t`/`b`, which almost always means the
+    /// previous field was read at the wrong width.
     #[error("bad TupleData format byte {byte:#04x} (misaligned parse?)")]
     BadTupleFormat { byte: u8 },
+    /// A Relation message carried a `relreplident` byte outside the documented set.
     #[error("invalid replica identity byte {byte:#04x}")]
     BadReplicaIdentity { byte: u8 },
+    /// A `String` field was not valid UTF-8. pgoutput strings are always text, so this is corruption
+    /// rather than a supported encoding.
     #[error("invalid UTF-8 in String field")]
     Utf8(#[from] std::str::Utf8Error),
+    /// The message decoded successfully but did not consume its whole payload — a decoder bug, and
+    /// the reason every parse checks its own frame rather than trusting the length.
     #[error("{unconsumed} trailing bytes after a complete message")]
     TrailingBytes { unconsumed: u32 },
 }

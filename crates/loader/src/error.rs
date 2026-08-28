@@ -13,6 +13,8 @@ pub enum LoaderError {
     /// "which configuration" framing belongs.
     #[error("invalid loader configuration: {0}")]
     Config(#[from] ConfigError),
+    /// A control-plane call failed. `transparent` because [`control::ControlError`] already names
+    /// the operation, and it is the one variant here that can be transient.
     #[error(transparent)]
     Control(#[from] control::ControlError),
     /// A DuckDB engine call failed. `op` names the operation while `source` keeps the typed engine

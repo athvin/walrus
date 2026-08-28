@@ -25,8 +25,11 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum LoaderPhase {
+    /// Leases are not yet held and the DuckDB files are not yet open. Both `/startup` and `/ready`
+    /// answer 503. The default, and byte `0` — which `AtomicPhase`'s zero default depends on.
     #[default]
     Bootstrapping = 0,
+    /// Serving normally: every probe answers 200.
     Ready = 1,
     /// Latched by a failed lossy DDL cast. A reload rebuild is its only exit.
     Quarantined = 2,
@@ -109,6 +112,11 @@ impl AtomicPhase {
     }
 }
 
+/// The state the three Kubernetes probes read, shared by every table worker.
+///
+/// One process holds exactly one of these behind an `Arc`: the phase latch is process-wide (a
+/// single quarantined table degrades the whole pod's `/ready`), and the poll stamp is whichever
+/// worker finished a cycle most recently.
 #[derive(Debug, Default)]
 pub struct LoaderState {
     phase: AtomicPhase,
@@ -118,6 +126,11 @@ pub struct LoaderState {
 }
 
 impl LoaderState {
+    /// A fresh state, already wrapped in the `Arc` every caller needs.
+    ///
+    /// Hands back `Arc<Self>` rather than `Self` because there is no useful unshared owner: the
+    /// probe router and the workers both hold it. That shape is why `clippy::new_ret_no_self` has a
+    /// scoped allow on the sink's equivalent.
     #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(LoaderState::default())
@@ -166,6 +179,8 @@ impl LoaderState {
             .transition(LoaderPhase::Quarantined, LoaderPhase::Ready);
     }
 
+    /// Whether the quarantine latch is set — the state `/ready` reports 503 for while `/startup`
+    /// stays satisfied.
     #[must_use]
     pub fn is_quarantined(&self) -> bool {
         matches!(self.phase.load(), LoaderPhase::Quarantined)
@@ -210,6 +225,10 @@ async fn metrics() -> impl IntoResponse {
     )
 }
 
+/// The probe + metrics router, with the shared state injected.
+///
+/// Deliberately **not** `#[must_use]`, for the reason the sink's `health::router` records: axum's
+/// `Router` already carries the attribute, so a second bare one is `clippy::double_must_use`.
 pub fn router(state: Arc<LoaderState>) -> Router {
     Router::new()
         .route("/startup", get(startup))

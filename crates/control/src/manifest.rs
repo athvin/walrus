@@ -53,16 +53,30 @@ string_enum! {
 /// rebuild trigger routes on (PR 6.7). Stream/snapshot/spill rows never set `reload_id`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestRow {
+    /// The row's primary key, and the *tiebreaker* half of the `(lsn_end, id)` claim order — so it
+    /// is load-bearing for ordering, not just a handle.
     pub id: ManifestId,
+    /// Generation this file belongs to; a retired generation's rows are never claimed.
     pub epoch: EpochNo,
+    /// Source schema the file's rows came from.
     pub source_schema: String,
+    /// Source table the file's rows came from.
     pub source_table: String,
+    /// Where the Parquet lives. Durable in object storage *before* this row exists.
     pub s3_uri: String,
+    /// Which producer wrote it, which is what the loader routes on; see [`ManifestKind`].
     pub kind: ManifestKind,
+    /// Rows in the file, for backlog accounting. Not a correctness input.
     pub row_count: i64,
+    /// Lowest commit LSN in the file — diagnostic only; the queue never orders on it.
     pub lsn_start: Lsn,
+    /// Highest **commit** LSN in the file: the frontier this file advances, and the primary claim
+    /// sort key. Snapshot files all share one `lsn_end`, which is why the claim uses `>=`-free
+    /// ordering rather than a `>` filter.
     pub lsn_end: Lsn,
+    /// The relation shape these rows were encoded at, so the loader can reconstruct the types.
     pub schema_version: SchemaVersionNo,
+    /// `Ready` to claim, or dead-lettered `Failed`; see [`ManifestStatus`].
     pub status: ManifestStatus,
     /// `Some` only for `kind='reload'` chunk files; the purge/routing key.
     pub reload_id: Option<ReloadId>,
@@ -74,14 +88,23 @@ pub struct ManifestRow {
 /// whole record instead of field by field (which silently skips whatever the assertion forgot).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewManifestFile {
+    /// Generation this file belongs to.
     pub epoch: EpochNo,
+    /// Source schema the file's rows came from.
     pub source_schema: String,
+    /// Source table the file's rows came from.
     pub source_table: String,
+    /// Where the Parquet already lives — the insert happens only after the PUT is durable.
     pub s3_uri: String,
+    /// Which producer wrote it; see [`ManifestKind`].
     pub kind: ManifestKind,
+    /// Rows in the file, for backlog accounting.
     pub row_count: i64,
+    /// Lowest commit LSN in the file — diagnostic only.
     pub lsn_start: Lsn,
+    /// Highest **commit** LSN in the file — the value the claim order sorts on.
     pub lsn_end: Lsn,
+    /// The relation shape these rows were encoded at.
     pub schema_version: SchemaVersionNo,
     /// Set (with `kind=Reload`) only by the chunk export engine (PR 6.5); `None` otherwise.
     pub reload_id: Option<ReloadId>,

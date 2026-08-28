@@ -69,6 +69,8 @@ fn to_ready_row(
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ManifestError {
+    /// The manifest row could not be written. `transparent` because [`control::ControlError`]
+    /// already names the operation, and it is the only way this step fails.
     #[error(transparent)]
     Control(#[from] control::ControlError),
 }

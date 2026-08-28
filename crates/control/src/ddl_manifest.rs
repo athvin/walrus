@@ -16,8 +16,11 @@ use sqlx::PgExecutor;
 pub struct DdlRow {
     /// Assigned by the DB on insert; ignored by [`insert_ddl`].
     pub id: DdlId,
+    /// Generation the event was recorded under.
     pub epoch: EpochNo,
+    /// Schema of the table the DDL changed.
     pub source_schema: String,
+    /// Table the DDL changed.
     pub source_table: String,
     /// Commit LSN of the DDL — orders it relative to DML.
     pub c_lsn: Lsn,

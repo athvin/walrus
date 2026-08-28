@@ -7,8 +7,11 @@ use tokio_util::sync::CancellationToken;
 /// One apply worker's terminal failure.
 #[derive(Debug)]
 pub struct WorkerFailure {
+    /// Schema of the table whose worker died.
     pub schema: String,
+    /// Table whose worker died.
     pub table: String,
+    /// The terminal error, moved rather than stringified so the supervisor can still classify it.
     pub error: LoaderError,
 }
 

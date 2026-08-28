@@ -28,7 +28,10 @@ pub const TRANSFORM_SQL: &str = include_str!("../sql/duckdb/templates/transform.
 /// other) cannot be constructed, and no call site has to re-check the second field.
 #[derive(Debug, Clone, Copy)]
 pub struct TruncateBoundary {
+    /// The TRUNCATE's commit LSN — which transaction wiped the table.
     pub ct: Lsn,
+    /// The TRUNCATE's per-row LSN — the intra-transaction tiebreaker that, with `ct`, orders the
+    /// wipe against rows committed by the same transaction.
     pub lt: Lsn,
 }
 

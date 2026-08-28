@@ -29,6 +29,8 @@ pub struct DurabilityCheckpoint {
 }
 
 impl DurabilityCheckpoint {
+    /// A checkpoint starting at the LSN the slot is resuming from — the position already known
+    /// durable, not zero, so a restart never re-confirms ground the source has moved past.
     #[must_use]
     pub const fn new(resume_lsn: Lsn) -> Self {
         DurabilityCheckpoint {
@@ -37,6 +39,8 @@ impl DurabilityCheckpoint {
         }
     }
 
+    /// The LSN it is safe to tell the source it may discard. This is what frees WAL on the source,
+    /// so it must never run ahead of what walrus has actually made durable.
     #[must_use]
     pub const fn confirmed_flush(&self) -> Lsn {
         self.confirmed_flush

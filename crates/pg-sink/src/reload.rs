@@ -57,7 +57,10 @@ fn count_u64(count: usize) -> u64 {
 /// request with a false "not in the publication" reason.
 #[derive(Debug)]
 pub enum PreflightOutcome {
+    /// The request is genuinely invalid. Terminal: the reload row is failed with this reason.
     Rejected(PreflightRejection),
+    /// Preflight could not reach a verdict. The claim is released and retried next tick, so a
+    /// transient fault never fails a valid request with a misleading reason.
     Infra(anyhow::Error),
 }
 
@@ -76,8 +79,10 @@ impl From<anyhow::Error> for PreflightOutcome {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum PreflightRejection {
+    /// The table is not published, so no chunk of it could ever be echoed back through the slot.
     #[error("table {0}.{1} is not in the publication")]
     NotPublished(String, String),
+    /// The table has no primary key, so the chunk cursor has nothing to page on.
     #[error("table {0}.{1} has no primary key")]
     NoPrimaryKey(String, String),
 }
@@ -376,10 +381,13 @@ pub struct ReloadControllerConfig {
     /// and `adopt_and_resume` would find no free permits, return early every cadence, and leave
     /// `requested` rows queued forever with nothing in the logs to say why.
     pub max_concurrent_reloads: NonZeroUsize,
+    /// How long an exporter's lease stays valid without renewal. Renewal runs at a third of this.
     pub lease_ttl: Duration,
     /// `lease_holder` — the same identity the heartbeat/ownership machinery uses (never a second one).
     pub instance: String,
+    /// The publication a requested table must belong to; checked by preflight.
     pub publication_name: String,
+    /// The generation exported chunks are stamped with.
     pub epoch: EpochNo,
     /// Rows per chunk SELECT (PR 6.5).
     pub chunk_rows: NonZeroU64,

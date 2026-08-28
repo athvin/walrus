@@ -29,12 +29,16 @@ pub const PG_EPOCH_UNIX_MICROS: i64 = PG_EPOCH_UNIX_SECS * 1_000_000;
 /// Wire form locked by `crates/common/tests/enum_wire_form.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Op {
+    /// A new row.
     #[serde(rename = "i")]
     Insert,
+    /// An existing row's new image.
     #[serde(rename = "u")]
     Update,
+    /// A removed row; the values are its old image.
     #[serde(rename = "d")]
     Delete,
+    /// The whole table was emptied. Carries no row values — it is a boundary, not a change.
     #[serde(rename = "t")]
     Truncate,
 }
@@ -46,8 +50,12 @@ pub enum Op {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
+    /// A row read from the exported snapshot during initial backfill.
     Snapshot,
+    /// A row decoded from the live WAL stream — the steady state.
     Stream,
+    /// A row from a single-table-reload chunk; carries snapshot-op semantics so an overlapping
+    /// stream event wins the loader's dedup.
     Reload,
 }
 

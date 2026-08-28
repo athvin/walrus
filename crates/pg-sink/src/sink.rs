@@ -31,14 +31,24 @@ pub use control::ManifestKind as FileKind;
 /// The result of a durable S3 PUT — everything PR 2.25 needs for the manifest row.
 #[derive(Debug, Clone)]
 pub struct WrittenObject {
+    /// The full `s3://…` URI, as it will be written to the manifest row.
     pub s3_uri: String,
+    /// The same object as a store-relative key — what a later delete needs, since the store API
+    /// takes a key rather than a URI.
     pub key: Path,
+    /// Source schema of the rows in the file.
     pub source_schema: String,
+    /// Source table of the rows in the file.
     pub source_table: String,
+    /// Commit LSN of the first transaction in the file.
     pub lsn_start: Lsn,
+    /// Commit LSN of the last transaction in the file — the loader's claim-order key.
     pub lsn_end: Lsn,
+    /// Rows written.
     pub row_count: u64,
+    /// The shape the rows were encoded against.
     pub schema_version: SchemaVersionNo,
+    /// Which producer wrote it, which is how the loader routes the file.
     pub kind: FileKind,
 }
 
@@ -159,6 +169,8 @@ pub enum SinkError {
     /// `to_string()` drops.
     #[error("parquet encode: {0}")]
     Encode(#[source] parquet::errors::ParquetError),
+    /// The object store rejected or could not complete the request. `transparent` because
+    /// `object_store::Error` already names the operation and the path.
     #[error(transparent)]
     Store(#[from] object_store::Error),
 }

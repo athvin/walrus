@@ -28,7 +28,9 @@ pub struct DdlEvent {
     pub c_event: String,
     /// `ALTER TABLE` | `CREATE TABLE` | `DROP TABLE` | `COMMENT` | …
     pub c_tag: String,
+    /// Schema of the table the DDL changed.
     pub source_schema: String,
+    /// Table the DDL changed. With `source_schema`, the key whose version this event bumps.
     pub source_table: String,
     /// The structured post-change column set (the schema-diff input); `None` for pure drops.
     pub c_columns: Option<serde_json::Value>,
@@ -87,6 +89,10 @@ pub struct DdlConsumer {
 }
 
 impl DdlConsumer {
+    /// A consumer for one generation, with no versions known yet.
+    ///
+    /// Versions start empty rather than being loaded from control Postgres: the first DDL event for
+    /// a table establishes its baseline, and until one arrives the table is at version 1.
     #[must_use]
     pub fn new(epoch: EpochNo) -> Self {
         DdlConsumer {
@@ -167,12 +173,16 @@ impl DdlConsumer {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum DdlError {
+    /// A `ddl_audit` tuple did not carry a column the decoder requires, or carried it with the
+    /// wrong shape. Names the column, since that identifies which migration is out of date.
     #[error("ddl_audit tuple missing/invalid column: {0}")]
     MissingColumn(&'static str),
     /// `#[from]` (which implies `#[source]`): a malformed column snapshot has exactly one meaning
     /// here, so `?` may carry the decode failure straight out of `from_tuple`.
     #[error("parse c_columns json: {0}")]
     Json(#[from] serde_json::Error),
+    /// Persisting the DDL history row failed. `transparent` because [`control::ControlError`]
+    /// already names the operation.
     #[error(transparent)]
     Control(#[from] control::ControlError),
 }

@@ -70,6 +70,11 @@ const fn nonzero_i64(value: i64) -> NonZeroI64 {
     }
 }
 
+/// The loader's fully-resolved configuration.
+///
+/// Every field has a default, so an omitted key is not an error; `deny_unknown_fields` makes a
+/// *misspelled* one fatal instead of silently ignored. Range and consistency checks are not in the
+/// deserializer but in [`Self::validate`], which [`Self::load`] runs before handing the value back.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct LoaderConfig {
@@ -77,6 +82,7 @@ pub struct LoaderConfig {
     pub control_db_url: String,
     /// S3/MinIO staging bucket the sink writes and the loader reads.
     pub object_store: ObjectStoreConfig,
+    /// Log format and filter; see [`TelemetryConfig`].
     pub telemetry: TelemetryConfig,
     /// Tokio worker threads. `None` uses [`std::thread::available_parallelism`]; configured values
     /// must be within 1..=64. A loader pod wants a small value because every apply loop shares one

@@ -28,10 +28,13 @@ string_enum! {
 /// **all** other state (manifest, checkpoints, registry).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicationState {
+    /// The generation counter itself — the value every other control-plane table is keyed by.
     pub epoch: EpochNo,
+    /// The replication slot whose lifetime *is* this generation.
     pub slot_name: String,
     /// The consistent snapshot LSN at slot creation.
     pub created_lsn: Lsn,
+    /// Where the generation stands; see [`ReplicationStatus`].
     pub status: ReplicationStatus,
 }
 

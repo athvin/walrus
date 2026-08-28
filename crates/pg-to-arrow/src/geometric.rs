@@ -17,12 +17,19 @@ use std::sync::Arc;
 /// (two points).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GeoKind {
+    /// `point` — a single `(x, y)`.
     Point,
+    /// `line` — the infinite line's three coefficients.
     Line,
+    /// `lseg` — a segment's two endpoints.
     Lseg,
+    /// `box` — a rectangle's two opposite corners. Same Arrow shape and parser as `Lseg`.
     Box,
+    /// `circle` — a center point plus a radius.
     Circle,
+    /// `path` — a point list plus its open/closed flag.
     Path,
+    /// `polygon` — a point list, always closed, so no flag is carried.
     Polygon,
 }
 
@@ -97,7 +104,9 @@ pub fn geometric_field(name: &str, type_oid: u32) -> Option<Field> {
 /// A 2-D point (`x`, `y`) — the atom every geometric shape is built from.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Pt {
+    /// Horizontal coordinate.
     pub x: f64,
+    /// Vertical coordinate.
     pub y: f64,
 }
 

@@ -16,15 +16,22 @@ use common::Lsn;
 /// A pre-existing slot's resume position.
 #[derive(Debug, Clone, Copy)]
 pub struct SlotInfo {
+    /// The oldest WAL the slot still pins on the source — what actually holds disk.
     pub restart_lsn: Lsn,
+    /// The position the slot's consumer has confirmed. This, not `restart_lsn`, is where streaming
+    /// resumes.
     pub confirmed_flush_lsn: Lsn,
 }
 
 /// Whether the slot already existed or we just created it.
 #[derive(Debug, Clone)]
 pub enum SlotResume {
+    /// The slot was already there; resume from what it has confirmed.
     Existing(SlotInfo),
+    /// The slot was created by this run, so there is no history to resume — only the point the
+    /// source became consistent, and possibly a snapshot to backfill from first.
     Created {
+        /// The LSN at which the new slot became consistent; where streaming starts.
         consistent_point: Lsn,
         /// `None` for a SQL-created slot; the exported snapshot is PR 2.29 (backfill).
         snapshot_name: Option<String>,

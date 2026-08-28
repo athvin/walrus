@@ -29,14 +29,18 @@ use std::fmt::Write as _;
 /// One `schema_version` of a table's shape — the `schema_registry` `columns` snapshot for that version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaVersion {
+    /// The version number this shape belongs to.
     pub version: SchemaVersionNo,
+    /// The table's columns at that version, in attnum order — the input both sides of a diff take.
     pub relation: PgRelation,
 }
 
 /// What a `COMMENT` targets. `COMMENT` is metadata: mirror only, never a data gate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommentTarget {
+    /// `COMMENT ON TABLE`.
     Table,
+    /// `COMMENT ON COLUMN`, carrying the column name.
     Column(String),
 }
 
@@ -101,7 +105,10 @@ const fn is_lossless_widen(old: &PgColumn, new: &PgColumn) -> bool {
 /// (PR 3.9). The sink cuts one file per structural change, so a step usually yields a single change.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SchemaDiff {
+    /// Changes that can be applied in place to both tables without losing anything.
     pub additive: Vec<AdditiveChange>,
+    /// Changes where the mirror and the raw log must diverge. A non-empty vector here is what
+    /// routes the step away from [`apply_additive`] and onto the quarantine-capable path.
     pub destructive: Vec<DestructiveChange>,
 }
 

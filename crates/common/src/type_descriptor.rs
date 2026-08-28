@@ -92,9 +92,13 @@ const _: () = assert!(
 /// truncated registry row is still a loud decode failure rather than a silently wrong plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypeDescriptor {
+    /// Source column name — the join key back to the relation this descriptor came from.
     pub column: String,
+    /// The source column's `pg_catalog` type OID (see [`crate::oids`]).
     pub pg_type_oid: u32,
+    /// That OID's type name as text, so a registry row stays readable without an OID table.
     pub pg_type: String,
+    /// Which mapping strategy the type takes; see [`Tier`].
     pub tier: Tier,
     /// How the value is shaped in Arrow, e.g. `"Struct/Decomposed"`.
     pub arrow: String,

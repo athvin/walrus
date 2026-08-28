@@ -5,6 +5,12 @@
 > deferred. `warnings = "deny"` makes `warn` and `deny` the same diagnostic here, so the entry is a
 > hard build failure until the whole exported surface is documented — and 13 of those items are enum
 > variants that no call site can reach. This note is the inventory that sweep needs.
+>
+> **Superseded in part:** the sweep this note scoped has since landed under the `doc-all-public`
+> rule — see [`doc-all-public.md`](./doc-all-public.md). The measured gap below is therefore
+> historical: steps 2–4 of "What enabling it takes" are done, and the only remaining blocker is
+> step 1, the `string_enum!` grammar. The counts in the table below are left as measured, because
+> they are what the sweep was sized against.
 
 ## What the rule asks for
 

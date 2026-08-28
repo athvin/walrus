@@ -33,6 +33,7 @@ pub struct HeartbeatConfig {
 /// OIDs (and layout) of walrus's own published tables — consumed for control, never materialised.
 #[derive(Debug, Default, Clone)]
 pub struct InternalTables {
+    /// `walrus.heartbeat`'s OID, learned from its `Relation` message; `None` until one arrives.
     pub heartbeat_oid: Option<u32>,
     /// Column index of `walrus.heartbeat.beat_seq`, learned from its `Relation` message.
     heartbeat_beat_seq_col: Option<usize>,
@@ -278,8 +279,11 @@ impl Heartbeat {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum HeartbeatError {
+    /// The heartbeat's own SQL connection could not be opened. Separate from the replication
+    /// connection on purpose: a beat is an ordinary write, not a stream operation.
     #[error("connect heartbeat SQL connection: {0}")]
     Connect(#[source] tokio_postgres::Error),
+    /// The heartbeat UPDATE failed, or its returned sequence could not be read.
     #[error("fire heartbeat UPDATE: {0}")]
     Beat(#[source] tokio_postgres::Error),
 }

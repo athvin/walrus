@@ -115,20 +115,32 @@ impl<T: Clock + ?Sized> Clock for &T {
 /// The three per-batch flush triggers. Whichever trips first (at a commit boundary) cuts the file.
 #[derive(Clone, Copy, Debug)]
 pub struct BatchTriggers {
+    /// How long a batch may stay open before it is cut. This is the bound on end-to-end latency
+    /// when traffic is too light to trip either size trigger.
     pub max_fill: Duration,
+    /// Committed-row ceiling. Non-zero because a zero trigger would cut a file per row.
     pub max_rows: NonZeroU64,
+    /// Buffered-byte ceiling, measured on the Arrow builders rather than the encoded Parquet.
     pub max_bytes: NonZeroU64,
 }
 
 /// A finished, ready-to-write batch. `lsn_end` = commit LSN of the last txn (NOT the max row LSN).
 #[derive(Debug)]
 pub struct SealedBatch {
+    /// The finished Arrow batch, ready to encode as Parquet.
     pub record_batch: RecordBatch,
+    /// Source schema of the rows.
     pub schema: String,
+    /// Source table of the rows.
     pub table: String,
+    /// The shape the rows were encoded against; carried onto the manifest row.
     pub schema_version: SchemaVersionNo,
+    /// Commit LSN of the first transaction in the batch.
     pub lsn_start: Lsn,
+    /// Commit LSN of the **last** transaction in the batch — not the highest per-row LSN. This is
+    /// the value the loader's claim order sorts on, so the distinction is load-bearing.
     pub lsn_end: Lsn,
+    /// Rows in the batch, all of them committed.
     pub row_count: u64,
 }
 
@@ -362,6 +374,8 @@ impl<C: Clock> TableBatcher<C> {
         Ok(sealed)
     }
 
+    /// Rows that are committed and therefore publishable. Excludes anything buffered for a
+    /// transaction still open, which is why this — not the builder length — drives the row trigger.
     #[must_use]
     pub const fn committed_rows(&self) -> u64 {
         self.committed.count()
@@ -429,14 +443,20 @@ fn estimate_row_bytes(values: &[TupleValue]) -> u64 {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum BatchError {
+    /// Sealing was attempted while a transaction was still open, which would split it across two
+    /// files and break the all-or-nothing guarantee a commit boundary provides.
     #[error("cannot seal mid-transaction (would split a committed txn tail)")]
     OpenTransaction,
+    /// Sealing was attempted with no committed rows, which would produce an empty Parquet file and
+    /// a manifest row claiming zero rows.
     #[error("nothing to seal (empty batch)")]
     Empty,
     /// Committed rows exist but the batch id was never assigned. Its commit-LSN half is gone: the
     /// committed state now carries the LSN bounds with the rows, so that mismatch cannot occur.
     #[error("batch has committed rows but no assigned batch id")]
     Unassigned,
+    /// Encoding the rows into their typed Arrow builders failed. `transparent` because
+    /// [`pg_to_arrow::Error`] already names the column and the value.
     #[error(transparent)]
     Arrow(#[from] pg_to_arrow::Error),
 }

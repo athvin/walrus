@@ -213,8 +213,12 @@ impl Drop for SubscribeGuard<'_> {
 /// A decoded `reload_signal` insert held between its `Insert` message and its transaction's fate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PendingSignal {
+    /// Which reload attempt the signal belongs to.
     pub reload_id: ReloadId,
+    /// Which chunk of that attempt. With `reload_id`, the key a waiter subscribes under.
     pub chunk_no: i64,
+    /// The LSN the exporter wrote *into* the signal row. Used only to cross-check the decoded
+    /// commit LSN — it is never the watermark itself, which the commit supplies.
     pub embedded_lsn: Lsn,
     /// The per-message xid — `Some` only inside a streamed transaction (which a single-row signal
     /// txn can never be; kept so the defensive stream paths stay precise).
@@ -288,6 +292,10 @@ pub struct PendingSignals {
 }
 
 impl PendingSignals {
+    /// Hold a decoded signal until its transaction commits.
+    ///
+    /// A signal cannot be resolved when it is decoded: its watermark *is* the commit LSN, which is
+    /// not known until the COMMIT message arrives. So every signal waits here first.
     pub fn push(&mut self, signal: PendingSignal) {
         self.pending.push(signal);
     }
@@ -348,6 +356,7 @@ impl PendingSignals {
         }
     }
 
+    /// Whether no signal is awaiting a commit — the steady state, since a reload signal is rare.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.pending.is_empty()

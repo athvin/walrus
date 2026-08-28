@@ -37,9 +37,11 @@ pub struct CommonConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ObjectStoreConfig {
+    /// Bucket the sink writes Parquet into and the loader reads it back from.
     pub bucket: String,
     /// `None` = real AWS; `Some` = MinIO / localstack.
     pub endpoint: Option<String>,
+    /// Region sent with every request. Still required against MinIO, which validates the signature.
     pub region: String,
 }
 

@@ -28,8 +28,13 @@ use tokio::time::Instant;
 /// streaming replication connection).
 #[derive(Debug)]
 pub struct BootstrapCtx {
+    /// Control-Postgres pool, already migrated to the current schema.
     pub control_pool: PgPool,
+    /// The staging object store, proven writable by the bootstrap canary rather than merely
+    /// configured — so a bad bucket fails at startup instead of at the first flush.
     pub object_store: Arc<dyn ObjectStore>,
+    /// The preflighted **SQL** connection to the source. Not the replication connection: that is a
+    /// separate one, opened later.
     pub source_client: tokio_postgres::Client,
 }
 
