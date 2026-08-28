@@ -46,7 +46,7 @@ done
 # to produce SKIP and a false-green final verdict; it is now an anomaly.
 supported_gates="fmt clippy test sqlx conformance deny msrv compose integration e2e manifests images"
 if [[ "$gates" == ,* ]] || [[ "$gates" == *, ]] || [[ "$gates" == *,,* ]] \
-   || [[ "$gates" =~ [^a-z,-] ]]; then
+   || [[ "$gates" =~ [^a-z0-9,-] ]]; then
   echo "GATE=FAIL"
   echo "ANOMALY=invalid comma-separated gate list $gates"
   exit 2

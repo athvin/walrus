@@ -328,6 +328,12 @@ class GateRunnerTests(unittest.TestCase):
         self.assertIn("CHECK:not-a-gate=FAIL", result.stdout)
         self.assertNotIn("SKIP", result.stdout)
 
+    def test_digit_in_supported_e2e_gate_passes_list_validation(self) -> None:
+        result = self.run_gate("e2e,not-a-gate")
+        self.assertEqual(2, result.returncode)
+        self.assertIn("CHECK:not-a-gate=FAIL", result.stdout)
+        self.assertNotIn("invalid comma-separated gate list", result.stdout)
+
 
 class CheckClassifierTests(unittest.TestCase):
     def run_classifier(self, checks: list[dict]) -> subprocess.CompletedProcess[str]:
