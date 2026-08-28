@@ -45,6 +45,7 @@
 
 use crate::ExitCode;
 
+/// The terminal-vs-transient contract every walrus error enum implements.
 pub trait FailureClass {
     /// REQUIRED. True when retrying under the startup deadline can never help — die now, non-zero.
     #[must_use = "classification is the whole point — calling this for effect does nothing"]
