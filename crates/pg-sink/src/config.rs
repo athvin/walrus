@@ -219,8 +219,13 @@ impl Default for SinkConfig {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ConfigError {
+    /// A file or environment value could not be deserialized. Figment already renders the offending
+    /// profile/key, and the failure itself stays in the chain so a reporter can reach the structure
+    /// behind that sentence instead of re-parsing it out. Boxed because `figment::Error` is wide
+    /// enough that carrying it inline would push every `Result<_, ConfigError>` here towards
+    /// `clippy::result_large_err`.
     #[error("config load/parse failed: {0}")]
-    Load(String),
+    Load(#[source] Box<figment::Error>),
     #[error("missing required field: {0}")]
     Missing(&'static str),
     #[error("field {field} out of bounds: {detail}")]
@@ -271,7 +276,7 @@ impl SinkConfig {
         );
         let cfg: SinkConfig = figment
             .extract()
-            .map_err(|e| ConfigError::Load(e.to_string()))?;
+            .map_err(|source| ConfigError::Load(Box::new(source)))?;
         cfg.validate()?;
         Ok(cfg)
     }

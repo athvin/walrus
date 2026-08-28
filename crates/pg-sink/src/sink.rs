@@ -154,19 +154,22 @@ impl ParquetSink {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum SinkError {
+    /// The engine's error itself, not its rendering: only the typed value tells a footer write
+    /// apart from an out-of-spec schema, and `ParquetError::External` nests a further cause that
+    /// `to_string()` drops.
     #[error("parquet encode: {0}")]
-    Encode(String),
+    Encode(#[source] parquet::errors::ParquetError),
     #[error(transparent)]
     Store(#[from] object_store::Error),
 }
 
 /// Every Parquet failure on the writer path — builder, `write`, footer/multipart `close` — is the
-/// same class, so `?` does the wrapping instead of an identical closure at each call. `Encode`
-/// keeps the rendered message rather than the typed error because [`SinkError`] must stay usable
-/// from `common::Error`'s stringly variants.
+/// same class, so `?` does the wrapping instead of an identical closure at each call. Flattening to
+/// `common::Error`'s stringly variants happens at the process edge below, so everything upstream of
+/// it still sees the engine failure whole.
 impl From<parquet::errors::ParquetError> for SinkError {
     fn from(error: parquet::errors::ParquetError) -> Self {
-        SinkError::Encode(error.to_string())
+        SinkError::Encode(error)
     }
 }
 
@@ -174,8 +177,8 @@ impl From<SinkError> for common::Error {
     fn from(e: SinkError) -> Self {
         match e {
             SinkError::Store(inner) => common::Error::ObjectStore(inner.to_string()),
-            SinkError::Encode(message) => {
-                common::Error::Internal(format!("parquet encode: {message}"))
+            SinkError::Encode(source) => {
+                common::Error::Internal(format!("parquet encode: {source}"))
             }
         }
     }

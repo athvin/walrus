@@ -47,6 +47,11 @@ fn a_parquet_failure_converts_into_the_encode_class() {
 
     assert!(matches!(&error, SinkError::Encode(_)));
     assert_eq!(error.to_string(), format!("parquet encode: {rendered}"));
+    // …and must not lose the engine error *itself*: it stays in the chain, downcastable, so a
+    // reporter can tell a footer write apart from an out-of-spec schema.
+    let cause = std::error::Error::source(&error).expect("encode keeps the engine error");
+    assert!(cause.is::<parquet::errors::ParquetError>());
+    assert_eq!(cause.to_string(), rendered);
 }
 
 /// The store is a **trait** dependency (`Arc<dyn ObjectStore>`), so the failure branch is reachable

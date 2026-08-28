@@ -83,6 +83,48 @@ fn control_txn_failure_preserves_source_and_exits_control_db() {
     assert_eq!(error.exit_code(), common::ExitCode::ControlDb);
 }
 
+/// `op` only says which call failed; the store's own error is what says *why* (503, missing
+/// credentials, a bad endpoint). Both are rendered, and the typed failure stays walkable behind them.
+#[test]
+fn object_store_failure_preserves_the_store_error_as_source() {
+    let error = LoaderError::ObjectStore {
+        op: "staging bucket not readable",
+        source: Box::new(object_store::Error::Generic {
+            store: "S3",
+            source: "503 slow down".into(),
+        }),
+    };
+
+    assert!(error.to_string().contains("503 slow down"));
+    let cause = error.source().expect("object-store source");
+    assert!(cause.to_string().contains("503 slow down"));
+    assert_eq!(error.exit_code(), common::ExitCode::ObjectStore);
+}
+
+/// "Permission denied" and "read-only file system" are one sentence apart to a log reader and two
+/// different operator actions; the `ErrorKind` survives in the chain to tell them apart.
+#[test]
+fn a_failed_retire_keeps_the_os_error_kind_in_the_chain() {
+    let error = LoaderError::File {
+        op: "retire",
+        path: "/var/lib/walrus/orders.duckdb".to_string(),
+        source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+    };
+
+    assert!(
+        error
+            .to_string()
+            .starts_with("retire /var/lib/walrus/orders.duckdb: ")
+    );
+    let io = error
+        .source()
+        .expect("file source")
+        .downcast_ref::<std::io::Error>()
+        .expect("the OS error stays downcastable");
+    assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(error.exit_code(), common::ExitCode::Internal);
+}
+
 #[test]
 fn health_failure_preserves_source_and_exits_internal() {
     let error = LoaderError::Health {

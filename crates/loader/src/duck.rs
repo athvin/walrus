@@ -203,7 +203,7 @@ impl TableDb {
     ///
     /// # Errors
     ///
-    /// Returns [`LoaderError::Internal`] if the Parquet schema contains a column name that cannot be
+    /// Returns [`LoaderError::Ident`] if the Parquet schema contains a column name that cannot be
     /// represented as a SQL identifier, or [`LoaderError::Duck`] if the schema cannot be inspected
     /// or its rows cannot be appended into the raw table.
     pub fn append_parquet(
@@ -226,8 +226,9 @@ impl TableDb {
             .map(|column| {
                 common::sql::SqlIdent::new(column)
                     .map(|ident| ident.to_string())
-                    .map_err(|e| {
-                        LoaderError::Internal(format!("parquet column name from {s3_uri}: {e}"))
+                    .map_err(|source| LoaderError::Ident {
+                        uri: s3_uri.to_string(),
+                        source,
                     })
             })
             .collect::<Result<Vec<_>, LoaderError>>()?

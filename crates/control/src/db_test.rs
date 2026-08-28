@@ -59,8 +59,12 @@ fn connect_errors_are_transient_migrations_are_terminal() {
     assert!(migrate.is_terminal());
     assert!(!migrate.is_transient());
 
-    // A violated invariant (CHECK constraint) is a programming bug — terminal.
-    let check = ControlError::CheckViolation("transformed_lsn > raw_appended_lsn".to_string());
+    // A violated invariant (CHECK constraint) is a programming bug — terminal. Built through the
+    // real classifier: the variant now carries the driver error that produced the verdict.
+    let check = ControlError::from(sqlx::Error::Database(Box::new(FakeDbError {
+        code: "23514",
+        message: "transformed_lsn > raw_appended_lsn",
+    })));
     assert!(check.is_terminal());
     assert!(!check.is_transient());
 }
@@ -72,7 +76,7 @@ fn from_sqlx_error_classifies_23514_as_terminal_check_violation() {
         message: "raw watermark passed transformed watermark",
     })));
 
-    assert!(matches!(&error, ControlError::CheckViolation(_)));
+    assert!(matches!(&error, ControlError::CheckViolation { .. }));
     assert!(error.is_terminal());
     assert!(!error.is_transient());
     assert!(
@@ -80,6 +84,13 @@ fn from_sqlx_error_classifies_23514_as_terminal_check_violation() {
             .to_string()
             .contains("raw watermark passed transformed watermark")
     );
+    // Classifying the failure must not consume it: the driver error stays in the chain, so the
+    // SQLSTATE and constraint detail behind the verdict are still reachable.
+    let cause = std::error::Error::source(&error).expect("check violation keeps the sqlx error");
+    let driver = cause
+        .downcast_ref::<sqlx::Error>()
+        .expect("the driver error stays downcastable");
+    assert!(matches!(driver, sqlx::Error::Database(_)));
 }
 
 #[test]

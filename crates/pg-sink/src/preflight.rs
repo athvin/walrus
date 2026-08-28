@@ -87,8 +87,24 @@ pub enum PreflightError {
          (apply migrations/source/0003_reload_signal.sql)"
     )]
     ReloadSignalMissing { detail: &'static str },
+    /// A catalog query failed on the wire. `source` keeps tokio-postgres's typed failure — SQLSTATE,
+    /// severity, hint — reachable by [`source()`](std::error::Error::source)/`downcast_ref`, exactly
+    /// as [`HeartbeatError`](crate::heartbeat::HeartbeatError) already does for the same client.
+    ///
+    /// `#[from]` rather than `#[source]`: every catalog read goes through one helper, so `?` there
+    /// is the only conversion and there is nothing for a second one to be confused with.
     #[error("preflight query failed: {0}")]
-    Query(String),
+    Query(#[from] tokio_postgres::Error),
+    /// The catalog answered, but not with a value the preflight can read (no rows, a non-numeric
+    /// setting). The assertion itself failed, so there is no underlying error to chain — and it is
+    /// not a [`PreflightError::Query`]: the query worked.
+    #[error("preflight catalog result unusable: {0}")]
+    UnusableResult(String),
+    /// A configured name cannot be rendered as a SQL identifier. `source` keeps *which* rule it
+    /// broke, so a caller can branch on it instead of matching on the message. Also not a
+    /// [`PreflightError::Query`]: the rejection happens before any statement reaches the server.
+    #[error("invalid SQL identifier: {0}")]
+    Ident(#[source] common::sql::IdentError),
 }
 
 impl From<PreflightError> for common::Error {
@@ -110,7 +126,9 @@ impl From<PreflightError> for common::Error {
             | PreflightError::NoReplicationPriv
             | PreflightError::DdlCaptureMissing { .. }
             | PreflightError::ReloadSignalMissing { .. }
-            | PreflightError::Query(_) => common::Error::Preflight(e.to_string()),
+            | PreflightError::Query(_)
+            | PreflightError::UnusableResult(_)
+            | PreflightError::Ident(_) => common::Error::Preflight(e.to_string()),
         }
     }
 }
@@ -163,7 +181,8 @@ impl<'a> SourcePreflight<'a> {
     /// # Errors
     ///
     /// Returns [`PreflightError::DdlCaptureMissing`] when the audit shape or either trigger is absent,
-    /// or [`PreflightError::Query`] when a catalog query fails.
+    /// [`PreflightError::Query`] when a catalog query fails, or [`PreflightError::UnusableResult`]
+    /// when one answers with no row to read.
     pub async fn assert_ddl_capture(&self) -> Result<(), PreflightError> {
         if self
             .first_text(
@@ -204,7 +223,8 @@ impl<'a> SourcePreflight<'a> {
     ///
     /// Returns [`PreflightError::NoReplicationPriv`], [`PreflightError::WalLevel`],
     /// [`PreflightError::ServerTooOld`], or [`PreflightError::NoHeadroom`] for a terminal prerequisite
-    /// mismatch; catalog failures return [`PreflightError::Query`].
+    /// mismatch; catalog failures return [`PreflightError::Query`], and a setting that is missing or
+    /// non-numeric returns [`PreflightError::UnusableResult`].
     pub async fn assert_server_prereqs(&self) -> Result<ServerInfo, PreflightError> {
         // The role must be able to start a WAL sender (rolreplication, or a superuser).
         let can_replicate = self
@@ -251,8 +271,9 @@ impl<'a> SourcePreflight<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`PreflightError::ReloadSignalMissing`] when the table or primary key is absent, or
-    /// [`PreflightError::Query`] when a catalog query fails.
+    /// Returns [`PreflightError::ReloadSignalMissing`] when the table or primary key is absent,
+    /// [`PreflightError::Query`] when a catalog query fails, or [`PreflightError::UnusableResult`]
+    /// when one answers with no row to read.
     pub async fn assert_reload_signal(&self) -> Result<(), PreflightError> {
         if self
             .first_text(
@@ -295,8 +316,10 @@ impl<'a> SourcePreflight<'a> {
     /// # Errors
     ///
     /// Returns [`PreflightError::PublicationMissing`] or [`PreflightError::PublicationGap`] when
-    /// automatic publication management is disabled, and [`PreflightError::Query`] when inspection
-    /// or an authorized create/alter statement fails.
+    /// automatic publication management is disabled, [`PreflightError::Query`] when inspection or
+    /// an authorized create/alter statement fails, [`PreflightError::UnusableResult`] when a catalog
+    /// answer cannot be read, and [`PreflightError::Ident`] when a configured publication or table
+    /// name is not a legal SQL identifier.
     pub async fn assert_publication_covers(&self) -> Result<(), PreflightError> {
         let pubname = &self.cfg.publication_name;
         // Parse once, up front: both statements below that name the publication as an *identifier*
@@ -361,7 +384,8 @@ impl<'a> SourcePreflight<'a> {
     /// # Errors
     ///
     /// Returns [`PreflightError::NoPrimaryKey`] for the first unusable table in strict mode, or
-    /// [`PreflightError::Query`] when publication/catalog rows cannot be read.
+    /// [`PreflightError::Query`] / [`PreflightError::UnusableResult`] when publication/catalog rows
+    /// cannot be read.
     pub async fn assert_tables_have_pk(&self, mode: PkMode) -> Result<PkReport, PreflightError> {
         let sql = format!(
             r#"SELECT pt.schemaname, pt.tablename, c.relreplident::text AS relreplident,
@@ -418,10 +442,7 @@ impl<'a> SourcePreflight<'a> {
     // ---- helpers ------------------------------------------------------------------------------
 
     async fn query(&self, sql: &str) -> Result<Vec<SimpleQueryMessage>, PreflightError> {
-        self.client
-            .simple_query(sql)
-            .await
-            .map_err(|e| PreflightError::Query(e.to_string()))
+        Ok(self.client.simple_query(sql).await?)
     }
 
     async fn exec(&self, sql: &str) -> Result<(), PreflightError> {
@@ -435,7 +456,7 @@ impl<'a> SourcePreflight<'a> {
                 return Ok(row.get(0).unwrap_or_default().to_string());
             }
         }
-        Err(PreflightError::Query(format!("no rows for `{sql}`")))
+        Err(PreflightError::UnusableResult(format!("no rows for `{sql}`")))
     }
 
     async fn setting(&self, name: &str) -> Result<String, PreflightError> {
@@ -448,7 +469,9 @@ impl<'a> SourcePreflight<'a> {
             .await?
             .trim()
             .parse()
-            .map_err(|_| PreflightError::Query(format!("setting {name} is not an integer")))
+            .map_err(|_| {
+                PreflightError::UnusableResult(format!("setting {name} is not an integer"))
+            })
     }
 
     async fn count(&self, sql: &str) -> Result<i32, PreflightError> {
@@ -456,7 +479,7 @@ impl<'a> SourcePreflight<'a> {
             .await?
             .trim()
             .parse()
-            .map_err(|_| PreflightError::Query(format!("`{sql}` did not return a count")))
+            .map_err(|_| PreflightError::UnusableResult(format!("`{sql}` did not return a count")))
     }
 
     async fn assert_headroom(
@@ -508,7 +531,7 @@ const fn identity_is_usable(identity: ReplicaIdentity, has_pk: bool) -> bool {
 
 /// Validate a SQL identifier before its [`std::fmt::Display`] implementation quotes it.
 fn ident(s: &str) -> Result<SqlIdent, PreflightError> {
-    SqlIdent::new(s).map_err(|e| PreflightError::Query(format!("invalid SQL identifier: {e}")))
+    SqlIdent::new(s).map_err(PreflightError::Ident)
 }
 
 #[cfg(test)]

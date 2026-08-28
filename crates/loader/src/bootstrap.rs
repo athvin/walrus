@@ -213,8 +213,9 @@ async fn verify_s3_read(store: &dyn ObjectStore) -> Result<(), LoaderError> {
     match store.head(&probe).await {
         Ok(_) => Ok(()),
         Err(object_store::Error::NotFound { .. }) => Ok(()),
-        Err(e) => Err(LoaderError::ObjectStore(format!(
-            "staging bucket not readable: {e}"
-        ))),
+        Err(source) => Err(LoaderError::ObjectStore {
+            op: "staging bucket not readable",
+            source: Box::new(source),
+        }),
     }
 }

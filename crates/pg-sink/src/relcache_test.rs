@@ -157,6 +157,14 @@ fn hydrate_message_is_unchanged_on_a_malformed_snapshot() {
             "hydrate from schema_registry: public.orders: columns snapshot is not a PgRelation: {source}"
         )
     );
+    // The rendered sentence is only half of it: serde's own failure stays in the chain, so a
+    // reporter can still reach its line/column and category instead of re-parsing the text.
+    let cause = std::error::Error::source(&error).expect("hydrate keeps the decode error");
+    assert!(
+        cause.downcast_ref::<serde_json::Error>().is_some(),
+        "the decode failure must stay downcastable"
+    );
+    assert_eq!(cause.to_string(), source.to_string());
     assert!(
         cache.is_empty(),
         "hydration must not partially update the cache"

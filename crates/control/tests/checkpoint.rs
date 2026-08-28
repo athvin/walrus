@@ -80,8 +80,14 @@ async fn check_rejects_transformed_ahead_of_raw() {
         .await
         .expect_err("transformed ahead of raw must be rejected");
     assert!(
-        matches!(err, ControlError::CheckViolation(_)) && err.is_terminal(),
+        matches!(err, ControlError::CheckViolation { .. }) && err.is_terminal(),
         "expected a terminal CheckViolation, got {err:?}"
+    );
+    // Against a real server the chain is what carries the SQLSTATE and constraint name; the
+    // one-line verdict above is a summary of it.
+    assert!(
+        std::error::Error::source(&err).is_some(),
+        "the driver error must survive classification, got {err:?}"
     );
 
     tx.rollback().await.unwrap();

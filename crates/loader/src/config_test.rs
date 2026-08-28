@@ -340,9 +340,14 @@ fn an_unknown_key_is_a_load_failure_carrying_figments_detail() {
         jail.set_env("WALRUS_NONSENSE", "boom"); // typo'd ConfigMap key
 
         let err = LoaderConfig::load().expect_err("unknown key must fail the load");
-        let ConfigError::Load(detail) = &err else {
+        let ConfigError::Load(source) = &err else {
             panic!("expected a Load failure, got {err:?}");
         };
+        let detail = source.to_string();
         assert!(detail.contains("nonsense"), "{detail}");
+        // The rendered sentence is only half of it: figment's own error stays in the chain, so a
+        // reporter can walk to it rather than re-parsing the text.
+        let cause = std::error::Error::source(&err).expect("load keeps figment's error as source");
+        assert_eq!(cause.to_string(), detail);
     });
 }

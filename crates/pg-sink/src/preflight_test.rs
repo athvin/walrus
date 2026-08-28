@@ -1,5 +1,6 @@
 use super::*;
 use common::FailureClass;
+use common::sql::IdentError;
 
 #[test]
 fn preflight_errors_map_to_exit_codes() {
@@ -33,6 +34,8 @@ fn preflight_errors_map_to_exit_codes() {
         PreflightError::ReloadSignalMissing {
             detail: "walrus.reload_signal table absent",
         },
+        PreflightError::UnusableResult("no rows for `SELECT 1`".into()),
+        PreflightError::Ident(IdentError::Empty),
     ] {
         let e: common::Error = pe.into();
         assert_eq!(e.exit_code(), common::ExitCode::Preflight);
@@ -47,13 +50,15 @@ fn quoting_doubles_delimiters_and_rejects_unusable_idents() {
     assert_eq!(ident("walrus_pub").unwrap().to_string(), "\"walrus_pub\"");
     assert_eq!(ident("a\"b").unwrap().to_string(), "\"a\"\"b\"");
 
-    assert!(matches!(
-        ident("").unwrap_err(),
-        PreflightError::Query(message) if message.contains("must not be empty")
-    ));
+    // A rejected name never reached the server, so it is its own class — and the rule it broke
+    // stays typed in the chain rather than being re-read out of a message.
+    let empty = ident("").unwrap_err();
+    assert!(matches!(&empty, PreflightError::Ident(IdentError::Empty)));
+    let cause = std::error::Error::source(&empty).expect("ident keeps the rule it broke");
+    assert!(cause.to_string().contains("must not be empty"));
     assert!(matches!(
         ident("a\0b").unwrap_err(),
-        PreflightError::Query(message) if message.contains("interior NUL")
+        PreflightError::Ident(IdentError::InteriorNul(name)) if name == "a\0b"
     ));
 }
 

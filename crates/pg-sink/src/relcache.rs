@@ -115,11 +115,12 @@ impl RelationCache {
         let decoded = rows
             .into_iter()
             .map(|row| {
-                let relation: PgRelation = serde_json::from_value(row.columns).map_err(|e| {
-                    RelationError::Hydrate(format!(
-                        "{}.{}: columns snapshot is not a PgRelation: {e}",
-                        row.source_schema, row.source_table
-                    ))
+                let relation: PgRelation = serde_json::from_value(row.columns).map_err(|source| {
+                    RelationError::Hydrate {
+                        schema: row.source_schema,
+                        table: row.source_table,
+                        source,
+                    }
                 })?;
                 let arrow_schema = build_arrow(&relation)?;
                 Ok(CachedRelation {
@@ -296,8 +297,19 @@ pub enum RelationError {
         #[source]
         source: pg_to_arrow::Error,
     },
-    #[error("hydrate from schema_registry: {0}")]
-    Hydrate(String),
+    /// A persisted `columns` snapshot did not decode into a [`PgRelation`]. The rendered sentence is
+    /// unchanged; what it gains is serde's own failure staying in the chain, so a reporter can reach
+    /// its line/column and category instead of re-parsing them back out of the text.
+    #[error(
+        "hydrate from schema_registry: {schema}.{table}: \
+         columns snapshot is not a PgRelation: {source}"
+    )]
+    Hydrate {
+        schema: String,
+        table: String,
+        #[source]
+        source: serde_json::Error,
+    },
 }
 
 #[cfg(test)]

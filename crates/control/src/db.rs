@@ -19,8 +19,16 @@ pub enum ControlError {
 
     /// A DB CHECK constraint was violated (e.g. `transformed_lsn > raw_appended_lsn`). Terminal —
     /// it means a programming bug, never a transient condition.
-    #[error("control-plane invariant violated (check constraint): {0}")]
-    CheckViolation(String),
+    ///
+    /// `message` is the constraint text an operator reads; `source` keeps the driver error that
+    /// produced the verdict, so the SQLSTATE, constraint name and detail/hint behind it stay
+    /// reachable rather than being reduced to that one line.
+    #[error("control-plane invariant violated (check constraint): {message}")]
+    CheckViolation {
+        message: String,
+        #[source]
+        source: sqlx::Error,
+    },
 
     /// A reload was requested for a table that already has a live (non-terminal) one — the
     /// `table_reload_one_live` partial unique index fired (PR 6.1). Terminal for THIS request:
@@ -50,7 +58,7 @@ impl FailureClass for ControlError {
     fn is_terminal(&self) -> bool {
         match self {
             ControlError::Migrate(_)
-            | ControlError::CheckViolation(_)
+            | ControlError::CheckViolation { .. }
             | ControlError::ReloadInProgress { .. }
             | ControlError::ReloadTransition { .. }
             | ControlError::Decode(_) => true,
@@ -72,7 +80,10 @@ impl ControlError {
         if let sqlx::Error::Database(db) = &e
             && db.code().as_deref() == Some("23514")
         {
-            return ControlError::CheckViolation(db.message().to_string());
+            // Read the message out while the borrow is live, then hand the driver error itself on
+            // as the cause — the verdict summarises it rather than replacing it.
+            let message = db.message().to_string();
+            return ControlError::CheckViolation { message, source: e };
         }
         ControlError::Connect(e)
     }

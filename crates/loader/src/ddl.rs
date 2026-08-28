@@ -351,18 +351,19 @@ pub fn apply_destructive(
 ///
 /// # Errors
 ///
-/// Returns [`LoaderError::Internal`] if removing an existing file fails for any reason other than
-/// `NotFound`.
+/// Returns [`LoaderError::File`] if removing an existing file fails for any reason other than
+/// `NotFound`, keeping the OS error itself as the failure's source.
 pub async fn retire_file(path: impl AsRef<std::path::Path>) -> Result<(), LoaderError> {
     // Bind the borrow ONCE — the removal and the failure message share this one view.
     let path = path.as_ref();
     match tokio::fs::remove_file(path).await {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(LoaderError::Internal(format!(
-            "retire {}: {e}",
-            path.display()
-        ))),
+        Err(source) => Err(LoaderError::File {
+            op: "retire",
+            path: path.display().to_string(),
+            source,
+        }),
     }
 }
 

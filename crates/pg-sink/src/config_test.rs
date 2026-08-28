@@ -141,11 +141,16 @@ fn a_misspelled_key_is_a_terminal_load_failure() {
             jail.set_env(key, value);
 
             let err = SinkConfig::load().expect_err("a misspelled key must fail the load");
-            let ConfigError::Load(detail) = &err else {
+            let ConfigError::Load(source) = &err else {
                 panic!("{key}: expected a Load failure, got {err:?}");
             };
             // Naming the offending key is what makes the error actionable in a pod log.
+            let detail = source.to_string();
             assert!(detail.contains(offender), "{key}: {detail}");
+            // …and figment's own error stays in the chain rather than being flattened into that
+            // sentence, so a reporter can walk to it.
+            let cause = std::error::Error::source(&err).expect("load keeps figment's error");
+            assert_eq!(cause.to_string(), detail, "{key}");
             assert!(common::Error::from(err).is_terminal(), "{key}");
         });
     }

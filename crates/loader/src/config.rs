@@ -166,7 +166,7 @@ impl LoaderConfig {
                     .split("__"),
             )
             .extract()
-            .map_err(|e| ConfigError::Load(e.to_string()))?;
+            .map_err(|source| ConfigError::Load(Box::new(source)))?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -219,9 +219,13 @@ impl LoaderConfig {
 pub enum ConfigError {
     /// A file or environment value could not be deserialized into [`LoaderConfig`] — bad syntax, a
     /// wrong type, or an unknown key under `deny_unknown_fields`. Figment already renders the
-    /// offending profile/key, so the detail is passed through verbatim.
+    /// offending profile/key, so the detail is passed through verbatim — and the failure itself
+    /// stays in the chain, so a reporter can reach the structure behind that sentence (profile, key
+    /// path, expected type) instead of re-parsing it out. Boxed because `figment::Error` is wide
+    /// enough that carrying it inline would push every `Result<_, ConfigError>` here towards
+    /// `clippy::result_large_err`.
     #[error("{0}")]
-    Load(String),
+    Load(#[source] Box<figment::Error>),
     /// A required string field was absent or blank.
     #[error("missing required field: {0}")]
     Missing(&'static str),

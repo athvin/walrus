@@ -233,7 +233,10 @@ fn build_store(cfg: &LoaderConfig) -> Result<AmazonS3, LoaderError> {
         b = b.with_endpoint(endpoint).with_allow_http(true);
     }
     b.build()
-        .map_err(|e| LoaderError::ObjectStore(format!("build S3 client: {e}")))
+        .map_err(|source| LoaderError::ObjectStore {
+            op: "build S3 client",
+            source: Box::new(source),
+        })
 }
 
 /// DuckDB httpfs credentials for `read_parquet('s3://…')`, from the object-store config + the AWS env
