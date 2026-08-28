@@ -165,6 +165,16 @@ fn clippy_threshold(cfg: &str, key: &str) -> Option<u64> {
     None
 }
 
+/// The body of a `clippy.toml` list key — everything between its brackets — or `None` when the key
+/// is absent at all. A lint that reads its subjects from such a list is only as strong as the list
+/// is populated, whatever level the manifest pins it at, so an emptied array (`Some("")`) and an
+/// absent key are two different failures and this tells them apart.
+fn clippy_list(cfg: &str, key: &str) -> Option<String> {
+    let (_, rest) = cfg.split_once(&format!("{key} = ["))?;
+    let (body, _) = rest.split_once(']')?;
+    Some(body.to_string())
+}
+
 #[test]
 fn every_member_opts_into_the_workspace_lint_table() {
     let wrapped_members = r#"[workspace]
@@ -301,6 +311,59 @@ fn the_workspace_lint_table_still_denies_the_suspicious_group() {
             "{lint} is a suspicious-group member; it must keep the default priority"
         );
     }
+}
+
+/// The third of those three names pins a level and nothing else. `await_holding_invalid_type` ships
+/// with no type list of its own, so the manifest entry is inert until `clippy.toml`'s
+/// `await-holding-invalid-types` names something: emptying that array leaves the manifest untouched
+/// and every assertion above green while the deny loses every site it could fire on — the same
+/// hollowing-out a raised threshold performs on the complexity and perf groups further down.
+///
+/// What the array must keep naming is `tokio::sync::watch::Ref`. The lint's two siblings know
+/// `std::sync` and `parking_lot` guards and stop there, but a `Ref` IS a read guard on the watch
+/// channel's inner lock: retained across an `.await` it blocks every `Sender::send`, which in the
+/// loader is the single epoch poller feeding every apply worker. The apply loop's two borrow sites
+/// copy the value out inside the borrowing statement (`*ctx.epoch_rx.borrow()`), and this array is
+/// what keeps that a rule rather than a habit.
+///
+/// Tokio's own `Mutex`/`RwLock` guards stay off the list deliberately. No production site holds
+/// one, and the source-database serialization locks in the compose-gated integration tests hold a
+/// `tokio::sync::MutexGuard` across the whole test body on purpose — the lint reaches test targets
+/// too, so naming those types would fail those tests for the behavior they exist to have.
+#[test]
+fn the_clippy_config_still_arms_the_await_holding_type_list() {
+    let synthetic = concat!(
+        "await-holding-invalid-types = [\n",
+        "  { path = \"a::B\" },\n",
+        "]\n",
+        "disallowed-methods = []\n"
+    );
+    let listed = clippy_list(synthetic, "await-holding-invalid-types").unwrap();
+    assert!(listed.contains(r#"path = "a::B""#));
+    assert_eq!(clippy_list(synthetic, "disallowed-types"), None);
+    assert_eq!(
+        clippy_list(synthetic, "disallowed-methods").as_deref(),
+        Some(""),
+        "an emptied array is the failure this guard exists for; it must not read as absent"
+    );
+
+    let root_manifest = std::fs::read_to_string(repo_root().join("Cargo.toml")).unwrap();
+    let clippy = section(&root_manifest, "[workspace.lints.clippy]")
+        .expect("root manifest must define [workspace.lints.clippy]");
+    assert_eq!(
+        clippy_deny_count(clippy, "await_holding_invalid_type"),
+        1,
+        "the array below is enforcement only while the manifest still denies the lint"
+    );
+
+    let cfg = std::fs::read_to_string(repo_root().join("clippy.toml")).unwrap();
+    let types = clippy_list(&cfg, "await-holding-invalid-types")
+        .expect("clippy.toml must state await-holding-invalid-types");
+    assert!(
+        types.contains(r#"path = "tokio::sync::watch::Ref""#),
+        "await_holding_invalid_type has no type to fire on unless the list names the watch read \
+         guard; found: {types}"
+    );
 }
 
 /// `clippy::style` is the third rung: code that is correct and idiomatically misspelled —
