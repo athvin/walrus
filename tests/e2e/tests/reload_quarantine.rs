@@ -14,7 +14,7 @@
 //!
 //! Then: `reload` the table, restart the loader, and it recovers. Three PR 6.12 loader fixes make
 //! recovery possible: (1) a worker error cancels the shutdown token so a multi-table quarantine
-//! *exits* the loader instead of deadlocking (`main.rs`); (2) bootstrap SKIPS the forward reconcile
+//! *exits* the loader instead of deadlocking (`app.rs`); (2) bootstrap SKIPS the forward reconcile
 //! when a rebuild reload is pending, so the restart doesn't re-quarantine before Phase A runs
 //! (`bootstrap.rs`); (3) Phase A skips the superseded version-crossing blocker so the reload chunk's
 //! rebuild clears the quarantine (`phase_a.rs`). The other tables' `transformed_lsn` strictly

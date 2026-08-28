@@ -55,8 +55,8 @@ impl OwnedTable {
 /// `store` is `&dyn`, not `&impl ObjectStore`, deliberately: this is a once-per-process async fn
 /// whose whole use of the store is one `head` (step 5), so the vtable costs a single indirect call
 /// on a cold path — while a generic parameter would monomorphize this entire state machine per
-/// store type for nothing. Callers pass their concrete client (`main` an `AmazonS3`) and the
-/// coercion happens here, at the boundary.
+/// store type for nothing. Callers pass their concrete client (`app::build_store`'s `AmazonS3`) and
+/// the coercion happens here, at the boundary.
 pub async fn bootstrap(
     cfg: &LoaderConfig,
     pool: &sqlx::PgPool,

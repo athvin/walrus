@@ -11,7 +11,7 @@
 //! 4. **`CHECKPOINT` and close** the `.duckdb` file so no stale lock is left for the next bootstrap.
 //!    [`crate::apply_loop`]'s drain runs the `CHECKPOINT`; the *close* is a **drop** — the worker task
 //!    owns its [`TableCtx`](crate::phase_a::TableCtx), so DuckDB's writer lock comes off when that
-//!    task's future ends, which is why `main` joins every worker before step 5;
+//!    task's future ends, which is why `app::pipeline` joins every worker before step 5;
 //! 5. **release the ownership lease** — last, and only *after* the watermarks commit, so a fast
 //!    replacement can't double-apply the tail. The two fences therefore come off in the REVERSE of
 //!    their bootstrap order (lease → file lock, so file lock → lease). Design §8.5 lists these two the

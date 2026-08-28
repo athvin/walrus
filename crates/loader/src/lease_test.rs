@@ -28,8 +28,8 @@ fn renew_interval_floors_at_one_second() {
     assert_eq!(renew_interval(renewable(3)), MIN_RENEW_INTERVAL);
 }
 
-/// `main` cancels the token and **joins** the renewer before `release_all`, instead of aborting it:
-/// `control::release_lease` only expires the row and leaves `owner_pod` set, while
+/// `app::pipeline` cancels the token and **joins** the renewer before `release_all`, instead of
+/// aborting it: `control::release_lease` only expires the row and leaves `owner_pod` set, while
 /// `control::renew_lease` is guarded on the owner alone — so a renewal that outlived the release
 /// would push `lease_expiry` a whole TTL forward and the successor's `acquire` would read a live
 /// owner (terminal `LeaseContended`). That join is only finite because cancellation ends the task,
@@ -55,7 +55,7 @@ async fn a_cancelled_renewer_ends_so_the_drain_can_join_it() {
     token.cancel();
     tokio::time::timeout(Duration::from_secs(5), renewer)
         .await
-        .expect("a cancelled renewer must end, or `main`'s join would stall the drain")
+        .expect("a cancelled renewer must end, or `app::pipeline`'s join would stall the drain")
         .expect("the renewer returns rather than panicking");
 }
 

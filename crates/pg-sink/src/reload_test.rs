@@ -78,11 +78,11 @@ fn an_ad_hoc_preflight_failure_is_infra_never_a_rejection() {
 
 #[test]
 fn the_configured_reload_cap_narrows_without_losing_its_non_zero_proof() {
-    // `main` narrows `SinkConfig`'s `NonZeroU64` into this struct's `NonZeroUsize`: only the 64-bit
-    // magnitude can fail to fit a `usize`, never the "at least one exporter" proof the config
-    // already made. A zero-permit semaphore would not *pause* the controller but kill it — `tick`
-    // and `adopt_and_resume` both return early on no free permits, so `requested` rows would queue
-    // forever with nothing in the logs to say why.
+    // `app::pipeline` narrows `SinkConfig`'s `NonZeroU64` into this struct's `NonZeroUsize`: only
+    // the 64-bit magnitude can fail to fit a `usize`, never the "at least one exporter" proof the
+    // config already made. A zero-permit semaphore would not *pause* the controller but kill it —
+    // `tick` and `adopt_and_resume` both return early on no free permits, so `requested` rows would
+    // queue forever with nothing in the logs to say why.
     let configured = crate::config::SinkConfig::default().max_concurrent_reloads;
     let cap = NonZeroUsize::try_from(configured).expect("the shipped default fits a usize");
     assert_eq!(u64::try_from(cap.get()), Ok(configured.get()));

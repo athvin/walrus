@@ -15,6 +15,9 @@
 //! fail-fast [`bootstrap`] that proves exclusive ownership (control-plane [`lease`] + DuckDB file lock)
 //! and stands up [`health`] — no manifest file is claimed yet (that is PR 3.2).
 //!
+//! [`app`] is the entry point: [`app::run`] is the whole service lifecycle, so the `walrus-loader`
+//! binary (`src/main.rs`) is only config, tracing, a runtime and an exit code.
+//!
 //! # Concurrency
 //!
 //! One apply worker per `.duckdb` file, all on a single `LocalSet`. [`duck`]'s
@@ -23,6 +26,7 @@
 //! intentionally `!Send` and cannot be handed to `tokio::spawn` — which is what the crate-level
 //! `clippy::future_not_send` allow above records for Clippy.
 
+pub mod app;
 pub mod apply_loop;
 pub mod bootstrap;
 pub mod compaction;

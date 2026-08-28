@@ -70,9 +70,9 @@ pub async fn apply_loop(ctx: TableCtx, shutdown: CancellationToken) -> Result<()
             _ = tick.tick() => {}
         }
         // Total-restart guard (§1.8): if the control plane opened a newer generation than the one we
-        // started on, this loader is now running a RETIRED epoch. Exit loudly (→ `main` cancels the token
-        // and the process restarts) so bootstrap wipes + rebuilds every `.duckdb` under the new epoch —
-        // never rebuild in place mid-run.
+        // started on, this loader is now running a RETIRED epoch. Exit loudly (→ `app::pipeline`
+        // cancels the token and the process restarts) so bootstrap wipes + rebuilds every `.duckdb`
+        // under the new epoch — never rebuild in place mid-run.
         let observed = *ctx.epoch_rx.borrow();
         epoch_guard(observed, baseline_epoch, ctx.epoch)?;
         // Drain step 2+3: `run_phase_a`/`run_phase_b` are never interrupted mid-flight, so the in-flight
@@ -109,8 +109,8 @@ pub async fn apply_loop(ctx: TableCtx, shutdown: CancellationToken) -> Result<()
 
 /// Drain one worker on SIGTERM: the in-flight cycle already finished (both watermarks committed), so just
 /// `CHECKPOINT` the WAL into the main file and return — dropping `ctx` closes the file, releasing the
-/// lock cleanly (no stale lock for the next bootstrap). The lease is released by `main` after all workers
-/// drain (after their watermarks commit). PR 3.12.
+/// lock cleanly (no stale lock for the next bootstrap). The lease is released by `app::pipeline` after
+/// all workers drain (after their watermarks commit). PR 3.12.
 fn drain(ctx: &TableCtx) -> Result<(), LoaderError> {
     if let Err(e) = ctx.db.conn().execute_batch("CHECKPOINT;") {
         tracing::warn!(table = %format_args!("{}.{}", ctx.schema, ctx.table), error = %e, "drain CHECKPOINT failed");

@@ -20,7 +20,7 @@
 //! Only one concrete store (`AmazonS3`) is ever built, so the middle row is *not* "flexibility": it
 //! is the shape `object_store::buffered::BufWriter::new` demands by value, which `put_with_kind`
 //! calls per file. Where nothing upstream demands it — the loader, which spends its store on one
-//! `head` — the client stays concrete (`loader::main::build_store`).
+//! `head` — the client stays concrete (`loader::app::build_store`).
 
 use crate::relcache::CachedRelation;
 use arrow::record_batch::RecordBatch;
