@@ -215,12 +215,13 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
             .await
         {
             // A lossy DDL cast that fails is a QUARANTINE (PR 3.9): latch the state so `/ready`
-            // degrades, fire a loud error-level alert, and stop — never a silent continue.
+            // degrades, fire a loud error-level alert, and stop — never a silent continue. The alert
+            // names the table and the latch, not the error: this worker's `Err` drains the loader, so
+            // `main` logs the failure itself (reason included) exactly once on the way out.
             if matches!(e, LoaderError::Quarantine { .. }) {
                 ctx.state.quarantine();
                 tracing::error!(
                     table = %format_args!("{}.{}", ctx.schema, ctx.table),
-                    error = %e,
                     "QUARANTINE: lossy schema change could not be applied — /ready degraded, processing stopped"
                 );
             }

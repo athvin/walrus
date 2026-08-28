@@ -200,9 +200,11 @@ where
             Err(e) => {
                 let now = Instant::now();
                 if now >= deadline {
+                    // Names the dependency `main` cannot see; the error itself is propagated and
+                    // logged there once, when it becomes the process exit code. The per-attempt
+                    // `warn!` below is the absorbed-retry record, so nothing is lost by omitting it.
                     tracing::error!(
                         dependency = what,
-                        error = %e,
                         "dependency still unavailable at the startup deadline"
                     );
                     return Err(e);

@@ -30,20 +30,24 @@ pub fn failure_channel(
 }
 
 /// Report a failure without ever parking the worker.
+///
+/// Both unhappy arms *discard* the failure, so each log below is that error's only record — hence
+/// `?` (which carries the `#[source]` chain `LoaderError`'s `Display` omits) and `warn!` rather than
+/// `error!`, signalling it was absorbed here.
 pub fn report(tx: &mpsc::Sender<WorkerFailure>, failure: WorkerFailure) {
     match tx.try_send(failure) {
         Ok(()) => {}
         Err(mpsc::error::TrySendError::Full(failure)) => {
             tracing::warn!(
                 table = %failure.to_table_key(),
-                error = %failure.error,
+                error = ?failure.error,
                 "worker failure channel full; dropping additional failure"
             );
         }
         Err(mpsc::error::TrySendError::Closed(failure)) => {
             tracing::warn!(
                 table = %failure.to_table_key(),
-                error = %failure.error,
+                error = ?failure.error,
                 "worker failure channel closed; supervisor already exited"
             );
         }
@@ -55,6 +59,10 @@ pub fn report(tx: &mpsc::Sender<WorkerFailure>, failure: WorkerFailure) {
 /// The first failure cancels the shared token so healthy workers finish draining, then returns that
 /// original typed error once all workers have stopped. Additional failures are logged without
 /// replacing the first failure.
+///
+/// The first failure is **returned, not logged**: `main` records it once, with its cause chain, as
+/// the process's terminal error, so this layer only names the table `main` cannot see. The
+/// additional failures go nowhere else, so those are logged in full.
 pub async fn supervise<D>(
     mut rx: mpsc::Receiver<WorkerFailure>,
     token: &CancellationToken,
@@ -70,17 +78,21 @@ where
             biased;
             Some(failure) = rx.recv() => {
                 if first.is_none() {
+                    // Attribution only: this failure is propagated to `main`, which logs it when it
+                    // maps it to an exit code. Repeating the error here would record one failure
+                    // twice at ERROR with different amounts of context.
                     tracing::error!(
                         table = %failure.to_table_key(),
-                        error = %failure.error,
                         "apply worker failed; cancelling loader"
                     );
                     token.cancel();
                     first = Some(failure);
                 } else {
+                    // These are absorbed here — nothing propagates them — so this is their one
+                    // record, and `?` keeps the `#[source]` chain `Display` leaves behind.
                     tracing::error!(
                         table = %failure.to_table_key(),
-                        error = %failure.error,
+                        error = ?failure.error,
                         "additional apply worker failed during drain"
                     );
                 }

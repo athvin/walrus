@@ -63,7 +63,12 @@ fn main() -> ExitCode {
     match runtime.block_on(run(cfg)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            tracing::error!(error = %e, "walrus-loader exiting");
+            // `?e`, not `%e`: this is the one place a failure is HANDLED, and `LoaderError`'s
+            // `Duck`/`ControlTxn`/`RegistryDecode`/`LsnParse`/`Health` variants deliberately name only
+            // the operation in `Display`, keeping the engine/driver failure in `#[source]` (see
+            // `error_test.rs`). `Debug` is what walks that chain into the log — `%e` would exit on
+            // "DuckDB: append …" with the reason nowhere on disk.
+            tracing::error!(error = ?e, "walrus-loader exiting");
             e.exit_code().into()
         }
     }

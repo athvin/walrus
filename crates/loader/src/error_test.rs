@@ -31,6 +31,16 @@ fn duck_preserves_the_engine_error_as_source() {
     );
 }
 
+/// The log-site contract behind `error = ?e` in `main` and `supervisor`: `Display` names the
+/// operation only, so `%e` would drop the engine failure entirely, while `Debug` carries it.
+#[test]
+fn debug_surfaces_the_cause_that_display_omits() {
+    let error = duck_error();
+
+    assert!(!format!("{error}").contains("_walrus_lsn"));
+    assert!(format!("{error:?}").contains("_walrus_lsn"));
+}
+
 #[test]
 fn duck_still_exits_internal() {
     assert_eq!(duck_error().exit_code(), common::ExitCode::Internal);
