@@ -52,7 +52,15 @@ impl Error {
     /// Build a boxed parse error without exposing its storage choice to call sites.
     ///
     /// Cold because a well-formed cell never constructs this diagnostic payload.
+    ///
+    /// Building the diagnostic is the entire call: an `Error` that is not returned reports nothing.
+    /// The `impl Into<String>` parameters are what hide that from `clippy::must_use_candidate`,
+    /// which treats a generic argument as possibly side-effecting and skips the function — the same
+    /// reason `common::__private::unknown_variant` states the attribute by hand. The attribute
+    /// belongs here rather than on [`Error`] itself: a bare `#[must_use]` on a function whose return
+    /// type already carries one is `clippy::double_must_use`.
     #[cold]
+    #[must_use]
     pub fn value_parse(
         column: impl Into<String>,
         value: impl Into<String>,

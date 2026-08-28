@@ -35,7 +35,11 @@ impl<K> DuckTable<K> {
 }
 
 impl DuckTable<Mirror> {
-    /// Tag a mirror table name.
+    /// Tag a mirror table name. Pure: it wraps `name` and stores nothing elsewhere, so a discarded
+    /// call is a wasted allocation. The `impl Into<String>` parameter is what hides that from
+    /// `clippy::must_use_candidate` — the lint treats any generic argument as possibly
+    /// side-effecting and skips the function — hence the explicit attribute, as on [`Self::to_raw`].
+    #[must_use]
     pub fn new(name: impl Into<String>) -> Self {
         DuckTable {
             name: name.into(),

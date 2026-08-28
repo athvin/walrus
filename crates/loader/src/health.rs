@@ -128,7 +128,14 @@ impl LoaderState {
         self.phase.store(LoaderPhase::Ready);
     }
 
+    // The four probe reads in this impl (`is_started`, `is_ready`, `is_quarantined`, `is_live`)
+    // answer a question and change nothing, so discarding one is always a bug — hence the explicit
+    // `#[must_use]` on each. `clippy::must_use_candidate` reaches none of them: `&self` on a struct
+    // with interior mutability (the atomic phase, the poll-stamp mutex) reads to that lint as a
+    // mutable — therefore side-effecting — argument. The mutators between them return `()` and
+    // correctly carry nothing.
     /// `/startup` gate: bootstrap finished, including a later quarantine.
+    #[must_use]
     pub fn is_started(&self) -> bool {
         matches!(
             self.phase.load(),
@@ -137,6 +144,7 @@ impl LoaderState {
     }
 
     /// `/ready` answers 200 only in the ready phase.
+    #[must_use]
     pub fn is_ready(&self) -> bool {
         matches!(self.phase.load(), LoaderPhase::Ready)
     }
@@ -158,6 +166,7 @@ impl LoaderState {
             .transition(LoaderPhase::Quarantined, LoaderPhase::Ready);
     }
 
+    #[must_use]
     pub fn is_quarantined(&self) -> bool {
         matches!(self.phase.load(), LoaderPhase::Quarantined)
     }
@@ -169,6 +178,7 @@ impl LoaderState {
     }
 
     /// Liveness = we have completed at least one cycle (progress stamped). Deliberately lag-free.
+    #[must_use]
     pub fn is_live(&self) -> bool {
         self.last_poll_completed_at.lock().is_some()
     }

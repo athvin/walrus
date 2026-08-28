@@ -420,12 +420,18 @@ impl ReloadController {
     /// Spawn the controller task next to the heartbeat. Failures inside the task are logged and
     /// retried next tick — the controller can degrade, never take the sink down.
     ///
+    /// The returned handle is the only channel the panic below can surface on, so dropping it on the
+    /// floor loses that report — hence `#[must_use]`, as on `loader`'s `spawn_epoch_watch` and
+    /// `spawn_renewer`. `clippy::must_use_candidate` cannot demand it here: the `sqlx::PgPool`
+    /// argument is not `Freeze`, so that lint reads the signature as side-effecting and skips it.
+    ///
     /// # Panics
     ///
     /// The spawned task panics if `cfg.poll_interval` is zero — [`tokio::time::interval`] rejects a
     /// zero period. That one failure is not a degradation the tick loop can absorb: it surfaces on
     /// the returned [`JoinHandle`](tokio::task::JoinHandle), since the interval is built before the
     /// loop starts.
+    #[must_use]
     pub fn spawn(
         pool: sqlx::PgPool,
         source_db_url: &str,

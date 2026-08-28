@@ -149,19 +149,27 @@ impl HealthState {
         self.live.store(live, Ordering::Relaxed); // independent deadlock latch; no payload
     }
 
+    // The four probe reads below answer a question and change nothing, so discarding one is always
+    // a bug — hence the explicit `#[must_use]` on each. `clippy::must_use_candidate` reaches none of
+    // them: `&self` on an all-atomic struct reads to that lint as a mutable — therefore
+    // side-effecting — argument. The `mark_*`/`set_*` mutators above return `()` and carry nothing.
+    #[must_use]
     pub fn phase(&self) -> Phase {
         self.phase.load()
     }
 
+    #[must_use]
     pub fn is_ready(&self) -> bool {
         // Acquire pairs with mark_terminating; phase and termination are independent probe latches.
         self.phase() == Phase::Ready && !self.terminating.load(Ordering::Acquire)
     }
 
+    #[must_use]
     pub fn is_live(&self) -> bool {
         self.live.load(Ordering::Relaxed) // independent deadlock latch; no payload
     }
 
+    #[must_use]
     pub fn is_degraded(&self) -> bool {
         self.degraded.load(Ordering::Relaxed) // report-only; no payload is observed
     }
@@ -218,6 +226,9 @@ async fn metrics() -> impl IntoResponse {
 }
 
 /// The probe + metrics router, with the shared state injected.
+///
+/// Deliberately **not** `#[must_use]`: axum's `Router` already carries the attribute, and a second
+/// bare one is `clippy::double_must_use`. Same for the loader's `health::router`.
 pub fn router(state: Arc<HealthState>) -> Router {
     Router::new()
         .route("/startup", get(startup))

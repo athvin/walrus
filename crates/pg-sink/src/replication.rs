@@ -253,6 +253,12 @@ impl ReplicationStream<Streaming> {
     /// Time remaining until the next unconditional feedback is due. The flush path (PR 2.26) races this
     /// against a slow S3 PUT so keepalive keeps flowing while the read loop is busy — a stalled flush
     /// must never starve the walsender past `wal_sender_timeout` (§1.9). Saturates to zero when overdue.
+    ///
+    /// This read and the two watermark reads below compute a value and touch no wire state, so each
+    /// carries `#[must_use]` explicitly. `clippy::must_use_candidate` reaches none of them: the
+    /// [`TcpStream`] inside `&self` reads to that lint as a mutable — therefore side-effecting —
+    /// argument, which is why this module has no lint-driven annotation to inherit.
+    #[must_use]
     pub fn feedback_budget(&self) -> Duration {
         self.feedback_deadline
             .saturating_duration_since(Instant::now())
@@ -347,6 +353,7 @@ impl ReplicationStream<Streaming> {
     }
 
     /// The highest received LSN (what the keepalive path reports as `write`).
+    #[must_use]
     pub const fn last_received(&self) -> Lsn {
         self.last_received
     }
@@ -358,6 +365,7 @@ impl ReplicationStream<Streaming> {
     }
 
     /// The current durable (`confirmed_flush`) baseline.
+    #[must_use]
     pub const fn durable(&self) -> Lsn {
         self.durable
     }

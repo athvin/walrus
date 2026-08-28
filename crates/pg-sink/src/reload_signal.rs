@@ -86,6 +86,12 @@ impl WatermarkWaiters {
     }
 
     /// Number of in-flight watermark waits.
+    ///
+    /// This read and [`Self::crosscheck_violations`] below both compute an answer and change
+    /// nothing, so each carries `#[must_use]` explicitly: `clippy::must_use_candidate` skips them
+    /// because `&self` on a type with interior mutability (the waiter mutex, the two atomics) reads
+    /// to that lint as a mutable — therefore side-effecting — argument.
+    #[must_use]
     pub fn waiter_count(&self) -> usize {
         self.waiters.lock().len()
     }
@@ -134,6 +140,7 @@ impl WatermarkWaiters {
     }
 
     /// Cross-check violations seen so far (the unit-testable mirror of the Prometheus counter).
+    #[must_use]
     pub fn crosscheck_violations(&self) -> u64 {
         self.crosscheck_violations.load(Ordering::Relaxed)
     }
@@ -148,6 +155,23 @@ impl WatermarkWaiters {
 /// the channel behind the registry's back, or blocking a runtime thread, is not part of what a
 /// subscription offers (API guideline C-DEREF: a guard exposes the access it means to grant, not
 /// its whole innards).
+///
+/// The attribute below sits on the TYPE rather than on [`WatermarkWaiters::subscribe`], so it covers
+/// every construction path at once — and it is the RAII case, not a style preference: this guard IS
+/// the subscription. `waiters.subscribe(id, chunk);` as a bare statement would register the waiter
+/// and drop it in the same expression, unsubscribing before the exporter ever writes its signal row,
+/// and the echo would then have no sender to resolve. `clippy::must_use_candidate` cannot reach
+/// `subscribe` (it takes `&self` on a type with interior mutability, which that lint reads as a
+/// side-effecting argument), so nothing but this attribute states the rule.
+///
+/// Dropping a subscription on the floor is therefore a compile error:
+///
+/// ```compile_fail
+/// #![deny(unused_must_use)]
+/// # let waiters = pg_sink::reload_signal::WatermarkWaiters::default();
+/// waiters.subscribe(common::ReloadId(1), 0);
+/// ```
+#[must_use = "the guard IS the subscription and its future — dropping it unsubscribes immediately"]
 #[derive(Debug)]
 pub struct SubscribeGuard<'a> {
     waiters: &'a WatermarkWaiters,

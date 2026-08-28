@@ -55,6 +55,11 @@ impl ParquetSink {
     /// `bucket` is *stored*, so it is taken as `impl Into<String>` and converted exactly once here:
     /// `main` hands over the owned name from its `SinkConfig`, fixtures pass a `&str` literal, and
     /// no call site has to spell `.to_string()` to reach an owned `String`.
+    ///
+    /// That same parameter is why `#[must_use]` is written out here while [`Self::object_key`] got
+    /// it from the lint: `clippy::must_use_candidate` treats a generic argument as possibly
+    /// side-effecting and skips the function. Constructing a sink PUTs nothing by itself.
+    #[must_use]
     pub fn new(store: Arc<dyn ObjectStore>, bucket: impl Into<String>, epoch: EpochNo) -> Self {
         ParquetSink {
             store,

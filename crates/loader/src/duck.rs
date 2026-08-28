@@ -289,6 +289,12 @@ impl TableDb {
     }
 
     /// The `.duckdb` connection (later PRs run the transform SQL through it).
+    ///
+    /// Handing out the borrow does nothing on its own — the caller still has to run something
+    /// through it — so a discarded call is a no-op. `clippy::must_use_candidate` cannot say so: the
+    /// `parquet_cols` `RefCell` behind `&self` reads to that lint as a mutable — therefore
+    /// side-effecting — argument, so the attribute is spelled out.
+    #[must_use]
     pub const fn conn(&self) -> &duckdb::Connection {
         &self.conn
     }

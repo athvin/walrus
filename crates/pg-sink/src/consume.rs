@@ -716,6 +716,12 @@ struct RowSource<'a> {
 }
 
 impl<C: Clock + Clone> BatchRouter<C> {
+    /// A fresh router with no batchers. Pure — nothing is registered anywhere, so a discarded call
+    /// builds and drops the routing table. `clippy::must_use_candidate` skips it (the `C` type
+    /// parameter and the `impl Into<String>` argument both read to that lint as possibly
+    /// side-effecting), which is why the attribute is written out; same for
+    /// [`StreamDemux::new`](crate::stream_txn::StreamDemux::new).
+    #[must_use]
     pub fn new(
         triggers: BatchTriggers,
         clock: C,

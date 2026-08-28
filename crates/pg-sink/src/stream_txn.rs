@@ -125,6 +125,9 @@ impl StreamedTxn {
     ///
     /// `aborted` is bound to a local first: a `move` closure reading `self.aborted` would truncate
     /// the capture path at the `*self` deref and capture the whole `&StreamedTxn` (RFC 2229).
+    ///
+    /// No `#[must_use]` here: the `Iterator` trait carries one, so an `impl Iterator` return is
+    /// already covered — unlike [`crate::relcache::Iter`], a named struct that needs its own.
     fn iter_survivors(&self) -> impl Iterator<Item = &StreamedChange> {
         let aborted = &self.aborted;
         self.changes
@@ -154,6 +157,9 @@ pub struct StreamDemux<C = std::sync::Arc<SystemClock>> {
 }
 
 impl<C: Clock + Clone> StreamDemux<C> {
+    /// A fresh demux with no open streams. Pure, and invisible to `clippy::must_use_candidate` for
+    /// the reason [`BatchRouter::new`](crate::consume::BatchRouter::new) is.
+    #[must_use]
     pub fn new(
         triggers: BatchTriggers,
         clock: C,
@@ -591,6 +597,12 @@ fn estimate_change_bytes(values: &[TupleValue]) -> u64 {
 }
 
 /// A streamed change carries its sub-xid; a non-streamed change never enters the demux.
+///
+/// A pure classification of `msg`, so calling it for effect is meaningless. It escapes
+/// `clippy::must_use_candidate` through the argument: a [`Message`] can hold a `TupleValue::Binary`,
+/// whose `bytes::Bytes` is not `Freeze`, and that lint reads any non-`Freeze` reference as a
+/// mutable — therefore side-effecting — argument.
+#[must_use]
 pub const fn is_streamed_change(msg: &Message) -> bool {
     matches!(
         msg,

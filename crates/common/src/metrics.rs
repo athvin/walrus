@@ -169,6 +169,12 @@ pub fn init() {
 }
 
 /// Render the current Prometheus text exposition. Empty until [`init`] installs the recorder.
+///
+/// Rendering allocates a fresh exposition string and changes nothing, so a discarded call is pure
+/// waste. `clippy::must_use_candidate` cannot say so — reading the `HANDLE` static counts as
+/// touching a mutable static, which makes the lint treat this function as side-effecting — so the
+/// attribute is spelled out.
+#[must_use]
 pub fn render() -> String {
     HANDLE
         .get()
