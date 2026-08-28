@@ -256,10 +256,8 @@ impl SinkConfig {
         // silently equates "unset" with "set to a path that is not UTF-8". `None` means unset.
         if let Some(path) = std::env::var_os("WALRUS_CONFIG") {
             let path = std::path::PathBuf::from(path);
-            let is_yaml = matches!(
-                path.extension().and_then(|e| e.to_str()),
-                Some("yaml") | Some("yml")
-            );
+            let ext = path.extension().and_then(|e| e.to_str());
+            let is_yaml = matches!(ext, Some("yaml" | "yml"));
             figment = if is_yaml {
                 figment.merge(Yaml::file(&path))
             } else {

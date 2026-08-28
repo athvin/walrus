@@ -93,11 +93,8 @@ fn is_same_duck_type(a: &PgColumn, b: &PgColumn) -> bool {
 /// A widening DuckDB *can* do in place without loss — the additive subset. Anything else whose DuckDB
 /// type changes is **lossy/narrowing** and belongs to PR 3.9's quarantine path.
 const fn is_lossless_widen(old: &PgColumn, new: &PgColumn) -> bool {
-    matches!(
-        (old.type_oid, new.type_oid),
-        (INT2, INT4) | (INT2, INT8) | (INT4, INT8) // int2→int4→int8
-            | (FLOAT4, FLOAT8) // float4→float8
-    )
+    // int2→int4→int8 and float4→float8 are the only in-place widenings, grouped by source type.
+    matches!((old.type_oid, new.type_oid), (INT2, INT4 | INT8) | (INT4, INT8) | (FLOAT4, FLOAT8))
 }
 
 /// The full classification of one version step: additive/lossless changes plus destructive ones

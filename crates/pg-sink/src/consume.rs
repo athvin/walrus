@@ -1007,17 +1007,17 @@ pub fn on_frame(ctx: &mut StreamCtx, frame: ReplicationMessage) -> anyhow::Resul
 fn trace_message(msg: &Message) {
     match msg {
         Message::Begin { final_lsn, xid, .. } => {
-            tracing::trace!(op = "begin", xid, final_lsn = %final_lsn, "decoded")
+            tracing::trace!(op = "begin", xid, final_lsn = %final_lsn, "decoded");
         }
         Message::Commit {
             commit_lsn,
             end_lsn,
             ..
         } => {
-            tracing::trace!(op = "commit", commit_lsn = %commit_lsn, end_lsn = %end_lsn, "decoded")
+            tracing::trace!(op = "commit", commit_lsn = %commit_lsn, end_lsn = %end_lsn, "decoded");
         }
         Message::Origin { commit_lsn, name } => {
-            tracing::trace!(op = "origin", commit_lsn = %commit_lsn, name, "decoded")
+            tracing::trace!(op = "origin", commit_lsn = %commit_lsn, name, "decoded");
         }
         Message::Relation { xid, relation } => tracing::trace!(
             op = "relation",
@@ -1027,7 +1027,7 @@ fn trace_message(msg: &Message) {
             "decoded"
         ),
         Message::Type { xid, oid, name, .. } => {
-            tracing::trace!(op = "type", xid = ?xid, type_oid = oid, name, "decoded")
+            tracing::trace!(op = "type", xid = ?xid, type_oid = oid, name, "decoded");
         }
         Message::Insert {
             xid,
@@ -1041,7 +1041,7 @@ fn trace_message(msg: &Message) {
             xid, relation_oid, ..
         } => tracing::trace!(op = "delete", xid = ?xid, relation_oid, "decoded"),
         Message::Truncate { xid, relations, .. } => {
-            tracing::trace!(op = "truncate", xid = ?xid, relations = relations.len(), "decoded")
+            tracing::trace!(op = "truncate", xid = ?xid, relations = relations.len(), "decoded");
         }
         Message::Message {
             xid,
@@ -1058,14 +1058,14 @@ fn trace_message(msg: &Message) {
             "decoded"
         ),
         Message::StreamStart { xid, first_segment } => {
-            tracing::trace!(op = "stream_start", xid, first_segment, "decoded")
+            tracing::trace!(op = "stream_start", xid, first_segment, "decoded");
         }
         Message::StreamStop => tracing::trace!(op = "stream_stop", "decoded"),
         Message::StreamCommit {
             xid, commit_lsn, ..
         } => tracing::trace!(op = "stream_commit", xid, commit_lsn = %commit_lsn, "decoded"),
         Message::StreamAbort { top_xid, sub_xid } => {
-            tracing::trace!(op = "stream_abort", top_xid, sub_xid, "decoded")
+            tracing::trace!(op = "stream_abort", top_xid, sub_xid, "decoded");
         }
         // Two-phase (v3) frames never occur at v2; log opaquely rather than special-case.
         other => tracing::trace!(op = "other", detail = ?other, "decoded"),

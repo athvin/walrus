@@ -164,6 +164,51 @@ linkedlist = "deny"
 # juggling is needed. Prefer the direct method item over a non-capturing forwarding adapter.
 redundant_closure_for_method_calls = "deny"
 match_wildcard_for_single_variants = "deny"
+# The five entries below finish the selective pick from `clippy::pedantic`, and the shape of that
+# pick is itself the policy: the group is enabled one lint at a time, never as
+# `pedantic = { level = "deny", priority = -1 }` with a column of re-allows under it. Unlike the six
+# groups above, `pedantic` is not carried by `clippy::all`, so a group entry here would be a
+# behaviour change rather than a pin — and enough of its members are wrong for this tree that each
+# re-allow would read as a retreat rather than as a decision. `missing_panics_doc` cannot see five of
+# the eight production panic sites: they are `tokio::time::interval`'s zero-period panic, raised
+# inside tokio, so its scan of the caller's own body finds nothing to document.
+# `module_name_repetitions` describes `error::LoaderError` and every sibling that names its own
+# module — the naming that makes an error type legible at its use site in another crate.
+# `too_many_lines` prices a `pgoutput` decoder arm like a getter. The inverse holds too, which is
+# what makes this a selection rather than a subset: two lints the usual pedantic advice turns *off*
+# are denied further down on their own merits (`must_use_candidate`, `missing_errors_doc`). All five
+# are pedantic, outside `clippy::all`, so none needs a `priority`. The two members of the same
+# recommended set that stay out — `doc_markdown`, which is really a curated `doc-valid-idents`
+# allow-list, and `unused_self`, which `avoid-breaking-exported-api` narrows to the two binary
+# crates — are argued in docs/implementation/notes/rust-skills/lint-pedantic-selective.md.
+#
+# `unnested_or_patterns` had four sites: three copies of `Some("yaml") | Some("yml")` in the config
+# loaders, where repeating the constructor hid that the choice is between two extensions and not two
+# shapes, plus the widening table in crates/loader/src/ddl.rs. The tree's other or-patterns alternate
+# *distinct* variants of one enum, or bare char/OID ranges, which is the shape this lint leaves alone.
+unnested_or_patterns = "deny"
+# A leading underscore is a promise that a binding goes unread, so reading one makes the name a lie.
+# Zero sites: every `_`-prefixed binding here is an RAII guard (`_g`, `_guard`, `_permit`), a
+# discarded `write!` result, a compile-time assertion, or an ignored tuple slot or parameter.
+used_underscore_binding = "deny"
+# `x = x + s` reallocates where `x += s` appends in place, and reads as arithmetic besides. Zero
+# sites: every `a + b` in the tree is integer, `Instant`/`Duration` or float.
+string_add_assign = "deny"
+# A block whose tail expression yields `()` must say so with a semicolon, so that giving that call a
+# return value later is a compile error rather than a silent change of meaning. Its whole reach was
+# eight sites: the seven wrapped `tracing::trace!` arms of `consume::trace_message`, braced blocks
+# only because the macro call does not fit on the arm's own line, plus the `append_value` arm of
+# `push_geometric` in crates/pg-to-arrow/src/batch.rs. The lint sees only *multi-line* blocks whose
+# tail is neither `;`- nor `}`-terminated, so a one-line arm body is out of its reach by construction.
+semicolon_if_nothing_returned = "deny"
+# Glob imports hide where a name came from and let an upstream addition shadow a local one. Clippy
+# exempts the two spellings walrus leans on — `use super::*` inside a `#[cfg(test)]` module, 63 of
+# them, and `use proptest::prelude::*` — so the only site is the `pg_to_arrow::oids` forwarding shim,
+# which carries a scoped allow with a reason. Those exemptions are clippy's
+# `warn-on-all-wildcard-imports` default rather than anything stated here, so `clippy.toml` must keep
+# leaving that key unset: `true` would put all 64 of those imports in scope of this deny without the
+# manifest moving. crates/common/tests/workspace_lints_inherited.rs notices either way.
+wildcard_imports = "deny"
 # `manual_let_else` is pedantic (outside `clippy::all`), so no priority juggling is needed.
 manual_let_else = "deny"
 # This lint is pedantic (outside `clippy::all`), so no priority juggling is needed.

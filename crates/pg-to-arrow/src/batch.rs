@@ -781,7 +781,7 @@ fn append_geometric(
             let parsed = s.map(geo::parse_path).transpose()?;
             match &parsed {
                 Some((closed, _)) => {
-                    struct_field::<BooleanBuilder>(sb, 0, col)?.append_value(*closed)
+                    struct_field::<BooleanBuilder>(sb, 0, col)?.append_value(*closed);
                 }
                 None => struct_field::<BooleanBuilder>(sb, 0, col)?.append_null(),
             }

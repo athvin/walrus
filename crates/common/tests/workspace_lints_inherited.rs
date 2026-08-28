@@ -667,6 +667,94 @@ fn duplicate_crate_versions_are_still_owned_by_the_supply_chain_gate() {
     );
 }
 
+/// `clippy::pedantic` is the one group within this table's reach that is deliberately *not* pinned
+/// by name, and that absence is itself the policy. Its members are style opinions rather than
+/// degrees of wrongness, and enough of them are wrong here that the group spelling plus a column of
+/// re-allows would say less than a list of names does: `missing_panics_doc` cannot see five of the
+/// eight production panic sites, `module_name_repetitions` describes `error::LoaderError` and every
+/// sibling that names its own module, `too_many_lines` prices a decoder arm like a getter.
+///
+/// So the group entry must stay absent while the named members stay present — two halves of one
+/// decision, which is why they are asserted together. The list below is a slice of the pick rather
+/// than all of it: it covers every member whose only reason for being denied is the pick itself,
+/// plus the two the usual pedantic advice turns *off* — `must_use_candidate` and
+/// `missing_errors_doc`, denied here on their own recorded merits. The cast and float lints are
+/// pedantic too, and stay out of this list because PR 17.3 and PR 17.5 own them.
+#[test]
+fn the_workspace_lint_table_selects_pedantic_lints_by_name_never_as_a_group() {
+    let synthetic = "pedantic = { level = \"deny\", priority = -1 }\n";
+    assert_eq!(clippy_group_deny_count(synthetic, "pedantic"), 1);
+
+    let root_manifest = std::fs::read_to_string(repo_root().join("Cargo.toml")).unwrap();
+    let clippy = section(&root_manifest, "[workspace.lints.clippy]")
+        .expect("root manifest must define [workspace.lints.clippy]");
+
+    assert_eq!(clippy_group_deny_count(clippy, "pedantic"), 0);
+    assert_eq!(clippy_deny_count(clippy, "pedantic"), 0);
+    assert_eq!(clippy_allow_count(clippy, "pedantic"), 0);
+    for line in clippy.lines() {
+        assert!(
+            !line.trim_start().starts_with("pedantic"),
+            "the pedantic group is enabled one lint at a time; a group entry replaces that \
+             decision with a column of re-allows"
+        );
+    }
+
+    for lint in [
+        "linkedlist",
+        "redundant_closure_for_method_calls",
+        "match_wildcard_for_single_variants",
+        "manual_let_else",
+        "match_bool",
+        "must_use_candidate",
+        "return_self_not_must_use",
+        "ref_option",
+        "assigning_clones",
+        "trivially_copy_pass_by_ref",
+        "non_std_lazy_statics",
+        "inline_always",
+        "unnecessary_safety_doc",
+        "missing_errors_doc",
+        "implicit_clone",
+        "unnested_or_patterns",
+        "used_underscore_binding",
+        "string_add_assign",
+        "semicolon_if_nothing_returned",
+        "wildcard_imports",
+    ] {
+        assert_eq!(
+            clippy_deny_count(clippy, lint),
+            1,
+            "{lint} is part of the selective pedantic pick; it must stay pinned by name"
+        );
+    }
+}
+
+/// The wildcard-import deny rests on an exemption clippy grants rather than on anything the lint
+/// table states: `use super::*` inside a `#[cfg(test)]` module and `use x::prelude::*` are skipped
+/// while `warn-on-all-wildcard-imports` keeps its default of `false`. 63 `*_test.rs` siblings here
+/// take the first spelling and `lsn_test.rs` takes the second, so stating that one key as `true`
+/// would put all 64 in scope of a deny from `clippy.toml`, with the manifest untouched.
+///
+/// That leaves exactly one site, and it is the case a glob is for: a module whose whole body
+/// forwards another crate's namespace under this crate's path.
+#[test]
+fn the_wildcard_import_deny_rests_on_clippys_own_carve_outs() {
+    const OIDS: &str = include_str!("../../pg-to-arrow/src/oids.rs");
+
+    assert_eq!(OIDS.matches("clippy::wildcard_imports").count(), 1);
+    assert!(OIDS.contains("reason = \"forwarding shim"));
+
+    let cfg = std::fs::read_to_string(repo_root().join("clippy.toml")).unwrap();
+    for line in cfg.lines() {
+        assert!(
+            !line.trim_start().starts_with("warn-on-all-wildcard-imports"),
+            "clippy.toml sets warn-on-all-wildcard-imports; that widens the deny to every test \
+             module's `use super::*`"
+        );
+    }
+}
+
 #[test]
 fn the_workspace_lint_table_denies_redundant_method_closures() {
     let root_manifest = std::fs::read_to_string(repo_root().join("Cargo.toml")).unwrap();
