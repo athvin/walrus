@@ -91,7 +91,7 @@ async fn seed(pool: &sqlx::PgPool, epoch: EpochNo) {
             epoch,
             slot_name: "walrus_slot".into(),
             created_lsn: "0/0".parse().unwrap(),
-            status: "streaming".into(),
+            status: control::ReplicationStatus::Streaming,
         },
     )
     .await

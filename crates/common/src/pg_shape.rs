@@ -13,10 +13,12 @@ use crate::Error;
 
 /// Postgres `relreplident` — governs which old-image columns Update/Delete carry (proto §6).
 ///
-/// The pgoutput byte parsed below and this enum's serde string are distinct wire forms. The serde
-/// form is a persisted control-plane contract inside `schema_registry.columns`. Rows written
-/// before the lowercase form was introduced contain PascalCase names, so the per-variant aliases
-/// are permanent compatibility for those historical rows; no data migration is needed.
+/// The pgoutput byte parsed below — which the catalog's `relreplident::text` cast shares, through
+/// the [`FromStr`](std::str::FromStr) that delegates to it — and this enum's serde string are
+/// distinct wire forms. The serde form is a persisted control-plane contract inside
+/// `schema_registry.columns`. Rows written before the lowercase form was introduced contain
+/// PascalCase names, so the per-variant aliases are permanent compatibility for those historical
+/// rows; no data migration is needed.
 ///
 /// Roll out readers before writers: deploy `walrus-loader` before `walrus-pg-sink`. The upgraded
 /// reader accepts both spellings, while an old reader cannot parse newly written lowercase names.
@@ -57,6 +59,27 @@ impl TryFrom<u8> for ReplicaIdentity {
                 "unknown relreplident byte {:?}",
                 char::from(other)
             ))),
+        }
+    }
+}
+
+impl std::str::FromStr for ReplicaIdentity {
+    type Err = crate::Error;
+
+    /// Parse the catalog code as `relreplident::text` renders it — one character, from the same
+    /// vocabulary the `TryFrom<u8>` above owns and which this delegates to, so a catalog read and
+    /// a Relation message can never drift into two tables. Deliberately **not** the serde word
+    /// form: `"d"` parses here, `"default"` does not.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Internal`] unless `s` is exactly one of `"d"`, `"n"`, `"f"`, or `"i"`. A
+    /// longer string is not a catalog code at all, so it is rejected before the byte table is
+    /// consulted.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.as_bytes() {
+            [code] => Self::try_from(*code),
+            _ => Err(Error::Internal(format!("unknown relreplident text {s:?}"))),
         }
     }
 }

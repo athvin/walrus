@@ -1,9 +1,10 @@
 //! `string_enum!`: one variant table -> an enum plus its two-way `&'static str` mapping.
 //!
 //! walrus stores several closed sets as plain Postgres `text` (`file_manifest.kind`/`.status`,
-//! `table_reload.flavor`/`.status`). Each needs the same pair of impls, and hand-writing them means
-//! every legal string is typed twice — once in `as_str`, once in `FromStr` — so the two directions
-//! can drift. This macro makes the variant table the single source of both.
+//! `table_reload.flavor`/`.status`, `replication_state.status`). Each needs the same pair of impls,
+//! and hand-writing them means every legal string is typed twice — once in `as_str`, once in
+//! `FromStr` — so the two directions can drift. This macro makes the variant table the single
+//! source of both.
 //!
 //! Generated code reaches the typed constructor adapter through `common`'s crate-root
 //! `__private` namespace. That namespace is a macro implementation detail with no stability

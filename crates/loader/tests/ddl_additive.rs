@@ -453,7 +453,7 @@ async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
             epoch,
             slot_name: "walrus_slot".into(),
             created_lsn: "0/0".parse().unwrap(),
-            status: "streaming".into(),
+            status: control::ReplicationStatus::Streaming,
         },
     )
     .await

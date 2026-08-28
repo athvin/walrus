@@ -1,8 +1,28 @@
 //! `replication_state` models: the epoch generation that namespaces all control-plane state.
 
-use crate::ControlError;
+use crate::{ControlError, parse::ParseEnumError};
+use common::string_enum;
 use common::{EpochNo, Lsn};
 use sqlx::PgExecutor;
+
+string_enum! {
+    /// Where a generation stands — the canonical enum for the `status` text column.
+    ///
+    /// Alone among the control plane's text-column enums this one has **no** SQL `CHECK` behind it:
+    /// the vocabulary lives only in the migration's trailing comment, so this variant table is the
+    /// only thing standing between a typo and a generation row nothing can classify. Every
+    /// generation the sink opens is born `Streaming` — first bootstrap and total-restart alike take
+    /// that one path (§1.8) — so `Bootstrapping` and `TotalRestart` are names the contract reserves
+    /// and no production writer has claimed yet.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ReplicationStatus {
+        error = ParseEnumError;
+        column = "replication_state.status";
+        Bootstrapping => "bootstrapping",
+        Streaming => "streaming",
+        TotalRestart => "total_restart",
+    }
+}
 
 /// One row per slot lifetime; a new slot = a new epoch (architecture §1.8). The `epoch` namespaces
 /// **all** other state (manifest, checkpoints, registry).
@@ -12,24 +32,36 @@ pub struct ReplicationState {
     pub slot_name: String,
     /// The consistent snapshot LSN at slot creation.
     pub created_lsn: Lsn,
-    /// `bootstrapping` | `streaming` | `total_restart`.
-    pub status: String,
+    pub status: ReplicationStatus,
 }
 
 /// The highest-epoch (current) generation, if bootstrap has run.
 ///
 /// # Errors
 ///
-/// Returns [`ControlError::Connect`] if the current generation cannot be queried or decoded.
+/// Returns [`ControlError::Connect`] if the current generation cannot be queried, or
+/// [`ControlError::Decode`] if the stored status is outside the enum's set.
 pub async fn read_current_epoch(
     ex: impl PgExecutor<'_>,
 ) -> Result<Option<ReplicationState>, ControlError> {
-    Ok(sqlx::query_file_as!(
-        ReplicationState,
-        "sql/postgres/queries/read_current_epoch.sql",
-    )
-    .fetch_optional(ex)
-    .await?)
+    // The `status` text column decodes to `String` here, then parses into the typed enum — the same
+    // shape as `manifest::claim_ready`, and for the same two reasons: a value outside the known set
+    // is a data-integrity bug (the sink only ever writes `as_str()`) that belongs in the terminal
+    // `Decode`, and the SQL text is unchanged, so the committed `.sqlx` offline cache stays valid
+    // without a regenerate.
+    let current = sqlx::query_file!("sql/postgres/queries/read_current_epoch.sql")
+        .fetch_optional(ex)
+        .await?;
+    let Some(current) = current else {
+        return Ok(None);
+    };
+    let state = ReplicationState {
+        epoch: current.epoch.into(),
+        slot_name: current.slot_name,
+        created_lsn: current.created_lsn,
+        status: current.status.parse()?,
+    };
+    Ok(Some(state))
 }
 
 /// Insert a new generation row (a new slot). Epoch bump / total-restart lands in PR 4.6.
@@ -47,7 +79,7 @@ pub async fn insert_epoch(
         s.epoch.0,
         s.slot_name,
         s.created_lsn as Lsn,
-        s.status,
+        s.status.as_str(),
     )
     .execute(ex)
     .await?;
@@ -69,15 +101,19 @@ pub async fn bump_epoch(
     ex: impl PgExecutor<'_>,
     slot_name: &str,
     created_lsn: Lsn,
-    status: &str,
+    status: ReplicationStatus,
 ) -> Result<EpochNo, ControlError> {
     let rec = sqlx::query_file!(
         "sql/postgres/queries/bump_epoch.sql",
         slot_name,
         created_lsn as Lsn,
-        status,
+        status.as_str(),
     )
     .fetch_one(ex)
     .await?;
     Ok(EpochNo(rec.epoch))
 }
+
+#[cfg(test)]
+#[path = "replication_state_test.rs"]
+mod tests;

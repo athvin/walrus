@@ -35,7 +35,9 @@ pub use parse::ParseEnumError;
 // several of their names (`renew_lease`, `complete`, `get`) would collide with or read vaguer
 // than the flat exports above. Only the types go flat.
 pub use reload::{ReloadFlavor, ReloadRow, ReloadStatus};
-pub use replication_state::{ReplicationState, bump_epoch, insert_epoch, read_current_epoch};
+pub use replication_state::{
+    ReplicationState, ReplicationStatus, bump_epoch, insert_epoch, read_current_epoch,
+};
 pub use schema_registry::{
     RegistryRow, read_all_latest_registry, read_latest_version, read_registry, upsert_registry,
 };

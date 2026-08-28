@@ -1,7 +1,8 @@
 //! Typed rejections for control-plane text-column enums.
 //!
 //! `file_manifest.kind`/`.status` and `table_reload.flavor`/`.status` are text columns with SQL
-//! `CHECK` constraints; their Rust enums are the second line of defence. A value outside the known
+//! `CHECK` constraints; their Rust enums are the second line of defence. `replication_state.status`
+//! has no CHECK, so there the enum is the *only* line. Either way a value outside the known
 //! vocabulary is a data-integrity bug, so the exact rejected text is preserved as data.
 
 /// A control-plane enum rejected a text value read from the database.

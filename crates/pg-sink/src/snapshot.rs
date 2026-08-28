@@ -460,12 +460,14 @@ pub async fn describe_source_relation(
             .with_context(|| format!("describe {schema}.{table}: relation OID"))?,
         schema: schema.to_string(),
         name: table.to_string(),
-        replica_identity: match relreplident.as_str() {
-            "f" => ReplicaIdentity::Full,
-            "n" => ReplicaIdentity::Nothing,
-            "i" => ReplicaIdentity::Index,
-            _ => ReplicaIdentity::Default,
-        },
+        // Parsed through the shared one-character table rather than matched as raw text a second
+        // time, so this path and a Relation message's byte can never disagree — and an
+        // unrecognised code is the invalid-`relreplident` error this function already documents,
+        // not a silent `Default` that would quietly change which old-image columns the loader
+        // expects.
+        replica_identity: relreplident
+            .parse::<ReplicaIdentity>()
+            .with_context(|| format!("describe {schema}.{table}: replica identity"))?,
         columns,
     })
 }

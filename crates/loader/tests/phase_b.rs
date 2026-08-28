@@ -116,7 +116,7 @@ async fn setup(epoch: EpochNo) -> (TableCtx, tempfile::TempDir) {
             epoch,
             slot_name: "walrus_slot".into(),
             created_lsn: "0/0".parse().unwrap(),
-            status: "streaming".into(),
+            status: control::ReplicationStatus::Streaming,
         },
     )
     .await

@@ -306,7 +306,7 @@ async fn establish_stream(
         &ctx.control_pool,
         slot.as_str(),
         snapshot.consistent_point,
-        "streaming",
+        control::ReplicationStatus::Streaming,
     )
     .await
     .context("open new epoch")?;
@@ -397,7 +397,7 @@ async fn current_or_new_epoch(
         epoch: 1_i64.into(),
         slot_name: slot_name.to_string(),
         created_lsn,
-        status: "streaming".to_string(),
+        status: control::ReplicationStatus::Streaming,
     };
     control::insert_epoch(pool, &state)
         .await

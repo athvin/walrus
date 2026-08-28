@@ -11,8 +11,8 @@
 
 use common::{EpochNo, FailureClass, Lsn};
 use control::{
-    ControlError, ReplicationState, advance_raw_appended, advance_transformed, connect,
-    ensure_checkpoint, insert_epoch, read_checkpoint, read_current_epoch, run_migrations,
+    ControlError, ReplicationState, ReplicationStatus, advance_raw_appended, advance_transformed,
+    connect, ensure_checkpoint, insert_epoch, read_checkpoint, read_current_epoch, run_migrations,
 };
 use sqlx::postgres::PgPool;
 
@@ -128,7 +128,7 @@ async fn read_current_epoch_returns_highest_generation() {
             epoch: EpochNo(700_010),
             slot_name: "walrus_slot".to_string(),
             created_lsn: lsn("0/10"),
-            status: "bootstrapping".to_string(),
+            status: ReplicationStatus::Bootstrapping,
         },
     )
     .await
@@ -139,7 +139,7 @@ async fn read_current_epoch_returns_highest_generation() {
             epoch: EpochNo(700_011),
             slot_name: "walrus_slot".to_string(),
             created_lsn: lsn("0/20"),
-            status: "streaming".to_string(),
+            status: ReplicationStatus::Streaming,
         },
     )
     .await
@@ -151,7 +151,7 @@ async fn read_current_epoch_returns_highest_generation() {
         EpochNo(700_011),
         "highest epoch is the current generation"
     );
-    assert_eq!(current.status, "streaming");
+    assert_eq!(current.status, ReplicationStatus::Streaming);
     assert_eq!(current.created_lsn, lsn("0/20"));
 
     tx.rollback().await.unwrap();

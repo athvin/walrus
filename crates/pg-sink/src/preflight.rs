@@ -16,6 +16,7 @@
 //! `version()`.
 
 use crate::config::SinkConfig;
+use common::ReplicaIdentity;
 use common::sql::{SqlIdent, SqlStrExt};
 use std::collections::HashSet;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
@@ -383,12 +384,13 @@ impl<'a> SourcePreflight<'a> {
             let relreplident = row.get("relreplident").unwrap_or_default();
             // `boolean::text` renders as "true"/"false" (not "t"/"f") over the simple protocol.
             let has_pk = row.get("has_pk") == Some("true");
-            // 'd' (default) needs a PK; 'f'/'i' carry a full/index identity; 'n' (nothing) never.
-            let usable = match relreplident {
-                "n" => false,
-                "d" => has_pk,
-                _ => true,
-            };
+            // The catalog code is parsed into the shared enum rather than matched as raw text, so
+            // `identity_is_usable` can be exhaustive. A code outside the catalog's four cannot
+            // occur for a real `pg_class` row, and a gate that cannot classify a table's identity
+            // must quarantine it rather than wave it through.
+            let usable = relreplident
+                .parse::<ReplicaIdentity>()
+                .is_ok_and(|identity| identity_is_usable(identity, has_pk));
             let id = TableId { schema, table };
             if usable {
                 report.ok.push(id);
@@ -486,6 +488,21 @@ impl<'a> SourcePreflight<'a> {
             }
         }
         Ok(set)
+    }
+}
+
+/// Can a published table's replica identity source a key? `DEFAULT` supplies one only with a
+/// PRIMARY KEY; `FULL` and `INDEX` carry their own old image; `NOTHING` never carries one.
+///
+/// Exhaustive (no `_` arm) for the same reason the `From<PreflightError>` conversion above is:
+/// which identities the sink can decode is data, never a guess, so a new [`ReplicaIdentity`]
+/// variant must be classified here instead of silently inheriting "usable".
+#[deny(clippy::wildcard_enum_match_arm)]
+const fn identity_is_usable(identity: ReplicaIdentity, has_pk: bool) -> bool {
+    match identity {
+        ReplicaIdentity::Default => has_pk,
+        ReplicaIdentity::Full | ReplicaIdentity::Index => true,
+        ReplicaIdentity::Nothing => false,
     }
 }
 

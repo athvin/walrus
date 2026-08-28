@@ -288,7 +288,7 @@ async fn lossy_cast_failure_quarantines_the_table_and_alerts() {
             epoch,
             slot_name: "walrus_slot".into(),
             created_lsn: "0/0".parse().unwrap(),
-            status: "streaming".into(),
+            status: control::ReplicationStatus::Streaming,
         },
     )
     .await

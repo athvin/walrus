@@ -58,6 +58,20 @@ fn quoting_doubles_delimiters_and_rejects_unusable_idents() {
 }
 
 #[test]
+fn only_a_keyless_default_identity_is_unusable() {
+    // `DEFAULT` is the one identity whose usability depends on the PK; the other three answer on
+    // their own, so `has_pk` must not change their verdict.
+    assert!(identity_is_usable(ReplicaIdentity::Default, true));
+    assert!(!identity_is_usable(ReplicaIdentity::Default, false));
+
+    for has_pk in [true, false] {
+        assert!(identity_is_usable(ReplicaIdentity::Full, has_pk));
+        assert!(identity_is_usable(ReplicaIdentity::Index, has_pk));
+        assert!(!identity_is_usable(ReplicaIdentity::Nothing, has_pk));
+    }
+}
+
+#[test]
 fn gap_and_signal_errors_name_their_remediation() {
     // An operator reading the crash log must be able to copy-paste the fix (reload H11).
     let gap = PreflightError::PublicationGap {

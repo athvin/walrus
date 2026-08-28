@@ -28,6 +28,25 @@ fn replica_identity_try_from_char() {
 }
 
 #[test]
+fn replica_identity_parses_the_catalog_cast_not_the_serde_word() {
+    // `relreplident::text` is the byte above in its catalog-cast form, so both readers agree.
+    for (text, expected) in [
+        ("d", ReplicaIdentity::Default),
+        ("n", ReplicaIdentity::Nothing),
+        ("f", ReplicaIdentity::Full),
+        ("i", ReplicaIdentity::Index),
+    ] {
+        assert_eq!(text.parse::<ReplicaIdentity>().unwrap(), expected);
+    }
+
+    // The persisted word form is a different wire form and must not sneak in through this door.
+    assert!("default".parse::<ReplicaIdentity>().is_err());
+    assert!("".parse::<ReplicaIdentity>().is_err());
+    assert!("dd".parse::<ReplicaIdentity>().is_err());
+    assert!("x".parse::<ReplicaIdentity>().is_err());
+}
+
+#[test]
 fn replica_identity_wire_form_is_lowercase_and_accepts_legacy() {
     let cases = [
         (ReplicaIdentity::Default, "\"default\"", "\"Default\""),
