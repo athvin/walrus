@@ -1,4 +1,5 @@
 use super::*;
+use object_store::local::LocalFileSystem;
 
 fn sink() -> ParquetSink {
     ParquetSink::new(
@@ -46,4 +47,33 @@ fn a_parquet_failure_converts_into_the_encode_class() {
 
     assert!(matches!(&error, SinkError::Encode(_)));
     assert_eq!(error.to_string(), format!("parquet encode: {rendered}"));
+}
+
+/// The store is a **trait** dependency (`Arc<dyn ObjectStore>`), so the failure branch is reachable
+/// by injecting a *different real implementation of that trait* instead of standing up a broken S3:
+/// `LocalFileSystem` answers `NotFound` for a key nothing ever wrote. The `InMemory` fixture above
+/// cannot play this part — its `delete` is remove-or-ignore and always returns `Ok` — which is what
+/// the trait seam buys that a concrete client would not.
+///
+/// Nothing is created, so nothing is cleaned up: the epoch-namespaced key carries a fresh uuid and
+/// the store only ever tries (and fails) to remove it.
+///
+/// What this pins is the classification, not the transport. `ParquetSink::delete` is the best-effort
+/// cleanup for an aborted streamed txn's speculative files (PR 2.30), and "best-effort" must mean
+/// *reported*, never *swallowed*: a store refusal stays `SinkError::Store` →
+/// `common::Error::ObjectStore` — the transient class — and is never folded into the terminal
+/// `Encode` side asserted above.
+#[tokio::test]
+async fn a_store_failure_propagates_as_the_transient_store_class() {
+    let store = LocalFileSystem::new_with_prefix(std::env::temp_dir())
+        .expect("the system temp dir is an existing directory");
+    let sink = ParquetSink::new(Arc::new(store), "walrus", common::EpochNo(5));
+    let file_id = uuid::Uuid::new_v4().to_string();
+    let absent = sink.object_key("public", "orders", "0/2A0".parse().unwrap(), &file_id);
+
+    let error = sink.delete(&absent).await.unwrap_err();
+
+    assert!(matches!(&error, SinkError::Store(_)));
+    let classified = common::Error::from(error);
+    assert!(matches!(classified, common::Error::ObjectStore(_)));
 }
