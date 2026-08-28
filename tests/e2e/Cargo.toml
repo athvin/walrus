@@ -17,8 +17,8 @@ it = []
 workspace = true
 
 [dependencies]
-common = { path = "../../crates/common", features = ["sqlx"] }
-control = { path = "../../crates/control" }
+common = { workspace = true, features = ["sqlx"] }
+control = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", "time", "net"] }
 sqlx = { workspace = true, features = ["runtime-tokio", "tls-rustls", "postgres"] }
 duckdb = { workspace = true, features = ["bundled"] }

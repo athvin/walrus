@@ -17,8 +17,8 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-common = { path = "../common" }
-control = { path = "../control" }
+common = { workspace = true }
+control = { workspace = true }
 sqlx = { workspace = true, features = ["runtime-tokio", "tls-rustls", "postgres"] }
 # The loader materialises Parquet into DuckDB; `bundled` compiles DuckDB from source (cached in CI).
 duckdb = { workspace = true, features = ["bundled"] }
@@ -44,7 +44,7 @@ tokio = { workspace = true, features = ["io-util"] }
 # Micro-benches (PR 5.5): transform scaling / TOAST back-scan / Phase-A append against in-memory DuckDB.
 criterion = { workspace = true }
 # The append bench generates a local Parquet fixture with the sink's own writer (Arrow → Parquet).
-pg-to-arrow = { path = "../pg-to-arrow" }
+pg-to-arrow = { workspace = true }
 # RAII scratch fixtures: the bench's Parquet file and every test that needs a real `.duckdb` file.
 # The guard deletes the directory on drop, so a panicking assertion cannot leak it.
 tempfile = { workspace = true }

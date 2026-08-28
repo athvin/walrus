@@ -186,6 +186,16 @@ multiple_bound_locations = "deny"
 self_named_module_files = "deny"
 
 [workspace.dependencies]
+# Internal crates, centralised for the reason the third-party pins below are: `common` was spelled
+# out in five member manifests, in two different relative forms (`../common` from a `crates/*`
+# member, `../../crates/common` from `tests/e2e`), so moving a crate meant finding all of them. A
+# path here is resolved against the workspace root, so each internal crate has exactly one spelling
+# and each member states only the edge — plus any feature it needs on top. `loader`, `pg-sink` and
+# `e2e` are deliberately absent: nothing depends on them, so they have no edge to centralise.
+common = { path = "crates/common" }
+control = { path = "crates/control" }
+pg-to-arrow = { path = "crates/pg-to-arrow" }
+
 # Shared version pins land here as later PRs add deps (tracing, sqlx, arrow, …).
 thiserror = "2"
 serde = "1"
