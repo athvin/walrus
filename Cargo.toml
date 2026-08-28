@@ -6,6 +6,10 @@ members = ["crates/common", "crates/control", "crates/loader", "crates/pg-sink",
 edition = "2024" # if-let chains require edition 2024 + Rust 1.88; walrus pins 1.95.0.
 license = "MIT"
 rust-version = "1.95" # MSRV — keep in sync with rust-toolchain.toml; CI `msrv` job fails on drift (PR 4.7)
+# That job reads this line alone, so per-member inheritance is a separate guard: every member takes
+# its floor from here with `rust-version.workspace = true`; one that states its own — or omits the
+# key, leaving Cargo no MSRV to check — fails crates/common/tests/msrv_inherited.rs.
+
 # walrus ships two container images, not registry packages: `common`, `control` and `loader` name
 # deployment roles, not crates.io identities. That is why no member carries the metadata a published
 # crate owes its readers (description, repository, keywords, categories) — and this key is what makes
