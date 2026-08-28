@@ -135,7 +135,7 @@ pub async fn connect_source(url: &str) -> Result<Client, common::Error> {
     // Drive the connection in the background; it lives as long as `client` is held.
     tokio::spawn(async move {
         if let Err(e) = connection.await {
-            tracing::warn!("source connection closed: {e}");
+            tracing::warn!(error = %e, "source connection closed");
         }
     });
     Ok(client)

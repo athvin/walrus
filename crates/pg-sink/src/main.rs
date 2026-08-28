@@ -40,7 +40,7 @@ fn main() -> ExitCode {
         .worker_threads(common::runtime::resolve_worker_threads(cfg.worker_threads))
         .max_blocking_threads(common::runtime::MAX_BLOCKING_THREADS)
         .build()
-        .inspect_err(|e| tracing::error!("failed to build tokio runtime: {e}"))
+        .inspect_err(|e| tracing::error!(error = %e, "failed to build tokio runtime"))
     else {
         return common::ExitCode::Internal.into();
     };
@@ -48,7 +48,7 @@ fn main() -> ExitCode {
     match runtime.block_on(run(cfg)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            tracing::error!("walrus-pg-sink exiting: {e:#}");
+            tracing::error!(error = %format_args!("{e:#}"), "walrus-pg-sink exiting");
             pg_sink::exit::code_for(&e).into()
         }
     }

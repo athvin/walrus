@@ -200,11 +200,20 @@ where
             Err(e) => {
                 let now = Instant::now();
                 if now >= deadline {
-                    tracing::error!("{what} still unavailable at startup deadline: {e}");
+                    tracing::error!(
+                        dependency = what,
+                        error = %e,
+                        "dependency still unavailable at the startup deadline"
+                    );
                     return Err(e);
                 }
                 let wait = backoff.min(deadline.saturating_duration_since(now));
-                tracing::warn!("{what} unavailable (transient), retrying in {wait:?}: {e}");
+                tracing::warn!(
+                    dependency = what,
+                    retry_in = ?wait,
+                    error = %e,
+                    "dependency unavailable (transient); retrying"
+                );
                 tokio::time::sleep(wait).await;
                 backoff = next_backoff(backoff);
             }

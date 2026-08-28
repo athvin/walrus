@@ -118,7 +118,7 @@ pub fn install_signal_handlers() -> CancellationToken {
         let mut sigterm = match signal(SignalKind::terminate()) {
             Ok(s) => s,
             Err(e) => {
-                tracing::error!("failed to install SIGTERM handler: {e}");
+                tracing::error!(error = %e, "failed to install SIGTERM handler");
                 child.cancel();
                 return;
             }
@@ -126,7 +126,7 @@ pub fn install_signal_handlers() -> CancellationToken {
         let mut sigint = match signal(SignalKind::interrupt()) {
             Ok(s) => s,
             Err(e) => {
-                tracing::error!("failed to install SIGINT handler: {e}");
+                tracing::error!(error = %e, "failed to install SIGINT handler");
                 child.cancel();
                 return;
             }

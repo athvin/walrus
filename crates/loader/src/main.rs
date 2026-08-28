@@ -56,14 +56,14 @@ fn main() -> ExitCode {
     {
         Ok(rt) => rt,
         Err(e) => {
-            tracing::error!("failed to build tokio runtime: {e}");
+            tracing::error!(error = %e, "failed to build tokio runtime");
             return common::ExitCode::Internal.into();
         }
     };
     match runtime.block_on(run(cfg)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            tracing::error!("walrus-loader exiting: {e}");
+            tracing::error!(error = %e, "walrus-loader exiting");
             e.exit_code().into()
         }
     }
