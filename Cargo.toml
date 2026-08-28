@@ -104,6 +104,14 @@ undocumented_unsafe_blocks = "deny"
 # Keep each unsafe block to one auditable invariant. This is another restriction lint outside
 # `clippy::all`, so it needs no group-vs-lint priority.
 multiple_unsafe_ops_per_block = "deny"
+# The caller-facing half of that family: an `unsafe fn` must publish, in a `# Safety` section, the
+# obligations its callers take on. This one is a style lint, so `all = "deny"` above carries it
+# already; name it anyway — as `ptr_arg` is named — so it survives a regrouping of `clippy::all`.
+missing_safety_doc = "deny"
+# Its inverse, and the only member of this family with live reach while the rustc forbid above
+# holds: any `# Safety` heading this tree could grow would sit on a *safe* item, promising callers
+# an obligation they do not owe. Pedantic, outside `clippy::all`, so it needs no priority either.
+unnecessary_safety_doc = "deny"
 # A suppression must say why. This restriction lint is outside `clippy::all`, so no priority is needed.
 allow_attributes_without_reason = "deny"
 # Promoting exactly this pedantic lint keeps every fallible public API's contract explicit.

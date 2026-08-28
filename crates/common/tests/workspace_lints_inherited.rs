@@ -116,6 +116,12 @@ fn member_inherits_lints(manifest: &str) -> bool {
     section(manifest, "[lints]").is_some_and(|body| body.contains("workspace = true"))
 }
 
+/// How many entries in a lint-table body pin `lint` at `deny`, whatever their indentation.
+fn clippy_deny_count(table: &str, lint: &str) -> usize {
+    let entry = format!(r#"{lint} = "deny""#);
+    table.lines().filter(|line| line.trim() == entry).count()
+}
+
 #[test]
 fn every_member_opts_into_the_workspace_lint_table() {
     let wrapped_members = r#"[workspace]
@@ -225,6 +231,30 @@ fn the_workspace_lint_table_still_denies_bare_export_attributes() {
         1,
         "workspace policy must reject bare `#[no_mangle]`-family attributes exactly once"
     );
+}
+
+/// Both directions of the `# Safety` section. The workspace forbid means walrus authors no
+/// `unsafe fn`, so the caller-obligation lint is belt-and-braces like its siblings above: it is
+/// what still demands the section if a member ever stops inheriting that forbid, and it reaches
+/// the tree today only through the `clippy::all` group. Its inverse is the half with live reach —
+/// while the forbid holds, every `# Safety` heading this tree could grow sits on a *safe* item,
+/// promising callers an obligation the compiler never imposes.
+#[test]
+fn the_workspace_lint_table_still_polices_safety_doc_sections() {
+    let synthetic = "missing_safety_doc = \"allow\"\n  unnecessary_safety_doc = \"deny\"\n";
+    assert_eq!(clippy_deny_count(synthetic, "missing_safety_doc"), 0);
+    assert_eq!(clippy_deny_count(synthetic, "unnecessary_safety_doc"), 1);
+
+    let root_manifest = std::fs::read_to_string(repo_root().join("Cargo.toml")).unwrap();
+    let clippy = section(&root_manifest, "[workspace.lints.clippy]")
+        .expect("root manifest must define [workspace.lints.clippy]");
+    for lint in ["missing_safety_doc", "unnecessary_safety_doc"] {
+        assert_eq!(
+            clippy_deny_count(clippy, lint),
+            1,
+            "workspace policy must pin {lint} = \"deny\" exactly once"
+        );
+    }
 }
 
 #[test]
