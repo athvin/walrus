@@ -1,11 +1,11 @@
-// Every serde-carrying enum in the workspace lives in `common` and has a bare-scalar JSON form.
-// `Op`, `Kind`, and `ReplicaIdentity` use serde's default external enum representation; `Tier` uses
-// numeric `into`/`try_from` conversion. Each expected value comes from an exhaustive match with no
-// `_` arm, making a new variant or payload a compile error before it can change the wire format.
-//
-// Because every variant is a unit variant, all four of serde's tagging strategies would produce a
-// *different* document, and only the default one produces the scalar the persisted contracts use.
-// The source guard at the bottom of the file is what keeps a later attribute from switching it.
+//! Every serde-carrying enum in the workspace lives in `common` and has a bare-scalar JSON form.
+//! `Op`, `Kind`, and `ReplicaIdentity` use serde's default external enum representation; `Tier` uses
+//! numeric `into`/`try_from` conversion. Each expected value comes from an exhaustive match with no
+//! `_` arm, making a new variant or payload a compile error before it can change the wire format.
+//!
+//! Because every variant is a unit variant, all four of serde's tagging strategies would produce a
+//! *different* document, and only the default one produces the scalar the persisted contracts use.
+//! The source guard at the bottom of the file is what keeps a later attribute from switching it.
 
 use common::{Kind, Op, ReplicaIdentity, Tier};
 use serde::{Serialize, de::DeserializeOwned};

@@ -1,5 +1,3 @@
-// The loader runs one worker per `.duckdb` file on a `LocalSet`. `TableDb` is Send + !Sync, so a
-// future holding `&TableCtx` or `&TableDb` across an await is intentionally !Send (see duck.rs).
 #![cfg_attr(
     test,
     allow(
@@ -16,6 +14,13 @@
 //! files (`<table>` mirror + `<table>_raw` CDC log). This PR is the first vertical slice: the ordered
 //! fail-fast [`bootstrap`] that proves exclusive ownership (control-plane [`lease`] + DuckDB file lock)
 //! and stands up [`health`] — no manifest file is claimed yet (that is PR 3.2).
+//!
+//! # Concurrency
+//!
+//! One apply worker per `.duckdb` file, all on a single `LocalSet`. [`duck`]'s `TableDb` is
+//! `Send + !Sync`, so a future holding `&TableCtx` or `&TableDb` across an await is intentionally
+//! `!Send` and cannot be handed to `tokio::spawn` — which is what the crate-level
+//! `clippy::future_not_send` allow above records for Clippy.
 
 pub mod apply_loop;
 pub mod bootstrap;

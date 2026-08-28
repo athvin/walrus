@@ -1,3 +1,12 @@
+//! Guard for `pat-if-let-chains`: the workspace keeps the edition that makes `let` chains legal,
+//! and the four audited nests stay flattened into them.
+//!
+//! Neither half has a lint behind it. A nested `if let A = x { if let B = y { … } }` compiles
+//! forever, and an edition downgrade would surface as a syntax error somewhere far from the
+//! manifest that caused it. So both are asserted as source text: the workspace manifest pins
+//! edition 2024 with the `rust-version` that ships the feature, and each rewritten site still
+//! reads as `&& let`.
+
 const ROOT: &str = include_str!("../../../Cargo.toml");
 const CONTROL_DB: &str = include_str!("../../control/src/db.rs");
 const SINK_CONSUME: &str = include_str!("../../pg-sink/src/consume.rs");
