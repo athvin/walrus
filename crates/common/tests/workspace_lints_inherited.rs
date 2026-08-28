@@ -321,6 +321,73 @@ fn the_style_group_carries_exactly_two_scoped_allows() {
     assert!(LSN_TEST.contains("reason = \"exercise the explicit borrowed Sub impl\""));
 }
 
+/// `clippy::complexity` is the fourth group pinned by name, and the first that is not another rung
+/// on the correctness → suspicious → style ladder: its lints — `needless_match`, `useless_format`,
+/// `unnecessary_cast`, `clone_on_copy`, `filter_next` — flag code that is correct and idiomatic
+/// but takes the long way round. Like all three siblings, the entry costs no diagnostic today,
+/// because `clippy::all` carries the group.
+///
+/// The priority half is what differs. Suspicious and style each have members named below at the
+/// default priority, so the group demonstrably has to sit under them; complexity has none — and
+/// still needs `priority = -1`, because `clippy::lint_groups_priority` compares a group against
+/// every named lint in the table rather than only the ones it carries. That is the half a later
+/// edit is likeliest to talk itself out of, so assert it directly.
+#[test]
+fn the_workspace_lint_table_still_denies_the_complexity_group() {
+    let synthetic = "complexity = \"deny\"\n";
+    assert_eq!(clippy_group_deny_count(synthetic, "complexity"), 0);
+    assert_eq!(clippy_deny_count(synthetic, "complexity"), 1);
+
+    let root_manifest = std::fs::read_to_string(repo_root().join("Cargo.toml")).unwrap();
+    let clippy = section(&root_manifest, "[workspace.lints.clippy]")
+        .expect("root manifest must define [workspace.lints.clippy]");
+    assert_eq!(
+        clippy_group_deny_count(clippy, "complexity"),
+        1,
+        "workspace policy must pin the complexity group at deny with priority = -1"
+    );
+    assert_eq!(
+        clippy_deny_count(clippy, "complexity"),
+        0,
+        "a priority-less `complexity = \"deny\"` collides with the named lints below it"
+    );
+}
+
+/// The one complexity-group suppression in the tree. `too_many_arguments` fires above seven
+/// parameters, and the fixture it sits on takes one for every raw-row field it seeds, on purpose:
+/// the parameter struct that would silence the lint has to be built and destructured at each of its
+/// call sites, which is the boilerplate the fixture exists to remove.
+/// `allow_attributes_without_reason` already forces the `reason`; what this pins is the count, so
+/// that a second complexity suppression is a policy decision taken here rather than in a source
+/// file.
+#[test]
+fn the_complexity_group_carries_exactly_one_scoped_allow() {
+    const TRANSFORM: &str = include_str!("../../loader/tests/transform.rs");
+
+    assert_eq!(TRANSFORM.matches("clippy::too_many_arguments").count(), 1);
+    assert!(TRANSFORM.contains("reason = \"test fixture seeds every raw-row field explicitly\""));
+}
+
+/// The complexity group's two configurable members. `too_many_arguments` and `type_complexity` read
+/// their limits from `clippy.toml` rather than from the lint table, so raising either threshold
+/// silences the lint with the group's deny still in place and nothing in the manifest moved. walrus
+/// states neither key; the one threshold it does state, `enum-variant-size-threshold`, *lowers* a
+/// limit rather than raising one, and belongs to a perf lint besides.
+#[test]
+fn the_clippy_config_does_not_raise_a_complexity_threshold() {
+    let cfg = std::fs::read_to_string(repo_root().join("clippy.toml")).unwrap();
+    assert!(
+        cfg.contains("enum-variant-size-threshold"),
+        "the clippy.toml scan must not be vacuous"
+    );
+    for key in ["too-many-arguments-threshold", "type-complexity-threshold"] {
+        assert!(
+            !cfg.lines().any(|line| line.trim_start().starts_with(key)),
+            "clippy.toml sets {key}, which can only weaken the denied complexity group"
+        );
+    }
+}
+
 #[test]
 fn the_workspace_lint_table_denies_redundant_method_closures() {
     let root_manifest = std::fs::read_to_string(repo_root().join("Cargo.toml")).unwrap();

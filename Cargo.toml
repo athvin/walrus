@@ -78,6 +78,21 @@ suspicious = { level = "deny", priority = -1 }
 # warn for the reason `suspicious` gives. crates/common/tests/workspace_lints_inherited.rs notices
 # if this entry drifts.
 style = { level = "deny", priority = -1 }
+# `clippy::complexity` steps off that ladder rather than adding a rung to it: not a further degree
+# of wrongness, but the other axis — code that is correct, idiomatically spelled, and simply says it
+# the long way round (`needless_match`, `useless_format`, `unnecessary_cast`, `clone_on_copy`,
+# `filter_next`). Pinned by name for the reason the three above are: `clippy::all` carries the group
+# today, so the entry changes no diagnostic — it changes what a regrouping of `clippy::all`, or a
+# member downgrading that one entry, can quietly take away. Its reach in the tree is a single site:
+# the `too_many_arguments` allow on the eight-argument raw-row fixture in
+# crates/loader/tests/transform.rs, scoped and reasoned. Two of this group's lints read their limits
+# from `clippy.toml` rather than from here, so raising `too-many-arguments-threshold` or
+# `type-complexity-threshold` would silence them with this deny still in place; walrus states
+# neither. Unlike suspicious and style, no lint named below belongs to this group — and
+# `priority = -1` is required regardless, because `clippy::lint_groups_priority` measures a group
+# against every named lint in the table, not only the ones it carries, and all of them sit at the
+# default 0. crates/common/tests/workspace_lints_inherited.rs notices if any of that drifts.
+complexity = { level = "deny", priority = -1 }
 # Phase 26 keeps ordered sequences contiguous. `linkedlist` is pedantic (outside `clippy::all`),
 # so this named deny needs no group-priority adjustment.
 linkedlist = "deny"
