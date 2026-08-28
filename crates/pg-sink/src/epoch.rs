@@ -14,6 +14,54 @@
 
 use common::Lsn;
 
+/// Postgres's `pg_replication_slots.wal_status` vocabulary, decoded once per catalog read.
+///
+/// Two decisions downstream turn on this single column — the categorical gauge and the invalidation
+/// test — and as raw string compares each spelled `"lost"` for itself. A typo in the second is
+/// precisely the bug this module exists to prevent, and it would be a silent one: the slot would
+/// classify as healthy forever while the WAL it needs was already gone. One decode leaves one place
+/// to get the word wrong, and the compiler checks every use of it after that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalStatus {
+    /// The WAL the slot needs is within `max_wal_size` — the healthy steady state.
+    Reserved,
+    /// Retained past `max_wal_size`, still inside `max_slot_wal_keep_size`.
+    Extended,
+    /// Past `max_slot_wal_keep_size`: the next checkpoint may invalidate the slot.
+    Unreserved,
+    /// Invalidated — the WAL this slot needed has been removed. The one value that is slot loss.
+    Lost,
+}
+
+impl WalStatus {
+    /// Decode the catalog text; `None` for SQL NULL and for any word a later PostgreSQL adds.
+    ///
+    /// `None` has to stay exactly as harmless as `Reserved` at every call site: a value walrus does
+    /// not recognise is no evidence the slot was invalidated, and a false positive here re-snapshots
+    /// the whole system (see this module's note).
+    fn from_catalog(text: &str) -> Option<Self> {
+        match text {
+            "reserved" => Some(Self::Reserved),
+            "extended" => Some(Self::Extended),
+            "unreserved" => Some(Self::Unreserved),
+            "lost" => Some(Self::Lost),
+            _ => None,
+        }
+    }
+
+    /// This status as the `walrus_sink_wal_status` gauge code. `deploy/observability/` reads these
+    /// exact numbers — the stat panel is titled `0 reserved · 1 unreserved · 2 lost` and
+    /// `WalrusSlotWalStatusDegraded` pages at `>= 1` — so `extended`, which is retention working as
+    /// designed rather than a problem, has to stay a healthy `0`.
+    const fn gauge_code(self) -> u8 {
+        match self {
+            Self::Reserved | Self::Extended => 0,
+            Self::Unreserved => 1,
+            Self::Lost => 2,
+        }
+    }
+}
+
 /// Result of inspecting the slot on a source connection. Only [`Absent`](SlotStatus::Absent) /
 /// [`Invalidated`](SlotStatus::Invalidated) — observed on a **successful** connection — are slot
 /// loss; [`Unreachable`](SlotStatus::Unreachable) is a hiccup (retry, never total-restart).
@@ -79,14 +127,13 @@ pub async fn classify_slot(client: &tokio_postgres::Client, slot: &str) -> SlotS
     let Some(row) = rows.first() else {
         return SlotStatus::Absent;
     };
-    let wal_status: Option<String> = row.get(0);
+    let reported: Option<String> = row.get(0);
+    let wal_status = reported.as_deref().and_then(WalStatus::from_catalog);
     // Expose the categorical slot health as a gauge (PR 4.10) from this existing read — no extra query.
-    common::metrics::set_wal_status(match wal_status.as_deref() {
-        Some("lost") => 2,
-        Some("unreserved") => 1,
-        _ => 0, // reserved / extended
-    });
-    if wal_status.as_deref() == Some("lost") {
+    // NULL and any word this walrus does not know fall to 0, the reserved/extended code, exactly as
+    // they fail the `Lost` test below: neither is evidence the slot was invalidated.
+    common::metrics::set_wal_status(wal_status.map_or(0, WalStatus::gauge_code));
+    if wal_status == Some(WalStatus::Lost) {
         return SlotStatus::Invalidated;
     }
     let confirmed: Option<String> = row.get(1);
