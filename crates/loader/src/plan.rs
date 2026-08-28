@@ -241,14 +241,14 @@ fn parse_emit(emit: &[String]) -> Vec<(&str, &str)> {
 /// The loader recombine expression for a type that collapses to one DuckDB scalar — over the winning raw
 /// row `s`. `None` for anything that stays flat (Tier-1, range, geometric).
 fn recombine_expr(pg_type_oid: u32, emit: &[(&str, &str)]) -> Option<String> {
-    match pg_type_oid {
-        INTERVAL if emit.len() == 3 => Some(format!(
-            "to_months(s.\"{}\") + to_days(s.\"{}\") + to_microseconds(s.\"{}\")",
-            emit[0].0, emit[1].0, emit[2].0
+    // Slice patterns, not `emit[0]` behind a length guard: the arity each expression needs is then
+    // checked by the compiler, and the emit columns are named where they are read.
+    match (pg_type_oid, emit) {
+        (INTERVAL, [(months, _), (days, _), (micros, _)]) => Some(format!(
+            "to_months(s.\"{months}\") + to_days(s.\"{days}\") + to_microseconds(s.\"{micros}\")"
         )),
-        TIMETZ if emit.len() == 2 => Some(format!(
-            "make_timetz(s.\"{}\", s.\"{}\")",
-            emit[0].0, emit[1].0
+        (TIMETZ, [(micros, _), (offset, _)]) => Some(format!(
+            "make_timetz(s.\"{micros}\", s.\"{offset}\")"
         )),
         _ => None,
     }

@@ -116,14 +116,14 @@ pub fn parse_range(text: &str) -> Result<ParsedRange<'_>, Error> {
     if bytes.len() < 3 {
         return Err(range_err(text));
     }
-    let lower_inc = match bytes[0] {
-        b'[' => true,
-        b'(' => false,
+    let lower_inc = match bytes.first() {
+        Some(b'[') => true,
+        Some(b'(') => false,
         _ => return Err(range_err(text)),
     };
-    let upper_inc = match bytes[bytes.len() - 1] {
-        b']' => true,
-        b')' => false,
+    let upper_inc = match bytes.last() {
+        Some(b']') => true,
+        Some(b')') => false,
         _ => return Err(range_err(text)),
     };
     let inner = &t[1..t.len() - 1];

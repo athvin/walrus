@@ -415,14 +415,15 @@ impl ChunkExporter {
             .query(&self.chunk_sql(), &[])
             .await
             .context("reload chunk SELECT")?;
-        if rows.is_empty() {
-            // Nothing at all past the cursor — drained with no file (the signal row for this
-            // empty probe is harmless; its echo resolved above).
+        // The chunk's last row is its next cursor (built once the file is written, below), and its
+        // absence is the drain: nothing at all past the cursor, so no file (the signal row for this
+        // empty probe is harmless; its echo resolved above).
+        let Some(last) = rows.last() else {
             return Ok(ChunkOutcome::Drained {
                 rows: 0,
                 final_lsn: watermark,
             });
-        }
+        };
 
         // Stamp + write: every row `commit_lsn = lsn = L_i` (see the module doc for the proof).
         let cached = crate::relcache::RelationCache::default()
@@ -457,7 +458,6 @@ impl ChunkExporter {
 
         // The cursor comes from the LAST ROW of the chunk just written — never a separate MAX()
         // query (racy). Values stay in their text output form (precision-safe for bigint PKs).
-        let last = &rows[rows.len() - 1];
         let cursor = cursor_from_row(&self.rel, &self.pk_cols, last)
             .context("build reload cursor from last chunk row")?;
 
