@@ -47,6 +47,13 @@ fn error_message_extracts_the_message_field() {
     // Fields: S<severity>\0 C<code>\0 M<message>\0 \0
     let body = b"SERROR\0C42704\0Mno such slot\0\0";
     assert_eq!(error_message(body), "no such slot");
+    // The bare NUL closes the field list, so trailing bytes are padding and never a field.
+    assert_eq!(error_message(b"SERROR\0\0Mhidden\0"), "(no message)");
+    // A frame truncated mid-field still yields the bytes that did arrive.
+    assert_eq!(error_message(b"C42704\0Mno such"), "no such");
+    // A present but empty message, and a body carrying no fields at all.
+    assert_eq!(error_message(b"M\0\0"), "");
+    assert_eq!(error_message(b""), "(no message)");
 }
 
 #[test]

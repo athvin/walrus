@@ -680,20 +680,17 @@ fn auth_sub_type(body: &[u8]) -> anyhow::Result<i32> {
 
 /// The `'M'` (human message) field of an ErrorResponse/NoticeResponse body.
 fn error_message(body: &[u8]) -> String {
-    let mut i = 0;
-    while i < body.len() && body[i] != 0 {
-        let field_type = body[i];
-        let start = i + 1;
-        let mut end = start;
-        while end < body.len() && body[end] != 0 {
-            end += 1;
-        }
-        if field_type == b'M' {
-            return String::from_utf8_lossy(&body[start..end]).into_owned();
-        }
-        i = end + 1;
-    }
-    "(no message)".to_string()
+    // The body is a run of NUL-terminated `(type byte, text)` fields closed by a bare NUL, so a
+    // split on NUL yields exactly one field per element and the terminator surfaces as the first
+    // empty one. A frame truncated mid-field simply ends the iterator on the same span the byte
+    // cursor would have stopped at.
+    body.split(|&b| b == 0)
+        .take_while(|field| !field.is_empty())
+        .find_map(|field| match field {
+            [b'M', text @ ..] => Some(String::from_utf8_lossy(text).into_owned()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "(no message)".to_string())
 }
 
 fn parse_dsn(dsn: &str) -> anyhow::Result<(String, u16, String, String)> {

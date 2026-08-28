@@ -319,9 +319,12 @@ async fn read_chunk_file(uri: &str) -> (Vec<i32>, Vec<(String, String)>) {
             .downcast_ref::<arrow::array::StringArray>()
             .unwrap()
             .clone();
-        for i in 0..batch.num_rows() {
-            ids.push(id_col.value(i));
-            let meta: serde_json::Value = serde_json::from_str(meta_col.value(i)).unwrap();
+        // Two columns walked in lockstep, so `zip` carries the pairing instead of a row index. The
+        // `Option`s are the arrays' null slots: unwrapping asserts what the sink guarantees (an
+        // `id` and a stamp on every exported row), which `.value(i)` would have read past silently.
+        for (id, meta) in id_col.iter().zip(meta_col.iter()) {
+            ids.push(id.unwrap());
+            let meta: serde_json::Value = serde_json::from_str(meta.unwrap()).unwrap();
             metas.push((
                 meta["commit_lsn"].as_str().unwrap().to_string(),
                 meta["lsn"].as_str().unwrap().to_string(),
@@ -431,13 +434,15 @@ async fn chunks_cover_the_table_exactly_with_per_chunk_stamps() {
     // Read the 3 files back: the union is the table exactly, and EVERY row's meta carries
     // commit_lsn = lsn = its file's lsn_end (the stamp).
     let mut all_ids = Vec::new();
-    for (i, (uri, _, _lsn_end, _)) in files.iter().enumerate() {
+    // `ends` was parsed out of `files` above, so zipping pairs each file with its own stamp — the
+    // row index that carried the pairing before was only ever a way to reach back into `ends`.
+    for ((uri, _, _lsn_end, _), end) in files.iter().zip(&ends) {
         let (ids, metas) = read_chunk_file(uri).await;
         for (commit_lsn, lsn) in &metas {
             assert_eq!(commit_lsn, lsn, "stamped commit_lsn = lsn");
             assert_eq!(
                 commit_lsn.parse::<Lsn>().unwrap(),
-                ends[i],
+                *end,
                 "stamp == the file's lsn_end"
             );
         }
