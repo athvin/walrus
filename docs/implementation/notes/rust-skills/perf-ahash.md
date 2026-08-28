@@ -22,7 +22,7 @@ supplies its key and how often it is probed:
 | `pg-sink/src/stream_txn.rs:76` `StreamedTxn::aborted` | `u32` sub-xid | source WAL | 1 probe per survivor at commit (`:126`) | rolled-back savepoints |
 | `pg-sink/src/stream_txn.rs:491` local `batchers` | `TableId` | source WAL | 1 `entry` per survivor | tables in one streamed txn |
 | `pg-sink/src/memory.rs:36` `InflightMeter::by_stream` | `(TableId, u32)` | source WAL | 1 `entry` per streamed row (`:55`) | bounded by `max_inflight_bytes` |
-| `pg-sink/src/ddl.rs:86` `DdlConsumer::versions` | `(String, String)` schema+table | **source catalog** | 1 per DDL event (`:101`, `:122`) | replicated tables |
+| `pg-sink/src/ddl.rs:86` `DdlConsumer::versions` | `(String, String)` schema+table | **source catalog** | borrowed scan per DDL event (`:107`, `:118`); hashed only on a table's first structural DDL (`:127`) | replicated tables |
 | `pg-sink/src/reload_signal.rs:50` `WatermarkWaiters::waiters` | `(ReloadId, i64)` | control-pg | 1 insert + 1 remove per reload chunk | in-flight chunks |
 | `pg-sink/src/preflight.rs:468` `published_tables` | `TableId { schema, table }` | **source catalog** | once per startup | published tables |
 | `pg-to-arrow/src/uuid_enum.rs:27` field metadata | `String` | walrus constant | once per uuid column | 1 |
@@ -96,10 +96,13 @@ probe cost:
 `with_capacity` (the rule's fourth key point) has no unserved site: the two `collect` sites
 (`loader/src/plan.rs:113`, `loader/src/ddl.rs:142`) already reserve from an exact `size_hint` through
 `FromIterator`, and every long-lived map's final size is a property of the source workload, not a
-number the constructor knows. The one lookup that *does* waste work is
-`DdlConsumer::version_of` (`ddl.rs:101-104`), which allocates two `String`s per probe to build an
-owned tuple key — but that is a key-type question on a per-DDL-event path, not a hasher question, and
-it is left alone here.
+number the constructor knows. The one lookup that *did* waste work was
+`DdlConsumer::version_of` (then `ddl.rs:101-104`), which allocated two `String`s per probe to build
+an owned tuple key — a key-type question on a per-DDL-event path rather than a hasher question, so
+this note left it alone. The `own-borrow-over-clone` pass has since replaced both of that map's
+probes with a borrowed scan (`ddl.rs:100-129`), which is why the row above no longer counts a hash
+per DDL event; the map itself, and the DoS-resistant hasher its source-supplied keys need, are
+unchanged.
 
 ## What is guarded now
 

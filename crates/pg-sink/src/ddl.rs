@@ -98,10 +98,34 @@ impl DdlConsumer {
     /// The current structural version for a table (1 until its first structural DDL).
     #[must_use]
     pub fn version_of(&self, schema: &str, table: &str) -> SchemaVersionNo {
+        // Compared borrowed, not looked up: `HashMap<(String, String), _>::get` can only be handed
+        // an OWNED key — `Borrow` has no `(&str, &str)` form to reach a `(String, String)` — so the
+        // keyed spelling has to allocate both halves of the name on every `Relation` message just
+        // to copy a version out. This map holds one entry per table that has taken a structural
+        // DDL, so scanning it borrowed is the cheaper read; [`crate::relcache::RelationCache`]
+        // resolves a name over the same table set the same way.
         self.versions
-            .get(&(schema.to_string(), table.to_string()))
-            .copied()
-            .unwrap_or(SchemaVersionNo(1))
+            .iter()
+            .find(|((s, t), _)| s.as_str() == schema && t.as_str() == table)
+            .map_or(SchemaVersionNo(1), |(_, version)| *version)
+    }
+
+    /// Record one structural DDL against a table: its version + 1, or 2 when this is the first
+    /// structural change it has seen.
+    fn bump(&mut self, schema: &str, table: &str) -> SchemaVersionNo {
+        // The bump edits its entry through the BORROWED name (see [`Self::version_of`]); only a
+        // table's first structural DDL owns copies of it, for the key it inserts.
+        let current = self
+            .versions
+            .iter_mut()
+            .find(|((s, t), _)| s.as_str() == schema && t.as_str() == table);
+        if let Some((_, version)) = current {
+            version.0 += 1;
+            return *version;
+        }
+        let version = SchemaVersionNo(2);
+        self.versions.insert((schema.to_string(), table.to_string()), version);
+        version
     }
 
     /// **(1)** write a `ddl_manifest` row stamped with `c_lsn`; **(2)** for a *structural* event, bump the
@@ -116,17 +140,13 @@ impl DdlConsumer {
         ex: impl sqlx::PgExecutor<'_>,
         ev: &DdlEvent,
     ) -> Result<Option<SchemaVersionNo>, DdlError> {
-        let key = (ev.source_schema.clone(), ev.source_table.clone());
         let structural = ev.is_structural();
+        // Both arms read the version through the event's own borrowed names; the owned copies below
+        // are the ones the `ddl_manifest` row keeps, so the bookkeeping adds none of its own.
         let version = if structural {
-            let v = self.versions.entry(key).or_insert(SchemaVersionNo(1));
-            v.0 += 1;
-            *v
+            self.bump(&ev.source_schema, &ev.source_table)
         } else {
-            self.versions
-                .get(&key)
-                .copied()
-                .unwrap_or(SchemaVersionNo(1))
+            self.version_of(&ev.source_schema, &ev.source_table)
         };
         let row = control::DdlRow {
             id: DdlId(0), // ignored on insert; the DB assigns the bigserial

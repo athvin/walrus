@@ -126,13 +126,25 @@ fn alter_table_is_structural_comment_is_metadata_only() {
 fn structural_ddl_bumps_version_metadata_does_not() {
     let mut c = DdlConsumer::new(common::EpochNo(1));
     assert_eq!(c.version_of("public", "orders"), common::SchemaVersionNo(1));
-    // Simulate the version bookkeeping consume() performs (no DB).
+    // The bookkeeping consume() performs for a structural event — the half that needs no DB.
     assert!(c.versions.is_empty());
-    // structural
-    let v = c
-        .versions
-        .entry(("public".into(), "orders".into()))
-        .or_insert(common::SchemaVersionNo(1));
-    v.0 += 1;
+
+    assert_eq!(c.bump("public", "orders"), common::SchemaVersionNo(2));
+    // A metadata-only event skips that call entirely, so a later read finds the structural version.
     assert_eq!(c.version_of("public", "orders"), common::SchemaVersionNo(2));
+}
+
+/// The version lookup matches on BOTH halves of the qualified name, so a table sharing one half
+/// with a bumped one still reads its own version (and a repeat bump edits the entry it found).
+#[test]
+fn each_qualified_table_name_keeps_its_own_version() {
+    let mut c = DdlConsumer::new(common::EpochNo(1));
+    assert_eq!(c.bump("public", "orders"), common::SchemaVersionNo(2));
+    assert_eq!(c.bump("public", "orders"), common::SchemaVersionNo(3));
+
+    assert_eq!(c.version_of("public", "orders"), common::SchemaVersionNo(3));
+    assert_eq!(c.version_of("public", "items"), common::SchemaVersionNo(1));
+    assert_eq!(c.version_of("other", "orders"), common::SchemaVersionNo(1));
+    assert_eq!(c.bump("other", "orders"), common::SchemaVersionNo(2));
+    assert_eq!(c.version_of("public", "orders"), common::SchemaVersionNo(3));
 }
