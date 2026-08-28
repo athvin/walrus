@@ -365,6 +365,41 @@ multiple_bound_locations = "deny"
 # `mod_module_files`, must stay absent: it bans the `mod.rs` walrus standardised on, and that
 # file's path is pinned by crates/common/tests/const_invariant_compile_fail.rs.
 self_named_module_files = "deny"
+# `clippy::nursery` is the second group this table enables one lint at a time, and — as with
+# `pedantic` above — the missing group entry is the policy rather than an oversight. Two things rule
+# the wholesale spelling out. It is not carried by `clippy::all`, so
+# `nursery = { level = "deny", priority = -1 }` would be a behaviour change rather than a pin; and a
+# nursery lint is unfinished by definition, so the column of re-allows underneath it would have to be
+# re-argued on every toolchain bump, as heuristics tighten and names graduate out into `style`,
+# `pedantic` or `perf`. Ten members are already denied above, each argued where it sits rather than
+# swept in by a group: `significant_drop_in_scrutinee` and `significant_drop_tightening` (lock scope,
+# PR 9.11), `needless_pass_by_ref_mut`, `missing_const_for_fn` (PR 21.1), `future_not_send`
+# (PR 14.8), `redundant_clone`, `elidable_lifetime_names`, `large_stack_frames` (PR 9.7),
+# `type_repetition_in_bounds` and `trait_duplication_in_bounds`.
+#
+# The two entries below finish that pick against the recommended starter set, and the fifth member
+# of it stays out: `use_self` is the only one of the five that would not be a pin. It has live sites
+# throughout the tree — `Lsn::ZERO` names its own type twice in crates/common/src/lsn.rs, and every
+# hand-written `Default` repeats its struct name — so enabling it is a tree-wide rewrite rather than
+# a line added here, and belongs to the change that carries those edits with it.
+#
+# `or_fun_call` is the eager-fallback gate that pick was missing: `unwrap_or(expensive())` pays for
+# the fallback on the path that does not take it, where `unwrap_or_else` / `or_default` pay only on
+# the path that does. Zero sites — every `unwrap_or`, `ok_or`, `or_insert` and `map_or` argument in
+# the tree is a literal, a `&'static str`, or a tuple-struct/enum-variant constructor, all of which
+# clippy's eagerness analysis rates cheap enough to leave eager — so, as with `dbg_macro`, this entry
+# only stops the first real one and crates/common/tests/workspace_lints_inherited.rs is what notices
+# if it is dropped. Its complement needs no pin of its own and pushes the other way:
+# `unnecessary_lazy_evaluations` is a complexity lint, so the group entry above already carries it,
+# and a fallback that lint would call cheap has to stay eager here.
+or_fun_call = "deny"
+# `redundant_else` is the one member of that recommended set which is pedantic rather than nursery,
+# so it belongs to the selective pedantic pick above as much as to this review; it is recorded here
+# because the review is what found it. An `else` block whose sibling `if` always returns, breaks,
+# continues or panics is a level of indentation with nothing behind it, and unindenting the tail is
+# what makes the early exit read as one. Zero sites: every `else` in the tree pairs with a
+# then-branch that produces a value. Outside `clippy::all`, so no priority juggling is needed.
+redundant_else = "deny"
 
 [workspace.dependencies]
 # Internal crates, centralised for the reason the third-party pins below are: `common` was spelled

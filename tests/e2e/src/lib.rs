@@ -811,10 +811,10 @@ async fn wait_ready(base: &str, deadline: Duration) -> Result<()> {
 async fn http_get_ok(url: &str) -> bool {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let rest = url.trim_start_matches("http://");
-    let (authority, path) = rest
-        .split_once('/')
-        .map(|(a, p)| (a, format!("/{p}")))
-        .unwrap_or((rest, "/".into()));
+    let (authority, path) = match rest.split_once('/') {
+        Some((a, p)) => (a, format!("/{p}")),
+        None => (rest, "/".to_string()),
+    };
     let Ok(mut stream) = tokio::net::TcpStream::connect(authority).await else {
         return false;
     };
@@ -835,10 +835,10 @@ async fn http_get_ok(url: &str) -> bool {
 async fn http_get(url: &str) -> Result<(bool, String)> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let rest = url.trim_start_matches("http://");
-    let (authority, path) = rest
-        .split_once('/')
-        .map(|(a, p)| (a, format!("/{p}")))
-        .unwrap_or((rest, "/".into()));
+    let (authority, path) = match rest.split_once('/') {
+        Some((a, p)) => (a, format!("/{p}")),
+        None => (rest, "/".to_string()),
+    };
     let mut stream = tokio::net::TcpStream::connect(authority)
         .await
         .context("connect for GET")?;

@@ -730,6 +730,85 @@ fn the_workspace_lint_table_selects_pedantic_lints_by_name_never_as_a_group() {
     }
 }
 
+/// `clippy::nursery` is the second group this table enables one lint at a time, and its absent group
+/// entry is the same decision the pedantic one above records, reached for one extra reason. Like
+/// `pedantic`, the group is not carried by `clippy::all`, so the entry would be a behaviour change
+/// rather than a pin. Unlike `pedantic`, its members are lints clippy itself calls unfinished:
+/// heuristics still being tightened, false positives still being fixed, names that graduate out into
+/// `style` or `perf`. A column of re-allows under `nursery = { level = "deny", priority = -1 }`
+/// would therefore have to be re-argued on every toolchain bump — churn bought with a group entry,
+/// which is the failure this test exists to keep out.
+///
+/// So the two halves are asserted together, exactly as for pedantic: the group entry must stay
+/// absent while the named members stay present. Every name below is denied on its own recorded
+/// merit — lock scope (PR 9.11), the mutable-borrow gate, `const fn` reachability (PR 21.1),
+/// Send-ness of a spawned future (PR 14.8), clone-vs-move, an elidable lifetime and singular
+/// generic bounds — and `or_fun_call` joins them as the eager-fallback gate the pick was missing.
+/// Its reach is zero today, for the reason the manifest gives, so nothing in the source goes red if
+/// that entry is dropped and this is the thing that does.
+#[test]
+fn the_workspace_lint_table_selects_nursery_lints_by_name_never_as_a_group() {
+    let synthetic = "nursery = { level = \"deny\", priority = -1 }\n";
+    assert_eq!(clippy_group_deny_count(synthetic, "nursery"), 1);
+
+    let root_manifest = std::fs::read_to_string(repo_root().join("Cargo.toml")).unwrap();
+    let clippy = section(&root_manifest, "[workspace.lints.clippy]")
+        .expect("root manifest must define [workspace.lints.clippy]");
+
+    assert_eq!(clippy_group_deny_count(clippy, "nursery"), 0);
+    assert_eq!(clippy_deny_count(clippy, "nursery"), 0);
+    assert_eq!(clippy_allow_count(clippy, "nursery"), 0);
+    for line in clippy.lines() {
+        assert!(
+            !line.trim_start().starts_with("nursery"),
+            "the nursery group is enabled one lint at a time; a group entry replaces that decision \
+             with a column of re-allows that every toolchain bump reopens"
+        );
+    }
+
+    for lint in [
+        "significant_drop_in_scrutinee",
+        "significant_drop_tightening",
+        "needless_pass_by_ref_mut",
+        "missing_const_for_fn",
+        "future_not_send",
+        "redundant_clone",
+        "elidable_lifetime_names",
+        "type_repetition_in_bounds",
+        "trait_duplication_in_bounds",
+        "or_fun_call",
+    ] {
+        assert_eq!(
+            clippy_deny_count(clippy, lint),
+            1,
+            "{lint} is part of the selective nursery pick; it must stay pinned by name"
+        );
+    }
+}
+
+/// The one member of that recommended starter set which is pedantic rather than nursery, so the
+/// pick above cannot carry it and the pedantic guard further up does not name it either: it is
+/// denied on the nursery review's finding rather than on that pick's own. An `else` block whose
+/// sibling `if` always returns, breaks, continues or panics is a level of indentation with nothing
+/// behind it — the early exit reads as one only once the tail is unindented past it. Zero sites,
+/// like `dbg_macro` and `format_push_string`: every `else` in the tree pairs with a then-branch that
+/// produces a value, so no source file goes red if the entry is dropped and this is what does.
+#[test]
+fn the_workspace_lint_table_still_denies_an_else_after_a_diverging_if() {
+    let synthetic = "redundant_else = \"warn\"\n  or_fun_call = \"deny\"\n";
+    assert_eq!(clippy_deny_count(synthetic, "redundant_else"), 0);
+    assert_eq!(clippy_deny_count(synthetic, "or_fun_call"), 1);
+
+    let root_manifest = std::fs::read_to_string(repo_root().join("Cargo.toml")).unwrap();
+    let clippy = section(&root_manifest, "[workspace.lints.clippy]")
+        .expect("root manifest must define [workspace.lints.clippy]");
+    assert_eq!(
+        clippy_deny_count(clippy, "redundant_else"),
+        1,
+        "workspace policy must pin redundant_else = \"deny\" exactly once"
+    );
+}
+
 /// The wildcard-import deny rests on an exemption clippy grants rather than on anything the lint
 /// table states: `use super::*` inside a `#[cfg(test)]` module and `use x::prelude::*` are skipped
 /// while `warn-on-all-wildcard-imports` keeps its default of `false`. 63 `*_test.rs` siblings here
