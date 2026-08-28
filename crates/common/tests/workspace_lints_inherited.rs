@@ -138,6 +138,18 @@ fn clippy_deny_count(table: &str, lint: &str) -> usize {
     table.lines().filter(|line| line.trim() == entry).count()
 }
 
+/// The same count for an entry that carries its rationale as a trailing `#` comment, which is how
+/// the panic family is spelled. Stripping the comment first keeps the comparison exact: a `contains`
+/// loose enough to see past a rationale would also match a lint named *inside* one.
+fn clippy_deny_count_ignoring_rationale(table: &str, lint: &str) -> usize {
+    let entry = format!(r#"{lint} = "deny""#);
+    table
+        .lines()
+        .map(|line| line.split_once('#').map_or(line, |(code, _)| code))
+        .filter(|code| code.trim() == entry)
+        .count()
+}
+
 /// How many entries pin the lint *group* `group` at `deny` with `priority = -1` — the only spelling
 /// a group may take in a table whose named lints sit at the default priority.
 fn clippy_group_deny_count(table: &str, group: &str) -> usize {
@@ -929,6 +941,57 @@ fn the_workspace_lint_table_still_denies_formatting_into_an_existing_buffer() {
         0,
         "format_in_format_args is a perf lint; the perf group entry above already carries it"
     );
+}
+
+/// The five entries that stand between a recoverable failure and an aborted pod. A bad config
+/// value, a short wire frame and a malformed range literal are all *expected* — walrus answers each
+/// with a typed `Err` that `main` maps onto a `common::ExitCode`. Nothing in the type system
+/// requires that; these denies are the requirement. All five are `restriction`/`pedantic` lints
+/// outside every group denied above, so only the named entry reaches each one, and four of them —
+/// `panic`, `todo`, `unreachable`, `panic_in_result_fn` — have zero sites, so dropping an entry
+/// breaks no build and reddens no other test, exactly as with `dbg_macro` above. `unimplemented` is
+/// the one that needs no help: `crates/pg-sink/src/backfill.rs` suppresses it with `#[expect]`, and
+/// an expectation left unfulfilled by a dropped deny is itself a denied warning. The other way to
+/// undo this policy — a scoped allow inside a production module — is what
+/// `crates/common/tests/no_panic_suppression.rs` watches.
+///
+/// Unlike every other entry in the table, these five carry their rationale on the same line, which
+/// is why the count used here has to strip it first.
+#[test]
+fn the_workspace_lint_table_still_denies_the_panic_family() {
+    let synthetic = "panic = \"warn\" # rationale\n  todo = \"deny\" # rationale\n";
+    assert_eq!(
+        clippy_deny_count(synthetic, "todo"),
+        0,
+        "the exact-match count cannot see past a trailing rationale — hence the second helper"
+    );
+    assert_eq!(
+        clippy_deny_count_ignoring_rationale(synthetic, "panic"),
+        0,
+        "a rationale must not rescue an entry that is not pinned at deny"
+    );
+    assert_eq!(
+        clippy_deny_count_ignoring_rationale(synthetic, "todo"),
+        1,
+        "an entry at deny still counts once with a rationale beside it"
+    );
+
+    let root_manifest = std::fs::read_to_string(repo_root().join("Cargo.toml")).unwrap();
+    let clippy = section(&root_manifest, "[workspace.lints.clippy]")
+        .expect("root manifest must define [workspace.lints.clippy]");
+    for lint in [
+        "panic",
+        "todo",
+        "unimplemented",
+        "unreachable",
+        "panic_in_result_fn",
+    ] {
+        assert_eq!(
+            clippy_deny_count_ignoring_rationale(clippy, lint),
+            1,
+            "workspace policy must pin {lint} = \"deny\" exactly once"
+        );
+    }
 }
 
 #[test]
