@@ -140,11 +140,10 @@ pub fn diff(old: &SchemaVersion, new: &SchemaVersion) -> Result<SchemaDiff, Load
         // DROP COLUMN(s): a length decrease is a drop (a rename keeps the count). Identify the dropped
         // columns by name-set difference — the surviving columns keep their names.
         let kept: std::collections::HashSet<&str> = nc.iter().map(|c| c.name.as_str()).collect();
-        for o in oc.iter().filter(|o| !kept.contains(o.name.as_str())) {
-            d.destructive.push(DestructiveChange::DropColumn {
-                name: o.name.clone(),
-            });
-        }
+        let dropped = oc.iter().filter(|o| !kept.contains(o.name.as_str()));
+        d.destructive.extend(dropped.map(|o| DestructiveChange::DropColumn {
+            name: o.name.clone(),
+        }));
         return Ok(d);
     }
 
@@ -173,9 +172,8 @@ pub fn diff(old: &SchemaVersion, new: &SchemaVersion) -> Result<SchemaDiff, Load
             }
         }
     }
-    for n in &nc[oc.len()..] {
-        d.additive.push(AdditiveChange::AddColumn(n.clone()));
-    }
+    let appended = nc[oc.len()..].iter().cloned();
+    d.additive.extend(appended.map(AdditiveChange::AddColumn));
     Ok(d)
 }
 

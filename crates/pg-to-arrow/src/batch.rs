@@ -952,9 +952,7 @@ fn parse_decimal(s: &str, scale: i8, col: &str) -> Result<i128, Error> {
     let mut digits = String::with_capacity(int_part.len() + scale);
     digits.push_str(int_part);
     digits.push_str(frac_part);
-    for _ in 0..(scale - frac_part.len()) {
-        digits.push('0');
-    }
+    digits.extend(std::iter::repeat_n('0', scale - frac_part.len()));
     let magnitude: i128 = digits.parse().map_err(|_| err())?;
     Ok(sign * magnitude)
 }

@@ -168,12 +168,10 @@ fn plan_column(
     // can't drift from the staged file.
     // Tier-2 that recombines to a single DuckDB scalar (interval / timetz).
     if let Some(expr) = recombine_expr(d.pg_type_oid, &emit) {
-        for &(n, t) in &emit {
-            raw_cols.push(RawCol {
-                name: n.to_string(),
-                duckdb_type: t.to_string(),
-            });
-        }
+        raw_cols.extend(emit.iter().map(|&(n, t)| RawCol {
+            name: n.to_string(),
+            duckdb_type: t.to_string(),
+        }));
         mirror_cols.push(MirrorCol {
             name: name.to_string(),
             duckdb_type: d.duckdb.clone(),
