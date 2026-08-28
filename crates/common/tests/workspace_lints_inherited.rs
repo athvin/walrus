@@ -573,6 +573,32 @@ fn the_workspace_lint_table_still_polices_safety_doc_sections() {
     }
 }
 
+/// The block-side half of that family, and the half no other guard covers: a `// SAFETY:` comment
+/// on every `unsafe { … }`, and one auditable operation per block so a single comment never has to
+/// justify two. Both are `clippy::restriction` lints, outside the `clippy::all` group denied above,
+/// so nothing but these named entries reaches them — and while `unsafe_code = "forbid"` holds they
+/// have no site to go red, which is exactly why dropping one is invisible in the source. They are
+/// what documents the first unsafe block this tree ever grows, in the member that stopped
+/// inheriting the forbid; `scripts/check-unsafe-invariants.sh` guards the forbid itself.
+#[test]
+fn the_workspace_lint_table_still_demands_documented_unsafe_blocks() {
+    let synthetic = "undocumented_unsafe_blocks = \"warn\"\n\
+                     multiple_unsafe_ops_per_block = \"deny\"\n";
+    assert_eq!(clippy_deny_count(synthetic, "undocumented_unsafe_blocks"), 0);
+    assert_eq!(clippy_deny_count(synthetic, "multiple_unsafe_ops_per_block"), 1);
+
+    let root_manifest = std::fs::read_to_string(repo_root().join("Cargo.toml")).unwrap();
+    let clippy = section(&root_manifest, "[workspace.lints.clippy]")
+        .expect("root manifest must define [workspace.lints.clippy]");
+    for lint in ["undocumented_unsafe_blocks", "multiple_unsafe_ops_per_block"] {
+        assert_eq!(
+            clippy_deny_count(clippy, lint),
+            1,
+            "workspace policy must pin {lint} = \"deny\" exactly once"
+        );
+    }
+}
+
 /// Diagnostics are `tracing` events, never raw stream writes. That was prose in
 /// `crates/common/src/telemetry.rs` before these two lints backed it: `println!` and `eprintln!`
 /// compile cleanly under every other entry in the table, so nothing went red when one

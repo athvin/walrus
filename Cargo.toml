@@ -187,8 +187,10 @@ inline_always = "deny"
 # unsafe block must carry a `// SAFETY:` comment. This is a restriction lint outside `clippy::all`,
 # so no group-vs-lint priority is needed.
 undocumented_unsafe_blocks = "deny"
-# Keep each unsafe block to one auditable invariant. This is another restriction lint outside
-# `clippy::all`, so it needs no group-vs-lint priority.
+# Keep each unsafe block to one auditable invariant, so a single `// SAFETY:` comment never has to
+# justify two operations. This is another restriction lint outside `clippy::all`, so it needs no
+# group-vs-lint priority. Neither of this pair has a site to go red while the forbid above holds, so
+# crates/common/tests/workspace_lints_inherited.rs is what notices if either entry is dropped.
 multiple_unsafe_ops_per_block = "deny"
 # The caller-facing half of that family: an `unsafe fn` must publish, in a `# Safety` section, the
 # obligations its callers take on. This one is a style lint, so `all = "deny"` above carries it
