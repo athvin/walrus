@@ -899,6 +899,38 @@ fn the_workspace_lint_table_still_pins_one_module_layout() {
     );
 }
 
+/// `push_str(&format!(..))` allocates a whole `String` to copy it into a buffer that already
+/// exists — the "build the parts with `format!`" shape PRs 11.4-11.6 replaced tree-wide with
+/// `write!`, `push_str` and scratch a caller owns and reuses. `format_push_string` is what keeps it
+/// out, and it is `clippy::restriction`: outside `all`, `perf`, `complexity` and every other group
+/// this table denies, so none of those entries reaches it and only the named one does. The tree has
+/// zero sites, so no source file goes red if that entry is dropped — this test is the thing that
+/// does, exactly as it is for `dbg_macro` above. Its two neighbours need no pin of their own:
+/// `format_in_format_args` is a perf lint and `useless_format` a complexity one, so the group
+/// entries already carry both, and naming either here would contradict the reach those entries
+/// record. No lint covers this rule's remaining shape — a `format!` inside a loop — so the
+/// benchmarks in `docs/benchmarks.md` stay its only detector.
+#[test]
+fn the_workspace_lint_table_still_denies_formatting_into_an_existing_buffer() {
+    let synthetic = "format_push_string = \"warn\"\n  print_stderr = \"deny\"\n";
+    assert_eq!(clippy_deny_count(synthetic, "format_push_string"), 0);
+    assert_eq!(clippy_deny_count(synthetic, "print_stderr"), 1);
+
+    let root_manifest = std::fs::read_to_string(repo_root().join("Cargo.toml")).unwrap();
+    let clippy = section(&root_manifest, "[workspace.lints.clippy]")
+        .expect("root manifest must define [workspace.lints.clippy]");
+    assert_eq!(
+        clippy_deny_count(clippy, "format_push_string"),
+        1,
+        "workspace policy must pin format_push_string = \"deny\" exactly once"
+    );
+    assert_eq!(
+        clippy_deny_count(clippy, "format_in_format_args"),
+        0,
+        "format_in_format_args is a perf lint; the perf group entry above already carries it"
+    );
+}
+
 #[test]
 fn the_clippy_carve_out_is_still_scoped_to_tests() {
     let cfg = std::fs::read_to_string(repo_root().join("clippy.toml")).unwrap();
