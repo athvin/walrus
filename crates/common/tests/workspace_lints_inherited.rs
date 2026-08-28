@@ -116,6 +116,22 @@ fn member_inherits_lints(manifest: &str) -> bool {
     section(manifest, "[lints]").is_some_and(|body| body.contains("workspace = true"))
 }
 
+/// Whether one manifest line assigns the `build` key.
+fn is_build_script_key(line: &str) -> bool {
+    let Some((key, _)) = line.split_once('=') else {
+        return false;
+    };
+    key.trim() == "build"
+}
+
+/// Whether a member manifest names a build script. `[package] build = "…"` is the one key that puts
+/// a program of walrus's own between Cargo and rustc, and so the one way a `cargo::rustc-check-cfg`
+/// directive could register a cfg name or feature value the workspace lint table never saw.
+fn declares_build_script(manifest: &str) -> bool {
+    let package = section(manifest, "[package]").unwrap_or_default();
+    package.lines().any(is_build_script_key)
+}
+
 /// How many entries in a lint-table body pin `lint` at `deny`, whatever their indentation.
 fn clippy_deny_count(table: &str, lint: &str) -> usize {
     let entry = format!(r#"{lint} = "deny""#);
@@ -628,6 +644,59 @@ fn the_workspace_lint_table_still_denies_bare_export_attributes() {
         1,
         "workspace policy must reject bare `#[no_mangle]`-family attributes exactly once"
     );
+}
+
+/// The two entries above are allow-by-default lints, so `warnings = "deny"` never reaches them and
+/// the named deny *is* the enforcement. This one is the other shape: `unexpected_cfgs` has been
+/// warn-by-default since Rust 1.80, so the group already escalates it and dropping this line
+/// changes no diagnostic today — which is precisely why nothing in the source would go red. What
+/// it enforces is that an unknown cfg stays a build failure over both halves of the predicate: the
+/// cfg *name*, and the *value* of `feature = "…"`, which Cargo checks against the declaring
+/// package's own feature list. Without it a gate misspelled `feature = "sqlx_"` is not an error
+/// but a constant false, and its block leaves the build in silence.
+///
+/// The second half of the guard is the `check-cfg` array this entry deliberately does not carry.
+/// walrus declares no custom cfg — every predicate in the tree is built-in or one of the four
+/// declared features — so there is nothing to list. But a build script registers cfgs from outside
+/// the manifest entirely, and one `cargo::rustc-check-cfg=cfg(feature, values(any()))` line
+/// blanket-accepts every feature spelling with this deny still in place and no lint table moved. No
+/// member has a build script; if one ever arrives, its directives are what this guard must read
+/// instead of its absence.
+#[test]
+fn the_workspace_lint_table_still_denies_unexpected_cfgs() {
+    assert!(declares_build_script("[package]\nbuild = \"gen.rs\"\n"));
+    assert!(!declares_build_script("[package]\nname = \"common\"\n"));
+    assert!(!declares_build_script("[build-dependencies]\ncc = \"1\"\n"));
+
+    let root = repo_root();
+    let root_manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    let rust = section(&root_manifest, "[workspace.lints.rust]")
+        .expect("root manifest must define [workspace.lints.rust]");
+    assert_eq!(
+        rust.lines()
+            .filter(|line| line.trim() == r#"unexpected_cfgs = "deny""#)
+            .count(),
+        1,
+        "workspace policy must reject unknown cfg names and feature values exactly once"
+    );
+
+    let members = workspace_members(&root_manifest);
+    assert!(
+        members.len() >= 6,
+        "member list parsed as {members:?} — the parser is broken"
+    );
+    for member in &members {
+        let dir = root.join(member);
+        assert!(
+            !dir.join("build.rs").exists(),
+            "{member} has a build.rs, which can register cfgs the lint table never declared"
+        );
+        let manifest = std::fs::read_to_string(dir.join("Cargo.toml")).unwrap();
+        assert!(
+            !declares_build_script(&manifest),
+            "{member} names a build script in [package]; see the build.rs note above"
+        );
+    }
 }
 
 /// Both directions of the `# Safety` section. The workspace forbid means walrus authors no

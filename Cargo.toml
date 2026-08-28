@@ -42,6 +42,19 @@ missing_unsafe_on_extern = "deny"
 unsafe_attr_outside_unsafe = "deny"
 # This rustc lint is allow-by-default, so `warnings = "deny"` does not enable it.
 missing_copy_implementations = "deny"
+# A cfg the compiler does not recognise is not an error — it is simply false. So a mistyped feature
+# gate (`#[cfg(feature = "sqlx_")]`) compiles, matches nothing, and takes its whole block out of the
+# build with no diagnostic at all. `unexpected_cfgs` is what rejects it, over both halves of the
+# predicate: the cfg *name*, and — because Cargo hands rustc each package's declared feature list —
+# the *value* of `feature = "…"`. Warn-by-default since Rust 1.80, so `warnings = "deny"` above
+# already escalates it; the named entry pins the policy independently of that group, exactly as
+# `unsafe_op_in_unsafe_fn` does. It carries no `check-cfg` array because walrus has no custom cfg to
+# declare: every predicate in the tree is either built-in (`test`, `debug_assertions`, `unix`,
+# `target_pointer_width`) or one of the four declared features (`sqlx`, `integration`,
+# `conformance`, `it`), and Cargo registers those itself. The first custom cfg belongs in a
+# `check-cfg` list on this entry; the only other place one can be registered — a build script — is
+# what crates/common/tests/workspace_lints_inherited.rs rules out.
+unexpected_cfgs = "deny"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
