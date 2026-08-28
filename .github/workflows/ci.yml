@@ -125,8 +125,11 @@ jobs:
       - name: Unsafe invariants (scripts/check-unsafe-invariants.sh)
         run: bash scripts/check-unsafe-invariants.sh
 
-      - name: cargo fmt --check
-        run: cargo fmt --check
+      # `--all` states the scope instead of leaving it to whatever package this step's directory
+      # resolves to: every workspace member, always. crates/common/tests/fmt_gate.rs is what fails
+      # if this step — or its `just fmt` mirror — ever stops gating.
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check
 
       # Fragment-specifier guard (PR 24.3). The checker recognizes `$name:tt` captures after
       # ignoring comments/string contents; bare prose `:tt` is not a finding. PR 24.6's deliberate

@@ -17,7 +17,7 @@ down:
 
 # Baseline gates (mirror CI).
 fmt:
-    cargo fmt --check
+    cargo fmt --all --check
 
 clippy:
     cargo clippy --all-targets --all-features -- -D warnings
