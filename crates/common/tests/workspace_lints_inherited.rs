@@ -267,6 +267,60 @@ fn the_workspace_lint_table_still_denies_the_suspicious_group() {
     }
 }
 
+/// `clippy::style` is the third rung: code that is correct and idiomatically misspelled —
+/// `len_zero`, `redundant_field_names`, `needless_return`, `single_match`, `question_mark`. Like
+/// its two siblings above, the named entry costs no diagnostic today, because `clippy::all` carries
+/// the group; unlike them, its reach is already visible outside this table. Three of its lints are
+/// pinned by name below on their own merits (`from_over_into`, `ptr_arg`, `missing_safety_doc`) —
+/// all at the default priority, so the group must sit under them or `clippy::lint_groups_priority`
+/// reports every one — and two sites hold a scoped allow with a reason, which is what a group with
+/// live sites looks like.
+#[test]
+fn the_workspace_lint_table_still_denies_the_style_group() {
+    let synthetic = "style = \"deny\"\n";
+    assert_eq!(clippy_group_deny_count(synthetic, "style"), 0);
+    assert_eq!(clippy_deny_count(synthetic, "style"), 1);
+
+    let root_manifest = std::fs::read_to_string(repo_root().join("Cargo.toml")).unwrap();
+    let clippy = section(&root_manifest, "[workspace.lints.clippy]")
+        .expect("root manifest must define [workspace.lints.clippy]");
+    assert_eq!(
+        clippy_group_deny_count(clippy, "style"),
+        1,
+        "workspace policy must pin the style group at deny with priority = -1"
+    );
+    assert_eq!(
+        clippy_deny_count(clippy, "style"),
+        0,
+        "a priority-less `style = \"deny\"` collides with the named lints below it"
+    );
+
+    let named_members = ["from_over_into", "ptr_arg", "missing_safety_doc"];
+    for lint in named_members {
+        assert_eq!(
+            clippy_deny_count(clippy, lint),
+            1,
+            "{lint} is a style-group member; it must keep the default priority"
+        );
+    }
+}
+
+/// The two style-group suppressions in the tree. Both are deliberate — a `new` that hands back the
+/// shared handle rather than `Self`, and a test that reaches for the borrowed operator impl on
+/// purpose — and `allow_attributes_without_reason` already forces each to carry a `reason`. What
+/// this asserts is the *count*: the group is enforced everywhere else, so a third suppression is a
+/// policy decision that has to be made here rather than in a source file.
+#[test]
+fn the_style_group_carries_exactly_two_scoped_allows() {
+    const HEALTH: &str = include_str!("../../pg-sink/src/health.rs");
+    const LSN_TEST: &str = include_str!("../src/lsn_test.rs");
+
+    assert_eq!(HEALTH.matches("clippy::new_ret_no_self").count(), 1);
+    assert!(HEALTH.contains("reason = \"intentionally returns the shared handle"));
+    assert_eq!(LSN_TEST.matches("clippy::op_ref").count(), 1);
+    assert!(LSN_TEST.contains("reason = \"exercise the explicit borrowed Sub impl\""));
+}
+
 #[test]
 fn the_workspace_lint_table_denies_redundant_method_closures() {
     let root_manifest = std::fs::read_to_string(repo_root().join("Cargo.toml")).unwrap();

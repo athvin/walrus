@@ -64,6 +64,20 @@ correctness = { level = "deny", priority = -1 }
 # given above — every named entry here sits at the default 0, and a group at or above a named lint's
 # priority overrides it. crates/common/tests/workspace_lints_inherited.rs notices if it drifts.
 suspicious = { level = "deny", priority = -1 }
+# `clippy::style` is the third rung of that ladder: not code that is wrong, nor code that is almost
+# always a mistake, but the non-idiomatic spelling of something correct — `len_zero`,
+# `redundant_field_names`, `needless_return`, `single_match`, `question_mark`. Pinned by name for
+# the reason the two above are, and it is the first of the three whose reach shows up in the source
+# rather than only in this table: three of its lints are already named below on their own merits
+# (`from_over_into`, `ptr_arg`, `missing_safety_doc`), and two sites hold a scoped allow with a
+# reason — `new_ret_no_self` in crates/pg-sink/src/health.rs, whose `new` hands back the shared
+# `Arc` handle the probes and the replication loop hold, and `op_ref` in
+# crates/common/src/lsn_test.rs, which exercises the borrowed `Sub` impl on purpose. `priority = -1`
+# is required for the reason given above — every named entry here sits at the default 0, and a group
+# at or above a named lint's priority overrides it. The level is the table's rather than a bare
+# warn for the reason `suspicious` gives. crates/common/tests/workspace_lints_inherited.rs notices
+# if this entry drifts.
+style = { level = "deny", priority = -1 }
 # Phase 26 keeps ordered sequences contiguous. `linkedlist` is pedantic (outside `clippy::all`),
 # so this named deny needs no group-priority adjustment.
 linkedlist = "deny"
