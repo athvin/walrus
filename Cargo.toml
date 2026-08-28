@@ -113,6 +113,37 @@ complexity = { level = "deny", priority = -1 }
 # every named lint in the table, not only the ones it carries, and all of them sit at the default 0.
 # crates/common/tests/workspace_lints_inherited.rs notices if any of that drifts.
 perf = { level = "deny", priority = -1 }
+# `clippy::cargo` is the sixth group and the first `clippy::all` does not carry — also the first
+# whose subject is not the source at all but the manifest this table lives in:
+# `cargo_common_metadata`, `multiple_crate_versions`, `wildcard_dependencies`,
+# `negative_feature_names`, `redundant_feature_names`. The rule asking for it scopes itself to crates
+# bound for a registry and offers `cargo = "allow"` to everyone else, which the `publish = false`
+# above makes walrus. Deny it anyway: three of the five police manifest hygiene a deployment artifact
+# owes exactly as much as a package does. A `*` requirement accepts the next breaking major the day
+# the lock file is regenerated, and a feature named `no-duckdb` or `with-sqlx` reads backwards in any
+# manifest. All three have zero sites — every third-party pin is explicit (arrow, parquet and duckdb
+# exact), the three internal edges are paths rather than version requirements, and the features are
+# `sqlx`, `integration`, `conformance`, `it` — so this entry is the only thing that would notice a
+# fourth spelling arrive. The other two members are owned elsewhere, and this pair of lines says
+# where:
+#   * `cargo_common_metadata` wants the description / repository / keywords / categories a published
+#     crate owes its readers, and skips every package that declares itself unpublishable — all six of
+#     them — so it is inert by construction. The interlock runs the other way: the day a member drops
+#     that key, this deny is what demands those fields in the one place they would matter.
+#     crates/common/tests/publish_policy.rs guards the key itself.
+#   * `multiple_crate_versions` is the opposite case, and the widest live reach of any lint in this
+#     table: duplicated crate names fill the lock file (ahash, bitflags, getrandom, hashbrown, rand,
+#     rustix, syn, thiserror, windows-sys, …), every pair created by a transitive resolution rather
+#     than by a walrus pin. deny.toml's `[bans] multiple-versions` already owns that question and
+#     deliberately holds it at "warn" until the tree is de-duplicated (PR 4.7); the allow below keeps
+#     the decision in the one file that can act on it — with a `skip` list and a per-crate reason —
+#     rather than restating it here, where the two spellings could only drift apart.
+# `priority = -1` is required for the reason the five groups above give, and for one more: the allow
+# on the next line sits at the default 0 like every named entry, so the group must sit under it or
+# `clippy::lint_groups_priority` reports the collision — and the allow itself would be overridden.
+# crates/common/tests/workspace_lints_inherited.rs notices if either line drifts.
+cargo = { level = "deny", priority = -1 }
+multiple_crate_versions = "allow"
 # Phase 26 keeps ordered sequences contiguous. `linkedlist` is pedantic (outside `clippy::all`),
 # so this named deny needs no group-priority adjustment.
 linkedlist = "deny"

@@ -129,6 +129,13 @@ fn clippy_group_deny_count(table: &str, group: &str) -> usize {
     table.lines().filter(|line| line.trim() == entry).count()
 }
 
+/// How many entries in a lint-table body pin `lint` at `allow` — the deliberate hole in a denied
+/// group, which has to be spelled out by name rather than taken by dropping the group itself.
+fn clippy_allow_count(table: &str, lint: &str) -> usize {
+    let entry = format!(r#"{lint} = "allow""#);
+    table.lines().filter(|line| line.trim() == entry).count()
+}
+
 /// The integer `key` is set to in a `clippy.toml` body, or `None` when the key is not stated at all
 /// — the difference between a threshold walrus chose and one it left at clippy's default.
 fn clippy_threshold(cfg: &str, key: &str) -> Option<u64> {
@@ -493,6 +500,80 @@ fn the_clippy_config_does_not_raise_a_perf_threshold() {
             "clippy.toml sets {key}; a perf threshold belongs in this test, not only in the config"
         );
     }
+}
+
+/// `clippy::cargo` is the sixth group pinned by name and the only one of the six that
+/// `clippy::all` does not carry, so unlike its five predecessors this entry is the *whole*
+/// enforcement: drop it and five manifest lints fall back to allow-by-default with no source file
+/// and no other manifest line to notice. Three of them have live reach in this tree the moment a
+/// wildcard requirement or a `no-`/`with-`-shaped feature name arrives. The other two are owned
+/// elsewhere, which is what the allow below the group records rather than hides:
+/// `cargo_common_metadata` skips every package that declares itself unpublishable — all six do, and
+/// `publish_policy.rs` guards that key — while `multiple_crate_versions` belongs to `deny.toml`'s
+/// `[bans]`, asserted separately below.
+///
+/// That allow is also what forces `priority = -1` here: it sits at the default 0 like every named
+/// entry in the table, so a priority-less group would both override it and go red under
+/// `clippy::lint_groups_priority`.
+#[test]
+fn the_workspace_lint_table_still_denies_the_cargo_group() {
+    let synthetic = "cargo = \"deny\"\n  multiple_crate_versions = \"allow\"\n";
+    assert_eq!(clippy_group_deny_count(synthetic, "cargo"), 0);
+    assert_eq!(clippy_deny_count(synthetic, "cargo"), 1);
+    assert_eq!(clippy_allow_count(synthetic, "multiple_crate_versions"), 1);
+    assert_eq!(clippy_allow_count(synthetic, "cargo"), 0);
+
+    let root_manifest = std::fs::read_to_string(repo_root().join("Cargo.toml")).unwrap();
+    let clippy = section(&root_manifest, "[workspace.lints.clippy]")
+        .expect("root manifest must define [workspace.lints.clippy]");
+    assert_eq!(
+        clippy_group_deny_count(clippy, "cargo"),
+        1,
+        "workspace policy must pin the cargo group at deny with priority = -1"
+    );
+    assert_eq!(
+        clippy_deny_count(clippy, "cargo"),
+        0,
+        "a priority-less `cargo = \"deny\"` collides with the named lints below it"
+    );
+    assert_eq!(
+        clippy_allow_count(clippy, "cargo"),
+        0,
+        "the cargo group is denied, never allowed wholesale — its two exceptions are named"
+    );
+    assert_eq!(
+        clippy_allow_count(clippy, "multiple_crate_versions"),
+        1,
+        "the one cargo-group member walrus does not enforce must be excused by name, not by \
+         weakening the group"
+    );
+    assert_eq!(
+        clippy_allow_count(clippy, "cargo_common_metadata"),
+        0,
+        "cargo_common_metadata is inert while every member sets publish = false; an allow would \
+         also cover the member that stops"
+    );
+}
+
+/// The receiving end of that allow: excusing `multiple_crate_versions` is a hand-off, not a
+/// dismissal. `cargo deny check` asks the same question in a compile-free CI job, over the whole
+/// lock file rather than one package's dependency graph, and its `skip` list takes a reason per
+/// crate — so what this asserts is that the key is still there to receive it. The level is
+/// deliberately not asserted: PR 4.7 set `multiple-versions` to "warn" until the tree is
+/// de-duplicated and anticipates the tightening to "deny", which must not fail this guard.
+#[test]
+fn duplicate_crate_versions_are_still_owned_by_the_supply_chain_gate() {
+    let synthetic = "[bans]\nskip = []\n";
+    assert!(section(synthetic, "[bans]").is_some_and(|bans| !bans.contains("multiple-versions")));
+
+    let deny = std::fs::read_to_string(repo_root().join("deny.toml")).unwrap();
+    let bans = section(&deny, "[bans]").expect("deny.toml must define [bans]");
+    assert!(
+        bans.lines()
+            .any(|line| line.trim_start().starts_with("multiple-versions")),
+        "deny.toml [bans] must keep stating multiple-versions — the clippy allow above hands the \
+         duplicate-crate question to it"
+    );
 }
 
 #[test]
