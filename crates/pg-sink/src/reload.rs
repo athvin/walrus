@@ -29,6 +29,7 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
 
 /// How long shutdown waits for exporters before aborting them. This is deliberately a fixed slice
 /// of the Kubernetes termination grace period; a straggler remains recoverable through lease expiry
@@ -633,7 +634,17 @@ impl ReloadController {
         // ends (any exit path). The flavor is stable across DDL-restarts, so one task = one count.
         let flavor = req.flavor.as_str();
         common::metrics::inc_reload_active(flavor);
-        exporters.spawn(async move {
+        // One span per exporter task: up to `max_concurrent_reloads` of these run at once, and the
+        // chunk engine underneath (`reload_export`) logs per chunk, per echo retry and per DDL
+        // restart — interleaved, those read as one stream of anonymous chunk lines. The span field
+        // is `source_table`, NOT `reload_id`: PR 6.8 reissues the attempt under a SUCCESSOR
+        // reload_id mid-task, so an id frozen at spawn would contradict the very events it labels,
+        // while the table being reloaded is invariant for the task's whole life (the events keep
+        // spelling the live `reload_id` themselves). `.instrument(span)` and never `span.enter()` —
+        // this future parks on chunk I/O and can resume on a different worker thread.
+        let table = format!("{}.{}", req.source_schema, req.source_table);
+        let span = tracing::info_span!("reload_export", source_table = %table);
+        let exporter = async move {
             let _permit = permit;
             // The lease-renewal target: the export loop repoints this on every DDL-restart, so
             // renewal follows the lease onto each successor row (PR 6.8).
@@ -694,7 +705,8 @@ impl ReloadController {
                 },
             }
             common::metrics::dec_reload_active(flavor); // balances the inc above (PR 6.11)
-        });
+        };
+        exporters.spawn(exporter.instrument(span));
     }
 
     /// Startup crash-recovery (PR 6.9 / H7): adopt this sink's own / orphaned `exporting` reloads

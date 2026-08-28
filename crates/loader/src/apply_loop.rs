@@ -42,6 +42,17 @@ pub(crate) fn epoch_guard(
 ///
 /// Panics if `ctx.poll_interval` is zero — [`tokio::time::interval`] rejects a zero period. The
 /// loader's config admits no zero cadence, so only a hand-built [`TableCtx`] can reach this.
+// One span per worker task: every owned table's loop runs concurrently on the SAME `LocalSet`
+// driver thread, so their lines interleave. What the span adds is the context an event cannot
+// spell for itself — `duck::in_txn`'s rollback warning, and every `log`-bridged sqlx/DuckDB record
+// emitted while this worker is polled, now name the table they belong to. The events below keep
+// their own `table` field regardless: a span ADDS context rather than relocating it, since the
+// JSON formatter renders event fields under `fields` and span fields under `span`/`spans` — two
+// query paths, pinned by `crates/common/src/telemetry_test.rs`.
+// `#[instrument]` and not `span.enter()`, because this loop awaits and a guard held across
+// `.await` follows the executor onto whichever task it resumed next. `ctx` is skipped (it owns the
+// pool and the DuckDB connection); `series` is its precomputed `"<schema>.<table>"`.
+#[tracing::instrument(skip_all, fields(table = %ctx.series))]
 pub async fn apply_loop(ctx: TableCtx, shutdown: CancellationToken) -> Result<(), LoaderError> {
     let mut tick = tokio::time::interval(ctx.poll_interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

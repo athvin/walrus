@@ -35,6 +35,7 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_postgres::NoTls;
+use tracing::Instrument as _;
 
 /// What one chunk did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,11 +132,17 @@ impl ChunkExporter {
         let (client, connection) = tokio_postgres::connect(source_db_url, NoTls)
             .await
             .context("open chunk-export SQL connection")?;
-        tokio::spawn(async move {
+        // `tokio::spawn` starts its task with an EMPTY span stack — the caller's span is
+        // thread-local to whoever polls it, not something a spawn inherits — so this driver's one
+        // warning would name no reload at all. `in_current_span` copies the exporter task's span
+        // (`reload::spawn_exporter`) onto the new task, which is what makes a dropped side
+        // connection attributable to the export it was dialled for.
+        let driver = async move {
             if let Err(e) = connection.await {
                 tracing::warn!(error = %e, "chunk-export SQL connection closed");
             }
-        });
+        };
+        tokio::spawn(driver.in_current_span());
         // The registry chain (control-pg) and the PK-index read (the SOURCE catalog) hit different
         // servers and neither consumes the other's output, so this dial-up costs the slower of the
         // two instead of their sum — `main::establish_stream`'s argument, paid on every attempt and

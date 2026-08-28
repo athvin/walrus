@@ -1,5 +1,48 @@
 use super::*;
 use crate::{CommonConfig, Error, FailureClass};
+use std::io::Write;
+use std::sync::{Arc, Mutex};
+use tracing_subscriber::fmt::MakeWriter;
+
+/// A `MakeWriter` that captures everything written into a shared buffer.
+#[derive(Clone, Default)]
+struct BufWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for BufWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for BufWriter {
+    type Writer = BufWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Capture `body`'s events through a *scoped* JSON subscriber (`with_default`) so we don't fight
+/// the one global install, returning what it wrote.
+fn capture_json(body: impl FnOnce()) -> String {
+    // Ensure a global subscriber exists so the level fast-path admits INFO events.
+    let _ = init_tracing(&TelemetryConfig::default());
+
+    let buf = BufWriter::default();
+    let subscriber = tracing_subscriber::registry()
+        .with(EnvFilter::new("info"))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(buf.clone()),
+        );
+
+    tracing::subscriber::with_default(subscriber, body);
+    String::from_utf8(buf.0.lock().unwrap().clone()).unwrap()
+}
 
 /// Run `body` inside a hermetic config environment so env changes cannot leak between tests.
 #[allow(
@@ -87,43 +130,7 @@ fn default_config_is_pretty_info() {
 
 #[test]
 fn json_flag_selects_json_formatter() {
-    use std::io::Write;
-    use std::sync::{Arc, Mutex};
-    use tracing_subscriber::fmt::MakeWriter;
-
-    // A `MakeWriter` that captures everything written into a shared buffer.
-    #[derive(Clone, Default)]
-    struct BufWriter(Arc<Mutex<Vec<u8>>>);
-    impl Write for BufWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    impl<'a> MakeWriter<'a> for BufWriter {
-        type Writer = BufWriter;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    // Ensure a global subscriber exists so the level fast-path admits INFO events, then capture
-    // via a *scoped* JSON subscriber (`with_default`) so we don't fight the one global install.
-    let _ = init_tracing(&TelemetryConfig::default());
-
-    let buf = BufWriter::default();
-    let subscriber = tracing_subscriber::registry()
-        .with(EnvFilter::new("info"))
-        .with(
-            tracing_subscriber::fmt::layer()
-                .json()
-                .with_writer(buf.clone()),
-        );
-
-    tracing::subscriber::with_default(subscriber, || {
+    let out = capture_json(|| {
         tracing::info!(
             commit_lsn = "0000000001B4C000",
             xid = 918273,
@@ -131,7 +138,6 @@ fn json_flag_selects_json_formatter() {
         );
     });
 
-    let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
     assert!(
         out.trim_start().starts_with('{'),
         "expected a JSON object: {out}"
@@ -143,5 +149,36 @@ fn json_flag_selects_json_formatter() {
     assert!(
         out.contains("\"flushed batch\""),
         "carries the message: {out}"
+    );
+}
+
+/// A span's fields and an event's own fields render at DIFFERENT JSON paths — `span`/`spans`
+/// versus `fields` — so a span is additive context, never a substitute for the event field a
+/// dashboard queries. That distinction is why `loader::apply_loop`'s per-worker span and
+/// `pg_sink::reload::spawn_exporter`'s per-exporter span were added *alongside* the `table` /
+/// `source_table` fields their events already spell, rather than replacing them; nothing else in
+/// the suite notices if a later cleanup deletes the duplicates and moves the queried key.
+#[test]
+fn span_fields_render_beside_event_fields_not_in_place_of_them() {
+    let out = capture_json(|| {
+        let span = tracing::info_span!("apply_loop", table = "public.orders");
+        // Sync body, so an entry guard is the right tool here — the async call sites use
+        // `#[instrument]` / `.instrument(span)` precisely because a guard cannot cross an `.await`.
+        let _guard = span.enter();
+        tracing::info!(transformed = "0000000001B4C000", "Phase B: mirror updated");
+    });
+
+    let event: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(
+        event["span"]["table"], "public.orders",
+        "the span field must survive into the event's span context: {out}"
+    );
+    assert!(
+        event["fields"].get("table").is_none(),
+        "a span field must NOT appear among the event's own fields: {out}"
+    );
+    assert_eq!(
+        event["fields"]["transformed"], "0000000001B4C000",
+        "the event keeps its own fields under `fields`: {out}"
     );
 }
