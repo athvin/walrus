@@ -2,10 +2,16 @@ use super::*;
 use crate::relcache::RelationCache;
 use arrow::array::StringArray;
 use common::{Kind, Op, PgColumn, PgRelation, ReplicaIdentity, SchemaVersionNo, UtcTimestamp};
+use parking_lot::Mutex;
 use pg_to_arrow::oids;
-use std::sync::Mutex;
 
 /// A hand-advanced clock for the `max_fill` test.
+///
+/// [`Clock`] is `Send + Sync` and every owner holds its clock behind an `Arc`, so the mutable
+/// offset needs a *lock* — a `Cell`/`RefCell` would make `FakeClock` `!Sync` and stop satisfying
+/// the bound. `parking_lot::Mutex` is the workspace's lock for the reason
+/// `docs/implementation/notes/rust-skills/own-mutex-interior.md` records: it is non-poisoning, so
+/// `lock()` hands back the guard directly instead of a `Result` that invites `unwrap()`.
 #[derive(Debug)]
 struct FakeClock {
     base: Instant,
@@ -19,13 +25,13 @@ impl FakeClock {
         })
     }
     fn advance(&self, d: Duration) {
-        *self.offset.lock().unwrap() += d;
+        *self.offset.lock() += d;
     }
 }
 impl super::private::Sealed for FakeClock {}
 impl Clock for FakeClock {
     fn now(&self) -> Instant {
-        self.base + *self.offset.lock().unwrap()
+        self.base + *self.offset.lock()
     }
 }
 
