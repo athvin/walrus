@@ -32,8 +32,9 @@ it:
 # Criterion micro-benches: sink decode + Arrow batch building (PR 5.4) and the loader's transform +
 # Phase-A append (PR 5.5). Run on a quiet machine; results print to stdout. Never a CI gate (shared
 # runners are too noisy) — CI only compile-checks the bench targets via `clippy --all-targets`.
-# Baselines live in docs/benchmarks.md. The loader targets build DuckDB (`bundled`), so a cold first
-# run compiles for ~20 min before it measures anything; the 1M-row transform grid takes minutes.
+# Baselines *and* the profiling workflow — how to get from "this bench is slow" to a flamegraph —
+# live in docs/benchmarks.md. The loader targets build DuckDB (`bundled`), so a cold first run
+# compiles for ~20 min before it measures anything; the 1M-row transform grid takes minutes.
 bench:
     cargo bench -p pg-sink -p pg-to-arrow -p loader
 

@@ -53,6 +53,66 @@ Criterion re-runs each bench against the stored sample and reports the change pl
 its noise threshold, which is what "within noise" in the tables below should mean from here on.
 Baselines live under `target/criterion/`, so `cargo clean` discards them.
 
+## Profiling — finding the hot spot
+
+The benches say **how fast** a path is; they do not say **where the time goes inside it**. The order
+this file records is: bench the path, profile it, change one thing, re-measure against a saved
+baseline. Every entry under [History](#history) cites a measured delta for that reason — including
+the honest nulls (PR 5.7's thin LTO, PR 5.8's TOAST back-scan) and the declines (PR 11.13 `SmallVec`,
+PR 11.16 compact strings), which are only defensible because a measurement exists. None of the below
+is a CI gate, and none of it adds a dependency: each profiler attaches to a binary the recipes above
+already build.
+
+### Debug info, per invocation
+
+`[profile.release]` carries only `lto = "thin"`, so release and `bench` builds compile without debug
+info and profiles come back with thin, cross-crate-inlined frames. Ask for symbols through the
+environment rather than the manifest — a committed `.cargo/config.toml` is forbidden anywhere in the
+workspace (`crates/common/tests/build_profile.rs::no_cargo_config_exists`), and the release artifact
+should stay the one the numbers here describe:
+
+```
+CARGO_PROFILE_BENCH_DEBUG=1 cargo bench -p pg-sink --bench decode -- --profile-time 10
+CARGO_PROFILE_RELEASE_DEBUG=1 cargo build --release -p pg-sink -p loader
+```
+
+`--profile-time N` is criterion's external-profiler mode: it iterates each bench for ~N seconds and
+skips the statistical analysis, so the samples belong to the routine rather than to criterion.
+
+### One path (a criterion bench)
+
+macOS (the reference machine), after `cargo install cargo-instruments` (needs Xcode):
+
+```
+cargo instruments -p pg-sink -t time --bench decode -- --profile-time 10       # CPU
+cargo instruments -p pg-to-arrow -t alloc --bench batch -- --profile-time 10   # allocations
+```
+
+Linux — run the bench binary whose path `cargo bench` prints, under `perf`:
+
+```
+perf record -g target/release/deps/decode-<hash> --profile-time 10
+perf script | inferno-collapse-perf | inferno-flamegraph > flamegraph.svg
+```
+
+### The whole service, under load
+
+A micro-bench ranks suspects inside one function; it cannot see a bottleneck that appears only with
+the real stack attached — which is how PR 5.6 found the loader saturating first while the sink's
+`inflight` stayed 0. Run `just bench-e2e <scenario>` and sample the *running* release process:
+`sample <pid>` or Instruments' attach on macOS, `perf record -g -p <pid>` on Linux. The script starts
+`target/release/walrus-pg-sink` and `target/release/walrus-loader` and holds both PIDs.
+
+### Two walrus-specific caveats
+
+- **The loader's time is mostly not Rust.** PR 5.5's `EXPLAIN ANALYZE` (below) is the profiler for
+  the transform: the cost centre is DuckDB's window/group-by, so a Rust sampler mostly shows the
+  worker parked in `duckdb` FFI. Profile the SQL first and the Rust caller second.
+- **Allocation questions need an allocation profiler, not a guess.** PR 11.16 defers `SinkMeta`
+  compact strings *until allocation profiling shows those strings limit the sink end to end*; the
+  measurement that re-opens it is `-t alloc` above (or `heaptrack` on Linux) over `append_row` plus a
+  `bench-e2e` sink run — not a new global-allocator dev-dependency taken on spec.
+
 ## Baselines (PR 5.4)
 
 Medians from the reference machine. `ns/row` = median ÷ rows (10 000 for decode, 1 000 for Arrow).
