@@ -129,6 +129,19 @@ fn clippy_group_deny_count(table: &str, group: &str) -> usize {
     table.lines().filter(|line| line.trim() == entry).count()
 }
 
+/// The integer `key` is set to in a `clippy.toml` body, or `None` when the key is not stated at all
+/// — the difference between a threshold walrus chose and one it left at clippy's default.
+fn clippy_threshold(cfg: &str, key: &str) -> Option<u64> {
+    for line in cfg.lines() {
+        if let Some(rest) = line.trim().strip_prefix(key)
+            && let Some(value) = rest.trim_start().strip_prefix('=')
+        {
+            return value.trim().parse().ok();
+        }
+    }
+    None
+}
+
 #[test]
 fn every_member_opts_into_the_workspace_lint_table() {
     let wrapped_members = r#"[workspace]
@@ -384,6 +397,100 @@ fn the_clippy_config_does_not_raise_a_complexity_threshold() {
         assert!(
             !cfg.lines().any(|line| line.trim_start().starts_with(key)),
             "clippy.toml sets {key}, which can only weaken the denied complexity group"
+        );
+    }
+}
+
+/// `clippy::perf` is the fifth and last group `clippy::all` carries. Where complexity flags code
+/// that takes the long way round, perf flags code that takes a fine way round and still asks the
+/// machine for work nobody needs — `single_char_pattern`, `unnecessary_to_owned`, `manual_memcpy`,
+/// `slow_vector_initialization`, `large_enum_variant`, `result_large_err`. The named entry costs no
+/// diagnostic today, exactly as its four siblings do; what it buys is that a regrouping of
+/// `clippy::all` cannot take the group away in silence.
+///
+/// `priority = -1` is required for complexity's reason rather than style's: this group has no
+/// member named below it either — the tree's large-value gates are pedantic or nursery lints — and
+/// `clippy::lint_groups_priority` measures a group against every named lint in the table, not only
+/// the ones it carries.
+#[test]
+fn the_workspace_lint_table_still_denies_the_perf_group() {
+    let synthetic = "perf = \"deny\"\n";
+    assert_eq!(clippy_group_deny_count(synthetic, "perf"), 0);
+    assert_eq!(clippy_deny_count(synthetic, "perf"), 1);
+
+    let root_manifest = std::fs::read_to_string(repo_root().join("Cargo.toml")).unwrap();
+    let clippy = section(&root_manifest, "[workspace.lints.clippy]")
+        .expect("root manifest must define [workspace.lints.clippy]");
+    assert_eq!(
+        clippy_group_deny_count(clippy, "perf"),
+        1,
+        "workspace policy must pin the perf group at deny with priority = -1"
+    );
+    assert_eq!(
+        clippy_deny_count(clippy, "perf"),
+        0,
+        "a priority-less `perf = \"deny\"` collides with the named lints below it"
+    );
+}
+
+/// The perf group's suppressions, and the widest live reach of the five groups: four
+/// `result_large_err` allows, one per copy of the `figment::Jail` `in_jail` helper. That closure
+/// must hand back `Result<(), figment::Error>`, and figment sizes that error — the helper is
+/// `#[cfg(test)]`-private to each crate, so the four copies are deliberate rather than a shared
+/// export. As with the style and complexity guards above, what this pins is the count *in these
+/// files*: a fifth suppression is a policy decision to be taken here, not in a source file.
+#[test]
+fn the_perf_group_carries_exactly_four_scoped_allows() {
+    const JAIL_HELPERS: [&str; 4] = [
+        include_str!("../src/config_test.rs"),
+        include_str!("../src/telemetry_test.rs"),
+        include_str!("../../loader/src/config_test.rs"),
+        include_str!("../../pg-sink/src/config_test.rs"),
+    ];
+
+    for helper in JAIL_HELPERS {
+        assert_eq!(helper.matches("clippy::result_large_err").count(), 1);
+        assert!(helper.contains("reason = \"figment Jail requires Result<(), figment::Error>"));
+    }
+}
+
+/// The perf group's four configurable members. `large_enum_variant`, `result_large_err`,
+/// `useless_vec` and `large_const_arrays` read their limits from `clippy.toml` rather than from the
+/// lint table, so raising one silences the lint with the group's deny still in place and nothing in
+/// the manifest moved. walrus states exactly one of the four keys and it *lowers* a limit —
+/// `enum-variant-size-threshold = 64`, under a third of clippy's 200-byte default — so the
+/// assertion is on the value, not on the key's presence. The other three stay unstated, on the
+/// strength of PR 9.7's recorded decision that a threshold move is a separate, noisier call.
+#[test]
+fn the_clippy_config_does_not_raise_a_perf_threshold() {
+    let synthetic = "enum-variant-size-threshold = 64\nlarge-error-threshold=256\n";
+    assert_eq!(
+        clippy_threshold(synthetic, "enum-variant-size-threshold"),
+        Some(64)
+    );
+    assert_eq!(
+        clippy_threshold(synthetic, "large-error-threshold"),
+        Some(256)
+    );
+    assert_eq!(clippy_threshold(synthetic, "too-large-for-stack"), None);
+
+    let cfg = std::fs::read_to_string(repo_root().join("clippy.toml")).unwrap();
+    let enum_variant = clippy_threshold(&cfg, "enum-variant-size-threshold")
+        .expect("clippy.toml must state enum-variant-size-threshold");
+    assert!(
+        enum_variant <= 200,
+        "enum-variant-size-threshold = {enum_variant} sits above clippy's default, which can only \
+         weaken the denied perf group"
+    );
+    for key in [
+        "large-error-threshold",
+        "too-large-for-stack",
+        "array-size-threshold",
+    ] {
+        assert_eq!(
+            clippy_threshold(&cfg, key),
+            None,
+            "clippy.toml sets {key}; a perf threshold belongs in this test, not only in the config"
         );
     }
 }

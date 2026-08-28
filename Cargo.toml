@@ -93,6 +93,26 @@ style = { level = "deny", priority = -1 }
 # against every named lint in the table, not only the ones it carries, and all of them sit at the
 # default 0. crates/common/tests/workspace_lints_inherited.rs notices if any of that drifts.
 complexity = { level = "deny", priority = -1 }
+# `clippy::perf` is the fifth and last group `clippy::all` carries, and its subject is neither
+# wrongness nor spelling: code that is correct, idiomatically spelled, as short as it goes — and
+# still asks the machine for work nobody needs. `single_char_pattern`, `unnecessary_to_owned`,
+# `manual_memcpy`, `slow_vector_initialization`, `large_enum_variant`, `result_large_err`. Pinned
+# by name for the reason the four above are: the entry changes no diagnostic today, only what a
+# regrouping of `clippy::all` — or a member downgrading that one entry — can quietly take away.
+# Its reach in the tree is the widest of the five: four scoped allows, one per copy of the
+# `figment::Jail` `in_jail` test helper, whose `Result<(), figment::Error>` return figment sizes
+# rather than walrus. Four of its lints read their limits from `clippy.toml` instead of from here,
+# so *raising* one silences the lint with this deny still in place: walrus lowers
+# `enum-variant-size-threshold` to 64 — under a third of clippy's default — and leaves
+# `large-error-threshold`, `too-large-for-stack` and `array-size-threshold` unstated, PR 9.7 having
+# recorded that a threshold move is a separate, noisier decision. No lint named below belongs to
+# this group: its nearest neighbours here are pedantic or nursery (`large_types_passed_by_value`,
+# `large_stack_arrays`, `large_futures`, `large_stack_frames`, `redundant_clone`), and
+# `format_push_string` / `rc_buffer` are restriction. So `priority = -1` is required here for
+# complexity's reason rather than style's — `clippy::lint_groups_priority` measures a group against
+# every named lint in the table, not only the ones it carries, and all of them sit at the default 0.
+# crates/common/tests/workspace_lints_inherited.rs notices if any of that drifts.
+perf = { level = "deny", priority = -1 }
 # Phase 26 keeps ordered sequences contiguous. `linkedlist` is pedantic (outside `clippy::all`),
 # so this named deny needs no group-priority adjustment.
 linkedlist = "deny"
