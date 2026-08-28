@@ -107,6 +107,15 @@ fn tier_matches_emit_fields_for_every_supported_oid() {
 }
 
 #[test]
+fn unmapped_builtin_oid_is_the_only_describe_failure() {
+    // money (790) is a builtin with no mapping, and 790 < FIRST_NORMAL_OID so the enum rule does
+    // not claim it either. Every descriptor field routes through `emit_fields`, so this is the one
+    // failure `describe_column`'s `# Errors` promises for a `#[non_exhaustive]` enum.
+    let err = describe_column(&col("price", 790, -1)).unwrap_err();
+    assert!(matches!(err, Error::NotTier1 { oid: 790, typmod: -1 }));
+}
+
+#[test]
 fn descriptor_json_roundtrips() {
     let d = describe_column(&col("duration", oids::INTERVAL, -1)).unwrap();
     let json = serde_json::to_string(&d).unwrap();

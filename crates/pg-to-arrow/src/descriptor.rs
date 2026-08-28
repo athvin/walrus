@@ -21,7 +21,9 @@ use std::num::NonZeroU32;
 ///
 /// # Errors
 ///
-/// Returns [`Error`] when the column cannot be mapped to its emitted Arrow fields.
+/// Returns [`Error::NotTier1`] carrying the column's OID and typmod when it maps to no supported
+/// tier. Every descriptor field is derived from [`schema::emit_fields`], so that is the only
+/// failure reachable here.
 #[must_use = "the descriptor error must be handled"]
 pub fn describe_column(col: &PgColumn) -> Result<TypeDescriptor, Error> {
     describe_column_with_labels(col, None)
@@ -31,7 +33,10 @@ pub fn describe_column(col: &PgColumn) -> Result<TypeDescriptor, Error> {
 ///
 /// # Errors
 ///
-/// Returns [`Error`] when the column cannot be mapped to its emitted Arrow fields.
+/// Returns [`Error::NotTier1`] carrying `col`'s OID and typmod when it maps to no supported tier.
+/// The `arrow`, `duckdb`, and `emit` fields all route through [`schema::emit_fields`], and the
+/// remaining fields are infallible, so no other variant can surface. `enum_labels` is never
+/// validated here — a label set for a non-enum column is ignored, not rejected.
 #[must_use = "the descriptor error must be handled"]
 pub fn describe_column_with_labels(
     col: &PgColumn,
@@ -55,7 +60,10 @@ pub fn describe_column_with_labels(
 ///
 /// # Errors
 ///
-/// Returns [`Error`] when any column cannot be mapped to its emitted Arrow fields.
+/// Returns the [`Error::NotTier1`] of the **first** column that maps to no supported tier: the
+/// walk short-circuits there, so a relation with several unmappable columns reports only the
+/// earliest. An empty relation is `Ok(vec![])` — [`schema::build_schema`], not this function, is
+/// what rejects it with [`Error::EmptyRelation`].
 pub fn describe_relation(rel: &PgRelation) -> Result<Vec<TypeDescriptor>, Error> {
     rel.columns.iter().map(describe_column).collect()
 }
