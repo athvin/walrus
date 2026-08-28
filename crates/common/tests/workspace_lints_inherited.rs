@@ -280,6 +280,33 @@ fn the_workspace_lint_table_still_denies_raw_stream_prints() {
     }
 }
 
+/// Multi-file module layout is a convention with nothing behind it: `foo.rs` + `foo/` and
+/// `foo/mod.rs` both compile, so a second style can arrive one directory at a time. walrus has
+/// exactly one such directory (`crates/pg-sink/src/pgoutput/`) and it uses `mod.rs`, which means
+/// this lint has zero sites — no source file goes red if the entry is dropped, so this test is the
+/// thing that does. Its inverse must stay absent for the same reason it was not chosen: enabling
+/// `mod_module_files` would ban the very file the tree standardised on.
+#[test]
+fn the_workspace_lint_table_still_pins_one_module_layout() {
+    let synthetic = "self_named_module_files = \"warn\"\n  mod_module_files = \"deny\"\n";
+    assert_eq!(clippy_deny_count(synthetic, "self_named_module_files"), 0);
+    assert_eq!(clippy_deny_count(synthetic, "mod_module_files"), 1);
+
+    let root_manifest = std::fs::read_to_string(repo_root().join("Cargo.toml")).unwrap();
+    let clippy = section(&root_manifest, "[workspace.lints.clippy]")
+        .expect("root manifest must define [workspace.lints.clippy]");
+    assert_eq!(
+        clippy_deny_count(clippy, "self_named_module_files"),
+        1,
+        "workspace policy must pin self_named_module_files = \"deny\" exactly once"
+    );
+    assert_eq!(
+        clippy_deny_count(clippy, "mod_module_files"),
+        0,
+        "mod_module_files is the inverse policy — it would ban pgoutput/mod.rs"
+    );
+}
+
 #[test]
 fn the_clippy_carve_out_is_still_scoped_to_tests() {
     let cfg = std::fs::read_to_string(repo_root().join("clippy.toml")).unwrap();

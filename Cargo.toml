@@ -176,6 +176,14 @@ elidable_lifetime_names = "deny"
 type_repetition_in_bounds = "deny"
 trait_duplication_in_bounds = "deny"
 multiple_bound_locations = "deny"
+# Module layout is one style, not two. `crates/pg-sink/src/pgoutput/` is the tree's only
+# multi-file module directory, and it carries a `mod.rs`. This restriction lint (outside
+# `clippy::all`, so no priority juggling) turns a future `foo.rs` + `foo/` pair into a build
+# failure instead of a second convention. It has zero sites today, so nothing but
+# crates/common/tests/workspace_lints_inherited.rs notices if the entry is dropped. Its inverse,
+# `mod_module_files`, must stay absent: it bans the `mod.rs` walrus standardised on, and that
+# file's path is pinned by crates/common/tests/const_invariant_compile_fail.rs.
+self_named_module_files = "deny"
 
 [workspace.dependencies]
 # Shared version pins land here as later PRs add deps (tracing, sqlx, arrow, …).
