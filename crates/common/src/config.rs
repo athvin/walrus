@@ -81,8 +81,13 @@ impl CommonConfig {
 
         let mut figment = Figment::new();
 
-        // Optional file underneath, chosen by extension (default TOML).
-        if let Ok(path) = std::env::var("WALRUS_CONFIG") {
+        // Optional file underneath, chosen by extension (default TOML). `var_os`, not `var`: the
+        // only thing the `Result` adds here is a `VarError` for an `if let Ok` to drop, and its two
+        // variants are not the same event. `NotPresent` is the documented no-file case; `NotUnicode`
+        // is an operator who set a path this process then ignored in silence, leaving `validate()`
+        // to blame a missing field instead. `Option` is the honest type — `None` *is* "unset" —
+        // and `PathBuf: From<OsString>`, so a path the OS accepts is simply opened.
+        if let Some(path) = std::env::var_os("WALRUS_CONFIG") {
             let path = std::path::PathBuf::from(path);
             let is_yaml = matches!(
                 path.extension().and_then(|e| e.to_str()),

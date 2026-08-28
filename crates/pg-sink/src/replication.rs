@@ -541,6 +541,10 @@ impl<S: Send> ReplicationStream<S> {
 
 /// Micros since the Postgres epoch (2000-01-01), for the standby-status timestamp.
 fn pg_epoch_micros() -> i64 {
+    // INTENTIONAL discard: `duration_since` fails only on a clock set before 1970, this runs once
+    // per feedback frame (so a log would flood rather than inform), and there is no `Result` to
+    // return through — a keepalive must not fail on a clock quirk. Zero back-dates the stamp, which
+    // Postgres reads for `pg_stat_replication` lag only; slot advancement rides the LSNs beside it.
     let unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();

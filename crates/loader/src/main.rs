@@ -295,8 +295,31 @@ fn duck_s3_access(cfg: &LoaderConfig) -> loader::duck::S3Access {
     loader::duck::S3Access {
         endpoint: endpoint.to_string(),
         region: cfg.object_store.region.clone(),
-        access_key_id: std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_default(),
-        secret_access_key: std::env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_default(),
+        access_key_id: aws_credential("AWS_ACCESS_KEY_ID"),
+        secret_access_key: aws_credential("AWS_SECRET_ACCESS_KEY"),
         use_ssl,
+    }
+}
+
+/// One AWS credential from the environment, empty when it is not readable.
+///
+/// The empty fallback stays: DuckDB httpfs with no key reaches an anonymous bucket, and failing
+/// startup here would reject that deployment. What does not stay is the silence. Every
+/// configuration walrus ships sets both variables (`.env.example`, `scripts/sink-smoke.sh`,
+/// `scripts/bench-e2e.sh`, the e2e harness), so an unset one is almost always the cause of the
+/// opaque 403 a worker meets much later, on its first `read_parquet('s3://…')` — with nothing on
+/// disk connecting the two. `unwrap_or_default` dropped exactly the `VarError` that names it.
+fn aws_credential(var: &'static str) -> String {
+    match std::env::var(var) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(
+                var,
+                %error,
+                "AWS credential unreadable from the environment; DuckDB will read the staging \
+                 bucket without one — expect an S3 authentication failure unless it is public"
+            );
+            String::new()
+        }
     }
 }

@@ -172,7 +172,10 @@ impl SinkConfig {
         use figment::providers::{Env, Format, Toml, Yaml};
 
         let mut figment = Figment::new();
-        if let Ok(path) = std::env::var("WALRUS_CONFIG") {
+        // `var_os` rather than `var`, for the reason `CommonConfig::load` gives at length: the
+        // `Result` here exists only to have its `VarError` discarded by an `if let Ok`, which
+        // silently equates "unset" with "set to a path that is not UTF-8". `None` means unset.
+        if let Some(path) = std::env::var_os("WALRUS_CONFIG") {
             let path = std::path::PathBuf::from(path);
             let is_yaml = matches!(
                 path.extension().and_then(|e| e.to_str()),
