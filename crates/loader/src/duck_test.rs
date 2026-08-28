@@ -189,10 +189,8 @@ fn owned_duckdb_handles_meet_the_blocking_pool_send_bound() {
 /// (the real commit LSN), while a non-spill file appends the per-row value verbatim.
 #[test]
 fn spill_override_stamps_lsn_end_but_verbatim_otherwise() {
-    let dir = std::env::temp_dir().join("walrus-loader-spill-override");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let db = TableDb::open(dir.join("orders.duckdb")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = TableDb::open(dir.path().join("orders.duckdb")).unwrap();
     db.ensure_tables(&orders(), common::SchemaVersionNo(1))
         .unwrap();
     // Local Parquet + JSON extraction need the json extension (no S3 here → configure_s3 is not called).
@@ -201,7 +199,7 @@ fn spill_override_stamps_lsn_end_but_verbatim_otherwise() {
     // A spill file: rows carry the placeholder `0000000000000064`, but the file committed at `…00C8`.
     let placeholder = "0000000000000064";
     let lsn_end = "00000000000000C8";
-    let spill = write_local_fixture(&dir, "spill.parquet", (1, 2), placeholder);
+    let spill = write_local_fixture(dir.path(), "spill.parquet", (1, 2), placeholder);
     let n = db
         .append_parquet("orders", &spill, common::SchemaVersionNo(1), Some(lsn_end))
         .unwrap();
@@ -213,7 +211,7 @@ fn spill_override_stamps_lsn_end_but_verbatim_otherwise() {
     );
 
     // A non-spill (verbatim) file: the per-row placeholder is preserved.
-    let batch = write_local_fixture(&dir, "batch.parquet", (3, 4), placeholder);
+    let batch = write_local_fixture(dir.path(), "batch.parquet", (3, 4), placeholder);
     let n = db
         .append_parquet("orders", &batch, common::SchemaVersionNo(1), None)
         .unwrap();

@@ -54,11 +54,11 @@ fn orders() -> PgRelation {
     }
 }
 
-fn tmpdir(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("walrus-loader-shut-{name}"));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+/// A scratch directory for one test's `.duckdb` file. The returned guard deletes it on drop — even
+/// when an assertion panics, which a trailing `remove_dir_all` would skip.
+fn tmpdir(name: &str) -> tempfile::TempDir {
+    let prefix = format!("walrus-loader-shut-{name}-");
+    tempfile::Builder::new().prefix(&prefix).tempdir().unwrap()
 }
 
 fn meta(op: &str, commit_hex: &str, l: u64) -> String {
@@ -222,7 +222,7 @@ async fn sigterm_mid_apply_commits_both_watermarks_and_releases_lease() {
         .expect("free lease acquired");
 
     let dir = tmpdir(&epoch.to_string());
-    let path = dir.join("orders.duckdb");
+    let path = dir.path().join("orders.duckdb");
     // Long poll so exactly ONE cycle runs (first tick fires immediately), then the drain returns.
     let ctx = ctx_on(
         pool.clone(),
@@ -256,7 +256,6 @@ async fn sigterm_mid_apply_commits_both_watermarks_and_releases_lease() {
         TableDb::open(&path).is_ok(),
         "file closed cleanly — no stale lock"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---- An in-flight full-rebuild is aborted (rolled back) on SIGTERM, not waited on. ----
@@ -264,7 +263,7 @@ async fn sigterm_mid_apply_commits_both_watermarks_and_releases_lease() {
 #[ignore = "requires a real .duckdb file (interrupt across threads)"]
 async fn in_flight_full_rebuild_is_aborted_on_sigterm() {
     let dir = tmpdir("abort");
-    let db = TableDb::open(dir.join("orders.duckdb")).unwrap();
+    let db = TableDb::open(dir.path().join("orders.duckdb")).unwrap();
     db.ensure_tables(&orders(), common::SchemaVersionNo(1))
         .unwrap();
     let t = TransformSql::from_relation(&orders());
@@ -322,7 +321,6 @@ async fn in_flight_full_rebuild_is_aborted_on_sigterm() {
         s, "ORIGINAL",
         "the committed value is intact after the abort"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---- A replacement loader resumes from the two watermarks: no loss, no duplicate application. ----
@@ -336,7 +334,7 @@ async fn a_replacement_loader_resumes_from_the_two_watermarks() {
     clean(&pool, epoch).await;
 
     let dir = tmpdir(&epoch.to_string());
-    let path = dir.join("orders.duckdb");
+    let path = dir.path().join("orders.duckdb");
 
     // File 1 processed by the first worker, then SIGTERM drains it.
     let f1 = write_row(epoch, "f1", 1, "v1", "i", "0000000000000064", 1);
@@ -415,5 +413,4 @@ async fn a_replacement_loader_resumes_from_the_two_watermarks() {
         .unwrap()
         .unwrap();
     assert_eq!(cp.transformed_lsn, "0/C8".parse::<Lsn>().unwrap());
-    let _ = std::fs::remove_dir_all(&dir);
 }

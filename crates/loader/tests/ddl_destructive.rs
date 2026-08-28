@@ -77,11 +77,11 @@ fn table_exists(conn: &duckdb::Connection, name: &str) -> bool {
     n > 0
 }
 
-fn tmpdir(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("walrus-loader-ddld-{name}"));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+/// A scratch directory for one test's `.duckdb` file. The returned guard deletes it on drop — even
+/// when an assertion panics, which a trailing `remove_dir_all` would skip.
+fn tmpdir(name: &str) -> tempfile::TempDir {
+    let prefix = format!("walrus-loader-ddld-{name}-");
+    tempfile::Builder::new().prefix(&prefix).tempdir().unwrap()
 }
 
 // ---- DROP COLUMN: physical on the mirror, retained-nullable on raw. ----
@@ -180,7 +180,7 @@ fn lossy_type_change_widens_raw_to_varchar_without_recasting() {
 #[tokio::test]
 async fn drop_table_retires_both_tables_and_the_file() {
     let dir = tmpdir("drop");
-    let path = dir.join("orders.duckdb");
+    let path = dir.path().join("orders.duckdb");
     {
         let db = TableDb::open(&path).unwrap();
         db.ensure_tables(
@@ -210,7 +210,6 @@ async fn drop_table_retires_both_tables_and_the_file() {
     // above passes `&PathBuf`) because `retire_file` takes a borrowed path view, not one exact type.
     retire_file(path.to_str().unwrap()).await.unwrap();
     assert!(!path.exists(), "the retire re-run left the file absent");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---- Compose: a lossy cast that fails quarantines the table and degrades /ready. ----
@@ -333,7 +332,7 @@ async fn lossy_cast_failure_quarantines_the_table_and_alerts() {
     .unwrap();
 
     let dir = tmpdir(&epoch.to_string());
-    let db = TableDb::open(dir.join("orders.duckdb")).unwrap();
+    let db = TableDb::open(dir.path().join("orders.duckdb")).unwrap();
     db.ensure_tables(&orders_v1, common::SchemaVersionNo(1))
         .unwrap();
     db.configure_s3(&s3()).unwrap();
@@ -419,6 +418,4 @@ async fn lossy_cast_failure_quarantines_the_table_and_alerts() {
         )
         .unwrap();
     assert_eq!(raw_type, "VARCHAR", "raw widened to VARCHAR, not re-cast");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

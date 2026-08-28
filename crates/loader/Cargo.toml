@@ -44,6 +44,8 @@ tokio = { workspace = true, features = ["io-util"] }
 criterion = { workspace = true }
 # The append bench generates a local Parquet fixture with the sink's own writer (Arrow → Parquet).
 pg-to-arrow = { path = "../pg-to-arrow" }
+# RAII scratch fixtures: the bench's Parquet file and every test that needs a real `.duckdb` file.
+# The guard deletes the directory on drop, so a panicking assertion cannot leak it.
 tempfile = { workspace = true }
 
 # `harness = false` hands the bench binary to criterion_main! instead of the libtest bench harness.

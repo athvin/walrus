@@ -27,10 +27,9 @@ fn open_fresh(dir: &Path) -> TableDb {
 
 #[test]
 fn rebuild_wipes_a_stale_generation_and_is_idempotent() {
-    let dir = std::env::temp_dir().join("walrus-loader-epoch-rebuild");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let db = open_fresh(&dir);
+    // The guard removes the directory on drop — including on an assertion panic below.
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_fresh(dir.path());
 
     // A file built for epoch 1 with a row in raw + mirror.
     db.set_built_epoch(common::EpochNo(1)).unwrap();
@@ -65,10 +64,8 @@ fn rebuild_wipes_a_stale_generation_and_is_idempotent() {
 
 #[test]
 fn fresh_file_is_not_rebuilt() {
-    let dir = std::env::temp_dir().join("walrus-loader-epoch-fresh");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let db = open_fresh(&dir);
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_fresh(dir.path());
     // Never stamped (built_epoch = None) → a fresh bootstrap, never a rebuild.
     assert!(!rebuild_for_new_epoch(&db, "orders", common::EpochNo(1)).unwrap());
     assert!(!rebuild_for_new_epoch(&db, "orders", common::EpochNo(5)).unwrap());

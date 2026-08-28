@@ -56,11 +56,11 @@ fn orders() -> PgRelation {
     }
 }
 
-fn tmpdir(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("walrus-loader-snap-{name}"));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+/// A scratch directory for one test's `.duckdb` file. The returned guard deletes it on drop — even
+/// when an assertion panics, which a trailing `remove_dir_all` would skip.
+fn tmpdir(name: &str) -> tempfile::TempDir {
+    let prefix = format!("walrus-loader-snap-{name}-");
+    tempfile::Builder::new().prefix(&prefix).tempdir().unwrap()
 }
 
 fn meta(op: &str, commit_hex: &str, l: u64) -> String {
@@ -125,7 +125,7 @@ async fn insert_file(pool: &sqlx::PgPool, epoch: EpochNo, uri: String, kind: &st
     .unwrap();
 }
 
-async fn setup(epoch: EpochNo, max_files: i64) -> (TableCtx, std::path::PathBuf) {
+async fn setup(epoch: EpochNo, max_files: i64) -> (TableCtx, tempfile::TempDir) {
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     for tbl in ["file_manifest", "loader_checkpoint", "replication_state"] {
@@ -150,7 +150,7 @@ async fn setup(epoch: EpochNo, max_files: i64) -> (TableCtx, std::path::PathBuf)
         .unwrap();
 
     let dir = tmpdir(&epoch.to_string());
-    let db = TableDb::open(dir.join("orders.duckdb")).unwrap();
+    let db = TableDb::open(dir.path().join("orders.duckdb")).unwrap();
     db.ensure_tables(&orders(), common::SchemaVersionNo(1))
         .unwrap();
     db.configure_s3(&s3()).unwrap();
@@ -190,7 +190,7 @@ fn mirror(ctx: &TableCtx) -> Vec<(i64, String)> {
 async fn snapshot_then_overlapping_stream_yields_stream_value() {
     let _g = LOCK.lock().await;
     let epoch = EpochNo(3_105_001);
-    let (ctx, dir) = setup(epoch, 100).await;
+    let (ctx, _dir) = setup(epoch, 100).await;
 
     // Snapshot file (commit_lsn = consistent_point 0x64) then an overlapping stream update (0xC8).
     let snap = write_row(epoch, "snap", 1, "snap", "i", "0000000000000064", 1);
@@ -206,7 +206,6 @@ async fn snapshot_then_overlapping_stream_yields_stream_value() {
         vec![(1, "streamed".to_string())],
         "the overlapping stream change wins; zero loss, zero dupes"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Two equal-`lsn_end` snapshot files, one per loader batch (`max_files=1`), must BOTH land — none
@@ -217,7 +216,7 @@ async fn snapshot_then_overlapping_stream_yields_stream_value() {
 async fn equal_lsn_end_snapshot_files_split_across_batches_all_applied() {
     let _g = LOCK.lock().await;
     let epoch = EpochNo(3_105_002);
-    let (ctx, dir) = setup(epoch, 1).await; // max_files=1 forces the split across batches
+    let (ctx, _dir) = setup(epoch, 1).await; // max_files=1 forces the split across batches
 
     // Two snapshot files at the SAME lsn_end (= consistent_point 0/64), distinct keys.
     let f1 = write_row(epoch, "snapA", 1, "A", "i", "0000000000000064", 1);
@@ -237,5 +236,4 @@ async fn equal_lsn_end_snapshot_files_split_across_batches_all_applied() {
         vec![(1, "A".to_string()), (2, "B".to_string())],
         "BOTH equal-lsn_end snapshot files applied — none skipped by the watermark"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -56,11 +56,11 @@ fn orders() -> PgRelation {
     }
 }
 
-fn tmpdir(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("walrus-loader-rs-{name}"));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+/// A scratch directory for one test's `.duckdb` file. The returned guard deletes it on drop — even
+/// when an assertion panics, which a trailing `remove_dir_all` would skip.
+fn tmpdir(name: &str) -> tempfile::TempDir {
+    let prefix = format!("walrus-loader-rs-{name}-");
+    tempfile::Builder::new().prefix(&prefix).tempdir().unwrap()
 }
 
 fn write_rows(epoch: EpochNo, name: &str, rows: &[(i32, &str, &str, &str, &str)]) -> String {
@@ -116,7 +116,7 @@ async fn seed_file(
     .0
 }
 
-async fn setup(epoch: EpochNo) -> (TableCtx, std::path::PathBuf) {
+async fn setup(epoch: EpochNo) -> (TableCtx, tempfile::TempDir) {
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     for tbl in [
@@ -145,7 +145,7 @@ async fn setup(epoch: EpochNo) -> (TableCtx, std::path::PathBuf) {
         .await
         .unwrap();
     let dir = tmpdir(&epoch.to_string());
-    let db = TableDb::open(dir.join("orders.duckdb")).unwrap();
+    let db = TableDb::open(dir.path().join("orders.duckdb")).unwrap();
     db.ensure_tables(&orders(), common::SchemaVersionNo(1))
         .unwrap();
     db.configure_s3(&s3()).unwrap();
@@ -249,7 +249,7 @@ async fn seed_live_mirror(ctx: &TableCtx, epoch: EpochNo) {
 async fn resync_repairs_drift_but_phantoms_survive() {
     let _g = LOCK.lock().await;
     let epoch = EpochNo(660_001);
-    let (ctx, dir) = setup(epoch).await;
+    let (ctx, _dir) = setup(epoch).await;
     seed_live_mirror(&ctx, epoch).await;
 
     // Drift the mirror both ways, directly in DuckDB: a MISSING row (delete id 1) and a PHANTOM
@@ -313,8 +313,6 @@ async fn resync_repairs_drift_but_phantoms_survive() {
         raw_has(&ctx, 1) && raw_has(&ctx, 3),
         "chunk rows flowed through raw (preserved)"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -322,7 +320,7 @@ async fn resync_repairs_drift_but_phantoms_survive() {
 async fn resync_never_pauses_the_table() {
     let _g = LOCK.lock().await;
     let epoch = EpochNo(660_002);
-    let (ctx, dir) = setup(epoch).await;
+    let (ctx, _dir) = setup(epoch).await;
     seed_live_mirror(&ctx, epoch).await;
 
     // A LIVE (non-terminal) resync — requested → exporting, never driven to completion.
@@ -361,8 +359,6 @@ async fn resync_never_pauses_the_table() {
         "0/200".parse().unwrap(),
         "the frontier advanced (no freeze at W)"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -370,7 +366,7 @@ async fn resync_never_pauses_the_table() {
 async fn resync_chunks_flow_through_raw() {
     let _g = LOCK.lock().await;
     let epoch = EpochNo(660_003);
-    let (ctx, dir) = setup(epoch).await;
+    let (ctx, _dir) = setup(epoch).await;
     seed_live_mirror(&ctx, epoch).await;
 
     // The open-question decision, pinned: a resync chunk row lands in `<table>_raw` like any file
@@ -400,8 +396,6 @@ async fn resync_chunks_flow_through_raw() {
         None,
         "no latch"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -409,7 +403,7 @@ async fn resync_chunks_flow_through_raw() {
 async fn resync_ddl_restart_preserves_the_resync_flavor() {
     let _g = LOCK.lock().await;
     let epoch = EpochNo(660_004);
-    let (ctx, dir) = setup(epoch).await;
+    let (ctx, _dir) = setup(epoch).await;
 
     // A mid-resync DDL restart (PR 6.8) reissues the attempt — the successor must stay `resync`
     // (restart_for_ddl copies the flavor via INSERT…SELECT), else a refresh would silently become a
@@ -457,5 +451,4 @@ async fn resync_ddl_restart_preserves_the_resync_flavor() {
         .execute(&ctx.pool)
         .await
         .unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
 }

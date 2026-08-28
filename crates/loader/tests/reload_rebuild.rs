@@ -55,11 +55,11 @@ fn orders() -> PgRelation {
     }
 }
 
-fn tmpdir(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("walrus-loader-rr-{name}"));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+/// A scratch directory for one test's `.duckdb` file. The returned guard deletes it on drop — even
+/// when an assertion panics, which a trailing `remove_dir_all` would skip.
+fn tmpdir(name: &str) -> tempfile::TempDir {
+    let prefix = format!("walrus-loader-rr-{name}-");
+    tempfile::Builder::new().prefix(&prefix).tempdir().unwrap()
 }
 
 /// Write a `(id, status, op, commit_lsn, lsn)` Parquet to MinIO. Ops use the wire values
@@ -141,7 +141,7 @@ async fn seed_file_v(
 }
 
 /// Fresh control state + an owned `TableCtx` (DuckDB in a temp dir).
-async fn setup(epoch: EpochNo) -> (TableCtx, std::path::PathBuf) {
+async fn setup(epoch: EpochNo) -> (TableCtx, tempfile::TempDir) {
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     for tbl in [
@@ -170,7 +170,7 @@ async fn setup(epoch: EpochNo) -> (TableCtx, std::path::PathBuf) {
         .await
         .unwrap();
     let dir = tmpdir(&epoch.to_string());
-    let db = TableDb::open(dir.join("orders.duckdb")).unwrap();
+    let db = TableDb::open(dir.path().join("orders.duckdb")).unwrap();
     db.ensure_tables(&orders(), common::SchemaVersionNo(1))
         .unwrap();
     db.configure_s3(&s3()).unwrap();
@@ -245,7 +245,7 @@ fn mirror_count(ctx: &TableCtx) -> i64 {
 async fn rebuild_converges_mirror_to_source_and_kills_phantoms() {
     let _g = LOCK.lock().await;
     let epoch = EpochNo(670_001);
-    let (ctx, dir) = setup(epoch).await;
+    let (ctx, _dir) = setup(epoch).await;
 
     // The OLD world: ids 1,2 streamed normally; then a phantom drifts into the mirror directly.
     let old = write_rows(
@@ -326,8 +326,6 @@ async fn rebuild_converges_mirror_to_source_and_kills_phantoms() {
     );
     assert_eq!(mirror_status(&ctx, 2), None);
     assert_eq!(mirror_count(&ctx), 2);
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -335,7 +333,7 @@ async fn rebuild_converges_mirror_to_source_and_kills_phantoms() {
 async fn superseded_rows_are_purged_and_their_content_discarded() {
     let _g = LOCK.lock().await;
     let epoch = EpochNo(670_002);
-    let (ctx, dir) = setup(epoch).await;
+    let (ctx, _dir) = setup(epoch).await;
 
     // One claim batch holds the whole story: a pre-`W` stream file (sorts first), the chunk, a
     // post-`W` stream file. The pre-`W` file is applied into the OLD raw before the chunk fires
@@ -394,8 +392,6 @@ async fn superseded_rows_are_purged_and_their_content_discarded() {
         "pre-`W` content is discarded with the old raw — the chunks re-cover its commit"
     );
     assert_eq!(mirror_count(&ctx), 2);
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -403,7 +399,7 @@ async fn superseded_rows_are_purged_and_their_content_discarded() {
 async fn delete_superseded_prunes_by_kind_and_lsn() {
     let _g = LOCK.lock().await;
     let epoch = EpochNo(670_005);
-    let (ctx, dir) = setup(epoch).await;
+    let (ctx, _dir) = setup(epoch).await;
 
     // The contract itself (the loop's safety net for LATE-arriving superseded rows too): every
     // non-reload row at lsn_end <= first_lsn goes; the chunk at lsn_end == first_lsn survives its
@@ -455,7 +451,6 @@ async fn delete_superseded_prunes_by_kind_and_lsn() {
         .execute(&ctx.pool)
         .await
         .unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -463,7 +458,7 @@ async fn delete_superseded_prunes_by_kind_and_lsn() {
 async fn stale_reload_file_is_skipped_and_retired() {
     let _g = LOCK.lock().await;
     let epoch = EpochNo(670_003);
-    let (ctx, dir) = setup(epoch).await;
+    let (ctx, _dir) = setup(epoch).await;
 
     // The .duckdb already rebuilt for a NEWER attempt (PR 6.8's restart hygiene, simulated).
     ctx.db
@@ -503,8 +498,6 @@ async fn stale_reload_file_is_skipped_and_retired() {
         Some(common::ReloadId(999_999)),
         "the latch never regresses (latest wins)"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -512,7 +505,7 @@ async fn stale_reload_file_is_skipped_and_retired() {
 async fn rebuild_clears_the_lossy_cast_quarantine() {
     let _g = LOCK.lock().await;
     let epoch = EpochNo(670_004);
-    let (ctx, dir) = setup(epoch).await;
+    let (ctx, _dir) = setup(epoch).await;
 
     // The PR 3.9 terminal state: a lossy ALTER COLUMN TYPE cast failed; /ready is degraded. (The
     // entry path is ddl_destructive.rs's covered ground; the EXIT is under test here.)
@@ -535,8 +528,6 @@ async fn rebuild_clears_the_lossy_cast_quarantine() {
         "the rebuild is the quarantine's one exit"
     );
     assert_eq!(mirror_status(&ctx, 1).as_deref(), Some("recovered"));
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -544,7 +535,7 @@ async fn rebuild_clears_the_lossy_cast_quarantine() {
 async fn resync_flavor_never_rebuilds_and_merges_over_the_live_mirror() {
     let _g = LOCK.lock().await;
     let epoch = EpochNo(670_006);
-    let (ctx, dir) = setup(epoch).await;
+    let (ctx, _dir) = setup(epoch).await;
 
     // A LIVE mirror the resync must NOT clear: ids 1,2 already streamed in. And — to prove the
     // resync arm skips `clear_quarantine` (only a rebuild is that exit) — latch the quarantine.
@@ -627,8 +618,6 @@ async fn resync_flavor_never_rebuilds_and_merges_over_the_live_mirror() {
         ctx.state.is_quarantined(),
         "resync is not a quarantine exit — the latch still holds"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -636,7 +625,7 @@ async fn resync_flavor_never_rebuilds_and_merges_over_the_live_mirror() {
 async fn superseded_version_crossing_file_is_skipped_not_reconciled() {
     let _g = LOCK.lock().await;
     let epoch = EpochNo(670_007);
-    let (ctx, dir) = setup(epoch).await;
+    let (ctx, _dir) = setup(epoch).await;
 
     // A live mirror {1} at the loader's current schema_version (1).
     let live = write_rows(
@@ -706,6 +695,4 @@ async fn superseded_version_crossing_file_is_skipped_not_reconciled() {
             .await
             .unwrap();
     assert_eq!(blocker_gone, 0, "the rebuild purged the skipped blocker");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

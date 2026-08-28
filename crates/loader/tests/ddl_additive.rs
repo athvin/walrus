@@ -356,11 +356,11 @@ fn orders_v2() -> PgRelation {
     )
 }
 
-fn tmpdir(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("walrus-loader-ddl-{name}"));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+/// A scratch directory for one test's `.duckdb` file. The returned guard deletes it on drop — even
+/// when an assertion panics, which a trailing `remove_dir_all` would skip.
+fn tmpdir(name: &str) -> tempfile::TempDir {
+    let prefix = format!("walrus-loader-ddl-{name}-");
+    tempfile::Builder::new().prefix(&prefix).tempdir().unwrap()
 }
 
 fn meta(op: &str, commit_hex: &str, l: u64) -> String {
@@ -515,7 +515,7 @@ async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
 
     // The loader starts at the v1 shape (a fresh .duckdb); Phase A reconciles across the boundary.
     let dir = tmpdir(&epoch.to_string());
-    let db = TableDb::open(dir.join("orders.duckdb")).unwrap();
+    let db = TableDb::open(dir.path().join("orders.duckdb")).unwrap();
     db.ensure_tables(&orders_v1(), common::SchemaVersionNo(1))
         .unwrap();
     db.configure_s3(&s3()).unwrap();
@@ -560,6 +560,4 @@ async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
         view.iter().any(|c| c == "note") && !view.iter().any(|c| c.starts_with("_applied")),
         "view evolved with the mirror, guard cols still hidden: {view:?}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

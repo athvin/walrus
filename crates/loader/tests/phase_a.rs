@@ -51,11 +51,11 @@ fn orders() -> PgRelation {
     }
 }
 
-fn tmpdir(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("walrus-loader-pa-{name}"));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+/// A scratch directory for one test's `.duckdb` file. The returned guard deletes it on drop — even
+/// when an assertion panics, which a trailing `remove_dir_all` would skip.
+fn tmpdir(name: &str) -> tempfile::TempDir {
+    let prefix = format!("walrus-loader-pa-{name}-");
+    tempfile::Builder::new().prefix(&prefix).tempdir().unwrap()
 }
 
 fn write_fixture(epoch: EpochNo) -> String {
@@ -102,7 +102,7 @@ async fn seed_manifest(pool: &sqlx::PgPool, epoch: EpochNo, uri: &str) {
 }
 
 /// Fresh control state + an owned `TableCtx` (DuckDB in a temp dir).
-async fn setup(epoch: EpochNo) -> (TableCtx, std::path::PathBuf) {
+async fn setup(epoch: EpochNo) -> (TableCtx, tempfile::TempDir) {
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     for tbl in ["file_manifest", "loader_checkpoint", "replication_state"] {
@@ -126,7 +126,7 @@ async fn setup(epoch: EpochNo) -> (TableCtx, std::path::PathBuf) {
         .await
         .unwrap();
     let dir = tmpdir(&epoch.to_string());
-    let db = TableDb::open(dir.join("orders.duckdb")).unwrap();
+    let db = TableDb::open(dir.path().join("orders.duckdb")).unwrap();
     db.ensure_tables(&orders(), common::SchemaVersionNo(1))
         .unwrap();
     db.configure_s3(&s3()).unwrap();
@@ -163,7 +163,7 @@ async fn appends_rows_verbatim_with_promoted_columns_and_meta_intact() {
     let _g = LOCK.lock().await;
     let epoch = EpochNo(3_200_001);
     let uri = write_fixture(epoch);
-    let (ctx, dir) = setup(epoch).await;
+    let (ctx, _dir) = setup(epoch).await;
     seed_manifest(&ctx.pool, epoch, &uri).await;
 
     let lsn = run_phase_a(&ctx).await.unwrap();
@@ -188,8 +188,6 @@ async fn appends_rows_verbatim_with_promoted_columns_and_meta_intact() {
         promoted_lsn, "0000000000000064",
         "lsn promoted (sortable 16-hex)"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -198,7 +196,7 @@ async fn advances_raw_watermark_and_deletes_the_claimed_manifest_rows() {
     let _g = LOCK.lock().await;
     let epoch = EpochNo(3_200_002);
     let uri = write_fixture(epoch);
-    let (ctx, dir) = setup(epoch).await;
+    let (ctx, _dir) = setup(epoch).await;
     seed_manifest(&ctx.pool, epoch, &uri).await;
 
     run_phase_a(&ctx).await.unwrap();
@@ -225,8 +223,6 @@ async fn advances_raw_watermark_and_deletes_the_claimed_manifest_rows() {
         .query_row("SELECT count(*) FROM orders", [], |r| r.get(0))
         .unwrap();
     assert_eq!(mirror, 0, "Phase A never writes the mirror");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -235,7 +231,7 @@ async fn re_running_the_same_file_appends_zero_rows() {
     let _g = LOCK.lock().await;
     let epoch = EpochNo(3_200_003);
     let uri = write_fixture(epoch);
-    let (ctx, dir) = setup(epoch).await;
+    let (ctx, _dir) = setup(epoch).await;
 
     seed_manifest(&ctx.pool, epoch, &uri).await;
     run_phase_a(&ctx).await.unwrap();
@@ -248,8 +244,6 @@ async fn re_running_the_same_file_appends_zero_rows() {
         2,
         "ON CONFLICT DO NOTHING on the composite PK → zero new rows"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -258,7 +252,7 @@ async fn pause_withholds_claims_and_lifts_on_failed() {
     let _g = LOCK.lock().await;
     let epoch = EpochNo(3_200_004);
     let uri = write_fixture(epoch);
-    let (ctx, dir) = setup(epoch).await;
+    let (ctx, _dir) = setup(epoch).await;
     seed_manifest(&ctx.pool, epoch, &uri).await;
     sqlx::query("DELETE FROM walrus.table_reload WHERE epoch = $1")
         .bind(epoch)
@@ -331,5 +325,4 @@ async fn pause_withholds_claims_and_lifts_on_failed() {
         .execute(&ctx.pool)
         .await
         .unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
 }

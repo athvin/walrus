@@ -112,11 +112,11 @@ async fn seed(pool: &sqlx::PgPool, epoch: EpochNo) {
     .unwrap();
 }
 
-fn tmpdir(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("walrus-loader-{name}"));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+/// A scratch directory for one test's `.duckdb` file. The returned guard deletes it on drop — even
+/// when an assertion panics, which a trailing `remove_dir_all` would skip.
+fn tmpdir(name: &str) -> tempfile::TempDir {
+    let prefix = format!("walrus-loader-{name}-");
+    tempfile::Builder::new().prefix(&prefix).tempdir().unwrap()
 }
 
 fn table_exists(db: &loader::duck::TableDb, name: &str) -> bool {
@@ -140,7 +140,7 @@ async fn bootstrap_creates_duckdb_with_both_tables_and_takes_the_lease() {
     control::run_migrations(&pool).await.unwrap();
     seed(&pool, epoch).await;
     let dir = tmpdir("bootstrap");
-    let cfg = cfg("loader-a", &dir, Duration::from_secs(30));
+    let cfg = cfg("loader-a", dir.path(), Duration::from_secs(30));
     let state = LoaderState::new();
 
     let owned = bootstrap(&cfg, &pool, &store(), &state).await.unwrap();
@@ -173,8 +173,6 @@ async fn bootstrap_creates_duckdb_with_both_tables_and_takes_the_lease() {
         orders.db.conn().execute_batch("SELECT 1").is_ok(),
         ".duckdb file lock is held (open RW)"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -190,7 +188,7 @@ async fn second_instance_with_live_lease_exits_terminal() {
 
     // Instance A takes the lease (live, 30s) and keeps its DuckDB connection open.
     let _owned_a = bootstrap(
-        &cfg("loader-a", &dir_a, Duration::from_secs(30)),
+        &cfg("loader-a", dir_a.path(), Duration::from_secs(30)),
         &pool,
         &store(),
         &state,
@@ -201,7 +199,7 @@ async fn second_instance_with_live_lease_exits_terminal() {
     // Instance B, while A's lease is live, must fail terminal with LeaseContended.
     let dir_b = tmpdir("live-b");
     let res = bootstrap(
-        &cfg("loader-b", &dir_b, Duration::from_secs(30)),
+        &cfg("loader-b", dir_b.path(), Duration::from_secs(30)),
         &pool,
         &store(),
         &LoaderState::new(),
@@ -213,9 +211,6 @@ async fn second_instance_with_live_lease_exits_terminal() {
         "a live lease is terminal: {err:?}"
     );
     assert_eq!(err.exit_code(), common::ExitCode::LeaseContended);
-
-    let _ = std::fs::remove_dir_all(&dir_a);
-    let _ = std::fs::remove_dir_all(&dir_b);
 }
 
 #[tokio::test]
@@ -232,7 +227,7 @@ async fn stale_lock_expired_lease_is_reclaimed_and_opened() {
     // Instance A takes a SHORT-TTL lease then "dies": dropping its TableDb releases the DuckDB lock.
     {
         let owned_a = bootstrap(
-            &cfg("loader-dead", &dir, Duration::from_millis(500)),
+            &cfg("loader-dead", dir.path(), Duration::from_millis(500)),
             &pool,
             &store(),
             &state,
@@ -246,7 +241,7 @@ async fn stale_lock_expired_lease_is_reclaimed_and_opened() {
 
     // Instance B reclaims the expired lease and opens the (now-unlocked) file. Token bumps to 2.
     let owned_b = bootstrap(
-        &cfg("loader-b", &dir, Duration::from_secs(30)),
+        &cfg("loader-b", dir.path(), Duration::from_secs(30)),
         &pool,
         &store(),
         &LoaderState::new(),
@@ -258,6 +253,4 @@ async fn stale_lock_expired_lease_is_reclaimed_and_opened() {
         "reclaim by a new owner bumps the fencing token"
     );
     assert!(table_exists(&owned_b[0].db, "orders"));
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

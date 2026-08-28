@@ -179,11 +179,11 @@ fn retention_floor_is_behind_transformed_lsn() {
 
 // ---- Reclamation: the CREATE OR REPLACE rebuild frees blocks a DELETE would only tombstone. ----
 
-fn tmpdir(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("walrus-loader-compact-{name}"));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+/// A scratch directory for one test's `.duckdb` file. The returned guard deletes it on drop — even
+/// when an assertion panics, which a trailing `remove_dir_all` would skip.
+fn tmpdir(name: &str) -> tempfile::TempDir {
+    let prefix = format!("walrus-loader-compact-{name}-");
+    tempfile::Builder::new().prefix(&prefix).tempdir().unwrap()
 }
 
 /// DuckDB block accounting — `used_blocks` reflects real storage (the OS file may not truncate, but the
@@ -202,7 +202,7 @@ fn rebuild_reclaims_space_and_prune_keeps_mirror_correct() {
     let rel = orders_rel();
     let t = TransformSql::from_relation(&rel);
     let dir = tmpdir("reclaim");
-    let db = TableDb::open(dir.join("orders.duckdb")).unwrap();
+    let db = TableDb::open(dir.path().join("orders.duckdb")).unwrap();
     db.ensure_tables(&rel, common::SchemaVersionNo(1)).unwrap();
 
     // Seed one key incrementally, then BLOAT the mirror with UPDATE churn (each tombstones the prior row
@@ -250,6 +250,4 @@ fn rebuild_reclaims_space_and_prune_keeps_mirror_correct() {
         Some(wide.as_str()),
         "prune keeps the mirror correct — the baseline preserved the value"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
