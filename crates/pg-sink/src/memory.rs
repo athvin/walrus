@@ -22,10 +22,14 @@ use std::num::NonZeroU64;
 /// alias lets a caller transpose silently, which is precisely the mix-up this accounting cannot
 /// detect (both halves are small opaque integers, and a swapped key simply meters the wrong stream).
 /// The transparent representation keeps it exactly one `u32` wide inside the per-row
-/// `StreamedChange`, whose move-cost budget is asserted in `stream_txn.rs`.
+/// `StreamedChange` — asserted directly below, as every other transparent walrus id asserts its own
+/// layout, and again indirectly by that row's move-cost budget in `stream_txn.rs`.
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TableId(pub u32);
+
+const _: () =
+    assert!(size_of::<TableId>() == size_of::<u32>() && align_of::<TableId>() == align_of::<u32>());
 
 /// Aggregate, process-wide accounting across all `(table, xid)` Arrow builders — distinct from any
 /// single batch's `max_bytes`.
