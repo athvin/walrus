@@ -112,9 +112,10 @@ pub enum IdentError {
 ///
 /// ```
 /// use common::sql::SqlIdent;
-/// assert_eq!(SqlIdent::new("plain").unwrap().to_string(), "\"plain\"");
-/// assert_eq!(SqlIdent::new("a\"b").unwrap().to_string(), "\"a\"\"b\"");
+/// assert_eq!(SqlIdent::new("plain")?.to_string(), "\"plain\"");
+/// assert_eq!(SqlIdent::new("a\"b")?.to_string(), "\"a\"\"b\"");
 /// assert!(SqlIdent::new("").is_err());
+/// # Ok::<(), common::sql::IdentError>(())
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SqlIdent(String);
