@@ -6,6 +6,12 @@ members = ["crates/common", "crates/control", "crates/loader", "crates/pg-sink",
 edition = "2024" # if-let chains require edition 2024 + Rust 1.88; walrus pins 1.95.0.
 license = "MIT"
 rust-version = "1.95" # MSRV — keep in sync with rust-toolchain.toml; CI `msrv` job fails on drift (PR 4.7)
+# walrus ships two container images, not registry packages: `common`, `control` and `loader` name
+# deployment roles, not crates.io identities. That is why no member carries the metadata a published
+# crate owes its readers (description, repository, keywords, categories) — and this key is what makes
+# that absence a decision rather than an omission. Every member inherits it with
+# `publish.workspace = true`; crates/common/tests/publish_policy.rs fails when one does not.
+publish = false
 
 # Lint-as-policy, centralised so no member crate can silently opt out of `deny(warnings)`.
 # NOTE: these only take effect in a member once it declares `[lints] workspace = true`.

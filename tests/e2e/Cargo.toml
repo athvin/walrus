@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-publish = false
+publish.workspace = true # a test driver, not a registry package — see the workspace bar
 
 # The end-to-end integration crate: it depends on nothing in the walrus DAG's *libraries* for its
 # assertions, but drives both binaries (`walrus-pg-sink`, `walrus-loader`) as black boxes over the
