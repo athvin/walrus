@@ -201,7 +201,7 @@ impl Serialize for UtcTimestamp {
 
 impl<'de> Deserialize<'de> for UtcTimestamp {
     /// Parse through [`FromStr`](std::str::FromStr), so a local or offset timestamp is a
-    /// deserialization error rather than a `UtcTimestamp` that is not UTC.
+    /// deserialization error rather than a [`UtcTimestamp`] that is not UTC.
     ///
     /// Hand-written rather than `#[serde(try_from = "String")]` for the same reason as
     /// [`Lsn`](crate::Lsn): that attribute would need a `TryFrom<String>` impl aliasing the

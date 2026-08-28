@@ -351,7 +351,8 @@ pub fn apply_destructive(
 /// The path is only ever *read* here, so it is taken as a borrowed view — the same bound
 /// [`TableDb::open`](crate::duck::TableDb::open) and the wrapped `tokio::fs::remove_file` already
 /// carry. A caller holding the `<dir>/<table>.duckdb` name as a `String` (or a literal) reaches it
-/// without a `Path::new` at the call site; nothing is owned or allocated by this signature.
+/// without a [`Path::new`](std::path::Path::new) at the call site; nothing is owned or allocated
+/// by this signature.
 ///
 /// # Errors
 ///

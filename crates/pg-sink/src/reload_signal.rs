@@ -253,8 +253,9 @@ fn signal_field<T: std::str::FromStr>(
 
 impl PendingSignal {
     /// Parse a decoded signal tuple by column NAME from the noted relation shape (internal tables
-    /// are never in the `RelationCache`, so the shape comes from `InternalTables`). The caller logs
-    /// a malformed tuple and drops it; it can never wedge the loop.
+    /// are never in the [`RelationCache`](crate::relcache::RelationCache), so the shape comes from
+    /// [`InternalTables`](crate::heartbeat::InternalTables)). The caller logs a malformed tuple and
+    /// drops it; it can never wedge the loop.
     ///
     /// # Errors
     ///

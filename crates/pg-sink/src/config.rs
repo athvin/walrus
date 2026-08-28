@@ -109,8 +109,8 @@ pub struct SinkConfig {
     pub object_store: ObjectStoreConfig,
     /// Logging setup.
     pub telemetry: TelemetryConfig,
-    /// Tokio worker threads. `None` uses `available_parallelism()`; configured values must be
-    /// within the inclusive 1..=64 bound.
+    /// Tokio worker threads. `None` uses [`std::thread::available_parallelism`]; configured values
+    /// must be within the inclusive 1..=64 bound.
     pub worker_threads: Option<usize>,
     /// Human tag for this process instance, e.g. `"walrus-pg-sink-0"`.
     pub instance: String,
@@ -175,7 +175,8 @@ pub struct SinkConfig {
     /// is terminal (the operator owns the source setup — PR 2.19 `migrations/source`).
     pub manage_publication: bool,
     /// `true` (default) = **strict** keys: a published user table with no usable replica identity is
-    /// terminal. `false` = **lenient**: quarantine + alert + continue (surfaced in the `PkReport`).
+    /// terminal. `false` = **lenient**: quarantine + alert + continue (surfaced in the
+    /// [`PkReport`](crate::preflight::PkReport)).
     pub strict_keys: bool,
 }
 

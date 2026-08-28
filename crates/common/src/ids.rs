@@ -272,7 +272,7 @@ impl From<DdlId> for i64 {
     }
 }
 
-/// Postgres `int8` support (feature `sqlx`): `ManifestId` binds and decodes exactly as its inner
+/// Postgres `int8` support (feature `sqlx`): [`ManifestId`] binds and decodes exactly as its inner
 /// `i64` — the transparent-newtype trick, now backed by each type's representation attribute above
 /// — so a `bigint` column round-trips with no SQL cast. Mirrors
 /// [`Lsn`](crate::Lsn)'s `sqlx_support`; hand-written rather than derived so `common`'s `sqlx` dep

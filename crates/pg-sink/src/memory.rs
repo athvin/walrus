@@ -248,7 +248,7 @@ impl HysteresisBand {
 
     /// Build a band whose resume threshold is strictly below its activation threshold.
     ///
-    /// Not `const`, unlike [`Ratio::new`]: the ordering test is `Ratio`'s derived
+    /// Not `const`, unlike [`Ratio::new`]: the ordering test is [`Ratio`]'s derived
     /// [`PartialOrd`], and a trait method is not callable in a const context on stable.
     ///
     /// # Errors

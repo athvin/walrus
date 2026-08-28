@@ -79,7 +79,7 @@ fn build_env_filter(cfg: &TelemetryConfig) -> EnvFilter {
 /// destination to whoever owns `main`. `crates/common/tests/subscriber_install_policy.rs` is what
 /// goes red when a library takes that choice back.
 ///
-/// Installing through `SubscriberInitExt::try_init` — rather than `set_global_default` — is what
+/// Installing through [`SubscriberInitExt::try_init`] — rather than `set_global_default` — is what
 /// also registers `tracing_log::LogTracer`, so the dependencies that still emit through the `log`
 /// facade (`tokio-postgres`, `sqlx` and `object_store`'s HTTP client among them) arrive here as
 /// events instead of being dropped. That bridge rides `tracing-subscriber`'s `tracing-log`

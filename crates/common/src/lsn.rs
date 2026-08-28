@@ -306,7 +306,7 @@ impl serde::Serialize for Lsn {
 
 impl<'de> serde::Deserialize<'de> for Lsn {
     /// Read a string in either accepted dialect via [`FromStr`] — so a malformed WAL position is a
-    /// deserialization error and no out-of-grammar `Lsn` is ever constructed.
+    /// deserialization error and no out-of-grammar [`Lsn`] is ever constructed.
     ///
     /// Hand-written rather than `#[serde(try_from = "String")]`, which would need a `TryFrom<String>`
     /// impl: a second owned-input parser aliasing [`FromStr`], the grammar's single entry point, to
@@ -320,7 +320,7 @@ impl<'de> serde::Deserialize<'de> for Lsn {
     }
 }
 
-/// Postgres `pg_lsn` support (feature `sqlx`), delegating to sqlx's `PgLsn` so an `Lsn` binds and
+/// Postgres `pg_lsn` support (feature `sqlx`), delegating to sqlx's `PgLsn` so an [`Lsn`] binds and
 /// decodes as a native `pg_lsn` — which sorts as a WAL position, matching this newtype's ordering.
 #[cfg(feature = "sqlx")]
 mod sqlx_support {

@@ -35,7 +35,7 @@ pub struct TableCtx {
     /// The table shape — the transform (Phase B) renders its SQL from this.
     pub rel: PgRelation,
     /// The `.duckdb` writer connection — the ownership fence DuckDB itself enforces. Its **drop** is
-    /// observable across processes: dropping this `TableCtx` closes the file and frees the writer
+    /// observable across processes: dropping this [`TableCtx`] closes the file and frees the writer
     /// lock, which is the "close" step of the drain contract (see [`crate::shutdown`]). `main`
     /// therefore joins every worker — dropping each ctx — before releasing the leases.
     pub db: TableDb,
@@ -49,7 +49,7 @@ pub struct TableCtx {
     /// Raw retention as an LSN-byte lag behind `transformed_lsn` (the prune floor).
     pub retention_lsn_lag: u64,
     /// The reload_id whose claim pause was already logged (PR 6.6) — a paused table says *why* it
-    /// is idle once per pause, not once per poll. Per-table by construction (one `TableCtx` per
+    /// is idle once per pause, not once per poll. Per-table by construction (one [`TableCtx`] per
     /// worker, with `!Sync` interior state), so this needs interior mutability behind
     /// `run_phase_a(&ctx)`, not synchronisation. `Option<ReloadId>` is `Copy`, so `Cell` has no borrow
     /// flag or runtime panic path.

@@ -78,8 +78,8 @@ pub struct LoaderConfig {
     /// S3/MinIO staging bucket the sink writes and the loader reads.
     pub object_store: ObjectStoreConfig,
     pub telemetry: TelemetryConfig,
-    /// Tokio worker threads. `None` uses `available_parallelism()`; configured values must be
-    /// within 1..=64. A loader pod wants a small value because every apply loop shares one
+    /// Tokio worker threads. `None` uses [`std::thread::available_parallelism`]; configured values
+    /// must be within 1..=64. A loader pod wants a small value because every apply loop shares one
     /// `LocalSet` thread; `WALRUS_WORKER_THREADS=2` is plenty for the remaining async work. Small,
     /// though — never a *current-thread* runtime: the spawned side tasks must keep running through
     /// a blocking full rebuild on the `LocalSet` thread (see the flavor note in `main`).

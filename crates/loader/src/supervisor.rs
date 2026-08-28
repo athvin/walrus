@@ -32,8 +32,8 @@ pub fn failure_channel(
 /// Report a failure without ever parking the worker.
 ///
 /// Both unhappy arms *discard* the failure, so each log below is that error's only record — hence
-/// `?` (which carries the `#[source]` chain `LoaderError`'s `Display` omits) and `warn!` rather than
-/// `error!`, signalling it was absorbed here.
+/// `?` (which carries the `#[source]` chain [`LoaderError`]'s `Display` omits) and `warn!` rather
+/// than `error!`, signalling it was absorbed here.
 pub fn report(tx: &mpsc::Sender<WorkerFailure>, failure: WorkerFailure) {
     match tx.try_send(failure) {
         Ok(()) => {}

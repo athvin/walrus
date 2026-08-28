@@ -63,7 +63,7 @@ pub fn range_fields(name: &str, family: RangeFamily, atttypmod: i32) -> Vec<Fiel
 
 /// The 4-field struct a multirange member carries: `lower`/`upper` (nullable — a member may be
 /// unbounded) and the always-present `lower_inc`/`upper_inc`. Shared by the schema field and the
-/// builder so `RecordBatch::try_new` sees identical types.
+/// builder so [`RecordBatch::try_new`](arrow::array::RecordBatch::try_new) sees identical types.
 #[must_use]
 pub fn multirange_struct_fields(family: RangeFamily, atttypmod: i32) -> Fields {
     let elem = family.elem_data_type(atttypmod);

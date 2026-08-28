@@ -1,5 +1,5 @@
 //! The fail-fast bootstrap scaffold — shared steps 2–4 (§4.2, architecture "Shared
-//! bootstrap"). Step 1 (config load/validate) is `SinkConfig::load`; step 4 (bind health) is in
+//! bootstrap"). Step 1 (config load/validate) is [`SinkConfig::load`]; step 4 (bind health) is in
 //! `main::run`. This module does the two dependency checks between them:
 //!
 //! 2. **control Postgres reachable + migrations current** — `connect` failures are *transient*

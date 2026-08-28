@@ -151,7 +151,7 @@ fn extract_points(text: &str) -> Result<Vec<Pt>, Error> {
     Ok(pts)
 }
 
-/// `"(x,y)"` → `Pt`.
+/// `"(x,y)"` → [`Pt`].
 ///
 /// # Errors
 ///
