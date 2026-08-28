@@ -26,14 +26,32 @@ Run them yourself on a quiet machine with `just bench`.
 ### How to re-run
 
 ```
-just bench                                   # both crates, criterion defaults
+just bench                                   # all three crates, criterion defaults
 cargo bench -p pg-sink --bench decode        # decoder only
 cargo bench -p pg-to-arrow --bench batch     # Arrow only
+cargo bench -p loader --bench transform      # loader transform only (the 1M grid takes minutes)
+cargo bench -p loader --bench append         # loader Phase-A append only
 # faster, still stable:
 cargo bench -p pg-sink -p pg-to-arrow -- --warm-up-time 1 --measurement-time 3
 ```
 
 Criterion writes per-bench estimates under `target/criterion/` (gitignored).
+
+### Comparing a change against a baseline
+
+Absolute medians drift between runs even on one machine — several entries below had to discount that
+drift after the fact (PR 16.3's Arrow control moved backward with no timed code changed; PR 11.12
+compared against a baseline taken many PRs earlier). Read an optimisation as a **delta measured
+back-to-back**, not as two absolute numbers taken weeks apart:
+
+```
+just bench-baseline before   # on the commit you want to beat; saves target/criterion/**/before
+just bench-compare before    # on the change; criterion prints the per-bench delta
+```
+
+Criterion re-runs each bench against the stored sample and reports the change plus whether it clears
+its noise threshold, which is what "within noise" in the tables below should mean from here on.
+Baselines live under `target/criterion/`, so `cargo clean` discards them.
 
 ## Baselines (PR 5.4)
 

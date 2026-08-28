@@ -50,7 +50,7 @@ from drifting. Adding Miri would create and maintain a second toolchain path on 
 The project already makes build-cost choices on measured grounds. The release-profile rationale at
 `Cargo.toml:203-211` adopts thin LTO but rejects `codegen-units = 1` because a few percent more
 runtime performance did not justify roughly doubling the measured release build. Likewise, the
-`bench` note at `justfile:32-36` keeps hardware-relative Criterion runs out of shared-runner CI.
+`bench` note at `justfile:32-38` keeps hardware-relative Criterion runs out of shared-runner CI.
 No Miri runtime is claimed here; the known nightly installation and sysroot-build work is enough to
 reject an unscoped job whose relevant first-party test set is empty.
 
