@@ -18,10 +18,13 @@ const TARGET_CPU_NOTE: &str =
 const PGO_ADR: &str = "docs/implementation/notes/rust-skills/opt-pgo-profile.md";
 const PGO_NOTE: &str =
     include_str!("../../../docs/implementation/notes/rust-skills/opt-pgo-profile.md");
+const RELEASE_PROFILE_ADR: &str = "docs/implementation/notes/rust-skills/perf-release-profile.md";
+const RELEASE_PROFILE_NOTE: &str =
+    include_str!("../../../docs/implementation/notes/rust-skills/perf-release-profile.md");
 // Every surface that can hand a target-CPU or ISA flag to a cargo invocation: the manifest, the
 // sole workflow, both shipped Dockerfiles, and the three developer entry points that build a
 // walrus binary. The rule's own Cargo-config example is titled "native builds for development", so
-// the local recipes are a first-class drift vector. This list is wider than CODEGEN_UNITS_SURFACES
+// the local recipes are a first-class drift vector. This list is wider than CARGO_BUILD_SURFACES
 // because it also covers debug-only `scripts/sink-smoke.sh`: an ISA floor is not a release-profile
 // knob, so a "native" flag on *any* build produces a host-specific binary.
 const TARGET_CPU_SURFACES: &[(&str, &str)] = &[
@@ -33,10 +36,11 @@ const TARGET_CPU_SURFACES: &[(&str, &str)] = &[
     ("scripts/bench-e2e.sh", BENCH_E2E),
     ("scripts/sink-smoke.sh", SINK_SMOKE),
 ];
-// Every surface that invokes cargo, which is where a codegen-unit override can be reinstated from
-// outside `[profile.release]`. The manifest is deliberately absent: its rejection prose names the
-// key, and `codegen_units_declaration` already parses the tables there.
-const CODEGEN_UNITS_SURFACES: &[(&str, &str)] = &[
+// Every surface that invokes cargo to build a shipped artifact or a benchmark, which is where a
+// profile key — a codegen-unit count, a panic strategy, a strip setting — can be reinstated from
+// outside the manifest. The manifest is deliberately absent: its rejection prose names those keys,
+// and `profile_key_declaration` already parses the tables there.
+const CARGO_BUILD_SURFACES: &[(&str, &str)] = &[
     (".github/workflows/ci.yml", CI_WORKFLOW),
     ("deploy/docker/Dockerfile.pg-sink", DOCKERFILE_PG_SINK),
     ("deploy/docker/Dockerfile.loader", DOCKERFILE_LOADER),
@@ -99,13 +103,14 @@ fn release_lto(manifest: &str) -> Result<&str, &'static str> {
     }
 }
 
-/// The `[profile.…]` header that declares `codegen-units`, if any. *Every* profile table counts,
-/// not only `[profile.release]`: the rule parks the override in a `bench`, `production` or
+/// The `[profile.…]` header that declares `key`, if any. *Every* profile table counts, not only
+/// `[profile.release]`: the rules park an override in a `bench`, `production` or
 /// `release-with-debug` table just as readily, and `bench` inherits `release` — an override there
 /// would quietly de-couple `docs/benchmarks.md`'s numbers from the shipped artifact. Per-package
-/// tables (`[profile.release.package.…]`) accept the key too. Comments are not assignments, so the
-/// rationale above the table may keep naming it.
-fn codegen_units_declaration(manifest: &str) -> Option<&str> {
+/// tables (`[profile.release.package.…]`) accept the keys too. Comments are not assignments, so the
+/// rationale above the table may keep naming them, and a key that doubles as a lint name — `panic`
+/// sits in `[workspace.lints.clippy]` — counts only under a `[profile…]` header.
+fn profile_key_declaration<'a>(manifest: &'a str, key: &str) -> Option<&'a str> {
     let mut profile = None;
 
     for line in manifest.lines() {
@@ -113,7 +118,7 @@ fn codegen_units_declaration(manifest: &str) -> Option<&str> {
         if line.starts_with('[') {
             profile = line.starts_with("[profile").then_some(line);
         } else if let Some(header) = profile
-            && assignment_value(line, "codegen-units").is_some()
+            && assignment_value(line, key).is_some()
         {
             return Some(header);
         }
@@ -123,7 +128,7 @@ fn codegen_units_declaration(manifest: &str) -> Option<&str> {
 }
 
 fn codegen_units_policy(manifest: &str) -> Result<(), &'static str> {
-    if codegen_units_declaration(manifest).is_some() {
+    if profile_key_declaration(manifest, "codegen-units").is_some() {
         Err("codegen-units declared")
     } else if !manifest.contains(CODEGEN_UNITS_ADR) {
         Err("missing codegen-units ADR link")
@@ -139,6 +144,48 @@ fn codegen_units_override_policy(body: &str) -> Result<(), &'static str> {
     for (needle, diagnostic) in [
         ("CODEGEN_UNITS", "a codegen-units env override is set"),
         ("codegen-units", "a codegen-units build flag is set"),
+    ] {
+        if body.contains(needle) {
+            return Err(diagnostic);
+        }
+    }
+    Ok(())
+}
+
+/// The two knobs the release-profile rule adds beyond LTO and codegen units. Both are rejected on
+/// behaviour rather than build cost: `panic = "abort"` deletes `crates/pg-sink/src/reload.rs`'s
+/// `JoinError::is_panic` arm from the shipped binary, so one panicking exporter task would take the
+/// pod down instead of leaving a classified log line and an expiring lease; `strip` removes the
+/// symbol table that names the frames in a profile of the release — and, by inheritance, `bench` —
+/// binary, which `docs/benchmarks.md` pins as its methodology.
+fn release_profile_policy(manifest: &str) -> Result<(), &'static str> {
+    for (key, diagnostic) in [
+        ("panic", "a panic strategy is declared"),
+        ("strip", "symbol stripping is declared"),
+    ] {
+        if profile_key_declaration(manifest, key).is_some() {
+            return Err(diagnostic);
+        }
+    }
+
+    if manifest.contains(RELEASE_PROFILE_ADR) {
+        Ok(())
+    } else {
+        Err("missing release-profile ADR link")
+    }
+}
+
+/// The out-of-manifest half, one environment needle and one build-flag needle per key, exactly as
+/// `codegen_units_override_policy` has. The trailing `=` is what makes the second pair safe: unlike
+/// `codegen-units`, these key names are ordinary English words, so a bare needle would reject any
+/// surface whose comments discussed a panic. `-C panic=abort` is caught twice over — here, and by
+/// `target_cpu_policy` below, which rejects *any* rustflags variable on all of these surfaces.
+fn profile_key_override_policy(body: &str) -> Result<(), &'static str> {
+    for (needle, diagnostic) in [
+        ("_PANIC", "a panic-strategy env override is set"),
+        ("_STRIP", "a symbol-stripping env override is set"),
+        ("panic=", "a panic-strategy build flag is set"),
+        ("strip=", "a symbol-stripping build flag is set"),
     ] {
         if body.contains(needle) {
             return Err(diagnostic);
@@ -253,7 +300,7 @@ fn profile_comment_does_not_declare_codegen_units() {
 #[test]
 fn no_profile_table_declares_codegen_units() {
     assert_eq!(
-        codegen_units_declaration(WORKSPACE_MANIFEST),
+        profile_key_declaration(WORKSPACE_MANIFEST, "codegen-units"),
         None,
         "walrus keeps the default codegen-unit count; see {CODEGEN_UNITS_ADR}"
     );
@@ -261,7 +308,7 @@ fn no_profile_table_declares_codegen_units() {
 
 #[test]
 fn no_build_surface_overrides_codegen_units() {
-    for (name, body) in CODEGEN_UNITS_SURFACES {
+    for (name, body) in CARGO_BUILD_SURFACES {
         assert_eq!(
             codegen_units_override_policy(body),
             Ok(()),
@@ -360,6 +407,123 @@ fn codegen_units_override_policy_rejects_fabricated_input() {
             "surface:\n{body}"
         );
     }
+}
+
+#[test]
+fn no_profile_table_declares_panic_or_strip() {
+    assert_eq!(
+        release_profile_policy(WORKSPACE_MANIFEST),
+        Ok(()),
+        "walrus keeps unwinding and its symbol table; see {RELEASE_PROFILE_ADR}"
+    );
+}
+
+#[test]
+fn release_profile_policy_rejects_fabricated_input() {
+    let linked_default = concat!(
+        "# docs/implementation/notes/rust-skills/perf-release-profile.md\n",
+        "[profile.release]\n",
+        "lto = \"thin\"\n",
+    );
+    // The workspace's own `panic = "deny"` clippy entry is not a profile key.
+    let lint_table_panic = concat!(
+        "# docs/implementation/notes/rust-skills/perf-release-profile.md\n",
+        "[workspace.lints.clippy]\n",
+        "panic = \"deny\"\n",
+        "\n",
+        "[profile.release]\n",
+        "lto = \"thin\"\n",
+    );
+    let abort_panic = concat!(
+        "# docs/implementation/notes/rust-skills/perf-release-profile.md\n",
+        "[profile.release]\n",
+        "lto = \"thin\"\n",
+        "panic = \"abort\"\n",
+    );
+    // `bench` inherits `release`, so stripping it alone still costs the benchmark its frames.
+    let stripped_bench = concat!(
+        "# docs/implementation/notes/rust-skills/perf-release-profile.md\n",
+        "[profile.release]\n",
+        "lto = \"thin\"\n",
+        "\n",
+        "[profile.bench]\n",
+        "inherits = \"release\"\n",
+        "strip = true\n",
+    );
+    let missing_link = "[profile.release]\nlto = \"thin\"\n";
+
+    let cases = [
+        (linked_default, Ok(())),
+        (lint_table_panic, Ok(())),
+        (abort_panic, Err("a panic strategy is declared")),
+        (stripped_bench, Err("symbol stripping is declared")),
+        (missing_link, Err("missing release-profile ADR link")),
+    ];
+
+    for (manifest, expected) in cases {
+        assert_eq!(
+            release_profile_policy(manifest),
+            expected,
+            "manifest:\n{manifest}"
+        );
+    }
+}
+
+#[test]
+fn no_build_surface_overrides_panic_or_strip() {
+    for (name, body) in CARGO_BUILD_SURFACES {
+        assert_eq!(
+            profile_key_override_policy(body),
+            Ok(()),
+            "{name} must build the profile the manifest declares; see {RELEASE_PROFILE_ADR}"
+        );
+    }
+}
+
+#[test]
+fn profile_key_override_policy_rejects_fabricated_input() {
+    let cases = [
+        ("RUN cargo build --release", Ok(())),
+        // Prose about a panicking task is not an override; only the two shapes below are.
+        ("# the exporter panics, the lease expires", Ok(())),
+        (
+            "ENV CARGO_PROFILE_RELEASE_PANIC=abort",
+            Err("a panic-strategy env override is set"),
+        ),
+        (
+            "ENV CARGO_PROFILE_RELEASE_STRIP=true",
+            Err("a symbol-stripping env override is set"),
+        ),
+        (
+            "RUSTFLAGS=\"-C panic=abort\" cargo build --release",
+            Err("a panic-strategy build flag is set"),
+        ),
+        (
+            "cargo build --release --config profile.bench.strip=true",
+            Err("a symbol-stripping build flag is set"),
+        ),
+    ];
+
+    for (body, expected) in cases {
+        assert_eq!(
+            profile_key_override_policy(body),
+            expected,
+            "surface:\n{body}"
+        );
+    }
+}
+
+#[test]
+fn release_profile_decision_is_recorded() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    assert!(
+        root.join(RELEASE_PROFILE_ADR).is_file(),
+        "missing release-profile decision at {RELEASE_PROFILE_ADR}"
+    );
+    assert!(
+        !RELEASE_PROFILE_NOTE.trim().is_empty(),
+        "{RELEASE_PROFILE_ADR} must contain the recorded decision and re-open trigger"
+    );
 }
 
 #[test]

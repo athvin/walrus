@@ -384,5 +384,11 @@ proptest = { version = "1", default-features = false, features = ["std"] }
 # *cutting* CI/Docker build time (PRs 5.1-5.3), and the bench inherits `release` so the numbers count.
 # Rejection recorded in full (with the re-open trigger) in
 # docs/implementation/notes/rust-skills/opt-codegen-units.md — guarded by crates/common/tests/build_profile.rs.
+# `panic` and `strip` are the two remaining knobs of that family, and both keep their defaults for
+# behavioural rather than build-cost reasons: unwinding is what lets crates/pg-sink/src/reload.rs
+# classify a panicking reload exporter instead of taking the whole sink down with it, and the symbol
+# table is what names the frames in a profile of the release — and, by inheritance, `bench` — binary.
+# Recorded, with the custom-profile and dev-override rejections, in
+# docs/implementation/notes/rust-skills/perf-release-profile.md — same guard.
 [profile.release]
 lto = "thin"
