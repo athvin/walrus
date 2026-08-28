@@ -8,13 +8,15 @@
 //! The single most dangerous bug here is a **false positive** — treating a network blip as slot loss
 //! would nuke and re-snapshot the whole system on every hiccup. So classification is split from the
 //! decision: [`classify_slot`] does the I/O (and maps a query failure to [`SlotStatus::Unreachable`]),
-//! and the pure [`decide`] guarantees `Unreachable` routes to a retry, **never** a fresh slot. Only a
-//! catalog that authoritatively says "connected, slot gone" opens a new generation.
+//! and the pure [`decide`] guarantees [`Unreachable`](SlotStatus::Unreachable) routes to a retry,
+//! **never** a fresh slot. Only a catalog that authoritatively says "connected, slot gone" opens a
+//! new generation.
 
 use common::Lsn;
 
-/// Result of inspecting the slot on a source connection. Only `Absent` / `Invalidated` — observed on a
-/// **successful** connection — are slot loss; `Unreachable` is a hiccup (retry, never total-restart).
+/// Result of inspecting the slot on a source connection. Only [`Absent`](SlotStatus::Absent) /
+/// [`Invalidated`](SlotStatus::Invalidated) — observed on a **successful** connection — are slot
+/// loss; [`Unreachable`](SlotStatus::Unreachable) is a hiccup (retry, never total-restart).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotStatus {
     /// Present and usable — resume from `confirmed_flush`.
@@ -40,8 +42,10 @@ pub enum SlotAction {
     Retry,
 }
 
-/// Decide what to do from a classified slot. Pure (no I/O) so the guard is unit-tested: `Unreachable`
-/// must map to `Retry`, and only `Absent` / `Invalidated` to `FreshSlot`.
+/// Decide what to do from a classified slot. Pure (no I/O) so the guard is unit-tested:
+/// [`Unreachable`](SlotStatus::Unreachable) must map to [`Retry`](SlotAction::Retry), and only
+/// [`Absent`](SlotStatus::Absent) / [`Invalidated`](SlotStatus::Invalidated) to
+/// [`FreshSlot`](SlotAction::FreshSlot).
 #[must_use]
 pub const fn decide(status: SlotStatus) -> SlotAction {
     match status {
@@ -52,9 +56,11 @@ pub const fn decide(status: SlotStatus) -> SlotAction {
 }
 
 /// Classify the slot over a **live** source connection (post-preflight): a present row with
-/// `wal_status <> 'lost'` is `Healthy`; `wal_status = 'lost'` is `Invalidated`; no row is `Absent`; a
-/// query error is `Unreachable` (the connection died — a hiccup, not slot loss). `wal_status` is the
-/// PG14+ invalidation signal, distinct from an empty result (a dropped slot) — both are handled.
+/// `wal_status <> 'lost'` is [`Healthy`](SlotStatus::Healthy); `wal_status = 'lost'` is
+/// [`Invalidated`](SlotStatus::Invalidated); no row is [`Absent`](SlotStatus::Absent); a query error
+/// is [`Unreachable`](SlotStatus::Unreachable) (the connection died — a hiccup, not slot loss).
+/// `wal_status` is the PG14+ invalidation signal, distinct from an empty result (a dropped slot) —
+/// both are handled.
 pub async fn classify_slot(client: &tokio_postgres::Client, slot: &str) -> SlotStatus {
     let rows = match client
         .query(

@@ -1,7 +1,7 @@
 //! `schema_registry` model: the versioned per-column type-mapping descriptors.
 //!
 //! **History, never a queue** — never pruned. The sink writes one row per structural
-//! `schema_version` (a `Vec<TypeDescriptor>` from `common`, PR 1.2, plus a snapshot of the
+//! `schema_version` (a `Vec` of [`TypeDescriptor`]s from `common`, PR 1.2, plus a snapshot of the
 //! resulting column set); the loader reads it back to rebuild the exact source types for a given
 //! file's `schema_version`. A `DELETE` here would make old-version Parquet files un-reconstructable.
 

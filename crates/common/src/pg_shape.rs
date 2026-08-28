@@ -170,9 +170,10 @@ impl PgRelation {
 
 /// One column value inside a TupleData (proto §5).
 ///
-/// **`Null` (`'n'`) and `UnchangedToast` (`'u'`) are DISTINCT** — a whole loader-correctness story
-/// (PR 3.6) depends on the difference surviving from wire to `<table>_raw`, where the loader
-/// resolves an unchanged-TOAST placeholder by back-scanning. It must never be collapsed to `Null`.
+/// **[`Null`](TupleValue::Null) (`'n'`) and [`UnchangedToast`](TupleValue::UnchangedToast) (`'u'`)
+/// are DISTINCT** — a whole loader-correctness story (PR 3.6) depends on the difference surviving
+/// from wire to `<table>_raw`, where the loader resolves an unchanged-TOAST placeholder by
+/// back-scanning. It must never be collapsed to [`Null`](TupleValue::Null).
 ///
 /// Not `Serialize`: this is an in-memory wire value, not a persisted document with a stable JSON
 /// contract. serde is added only if a later PR needs it.

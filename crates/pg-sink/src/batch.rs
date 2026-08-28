@@ -4,7 +4,7 @@
 //! flushes when **any** threshold trips — `max_fill` (cadence), `max_rows`, or `max_bytes` — but
 //! **never in the middle of a committed transaction's tail**: rows buffer against the open txn and
 //! become flush-eligible only at `Commit`, so a batch may span many small txns but never a fraction of
-//! one (§1.6). This PR seals an in-memory `RecordBatch`; the Parquet/S3 write is PR 2.24.
+//! one (§1.6). This PR seals an in-memory [`RecordBatch`]; the Parquet/S3 write is PR 2.24.
 //!
 //! `lsn_end` is the **commit LSN** of the batch's last transaction — the load-bearing key for the
 //! manifest (PR 2.25) and checkpoint (PR 2.26), and deliberately *not* the max per-row LSN.
@@ -13,7 +13,7 @@
 //!
 //! | Site | Dispatch | Why |
 //! |---|---|---|
-//! | `Clock` (this module) | **static** (`C: Clock`) | one production impl on a per-commit path |
+//! | [`Clock`] (this module) | **static** (`C: Clock`) | one production impl on a per-commit path |
 //! | `Arc<dyn ObjectStore>` (`sink.rs`) | dynamic | `BufWriter::new` takes `Arc<dyn ObjectStore>` |
 //! | `Box<dyn ArrayBuilder>` (`pg-to-arrow`) | dynamic | one heterogeneous builder per column |
 //!
@@ -320,7 +320,8 @@ impl<C: Clock> TableBatcher<C> {
             || self.clock.now().saturating_duration_since(opened_at) >= self.triggers.max_fill
     }
 
-    /// Finish the Arrow builders into a `SealedBatch` and reset. Errors if an open txn would be split.
+    /// Finish the Arrow builders into a [`SealedBatch`] and reset. Errors if an open txn would be
+    /// split.
     ///
     /// # Errors
     ///

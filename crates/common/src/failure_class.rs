@@ -1,12 +1,12 @@
-//! `FailureClass` — the terminal-vs-transient contract every walrus error enum implements.
+//! [`FailureClass`] — the terminal-vs-transient contract every walrus error enum implements.
 //!
 //! **Required:** [`FailureClass::is_terminal`] — the one thing an implementor must decide, and
 //! deliberately the only one: an exhaustive `match` with no `_` arm makes an unclassified new
 //! variant a compile error.
 //!
-//! **Defaulted:** [`FailureClass::is_transient`] is the exact complement of `is_terminal` and
-//! should never be overridden. [`FailureClass::exit_code`] answers `Internal` (70) for an
-//! unclassified failure; every error type whose values reach a `main` overrides it with the
+//! **Defaulted:** [`FailureClass::is_transient`] is the exact complement of `is_terminal` and should
+//! never be overridden. [`FailureClass::exit_code`] answers [`Internal`](ExitCode::Internal) (70)
+//! for an unclassified failure; every error type whose values reach a `main` overrides it with the
 //! documented per-variant code.
 //!
 //! **Deliberately NOT sealed.** Cross-crate implementation *is* the contract: `control::ControlError`

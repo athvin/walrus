@@ -1,9 +1,9 @@
-//! Write a `RecordBatch` to Parquet with arrow-rs.
+//! Write a [`RecordBatch`] to Parquet with arrow-rs.
 //!
 //! The one rule (walrus-pg-sink.md §2.1): DuckDB reads Parquet's **native** logical types, so we
 //! must **not** coerce temporals. arrow-rs already emits `TIMESTAMP(MICROS, isAdjustedToUTC=…)`
 //! straight from `Timestamp(Microsecond, tz)` — coercing to NANOS/MILLIS is exactly the bug §2.1
-//! warns about. So `default_writer_properties` only sets compression and leaves the temporal
+//! warns about. So [`default_writer_properties`] only sets compression and leaves the temporal
 //! encoding to arrow-rs. PR 2.11's conformance tests prove the round-trip through in-process DuckDB.
 
 use crate::error::Error;

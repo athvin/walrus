@@ -1,9 +1,9 @@
 //! Typed domain IDs — newtypes over the bare `i64` primary keys the control plane hands around.
 //!
-//! `ManifestId` extends the [`Lsn`](crate::Lsn) newtype pattern to a `file_manifest` row's id, so it
-//! can't be silently swapped for another bare `i64` (a manifest id vs an epoch vs a schema version).
-//! `ManifestId`, [`EpochNo`], [`SchemaVersionNo`], [`ReloadId`], and [`DdlId`] share the same
-//! transparent `int8` boundary while remaining distinct types inside Rust.
+//! [`ManifestId`] extends the [`Lsn`](crate::Lsn) newtype pattern to a `file_manifest` row's id, so
+//! it can't be silently swapped for another bare `i64` (a manifest id vs an epoch vs a schema
+//! version). [`ManifestId`], [`EpochNo`], [`SchemaVersionNo`], [`ReloadId`], and [`DdlId`] share the
+//! same transparent `int8` boundary while remaining distinct types inside Rust.
 //!
 //! Which bare integers deliberately stay bare — the pgoutput wire scalars (relation/type OIDs and
 //! transaction ids) — and what would reopen that, is recorded in
@@ -14,9 +14,9 @@
 //! to the inner `i64`, so width, fill, `+`, and `#` behave exactly as they did on the bare integer
 //! each type replaced — wrapping an id must not cost a format specifier. (Hex of a negative id is
 //! the inner integer's two's-complement bit pattern, as it would be bare; real control-plane ids are
-//! positive.) `Octal` and `Binary` are deliberately absent: a `bigserial` key, a generation counter,
-//! and a schema version have no base-8 or base-2 reading. [`Lsn`](crate::Lsn) implements all four
-//! because a WAL byte address does.
+//! positive.) [`Octal`](std::fmt::Octal) and [`Binary`](std::fmt::Binary) are deliberately absent: a
+//! `bigserial` key, a generation counter, and a schema version have no base-8 or base-2 reading.
+//! [`Lsn`](crate::Lsn) implements all four because a WAL byte address does.
 //!
 //! Reading text back is a separate question from printing it, and the answer is not shared:
 //! [`ReloadId`] alone implements [`FromStr`](std::str::FromStr), because it is the only one of the

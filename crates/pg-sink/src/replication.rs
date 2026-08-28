@@ -7,8 +7,8 @@
 //! prescribes: a Startup handshake, `START_REPLICATION`, then the CopyBoth byte stream (`'w'`
 //! XLogData / `'k'` primary keepalive), replying with `'r'` standby-status updates. The dev harness
 //! uses `trust` auth so the handshake carries no SCRAM (SCRAM would be added here if a
-//! password-authed source were required). The `ReplicationStream` / `ReplicationMessage` /
-//! `StandbyStatus` seam is unchanged for callers, so PR 2.21's decoder plugs in regardless.
+//! password-authed source were required). The [`ReplicationStream`] / [`ReplicationMessage`] /
+//! [`StandbyStatus`] seam is unchanged for callers, so PR 2.21's decoder plugs in regardless.
 //!
 //! **Two LSNs, kept apart (§1.9):** the *received* LSN (sent as `write` to stay connected) advances
 //! here on every frame; `flush`/`apply` (= `confirmed_flush_lsn`, which releases source WAL) only
@@ -76,7 +76,7 @@ pub struct Idle;
 #[derive(Debug, Clone, Copy)]
 pub struct Streaming;
 
-/// A hand-rolled replication connection, typed by which protocol state it is in. `Streaming` is the
+/// A hand-rolled replication connection, typed by which protocol state it is in. [`Streaming`] is the
 /// default because every consumer of this module ([`crate::consume`], [`crate::shutdown`],
 /// [`crate::checkpoint`]) only ever holds a live CopyBoth stream; the [`Idle`] form exists for the
 /// snapshot-export handoff (PR 2.29) and exposes nothing that would tear the wire.

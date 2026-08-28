@@ -1,4 +1,4 @@
-//! `SinkMeta` — the provenance document embedded in every Parquet row.
+//! [`SinkMeta`] — the provenance document embedded in every Parquet row.
 //!
 //! Each row walrus writes carries one added column, `walrus_pg_sink_meta`, a JSON document
 //! bunching *all* batch/row provenance. The sink **serializes** [`SinkMeta`] into that column; the
@@ -8,7 +8,7 @@
 //!
 //! **The JSON keys and value shapes here are a cross-service wire contract** (architecture.md
 //! §1.4): the sink and loader must agree byte-for-byte, so a renamed field or a stray offset on a
-//! timestamp silently breaks the loader. Field names match the documented keys 1:1; `Op`/`Kind`
+//! timestamp silently breaks the loader. Field names match the documented keys 1:1; [`Op`]/[`Kind`]
 //! serialize to the documented scalars; and every datetime is UTC RFC-3339 with a `Z` suffix.
 
 use crate::{EpochNo, Error, Lsn, Result, SchemaVersionNo};

@@ -104,12 +104,12 @@ impl RelationCache {
     }
 
     /// Rebuild cache entries at bootstrap from persisted `schema_registry` rows (step 7). Each row's
-    /// `columns` snapshot is the serialized `PgRelation`; the Arrow schema is recomputed from it, and
-    /// the stored descriptors are used verbatim.
+    /// `columns` snapshot is the serialized [`PgRelation`]; the Arrow schema is recomputed from it,
+    /// and the stored descriptors are used verbatim.
     ///
     /// # Errors
     ///
-    /// Returns [`RelationError::Hydrate`] when a persisted snapshot is not a `PgRelation`, or
+    /// Returns [`RelationError::Hydrate`] when a persisted snapshot is not a [`PgRelation`], or
     /// [`RelationError::Schema`] when its shape cannot be mapped to Arrow.
     pub fn hydrate(&mut self, rows: Vec<control::RegistryRow>) -> Result<(), RelationError> {
         let decoded = rows

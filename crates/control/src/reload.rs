@@ -5,7 +5,7 @@
 //! surfaces as the typed [`ControlError::ReloadTransition`], never a silent double-claim. The
 //! status walk is `requested → exporting → export_complete → complete`, with `failed` terminal
 //! from the two middle states. There is deliberately **no** `superseded` status: a DDL restart
-//! (PR 6.8) is `fail()` with an explanatory reason plus a fresh successor row.
+//! (PR 6.8) is [`fail()`](fail) with an explanatory reason plus a fresh successor row.
 //!
 //! `reload_id` is a **bigserial, not a UUID** (a recorded deviation from the design doc): "honor
 //! only the latest reload_id" (H9) becomes a numeric max, and the id fits the loader's

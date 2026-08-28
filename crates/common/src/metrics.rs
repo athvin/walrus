@@ -42,7 +42,7 @@ pub mod names {
     pub const SINK_ABORTED_TXN_COUNT: &str = "walrus_sink_aborted_txn_total";
     pub const SINK_FAILED_FILE_COUNT: &str = "walrus_sink_failed_file_total";
     // --- reload (single-table-reload subsystem, PR 6.3/6.8/6.11) ---
-    /// Non-terminal reloads in flight, labelled by `FLAVOR_LABEL` — a gauge the controller inc/decs
+    /// Non-terminal reloads in flight, labelled by [`FLAVOR_LABEL`] — a gauge the controller inc/decs
     /// as exporters start and end; returns to 0 when the queue drains (PR 6.11).
     pub const RELOAD_ACTIVE: &str = "walrus_reload_active";
     /// Chunk files exported, per table (PR 6.11).
@@ -108,8 +108,9 @@ pub mod names {
         RELOAD_LEASE_STALE,
     ];
 
-    /// Every per-table reload series (PR 6.11) — labelled by `TABLE_LABEL`, like the loader set. Not
-    /// zero-inited globally (reloads are rare operator events); each appears on its first emission.
+    /// Every per-table reload series (PR 6.11) — labelled by [`TABLE_LABEL`], like the loader set.
+    /// Not zero-inited globally (reloads are rare operator events); each appears on its first
+    /// emission.
     pub const RELOAD_PER_TABLE: &[&str] = &[
         RELOAD_CHUNKS_TOTAL,
         RELOAD_ROWS_EXPORTED_TOTAL,

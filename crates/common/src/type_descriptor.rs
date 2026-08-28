@@ -1,4 +1,4 @@
-//! `TypeDescriptor` — the per-column type-mapping descriptor (walrus-pg-sink.md §2.6).
+//! [`TypeDescriptor`] — the per-column type-mapping descriptor (walrus-pg-sink.md §2.6).
 //!
 //! Part of the same decoupling seam as [`crate::pg_shape`]: the sink writes one descriptor per
 //! source column into `schema_registry` (keyed by `schema_version`); the loader reads it back to

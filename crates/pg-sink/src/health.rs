@@ -4,7 +4,8 @@
 //!
 //! - `/startup` — 200 iff bootstrap is done. While it is non-200, Kubernetes runs *neither* liveness
 //!   nor readiness, so a legitimately slow initial catch-up can never be killed mid-progress.
-//! - `/ready`   — 200 iff `Ready` **and** not terminating; keeps the pod out of rotation otherwise.
+//! - `/ready`   — 200 iff [`Phase::Ready`] **and** not terminating; keeps the pod out of rotation
+//!   otherwise.
 //! - `/healthz` — liveness = **true deadlock only**. It is NOT gated on slot lag: a pod catching up
 //!   after an outage has high lag *by definition*, and a lag-based liveness probe would kill it
 //!   exactly when it is doing its job. High lag feeds `degraded` on readiness/health, never a kill.
@@ -20,7 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use tokio_util::sync::CancellationToken;
 
-/// The bootstrap phase the probes read. `Bootstrapping` gates the other two.
+/// The bootstrap phase the probes read. [`Bootstrapping`](Phase::Bootstrapping) gates the other two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum Phase {

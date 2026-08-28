@@ -9,8 +9,9 @@
 //!
 //! **enum.** Values are lossless as `VARCHAR`; the **ordered label set** is lost on the wire and is
 //! carried by the descriptor (PR 2.17), from which the loader recreates the DuckDB `ENUM`. Enum OIDs
-//! are dynamic (≥ `FIRST_NORMAL_OID`), so we treat a non-builtin OID as `enum → VARCHAR` for now
-//! ([`is_enum_oid`]); PR 2.22 resolves enum-ness from the source catalog / the decoder's `Type` message.
+//! are dynamic (≥ [`oids::FIRST_NORMAL_OID`]), so we treat a non-builtin OID as `enum → VARCHAR` for
+//! now ([`is_enum_oid`]); PR 2.22 resolves enum-ness from the source catalog / the decoder's `Type`
+//! message.
 
 use crate::error::Error;
 use crate::oids;
@@ -43,15 +44,15 @@ pub fn enum_field(name: &str) -> Field {
     Field::new(name, DataType::Utf8, true)
 }
 
-/// Interim enum detection: a non-builtin OID (≥ `FIRST_NORMAL_OID`) is treated as an enum carrier.
-/// PR 2.22 replaces this with a catalog-derived marker (the decoder's `Type` message).
+/// Interim enum detection: a non-builtin OID (≥ [`oids::FIRST_NORMAL_OID`]) is treated as an enum
+/// carrier. PR 2.22 replaces this with a catalog-derived marker (the decoder's `Type` message).
 #[must_use]
 pub const fn is_enum_oid(type_oid: u32) -> bool {
     type_oid >= oids::FIRST_NORMAL_OID
 }
 
 /// Parse canonical UUID text (`"550e8400-e29b-41d4-a716-446655440000"`) into 16 bytes. Rejects
-/// malformed input with `ValueParse` (no silent zero-padding).
+/// malformed input with [`Error::ValueParse`] (no silent zero-padding).
 ///
 /// # Errors
 ///

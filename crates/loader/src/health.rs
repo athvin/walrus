@@ -19,9 +19,9 @@ use tokio_util::sync::CancellationToken;
 
 /// The loader's health lifecycle — exactly one of three states.
 ///
-/// `Quarantined` implies bootstrap finished: its producer is a failed lossy DDL cast in the apply
-/// loop, which cannot run before bootstrap. That implication keeps `/startup` satisfied while
-/// `/ready` degrades.
+/// [`Quarantined`](LoaderPhase::Quarantined) implies bootstrap finished: its producer is a failed
+/// lossy DDL cast in the apply loop, which cannot run before bootstrap. That implication keeps
+/// `/startup` satisfied while `/ready` degrades.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum LoaderPhase {

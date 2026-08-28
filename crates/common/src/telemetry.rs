@@ -43,7 +43,7 @@ const DEFAULT_FILTER: &str = "info";
 pub struct TelemetryConfig {
     /// Emit newline-delimited JSON (one object per event) instead of the pretty formatter.
     pub json: bool,
-    /// `EnvFilter` directive, e.g. `"info,pg_sink=debug,loader=debug"` — targets are matched by
+    /// [`EnvFilter`] directive, e.g. `"info,pg_sink=debug,loader=debug"` — targets are matched by
     /// prefix against the **lib** crate names, so `walrus=…` would reach only the two `main.rs`
     /// roots. Empty → fall back to `RUST_LOG`, then `DEFAULT_FILTER`.
     pub filter: String,
@@ -58,7 +58,7 @@ impl Default for TelemetryConfig {
     }
 }
 
-/// Build the `EnvFilter`: an explicit `cfg.filter` wins; an empty one falls back to `RUST_LOG`,
+/// Build the [`EnvFilter`]: an explicit `cfg.filter` wins; an empty one falls back to `RUST_LOG`,
 /// then to [`DEFAULT_FILTER`]. A malformed directive degrades to the default rather than silently
 /// disabling logging.
 fn build_env_filter(cfg: &TelemetryConfig) -> EnvFilter {
@@ -69,7 +69,7 @@ fn build_env_filter(cfg: &TelemetryConfig) -> EnvFilter {
     }
 }
 
-/// Build the `EnvFilter` + fmt layer (pretty or JSON per `cfg.json`) and install it as the global
+/// Build the [`EnvFilter`] + fmt layer (pretty or JSON per `cfg.json`) and install it as the global
 /// default subscriber.
 ///
 /// **Only a binary's `main` may call this.** A subscriber is process-wide and installs once, so

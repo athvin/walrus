@@ -1,5 +1,5 @@
-//! `LoaderError` — every terminal bootstrap failure, each mapped to a distinct [`common::ExitCode`] so
-//! a broken deploy is greppable in `kubectl logs` (the "context in the loop, exit code at `main`"
+//! [`LoaderError`] — every terminal bootstrap failure, each mapped to a distinct [`common::ExitCode`]
+//! so a broken deploy is greppable in `kubectl logs` (the "context in the loop, exit code at `main`"
 //! idiom). Transient failures are retried to a deadline *before* becoming one of these.
 
 use crate::config::ConfigError;
@@ -125,8 +125,8 @@ impl From<&LoaderError> for common::Error {
 }
 
 impl FailureClass for LoaderError {
-    /// Exhaustive, no `_` arm. Only a wrapped `ControlError` can be transient; every other variant
-    /// is a terminal bootstrap failure by construction.
+    /// Exhaustive, no `_` arm. Only a wrapped [`control::ControlError`] can be transient; every
+    /// other variant is a terminal bootstrap failure by construction.
     fn is_terminal(&self) -> bool {
         match self {
             LoaderError::Control(e) => e.is_terminal(),

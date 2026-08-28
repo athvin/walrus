@@ -1,12 +1,13 @@
-//! The decode loop: join the live [`ReplicationStream`] (PR 2.20) to the sync, pure `pgoutput`
+//! The decode loop: join the live [`ReplicationStream`] (PR 2.20) to the sync, pure [`pgoutput`]
 //! decoder (PRs 2.2–2.8). The Rust analogue of the proof harness's `run-tests.sh` — an `INSERT` now
 //! decodes to `Begin → Relation → Insert → Commit` against a real Postgres. No Arrow / batching / S3.
 //!
-//! **The seam that kept the decoder testable:** `pgoutput::parse_message` stays **sync + pure**; this
-//! loop owns the I/O (`.await`s a frame) and calls the decoder synchronously on the returned `Bytes`.
-//! The `StreamCtx` (are we inside a `Stream Start`/`Stop` block?) is threaded across frames by the
-//! loop, since a v2 sub-xid prefix appears *only inside* a stream. Small txns still arrive whole at
-//! commit (no stream frames), and `StreamCtx` handles both shapes with no special-casing here.
+//! **The seam that kept the decoder testable:** [`pgoutput::parse_message`] stays **sync + pure**;
+//! this loop owns the I/O (`.await`s a frame) and calls the decoder synchronously on the returned
+//! `Bytes`. The [`StreamCtx`] (are we inside a `Stream Start`/`Stop` block?) is threaded across
+//! frames by the loop, since a v2 sub-xid prefix appears *only inside* a stream. Small txns still
+//! arrive whole at commit (no stream frames), and [`StreamCtx`] handles both shapes with no
+//! special-casing here.
 
 use crate::batch::{BatchTriggers, Clock, SealedBatch, TableBatcher};
 use crate::health::HealthState;

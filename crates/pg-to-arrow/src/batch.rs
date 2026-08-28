@@ -1,12 +1,13 @@
 #![deny(clippy::indexing_slicing)] // PR 16.2: the 460 ns/row append path carries width proofs.
 
-//! `BatchBuilder`: decoded `TupleValue`s + a `SinkMeta` → an Arrow `RecordBatch`.
+//! [`BatchBuilder`] — decoded [`TupleValue`]s + a [`SinkMeta`] → an Arrow [`RecordBatch`].
 //!
 //! pgoutput ships values as canonical **text**; this builder parses each into its Tier-1 Arrow
-//! representation, maps `Null` and `UnchangedToast` onto the validity bitmap (a null in both cases —
-//! the TOAST placeholder's column name is recorded in `SinkMeta.unchanged_toast` upstream and echoed
-//! into the meta JSON; *resolving* it is the loader's back-scan, PR 3.6), and serializes the
-//! provenance into the trailing `walrus_pg_sink_meta` column. All column builders (including meta)
+//! representation, maps [`TupleValue::Null`] and [`TupleValue::UnchangedToast`] onto the validity
+//! bitmap (a null in both cases — the TOAST placeholder's column name is recorded in
+//! [`SinkMeta::unchanged_toast`] upstream and echoed into the meta JSON; *resolving* it is the
+//! loader's back-scan, PR 3.6), and serializes the provenance into the trailing
+//! `walrus_pg_sink_meta` column. All column builders (including meta)
 //! move in lockstep — every `append_row` pushes exactly one slot to every column.
 
 use crate::error::Error;
@@ -105,7 +106,7 @@ fn emit_kind(col: &PgColumn) -> Result<Emit, Error> {
     })
 }
 
-/// Accumulates decoded rows for ONE relation into a single Arrow `RecordBatch`.
+/// Accumulates decoded rows for ONE relation into a single Arrow [`RecordBatch`].
 #[derive(Debug)]
 pub struct BatchBuilder {
     schema: SchemaRef,
@@ -154,7 +155,7 @@ impl BatchBuilder {
     }
 
     /// Append one decoded tuple + its provenance. `values.len()` must equal the source column count
-    /// (one `TupleValue` per source column — Tier-2 values fan out to several builders internally).
+    /// (one [`TupleValue`] per source column — Tier-2 values fan out to several builders internally).
     ///
     /// # Errors
     ///
@@ -254,10 +255,10 @@ impl BatchBuilder {
     }
 
     /// Consume the builder, finishing all column builders into arrays and assembling the
-    /// schema-checked `RecordBatch`.
+    /// schema-checked [`RecordBatch`].
     ///
     /// `into_`, not `finish`: arrow-rs's [`ArrayBuilder::finish`] takes `&mut self` and leaves the
-    /// builder reusable, but this takes `self` by value and spends it — one `BatchBuilder` per
+    /// builder reusable, but this takes `self` by value and spends it — one [`BatchBuilder`] per
     /// sealed micro-batch. The names differ because the ownership does. Callers that hold the
     /// builder behind a `&mut` (see `pg_sink::batch::TableBatcher::seal`) must `mem::replace` it out
     /// first; the name is what tells them so.

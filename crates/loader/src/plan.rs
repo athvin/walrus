@@ -13,8 +13,8 @@
 //!
 //! A plan built from a bare [`PgRelation`] ([`TablePlan::tier1`]) reproduces the pre-descriptor scalar
 //! behaviour exactly (emit == source column via `crate::duck::duck_type`), so the hermetic/compose
-//! tests that pass a `PgRelation` are unchanged; the registry path ([`TablePlan::from_registry`]) adds
-//! the Tier-2 shapes.
+//! tests that pass a [`PgRelation`] are unchanged; the registry path ([`TablePlan::from_registry`])
+//! adds the Tier-2 shapes.
 
 use common::oids::{INTERVAL, TIMETZ};
 use common::{PgRelation, TypeDescriptor};

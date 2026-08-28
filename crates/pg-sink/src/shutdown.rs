@@ -41,7 +41,8 @@ where
     body.await
 }
 
-/// Outcome of a drain attempt (the caller maps this to an `ExitCode` — a completed drain is `Success`).
+/// Outcome of a drain attempt (the caller maps this to a [`common::ExitCode`] — a completed drain is
+/// [`Success`](common::ExitCode::Success)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrainOutcome {
     /// Committed batch(es) flushed + manifested, final feedback sent, connection closed — slot left

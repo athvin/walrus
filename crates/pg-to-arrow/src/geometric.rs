@@ -13,7 +13,8 @@ use arrow::datatypes::{DataType, Field, Fields};
 use std::sync::Arc;
 
 /// Which geometric shape a source column carries — selects the parser (and hence the nested builder).
-/// `Lseg`/`Box` share one shape (`STRUCT(p1, p2)`) and one parser (two points).
+/// [`Lseg`](GeoKind::Lseg)/[`Box`](GeoKind::Box) share one shape (`STRUCT(p1, p2)`) and one parser
+/// (two points).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GeoKind {
     Point,
@@ -25,7 +26,7 @@ pub enum GeoKind {
     Polygon,
 }
 
-/// The geometric `GeoKind` for an OID, or `None` for a non-geometric (incl. PostGIS) type.
+/// The geometric [`GeoKind`] for an OID, or `None` for a non-geometric (incl. PostGIS) type.
 #[must_use]
 pub const fn geo_kind(type_oid: u32) -> Option<GeoKind> {
     Some(match type_oid {

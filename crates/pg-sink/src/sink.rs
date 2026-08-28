@@ -1,8 +1,8 @@
 //! Arrow → Parquet → S3 PUT (§1.4) — **step (a) of the durability checkpoint** (§1.5).
 //!
-//! Encode a [`SealedBatch`] to Parquet with arrow-rs's `AsyncArrowWriter` and stream it straight into
-//! an S3 object via `object_store`'s multipart `BufWriter` — never materialising the file on local
-//! disk. `close()` (which completes the multipart) is the **durability point**: `put` returns a
+//! Encode a [`SealedBatch`] to Parquet with arrow-rs's [`AsyncArrowWriter`] and stream it straight
+//! into an S3 object via `object_store`'s multipart [`BufWriter`] — never materialising the file on
+//! local disk. `close()` (which completes the multipart) is the **durability point**: `put` returns a
 //! [`WrittenObject`] only after it, because the manifest INSERT (PR 2.25) and the slot advance
 //! (PR 2.26) must never get ahead of a batch that isn't durably in S3 (the WAL-bounding invariant).
 //!

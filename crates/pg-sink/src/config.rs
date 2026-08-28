@@ -1,4 +1,4 @@
-//! `SinkConfig` — the fully-validated sink configuration (bootstrap step 1).
+//! [`SinkConfig`] — the fully-validated sink configuration (bootstrap step 1).
 //!
 //! Mirrors [`common::CommonConfig`]'s pattern: read a `WALRUS_`-prefixed environment (with an
 //! optional file underneath) into a typed serde struct, then bounds-check it. **Invalid config is a

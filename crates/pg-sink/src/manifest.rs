@@ -1,10 +1,11 @@
 //! Durability step (b): after the Parquet PUT is durable in S3 (PR 2.24), **commit** a `file_manifest`
 //! `ready` row — the loader's work-queue entry (§1.5).
 //!
-//! This is a thin adapter: map a [`WrittenObject`] → `control::NewManifestFile` and delegate to
-//! `control::insert_ready` (PR 1.4), so the `WHERE status='ready'` partial index and the
+//! This is a thin adapter: map a [`WrittenObject`] → [`control::NewManifestFile`] and delegate to
+//! [`control::insert_ready`] (PR 1.4), so the `WHERE status='ready'` partial index and the
 //! `ORDER BY lsn_end, id` claim contract stay in one place. **`lsn_end` is the commit LSN** carried
-//! from the `SealedBatch` — never `max(row.lsn)`, which would silently drop a late-committing large txn.
+//! from the [`SealedBatch`](crate::batch::SealedBatch) — never `max(row.lsn)`, which would silently
+//! drop a late-committing large txn.
 //!
 //! **Ordering & at-least-once:** the row is committed *only after* the PUT returns durable. A crash
 //! *between* the PUT and this commit leaves no `ready` row, so the batch re-streams and re-writes — no

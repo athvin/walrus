@@ -55,7 +55,7 @@ impl RangeFamily {
 
     /// Arrow element type for `_lower`/`_upper`. Unconstrained `numrange` falls back to `Utf8` — the
     /// Tier-3 VARCHAR carrier wired here and *proven* in PR 2.15 (a range column carries no element
-    /// typmod, so in practice `Num` is always `Utf8` today).
+    /// typmod, so in practice [`Num`](RangeFamily::Num) is always `Utf8` today).
     #[must_use]
     pub fn elem_data_type(self, atttypmod: i32) -> DataType {
         match self {
@@ -93,9 +93,9 @@ fn range_err(text: &str) -> Error {
     Error::value_parse("range", text, "range")
 }
 
-/// Parse `[1,10)` / `empty` / `(,5]` / `[2024-01-01,)` into a `ParsedRange`. An inclusivity marker on
-/// an unbounded side is forced to `false` (an infinite bound is never inclusive — matches Postgres'
-/// `lower_inc`/`upper_inc`).
+/// Parse `[1,10)` / `empty` / `(,5]` / `[2024-01-01,)` into a [`ParsedRange`]. An inclusivity marker
+/// on an unbounded side is forced to `false` (an infinite bound is never inclusive — matches
+/// Postgres' `lower_inc`/`upper_inc`).
 ///
 /// # Errors
 ///

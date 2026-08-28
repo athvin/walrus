@@ -3,8 +3,9 @@
 //! Assert every server-side precondition before a single byte of WAL is read: the connecting role has
 //! the `REPLICATION` privilege, `wal_level = logical`, server ≥ 14, slot / wal-sender headroom, the
 //! publication covers `walrus.ddl_audit` + `walrus.heartbeat`, and every published **user** table has
-//! a usable replica identity (a PK for `DEFAULT`). Any mismatch is **terminal** — a `PreflightError`
-//! mapped to a distinct, greppable `ExitCode` (`CrashLoopBackOff`, not a silent slow failure).
+//! a usable replica identity (a PK for `DEFAULT`). Any mismatch is **terminal** — a
+//! [`PreflightError`] mapped to a distinct, greppable [`common::ExitCode`] (`CrashLoopBackOff`, not
+//! a silent slow failure).
 //!
 //! **Connection note:** `tokio-postgres` 0.7 has no API to open a `replication=database` connection
 //! (and its config parser rejects the param), so the preflight runs its catalog checks over an
@@ -47,7 +48,8 @@ pub struct PkReport {
     pub quarantined: Vec<TableId>,
 }
 
-/// A terminal source-preflight mismatch. `main` maps it (via `common::Error`) to a distinct exit code.
+/// A terminal source-preflight mismatch. `main` maps it (via [`common::Error`]) to a distinct exit
+/// code.
 /// This taxonomy is still growing; new variants must remain additive for downstream crates.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]

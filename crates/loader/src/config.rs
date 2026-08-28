@@ -1,5 +1,6 @@
-//! `LoaderConfig` — the fully-validated loader configuration (bootstrap step 0). Mirrors the sink's
-//! pattern: `WALRUS_`-prefixed env (optional file underneath) → typed serde struct → bounds-check.
+//! [`LoaderConfig`] — the fully-validated loader configuration (bootstrap step 0). Mirrors the
+//! sink's pattern: `WALRUS_`-prefixed env (optional file underneath) → typed serde struct →
+//! bounds-check.
 //! Invalid config is a **terminal** bootstrap error → [`common::ExitCode::Config`].
 
 use common::{ObjectStoreConfig, TelemetryConfig};

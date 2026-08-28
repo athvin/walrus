@@ -17,9 +17,10 @@
 //!
 //! # Concurrency
 //!
-//! One apply worker per `.duckdb` file, all on a single `LocalSet`. [`duck`]'s `TableDb` is
-//! `Send + !Sync`, so a future holding `&TableCtx` or `&TableDb` across an await is intentionally
-//! `!Send` and cannot be handed to `tokio::spawn` — which is what the crate-level
+//! One apply worker per `.duckdb` file, all on a single `LocalSet`. [`duck`]'s
+//! [`TableDb`](duck::TableDb) is `Send + !Sync`, so a future holding a `&` borrow of
+//! [`TableCtx`](phase_a::TableCtx) or that [`TableDb`](duck::TableDb) across an await is
+//! intentionally `!Send` and cannot be handed to `tokio::spawn` — which is what the crate-level
 //! `clippy::future_not_send` allow above records for Clippy.
 
 pub mod apply_loop;

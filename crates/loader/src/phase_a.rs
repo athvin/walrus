@@ -19,7 +19,7 @@ use std::num::NonZeroI64;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Everything one owned table's apply worker needs — **owned** (one `TableDb`/DuckDB connection per
+/// Everything one owned table's apply worker needs — **owned** (one [`TableDb`]/DuckDB connection per
 /// table, never shared), so it can move into a `spawn_local`'d [`crate::apply_loop::apply_loop`].
 #[derive(Debug)]
 pub struct TableCtx {
