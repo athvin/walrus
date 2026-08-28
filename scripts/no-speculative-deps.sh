@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # no-speculative-deps.sh — PR 11.17. Phase 11 evaluated five allocator/container crates and
-# declined each with a measurement or a structural argument. This guard keeps those decisions
-# honest: none may become a DIRECT dependency without first updating the ADR that declined it.
+# declined each with a measurement or a structural argument; the `perf-ahash` audit added the three
+# faster-hasher crates on the same terms. This guard keeps those decisions honest: none may become a
+# DIRECT dependency without first updating the ADR that declined it.
 #
 #   bash scripts/no-speculative-deps.sh
 #
-# Manifest-scoped ON PURPOSE: smallvec / arrayvec / tinyvec / bumpalo are legitimately present in
-# Cargo.lock transitively (bumpalo arrives via wasm-bindgen-macro-support and zopfli). A lock-file
-# guard would fail on day one and prove nothing.
+# Manifest-scoped ON PURPOSE: smallvec / arrayvec / tinyvec / bumpalo / ahash are legitimately present
+# in Cargo.lock transitively (bumpalo arrives via wasm-bindgen-macro-support and zopfli; ahash via
+# arrow and two vendored hashbrown versions). A lock-file guard would fail on day one and prove nothing.
 set -euo pipefail
 
 REPO_ROOT=$(git rev-parse --show-toplevel)
@@ -21,6 +22,9 @@ DECLINED=(
   "thin-vec|docs/implementation/notes/rust-skills/mem-thinvec.md|thin[-_]vec"
   "compact_str|docs/implementation/notes/rust-skills/mem-compact-string.md|compact[-_]str"
   "bumpalo|docs/implementation/notes/rust-skills/mem-arena-allocator.md|bumpalo"
+  "ahash|docs/implementation/notes/rust-skills/perf-ahash.md|ahash"
+  "rustc-hash|docs/implementation/notes/rust-skills/perf-ahash.md|rustc[-_]hash"
+  "gxhash|docs/implementation/notes/rust-skills/perf-ahash.md|gxhash"
 )
 
 scan_manifests() {

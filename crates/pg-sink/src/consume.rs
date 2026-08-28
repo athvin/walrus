@@ -695,6 +695,7 @@ pub async fn flush_batch_kind(
 /// per-table batchers + the sink context stamped into each row's `walrus_pg_sink_meta`.
 #[derive(Debug)]
 pub struct BatchRouter<C> {
+    // HASHER-CHOICE: std's default. This is the tree's densest map — one `entry` per decoded row — and a faster hasher was still declined: no profile implicates hashing and the keys are source-derived. See docs/implementation/notes/rust-skills/perf-ahash.md.
     batchers: HashMap<u32, TableBatcher<C>>,
     triggers: BatchTriggers,
     clock: C,
