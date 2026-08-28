@@ -7,7 +7,8 @@
 )]
 //! Conformance guard for `closure-move-capture` (PR 25.4): every production `move` closure and
 //! `async move` block captures explicitly pre-bound locals, never `self`. Pure source scanning —
-//! no Docker, no new dependency.
+//! no Docker, no new dependency. Two clone-shaped guards ride along, because they answer the other
+//! half of the same question — what a capture is allowed to duplicate, and what it never may.
 
 use std::path::{Path, PathBuf};
 
@@ -382,6 +383,26 @@ fn redundant_clone_stays_denied() {
         1,
         "[workspace.lints.clippy] must deny redundant_clone exactly once"
     );
+}
+
+/// `own-clone-explicit`: a `Clone` nobody calls is still an invitation to call one.
+/// `StreamedChange` buffers one decoded row of an open streamed transaction — pushed by
+/// value, drained by `extract_if`, read through `iter_survivors` — and `InflightMeter` charges its
+/// bytes exactly once against the spill ceiling. A derive would make an unmetered deep copy of that
+/// whole buffer compile silently, so the buffered row stays move-only.
+#[test]
+fn the_buffered_streamed_row_stays_move_only() {
+    let source = std::fs::read_to_string(repo_root().join("crates/pg-sink/src/stream_txn.rs"))
+        .expect("read the streamed-transaction buffer source");
+    let derive = source
+        .split_once("struct StreamedChange")
+        .expect("the StreamedChange definition")
+        .0
+        .lines()
+        .rev()
+        .find(|line| line.starts_with("#[derive("))
+        .expect("the StreamedChange derive list");
+    assert!(!derive.contains("Clone"), "StreamedChange derives: {derive}");
 }
 
 #[test]

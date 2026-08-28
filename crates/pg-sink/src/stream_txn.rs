@@ -39,7 +39,13 @@ use std::sync::Arc;
 /// `values` is the decoded tuple, fixed at its source relation's width the moment the row is
 /// buffered — nothing ever appends to it — so it is frozen into a `Box<[_]>`: the capacity word a
 /// `Vec` would carry is dead weight repeated once per buffered row.
-#[derive(Clone, Debug)]
+///
+/// Deliberately **not** `Clone`. A buffered row is only ever moved (`push_change`, then
+/// `take_stream`'s `extract_if`) or borrowed (`iter_survivors`), and [`InflightMeter`] charges its
+/// bytes exactly once against the ceiling that decides when to spill. Deriving `Clone` would let a
+/// second, unmetered deep copy of an open transaction's buffer — one `Box<[TupleValue]>` per row —
+/// compile silently, so duplication here has to be a deliberate `impl`, not a derive nobody uses.
+#[derive(Debug)]
 struct StreamedChange {
     sub_xid: u32,
     oid: TableId,
