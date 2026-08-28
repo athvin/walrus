@@ -140,23 +140,22 @@ impl PgRelation {
     /// # Examples
     ///
     /// ```
-    /// use common::{PgColumn, PgRelation, ReplicaIdentity};
-    ///
-    /// let col = |name: &str, is_key: bool| PgColumn {
-    ///     name: name.to_string(),
-    ///     type_oid: 23,
-    ///     type_modifier: -1,
-    ///     is_key,
-    /// };
-    /// let customers = PgRelation {
-    ///     oid: 42,
-    ///     schema: "public".to_string(),
-    ///     name: "customers".to_string(),
-    ///     replica_identity: ReplicaIdentity::Default,
-    ///     columns: vec![col("region", true), col("id", true), col("email", false)],
-    /// };
-    ///
-    /// // Non-key columns drop out; a composite key keeps relation order, not sorted order.
+    /// # use common::{PgColumn, PgRelation, ReplicaIdentity};
+    /// # let col = |name: &str, is_key: bool| PgColumn {
+    /// #     name: name.to_string(),
+    /// #     type_oid: 23,
+    /// #     type_modifier: -1,
+    /// #     is_key,
+    /// # };
+    /// # let customers = PgRelation {
+    /// #     oid: 42,
+    /// #     schema: "public".to_string(),
+    /// #     name: "customers".to_string(),
+    /// #     replica_identity: ReplicaIdentity::Default,
+    /// #     columns: vec![col("region", true), col("id", true), col("email", false)],
+    /// # };
+    /// // `customers` is declared `region` (key), `id` (key), `email` (non-key): non-key columns
+    /// // drop out, and the composite key keeps relation order, not sorted order.
     /// assert_eq!(customers.to_key_columns(), vec!["region", "id"]);
     /// ```
     #[must_use]
