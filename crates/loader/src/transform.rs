@@ -320,12 +320,12 @@ impl TransformSql {
             .mirror
             .iter()
             .map(|c| {
-                let e = if c.is_recombine {
-                    c.value_expr.clone()
+                let qc = q(&c.name);
+                if c.is_recombine {
+                    format!("{} AS {qc}", c.value_expr)
                 } else {
-                    format!("s.{}", q(&c.name))
-                };
-                format!("{e} AS {}", q(&c.name))
+                    format!("s.{qc} AS {qc}")
+                }
             })
             .collect();
         let mirror_names = self
@@ -363,12 +363,12 @@ impl TransformSql {
             .mirror
             .iter()
             .map(|c| {
-                let e = if c.is_recombine {
-                    format!("s.{}", q(&c.name))
+                let qc = q(&c.name);
+                if c.is_recombine {
+                    format!("s.{qc} AS {qc}")
                 } else {
-                    c.value_expr.clone()
-                };
-                format!("{e} AS {}", q(&c.name))
+                    format!("{} AS {qc}", c.value_expr)
+                }
             })
             .collect();
         cols.push("s.\"_walrus_commit_lsn\" AS \"_applied_commit_lsn\"".to_string());

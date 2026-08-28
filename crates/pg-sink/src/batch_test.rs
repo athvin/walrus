@@ -160,7 +160,7 @@ fn flushes_on_row_count_at_commit_boundary() {
 
 #[test]
 fn committed_rows_keep_byte_identical_batch_id_with_clone_from() {
-    assert!(include_str!("batch.rs").contains("meta.batch_id.clone_from(&batch_id);"));
+    assert!(include_str!("batch.rs").contains("meta.batch_id.clone_from(batch_id);"));
 
     let mut b = TableBatcher::new(
         cached(),

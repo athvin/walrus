@@ -279,7 +279,11 @@ impl<C: Clock> TableBatcher<C> {
         if self.pending.is_empty() {
             return Ok(());
         }
-        let batch_id = self.batch_id.clone().ok_or(BatchError::Unassigned)?;
+        // Borrowed, not cloned: every use below only *reads* the id (`clone_from`'s source), and
+        // `batch_id` is a disjoint field from the `pending`/`builder`/`committed`/`pending_bytes`
+        // this body mutates — so the shared borrow lives across the whole loop for free, where an
+        // owned copy cost one `String` allocation per commit boundary per table.
+        let batch_id = self.batch_id.as_ref().ok_or(BatchError::Unassigned)?;
         // One clock read per commit boundary (never per row); only the batch's first promoted row
         // keeps it, as the `max_fill` start.
         let now = self.clock.now();
@@ -287,7 +291,7 @@ impl<C: Clock> TableBatcher<C> {
         for (mut meta, values) in self.pending.drain(..) {
             meta.commit_lsn = commit_lsn;
             meta.commit_ts = commit_ts;
-            meta.batch_id.clone_from(&batch_id);
+            meta.batch_id.clone_from(batch_id);
             self.builder.append_row(&values, &meta)?;
             self.committed.record_row(commit_lsn, now);
         }
