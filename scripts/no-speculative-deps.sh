@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # no-speculative-deps.sh — PR 11.17. Phase 11 evaluated five allocator/container crates and
 # declined each with a measurement or a structural argument; the `perf-ahash` audit added the three
-# faster-hasher crates on the same terms. This guard keeps those decisions honest: none may become a
-# DIRECT dependency without first updating the ADR that declined it.
+# faster-hasher crates on the same terms, and the `anti-premature-optimize` audit the four
+# global-allocator swaps. This guard keeps those decisions honest: none may become a DIRECT
+# dependency without first updating the ADR that declined it.
 #
 #   bash scripts/no-speculative-deps.sh
 #
@@ -16,6 +17,11 @@ REPO_ROOT=$(git rev-parse --show-toplevel)
 # package name | ADR that declined it | dependency-key/package spelling accepted by Cargo.
 # If a later PR adopts one on a measurement, delete its row and update that ADR. This list encodes
 # decisions, not dogma.
+#
+# The last four rows are a different axis from the rest: a global-allocator swap replaces the system
+# allocator for the whole process rather than one container or hasher, and — unlike a hand-written
+# `GlobalAlloc`, which `unsafe_code = "forbid"` rejects — installing one takes no unsafe code in
+# walrus, only a manifest line. None of the four is in Cargo.lock even transitively.
 DECLINED=(
   "smallvec|docs/implementation/notes/rust-skills/mem-smallvec.md|smallvec"
   "arrayvec|docs/implementation/notes/rust-skills/mem-arrayvec.md|arrayvec"
@@ -25,6 +31,10 @@ DECLINED=(
   "ahash|docs/implementation/notes/rust-skills/perf-ahash.md|ahash"
   "rustc-hash|docs/implementation/notes/rust-skills/perf-ahash.md|rustc[-_]hash"
   "gxhash|docs/implementation/notes/rust-skills/perf-ahash.md|gxhash"
+  "tikv-jemallocator|docs/implementation/notes/rust-skills/anti-premature-optimize.md|tikv[-_]jemallocator"
+  "jemallocator|docs/implementation/notes/rust-skills/anti-premature-optimize.md|jemallocator"
+  "mimalloc|docs/implementation/notes/rust-skills/anti-premature-optimize.md|mimalloc"
+  "snmalloc-rs|docs/implementation/notes/rust-skills/anti-premature-optimize.md|snmalloc[-_]rs"
 )
 
 scan_manifests() {
