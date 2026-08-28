@@ -35,8 +35,23 @@ pub fn unknown_variant<E>(
 /// The export attribute below publishes this at `common`'s root, so a caller reaches it by ordinary
 /// path import — never the order-sensitive `#[macro_use] extern crate` of the 2015 edition.
 ///
-/// ```ignore
+/// The declared `error` type becomes the generated `FromStr`'s `Err`, so it must offer an
+/// associated `new(column: &'static str, input: &str) -> Self` for the rejection path to call.
+/// walrus passes `control::ParseEnumError`; the example hides an equivalent stand-in, because
+/// `common` sits *below* `control` in the dependency DAG and cannot name the real one.
+///
+/// ```
 /// use common::string_enum;
+/// # #[derive(Debug, PartialEq, Eq)]
+/// # pub struct ParseEnumError {
+/// #     column: &'static str,
+/// #     input: String,
+/// # }
+/// # impl ParseEnumError {
+/// #     fn new(column: &'static str, input: &str) -> Self {
+/// #         Self { column, input: input.to_string() }
+/// #     }
+/// # }
 ///
 /// string_enum! {
 ///     /// Doc comments are captured and re-emitted onto the generated enum.
@@ -48,6 +63,10 @@ pub fn unknown_variant<E>(
 ///         Stream   => "stream",
 ///     }
 /// }
+///
+/// assert_eq!(ManifestKind::Snapshot.as_str(), "snapshot");
+/// assert_eq!("stream".parse::<ManifestKind>(), Ok(ManifestKind::Stream));
+/// assert!("archived".parse::<ManifestKind>().is_err());
 /// ```
 #[macro_export]
 macro_rules! string_enum {
