@@ -47,6 +47,18 @@ impl DuckTable<Mirror> {
     ///
     /// Formats a fresh name per call — hence `to_`, next to the free [`Self::as_str`]. A caller that
     /// needs the raw name twice should bind it once rather than re-deriving the suffix.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use loader::table_name::{DuckTable, Mirror};
+    ///
+    /// let mirror = DuckTable::<Mirror>::new("public_orders");
+    /// let raw = mirror.to_raw();
+    ///
+    /// assert_eq!(mirror.as_str(), "public_orders");
+    /// assert_eq!(raw.as_str(), "public_orders_raw");
+    /// ```
     #[must_use]
     pub fn to_raw(&self) -> DuckTable<Raw> {
         DuckTable {

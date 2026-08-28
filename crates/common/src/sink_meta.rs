@@ -120,6 +120,20 @@ impl UtcTimestamp {
     ///
     /// Returns [`Error::Internal`] when adding the Postgres epoch offset overflows or the resulting
     /// instant is outside jiff's supported range. Either condition indicates a corrupt wire value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use common::UtcTimestamp;
+    ///
+    /// // Zero is the *Postgres* epoch — 2000-01-01, not 1970-01-01.
+    /// assert_eq!(UtcTimestamp::from_pg_micros(0)?.to_string(), "2000-01-01T00:00:00Z");
+    /// assert_eq!(
+    ///     UtcTimestamp::from_pg_micros(-1_000_000)?.to_string(),
+    ///     "1999-12-31T23:59:59Z"
+    /// );
+    /// # Ok::<(), common::Error>(())
+    /// ```
     pub fn from_pg_micros(pg_micros: i64) -> Result<Self> {
         let unix_micros = pg_micros.checked_add(PG_EPOCH_UNIX_MICROS).ok_or_else(|| {
             Error::Internal(format!("pgoutput commit_ts overflow: {pg_micros} µs"))

@@ -84,6 +84,24 @@ impl PgColumn {
     ///
     /// The packing (the exact math PR 2.3 relies on): `precision = ((mod - 4) >> 16) & 0xFFFF`,
     /// `scale = (mod - 4) & 0xFFFF`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use common::{PgColumn, oids};
+    ///
+    /// let amount = PgColumn {
+    ///     name: "amount".to_string(),
+    ///     type_oid: oids::NUMERIC,
+    ///     type_modifier: 655_366,
+    ///     is_key: false,
+    /// };
+    /// assert_eq!(amount.numeric_precision_scale(), Some((10, 2)));
+    ///
+    /// // An unconstrained `numeric` carries no modifier to decode.
+    /// let unconstrained = PgColumn { type_modifier: -1, ..amount };
+    /// assert_eq!(unconstrained.numeric_precision_scale(), None);
+    /// ```
     #[must_use]
     pub fn numeric_precision_scale(&self) -> Option<(u16, u16)> {
         if self.type_oid != crate::oids::NUMERIC || self.type_modifier < 4 {
@@ -118,6 +136,29 @@ impl PgRelation {
     ///
     /// `to_`, not `as_`: this allocates a fresh `Vec` on every call. The `&str`s inside borrow
     /// from `self`, but the container does not. Bind it once; do not call it in a loop.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use common::{PgColumn, PgRelation, ReplicaIdentity};
+    ///
+    /// let col = |name: &str, is_key: bool| PgColumn {
+    ///     name: name.to_string(),
+    ///     type_oid: 23,
+    ///     type_modifier: -1,
+    ///     is_key,
+    /// };
+    /// let customers = PgRelation {
+    ///     oid: 42,
+    ///     schema: "public".to_string(),
+    ///     name: "customers".to_string(),
+    ///     replica_identity: ReplicaIdentity::Default,
+    ///     columns: vec![col("region", true), col("id", true), col("email", false)],
+    /// };
+    ///
+    /// // Non-key columns drop out; a composite key keeps relation order, not sorted order.
+    /// assert_eq!(customers.to_key_columns(), vec!["region", "id"]);
+    /// ```
     #[must_use]
     pub fn to_key_columns(&self) -> Vec<&str> {
         self.columns

@@ -148,6 +148,27 @@ fn signed_time_to_micros(tok: &str) -> Option<i64> {
 ///
 /// Returns [`Error::ValueParse`] for an unknown unit, malformed number or clock, a missing unit,
 /// integer overflow, or a month/day total outside the emitted `i32` range.
+///
+/// # Examples
+///
+/// ```
+/// use pg_to_arrow::parse_interval;
+///
+/// // 1 year folds into the month field; the clock becomes microseconds.
+/// assert_eq!(parse_interval("1 year 2 mons 3 days 04:05:06.5")?, (14, 3, 14_706_500_000));
+/// # Ok::<(), pg_to_arrow::Error>(())
+/// ```
+///
+/// The three fields stay independent — none of these collapses into another:
+///
+/// ```
+/// use pg_to_arrow::parse_interval;
+///
+/// assert_eq!(parse_interval("1 mon")?, (1, 0, 0));
+/// assert_eq!(parse_interval("30 days")?, (0, 30, 0));
+/// assert_eq!(parse_interval("720:00:00")?, (0, 0, 2_592_000_000_000));
+/// # Ok::<(), pg_to_arrow::Error>(())
+/// ```
 pub fn parse_interval(text: &str) -> Result<(i32, i32, i64), Error> {
     let err = || parse_err("interval", text);
     let mut months: i64 = 0;
@@ -227,6 +248,25 @@ pub fn parse_interval(text: &str) -> Result<(i32, i32, i64), Error> {
 ///
 /// Returns [`Error::ValueParse`] if the clock, UTC-offset separator, or offset components are
 /// missing, malformed, or outside the representable integer range.
+///
+/// # Examples
+///
+/// ```
+/// use pg_to_arrow::parse_timetz;
+///
+/// // `offset_seconds` keeps the printed sign: east of UTC is positive, west negative.
+/// assert_eq!(parse_timetz("12:34:56.789+05:30")?, (45_296_789_000, 19_800));
+/// assert_eq!(parse_timetz("12:34:56-08")?, (45_296_000_000, -28_800));
+/// # Ok::<(), pg_to_arrow::Error>(())
+/// ```
+///
+/// A `timetz` without an offset is not canonical text and is rejected:
+///
+/// ```
+/// use pg_to_arrow::parse_timetz;
+///
+/// assert!(parse_timetz("12:34:56").is_err());
+/// ```
 pub fn parse_timetz(text: &str) -> Result<(i64, i32), Error> {
     let err = || parse_err("timetz", text);
     // The clock carries no sign, so the first `+`/`-` opens the offset. Splitting there once yields

@@ -16,6 +16,8 @@ mod private {
 ///
 /// This is literal escaping only; it is **not** identifier quoting (that doubles `"`).
 ///
+/// # Examples
+///
 /// ```
 /// use common::sql::sql_literal;
 /// assert_eq!(sql_literal("O'Brien"), "O''Brien");
@@ -64,6 +66,8 @@ pub trait SqlStrExt: private::Sealed {
     /// Always allocates a new `String` — hence `to_`, matching `str::to_uppercase` and unlike
     /// [`sql_literal`], which borrows when there is nothing to escape.
     ///
+    /// # Examples
+    ///
     /// ```
     /// use common::sql::SqlStrExt;
     /// assert_eq!("O'Brien".to_quoted_literal(), "'O''Brien'");
@@ -103,6 +107,8 @@ pub enum IdentError {
 /// Construction rejects values that cannot safely reach the wire. [`Display`](fmt::Display)
 /// always renders the SQL-standard double-quoted form, doubling interior double quotes. Contrast
 /// [`sql_literal`], which escapes a value rather than a name.
+///
+/// # Examples
 ///
 /// ```
 /// use common::sql::SqlIdent;

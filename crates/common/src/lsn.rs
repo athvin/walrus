@@ -19,6 +19,33 @@ use std::str::FromStr;
 ///
 /// The transparent representation guarantees that the SQLx encoding delegation stays
 /// layout-identical to the single `u64` value it forwards as `i64` wire bits.
+///
+/// # Examples
+///
+/// Both accepted dialects name the same position, and printing always gives the padded form:
+///
+/// ```
+/// use common::Lsn;
+///
+/// let from_postgres: Lsn = "0/199BAC8".parse()?;
+/// let from_control_db: Lsn = "000000000199BAC8".parse()?;
+///
+/// assert_eq!(from_postgres, from_control_db);
+/// assert_eq!(from_postgres.as_u64(), 0x199BAC8);
+/// assert_eq!(from_postgres.to_string(), "000000000199BAC8");
+/// # Ok::<(), common::lsn::LsnParseError>(())
+/// ```
+///
+/// The padding is what buys the ordering contract: sorting the *text* sorts the WAL positions.
+///
+/// ```
+/// use common::Lsn;
+///
+/// let mut positions = [Lsn::new(0x100), Lsn::ZERO, Lsn::new(0xFF)];
+/// positions.sort_by_key(Lsn::to_string);
+///
+/// assert_eq!(positions, [Lsn::ZERO, Lsn::new(0xFF), Lsn::new(0x100)]);
+/// ```
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Lsn(u64);
@@ -68,6 +95,16 @@ impl Lsn {
     ///
     /// A named method, not `Sub<u64>`: the clamp is a policy decision (the retention floor must
     /// never go negative and must never wrap), and a reader seeing `lsn - lag` would not expect it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use common::Lsn;
+    ///
+    /// assert_eq!(Lsn::new(300).saturating_sub_bytes(100), Lsn::new(200));
+    /// // A floor further back than the head clamps at zero instead of wrapping.
+    /// assert_eq!(Lsn::new(100).saturating_sub_bytes(300), Lsn::ZERO);
+    /// ```
     #[must_use = "returns the retreated position; it does not move anything"]
     pub const fn saturating_sub_bytes(self, bytes: u64) -> Self {
         Lsn(self.0.saturating_sub(bytes))

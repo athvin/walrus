@@ -41,6 +41,20 @@ pub enum WorkerThreadsError {
 /// Returns [`WorkerThreadsError::Zero`] for a configured zero, or
 /// [`WorkerThreadsError::TooMany`] above [`MAX_WORKER_THREADS`]. `None` selects automatic sizing
 /// and is always accepted.
+///
+/// # Examples
+///
+/// ```
+/// use common::runtime::{WorkerThreadsError, validate_worker_threads};
+///
+/// assert_eq!(validate_worker_threads(None), Ok(()));
+/// assert_eq!(validate_worker_threads(Some(8)), Ok(()));
+/// assert_eq!(validate_worker_threads(Some(0)), Err(WorkerThreadsError::Zero));
+/// assert_eq!(
+///     validate_worker_threads(Some(65)),
+///     Err(WorkerThreadsError::TooMany { configured: 65 })
+/// );
+/// ```
 pub const fn validate_worker_threads(configured: Option<usize>) -> Result<(), WorkerThreadsError> {
     let Some(threads) = configured else {
         return Ok(());

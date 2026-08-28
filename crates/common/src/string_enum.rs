@@ -40,6 +40,8 @@ pub fn unknown_variant<E>(
 /// walrus passes `control::ParseEnumError`; the example hides an equivalent stand-in, because
 /// `common` sits *below* `control` in the dependency DAG and cannot name the real one.
 ///
+/// # Examples
+///
 /// ```
 /// use common::string_enum;
 /// # #[derive(Debug, PartialEq, Eq)]

@@ -12,6 +12,36 @@
 //! **Deliberately NOT sealed.** Cross-crate implementation *is* the contract: `control::ControlError`
 //! and `loader::LoaderError` classify themselves from their own crates, which a private supertrait
 //! here would forbid. Sealing is for single-implementor seams like `pg_sink::batch::Clock`.
+//!
+//! # Examples
+//!
+//! An implementor decides `is_terminal` and inherits the other two answers:
+//!
+//! ```
+//! use common::{ExitCode, FailureClass};
+//!
+//! #[derive(Debug)]
+//! enum BootstrapError {
+//!     BadConfig,
+//!     ControlDbStillComingUp,
+//! }
+//!
+//! impl FailureClass for BootstrapError {
+//!     // The exhaustive match with no `_` arm is the point: a new variant will not compile
+//!     // until it is classified here.
+//!     fn is_terminal(&self) -> bool {
+//!         match self {
+//!             BootstrapError::BadConfig => true,
+//!             BootstrapError::ControlDbStillComingUp => false,
+//!         }
+//!     }
+//! }
+//!
+//! assert!(BootstrapError::BadConfig.is_terminal());
+//! assert!(BootstrapError::ControlDbStillComingUp.is_transient());
+//! // The defaulted exit code stays `Internal` until an implementor overrides it.
+//! assert_eq!(BootstrapError::BadConfig.exit_code(), ExitCode::Internal);
+//! ```
 
 use crate::ExitCode;
 
