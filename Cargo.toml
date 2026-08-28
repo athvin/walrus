@@ -54,6 +54,16 @@ all = { level = "deny", priority = -1 }
 # `clippy::lint_groups_priority`, which is a correctness lint. No source file changes either way,
 # so crates/common/tests/workspace_lints_inherited.rs is what notices if this entry drifts.
 correctness = { level = "deny", priority = -1 }
+# `clippy::suspicious` is the group next door: not code that is provably wrong, but code that is
+# almost always a mistake — `suspicious_else_formatting`, `suspicious_map`, `suspicious_splitn`,
+# `suspicious_arithmetic_impl`. Pinned by name for the reason `correctness` is, and it is not idle
+# belt-and-braces: three lints this group carries today are already named below on their own merits
+# (`await_holding_lock`, `await_holding_refcell_ref`, `await_holding_invalid_type`). The level is
+# the table's rather than a bare warn: under `warnings = "deny"` above the two produce the same
+# diagnostic, but only one of them states the policy. `priority = -1` is required for the reason
+# given above — every named entry here sits at the default 0, and a group at or above a named lint's
+# priority overrides it. crates/common/tests/workspace_lints_inherited.rs notices if it drifts.
+suspicious = { level = "deny", priority = -1 }
 # Phase 26 keeps ordered sequences contiguous. `linkedlist` is pedantic (outside `clippy::all`),
 # so this named deny needs no group-priority adjustment.
 linkedlist = "deny"

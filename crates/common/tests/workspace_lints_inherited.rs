@@ -222,6 +222,51 @@ fn the_workspace_lint_table_still_denies_the_correctness_group() {
     );
 }
 
+/// `clippy::suspicious` is the group next door to correctness: code that compiles and is not
+/// provably wrong, but is almost always a mistake — `suspicious_else_formatting`, `suspicious_map`,
+/// `suspicious_splitn`, `suspicious_arithmetic_impl`. Its named entry has no site to go red for the
+/// same reason correctness's does not: `clippy::all` carries the group, so dropping it changes no
+/// diagnostic today — only what a regrouping of `clippy::all` can quietly take away.
+///
+/// Unlike correctness, this group's reach here is already visible: three of the lints it carries
+/// today are pinned by name below, each argued on its own (`await_holding_lock`,
+/// `await_holding_refcell_ref`, `await_holding_invalid_type`). Those named entries sit at the
+/// default priority, so the group must sit below them — the priority-less spelling would override
+/// every one of them and go red under `clippy::lint_groups_priority`.
+#[test]
+fn the_workspace_lint_table_still_denies_the_suspicious_group() {
+    let synthetic = "suspicious = \"deny\"\n";
+    assert_eq!(clippy_group_deny_count(synthetic, "suspicious"), 0);
+    assert_eq!(clippy_deny_count(synthetic, "suspicious"), 1);
+
+    let root_manifest = std::fs::read_to_string(repo_root().join("Cargo.toml")).unwrap();
+    let clippy = section(&root_manifest, "[workspace.lints.clippy]")
+        .expect("root manifest must define [workspace.lints.clippy]");
+    assert_eq!(
+        clippy_group_deny_count(clippy, "suspicious"),
+        1,
+        "workspace policy must pin the suspicious group at deny with priority = -1"
+    );
+    assert_eq!(
+        clippy_deny_count(clippy, "suspicious"),
+        0,
+        "a priority-less `suspicious = \"deny\"` collides with the named lints below it"
+    );
+
+    let named_members = [
+        "await_holding_lock",
+        "await_holding_refcell_ref",
+        "await_holding_invalid_type",
+    ];
+    for lint in named_members {
+        assert_eq!(
+            clippy_deny_count(clippy, lint),
+            1,
+            "{lint} is a suspicious-group member; it must keep the default priority"
+        );
+    }
+}
+
 #[test]
 fn the_workspace_lint_table_denies_redundant_method_closures() {
     let root_manifest = std::fs::read_to_string(repo_root().join("Cargo.toml")).unwrap();
