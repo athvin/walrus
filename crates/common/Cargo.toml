@@ -20,6 +20,10 @@ serde = { workspace = true, features = ["derive"] }
 # SinkMeta's amortized split-serialization (PR 5.7) renders the meta JSON fragments in production.
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# walrus's ONE subscriber dependency: `common` is the shared bootstrap both binaries call, so the
+# single global install lives in src/telemetry.rs and every other crate emits through the `tracing`
+# facade alone. tests/subscriber_install_policy.rs is what fails when a second crate adds this dep.
+#
 # `tracing-log` is a default feature, named here to make it a contract rather than an accident: it
 # is what makes `SubscriberInitExt::try_init` install the `log` -> `tracing` bridge, so the records
 # tokio-postgres / sqlx / reqwest still emit through the `log` facade reach our subscriber. A future

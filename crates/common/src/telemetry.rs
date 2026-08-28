@@ -71,6 +71,13 @@ fn build_env_filter(cfg: &TelemetryConfig) -> EnvFilter {
 /// Build the `EnvFilter` + fmt layer (pretty or JSON per `cfg.json`) and install it as the global
 /// default subscriber.
 ///
+/// **Only a binary's `main` may call this.** A subscriber is process-wide and installs once, so
+/// `common` is the one crate here that depends on `tracing-subscriber` and holds the one install;
+/// every other crate — `control`, `pg-to-arrow`, and the sink and loader *libraries* beneath the
+/// two `main`s — emits through the `tracing` facade alone, leaving format, level filter and
+/// destination to whoever owns `main`. `crates/common/tests/subscriber_install_policy.rs` is what
+/// goes red when a library takes that choice back.
+///
 /// Installing through `SubscriberInitExt::try_init` — rather than `set_global_default` — is what
 /// also registers `tracing_log::LogTracer`, so the dependencies that still emit through the `log`
 /// facade (`tokio-postgres`, `sqlx` and `object_store`'s HTTP client among them) arrive here as
