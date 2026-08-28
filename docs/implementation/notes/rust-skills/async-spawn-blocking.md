@@ -4,7 +4,8 @@
 > `Send + !Sync` connection and cannot satisfy `tokio::task::spawn_blocking`'s closure bound as
 > written. `LocalSet::run_until` explicitly disables `block_in_place` while polling the loader
 > workers, so using it at those sites would panic. The resulting shared-thread stall is not accepted;
-> it is filed below.
+> it is filed below. The sink's Parquet encode (§5) *can* meet the bound and is declined on evidence
+> instead, alongside the `/metrics` render (§4).
 
 ## What the rule asks for
 
@@ -75,9 +76,10 @@ owned by a `LocalSet`; those remain pinned to the one driver thread.
 
 ## 3. Open finding — all apply loops share one thread
 
-`crates/loader/src/main.rs` creates one `LocalSet` and calls `spawn_local` once for every owned table.
-That is one worker task per `.duckdb` file, not one OS thread per file. All those tasks are polled by
-the same LocalSet driver thread.
+`crates/loader/src/app.rs`'s `pipeline` creates one `LocalSet` and calls `JoinSet::spawn_local_on` once
+for every owned table, then drives the whole fleet through a single `LocalSet::run_until`. That is one
+worker task per `.duckdb` file, not one OS thread per file. All those tasks are polled by the same
+LocalSet driver thread — the thread `main.rs`'s `runtime.block_on` occupies.
 
 `full_rebuild_abortable` then calls synchronous `full_rebuild` inside one of those tasks. Its
 `CREATE OR REPLACE TABLE … AS SELECT` can run for seconds. During that time every other table misses
@@ -98,6 +100,38 @@ does not hold a DuckDB handle or perform I/O. No latency evidence justifies addi
 so it remains synchronous. If profiles later show millisecond-scale render stalls, that measurement
 would justify revisiting it independently of DuckDB ownership.
 
+## 5. The sink's Parquet encode — same bar, same answer
+
+`put_with_kind` in `crates/pg-sink/src/sink.rs` is the sink's counterpart to §1 — the one CPU-bound
+block on its flush path, and the heaviest site this rule reaches outside the loader. It encodes a whole
+sealed batch — `max_rows` 100 000 rows or `max_bytes` 128 MiB by default —
+to Snappy-compressed Parquet on whichever runtime thread is polling the flush. Every producer reaches it
+(streamed WAL, backfill, open-txn spill, reload export), and each one calls the synchronous
+`Batcher::seal` → `into_record_batch` on that same thread immediately before, so the CPU block is the
+Arrow finalization plus the encode.
+
+`AsyncArrowWriter` does not change that. In parquet 54.3.1 it holds a synchronous
+`ArrowWriter<Vec<u8>>`: `write` runs `sync_writer.write(batch)` before it awaits anything and touches the
+async writer only when that batch closed a row group, and `close` → `finish` runs `sync_writer.finish()`
+the same way. `default_writer_properties` leaves `max_row_group_size` at parquet's 1 048 576-row default,
+so a default-sized batch is a single row group and its encode is one uninterrupted block of CPU on the
+task. The `async` in that type name is the upload, not the compression.
+
+Unlike §1 this site type-checks: `SealedBatch` owns its `RecordBatch`, which is `Send + 'static`, and
+`pg_to_arrow` already exports the synchronous `write_parquet_bytes` such a closure would call. It is
+declined anyway, on two grounds:
+
+- **Nothing measured separates the encode from the PUT.** The only series over this path,
+  `walrus_sink_batch_flush_latency_seconds`, is stamped inside `put_with_kind` around the encode and the
+  multipart upload together, so no recorded number says which half dominates. Walrus prices an
+  optimization against a `docs/benchmarks.md` delta; a blocking-pool hop plus a join-failure path bought
+  on a hunch is the same trade §4 declines for `render()`.
+- **It would buy a thread, not a task.** The consume loop awaits the flush either way, so offloading
+  makes nothing in this pipeline happen sooner. It frees one of `worker_threads` runtime threads
+  (`available_parallelism()` by default) for the duration, and tokio's work stealing already moves the
+  health, heartbeat and reload-exporter tasks off a busy worker. That is the inverse of §3, where the
+  blocked thread is the only driver the sibling tables have.
+
 ## What would reverse this
 
 For DuckDB operations, landing the owned-`TableDb` move-and-recover design would satisfy
@@ -105,3 +139,10 @@ For DuckDB operations, landing the owned-`TableDb` move-and-recover design would
 the closure would still need owned `'static` state. A per-file runtime/thread topology instead resolves
 the shared-thread finding while intentionally keeping DuckDB calls synchronous on their dedicated
 thread.
+
+For §5, what reverses it is a profile that splits that histogram and shows the encode dominating. The
+conversion is then local, and its shape is fixed by the durability point above: encode with
+`pg_to_arrow::write_parquet_bytes` inside `spawn_blocking`, then hand the bytes to the same
+`object_store::buffered::BufWriter` (whose `put` takes `Bytes` without a copy) and shut it down. What
+must not follow is a rewrite to a single `ObjectStore::put`: `WrittenObject` may be returned only after
+the multipart upload completes.

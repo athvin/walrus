@@ -120,9 +120,14 @@ impl ParquetSink {
         let flush_start = std::time::Instant::now();
         let rows = u64::try_from(batch.record_batch.num_rows()).unwrap_or(u64::MAX);
 
-        // Multipart streaming writer — no local temp file, no whole-batch buffering.
+        // Multipart streaming upload — no local temp file.
         let buf_writer = BufWriter::new(Arc::clone(&self.store), key.clone());
         let props = pg_to_arrow::default_writer_properties();
+        // The ENCODE stays on this task: `AsyncArrowWriter` wraps a synchronous `ArrowWriter`, so
+        // `write` and `close` compress the whole batch before they await — the `async` in that name is
+        // the upload, not the compression. Why the blocking pool is declined here, and the shape the
+        // conversion would take if a profile ever demands it, is §5 of
+        // docs/implementation/notes/rust-skills/async-spawn-blocking.md.
         let mut writer =
             AsyncArrowWriter::try_new(buf_writer, batch.record_batch.schema(), Some(props))?;
         writer.write(&batch.record_batch).await?;
