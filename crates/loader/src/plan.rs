@@ -278,3 +278,7 @@ fn emit_arrow_to_duck(arrow: &str) -> &str {
         _ => "VARCHAR",
     }
 }
+
+#[cfg(test)]
+#[path = "plan_test.rs"]
+mod tests;

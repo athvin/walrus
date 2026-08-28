@@ -811,9 +811,9 @@ fn the_workspace_lint_table_still_denies_an_else_after_a_diverging_if() {
 
 /// The wildcard-import deny rests on an exemption clippy grants rather than on anything the lint
 /// table states: `use super::*` inside a `#[cfg(test)]` module and `use x::prelude::*` are skipped
-/// while `warn-on-all-wildcard-imports` keeps its default of `false`. 63 `*_test.rs` siblings here
+/// while `warn-on-all-wildcard-imports` keeps its default of `false`. 64 `*_test.rs` siblings here
 /// take the first spelling and `lsn_test.rs` takes the second, so stating that one key as `true`
-/// would put all 64 in scope of a deny from `clippy.toml`, with the manifest untouched.
+/// would put all 65 in scope of a deny from `clippy.toml`, with the manifest untouched.
 ///
 /// That leaves exactly one site, and it is the case a glob is for: a module whose whole body
 /// forwards another crate's namespace under this crate's path.

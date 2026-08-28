@@ -57,9 +57,9 @@ a call-shaped line immediately followed by a closing brace.
 
 `wildcard_imports` deserves its own line because the deny rests on a carve-out clippy grants rather
 than on anything the lint table says: `use super::*` inside a test module and `use x::prelude::*`
-are skipped while `warn-on-all-wildcard-imports` keeps its default of `false`. 63 test modules here
+are skipped while `warn-on-all-wildcard-imports` keeps its default of `false`. 64 test modules here
 take the first spelling and `lsn_test.rs` takes the second, so stating that one key as `true` would
-put 64 imports in scope of a deny without the manifest moving —
+put 65 imports in scope of a deny without the manifest moving —
 `crates/common/tests/workspace_lints_inherited.rs` is what notices.
 
 ## `doc_markdown` — declined

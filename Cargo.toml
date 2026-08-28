@@ -202,11 +202,11 @@ string_add_assign = "deny"
 # tail is neither `;`- nor `}`-terminated, so a one-line arm body is out of its reach by construction.
 semicolon_if_nothing_returned = "deny"
 # Glob imports hide where a name came from and let an upstream addition shadow a local one. Clippy
-# exempts the two spellings walrus leans on — `use super::*` inside a `#[cfg(test)]` module, 63 of
+# exempts the two spellings walrus leans on — `use super::*` inside a `#[cfg(test)]` module, 64 of
 # them, and `use proptest::prelude::*` — so the only site is the `pg_to_arrow::oids` forwarding shim,
 # which carries a scoped allow with a reason. Those exemptions are clippy's
 # `warn-on-all-wildcard-imports` default rather than anything stated here, so `clippy.toml` must keep
-# leaving that key unset: `true` would put all 64 of those imports in scope of this deny without the
+# leaving that key unset: `true` would put all 65 of those imports in scope of this deny without the
 # manifest moving. crates/common/tests/workspace_lints_inherited.rs notices either way.
 wildcard_imports = "deny"
 # `manual_let_else` is pedantic (outside `clippy::all`), so no priority juggling is needed.
