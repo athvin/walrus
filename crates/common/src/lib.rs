@@ -49,6 +49,12 @@ pub mod type_descriptor;
 // private: `use common::string_enum;` resolves the macro, not the module.
 mod string_enum;
 
+// The flat block below is this crate's entry point, and deliberately not a `prelude` to glob.
+// Every consumer reaches the root through exactly one brace-grouped `use common::{…}`, spelling
+// its own one-to-ten-item subset; a glob would swap those explicit lists for an over-import in
+// which a `Result` shadows the `std` prelude's and an `Error` the crate-local one. The namespace
+// modules (`oids`, `metrics`, `sql`, `runtime`) stay qualified too: `oids::INT4` says what a
+// bare `INT4` would not. Reopen if a consumer ever needs a second `use` statement for this root.
 pub use config::{CommonConfig, ObjectStoreConfig};
 pub use error::{Error, ExitCode, Result};
 pub use failure_class::FailureClass;
