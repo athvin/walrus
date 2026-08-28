@@ -104,10 +104,23 @@ pub async fn run_phase_b(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     // boundary re-transform advances it to the same value — a no-op) — that is the snapshot/stream
     // boundary being held closed (PR 3.10). The full-rebuild (PR 3.11) is the safety net regardless.
     control::advance_transformed(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table, max_lsn).await?;
-    tracing::info!(
-        table = %format_args!("{}.{}", ctx.schema, ctx.table),
-        transformed = %max_lsn,
-        "Phase B: mirror updated, transformed_lsn advanced"
-    );
+    // Only a watermark that MOVED is a lifecycle event. The boundary re-transform described above
+    // re-applies the same commit on every poll while the source sits idle (`max_lsn == after`, a
+    // no-op against the mirror), so keeping one `info!` here would emit a line per table per
+    // `poll_interval` forever — claiming an advance that did not happen — and bury the cycles that
+    // did move. The idle re-scan is diagnostic detail: `debug`.
+    if max_lsn > after {
+        tracing::info!(
+            table = %format_args!("{}.{}", ctx.schema, ctx.table),
+            transformed = %max_lsn,
+            "Phase B: mirror updated, transformed_lsn advanced"
+        );
+    } else {
+        tracing::debug!(
+            table = %format_args!("{}.{}", ctx.schema, ctx.table),
+            transformed = %max_lsn,
+            "Phase B: boundary re-transform, transformed_lsn unchanged"
+        );
+    }
     Ok(Some(max_lsn))
 }

@@ -43,8 +43,9 @@ const DEFAULT_FILTER: &str = "info";
 pub struct TelemetryConfig {
     /// Emit newline-delimited JSON (one object per event) instead of the pretty formatter.
     pub json: bool,
-    /// `EnvFilter` directive, e.g. `"info,walrus=debug"`. Empty → fall back to `RUST_LOG`, then
-    /// `DEFAULT_FILTER`.
+    /// `EnvFilter` directive, e.g. `"info,pg_sink=debug,loader=debug"` — targets are matched by
+    /// prefix against the **lib** crate names, so `walrus=…` would reach only the two `main.rs`
+    /// roots. Empty → fall back to `RUST_LOG`, then `DEFAULT_FILTER`.
     pub filter: String,
 }
 

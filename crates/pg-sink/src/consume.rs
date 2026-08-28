@@ -990,20 +990,28 @@ pub fn on_frame(ctx: &mut StreamCtx, frame: ReplicationMessage) -> anyhow::Resul
 
 /// Structured log for one decoded message — **fields, not string interpolation**, so logs stay
 /// queryable (`op`, `source_table`, `commit_lsn`, `lsn`, `xid`).
+///
+/// Every arm is `trace!`, the level this function's name has always claimed. It fires once per
+/// decoded WAL record — per *row* for the change families — so at `info` a single busy source
+/// buries the events an operator actually reads: the durability line each flushed file writes, the
+/// DDL bumps, the heartbeat round-trips. Per-record decode detail is what
+/// `RUST_LOG=pg_sink=trace` is for; the loop's own lifecycle events around it stay at `info`.
 fn trace_message(msg: &Message) {
     match msg {
         Message::Begin { final_lsn, xid, .. } => {
-            tracing::info!(op = "begin", xid, final_lsn = %final_lsn, "decoded")
+            tracing::trace!(op = "begin", xid, final_lsn = %final_lsn, "decoded")
         }
         Message::Commit {
             commit_lsn,
             end_lsn,
             ..
-        } => tracing::info!(op = "commit", commit_lsn = %commit_lsn, end_lsn = %end_lsn, "decoded"),
-        Message::Origin { commit_lsn, name } => {
-            tracing::info!(op = "origin", commit_lsn = %commit_lsn, name, "decoded")
+        } => {
+            tracing::trace!(op = "commit", commit_lsn = %commit_lsn, end_lsn = %end_lsn, "decoded")
         }
-        Message::Relation { xid, relation } => tracing::info!(
+        Message::Origin { commit_lsn, name } => {
+            tracing::trace!(op = "origin", commit_lsn = %commit_lsn, name, "decoded")
+        }
+        Message::Relation { xid, relation } => tracing::trace!(
             op = "relation",
             xid = ?xid,
             source_table = %format_args!("{}.{}", relation.schema, relation.name),
@@ -1011,21 +1019,21 @@ fn trace_message(msg: &Message) {
             "decoded"
         ),
         Message::Type { xid, oid, name, .. } => {
-            tracing::info!(op = "type", xid = ?xid, type_oid = oid, name, "decoded")
+            tracing::trace!(op = "type", xid = ?xid, type_oid = oid, name, "decoded")
         }
         Message::Insert {
             xid,
             relation_oid,
             new,
-        } => tracing::info!(op = "insert", xid = ?xid, relation_oid, cols = new.len(), "decoded"),
+        } => tracing::trace!(op = "insert", xid = ?xid, relation_oid, cols = new.len(), "decoded"),
         Message::Update {
             xid, relation_oid, ..
-        } => tracing::info!(op = "update", xid = ?xid, relation_oid, "decoded"),
+        } => tracing::trace!(op = "update", xid = ?xid, relation_oid, "decoded"),
         Message::Delete {
             xid, relation_oid, ..
-        } => tracing::info!(op = "delete", xid = ?xid, relation_oid, "decoded"),
+        } => tracing::trace!(op = "delete", xid = ?xid, relation_oid, "decoded"),
         Message::Truncate { xid, relations, .. } => {
-            tracing::info!(op = "truncate", xid = ?xid, relations = relations.len(), "decoded")
+            tracing::trace!(op = "truncate", xid = ?xid, relations = relations.len(), "decoded")
         }
         Message::Message {
             xid,
@@ -1033,21 +1041,26 @@ fn trace_message(msg: &Message) {
             lsn,
             prefix,
             ..
-        } => {
-            tracing::info!(op = "message", xid = ?xid, transactional, lsn = %lsn, prefix, "decoded")
-        }
+        } => tracing::trace!(
+            op = "message",
+            xid = ?xid,
+            transactional,
+            lsn = %lsn,
+            prefix,
+            "decoded"
+        ),
         Message::StreamStart { xid, first_segment } => {
-            tracing::info!(op = "stream_start", xid, first_segment, "decoded")
+            tracing::trace!(op = "stream_start", xid, first_segment, "decoded")
         }
-        Message::StreamStop => tracing::info!(op = "stream_stop", "decoded"),
+        Message::StreamStop => tracing::trace!(op = "stream_stop", "decoded"),
         Message::StreamCommit {
             xid, commit_lsn, ..
-        } => tracing::info!(op = "stream_commit", xid, commit_lsn = %commit_lsn, "decoded"),
+        } => tracing::trace!(op = "stream_commit", xid, commit_lsn = %commit_lsn, "decoded"),
         Message::StreamAbort { top_xid, sub_xid } => {
-            tracing::info!(op = "stream_abort", top_xid, sub_xid, "decoded")
+            tracing::trace!(op = "stream_abort", top_xid, sub_xid, "decoded")
         }
         // Two-phase (v3) frames never occur at v2; log opaquely rather than special-case.
-        other => tracing::info!(op = "other", detail = ?other, "decoded"),
+        other => tracing::trace!(op = "other", detail = ?other, "decoded"),
     }
 }
 
