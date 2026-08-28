@@ -372,36 +372,38 @@ impl<'a> SourcePreflight<'a> {
         );
         let mut report = PkReport::default();
         for msg in self.query(&sql).await? {
-            if let SimpleQueryMessage::Row(row) = msg {
-                let schema = row.get("schemaname").unwrap_or_default().to_string();
-                let table = row.get("tablename").unwrap_or_default().to_string();
-                let relreplident = row.get("relreplident").unwrap_or_default();
-                // `boolean::text` renders as "true"/"false" (not "t"/"f") over the simple protocol.
-                let has_pk = row.get("has_pk") == Some("true");
-                // 'd' (default) needs a PK; 'f'/'i' carry a full/index identity; 'n' (nothing) never.
-                let usable = match relreplident {
-                    "n" => false,
-                    "d" => has_pk,
-                    _ => true,
-                };
-                let id = TableId { schema, table };
-                if usable {
-                    report.ok.push(id);
-                } else {
-                    match mode {
-                        PkMode::Strict => {
-                            return Err(PreflightError::NoPrimaryKey {
-                                schema: id.schema,
-                                table: id.table,
-                            });
-                        }
-                        PkMode::Lenient => {
-                            tracing::warn!(
-                                schema = %id.schema, table = %id.table,
-                                "ALERT: published table has no usable replica identity — quarantined (lenient)"
-                            );
-                            report.quarantined.push(id);
-                        }
+            // Only `Row` carries catalog data; the command tag and row description carry none.
+            let SimpleQueryMessage::Row(row) = msg else {
+                continue;
+            };
+            let schema = row.get("schemaname").unwrap_or_default().to_string();
+            let table = row.get("tablename").unwrap_or_default().to_string();
+            let relreplident = row.get("relreplident").unwrap_or_default();
+            // `boolean::text` renders as "true"/"false" (not "t"/"f") over the simple protocol.
+            let has_pk = row.get("has_pk") == Some("true");
+            // 'd' (default) needs a PK; 'f'/'i' carry a full/index identity; 'n' (nothing) never.
+            let usable = match relreplident {
+                "n" => false,
+                "d" => has_pk,
+                _ => true,
+            };
+            let id = TableId { schema, table };
+            if usable {
+                report.ok.push(id);
+            } else {
+                match mode {
+                    PkMode::Strict => {
+                        return Err(PreflightError::NoPrimaryKey {
+                            schema: id.schema,
+                            table: id.table,
+                        });
+                    }
+                    PkMode::Lenient => {
+                        tracing::warn!(
+                            schema = %id.schema, table = %id.table,
+                            "ALERT: published table has no usable replica identity — quarantined (lenient)"
+                        );
+                        report.quarantined.push(id);
                     }
                 }
             }

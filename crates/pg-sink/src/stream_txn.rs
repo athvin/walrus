@@ -399,39 +399,39 @@ impl<C: Clock + Clone> StreamDemux<C> {
             if self.current_top == Some(top_xid) {
                 self.current_top = None;
             }
-            if let Some(txn) = self.open.remove(&top_xid) {
-                self.release_txn_meter(&txn);
-                for s in &txn.staged {
-                    if let Err(error) = sink.delete(&s.written.key).await {
-                        tracing::warn!(
-                            key = %s.written.key,
-                            error = %error,
-                            "failed to delete aborted speculative spill; object orphaned in staging"
-                        );
-                    }
+            let Some(txn) = self.open.remove(&top_xid) else {
+                return; // never opened (or already aborted) — no buffer and no spills to delete
+            };
+            self.release_txn_meter(&txn);
+            for s in &txn.staged {
+                if let Err(error) = sink.delete(&s.written.key).await {
+                    tracing::warn!(
+                        key = %s.written.key,
+                        error = %error,
+                        "failed to delete aborted speculative spill; object orphaned in staging"
+                    );
                 }
-                tracing::info!(
-                    top_xid,
-                    rows = txn.changes.len(),
-                    staged = txn.staged.len(),
-                    "whole-txn abort"
-                );
             }
+            tracing::info!(
+                top_xid,
+                rows = txn.changes.len(),
+                staged = txn.staged.len(),
+                "whole-txn abort"
+            );
             return;
         }
-        let doomed: Vec<_> = match self.open.get_mut(&top_xid) {
-            Some(txn) => {
-                txn.abort_subtxn(sub_xid);
-                // One predicate pass both removes the rolled-back spills and hands them over: the
-                // survivors compact inside `staged`'s allocation (the txn stays open and keeps
-                // spilling), and the doomed entries move out instead of their keys being cloned
-                // to outlive the borrow the awaited deletes cannot hold.
-                txn.staged
-                    .extract_if(.., |s| s.sub_xid == sub_xid)
-                    .collect::<Vec<_>>()
-            }
-            None => return,
+        let Some(txn) = self.open.get_mut(&top_xid) else {
+            return; // the top-level txn is not open here — nothing of its savepoint to drop
         };
+        txn.abort_subtxn(sub_xid);
+        // One predicate pass both removes the rolled-back spills and hands them over: the
+        // survivors compact inside `staged`'s allocation (the txn stays open and keeps
+        // spilling), and the doomed entries move out instead of their keys being cloned
+        // to outlive the borrow the awaited deletes cannot hold.
+        let doomed = txn
+            .staged
+            .extract_if(.., |s| s.sub_xid == sub_xid)
+            .collect::<Vec<_>>();
         for spill in &doomed {
             if let Err(error) = sink.delete(&spill.written.key).await {
                 tracing::warn!(
