@@ -261,8 +261,11 @@ for gate in ${gates//,/ }; do
     e2e)
       if ! docker_up; then skip e2e "docker daemon not running — CI covers this job"
       elif ensure_stack; then
-        run_check e2e-quarantine cargo test -p e2e --features it --test reload_quarantine -- --ignored --test-threads=1
-        run_check e2e-scale      cargo test -p e2e --features it --test reload_scale      -- --ignored --test-threads=1
+        # Build both reload executables before either harness starts its nested production-binary
+        # build. Separate cargo invocations alternate dependency feature sets and relink the entire
+        # E2E graph twice; repeated --test selectors keep execution serialized without that churn.
+        run_check e2e-reload cargo test -p e2e --features it \
+          --test reload_quarantine --test reload_scale -- --ignored --test-threads=1
       else
         cp "$tmpdir/compose-up.log" "$tmpdir/e2e.log" 2>/dev/null || true
         failed e2e

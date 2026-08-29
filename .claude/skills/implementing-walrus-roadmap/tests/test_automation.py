@@ -368,6 +368,13 @@ class GateRunnerTests(unittest.TestCase):
             integration_case,
         )
 
+    def test_e2e_gate_builds_reload_targets_in_one_cargo_invocation(self) -> None:
+        script = (SKILL_ROOT / "scripts/run_gate.sh").read_text()
+        e2e_case = script[script.index("    e2e)") : script.index("    manifests)")]
+        self.assertEqual(1, e2e_case.count("cargo test -p e2e"))
+        self.assertIn("--test reload_quarantine --test reload_scale", e2e_case)
+        self.assertIn("--test-threads=1", e2e_case)
+
 
 class CheckClassifierTests(unittest.TestCase):
     def run_classifier(self, checks: list[dict]) -> subprocess.CompletedProcess[str]:
