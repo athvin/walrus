@@ -342,6 +342,22 @@ class GateRunnerTests(unittest.TestCase):
             sqlx_case.index("run_check sqlx-prepare cargo sqlx prepare --check --workspace"),
         )
 
+    def test_ignored_integration_gate_runs_only_discovered_test_targets(self) -> None:
+        script = (SKILL_ROOT / "scripts/run_gate.sh").read_text()
+        helper = script[
+            script.index("run_ignored_integration_tests()") : script.index("docker_up()")
+        ]
+        integration_case = script[
+            script.index("    integration)") : script.index("    e2e)")
+        ]
+        self.assertIn("rg -l '#\\[ignore'", helper)
+        self.assertIn('cargo test -p "$package" --test "$target"', helper)
+        self.assertIn(
+            "run_check integration-ignored run_ignored_integration_tests",
+            integration_case,
+        )
+        self.assertNotIn("cargo test --workspace -- --ignored", integration_case)
+
 
 class CheckClassifierTests(unittest.TestCase):
     def run_classifier(self, checks: list[dict]) -> subprocess.CompletedProcess[str]:

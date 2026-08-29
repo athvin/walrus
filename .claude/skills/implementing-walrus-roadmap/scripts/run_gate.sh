@@ -115,6 +115,27 @@ run_check() { # run_check NAME cmd...
   if "$@" >"$tmpdir/$name.log" 2>&1; then pass "$name"; else failed "$name"; fi
 }
 
+run_ignored_integration_tests() {
+  # `cargo test --workspace -- --ignored` starts every workspace test binary,
+  # including the many policy/unit targets that have no ignored tests. On
+  # macOS, each newly linked binary can incur a substantial syspolicyd scan.
+  # Discover the integration targets that actually contain `#[ignore]` and
+  # run those targets serially: the test coverage and shared-stack isolation
+  # are unchanged, while zero-match binaries are never launched.
+  local package path target
+  local found=no
+  for package in control pg-sink loader; do
+    while IFS= read -r path; do
+      [ -n "$path" ] || continue
+      found=yes
+      target=${path##*/}
+      target=${target%.rs}
+      cargo test -p "$package" --test "$target" -- --ignored --test-threads=1 || return 1
+    done < <(rg -l '#\[ignore' "crates/$package/tests" --glob '*.rs' | LC_ALL=C sort)
+  done
+  [ "$found" = yes ]
+}
+
 docker_up() { command -v docker >/dev/null && timeout 20 docker info >/dev/null 2>&1; }
 
 ensure_stack() { # boot compose once per run; returns 1 if it cannot
@@ -225,9 +246,10 @@ for gate in ${gates//,/ }; do
           skip control-migrations "sqlx-cli not installed"
         fi
         run_check integration-control cargo test -p control --features integration
-        # pg-sink's integration tests are #[ignore]d, not feature-gated; CI runs
-        # them one file at a time. Locally, one serialized sweep is the mirror.
-        run_check integration-ignored cargo test --workspace -- --ignored --test-threads=1
+        # Compose-backed integration tests are #[ignore]d, not feature-gated;
+        # run only targets that contain ignored tests, one file at a time like
+        # CI, rather than launching every zero-match workspace test binary.
+        run_check integration-ignored run_ignored_integration_tests
       else
         cp "$tmpdir/compose-up.log" "$tmpdir/integration.log" 2>/dev/null || true
         failed integration
