@@ -62,13 +62,37 @@ fn minio() -> Arc<dyn object_store::ObjectStore> {
 }
 
 async fn drop_slot(admin: &tokio_postgres::Client, slot: &str) {
+    // A dropped replication stream can remain active briefly while Postgres notices the closed
+    // socket. Terminate any leaked test walsender, then wait for the slot to become droppable so
+    // this integration target cannot contaminate the following E2E slot-count assertions.
     let _ = admin
         .execute(
-            "SELECT pg_drop_replication_slot(slot_name)
-             FROM pg_replication_slots WHERE slot_name = $1 AND NOT active",
+            "SELECT pg_terminate_backend(active_pid)
+             FROM pg_replication_slots WHERE slot_name = $1 AND active_pid IS NOT NULL",
             &[&slot],
         )
         .await;
+    for _ in 0..50 {
+        let active = admin
+            .query_opt(
+                "SELECT active FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot],
+            )
+            .await
+            .ok()
+            .flatten()
+            .map(|row| row.get::<_, bool>(0));
+        match active {
+            None => return,
+            Some(false) => {
+                let _ = admin
+                    .execute("SELECT pg_drop_replication_slot($1)", &[&slot])
+                    .await;
+                return;
+            }
+            Some(true) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
 }
 
 async fn ready_count(pool: &sqlx::PgPool, epoch: EpochNo) -> i64 {
@@ -269,8 +293,8 @@ async fn large_txn_single_ready_file_only_after_stream_commit() {
         "confirmed_flush advances on commit"
     );
 
-    cleanup(&pool, &admin, epoch, slot).await;
     drop(stream);
+    cleanup(&pool, &admin, epoch, slot).await;
 }
 
 #[tokio::test]
@@ -380,6 +404,6 @@ async fn whole_txn_abort_writes_no_ready_row() {
         "an aborted streamed txn writes NO ready row"
     );
 
-    cleanup(&pool, &admin, epoch, slot).await;
     drop(stream);
+    cleanup(&pool, &admin, epoch, slot).await;
 }
