@@ -89,10 +89,6 @@ async fn savepoint_rollback_ready_file_has_exactly_6000_rows() {
         .unwrap();
     drop_slot(&admin, slot).await;
     let resume = verify_or_create_slot(&admin, slot).await.unwrap();
-    let mut stream =
-        ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
-            .await
-            .unwrap();
     let sink = ParquetSink::new(minio(), "walrus", epoch);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
@@ -115,6 +111,13 @@ async fn savepoint_rollback_ready_file_has_exactly_6000_rows() {
     );
     let mut cache = RelationCache::default();
     let mut ctx = StreamCtx::default();
+
+    // Delay opening replication until setup is complete so the compose
+    // source's five-second `wal_sender_timeout` cannot expire an idle sender.
+    let mut stream =
+        ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
+            .await
+            .unwrap();
 
     // proto §9b: kept-A (3000, top branch) · rolled-back savepoint (3000, streamed then discarded) ·
     // kept-B (3000, new savepoint after the rollback). The whole thing exceeds work_mem → streams.

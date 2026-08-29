@@ -124,10 +124,6 @@ async fn large_txn_single_ready_file_only_after_stream_commit() {
         .unwrap();
     drop_slot(&admin, slot).await;
     let resume = verify_or_create_slot(&admin, slot).await.unwrap();
-    let mut stream =
-        ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
-            .await
-            .unwrap();
     let sink = ParquetSink::new(minio(), "walrus", epoch);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
@@ -146,6 +142,13 @@ async fn large_txn_single_ready_file_only_after_stream_commit() {
     let mut checkpoint = DurabilityCheckpoint::new(resume.start_lsn());
     let mut cache = RelationCache::default();
     let mut ctx = StreamCtx::default();
+
+    // Delay opening replication until setup is complete so the compose
+    // source's five-second `wal_sender_timeout` cannot expire an idle sender.
+    let mut stream =
+        ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
+            .await
+            .unwrap();
 
     // 8000 rows in ONE transaction → exceeds logical_decoding_work_mem=64kB → streams before commit.
     admin
@@ -287,10 +290,6 @@ async fn whole_txn_abort_writes_no_ready_row() {
         .unwrap();
     drop_slot(&admin, slot).await;
     let resume = verify_or_create_slot(&admin, slot).await.unwrap();
-    let mut stream =
-        ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
-            .await
-            .unwrap();
     let sink = ParquetSink::new(minio(), "walrus", epoch);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
@@ -307,6 +306,13 @@ async fn whole_txn_abort_writes_no_ready_row() {
     );
     let mut cache = RelationCache::default();
     let mut ctx = StreamCtx::default();
+
+    // Delay opening replication until setup is complete so the compose
+    // source's five-second `wal_sender_timeout` cannot expire an idle sender.
+    let mut stream =
+        ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
+            .await
+            .unwrap();
 
     // A big txn that ROLLS BACK: a live walsender streams the rows (proto §9a) then Stream Abort.
     admin
