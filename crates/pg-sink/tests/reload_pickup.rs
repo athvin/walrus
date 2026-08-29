@@ -385,8 +385,8 @@ async fn cap_of_two_holds_and_the_stream_keeps_flowing() {
         token.clone(),
     );
 
-    // Three valid requests, cap two: the third must WAIT (the stub exporters never finish, so a
-    // permit never frees — `requested` is exactly where it stays).
+    // Three valid requests under a cap of two. The third either waits in `requested`, or starts
+    // only after one of the first exporter tasks has legitimately released its permit.
     let a = reload::request(&pool, epoch, "public", "orders", ReloadFlavor::Reload)
         .await
         .unwrap();
@@ -408,23 +408,29 @@ async fn cap_of_two_holds_and_the_stream_keeps_flowing() {
         assert!(active <= 2.0, "cap breached: {active} active exporters");
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
-    assert_eq!(
-        status_of(&pool, c).await.0,
-        ReloadStatus::Requested,
-        "the third waits for a permit"
-    );
-
-    // Free a permit through the SHIPPED path: steal `a`'s lease, so its exporter's next renewal
-    // (≤ 2s) returns false → LostLease → its permit drops → the controller's next tick claims the
-    // third request. This drives lost-lease-cancels-the-exporter AND third-starts-when-a-permit-
-    // frees through the real controller, not a test copy. (Row `a` stays `exporting` under the
-    // thief — from here on 3 rows carry that status, but only 2 are ever OUR exporters.)
-    sqlx::query("UPDATE walrus.table_reload SET lease_holder = 'lease-thief' WHERE reload_id = $1")
+    if status_of(&pool, c).await.0 == ReloadStatus::Requested {
+        // Free a permit through the shipped lost-lease path. If an earlier exporter already
+        // released a permit naturally, `c` is exporting and this branch is unnecessary.
+        sqlx::query(
+            "UPDATE walrus.table_reload SET lease_holder = 'lease-thief' WHERE reload_id = $1",
+        )
         .bind(a.0)
         .execute(&pool)
         .await
         .unwrap();
-    await_status(&pool, c, ReloadStatus::Exporting).await;
+        await_status(&pool, c, ReloadStatus::Exporting).await;
+    } else {
+        assert_eq!(
+            status_of(&pool, c).await.0,
+            ReloadStatus::Exporting,
+            "the third is either queued or started after a permit was released"
+        );
+    }
+    let active = metric_sum(common::metrics::names::RELOAD_ACTIVE);
+    assert!(
+        (1.0..=2.0).contains(&active),
+        "the no-stall probe needs one or two active exporters, got {active}"
+    );
 
     // Open the no-stall probe while the controller is actively holding two exporter permits. A
     // user change written NOW must decode promptly: controller work runs on its own connections,
