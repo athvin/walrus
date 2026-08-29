@@ -245,7 +245,10 @@ for gate in ${gates//,/ }; do
         else
           skip control-migrations "sqlx-cli not installed"
         fi
-        run_check integration-control cargo test -p control --features integration
+        # These tests share one live control database and derive fixture epochs
+        # from its current state. Serial execution prevents two binaries/tests
+        # from choosing the same next epoch and claiming each other's rows.
+        run_check integration-control cargo test -p control --features integration -- --test-threads=1
         # Compose-backed integration tests are #[ignore]d, not feature-gated;
         # run only targets that contain ignored tests, one file at a time like
         # CI, rather than launching every zero-match workspace test binary.

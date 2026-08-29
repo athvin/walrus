@@ -358,6 +358,16 @@ class GateRunnerTests(unittest.TestCase):
         )
         self.assertNotIn("cargo test --workspace -- --ignored", integration_case)
 
+    def test_control_integration_gate_serializes_the_shared_database(self) -> None:
+        script = (SKILL_ROOT / "scripts/run_gate.sh").read_text()
+        integration_case = script[
+            script.index("    integration)") : script.index("    e2e)")
+        ]
+        self.assertIn(
+            "cargo test -p control --features integration -- --test-threads=1",
+            integration_case,
+        )
+
 
 class CheckClassifierTests(unittest.TestCase):
     def run_classifier(self, checks: list[dict]) -> subprocess.CompletedProcess[str]:
