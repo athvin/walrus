@@ -123,10 +123,6 @@ async fn sigterm_mid_stream_drains_commits_and_resumes() {
     drop_slot(&admin, slot).await;
     let resume = verify_or_create_slot(&admin, slot).await.unwrap();
 
-    let mut stream =
-        ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
-            .await
-            .unwrap();
     let mut checkpoint = DurabilityCheckpoint::new(resume.start_lsn());
     let sink = ParquetSink::new(minio(), "walrus", epoch);
     let pool = control::connect(&control_url()).await.unwrap();
@@ -144,6 +140,15 @@ async fn sigterm_mid_stream_drains_commits_and_resumes() {
     );
     let mut cache = RelationCache::default();
     let mut ctx = StreamCtx::default();
+
+    // Open replication only after control-plane and sink setup. The compose
+    // source uses a five-second `wal_sender_timeout`; starting the stream
+    // before migrations/router construction can let an otherwise idle sender
+    // expire before this test begins consuming frames.
+    let mut stream =
+        ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
+            .await
+            .unwrap();
 
     // A single committed txn — flush-eligible only via drain (below every threshold).
     admin
