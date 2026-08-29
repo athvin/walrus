@@ -88,10 +88,6 @@ async fn large_txn_low_ceiling_spills_and_stays_bounded() {
         .unwrap();
     drop_slot(&admin, slot).await;
     let resume = verify_or_create_slot(&admin, slot).await.unwrap();
-    let mut stream =
-        ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
-            .await
-            .unwrap();
     let sink = ParquetSink::new(minio(), "walrus", epoch);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
@@ -116,6 +112,14 @@ async fn large_txn_low_ceiling_spills_and_stays_bounded() {
     let mut checkpoint = DurabilityCheckpoint::new(resume.start_lsn());
     let mut cache = RelationCache::default();
     let mut ctx = StreamCtx::default();
+
+    // Open replication only after the control-plane cleanup and demux setup.
+    // The compose source has a five-second `wal_sender_timeout`, so an idle
+    // stream created before that work can expire before frame consumption.
+    let mut stream =
+        ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
+            .await
+            .unwrap();
 
     // 8000 rows in one txn (~640 KiB of Arrow) ≫ the 64 KiB ceiling → repeated speculative spills.
     admin
