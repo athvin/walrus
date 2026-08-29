@@ -402,7 +402,10 @@ fn the_buffered_streamed_row_stays_move_only() {
         .rev()
         .find(|line| line.starts_with("#[derive("))
         .expect("the StreamedChange derive list");
-    assert!(!derive.contains("Clone"), "StreamedChange derives: {derive}");
+    assert!(
+        !derive.contains("Clone"),
+        "StreamedChange derives: {derive}"
+    );
 }
 
 #[test]

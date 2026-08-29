@@ -334,6 +334,14 @@ class GateRunnerTests(unittest.TestCase):
         self.assertIn("CHECK:not-a-gate=FAIL", result.stdout)
         self.assertNotIn("invalid comma-separated gate list", result.stdout)
 
+    def test_sqlx_gate_migrates_before_prepare_check(self) -> None:
+        script = (SKILL_ROOT / "scripts/run_gate.sh").read_text()
+        sqlx_case = script[script.index("    sqlx)") : script.index("    conformance)")]
+        self.assertLess(
+            sqlx_case.index("sqlx migrate run --source migrations/control"),
+            sqlx_case.index("run_check sqlx-prepare cargo sqlx prepare --check --workspace"),
+        )
+
 
 class CheckClassifierTests(unittest.TestCase):
     def run_classifier(self, checks: list[dict]) -> subprocess.CompletedProcess[str]:

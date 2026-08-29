@@ -204,9 +204,7 @@ fn source_offences(relative: &str, source: &str) -> Vec<String> {
             }
         }
 
-        if line.contains(INIT_CALL)
-            && !line.contains(INIT_DEFINITION)
-            && !is_binary_root(relative)
+        if line.contains(INIT_CALL) && !line.contains(INIT_DEFINITION) && !is_binary_root(relative)
         {
             offences.push(format!(
                 "{relative}:{line_number}: calls {INIT_CALL} outside a binary main; a library \
@@ -339,8 +337,14 @@ fn the_source_scan_accepts_the_shapes_walrus_actually_has() {
     let empty = Vec::<String>::new();
 
     assert_eq!(source_offences(INSTALL_SITE, install_site), empty);
-    assert_eq!(source_offences("crates/loader/src/main.rs", binary_root), empty);
-    assert_eq!(source_offences("crates/common/src/metrics.rs", library), empty);
+    assert_eq!(
+        source_offences("crates/loader/src/main.rs", binary_root),
+        empty
+    );
+    assert_eq!(
+        source_offences("crates/common/src/metrics.rs", library),
+        empty
+    );
 }
 
 #[test]
@@ -367,6 +371,9 @@ fn the_manifest_scan_reads_the_shipped_tables_only() {
 
     assert_eq!(offences.len(), 1, "{}", offences.join("\n"));
     assert!(offences[0].contains("tracing-subscriber"));
-    assert_eq!(manifest_offences("crates/loader/Cargo.toml", dev_only), empty);
+    assert_eq!(
+        manifest_offences("crates/loader/Cargo.toml", dev_only),
+        empty
+    );
     assert_eq!(manifest_offences(SUBSCRIBER_OWNER, shipped), empty);
 }

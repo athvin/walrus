@@ -856,7 +856,10 @@ impl ReloadController {
                     .await
                     .map(|row| row.get::<_, bool>(0))
                     .with_context(|| {
-                        format!("publication check for {}.{}", req.source_schema, req.source_table)
+                        format!(
+                            "publication check for {}.{}",
+                            req.source_schema, req.source_table
+                        )
                     })
             },
             async {

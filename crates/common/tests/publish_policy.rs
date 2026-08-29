@@ -20,7 +20,10 @@ const MEMBER_MANIFESTS: &[(&str, &str)] = &[
     ("crates/control", include_str!("../../control/Cargo.toml")),
     ("crates/loader", include_str!("../../loader/Cargo.toml")),
     ("crates/pg-sink", include_str!("../../pg-sink/Cargo.toml")),
-    ("crates/pg-to-arrow", include_str!("../../pg-to-arrow/Cargo.toml")),
+    (
+        "crates/pg-to-arrow",
+        include_str!("../../pg-to-arrow/Cargo.toml"),
+    ),
     ("tests/e2e", include_str!("../../../tests/e2e/Cargo.toml")),
 ];
 
@@ -133,8 +136,7 @@ fn every_workspace_member_is_covered() {
     covered.sort_unstable();
 
     assert_eq!(
-        declared,
-        covered,
+        declared, covered,
         "add each new member's manifest to MEMBER_MANIFESTS so its publish key is checked too"
     );
 }

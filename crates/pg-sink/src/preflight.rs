@@ -484,22 +484,23 @@ impl<'a> SourcePreflight<'a> {
                 return Ok(row.get(0).unwrap_or_default().to_string());
             }
         }
-        Err(PreflightError::UnusableResult(format!("no rows for `{sql}`")))
+        Err(PreflightError::UnusableResult(format!(
+            "no rows for `{sql}`"
+        )))
     }
 
     async fn setting(&self, name: &str) -> Result<String, PreflightError> {
-        self.first_text(&format!("SELECT current_setting({})", name.to_quoted_literal()))
-            .await
+        self.first_text(&format!(
+            "SELECT current_setting({})",
+            name.to_quoted_literal()
+        ))
+        .await
     }
 
     async fn setting_i32(&self, name: &str) -> Result<i32, PreflightError> {
-        self.setting(name)
-            .await?
-            .trim()
-            .parse()
-            .map_err(|_| {
-                PreflightError::UnusableResult(format!("setting {name} is not an integer"))
-            })
+        self.setting(name).await?.trim().parse().map_err(|_| {
+            PreflightError::UnusableResult(format!("setting {name} is not an integer"))
+        })
     }
 
     async fn count(&self, sql: &str) -> Result<i32, PreflightError> {

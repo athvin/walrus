@@ -25,14 +25,20 @@ const MEMBER_MANIFESTS: &[(&str, &str)] = &[
     ("crates/control", include_str!("../../control/Cargo.toml")),
     ("crates/loader", include_str!("../../loader/Cargo.toml")),
     ("crates/pg-sink", include_str!("../../pg-sink/Cargo.toml")),
-    ("crates/pg-to-arrow", include_str!("../../pg-to-arrow/Cargo.toml")),
+    (
+        "crates/pg-to-arrow",
+        include_str!("../../pg-to-arrow/Cargo.toml"),
+    ),
     ("tests/e2e", include_str!("../../../tests/e2e/Cargo.toml")),
 ];
 
 /// The dependency tables a member declares. All three are read: a dev- or build-dependency drifts
 /// exactly as a normal one does, and `[dev-dependencies]` is where `criterion` and `proptest` live.
-const DEPENDENCY_TABLES: [&str; 3] =
-    ["[dependencies]", "[dev-dependencies]", "[build-dependencies]"];
+const DEPENDENCY_TABLES: [&str; 3] = [
+    "[dependencies]",
+    "[dev-dependencies]",
+    "[build-dependencies]",
+];
 
 /// The three internal edges, in the order the root table pins them. A seventh crate that another
 /// member depends on has to be added here — which is the moment its path spelling is decided.
@@ -180,13 +186,20 @@ fn every_member_dependency_inherits_the_workspace_pin() {
         }
     }
 
-    assert!(scanned >= 60, "only {scanned} dependency entries read — the scan is broken");
+    assert!(
+        scanned >= 60,
+        "only {scanned} dependency entries read — the scan is broken"
+    );
 }
 
 #[test]
 fn the_workspace_table_carries_no_pin_nobody_inherits() {
     let pins = workspace_pins();
-    assert!(pins.len() >= 25, "only {} pins read — the scan is broken", pins.len());
+    assert!(
+        pins.len() >= 25,
+        "only {} pins read — the scan is broken",
+        pins.len()
+    );
 
     let inherited = inherited_packages();
     for (name, _) in pins {
@@ -205,7 +218,10 @@ fn each_internal_crate_is_pinned_once_with_a_root_relative_path() {
         .collect();
 
     let names: Vec<&str> = internal.iter().map(|&(name, _)| name).collect();
-    assert_eq!(names, INTERNAL_CRATES, "the internal edges walrus pins at the root");
+    assert_eq!(
+        names, INTERNAL_CRATES,
+        "the internal edges walrus pins at the root"
+    );
 
     for (name, value) in internal {
         assert_eq!(
@@ -224,8 +240,7 @@ fn every_workspace_member_is_covered() {
     covered.sort_unstable();
 
     assert_eq!(
-        declared,
-        covered,
+        declared, covered,
         "add each new member's manifest to MEMBER_MANIFESTS so its pins are checked too"
     );
 }
@@ -274,11 +289,15 @@ fn the_scan_reads_a_fabricated_manifest() {
 fn the_unread_table_check_rejects_fabricated_headers() {
     assert!(is_unread_dependency_table("[dependencies.serde]"));
     assert!(is_unread_dependency_table("[dev-dependencies.criterion]"));
-    assert!(is_unread_dependency_table("[target.'cfg(unix)'.dependencies]"));
+    assert!(is_unread_dependency_table(
+        "[target.'cfg(unix)'.dependencies]"
+    ));
 
     for table in DEPENDENCY_TABLES {
         assert!(!is_unread_dependency_table(table), "{table} is read");
     }
     assert!(!is_unread_dependency_table("[features]"));
-    assert!(!is_unread_dependency_table("# dependencies are pinned at the root"));
+    assert!(!is_unread_dependency_table(
+        "# dependencies are pinned at the root"
+    ));
 }

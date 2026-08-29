@@ -174,17 +174,21 @@ async fn pipeline(
     // The receiver closes when the final worker exits; nothing above may keep an extra sender alive.
     drop(failures_tx);
     let first_failure = local
-        .run_until(crate::supervisor::supervise(failures_rx, token, async move {
-            // Once the supervisor sees a failure it cancels `token`, so healthy workers leave
-            // their loops and this drain always makes progress. It must run to completion:
-            // `supervise` only returns when this future does, and the lease release below depends
-            // on every worker having been joined (see the drop-order note).
-            while let Some(joined) = workers.join_next().await {
-                if let Err(error) = joined {
-                    tracing::error!(%error, "apply worker panicked");
+        .run_until(crate::supervisor::supervise(
+            failures_rx,
+            token,
+            async move {
+                // Once the supervisor sees a failure it cancels `token`, so healthy workers leave
+                // their loops and this drain always makes progress. It must run to completion:
+                // `supervise` only returns when this future does, and the lease release below depends
+                // on every worker having been joined (see the drop-order note).
+                while let Some(joined) = workers.join_next().await {
+                    if let Err(error) = joined {
+                        tracing::error!(%error, "apply worker panicked");
+                    }
                 }
-            }
-        }))
+            },
+        ))
         .await;
 
     // DROP ORDER, load-bearing (see `loader::shutdown` steps 4-5): each `join_next` above joined a
@@ -232,11 +236,10 @@ fn build_store(cfg: &LoaderConfig) -> Result<AmazonS3, LoaderError> {
     if let Some(endpoint) = &cfg.object_store.endpoint {
         b = b.with_endpoint(endpoint).with_allow_http(true);
     }
-    b.build()
-        .map_err(|source| LoaderError::ObjectStore {
-            op: "build S3 client",
-            source: Box::new(source),
-        })
+    b.build().map_err(|source| LoaderError::ObjectStore {
+        op: "build S3 client",
+        source: Box::new(source),
+    })
 }
 
 /// DuckDB httpfs credentials for `read_parquet('s3://…')`, from the object-store config + the AWS env

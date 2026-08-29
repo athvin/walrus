@@ -232,7 +232,11 @@ fn synthetic_thread_local_is_accepted() {
     let offences = plain_static_offences("fixture/thread_local.rs", source);
     let diagnostic = offences.join("\n");
 
-    assert_eq!(offences.len(), 1, "only the trailing plain static: {diagnostic}");
+    assert_eq!(
+        offences.len(),
+        1,
+        "only the trailing plain static: {diagnostic}"
+    );
     assert!(diagnostic.contains("fixture/thread_local.rs:5"));
     assert!(diagnostic.contains("TIMEOUT_MS"));
 }
@@ -245,7 +249,11 @@ fn synthetic_inline_thread_local_is_accepted() {
     let offences = plain_static_offences("fixture/inline_thread_local.rs", source);
     let diagnostic = offences.join("\n");
 
-    assert_eq!(offences.len(), 1, "one line opens and closes it: {diagnostic}");
+    assert_eq!(
+        offences.len(),
+        1,
+        "one line opens and closes it: {diagnostic}"
+    );
     assert!(diagnostic.contains("fixture/inline_thread_local.rs:2"));
 }
 

@@ -245,9 +245,9 @@ fn recombine_expr(pg_type_oid: u32, emit: &[(&str, &str)]) -> Option<String> {
         (INTERVAL, [(months, _), (days, _), (micros, _)]) => Some(format!(
             "to_months(s.\"{months}\") + to_days(s.\"{days}\") + to_microseconds(s.\"{micros}\")"
         )),
-        (TIMETZ, [(micros, _), (offset, _)]) => Some(format!(
-            "make_timetz(s.\"{micros}\", s.\"{offset}\")"
-        )),
+        (TIMETZ, [(micros, _), (offset, _)]) => {
+            Some(format!("make_timetz(s.\"{micros}\", s.\"{offset}\")"))
+        }
         _ => None,
     }
 }

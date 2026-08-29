@@ -15,7 +15,10 @@ const MEMBER_MANIFESTS: &[(&str, &str)] = &[
     ("crates/control", include_str!("../../control/Cargo.toml")),
     ("crates/loader", include_str!("../../loader/Cargo.toml")),
     ("crates/pg-sink", include_str!("../../pg-sink/Cargo.toml")),
-    ("crates/pg-to-arrow", include_str!("../../pg-to-arrow/Cargo.toml")),
+    (
+        "crates/pg-to-arrow",
+        include_str!("../../pg-to-arrow/Cargo.toml"),
+    ),
     ("tests/e2e", include_str!("../../../tests/e2e/Cargo.toml")),
 ];
 
@@ -108,7 +111,10 @@ fn no_declared_name_announces_its_language() {
 
     for &(member, manifest) in MEMBER_MANIFESTS {
         let names = declared_names(manifest);
-        assert!(!names.is_empty(), "{member} declares no name — scan is broken");
+        assert!(
+            !names.is_empty(),
+            "{member} declares no name — scan is broken"
+        );
         for name in &names {
             assert_eq!(
                 language_marker(name),
@@ -122,7 +128,10 @@ fn no_declared_name_announces_its_language() {
     // The shipped binaries live in `[[bin]]`, not `[package]`. Finding them proves the scan
     // reaches every target table, so a `-rs` binary under a clean package name still fails above.
     for binary in ["walrus-loader", "walrus-pg-sink"] {
-        assert!(all.contains(&binary), "the scan missed the {binary} bin target");
+        assert!(
+            all.contains(&binary),
+            "the scan missed the {binary} bin target"
+        );
     }
 }
 
@@ -130,7 +139,11 @@ fn no_declared_name_announces_its_language() {
 fn no_member_directory_announces_its_language() {
     for &(member, _) in MEMBER_MANIFESTS {
         let dir = last_segment(member);
-        assert_eq!(language_marker(dir), None, "the {member} directory says Rust");
+        assert_eq!(
+            language_marker(dir),
+            None,
+            "the {member} directory says Rust"
+        );
     }
 }
 
@@ -142,8 +155,7 @@ fn every_workspace_member_is_covered() {
     covered.sort_unstable();
 
     assert_eq!(
-        declared,
-        covered,
+        declared, covered,
         "add each new member's manifest to MEMBER_MANIFESTS so its names are checked too"
     );
 }

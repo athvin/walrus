@@ -22,7 +22,10 @@ const MEMBER_MANIFESTS: &[(&str, &str)] = &[
     ("crates/control", include_str!("../../control/Cargo.toml")),
     ("crates/loader", include_str!("../../loader/Cargo.toml")),
     ("crates/pg-sink", include_str!("../../pg-sink/Cargo.toml")),
-    ("crates/pg-to-arrow", include_str!("../../pg-to-arrow/Cargo.toml")),
+    (
+        "crates/pg-to-arrow",
+        include_str!("../../pg-to-arrow/Cargo.toml"),
+    ),
     ("tests/e2e", include_str!("../../../tests/e2e/Cargo.toml")),
 ];
 
@@ -158,8 +161,7 @@ fn every_workspace_member_is_covered() {
     covered.sort_unstable();
 
     assert_eq!(
-        declared,
-        covered,
+        declared, covered,
         "add each new member's manifest to MEMBER_MANIFESTS so its MSRV key is checked too"
     );
 }
@@ -172,7 +174,10 @@ fn the_msrv_key_is_read_from_fabricated_manifests() {
     let another_key = "[package]\nrust-version-policy = \"inherit\"\n";
     let root_only = "[package]\nname = \"e2e\"\n[workspace.package]\nrust-version = \"1.95\"\n";
 
-    assert_eq!(package_msrv(inherited), Some(("rust-version.workspace", "true")));
+    assert_eq!(
+        package_msrv(inherited),
+        Some(("rust-version.workspace", "true"))
+    );
     assert_eq!(
         package_msrv(stated),
         Some(("rust-version", "\"1.95\"")),
@@ -180,7 +185,11 @@ fn the_msrv_key_is_read_from_fabricated_manifests() {
     );
     assert_eq!(package_msrv(commented), None);
     assert_eq!(package_msrv(another_key), None);
-    assert_eq!(package_msrv(root_only), None, "a member cannot borrow the root declaration");
+    assert_eq!(
+        package_msrv(root_only),
+        None,
+        "a member cannot borrow the root declaration"
+    );
 }
 
 #[test]

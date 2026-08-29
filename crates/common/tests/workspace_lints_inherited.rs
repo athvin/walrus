@@ -827,7 +827,9 @@ fn the_wildcard_import_deny_rests_on_clippys_own_carve_outs() {
     let cfg = std::fs::read_to_string(repo_root().join("clippy.toml")).unwrap();
     for line in cfg.lines() {
         assert!(
-            !line.trim_start().starts_with("warn-on-all-wildcard-imports"),
+            !line
+                .trim_start()
+                .starts_with("warn-on-all-wildcard-imports"),
             "clippy.toml sets warn-on-all-wildcard-imports; that widens the deny to every test \
              module's `use super::*`"
         );
@@ -976,13 +978,22 @@ fn the_workspace_lint_table_still_polices_safety_doc_sections() {
 fn the_workspace_lint_table_still_demands_documented_unsafe_blocks() {
     let synthetic = "undocumented_unsafe_blocks = \"warn\"\n\
                      multiple_unsafe_ops_per_block = \"deny\"\n";
-    assert_eq!(clippy_deny_count(synthetic, "undocumented_unsafe_blocks"), 0);
-    assert_eq!(clippy_deny_count(synthetic, "multiple_unsafe_ops_per_block"), 1);
+    assert_eq!(
+        clippy_deny_count(synthetic, "undocumented_unsafe_blocks"),
+        0
+    );
+    assert_eq!(
+        clippy_deny_count(synthetic, "multiple_unsafe_ops_per_block"),
+        1
+    );
 
     let root_manifest = std::fs::read_to_string(repo_root().join("Cargo.toml")).unwrap();
     let clippy = section(&root_manifest, "[workspace.lints.clippy]")
         .expect("root manifest must define [workspace.lints.clippy]");
-    for lint in ["undocumented_unsafe_blocks", "multiple_unsafe_ops_per_block"] {
+    for lint in [
+        "undocumented_unsafe_blocks",
+        "multiple_unsafe_ops_per_block",
+    ] {
         assert_eq!(
             clippy_deny_count(clippy, lint),
             1,

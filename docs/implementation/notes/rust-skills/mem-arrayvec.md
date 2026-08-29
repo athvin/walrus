@@ -1,8 +1,10 @@
 # ArrayVec has no hard-capacity home in walrus (PR 11.14; re-audited repo-wide)
 
 > **Status:** decided 2026-08-13 — declined, structurally; re-audited 2026-08-27 against the raw
-> rule and still declined. No `arrayvec` dependency. The re-audit did find one exact compile-time
-> width (the standby-status frame) and gave it a plain `[u8; N]` stack array — std, not the crate.
+> rule and still declined. The decline is **structural, not bench-gated**: no growable candidate has
+> a legal compile-time bound to encode, so benchmarking an `ArrayVec<T, N>` against it is not
+> reachable. No `arrayvec` dependency. The re-audit did find one exact compile-time width (the
+> standby-status frame) and gave it a plain `[u8; N]` stack array — std, not the crate.
 
 ## What the rule asks
 

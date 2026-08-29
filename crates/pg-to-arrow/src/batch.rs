@@ -110,9 +110,9 @@ fn emit_kind(col: &PgColumn) -> Result<Emit, Error> {
 #[derive(Debug)]
 pub struct BatchBuilder {
     schema: SchemaRef,
-    builders: Builders,   // one per EMITTED field, flat, in schema order
-    plan: Box<[Emit]>,    // one per SOURCE column: how its value fans out
-    meta: StringBuilder,  // the trailing walrus_pg_sink_meta column
+    builders: Builders,  // one per EMITTED field, flat, in schema order
+    plan: Box<[Emit]>,   // one per SOURCE column: how its value fans out
+    meta: StringBuilder, // the trailing walrus_pg_sink_meta column
     rows: usize,
     /// The batch-constant meta JSON fragment, serialized once from the first row (PR 5.7).
     meta_const: Option<String>,
@@ -684,7 +684,8 @@ fn struct_field<'a, T: ArrayBuilder>(
     idx: usize,
     col: &str,
 ) -> Result<&'a mut T, Error> {
-    sb.field_builder::<T>(idx).ok_or_else(|| downcast_error(col))
+    sb.field_builder::<T>(idx)
+        .ok_or_else(|| downcast_error(col))
 }
 
 /// Typed accessor for a `dyn` column builder, attributing a downcast failure to the column.

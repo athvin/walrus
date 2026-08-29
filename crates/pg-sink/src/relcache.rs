@@ -127,13 +127,14 @@ impl RelationCache {
         let decoded = rows
             .into_iter()
             .map(|row| {
-                let relation: PgRelation = serde_json::from_value(row.columns).map_err(|source| {
-                    RelationError::Hydrate {
-                        schema: row.source_schema,
-                        table: row.source_table,
-                        source,
-                    }
-                })?;
+                let relation: PgRelation =
+                    serde_json::from_value(row.columns).map_err(|source| {
+                        RelationError::Hydrate {
+                            schema: row.source_schema,
+                            table: row.source_table,
+                            source,
+                        }
+                    })?;
                 let arrow_schema = build_arrow(&relation)?;
                 Ok(CachedRelation {
                     arrow_schema,
@@ -283,13 +284,12 @@ fn build_cached(
     schema_version: SchemaVersionNo,
 ) -> Result<CachedRelation, RelationError> {
     let arrow_schema = build_arrow(&relation)?;
-    let descriptors = pg_to_arrow::describe_relation(&relation).map_err(|source| {
-        RelationError::Schema {
+    let descriptors =
+        pg_to_arrow::describe_relation(&relation).map_err(|source| RelationError::Schema {
             schema: relation.schema.clone(),
             table: relation.name.clone(),
             source,
-        }
-    })?;
+        })?;
     Ok(CachedRelation {
         arrow_schema,
         descriptors,

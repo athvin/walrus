@@ -23,7 +23,10 @@ fn a_malformed_lsn_keeps_its_typed_cause_under_the_field_context() {
 #[test]
 fn the_field_label_names_the_offending_column() {
     let err = parse_lsn("", "confirmed_flush_lsn").expect_err("the empty string is not an LSN");
-    assert_eq!(err.to_string(), "parse confirmed_flush_lsn as a Postgres LSN");
+    assert_eq!(
+        err.to_string(),
+        "parse confirmed_flush_lsn as a Postgres LSN"
+    );
 }
 
 #[test]

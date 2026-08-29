@@ -647,10 +647,12 @@ fn cursor_from_row(
 /// the chunk loop reuses one allocation across every row it exports.
 fn read_row_into(row: &tokio_postgres::Row, rel: &PgRelation, out: &mut Vec<TupleValue>) {
     out.clear();
-    out.extend((0..rel.columns.len()).map(|i| match row.get::<_, Option<String>>(i) {
-        Some(s) => TupleValue::Text(s),
-        None => TupleValue::Null,
-    }));
+    out.extend(
+        (0..rel.columns.len()).map(|i| match row.get::<_, Option<String>>(i) {
+            Some(s) => TupleValue::Text(s),
+            None => TupleValue::Null,
+        }),
+    );
 }
 
 #[cfg(test)]

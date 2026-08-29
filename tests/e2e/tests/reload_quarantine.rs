@@ -122,11 +122,14 @@ async fn quarantined_table_recovers_via_reload_without_stalling_others() {
     }
 
     // A low-rate writer keeps rl1/rl2 advancing across the whole window (else their transformed_lsn
-    // legitimately sits still and the recovery assertion proves nothing).
+    // legitimately sits still and the recovery assertion proves nothing). It runs until `churn.abort()`
+    // below rather than for a fixed number of rounds: the freeze sample is taken when the loader
+    // *exits*, so a writer that stops earlier leaves the others with nothing new to apply after the
+    // restart, and the recovery assertion fails on a slow quarantine instead of on a real stall.
     let churn = {
         let src = h.source_pool().clone();
         tokio::spawn(async move {
-            for r in 0..60 {
+            for r in 0u32.. {
                 for t in OTHERS {
                     let _ = sqlx::query(&format!(
                         "UPDATE public.{t} SET status = 'c{r}' WHERE id = ((random()*199)::int + 1)"

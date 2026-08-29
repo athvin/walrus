@@ -196,8 +196,7 @@ fn the_deferred_backfill_seam_is_still_a_self_retiring_expect() {
         .expect("the carve-out module must still carry the deferred-seam suppression");
 
     assert_eq!(
-        form,
-        EXPECT_FORM,
+        form, EXPECT_FORM,
         "the carve-out must be #[expect(…)], so an unfulfilled expectation retires it the day the \
          parallel CTID-range backfill lands; #[allow(…)] would sit there forever"
     );

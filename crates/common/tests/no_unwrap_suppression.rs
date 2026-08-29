@@ -170,8 +170,7 @@ fn the_recorder_install_is_still_a_self_retiring_expect() {
         .expect("the carve-out module must still carry the install-once suppression");
 
     assert_eq!(
-        form,
-        EXPECT_FORM,
+        form, EXPECT_FORM,
         "the carve-out must be #[expect(…)], so an unfulfilled expectation retires it the day \
          install_recorder stops needing one; #[allow(…)] would sit there forever"
     );

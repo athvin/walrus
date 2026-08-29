@@ -169,7 +169,16 @@ for gate in ${gates//,/ }; do
       fi
       if command -v sqlx >/dev/null && docker_up && ensure_stack; then
         export DATABASE_URL="$CONTROL_DB_URL"
-        run_check sqlx-prepare cargo sqlx prepare --check --workspace
+        # `prepare --check` re-type-checks every query against a LIVE schema, and a freshly booted
+        # control-pg is empty (compose mounts no init SQL for it). Migrate first — otherwise every
+        # `sqlx::query_file!` fails with `relation "walrus.…" does not exist`, because the
+        # `integration` gate's migrate step runs only later in the list. `migrate run` is
+        # idempotent, so running it in both places is a no-op the second time.
+        if sqlx migrate run --source migrations/control >"$tmpdir/sqlx-prepare.log" 2>&1; then
+          run_check sqlx-prepare cargo sqlx prepare --check --workspace
+        else
+          failed sqlx-prepare
+        fi
       else
         skip sqlx-prepare "needs sqlx-cli + a running control PG (docker daemon)"
       fi ;;

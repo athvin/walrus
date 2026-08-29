@@ -145,7 +145,10 @@ fn the_serde_policy_rejects_fabricated_manifests() {
 
 #[test]
 fn the_seam_and_documentation_policies_reject_fabricated_input() {
-    assert_eq!(sqlx_off_build("run: cargo check -p common --no-default-features"), Ok(()));
+    assert_eq!(
+        sqlx_off_build("run: cargo check -p common --no-default-features"),
+        Ok(())
+    );
     assert_eq!(
         sqlx_off_build("- run: cargo test --workspace\n"),
         Err("no CI build compiles `common` with its optional feature off")

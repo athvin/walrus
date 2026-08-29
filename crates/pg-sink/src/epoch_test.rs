@@ -29,7 +29,11 @@ fn only_lost_decodes_to_the_invalidating_wal_status() {
         ("Lost", None),
         ("", None),
     ] {
-        assert_eq!(WalStatus::from_catalog(text), decoded, "wal_status {text:?}");
+        assert_eq!(
+            WalStatus::from_catalog(text),
+            decoded,
+            "wal_status {text:?}"
+        );
     }
 }
 

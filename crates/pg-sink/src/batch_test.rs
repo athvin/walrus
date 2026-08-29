@@ -360,7 +360,10 @@ fn an_erased_clock_still_satisfies_the_generic_bound() {
         .unwrap();
     assert!(!b.should_flush(), "no wall time has elapsed yet");
     fake.advance(Duration::from_millis(150));
-    assert!(b.should_flush(), "max_fill tripped through `Arc<dyn Clock>`");
+    assert!(
+        b.should_flush(),
+        "max_fill tripped through `Arc<dyn Clock>`"
+    );
 }
 
 #[test]

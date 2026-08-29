@@ -30,7 +30,10 @@ pub enum WorkerThreadsError {
     #[error("must be >= 1 (omit for automatic sizing)")]
     Zero,
     /// Above [`MAX_WORKER_THREADS`] — a misconfiguration on a pod, not an intent.
-    #[error("must be <= {} (got {configured}; omit for automatic sizing)", MAX_WORKER_THREADS)]
+    #[error(
+        "must be <= {} (got {configured}; omit for automatic sizing)",
+        MAX_WORKER_THREADS
+    )]
     TooMany { configured: usize },
 }
 

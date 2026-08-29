@@ -122,13 +122,23 @@ fn descriptor_without_meta_loads_as_no_metadata() {
 fn a_missing_mapping_key_is_still_a_hard_error() {
     // Only `meta` defaults — dropping a mapping key must stay a loud decode failure, never a
     // silently wrong plan.
-    for key in ["column", "pg_type_oid", "pg_type", "tier", "arrow", "duckdb", "emit"] {
+    for key in [
+        "column",
+        "pg_type_oid",
+        "pg_type",
+        "tier",
+        "arrow",
+        "duckdb",
+        "emit",
+    ] {
         let mut doc: serde_json::Value = serde_json::from_str(LEGACY_SCALAR_DESCRIPTOR).unwrap();
         doc.as_object_mut().unwrap().remove(key);
 
         let error = serde_json::from_value::<TypeDescriptor>(doc).unwrap_err();
         assert!(
-            error.to_string().contains(&format!("missing field `{key}`")),
+            error
+                .to_string()
+                .contains(&format!("missing field `{key}`")),
             "missing {key} must remain a hard error: {error}"
         );
     }

@@ -98,10 +98,12 @@ async fn alter_add_column_bumps_version_and_cuts_file() {
         .unwrap();
     drop_slot(&admin, slot).await;
     let resume = verify_or_create_slot(&admin, slot).await.unwrap();
-    let mut stream =
-        ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
-            .await
-            .unwrap();
+    // The control-plane setup happens BEFORE the CopyBoth stream opens. Nothing reads the
+    // replication socket or sends standby feedback until the decode loop below, and the harness runs
+    // `wal_sender_timeout=5s`, so connecting + migrating + clearing the epoch while the stream is
+    // already open is enough for the walsender to terminate it under a loaded serial sweep ("source
+    // closed the replication connection" on the first `next()`). The slot — created above — retains
+    // the WAL, so opening the stream later replays every frame from `resume.start_lsn()`.
     let sink = ParquetSink::new(minio(), "walrus", epoch);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
@@ -112,6 +114,10 @@ async fn alter_add_column_bumps_version_and_cuts_file() {
             .await
             .unwrap();
     }
+    let mut stream =
+        ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
+            .await
+            .unwrap();
     // High row cap → the pre-DDL row stays buffered until the DDL CUTS it (the interesting path).
     let mut router = BatchRouter::new(
         BatchTriggers {

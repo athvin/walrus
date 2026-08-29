@@ -107,12 +107,27 @@ fn the_fmt_gate_policy_rejects_fabricated_surfaces() {
     let cases = [
         ("      - run: cargo fmt --all --check\n", Ok(())),
         ("    cargo fmt --all --check\n", Ok(())),
-        ("      - run: cargo clippy --all-targets\n", Err("nothing runs cargo fmt")),
+        (
+            "      - run: cargo clippy --all-targets\n",
+            Err("nothing runs cargo fmt"),
+        ),
         // A step titled after a command it does not run, and a commented-out recipe line.
-        ("      - name: cargo fmt --all --check\n", Err("nothing runs cargo fmt")),
-        ("    # cargo fmt --all --check\n", Err("nothing runs cargo fmt")),
-        ("      - run: cargo fmt --all\n", Err("cargo fmt runs without --check")),
-        ("      - run: cargo fmt --check\n", Err("the check is not workspace-wide")),
+        (
+            "      - name: cargo fmt --all --check\n",
+            Err("nothing runs cargo fmt"),
+        ),
+        (
+            "    # cargo fmt --all --check\n",
+            Err("nothing runs cargo fmt"),
+        ),
+        (
+            "      - run: cargo fmt --all\n",
+            Err("cargo fmt runs without --check"),
+        ),
+        (
+            "      - run: cargo fmt --check\n",
+            Err("the check is not workspace-wide"),
+        ),
     ];
 
     for (surface, expected) in cases {
@@ -131,7 +146,10 @@ fn a_recipe_body_stops_at_the_next_recipe() {
         "    cargo clippy --all-targets --all-features -- -D warnings\n",
     );
 
-    assert_eq!(recipe_body(justfile, "fmt"), Some("    cargo fmt --all --check\n\n"));
+    assert_eq!(
+        recipe_body(justfile, "fmt"),
+        Some("    cargo fmt --all --check\n\n")
+    );
     assert_eq!(recipe_body(justfile, "test"), None);
 }
 
@@ -139,12 +157,25 @@ fn a_recipe_body_stops_at_the_next_recipe() {
 fn the_toolchain_policy_rejects_fabricated_pins() {
     let cases = [
         ("components = [\"rustfmt\", \"clippy\"]\n", Ok(())),
-        ("channel = \"1.95.0\"\n", Err("the pin declares no components")),
-        ("# components = [\"rustfmt\"]\n", Err("the pin declares no components")),
-        ("components = [\"clippy\"]\n", Err("the components omit rustfmt")),
+        (
+            "channel = \"1.95.0\"\n",
+            Err("the pin declares no components"),
+        ),
+        (
+            "# components = [\"rustfmt\"]\n",
+            Err("the pin declares no components"),
+        ),
+        (
+            "components = [\"clippy\"]\n",
+            Err("the components omit rustfmt"),
+        ),
     ];
 
     for (toolchain, expected) in cases {
-        assert_eq!(ships_rustfmt(toolchain), expected, "toolchain:\n{toolchain}");
+        assert_eq!(
+            ships_rustfmt(toolchain),
+            expected,
+            "toolchain:\n{toolchain}"
+        );
     }
 }

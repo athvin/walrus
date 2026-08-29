@@ -63,7 +63,11 @@ async fn a_cancelled_renewer_ends_so_the_drain_can_join_it() {
 /// one out of reach: nothing under `MIN_LEASE_TTL` parses, in release builds as well as debug.
 #[test]
 fn a_ttl_the_renewer_could_not_fit_inside_never_parses() {
-    for too_short in [Duration::ZERO, Duration::from_millis(500), MIN_RENEW_INTERVAL] {
+    for too_short in [
+        Duration::ZERO,
+        Duration::from_millis(500),
+        MIN_RENEW_INTERVAL,
+    ] {
         assert!(
             matches!(
                 LeaseTtl::new(too_short),

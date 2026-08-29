@@ -263,7 +263,9 @@ impl<C: Clock> TableBatcher<C> {
         self.batch_id.get_or_insert_with(|| {
             format!("{}.{}-{}", meta.source_schema, meta.source_table, meta.lsn)
         });
-        self.pending_bytes = self.pending_bytes.saturating_add(estimate_row_bytes(values));
+        self.pending_bytes = self
+            .pending_bytes
+            .saturating_add(estimate_row_bytes(values));
         self.pending.push((meta, values.into()));
     }
 

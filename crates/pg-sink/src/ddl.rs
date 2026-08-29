@@ -130,7 +130,8 @@ impl DdlConsumer {
             return *version;
         }
         let version = SchemaVersionNo(2);
-        self.versions.insert((schema.to_string(), table.to_string()), version);
+        self.versions
+            .insert((schema.to_string(), table.to_string()), version);
         version
     }
 

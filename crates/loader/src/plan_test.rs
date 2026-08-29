@@ -81,7 +81,9 @@ fn mirror_names(plan: &TablePlan) -> Vec<&str> {
 /// `MirrorValue` has no `PartialEq` (a plan is never compared in production), so render it.
 fn mirror_value(c: &MirrorCol) -> String {
     match &c.value {
-        MirrorValue::Passthrough { toast_resolvable: t } => format!("passthrough({t})"),
+        MirrorValue::Passthrough {
+            toast_resolvable: t,
+        } => format!("passthrough({t})"),
         MirrorValue::Recombine(expr) => format!("recombine({expr})"),
     }
 }
@@ -105,7 +107,10 @@ fn a_nested_or_unknown_emit_type_falls_back_rather_than_failing() {
     assert_eq!(emit_arrow_to_duck("LIST"), "VARCHAR");
 
     // The one mapping whose DuckDB spelling is several words.
-    assert_eq!(emit_arrow_to_duck("TIMESTAMPTZ"), "TIMESTAMP WITH TIME ZONE");
+    assert_eq!(
+        emit_arrow_to_duck("TIMESTAMPTZ"),
+        "TIMESTAMP WITH TIME ZONE"
+    );
 }
 
 #[test]

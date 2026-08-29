@@ -98,7 +98,10 @@ fn is_same_duck_type(a: &PgColumn, b: &PgColumn) -> bool {
 /// type changes is **lossy/narrowing** and belongs to PR 3.9's quarantine path.
 const fn is_lossless_widen(old: &PgColumn, new: &PgColumn) -> bool {
     // int2→int4→int8 and float4→float8 are the only in-place widenings, grouped by source type.
-    matches!((old.type_oid, new.type_oid), (INT2, INT4 | INT8) | (INT4, INT8) | (FLOAT4, FLOAT8))
+    matches!(
+        (old.type_oid, new.type_oid),
+        (INT2, INT4 | INT8) | (INT4, INT8) | (FLOAT4, FLOAT8)
+    )
 }
 
 /// The full classification of one version step: additive/lossless changes plus destructive ones
@@ -145,9 +148,10 @@ pub fn diff(old: &SchemaVersion, new: &SchemaVersion) -> Result<SchemaDiff, Load
         // columns by name-set difference — the surviving columns keep their names.
         let kept: std::collections::HashSet<&str> = nc.iter().map(|c| c.name.as_str()).collect();
         let dropped = oc.iter().filter(|o| !kept.contains(o.name.as_str()));
-        d.destructive.extend(dropped.map(|o| DestructiveChange::DropColumn {
-            name: o.name.clone(),
-        }));
+        d.destructive
+            .extend(dropped.map(|o| DestructiveChange::DropColumn {
+                name: o.name.clone(),
+            }));
         return Ok(d);
     }
 
