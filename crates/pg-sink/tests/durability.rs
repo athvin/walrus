@@ -101,10 +101,6 @@ async fn slot_advances_only_after_s3_and_manifest_durable() {
     drop_slot(&admin, slot).await;
     let resume = verify_or_create_slot(&admin, slot).await.unwrap();
 
-    let mut stream =
-        ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
-            .await
-            .unwrap();
     let epoch = EpochNo(2_260_001);
     let sink = ParquetSink::new(minio(), "walrus", epoch);
     let pool = control_pool().await;
@@ -122,6 +118,15 @@ async fn slot_advances_only_after_s3_and_manifest_durable() {
     );
     let mut cache = RelationCache::default();
     let mut ctx = StreamCtx::default();
+
+    // Open CopyBoth only after the control-plane and batching setup is complete. The compose source
+    // uses `wal_sender_timeout=5s`; opening earlier leaves nobody reading the socket or sending
+    // standby feedback while migrations and setup run, so a loaded serial sweep can lose the
+    // connection before the first `next()`. The slot already retains everything from `start_lsn`.
+    let mut stream =
+        ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
+            .await
+            .unwrap();
 
     admin
         .execute(
