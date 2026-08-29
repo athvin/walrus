@@ -132,6 +132,17 @@ async fn status_of(pool: &sqlx::PgPool, reload_id: ReloadId) -> (ReloadStatus, O
     (row.status, row.error)
 }
 
+fn metric_sum(name: &str) -> f64 {
+    common::metrics::render()
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| line.strip_prefix(name))
+        .filter(|rest| rest.starts_with(' ') || rest.starts_with('{'))
+        .filter_map(|rest| rest.split_whitespace().last())
+        .filter_map(|value| value.parse::<f64>().ok())
+        .sum()
+}
+
 /// Poll until the row reaches `want` (the controller's cadence is 200ms; give it a few).
 async fn await_status(pool: &sqlx::PgPool, reload_id: ReloadId, want: ReloadStatus) {
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -338,38 +349,31 @@ async fn preflight_failures_land_in_failed_with_reasons() {
         .unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires docker compose up --wait (source + control PG)"]
 async fn cap_of_two_holds_and_the_stream_keeps_flowing() {
     let _g = SOURCE_LOCK.lock().await;
+    common::metrics::init();
     let epoch = EpochNo(640_003);
     let slot = "walrus_reload_pickup";
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
     admin
-        .execute(
-            "DELETE FROM public.customers WHERE region = 'rl' AND id = 640003",
-            &[],
+        .batch_execute(
+            "DELETE FROM public.orders WHERE id = 640001;
+             DELETE FROM public.customers WHERE region = 'rl-seed' AND id = 640002;
+             DELETE FROM public.customers WHERE region = 'rl' AND id = 640003;
+             DELETE FROM public.items WHERE id = 640003;
+             INSERT INTO public.orders (id, status) VALUES (640001, 'reload-cap');
+             INSERT INTO public.customers (region, id, name)
+                 VALUES ('rl-seed', 640002, 'reload-cap');
+             INSERT INTO public.items (id, label, qty) VALUES (640003, 'reload-cap', 1);",
         )
         .await
         .unwrap();
     let pool = pool_for(epoch).await;
     seed_registry(&admin, &pool, epoch, &["orders", "customers", "items"]).await;
-
-    // A live stream BEFORE the controller starts — the no-stall probe.
-    let _ = admin
-        .execute(
-            "SELECT pg_drop_replication_slot(slot_name)
-             FROM pg_replication_slots WHERE slot_name = $1 AND NOT active",
-            &[&slot],
-        )
-        .await;
-    let resume = verify_or_create_slot(&admin, slot).await.unwrap();
-    let mut stream =
-        ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
-            .await
-            .unwrap();
 
     let token = CancellationToken::new();
     let handle = ReloadController::spawn(
@@ -396,16 +400,12 @@ async fn cap_of_two_holds_and_the_stream_keeps_flowing() {
     await_status(&pool, a, ReloadStatus::Exporting).await;
     await_status(&pool, b, ReloadStatus::Exporting).await;
 
-    // Sample across several poll cadences: never more than two exporting; the third never claimed.
+    // Sample across several poll cadences. Status rows are not the cap: an exporter that hits an
+    // infra error deliberately leaves its row `exporting` for lease-based adoption. The active
+    // gauge wraps the actual semaphore-held task and therefore measures the load-bearing limit.
     for _ in 0..8 {
-        let exporting: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM walrus.table_reload WHERE epoch = $1 AND status = 'exporting'",
-        )
-        .bind(epoch)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!(exporting <= 2, "cap breached: {exporting} exporting");
+        let active = metric_sum(common::metrics::names::RELOAD_ACTIVE);
+        assert!(active <= 2.0, "cap breached: {active} active exporters");
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
     assert_eq!(
@@ -426,8 +426,22 @@ async fn cap_of_two_holds_and_the_stream_keeps_flowing() {
         .unwrap();
     await_status(&pool, c, ReloadStatus::Exporting).await;
 
-    // The replication stream never paused while the controller worked: a user change written NOW
-    // decodes promptly (the controller runs on its own connections, off the decode path).
+    // Open the no-stall probe while the controller is actively holding two exporter permits. A
+    // user change written NOW must decode promptly: controller work runs on its own connections,
+    // off the decode path. Starting here also keeps this deliberately manual stream from idling
+    // past the compose source's five-second `wal_sender_timeout` before its first `next()` call.
+    let _ = admin
+        .execute(
+            "SELECT pg_drop_replication_slot(slot_name)
+             FROM pg_replication_slots WHERE slot_name = $1 AND NOT active",
+            &[&slot],
+        )
+        .await;
+    let resume = verify_or_create_slot(&admin, slot).await.unwrap();
+    let mut stream =
+        ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
+            .await
+            .unwrap();
     admin
         .execute(
             "INSERT INTO public.customers (region, id, name) VALUES ('rl', 640003, 'no-stall')",
@@ -469,9 +483,12 @@ async fn cap_of_two_holds_and_the_stream_keeps_flowing() {
         )
         .await;
     admin
-        .execute(
-            "DELETE FROM public.customers WHERE region = 'rl' AND id = 640003",
-            &[],
+        .batch_execute(
+            "DELETE FROM public.orders WHERE id = 640001;
+             DELETE FROM public.customers
+                 WHERE (region = 'rl-seed' AND id = 640002)
+                    OR (region = 'rl' AND id = 640003);
+             DELETE FROM public.items WHERE id = 640003;",
         )
         .await
         .unwrap();
