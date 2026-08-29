@@ -334,7 +334,7 @@ async fn read_chunk_file(uri: &str) -> (Vec<i32>, Vec<(String, String)>) {
     (ids, metas)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires docker compose up --wait (source + control PG + MinIO)"]
 async fn chunks_cover_the_table_exactly_with_per_chunk_stamps() {
     let _g = SOURCE_LOCK.lock().await;
@@ -468,7 +468,7 @@ async fn chunks_cover_the_table_exactly_with_per_chunk_stamps() {
         .unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires docker compose up --wait (source + control PG + MinIO)"]
 async fn resume_from_cursor_never_reexports_completed_chunks() {
     let _g = SOURCE_LOCK.lock().await;

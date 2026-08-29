@@ -261,7 +261,7 @@ async fn status(pool: &sqlx::PgPool, reload_id: ReloadId) -> ReloadStatus {
         .status
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires docker compose up --wait (source + control PG + MinIO)"]
 async fn kill_mid_export_resumes_from_cursor_and_completes() {
     let _g = SOURCE_LOCK.lock().await;
@@ -373,7 +373,7 @@ async fn kill_mid_export_resumes_from_cursor_and_completes() {
         .unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires docker compose up --wait (source + control PG + MinIO)"]
 async fn complete_waits_for_transformed_lsn_to_reach_h() {
     let _g = SOURCE_LOCK.lock().await;

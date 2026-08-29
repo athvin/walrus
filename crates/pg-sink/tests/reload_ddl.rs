@@ -343,7 +343,7 @@ fn counter_value(name: &str) -> f64 {
     total
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires docker compose up --wait (source + control PG + MinIO)"]
 async fn mid_export_ddl_restarts_fresh_attempt_at_new_schema() {
     let _g = SOURCE_LOCK.lock().await;
@@ -482,7 +482,7 @@ async fn mid_export_ddl_restarts_fresh_attempt_at_new_schema() {
         .unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires docker compose up --wait (source + control PG + MinIO)"]
 async fn restart_cap_exhaustion_fails_loudly() {
     let _g = SOURCE_LOCK.lock().await;

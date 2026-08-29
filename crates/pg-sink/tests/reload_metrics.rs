@@ -244,7 +244,7 @@ fn metric_sum(name: &str) -> f64 {
     total
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires docker compose up --wait (source + control PG + MinIO)"]
 async fn chunk_export_moves_chunk_row_and_echo_metrics() {
     let _g = SOURCE_LOCK.lock().await;
