@@ -64,11 +64,11 @@
       "name": "partially-registered-ci-cannot-pass",
       "skills": ["implementing-walrus-roadmap"],
       "query": "Poll CI for the open roadmap PR.",
-      "setup": "The head rollup currently contains only one successful implementation-roadmap check, or one successful copy of each ci.yml job; the second push/pull_request workflow copy has not registered.",
+      "setup": "The head rollup currently contains only one successful implementation-roadmap check, or another incomplete subset of the jobs declared in ci.yml.",
       "expected_behavior": [
-        "classify_checks.py reads every job display name from ci.yml and requires two copies per head",
-        "ci_status.sh returns PENDING rather than PASS while any expected copy is under-registered",
-        "The loop never attempts a merge until both workflow copies are terminal and successful/neutral/skipped"
+        "classify_checks.py reads every job display name from ci.yml and requires one copy of each per head",
+        "ci_status.sh returns PENDING rather than PASS while any expected job is under-registered",
+        "The loop never attempts a merge until the PR workflow is terminal and every job is successful/neutral/skipped"
       ]
     },
     {
