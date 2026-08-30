@@ -30,6 +30,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Validate roadmap index and task contracts
         run: |
+          # The implementation roadmap was retired from the repository after completion. Keep this
+          # named check as a stable branch-protection/automation interface, and reactivate the full
+          # validator automatically if the roadmap is restored.
+          if [ ! -f docs/implementation/README.md ]; then
+            echo "Implementation roadmap is not present; nothing to validate."
+            exit 0
+          fi
           # A half-landed bookkeeping edit must fail on every PR/branch. The one
           # recovery exception is the push run on main itself: allowing exit 5
           # there lets preflight prove DRIFT and open the docs-only reconcile PR.
