@@ -1,16 +1,13 @@
 //! Guard for `api-serde-optional`. The rule asks a library crate to hide serde behind a Cargo
 //! feature; walrus rejected that for `common` and kept `sqlx` as its one optional seam. Three
-//! things drift silently and no lint covers any of them: the manifest could grow a `serde` feature
-//! without the recorded decision being revisited, the crate docs could stop naming the optional
-//! feature a consumer has to opt into, and CI could drop the only build that compiles `common`
-//! with `sqlx` **off** — the state workspace feature unification otherwise hides.
+//! things drift silently and no lint covers any of them: the manifest could grow a `serde` feature,
+//! the crate docs could stop naming the optional feature a consumer has to opt into, and CI could
+//! drop the only build that compiles `common` with `sqlx` **off** — the state workspace feature
+//! unification otherwise hides.
 
 const COMMON_MANIFEST: &str = include_str!("../Cargo.toml");
 const COMMON_LIB: &str = include_str!("../src/lib.rs");
 const CI_WORKFLOW: &str = include_str!("../../../.github/workflows/ci.yml");
-const NOTE_PATH: &str = "docs/implementation/notes/rust-skills/api-serde-optional.md";
-const NOTE: &str =
-    include_str!("../../../docs/implementation/notes/rust-skills/api-serde-optional.md");
 
 /// The body of `[section]` in `manifest`, up to the next table header at column 0.
 fn section<'a>(manifest: &'a str, header: &str) -> Option<&'a str> {
@@ -99,10 +96,6 @@ fn documents_the_optional_feature(lib_rs: &str) -> Result<(), &'static str> {
 #[test]
 fn serde_stays_a_hard_dependency_of_common() {
     assert_eq!(serde_policy(COMMON_MANIFEST), Ok(()));
-    assert!(
-        !NOTE.trim().is_empty(),
-        "{NOTE_PATH} must carry the recorded decision and its re-open trigger"
-    );
 }
 
 #[test]

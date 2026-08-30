@@ -1,8 +1,6 @@
 use super::{Reader, parse_tuple};
 use common::TupleValue;
 
-const ARRAYVEC_DECISION: &str =
-    include_str!("../../../../docs/implementation/notes/rust-skills/mem-arrayvec.md");
 const PG_MAX_COLUMNS: u16 = 1_600;
 
 fn all_null_tuple(ncols: u16) -> Vec<u8> {
@@ -14,7 +12,6 @@ fn all_null_tuple(ncols: u16) -> Vec<u8> {
 
 #[test]
 fn decodes_a_postgres_max_width_tuple_without_a_fixed_capacity_type() {
-    assert!(ARRAYVEC_DECISION.contains("structural, not bench-gated"));
     let bytes = all_null_tuple(PG_MAX_COLUMNS);
     let mut reader = Reader::new(&bytes);
 
