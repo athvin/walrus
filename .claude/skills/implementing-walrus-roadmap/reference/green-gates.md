@@ -54,18 +54,21 @@ reader knows which DoD lines only CI proved.
 
 ## 2. Gate → CI job map
 
-CI (`.github/workflows/ci.yml`) fires on **both `push` and `pull_request`**, so
-every check name appears twice on a PR head; both copies must pass. The `changes`
-job classifies the diff and gates the eight compile-heavy jobs on
+CI (`.github/workflows/ci.yml`) fires once for a PR through `pull_request`;
+`push` is restricted to `main`. Every declared check must register and pass. The
+`changes` job classifies the diff and gates the nine code-heavy jobs on
 `code == 'true'`; an `if:`-skipped job still reports success, which is what lets
-a docs-only PR go green in ~2 minutes without wedging required checks.
+a docs-only PR go green quickly without wedging required checks.
 
 | CI job | Local gate |
 |---|---|
 | `changes (classify diff)` | — (decides whether the rest run) |
-| `gates (fmt · clippy · test)` | `fmt,clippy,test` |
+| `static (guards · fmt)` | `fmt` + repository guards |
+| `clippy (all targets · all features)` | `clippy` |
+| `unit (workspace · common feature seam)` | `test` |
 | `compose (source-pg · control-pg · minio)` | `compose` |
-| `integration (control migrations + sqlx offline)` | `integration` + `sqlx` |
+| `integration (control · SQLx · sink)` | `integration` + `sqlx` (control/sink half) |
+| `integration (loader)` | `integration` (loader half) |
 | `e2e (full pipeline — quarantine recovery + N-table scale)` | `e2e` |
 | `conformance (DuckDB read-back)` | `conformance` |
 | `supply-chain (cargo-deny …)` | `deny` (always runs in CI — never gated on `code`) |
@@ -73,9 +76,10 @@ a docs-only PR go green in ~2 minutes without wedging required checks.
 | `images (build + PID-1 SIGTERM smoke)` | `images` |
 | `manifests (kustomize + kubeconform)` | `manifests` (always runs in CI) |
 
-Timing: the jobs that build the bundled DuckDB (`gates`, `integration`, `e2e`,
-`conformance`, `images`) cold-build in ~20 minutes and ~3 with a warm sccache —
-hence `--wait 2700` for code PRs. Poll patiently; do not read this as a hang.
+Timing: the jobs that build the bundled DuckDB (`clippy`, `unit`, loader
+integration, `e2e`, `conformance`, `images`) are parallel but can still take
+~20 minutes cold and ~3 with a warm sccache — hence `--wait 2700` for code PRs.
+Poll patiently; do not read this as a hang.
 
 ## 3. What a gate list contains
 
@@ -138,11 +142,10 @@ Diagnose once, then stop: `gh run list --branch <branch> --limit 5`,
 `gh workflow list`, and check that the head commit actually pushed
 (`git rev-parse HEAD` vs `gh pr view <N> --json headRefOid`).
 
-Registration is part of the verdict. Because `ci.yml` runs on both `push` and
-`pull_request`, `classify_checks.py` reads every job name from that workflow and
-requires two copies on the PR head. One successful roadmap job—or even one
-complete copy of the whole workflow—remains `PENDING`; it cannot false-green a
-head while the second run is still registering.
+Registration is part of the verdict. `classify_checks.py` reads every job name
+from `ci.yml` and requires one copy of each on the PR head. One successful
+roadmap job—or any incomplete subset of the workflow—remains `PENDING`; it
+cannot false-green a head while the remaining jobs are still registering.
 
 ## 6. Known flakes
 
@@ -152,9 +155,7 @@ head while the second run is still registering.
 
 `ci_status.sh` prints `FLAKE_CANDIDATE=yes` when *every* failing check is a known
 flake. Cap the reruns at 2 per PR (ledger `reruns=`); after that treat it as a
-real failure. Because CI runs on both `push` and `pull_request`, one bad commit
-can show the same flake twice — rerun the failed jobs of both runs before
-concluding anything.
+real failure. Rerun only the failed jobs in the PR's single workflow run.
 
 Also flake-adjacent: the compose-based integration tests share one control PG and
 bootstrap picks the epoch via `read_current_epoch = MAX`. A locally polluted or
@@ -168,11 +169,11 @@ and run them in CI order before believing a local-only failure.
 
 - Code PR: `--wait 2700 --grace 300`. Mark-done / docs-only PR: `--wait 900
   --grace 300`.
-- Registration grace: `statusCheckRollup` is empty for a couple of minutes after
-  a push while GitHub registers both runs; `--grace` treats that as PENDING
-  instead of NO_CHECKS.
-- On `FAIL` the script prints `FAILING=` names and one `RUN_ID=` line per failing
-  run for that head SHA. Hand both to the fixer; the fixer fetches logs itself
+- Registration grace: `statusCheckRollup` can be empty briefly after a push
+  while GitHub registers the PR run; `--grace` treats that as PENDING instead of
+  NO_CHECKS.
+- On `FAIL` the script prints `FAILING=` names and the `RUN_ID=` for the failing
+  run on that head SHA. Hand both to the fixer; the fixer fetches logs itself
   with `gh run view <run-id> --log-failed` — logs never transit the orchestrator.
 - Never substitute `gh pr checks`: it exits 1 for "no checks configured" exactly
   as it does for "checks failed".

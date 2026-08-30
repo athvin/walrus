@@ -115,7 +115,7 @@ Then finish only the remaining work under the same rules.
 MODE=ci-fix: CI failed on the open PR.
 {FAILURE_CONTEXT}
 Fetch the logs yourself: `gh run view <RUN_ID> --log-failed`. Note that CI runs
-on both push and pull_request, so the same failure may appear under two run ids.
+once per PR head through pull_request, so use the run id reported for that head.
 Make the smallest change that turns the named checks green without violating the
 task or its Explicitly-deferred list. Never weaken a gate to pass it. Commit as
 `fix(PR {ID}): <failing-check>: <cause>`. Report one extra line:

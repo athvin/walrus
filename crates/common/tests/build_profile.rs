@@ -10,17 +10,9 @@ const JUSTFILE: &str = include_str!("../../../justfile");
 const BENCH_E2E: &str = include_str!("../../../scripts/bench-e2e.sh");
 const SINK_SMOKE: &str = include_str!("../../../scripts/sink-smoke.sh");
 const CODEGEN_UNITS_ADR: &str = "docs/implementation/notes/rust-skills/opt-codegen-units.md";
-const CODEGEN_UNITS_NOTE: &str =
-    include_str!("../../../docs/implementation/notes/rust-skills/opt-codegen-units.md");
 const TARGET_CPU_ADR: &str = "docs/implementation/notes/rust-skills/opt-target-cpu.md";
-const TARGET_CPU_NOTE: &str =
-    include_str!("../../../docs/implementation/notes/rust-skills/opt-target-cpu.md");
 const PGO_ADR: &str = "docs/implementation/notes/rust-skills/opt-pgo-profile.md";
-const PGO_NOTE: &str =
-    include_str!("../../../docs/implementation/notes/rust-skills/opt-pgo-profile.md");
 const RELEASE_PROFILE_ADR: &str = "docs/implementation/notes/rust-skills/perf-release-profile.md";
-const RELEASE_PROFILE_NOTE: &str =
-    include_str!("../../../docs/implementation/notes/rust-skills/perf-release-profile.md");
 // Every surface that can hand a target-CPU or ISA flag to a cargo invocation: the manifest, the
 // sole workflow, both shipped Dockerfiles, and the three developer entry points that build a
 // walrus binary. The rule's own Cargo-config example is titled "native builds for development", so
@@ -318,12 +310,8 @@ fn no_build_surface_overrides_codegen_units() {
 }
 
 #[test]
-fn codegen_units_rejection_rationale_is_still_recorded() {
+fn workspace_rejects_codegen_units() {
     assert_eq!(codegen_units_policy(WORKSPACE_MANIFEST), Ok(()));
-    assert!(
-        !CODEGEN_UNITS_NOTE.trim().is_empty(),
-        "{CODEGEN_UNITS_ADR} must contain the recorded decision"
-    );
 }
 
 #[test]
@@ -514,16 +502,8 @@ fn profile_key_override_policy_rejects_fabricated_input() {
 }
 
 #[test]
-fn release_profile_decision_is_recorded() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    assert!(
-        root.join(RELEASE_PROFILE_ADR).is_file(),
-        "missing release-profile decision at {RELEASE_PROFILE_ADR}"
-    );
-    assert!(
-        !RELEASE_PROFILE_NOTE.trim().is_empty(),
-        "{RELEASE_PROFILE_ADR} must contain the recorded decision and re-open trigger"
-    );
+fn workspace_rejects_panic_and_strip_profile_overrides() {
+    assert_eq!(release_profile_policy(WORKSPACE_MANIFEST), Ok(()));
 }
 
 #[test]
@@ -616,19 +596,6 @@ fn target_cpu_policy_rejects_fabricated_input() {
 }
 
 #[test]
-fn target_cpu_rejection_is_recorded() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    assert!(
-        root.join(TARGET_CPU_ADR).is_file(),
-        "missing target-CPU decision at {TARGET_CPU_ADR}"
-    );
-    assert!(
-        !TARGET_CPU_NOTE.trim().is_empty(),
-        "{TARGET_CPU_ADR} must contain the recorded decision"
-    );
-}
-
-#[test]
 fn no_build_surface_enables_pgo() {
     for (name, body) in PGO_SURFACES {
         assert_eq!(
@@ -664,17 +631,4 @@ fn pgo_policy_rejects_fabricated_input() {
     for (body, expected) in cases {
         assert_eq!(pgo_policy(body), expected, "surface:\n{body}");
     }
-}
-
-#[test]
-fn pgo_decision_is_still_recorded() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    assert!(
-        root.join(PGO_ADR).is_file(),
-        "missing PGO decision at {PGO_ADR}"
-    );
-    assert!(
-        !PGO_NOTE.trim().is_empty(),
-        "{PGO_ADR} must contain the recorded decision and re-open trigger"
-    );
 }

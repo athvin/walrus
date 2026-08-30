@@ -6,9 +6,9 @@
 #   - statusCheckRollup is empty for a few minutes after a push while GitHub
 #     registers the runs — callers pass --grace to treat that window as PENDING
 #     instead of NO_CHECKS.
-#   - walrus CI triggers on `push` AND `pull_request`, so a head SHA has two
-#     runs. PASS requires two copies of every job declared in ci.yml; RUN_ID
-#     below is resolved by head SHA and lists every failing terminal run.
+#   - walrus PR CI triggers once through `pull_request` (`push` is main-only).
+#     PASS requires one copy of every job declared in ci.yml; RUN_ID below is
+#     resolved by head SHA and lists every failing terminal run.
 #
 # Usage: ci_status.sh <pr-number> [--wait <seconds>] [--grace <seconds>]
 #

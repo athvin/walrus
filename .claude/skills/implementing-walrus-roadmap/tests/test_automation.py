@@ -410,21 +410,21 @@ class CheckClassifierTests(unittest.TestCase):
         spec.loader.exec_module(module)
         return module.expected_check_names()
 
-    def test_one_registered_workflow_copy_is_pending(self) -> None:
+    def test_incompletely_registered_workflow_is_pending(self) -> None:
         names = self.expected_names()
-        self.assertEqual(11, len(names))
+        self.assertEqual(14, len(names))
         self.assertIn("implementation roadmap contract", names)
-        result = self.run_classifier([self.completed(name) for name in names])
+        result = self.run_classifier([self.completed(name) for name in names[:-1]])
         self.assertEqual(2, result.returncode)
         self.assertIn("UNDER_REGISTERED=", result.stdout)
         self.assertIn("VERDICT=PENDING", result.stdout)
 
-    def test_two_complete_workflow_copies_pass(self) -> None:
+    def test_one_complete_workflow_copy_passes(self) -> None:
         names = self.expected_names()
-        checks = [self.completed(name) for name in names for _ in range(2)]
+        checks = [self.completed(name) for name in names]
         result = self.run_classifier(checks)
         self.assertEqual(0, result.returncode)
-        self.assertIn("EXPECTED_COPIES_PER_CHECK=2", result.stdout)
+        self.assertIn("EXPECTED_COPIES_PER_CHECK=1", result.stdout)
         self.assertIn("VERDICT=PASS", result.stdout)
 
     def test_cheap_roadmap_check_alone_cannot_false_green(self) -> None:

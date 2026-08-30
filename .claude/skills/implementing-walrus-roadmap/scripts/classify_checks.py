@@ -5,11 +5,11 @@ Called by ci_status.sh with the output of
 `gh pr view --json statusCheckRollup,headRefOid,headRefName,state,mergeable`.
 
 walrus specifics this encodes:
-  * CI fires on BOTH `push` and `pull_request`, so every workflow job must
-    appear twice on a PR head. The job set is read from ci.yml; a missing first
-    or second copy is PENDING, never PASS, which closes the half-registration
-    race where the cheapest job finishes first.
-  * The `changes` job gates the eight compile-heavy jobs, and an `if:`-skipped
+  * PR CI fires once through `pull_request` (push CI is main-only), so every
+    workflow job must appear once on a PR head. The job set is read from ci.yml;
+    a missing job is PENDING, never PASS, which closes the registration race
+    where the cheapest job finishes first.
+  * The `changes` job gates the nine code-heavy jobs, and an `if:`-skipped
     job concludes SKIPPED — which is a PASS. That is what makes a docs-only PR
     (the mark-done PR) go green in ~2 minutes.
 
@@ -37,16 +37,16 @@ PENDING_STATES = {"QUEUED", "IN_PROGRESS", "WAITING", "PENDING",
 # failed job is the correct first response, not a code fix. See
 # reference/green-gates.md → "Known flakes".
 FLAKY_PREFIXES = ("e2e",)
-EXPECTED_COPIES_PER_HEAD = 2
+EXPECTED_COPIES_PER_HEAD = 1
 
 
 def expected_check_names() -> tuple[str, ...]:
     """Read the job display names from the checked-out CI workflow.
 
-    Walrus runs that workflow for both ``push`` and ``pull_request``.  Requiring
-    two copies of every job prevents the first cheap job to finish from making a
-    still-registering head look green.  Parsing just the top-level job/name
-    shape keeps this check independent of PyYAML on the orchestration host.
+    Walrus runs PR CI once through ``pull_request``. Requiring one copy of every
+    declared job prevents the first cheap job to finish from making a
+    still-registering head look green. Parsing just the top-level job/name shape
+    keeps this check independent of PyYAML on the orchestration host.
     """
     root = Path(__file__).resolve().parents[4]
     workflow = root / ".github/workflows/ci.yml"
