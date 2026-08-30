@@ -66,9 +66,6 @@ async fn pipeline(
     let deadline = Instant::now() + cfg.startup_deadline;
     let ctx = bootstrap::run_shared(cfg, deadline).await?;
 
-    state.mark_ready();
-    tracing::info!("bootstrap complete; ready");
-
     const SCHEMA_VERSION: common::SchemaVersionNo = common::SchemaVersionNo(1);
     let triggers = crate::batch::BatchTriggers {
         max_fill: cfg.max_fill,
@@ -86,6 +83,11 @@ async fn pipeline(
         start_lsn,
         sink,
     } = establish_stream(cfg, &ctx, &mut cache, triggers, SCHEMA_VERSION).await?;
+    // The shared dependency checks are only the first half of bootstrap. Do not advertise ready
+    // until slot classification plus fresh-slot epoch/backfill (or resume hydration) has completed:
+    // the loader is allowed to start as soon as this endpoint flips, and it needs the epoch to exist.
+    state.mark_ready();
+    tracing::info!("bootstrap complete; ready");
     tracing::info!(slot = %cfg.slot_name, start_lsn = %start_lsn, epoch = %epoch, "streaming logical replication");
 
     // ONE wall clock for the whole decode path: the router's and the demux's batchers share it by
