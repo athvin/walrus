@@ -1,8 +1,12 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! The health server, end to end: `/startup` gates `/ready` until bootstrap completes, and a
 //! cancelled token drives `with_graceful_shutdown` to return — the same path SIGTERM trips.
 
-use pg_sink::health::{serve_on, HealthState};
+use pg_sink::health::{HealthState, serve_on};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,7 +42,7 @@ async fn spawn_server() -> (
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let token = CancellationToken::new();
-    let handle = tokio::spawn(serve_on(listener, state.clone(), token.clone()));
+    let handle = tokio::spawn(serve_on(listener, Arc::clone(&state), token.clone()));
     (addr, state, token, handle)
 }
 

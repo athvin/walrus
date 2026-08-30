@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! DuckDB read-back conformance harness (Tier-1).
 //!
 //! The keystone of Phase 2b: write a `RecordBatch` to Parquet, then read it back through in-process
@@ -11,8 +15,7 @@
 
 use common::{Kind, Op, PgColumn, PgRelation, ReplicaIdentity, SinkMeta, TupleValue, UtcTimestamp};
 use duckdb::Connection;
-use pg_to_arrow::batch::BatchBuilder;
-use pg_to_arrow::{oids, write_parquet_bytes};
+use pg_to_arrow::{BatchBuilder, oids, write_parquet_bytes};
 use std::io::Write;
 
 fn meta() -> SinkMeta {
@@ -20,17 +23,17 @@ fn meta() -> SinkMeta {
         op: Op::Insert,
         lsn: "0/10".parse().unwrap(),
         commit_lsn: "0/20".parse().unwrap(),
-        commit_ts: UtcTimestamp::parse_rfc3339("2026-07-04T12:00:00Z").unwrap(),
+        commit_ts: "2026-07-04T12:00:00Z".parse::<UtcTimestamp>().unwrap(),
         xid: 1,
-        epoch: 7,
+        epoch: common::EpochNo(7),
         batch_id: "b1".to_string(),
-        schema_version: 1,
+        schema_version: common::SchemaVersionNo(1),
         source_schema: "public".to_string(),
         source_table: "t".to_string(),
         kind: Kind::Stream,
-        unchanged_toast: vec![],
+        unchanged_toast: Box::default(),
         sink_instance: "walrus-pg-sink-0".to_string(),
-        sink_processed_at: UtcTimestamp::parse_rfc3339("2026-07-04T12:00:00Z").unwrap(),
+        sink_processed_at: "2026-07-04T12:00:00Z".parse::<UtcTimestamp>().unwrap(),
     }
 }
 
@@ -51,7 +54,7 @@ fn one_col_batch(oid: u32, typmod: i32, value: &str) -> arrow::array::RecordBatc
     let mut b = BatchBuilder::new(&rel).unwrap();
     b.append_row(&[TupleValue::Text(value.to_string())], &meta())
         .unwrap();
-    b.finish().unwrap()
+    b.into_record_batch().unwrap()
 }
 
 /// Write `bytes` to a temp `.parquet`, then run `sql` (with `{p}` = `read_parquet('<path>')`) in
@@ -215,7 +218,7 @@ fn interval_null_sets_all_three_columns_null() {
     let rel = one_col_rel(oids::INTERVAL, -1);
     let mut b = BatchBuilder::new(&rel).unwrap();
     b.append_row(&[TupleValue::Null], &meta()).unwrap();
-    let bytes = write_parquet_bytes(&b.finish().unwrap()).unwrap();
+    let bytes = write_parquet_bytes(&b.into_record_batch().unwrap()).unwrap();
     let rows = read_parquet_rows(
         &bytes,
         "SELECT 'x', (c_months IS NULL AND c_days IS NULL AND c_micros IS NULL)::VARCHAR FROM {p}",
@@ -265,7 +268,7 @@ fn timetz_offset_sign_roundtrips() {
 fn one_col_value_batch(oid: u32, typmod: i32, value: TupleValue) -> arrow::array::RecordBatch {
     let mut b = BatchBuilder::new(&one_col_rel(oid, typmod)).unwrap();
     b.append_row(&[value], &meta()).unwrap();
-    b.finish().unwrap()
+    b.into_record_batch().unwrap()
 }
 
 #[test]

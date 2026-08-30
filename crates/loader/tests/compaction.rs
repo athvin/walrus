@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Full-rebuild / compaction (loader §5.7, §9.4). Three hermetic tests prove the rebuild matches the
 //! incremental mirror, preserves a pruned value via the mirror baseline, and drops `op='d'` winners; the
 //! `#[ignore]` test proves the `CREATE OR REPLACE` rebuild reclaims space a `DELETE` would not.
@@ -9,7 +14,7 @@
 use common::{Lsn, PgColumn, PgRelation, ReplicaIdentity};
 use loader::compaction::{full_rebuild, prune_raw, retention_floor};
 use loader::duck::TableDb;
-use loader::transform::{apply_transform, TransformSql};
+use loader::transform::{TransformSql, apply_transform};
 use tokio_util::sync::CancellationToken;
 
 fn orders_rel() -> PgRelation {
@@ -33,8 +38,8 @@ fn lsn(n: u64) -> String {
 }
 
 fn mem(rel: &PgRelation) -> TableDb {
-    let db = TableDb::open(std::path::Path::new(":memory:")).unwrap();
-    db.ensure_tables(rel, 1).unwrap();
+    let db = TableDb::open(":memory:").unwrap();
+    db.ensure_tables(rel, common::SchemaVersionNo(1)).unwrap();
     db
 }
 
@@ -83,11 +88,11 @@ fn full_rebuild_matches_incremental_mirror() {
 
     let inc = mem(&rel);
     seed_history(inc.conn());
-    apply_transform(inc.conn(), &t, &Lsn::ZERO).unwrap();
+    apply_transform(inc.conn(), &t, Lsn::ZERO).unwrap();
 
     let reb = mem(&rel);
     seed_history(reb.conn());
-    full_rebuild(reb.conn(), &t, &CancellationToken::new()).unwrap();
+    full_rebuild(&reb, &t, &CancellationToken::new()).unwrap();
 
     assert_eq!(
         dump(inc.conn()),
@@ -110,16 +115,16 @@ fn pruned_value_survives_via_mirror_baseline() {
 
     // Apply a change incrementally so the mirror holds it (with its `_applied_*` tuple).
     seed_raw(db.conn(), 1, "kept", 'i', 100, 1);
-    apply_transform(db.conn(), &t, &Lsn::ZERO).unwrap();
+    apply_transform(db.conn(), &t, Lsn::ZERO).unwrap();
     assert_eq!(status_of(db.conn(), 1).as_deref(), Some("kept"));
 
     // Prune ALL of raw (floor above the row) — its only raw evidence is gone.
-    let pruned = prune_raw(db.conn(), &t, &"0/C8".parse().unwrap()).unwrap();
+    let pruned = prune_raw(db.conn(), &t, "0/C8".parse().unwrap()).unwrap();
     assert_eq!(pruned, 1);
     assert_eq!(raw_count(db.conn()), 0, "raw evidence pruned");
 
     // The rebuild unions the current mirror as a baseline → the value is not lost.
-    full_rebuild(db.conn(), &t, &CancellationToken::new()).unwrap();
+    full_rebuild(&db, &t, &CancellationToken::new()).unwrap();
     assert_eq!(
         status_of(db.conn(), 1).as_deref(),
         Some("kept"),
@@ -135,11 +140,30 @@ fn deleted_keys_stay_absent_after_rebuild() {
     let db = mem(&rel);
     seed_raw(db.conn(), 1, "a", 'i', 100, 1);
     seed_raw(db.conn(), 1, "a", 'd', 100, 2);
-    full_rebuild(db.conn(), &t, &CancellationToken::new()).unwrap();
+    full_rebuild(&db, &t, &CancellationToken::new()).unwrap();
     assert_eq!(
         dump(db.conn()).len(),
         0,
         "the delete winner is dropped by the rebuild's WHERE op<>'d'"
+    );
+}
+
+// ---- A drain observed before the heavy rewrite starts is an intentional no-op.
+#[test]
+fn pre_cancelled_full_rebuild_does_not_start() {
+    let rel = orders_rel();
+    let t = TransformSql::from_relation(&rel);
+    let db = mem(&rel);
+    seed_raw(db.conn(), 1, "not-applied", 'i', 100, 1);
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    full_rebuild(&db, &t, &cancel).unwrap();
+
+    assert_eq!(
+        dump(db.conn()),
+        Vec::<(i64, String)>::new(),
+        "a pre-cancelled rebuild returns Ok without changing the mirror"
     );
 }
 
@@ -155,11 +179,11 @@ fn retention_floor_is_behind_transformed_lsn() {
 
 // ---- Reclamation: the CREATE OR REPLACE rebuild frees blocks a DELETE would only tombstone. ----
 
-fn tmpdir(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("walrus-loader-compact-{name}"));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+/// A scratch directory for one test's `.duckdb` file. The returned guard deletes it on drop — even
+/// when an assertion panics, which a trailing `remove_dir_all` would skip.
+fn tmpdir(name: &str) -> tempfile::TempDir {
+    let prefix = format!("walrus-loader-compact-{name}-");
+    tempfile::Builder::new().prefix(&prefix).tempdir().unwrap()
 }
 
 /// DuckDB block accounting — `used_blocks` reflects real storage (the OS file may not truncate, but the
@@ -178,15 +202,15 @@ fn rebuild_reclaims_space_and_prune_keeps_mirror_correct() {
     let rel = orders_rel();
     let t = TransformSql::from_relation(&rel);
     let dir = tmpdir("reclaim");
-    let db = TableDb::open(&dir.join("orders.duckdb")).unwrap();
-    db.ensure_tables(&rel, 1).unwrap();
+    let db = TableDb::open(dir.path().join("orders.duckdb")).unwrap();
+    db.ensure_tables(&rel, common::SchemaVersionNo(1)).unwrap();
 
     // Seed one key incrementally, then BLOAT the mirror with UPDATE churn (each tombstones the prior row
     // version in DuckDB's MVCC). A wide value makes the bloat span many blocks. The value is held constant
     // so it also matches the raw row at the same tuple — the rebuild result is unambiguous.
     let wide = "z".repeat(2000);
     seed_raw(db.conn(), 1, &wide, 'i', 100, 1);
-    apply_transform(db.conn(), &t, &Lsn::ZERO).unwrap();
+    apply_transform(db.conn(), &t, Lsn::ZERO).unwrap();
     for _ in 0..4000 {
         db.conn()
             .execute("UPDATE orders SET status = ? WHERE id = 1", [&wide])
@@ -204,7 +228,7 @@ fn rebuild_reclaims_space_and_prune_keeps_mirror_correct() {
     );
 
     // The CREATE OR REPLACE rebuild rewrites the table to one clean row → blocks freed.
-    full_rebuild(db.conn(), &t, &CancellationToken::new()).unwrap();
+    full_rebuild(&db, &t, &CancellationToken::new()).unwrap();
     let rebuilt = used_blocks(db.conn());
     assert!(
         rebuilt < bloated,
@@ -218,14 +242,12 @@ fn rebuild_reclaims_space_and_prune_keeps_mirror_correct() {
 
     // Prune the raw evidence, rebuild again — the mirror stays correct via the baseline.
     let floor = retention_floor("0/C8".parse().unwrap(), 0);
-    prune_raw(db.conn(), &t, &floor).unwrap();
+    prune_raw(db.conn(), &t, floor).unwrap();
     assert_eq!(raw_count(db.conn()), 0, "raw pruned below the floor");
-    full_rebuild(db.conn(), &t, &CancellationToken::new()).unwrap();
+    full_rebuild(&db, &t, &CancellationToken::new()).unwrap();
     assert_eq!(
         status_of(db.conn(), 1).as_deref(),
         Some(wide.as_str()),
         "prune keeps the mirror correct — the baseline preserved the value"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

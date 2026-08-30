@@ -1,11 +1,15 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! `/metrics` exposes every loader series the design enumerates (PR 4.10). The loader's series are
 //! per-table, so `init_table_series` is how they first appear (the loader calls it per owned table at
 //! bootstrap); here we register a demo table and assert the exposition lists every
 //! `common::metrics::names::LOADER_*` constant, labelled by table.
 
 use common::metrics::names;
-use loader::health::{serve_on, LoaderState};
+use loader::health::{LoaderState, serve_on};
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};

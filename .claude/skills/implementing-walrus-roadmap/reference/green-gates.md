@@ -32,8 +32,8 @@ unknown gate is `ANOMALY` (exit 2), never a passing skip.
 | `deny` | `cargo deny check` | `cargo-deny` |
 | `msrv` | `Cargo.toml` `rust-version` == `rust-toolchain.toml` `channel` | — |
 | `compose` | `docker compose … up --wait` + the connectivity smoke | docker daemon |
-| `integration` | control migrations, `cargo test -p control --features integration`, then `cargo test --workspace -- --ignored --test-threads=1` | docker daemon |
-| `e2e` | `cargo test -p e2e --features it --test reload_quarantine\|reload_scale -- --ignored --test-threads=1` | docker daemon |
+| `integration` | control migrations, serialized control integration tests, then each discovered ignored test target one at a time | docker daemon |
+| `e2e` | `cargo test -p e2e --features it --test reload_quarantine --test reload_scale -- --ignored --test-threads=1` | docker daemon |
 | `manifests` | `bash scripts/k8s-validate.sh` | kustomize + kubeconform |
 | `images` | `bash scripts/image-smoke.sh` | docker daemon |
 

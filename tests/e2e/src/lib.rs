@@ -1,4 +1,14 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // e2e harness lib (not test-cfg)
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    clippy::missing_errors_doc,
+    clippy::must_use_candidate,
+    clippy::disallowed_methods,
+    reason = "compose-gated e2e harness, not a published API; unwrap/expect are test setup and \
+              anyhow failure is the test failure; synchronous child-log creation and log scrapes \
+              observe out-of-process services, not walrus runtime I/O"
+)]
 //! The walrus end-to-end harness (`architecture.md` "Local harness"). It brings up **both binaries** —
 //! `walrus-pg-sink` and `walrus-loader` — as child processes against the already-running compose stack
 //! (source PG :5432, control PG :5433, MinIO :9000), drives the *source* database, and lets a test assert
@@ -23,6 +33,7 @@ const MINIO: &str = "walrus-minio-1";
 /// A running walrus stack: the compose services (assumed up) plus a live `pg-sink` and `loader` spawned
 /// as child processes. `Drop` kills both — a leaked sink holds the replication slot and blocks the next
 /// run's bootstrap.
+#[derive(Debug)]
 pub struct Harness {
     sink: Child,
     loader: Child,
@@ -114,7 +125,7 @@ impl Harness {
         .await
         .context("reset source tables + slot")?;
 
-        let bins = target_dir();
+        let bins = target_dir()?;
         build_bins(&bins).await?;
         let duckdb_dir = std::env::temp_dir().join(format!("walrus-e2e-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&duckdb_dir);
@@ -143,12 +154,12 @@ impl Harness {
     }
 
     /// The source Postgres pool — for tests that need multiple concurrent sessions (overlapping txns).
-    pub fn source_pool(&self) -> &sqlx::PgPool {
+    pub const fn source_pool(&self) -> &sqlx::PgPool {
         &self.source
     }
 
     /// The control Postgres pool — for tests that read checkpoints / the manifest directly (PR 4.4).
-    pub fn control_pool(&self) -> &sqlx::PgPool {
+    pub const fn control_pool(&self) -> &sqlx::PgPool {
         &self.control
     }
 
@@ -209,7 +220,7 @@ impl Harness {
 
     /// List S3 object keys under `<epoch>/<schema>/<table>/`.
     pub async fn s3_list(&self, table: &str) -> Result<Vec<String>> {
-        use object_store::{aws::AmazonS3Builder, ObjectStore};
+        use object_store::{ObjectStore, aws::AmazonS3Builder};
         let store = AmazonS3Builder::new()
             .with_bucket_name(BUCKET)
             .with_region("us-east-1")
@@ -235,8 +246,7 @@ impl Harness {
         let s: String = sqlx::query_scalar("SELECT pg_current_wal_lsn()::text")
             .fetch_one(&self.source)
             .await?;
-        s.parse()
-            .map_err(|e| anyhow::anyhow!("parse wal lsn {s:?}: {e:?}"))
+        s.parse().context("parse pg_current_wal_lsn")
     }
 
     /// Poll `loader_checkpoint.transformed_lsn` for `table` until it passes `target` (every streamed
@@ -258,14 +268,14 @@ impl Harness {
             .bind(table)
             .fetch_one(&self.control)
             .await?;
-            let cp = control::read_checkpoint(&self.control, self.epoch, "public", table).await?;
-            if let Some(cp) = cp {
-                if pending == 0
-                    && cp.transformed_lsn > target
-                    && cp.transformed_lsn == cp.raw_appended_lsn
-                {
-                    return Ok(());
-                }
+            let cp =
+                control::read_checkpoint(&self.control, self.epoch.into(), "public", table).await?;
+            if let Some(cp) = cp
+                && pending == 0
+                && cp.transformed_lsn > target
+                && cp.transformed_lsn == cp.raw_appended_lsn
+            {
+                return Ok(());
             }
             if start.elapsed() > deadline {
                 anyhow::bail!(
@@ -327,7 +337,7 @@ impl Harness {
     /// makes a table worker return `Err`, which cancels the token and drains the whole loader — so
     /// this flips to `false`. PR 6.12 waits on it to observe the quarantine before requesting the
     /// recovery reload.
-    pub fn loader_running(&mut self) -> bool {
+    pub fn is_loader_running(&mut self) -> bool {
         matches!(self.loader.try_wait(), Ok(None))
     }
 
@@ -376,11 +386,10 @@ impl Harness {
         let start = Instant::now();
         loop {
             if let Some(cp) =
-                control::read_checkpoint(&self.control, self.epoch, "public", table).await?
+                control::read_checkpoint(&self.control, self.epoch.into(), "public", table).await?
+                && cp.raw_appended_lsn > target
             {
-                if cp.raw_appended_lsn > target {
-                    return Ok(());
-                }
+                return Ok(());
             }
             if start.elapsed() > deadline {
                 anyhow::bail!(
@@ -392,7 +401,8 @@ impl Harness {
     }
 
     /// Assert the loader's DuckDB mirror `<table>_current` equals the current source `public.<table>`
-    /// **row-by-row** (id + status), the effectively-once convergence check. Call after [`stop_loader`]
+    /// **row-by-row** (id + status), the effectively-once convergence check. Call after
+    /// [`Self::stop_loader`]
     /// (DuckDB is single-writer, so the mirror is read only once the loader has exited).
     pub async fn assert_mirror_equals_source(&self, table: &str) -> Result<()> {
         let src: Vec<(i32, Option<String>)> = sqlx::query_as(&format!(
@@ -484,7 +494,7 @@ impl Harness {
         .await?;
         s.context("replication slot not found")?
             .parse()
-            .map_err(|e| anyhow::anyhow!("parse confirmed_flush_lsn: {e:?}"))
+            .context("parse confirmed_flush_lsn")
     }
 
     /// The slot's `restart_lsn` — the oldest WAL the slot still needs. Follows `confirmed_flush` once a
@@ -498,12 +508,12 @@ impl Harness {
         .await?;
         s.context("replication slot not found")?
             .parse()
-            .map_err(|e| anyhow::anyhow!("parse restart_lsn: {e:?}"))
+            .context("parse restart_lsn")
     }
 
     /// Whether a walsender is attached to the slot (`active = true`) — proof the connection is live. A
     /// severed walsender (e.g. `wal_sender_timeout` with no keepalive) flips this to `false`.
-    pub async fn slot_active(&self) -> Result<bool> {
+    pub async fn is_slot_active(&self) -> Result<bool> {
         let active: Option<bool> =
             sqlx::query_scalar("SELECT active FROM pg_replication_slots WHERE slot_name = $1")
                 .bind(SLOT)
@@ -602,7 +612,7 @@ impl Harness {
 
     /// Whether the sink child is still running (has not exited) — proof the walsender did not sever it
     /// (a severed replication connection makes the sink's `next()` error and the process exit).
-    pub fn sink_running(&mut self) -> bool {
+    pub fn is_sink_running(&mut self) -> bool {
         matches!(self.sink.try_wait(), Ok(None))
     }
 
@@ -612,7 +622,7 @@ impl Harness {
     pub async fn current_epoch(&self) -> Result<i64> {
         Ok(control::read_current_epoch(&self.control)
             .await?
-            .map(|s| s.epoch)
+            .map(|s| i64::from(s.epoch))
             .unwrap_or(1))
     }
 
@@ -690,12 +700,15 @@ impl Drop for Harness {
 }
 
 /// The `target/<profile>/` directory holding the sibling binaries (next to this test binary).
-fn target_dir() -> PathBuf {
+fn target_dir() -> Result<PathBuf> {
     // .../target/<profile>/deps/<thisbin> → up two = target/<profile>/
-    let mut p = std::env::current_exe().expect("current_exe");
+    // Deliberately not an `expect`: an unresolvable `current_exe` is an environment failure (the test
+    // binary was moved or unlinked mid-run), not a violated invariant of ours, so it joins the
+    // harness's anyhow chain like every other setup step instead of panicking without a cause.
+    let mut p = std::env::current_exe().context("resolve current_exe for target/<profile>")?;
     p.pop(); // deps
     p.pop(); // <profile>
-    p
+    Ok(p)
 }
 
 async fn build_bins(_target: &std::path::Path) -> Result<()> {
@@ -798,10 +811,10 @@ async fn wait_ready(base: &str, deadline: Duration) -> Result<()> {
 async fn http_get_ok(url: &str) -> bool {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let rest = url.trim_start_matches("http://");
-    let (authority, path) = rest
-        .split_once('/')
-        .map(|(a, p)| (a, format!("/{p}")))
-        .unwrap_or((rest, "/".into()));
+    let (authority, path) = match rest.split_once('/') {
+        Some((a, p)) => (a, format!("/{p}")),
+        None => (rest, "/".to_string()),
+    };
     let Ok(mut stream) = tokio::net::TcpStream::connect(authority).await else {
         return false;
     };
@@ -822,10 +835,10 @@ async fn http_get_ok(url: &str) -> bool {
 async fn http_get(url: &str) -> Result<(bool, String)> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let rest = url.trim_start_matches("http://");
-    let (authority, path) = rest
-        .split_once('/')
-        .map(|(a, p)| (a, format!("/{p}")))
-        .unwrap_or((rest, "/".into()));
+    let (authority, path) = match rest.split_once('/') {
+        Some((a, p)) => (a, format!("/{p}")),
+        None => (rest, "/".to_string()),
+    };
     let mut stream = tokio::net::TcpStream::connect(authority)
         .await
         .context("connect for GET")?;

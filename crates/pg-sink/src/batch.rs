@@ -4,28 +4,83 @@
 //! flushes when **any** threshold trips — `max_fill` (cadence), `max_rows`, or `max_bytes` — but
 //! **never in the middle of a committed transaction's tail**: rows buffer against the open txn and
 //! become flush-eligible only at `Commit`, so a batch may span many small txns but never a fraction of
-//! one (§1.6). This PR seals an in-memory `RecordBatch`; the Parquet/S3 write is PR 2.24.
+//! one (§1.6). This PR seals an in-memory [`RecordBatch`]; the Parquet/S3 write is PR 2.24.
 //!
 //! `lsn_end` is the **commit LSN** of the batch's last transaction — the load-bearing key for the
 //! manifest (PR 2.25) and checkpoint (PR 2.26), and deliberately *not* the max per-row LSN.
+//!
+//! ## Dynamic dispatch in `pg-sink` — the deliberate list
+//!
+//! | Site | Dispatch | Why |
+//! |---|---|---|
+//! | [`Clock`] (this module) | **static** (`C: Clock`) | one production impl on a per-commit path |
+//! | `Arc<dyn ObjectStore>` (`sink.rs`) | dynamic | `BufWriter::new` takes `Arc<dyn ObjectStore>` |
+//! | `Box<dyn ArrayBuilder>` (`pg-to-arrow`) | dynamic | one heterogeneous builder per column |
+//!
+//! Only one concrete store (`AmazonS3`) is ever built, so the middle row is *not* "flexibility": it
+//! is the shape `object_store::buffered::BufWriter::new` demands by value, which `put_with_kind`
+//! calls per file. Where nothing upstream demands it — the loader, which spends its store on one
+//! `head` — the client stays concrete (`loader::app::build_store`).
 
 use crate::relcache::CachedRelation;
 use arrow::record_batch::RecordBatch;
-use common::{Lsn, SinkMeta, TupleValue, UtcTimestamp};
+use common::{Lsn, SchemaVersionNo, SinkMeta, TupleValue, UtcTimestamp};
 use pg_to_arrow::BatchBuilder;
+use std::fmt;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Injectable clock so `max_fill` is testable without sleeping. Production uses [`SystemClock`]; the
-/// single production impl is deliberate — the trait exists **for that test seam**, not as dead
-/// generality (audited PR 8.5, kept by design).
-pub trait Clock: Send + Sync {
-    fn now(&self) -> Instant;
+mod private {
+    pub trait Sealed {}
 }
+
+/// Injectable clock so `max_fill` is testable without sleeping. Production has exactly one impl
+/// ([`SystemClock`]); the trait exists **for that test seam**, not as dead generality (audited
+/// PR 8.5, kept by design). Since PR 19.5 the seam is **statically dispatched**: every owner is
+/// generic over `C: Clock`, so the one production instantiation inlines and no vtable rides the
+/// per-commit path. `Arc<SystemClock>` / `Arc<FakeClock>` satisfy the bound via the delegating impls
+/// below (PR 19.4).
+///
+/// This trait is sealed: it can be called and stored from anywhere, but only `pg-sink` can implement
+/// it.
+///
+/// ```compile_fail
+/// use std::time::Instant;
+///
+/// #[derive(Debug)]
+/// struct WallClock;
+///
+/// impl pg_sink::batch::Clock for WallClock {
+///     fn now(&self) -> Instant {
+///         Instant::now()
+///     }
+/// }
+/// ```
+pub trait Clock: private::Sealed + Send + Sync + fmt::Debug {
+    fn now(&self) -> Instant;
+
+    /// Return the instant `after` from now, or `None` if it would overflow [`Instant`].
+    ///
+    /// This generic convenience method is available to concrete clocks. The `Self: Sized` gate
+    /// excludes it from the vtable so [`Clock`] remains dyn-compatible.
+    fn deadline<D: Into<Duration>>(&self, after: D) -> Option<Instant>
+    where
+        Self: Sized,
+    {
+        self.now().checked_add(after.into())
+    }
+}
+
+/// Dyn-compatibility guard. Adding an ungated generic method, a bare-`Self` return, or an
+/// associated const to [`Clock`] breaks compilation here, which is exactly the intent.
+const _: fn(&dyn Clock) -> std::time::Instant = |c| c.now();
 
 /// The wall clock.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemClock;
+
+impl private::Sealed for SystemClock {}
 
 impl Clock for SystemClock {
     fn now(&self) -> Instant {
@@ -33,53 +88,161 @@ impl Clock for SystemClock {
     }
 }
 
+/// Delegating wrapper impls preserve the private seal while allowing a shared or borrowed clock to
+/// satisfy a `C: Clock` bound — the std pattern (`impl<R: Read + ?Sized> Read for &mut R`). Walrus
+/// clocks are held behind an `Arc` because batchers share one, so without these impls the generic
+/// form is unusable.
+///
+/// `?Sized` is load-bearing: it keeps a trait-object clock behind `Arc` covered. Both `Clock` impls
+/// target wrapper types; a bare `impl<T: Clock> Clock for T` would collide with
+/// `impl Clock for SystemClock` (E0119).
+impl<T: Clock + ?Sized> private::Sealed for std::sync::Arc<T> {}
+
+impl<T: Clock + ?Sized> Clock for std::sync::Arc<T> {
+    fn now(&self) -> Instant {
+        (**self).now()
+    }
+}
+
+impl<T: Clock + ?Sized> private::Sealed for &T {}
+
+impl<T: Clock + ?Sized> Clock for &T {
+    fn now(&self) -> Instant {
+        (**self).now()
+    }
+}
+
 /// The three per-batch flush triggers. Whichever trips first (at a commit boundary) cuts the file.
 #[derive(Clone, Copy, Debug)]
 pub struct BatchTriggers {
+    /// How long a batch may stay open before it is cut. This is the bound on end-to-end latency
+    /// when traffic is too light to trip either size trigger.
     pub max_fill: Duration,
-    pub max_rows: u64,
-    pub max_bytes: u64,
+    /// Committed-row ceiling. Non-zero because a zero trigger would cut a file per row.
+    pub max_rows: NonZeroU64,
+    /// Buffered-byte ceiling, measured on the Arrow builders rather than the encoded Parquet.
+    pub max_bytes: NonZeroU64,
 }
 
 /// A finished, ready-to-write batch. `lsn_end` = commit LSN of the last txn (NOT the max row LSN).
 #[derive(Debug)]
 pub struct SealedBatch {
+    /// The finished Arrow batch, ready to encode as Parquet.
     pub record_batch: RecordBatch,
+    /// Source schema of the rows.
     pub schema: String,
+    /// Source table of the rows.
     pub table: String,
-    pub schema_version: i64,
+    /// The shape the rows were encoded against; carried onto the manifest row.
+    pub schema_version: SchemaVersionNo,
+    /// Commit LSN of the first transaction in the batch.
     pub lsn_start: Lsn,
+    /// Commit LSN of the **last** transaction in the batch — not the highest per-row LSN. This is
+    /// the value the loader's claim order sorts on, so the distinction is load-bearing.
     pub lsn_end: Lsn,
+    /// Rows in the batch, all of them committed.
     pub row_count: u64,
 }
 
-/// Accumulates one table's committed changes into an Arrow builder until a trigger trips.
-pub struct TableBatcher {
-    rel: Arc<CachedRelation>,
-    triggers: BatchTriggers,
-    clock: Arc<dyn Clock>,
-    /// Committed (flush-eligible) rows.
-    builder: BatchBuilder,
-    /// Rows of the currently-open transaction — not yet flush-eligible.
-    pending: Vec<(SinkMeta, Vec<TupleValue>)>,
-    pending_bytes: u64,
-    committed_rows: u64,
-    committed_bytes: u64,
-    /// Commit LSN of the batch's first / last committed txn.
-    first_commit_lsn: Option<Lsn>,
-    last_commit_lsn: Lsn,
-    /// When the first committed row landed (drives `max_fill`).
-    opened_at: Option<Instant>,
-    /// The file id shared by every row of this batch (assigned when it opens; the manifest, PR 2.25,
-    /// keys on it). Empty until the first row is pushed.
-    batch_id: String,
+/// The batch's flush-eligible half: either nothing has committed into it yet, or a row count that
+/// comes **with** the bounds every trigger and the sealed file read.
+///
+/// These five values are one state, so they are one value. Held apart — a `u64` count beside three
+/// `Option`s — "N committed rows but no commit-LSN bounds" was representable, and [`TableBatcher::seal`]
+/// had to catch that impossible combination at runtime; here the compiler does. `first_commit_lsn`
+/// and `opened_at` belong to the FIRST promoted row, so a promotion that fails part-way through a
+/// transaction can no longer leave bounds behind with no rows to match them.
+#[derive(Debug)]
+enum CommittedRows {
+    /// No transaction has committed into this batch yet — nothing is flush-eligible, nothing to seal.
+    None,
+    Rows {
+        count: NonZeroU64,
+        /// A rough running Arrow-size estimate (see [`estimate_row_bytes`]) — the `max_bytes` trigger.
+        bytes: u64,
+        /// Commit LSN of the batch's first / last committed txn.
+        first_commit_lsn: Lsn,
+        last_commit_lsn: Lsn,
+        /// When the first committed row landed (drives `max_fill`).
+        opened_at: Instant,
+    },
 }
 
-impl TableBatcher {
+impl CommittedRows {
+    /// Count one freshly-promoted row: the first opens the state (fixing the lower bound and starting
+    /// the `max_fill` clock), each later one only extends the upper bound. Named apart from
+    /// [`TableBatcher::push`], which buffers a row that has *not* committed yet.
+    const fn record_row(&mut self, commit_lsn: Lsn, now: Instant) {
+        match self {
+            CommittedRows::None => {
+                *self = CommittedRows::Rows {
+                    count: NonZeroU64::MIN,
+                    bytes: 0,
+                    first_commit_lsn: commit_lsn,
+                    last_commit_lsn: commit_lsn,
+                    opened_at: now,
+                };
+            }
+            CommittedRows::Rows {
+                count,
+                last_commit_lsn,
+                ..
+            } => {
+                *count = count.saturating_add(1);
+                *last_commit_lsn = commit_lsn;
+            }
+        }
+    }
+
+    /// Fold one promoted transaction's byte estimate in. Its only caller
+    /// ([`TableBatcher::on_commit`]) promotes at least one row first, so the empty arm is a
+    /// can't-happen no-op rather than a silent drop — and it needs no `unreachable!`.
+    const fn add_bytes(&mut self, added: u64) {
+        if let CommittedRows::Rows { bytes, .. } = self {
+            *bytes = bytes.saturating_add(added);
+        }
+    }
+
+    /// The committed row count — `0` before the first commit.
+    const fn count(&self) -> u64 {
+        match self {
+            CommittedRows::None => 0,
+            CommittedRows::Rows { count, .. } => count.get(),
+        }
+    }
+}
+
+/// Accumulates one table's committed changes into an Arrow builder until a trigger trips.
+#[derive(Debug)]
+pub struct TableBatcher<C> {
+    rel: Arc<CachedRelation>,
+    triggers: BatchTriggers,
+    clock: C,
+    /// Committed (flush-eligible) rows.
+    builder: BatchBuilder,
+    /// Rows of the currently-open transaction — not yet flush-eligible. The outer `Vec` is reused
+    /// across transactions (see [`Self::on_commit`]), but each buffered tuple is frozen at its
+    /// decoded width, so it carries no capacity word.
+    pending: Vec<(SinkMeta, Box<[TupleValue]>)>,
+    pending_bytes: u64,
+    /// The flush-eligible half — count, bytes, and LSN bounds as one state (see [`CommittedRows`]).
+    committed: CommittedRows,
+    /// The file id shared by every row of this batch (assigned when it opens; the manifest, PR 2.25,
+    /// keys on it). `None` until the first row is pushed.
+    batch_id: Option<String>,
+}
+
+impl<C: Clock> TableBatcher<C> {
+    /// Create an empty batcher for one cached relation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BatchError::Arrow`] if the relation cannot produce a supported Arrow schema or
+    /// typed builder set.
     pub fn new(
         rel: Arc<CachedRelation>,
         triggers: BatchTriggers,
-        clock: Arc<dyn Clock>,
+        clock: C,
     ) -> Result<Self, BatchError> {
         let builder = BatchBuilder::new(&rel.relation)?;
         Ok(TableBatcher {
@@ -89,28 +252,26 @@ impl TableBatcher {
             builder,
             pending: Vec::new(),
             pending_bytes: 0,
-            committed_rows: 0,
-            committed_bytes: 0,
-            first_commit_lsn: None,
-            last_commit_lsn: Lsn::ZERO,
-            opened_at: None,
-            batch_id: String::new(),
+            committed: CommittedRows::None,
+            batch_id: None,
         })
     }
 
     /// Append one change to the OPEN txn buffer (not yet flush-eligible). Its `meta.commit_lsn` and
     /// `meta.batch_id` are patched at [`Self::on_commit`].
     pub fn push(&mut self, meta: SinkMeta, values: &[TupleValue]) {
-        if self.batch_id.is_empty() {
-            // Assign the file id when the batch opens; every row shares it.
-            self.batch_id = format!("{}.{}-{}", meta.source_schema, meta.source_table, meta.lsn);
-        }
-        self.pending_bytes += estimate_row_bytes(values);
-        self.pending.push((meta, values.to_vec()));
+        self.batch_id.get_or_insert_with(|| {
+            format!("{}.{}-{}", meta.source_schema, meta.source_table, meta.lsn)
+        });
+        self.pending_bytes = self
+            .pending_bytes
+            .saturating_add(estimate_row_bytes(values));
+        self.pending.push((meta, values.into()));
     }
 
     /// Whether an open transaction's rows are buffered (not a commit boundary).
-    pub fn has_open_txn(&self) -> bool {
+    #[must_use]
+    pub const fn has_open_txn(&self) -> bool {
         !self.pending.is_empty()
     }
 
@@ -118,6 +279,12 @@ impl TableBatcher {
     /// flush-eligible. `commit_lsn` and `commit_ts` are known only at Commit, so per-row metas were
     /// pushed with placeholders and get the real transaction values stamped here (PR 5.9). A commit
     /// with no rows for this table is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BatchError::Unassigned`] if buffered rows have no assigned batch id, or
+    /// [`BatchError::Arrow`] if a buffered value or its provenance cannot be appended to the
+    /// relation's Arrow builders.
     pub fn on_commit(
         &mut self,
         commit_lsn: Lsn,
@@ -126,74 +293,108 @@ impl TableBatcher {
         if self.pending.is_empty() {
             return Ok(());
         }
-        if self.opened_at.is_none() {
-            self.opened_at = Some(self.clock.now());
-        }
-        self.first_commit_lsn.get_or_insert(commit_lsn);
-        self.last_commit_lsn = commit_lsn;
-        for (mut meta, values) in std::mem::take(&mut self.pending) {
+        // Borrowed, not cloned: every use below only *reads* the id (`clone_from`'s source), and
+        // `batch_id` is a disjoint field from the `pending`/`builder`/`committed`/`pending_bytes`
+        // this body mutates — so the shared borrow lives across the whole loop for free, where an
+        // owned copy cost one `String` allocation per commit boundary per table.
+        let batch_id = self.batch_id.as_ref().ok_or(BatchError::Unassigned)?;
+        // One clock read per commit boundary (never per row); only the batch's first promoted row
+        // keeps it, as the `max_fill` start.
+        let now = self.clock.now();
+        // Draining keeps the allocation so the next transaction refills the same pending buffer.
+        for (mut meta, values) in self.pending.drain(..) {
             meta.commit_lsn = commit_lsn;
             meta.commit_ts = commit_ts;
-            meta.batch_id = self.batch_id.clone();
+            meta.batch_id.clone_from(batch_id);
             self.builder.append_row(&values, &meta)?;
-            self.committed_rows += 1;
+            self.committed.record_row(commit_lsn, now);
         }
-        self.committed_bytes += std::mem::take(&mut self.pending_bytes);
+        self.committed
+            .add_bytes(std::mem::take(&mut self.pending_bytes));
         Ok(())
     }
 
     /// True iff a trigger trips **and** we're at a commit boundary (no open txn, ≥1 committed row).
+    #[must_use]
     pub fn should_flush(&self) -> bool {
-        if self.has_open_txn() || self.committed_rows == 0 {
+        if self.has_open_txn() {
             return false;
         }
-        self.committed_rows >= self.triggers.max_rows
-            || self.committed_bytes >= self.triggers.max_bytes
-            || self.opened_at.is_some_and(|t| {
-                self.clock.now().saturating_duration_since(t) >= self.triggers.max_fill
-            })
+        let CommittedRows::Rows {
+            count,
+            bytes,
+            opened_at,
+            ..
+        } = self.committed
+        else {
+            return false; // nothing committed is never flush-eligible
+        };
+        count.get() >= self.triggers.max_rows.get()
+            || bytes >= self.triggers.max_bytes.get()
+            || self.clock.now().saturating_duration_since(opened_at) >= self.triggers.max_fill
     }
 
-    /// Finish the Arrow builders into a `SealedBatch` and reset. Errors if an open txn would be split.
+    /// Finish the Arrow builders into a [`SealedBatch`] and reset. Errors if an open txn would be
+    /// split.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BatchError::OpenTransaction`] if uncommitted rows remain,
+    /// [`BatchError::Empty`] if no committed rows exist, [`BatchError::Unassigned`] if committed
+    /// rows have no assigned batch id, or [`BatchError::Arrow`] if finishing or rebuilding the
+    /// typed Arrow batch fails.
     pub fn seal(&mut self) -> Result<SealedBatch, BatchError> {
         if self.has_open_txn() {
             return Err(BatchError::OpenTransaction);
         }
-        if self.committed_rows == 0 {
+        let CommittedRows::Rows {
+            count,
+            first_commit_lsn,
+            last_commit_lsn,
+            ..
+        } = self.committed
+        else {
             return Err(BatchError::Empty);
+        };
+        // The LSN bounds arrived WITH the rows above, so only the separately-assigned id can be missing.
+        if self.batch_id.is_none() {
+            return Err(BatchError::Unassigned);
         }
         let builder = std::mem::replace(&mut self.builder, BatchBuilder::new(&self.rel.relation)?);
-        let record_batch = builder.finish()?;
+        let record_batch = builder.into_record_batch()?;
         let sealed = SealedBatch {
             record_batch,
             schema: self.rel.relation.schema.clone(),
             table: self.rel.relation.name.clone(),
             schema_version: self.rel.schema_version,
-            lsn_start: self.first_commit_lsn.unwrap_or(Lsn::ZERO),
-            lsn_end: self.last_commit_lsn,
-            row_count: self.committed_rows,
+            lsn_start: first_commit_lsn,
+            lsn_end: last_commit_lsn,
+            row_count: count.get(),
         };
-        self.committed_rows = 0;
-        self.committed_bytes = 0;
-        self.first_commit_lsn = None;
-        self.last_commit_lsn = Lsn::ZERO;
-        self.opened_at = None;
-        self.batch_id = String::new();
+        self.committed = CommittedRows::None;
+        self.batch_id = None;
         Ok(sealed)
     }
 
-    pub fn committed_rows(&self) -> u64 {
-        self.committed_rows
+    /// Rows that are committed and therefore publishable. Excludes anything buffered for a
+    /// transaction still open, which is why this — not the builder length — drives the row trigger.
+    #[must_use]
+    pub const fn committed_rows(&self) -> u64 {
+        self.committed.count()
     }
 
     /// The commit LSN of the earliest committed-but-unsealed row, or `None` if nothing is buffered.
     /// The durability floor an idle heartbeat must not advance `confirmed_flush` past (PR 2.27): those
     /// rows are not yet in S3, so a slot advance beyond them would lose them on crash. Open-txn
     /// (uncommitted) rows do **not** count — their future commit LSN re-streams regardless.
-    pub fn undurable_floor(&self) -> Option<Lsn> {
-        (self.committed_rows > 0)
-            .then_some(self.first_commit_lsn)
-            .flatten()
+    #[must_use]
+    pub const fn undurable_floor(&self) -> Option<Lsn> {
+        match self.committed {
+            CommittedRows::None => None,
+            CommittedRows::Rows {
+                first_commit_lsn, ..
+            } => Some(first_commit_lsn),
+        }
     }
 
     /// **Drop** the open (uncommitted) transaction's speculative buffer — on a graceful drain (PR 2.28)
@@ -206,9 +407,15 @@ impl TableBatcher {
 
     /// Seal the in-flight **committed** batch on drain: drop any open speculative buffer first, then
     /// seal iff there are committed rows. `None` when nothing committed is in flight.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BatchError::Unassigned`] if the committed rows carry no batch id, or the
+    /// [`BatchError::Arrow`] produced while sealing committed rows. The open transaction is
+    /// deliberately discarded first, so [`BatchError::OpenTransaction`] is not expected here.
     pub fn drain_committed(&mut self) -> Result<Option<SealedBatch>, BatchError> {
         self.drop_open_txn();
-        if self.committed_rows == 0 {
+        if matches!(self.committed, CommittedRows::None) {
             return Ok(None);
         }
         self.seal().map(Some)
@@ -217,25 +424,41 @@ impl TableBatcher {
 
 /// A rough running byte estimate of the buffered Arrow size (not the compressed Parquet size, which
 /// isn't known until write) — enough to drive the `max_bytes` trigger.
+///
+/// Saturating for the reason [`crate::memory::InflightMeter::add`] is: the only question asked of
+/// this number is whether the batch has reached `max_bytes`, and `u64::MAX` preserves that answer.
+/// The per-value clamps already state that intent; a `sum`/`+` would discard it by wrapping to a
+/// *small* estimate in release — the one outcome that silently disables the trigger.
 fn estimate_row_bytes(values: &[TupleValue]) -> u64 {
     const META_OVERHEAD: u64 = 96; // the walrus_pg_sink_meta JSON per row, roughly
-    let value_bytes: u64 = values
+    values
         .iter()
         .map(|v| match v {
-            TupleValue::Text(s) => s.len() as u64,
-            TupleValue::Binary(b) => b.len() as u64,
+            TupleValue::Text(s) => u64::try_from(s.len()).unwrap_or(u64::MAX),
+            TupleValue::Binary(b) => u64::try_from(b.len()).unwrap_or(u64::MAX),
             TupleValue::Null | TupleValue::UnchangedToast => 1,
         })
-        .sum();
-    META_OVERHEAD + value_bytes
+        .fold(META_OVERHEAD, u64::saturating_add)
 }
 
+/// This taxonomy is still growing; new variants must remain additive for downstream crates.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum BatchError {
+    /// Sealing was attempted while a transaction was still open, which would split it across two
+    /// files and break the all-or-nothing guarantee a commit boundary provides.
     #[error("cannot seal mid-transaction (would split a committed txn tail)")]
     OpenTransaction,
+    /// Sealing was attempted with no committed rows, which would produce an empty Parquet file and
+    /// a manifest row claiming zero rows.
     #[error("nothing to seal (empty batch)")]
     Empty,
+    /// Committed rows exist but the batch id was never assigned. Its commit-LSN half is gone: the
+    /// committed state now carries the LSN bounds with the rows, so that mismatch cannot occur.
+    #[error("batch has committed rows but no assigned batch id")]
+    Unassigned,
+    /// Encoding the rows into their typed Arrow builders failed. `transparent` because
+    /// [`pg_to_arrow::Error`] already names the column and the value.
     #[error(transparent)]
     Arrow(#[from] pg_to_arrow::Error),
 }

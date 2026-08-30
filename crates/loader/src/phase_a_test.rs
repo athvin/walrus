@@ -1,5 +1,6 @@
 use super::{pause_began, raw_append_lag_bytes};
 use common::Lsn;
+use std::cell::Cell;
 
 #[test]
 fn empty_queue_is_zero_lag() {
@@ -23,10 +24,14 @@ fn frontier_ahead_of_queue_saturates_to_zero() {
 
 #[test]
 fn pause_logs_once_per_pause_and_relatches_on_a_new_reload() {
-    let latch = parking_lot::Mutex::new(None);
-    assert_eq!(pause_began(&latch, Some(7)), Some(7), "a new pause logs");
+    let latch = Cell::new(None);
     assert_eq!(
-        pause_began(&latch, Some(7)),
+        pause_began(&latch, Some(common::ReloadId(7))),
+        Some(common::ReloadId(7)),
+        "a new pause logs"
+    );
+    assert_eq!(
+        pause_began(&latch, Some(common::ReloadId(7))),
         None,
         "same pause: silent on later polls"
     );
@@ -36,13 +41,13 @@ fn pause_logs_once_per_pause_and_relatches_on_a_new_reload() {
         "lifted: silent, latch cleared"
     );
     assert_eq!(
-        pause_began(&latch, Some(8)),
-        Some(8),
+        pause_began(&latch, Some(common::ReloadId(8))),
+        Some(common::ReloadId(8)),
         "the next reload logs again"
     );
     assert_eq!(
-        pause_began(&latch, Some(9)),
-        Some(9),
+        pause_began(&latch, Some(common::ReloadId(9))),
+        Some(common::ReloadId(9)),
         "a superseding reload (a PR 6.8 restart) logs without an intervening lift"
     );
 }

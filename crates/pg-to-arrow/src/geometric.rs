@@ -13,20 +13,29 @@ use arrow::datatypes::{DataType, Field, Fields};
 use std::sync::Arc;
 
 /// Which geometric shape a source column carries — selects the parser (and hence the nested builder).
-/// `Lseg`/`Box` share one shape (`STRUCT(p1, p2)`) and one parser (two points).
+/// [`Lseg`](GeoKind::Lseg)/[`Box`](GeoKind::Box) share one shape (`STRUCT(p1, p2)`) and one parser
+/// (two points).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GeoKind {
+    /// `point` — a single `(x, y)`.
     Point,
+    /// `line` — the infinite line's three coefficients.
     Line,
+    /// `lseg` — a segment's two endpoints.
     Lseg,
+    /// `box` — a rectangle's two opposite corners. Same Arrow shape and parser as `Lseg`.
     Box,
+    /// `circle` — a center point plus a radius.
     Circle,
+    /// `path` — a point list plus its open/closed flag.
     Path,
+    /// `polygon` — a point list, always closed, so no flag is carried.
     Polygon,
 }
 
-/// The geometric `GeoKind` for an OID, or `None` for a non-geometric (incl. PostGIS) type.
-pub fn geo_kind(type_oid: u32) -> Option<GeoKind> {
+/// The geometric [`GeoKind`] for an OID, or `None` for a non-geometric (incl. PostGIS) type.
+#[must_use]
+pub const fn geo_kind(type_oid: u32) -> Option<GeoKind> {
     Some(match type_oid {
         oids::POINT => GeoKind::Point,
         oids::LINE => GeoKind::Line,
@@ -63,6 +72,7 @@ fn point_list() -> DataType {
 /// The single emitted Arrow field for a geometric column (a `STRUCT` or a `LIST<STRUCT>` of doubles),
 /// or `None` for a non-geometric OID. Leaf fields are nullable so a whole-column NULL can null every
 /// leaf (`StructBuilder` requires each child appended for every row).
+#[must_use]
 pub fn geometric_field(name: &str, type_oid: u32) -> Option<Field> {
     let dt = match type_oid {
         oids::POINT => point_struct(),
@@ -94,16 +104,20 @@ pub fn geometric_field(name: &str, type_oid: u32) -> Option<Field> {
 /// A 2-D point (`x`, `y`) — the atom every geometric shape is built from.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Pt {
+    /// Horizontal coordinate.
     pub x: f64,
+    /// Vertical coordinate.
     pub y: f64,
 }
 
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+    std::mem::size_of::<Pt>() == 16,
+    "Pt is the element of the unbounded path/polygon vertex Vec built per value"
+);
+
 fn geo_err(text: &str) -> Error {
-    Error::ValueParse {
-        column: "geometric".to_string(),
-        value: text.to_string(),
-        data_type: "geometric".to_string(),
-    }
+    Error::value_parse("geometric", text, "geometric")
 }
 
 fn parse_f64(s: &str, text: &str) -> Result<f64, Error> {
@@ -122,19 +136,23 @@ fn parse_pt_inner(inner: &str, text: &str) -> Result<Pt, Error> {
 /// Extract every flat `(x,y)` coordinate group from a geometric literal, in order. Outer wrapping
 /// parens (`((…),(…))`) are skipped because their inner span still contains a `(`.
 fn extract_points(text: &str) -> Result<Vec<Pt>, Error> {
-    let mut pts = Vec::new();
     let bytes = text.as_bytes();
+    // Every group starts at its own `(`, so the `(` count is an exact upper bound on the points, and
+    // a tight one — only the outer wrapper (`((…),(…))`) is ever slack. One extra byte scan buys a
+    // single allocation for a `path`/`polygon`, which carries an unbounded vertex list and is parsed
+    // per value on the batch-build path; the 1–2 point shapes size down to exactly what they need.
+    let mut pts = Vec::with_capacity(bytes.iter().filter(|&&b| b == b'(').count());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'(' {
-            if let Some(off) = text[i + 1..].find(')') {
-                let close = i + 1 + off;
-                let inner = &text[i + 1..close];
-                if !inner.contains('(') {
-                    pts.push(parse_pt_inner(inner, text)?);
-                    i = close + 1;
-                    continue;
-                }
+        if bytes[i] == b'('
+            && let Some(off) = text[i + 1..].find(')')
+        {
+            let close = i + 1 + off;
+            let inner = &text[i + 1..close];
+            if !inner.contains('(') {
+                pts.push(parse_pt_inner(inner, text)?);
+                i = close + 1;
+                continue;
             }
         }
         i += 1;
@@ -142,7 +160,12 @@ fn extract_points(text: &str) -> Result<Vec<Pt>, Error> {
     Ok(pts)
 }
 
-/// `"(x,y)"` → `Pt`.
+/// `"(x,y)"` → [`Pt`].
+///
+/// # Errors
+///
+/// Returns [`Error::ValueParse`] unless the input contains exactly one point with finite-format
+/// numeric coordinates.
 pub fn parse_point(text: &str) -> Result<Pt, Error> {
     match extract_points(text)?.as_slice() {
         [p] => Ok(*p),
@@ -151,6 +174,10 @@ pub fn parse_point(text: &str) -> Result<Pt, Error> {
 }
 
 /// `"(x1,y1),(x2,y2)"` (box) or `"[(x1,y1),(x2,y2)]"` (lseg) → two points.
+///
+/// # Errors
+///
+/// Returns [`Error::ValueParse`] unless the input contains exactly two parseable coordinate pairs.
 pub fn parse_box(text: &str) -> Result<(Pt, Pt), Error> {
     match extract_points(text)?.as_slice() {
         [a, b] => Ok((*a, *b)),
@@ -159,6 +186,10 @@ pub fn parse_box(text: &str) -> Result<(Pt, Pt), Error> {
 }
 
 /// `"<(x,y),r>"` → center point + radius.
+///
+/// # Errors
+///
+/// Returns [`Error::ValueParse`] if the center is not one point or the radius is not an `f64`.
 pub fn parse_circle(text: &str) -> Result<(Pt, f64), Error> {
     let t = text.trim();
     let t = t.strip_prefix('<').unwrap_or(t);
@@ -173,6 +204,10 @@ pub fn parse_circle(text: &str) -> Result<(Pt, f64), Error> {
 }
 
 /// `"{A,B,C}"` (line as `Ax + By + C = 0`) → `(a, b, c)`.
+///
+/// # Errors
+///
+/// Returns [`Error::ValueParse`] unless the input contains exactly three parseable coefficients.
 pub fn parse_line(text: &str) -> Result<(f64, f64, f64), Error> {
     let t = text.trim();
     let t = t.strip_prefix('{').unwrap_or(t);
@@ -190,6 +225,10 @@ pub fn parse_line(text: &str) -> Result<(f64, f64, f64), Error> {
 
 /// Returns `(is_closed, points)`: `[(…)]` = open, `((…))` = closed — the flag is **mandatory**
 /// (dropping it makes the two indistinguishable on read-back).
+///
+/// # Errors
+///
+/// Returns [`Error::ValueParse`] if any coordinate is invalid or the path contains no points.
 pub fn parse_path(text: &str) -> Result<(bool, Vec<Pt>), Error> {
     let t = text.trim();
     let is_closed = t.starts_with('(');
@@ -201,6 +240,10 @@ pub fn parse_path(text: &str) -> Result<(bool, Vec<Pt>), Error> {
 }
 
 /// `"((x,y),…)"` → the polygon's vertices.
+///
+/// # Errors
+///
+/// Returns [`Error::ValueParse`] if any coordinate is invalid or the polygon has no vertices.
 pub fn parse_polygon(text: &str) -> Result<Vec<Pt>, Error> {
     let pts = extract_points(text)?;
     if pts.is_empty() {

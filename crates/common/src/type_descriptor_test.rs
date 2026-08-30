@@ -1,4 +1,5 @@
 use super::*;
+use std::num::NonZeroU32;
 
 /// The walrus-pg-sink.md §2.6 interval descriptor, comment-free.
 const DOCS_DESCRIPTOR: &str = r#"{
@@ -18,6 +19,18 @@ const DOCS_DESCRIPTOR: &str = r#"{
         }
     }"#;
 
+/// A tier-1 scalar descriptor as an older sink wrote it: no `recombine`, no `meta`. `schema_registry`
+/// is never pruned, so rows in this shape stay readable forever.
+const LEGACY_SCALAR_DESCRIPTOR: &str = r#"{
+        "column": "id",
+        "pg_type_oid": 23,
+        "pg_type": "int4",
+        "tier": 1,
+        "arrow": "Int32",
+        "duckdb": "INTEGER",
+        "emit": ["id:INT32"]
+    }"#;
+
 #[test]
 fn tier_serializes_as_integer() {
     assert_eq!(serde_json::to_string(&Tier::One).unwrap(), "1");
@@ -27,6 +40,25 @@ fn tier_serializes_as_integer() {
     assert!(serde_json::from_str::<Tier>("4").is_err());
     // A quoted string is NOT a valid tier — the contract is a JSON number.
     assert!(serde_json::from_str::<Tier>("\"2\"").is_err());
+}
+
+#[test]
+fn tier_validation_is_callable_outside_serde() {
+    assert_eq!(Tier::try_from(1u8).unwrap(), Tier::One);
+    assert_eq!(Tier::try_from(2u8).unwrap(), Tier::Two);
+    assert_eq!(Tier::try_from(3u8).unwrap(), Tier::Three);
+
+    // The rejection path is now ordinary Rust — no serde_json round trip needed.
+    for bad in [0u8, 4u8, 255u8] {
+        let err = Tier::try_from(bad).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid tier"),
+            "message is the operator-grepped one: {err}"
+        );
+    }
+
+    // And the serialize direction goes through the same conversion.
+    assert_eq!(u8::from(Tier::Three), 3);
 }
 
 #[test]
@@ -74,6 +106,55 @@ fn tier_one_scalar_descriptor_round_trips() {
 }
 
 #[test]
+fn descriptor_without_meta_loads_as_no_metadata() {
+    let d: TypeDescriptor = serde_json::from_str(LEGACY_SCALAR_DESCRIPTOR).unwrap();
+
+    assert_eq!(d.meta, TypeMeta::default());
+    assert_eq!(d.recombine, None);
+    assert_eq!(d.tier, Tier::One);
+
+    // The omitted key is a read-side allowance only: writing it back restores the §2.6 shape.
+    let v: serde_json::Value = serde_json::to_value(&d).unwrap();
+    assert_eq!(v["meta"]["enum_labels"], serde_json::Value::Null);
+}
+
+#[test]
+fn a_missing_mapping_key_is_still_a_hard_error() {
+    // Only `meta` defaults — dropping a mapping key must stay a loud decode failure, never a
+    // silently wrong plan.
+    for key in [
+        "column",
+        "pg_type_oid",
+        "pg_type",
+        "tier",
+        "arrow",
+        "duckdb",
+        "emit",
+    ] {
+        let mut doc: serde_json::Value = serde_json::from_str(LEGACY_SCALAR_DESCRIPTOR).unwrap();
+        doc.as_object_mut().unwrap().remove(key);
+
+        let error = serde_json::from_value::<TypeDescriptor>(doc).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("missing field `{key}`")),
+            "missing {key} must remain a hard error: {error}"
+        );
+    }
+}
+
+#[test]
+fn type_meta_defaults_every_key() {
+    // The all-optional metadata bag: an empty object is `TypeMeta::default()`, so a registry row
+    // that predates a metadata key still loads.
+    assert_eq!(
+        serde_json::from_str::<TypeMeta>("{}").unwrap(),
+        TypeMeta::default()
+    );
+}
+
+#[test]
 fn type_meta_carries_enum_labels() {
     let meta = TypeMeta {
         enum_labels: Some(vec![
@@ -87,4 +168,25 @@ fn type_meta_carries_enum_labels() {
         serde_json::from_str(&serde_json::to_string(&meta).unwrap()).unwrap();
     assert_eq!(v["enum_labels"], serde_json::json!(["happy", "meh", "sad"]));
     assert_eq!(v["bit_length"], serde_json::Value::Null);
+}
+
+#[test]
+fn type_meta_nonzero_lengths_keep_the_json_number_shape() {
+    let meta = TypeMeta {
+        bit_length: NonZeroU32::new(8),
+        char_length: NonZeroU32::new(5),
+        ..TypeMeta::default()
+    };
+    let value = serde_json::to_value(&meta).unwrap();
+    assert_eq!(value["bit_length"], serde_json::json!(8));
+    assert_eq!(value["char_length"], serde_json::json!(5));
+    assert_eq!(serde_json::from_value::<TypeMeta>(value).unwrap(), meta);
+
+    let invalid = serde_json::json!({
+        "enum_labels": null,
+        "bit_length": 0,
+        "char_length": null,
+        "money_fraction_digits": null
+    });
+    assert!(serde_json::from_value::<TypeMeta>(invalid).is_err());
 }

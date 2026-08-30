@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! End-to-end WAL-runaway chaos (`architecture.md` "WAL-runaway chaos" + §1.9): stall the sink's S3
 //! durability and keep writing to source; the slot's retained WAL rises (the retained-WAL alert
 //! condition trips) while the walsender stays connected and `confirmed_flush_lsn` holds — bounded,
@@ -69,7 +73,7 @@ async fn wal_runaway_is_bounded_then_catches_up() {
         .await
         .expect("retained WAL rises past the alert threshold (runaway detected)");
     assert!(
-        h.slot_active().await.unwrap(),
+        h.is_slot_active().await.unwrap(),
         "walsender stays connected while S3 is stalled (keepalive keeps feedback flowing)"
     );
     // confirmed_flush is FROZEN while durability is stalled: two reads 3s apart are equal (the sink is

@@ -10,37 +10,61 @@
 //! Parquet the sink actually writes. `tier_of` mirrors that dispatch's precedence branch-for-branch.
 
 use crate::range::RangeFamily;
-use crate::{geometric, oids, schema, tier3, uuid_enum};
+use crate::{Error, geometric, oids, schema, tier3, uuid_enum};
 use arrow::datatypes::DataType;
 use common::{PgColumn, PgRelation, Tier, TypeDescriptor, TypeMeta};
+use std::borrow::Cow;
+use std::num::NonZeroU32;
 
 /// Derive the per-column mapping descriptor (§2.6). Enum `enum_labels` are caller-supplied (the sink
 /// hydrates them from the catalog in PR 2.22); use [`describe_column_with_labels`] to pass them.
-pub fn describe_column(col: &PgColumn) -> TypeDescriptor {
+///
+/// # Errors
+///
+/// Returns [`Error::NotTier1`] carrying the column's OID and typmod when it maps to no supported
+/// tier. Every descriptor field is derived from [`schema::emit_fields`], so that is the only
+/// failure reachable here.
+#[must_use = "the descriptor error must be handled"]
+pub fn describe_column(col: &PgColumn) -> Result<TypeDescriptor, Error> {
     describe_column_with_labels(col, None)
 }
 
 /// [`describe_column`] plus the ordered enum label set (only used when the column is an enum).
+///
+/// # Errors
+///
+/// Returns [`Error::NotTier1`] carrying `col`'s OID and typmod when it maps to no supported tier.
+/// The `arrow`, `duckdb`, and `emit` fields all route through [`schema::emit_fields`], and the
+/// remaining fields are infallible, so no other variant can surface. `enum_labels` is never
+/// validated here — a label set for a non-enum column is ignored, not rejected.
+#[must_use = "the descriptor error must be handled"]
 pub fn describe_column_with_labels(
     col: &PgColumn,
     enum_labels: Option<Vec<String>>,
-) -> TypeDescriptor {
+) -> Result<TypeDescriptor, Error> {
     let tier = tier_of(col);
-    TypeDescriptor {
+    Ok(TypeDescriptor {
         column: col.name.clone(),
         pg_type_oid: col.type_oid,
         pg_type: pg_type_name(col.type_oid).to_string(),
         tier,
-        arrow: arrow_of(col, tier),
-        duckdb: duckdb_of(col, tier),
-        emit: emit_of(col),
+        arrow: arrow_of(col, tier)?,
+        duckdb: duckdb_of(col, tier)?,
+        emit: emit_of(col)?,
         recombine: recombine_of(col),
         meta: meta_of(col, enum_labels),
-    }
+    })
 }
 
 /// Descriptors for every column of a relation, in column order.
-pub fn describe_relation(rel: &PgRelation) -> Vec<TypeDescriptor> {
+///
+/// # Errors
+///
+/// Returns the [`Error::NotTier1`] of the **first** column that maps to no supported tier: the
+/// walk short-circuits there, so a relation with several unmappable columns reports only the
+/// earliest. An empty relation is `Ok(vec![])` — [`schema::build_schema`], not this function, is
+/// what rejects it with [`Error::EmptyRelation`].
+pub fn describe_relation(rel: &PgRelation) -> Result<Vec<TypeDescriptor>, Error> {
     rel.columns.iter().map(describe_column).collect()
 }
 
@@ -71,15 +95,11 @@ fn tier_of(col: &PgColumn) -> Tier {
 /// The emitted `name:ARROW_TYPE` list, taken **directly** from [`schema::emit_fields`] so it lists the
 /// sibling columns in exactly the order (and with the names) the sink writes them. The loader
 /// positional-binds against this list.
-fn emit_of(col: &PgColumn) -> Vec<String> {
-    schema::emit_fields(col)
-        .map(|fields| {
-            fields
-                .iter()
-                .map(|f| format!("{}:{}", f.name(), arrow_emit_name(f.data_type())))
-                .collect()
-        })
-        .unwrap_or_default()
+fn emit_of(col: &PgColumn) -> Result<Vec<String>, Error> {
+    Ok(schema::emit_fields(col)?
+        .iter()
+        .map(|f| format!("{}:{}", f.name(), arrow_emit_name(f.data_type())))
+        .collect())
 }
 
 /// The loader-side recombine expression (a hint the loader phase finalizes). Only the types that
@@ -100,30 +120,36 @@ fn meta_of(col: &PgColumn, enum_labels: Option<Vec<String>>) -> TypeMeta {
     if uuid_enum::is_enum_oid(col.type_oid) {
         meta.enum_labels = enum_labels;
     }
-    // bit(n)/varbit(n): atttypmod IS the bit count (no VARHDRSZ header).
-    if (col.type_oid == oids::BIT || col.type_oid == oids::VARBIT) && col.type_modifier >= 0 {
-        meta.bit_length = Some(col.type_modifier as u32);
+    // bit(n)/varbit(n): atttypmod IS the bit count (no VARHDRSZ header); zero is invalid.
+    if (col.type_oid == oids::BIT || col.type_oid == oids::VARBIT) && col.type_modifier > 0 {
+        meta.bit_length = u32::try_from(col.type_modifier)
+            .ok()
+            .and_then(NonZeroU32::new);
     }
-    // char(n)/varchar(n): atttypmod is n + VARHDRSZ (4).
-    if (col.type_oid == oids::BPCHAR || col.type_oid == oids::VARCHAR) && col.type_modifier >= 4 {
-        meta.char_length = Some((col.type_modifier - 4) as u32);
+    // char(n)/varchar(n): atttypmod is n + VARHDRSZ (4); zero is invalid.
+    if (col.type_oid == oids::BPCHAR || col.type_oid == oids::VARCHAR) && col.type_modifier > 4 {
+        meta.char_length = u32::try_from(col.type_modifier - 4)
+            .ok()
+            .and_then(NonZeroU32::new);
     }
     meta
 }
 
 /// The `arrow` descriptor string: Tier-2 is a decomposition; Tier-1/Tier-3 report the single Arrow type.
-fn arrow_of(col: &PgColumn, tier: Tier) -> String {
-    match tier {
+#[deny(clippy::wildcard_enum_match_arm)]
+fn arrow_of(col: &PgColumn, tier: Tier) -> Result<String, Error> {
+    Ok(match tier {
         Tier::Two => "Struct/Decomposed".to_string(),
-        _ => first_field_type(col)
+        Tier::One | Tier::Three => first_field_type(col)?
             .map(|dt| format!("{dt:?}"))
             .unwrap_or_else(|| "Utf8".to_string()),
-    }
+    })
 }
 
 /// The `duckdb` target type string.
-fn duckdb_of(col: &PgColumn, tier: Tier) -> String {
-    match tier {
+#[deny(clippy::wildcard_enum_match_arm)]
+fn duckdb_of(col: &PgColumn, tier: Tier) -> Result<String, Error> {
+    Ok(match tier {
         Tier::Two => match col.type_oid {
             oids::INTERVAL => "INTERVAL".to_string(),
             oids::TIMETZ => "TIMETZ".to_string(),
@@ -135,43 +161,47 @@ fn duckdb_of(col: &PgColumn, tier: Tier) -> String {
             }
             _ => "STRUCT".to_string(), // geometric
         },
-        _ => first_field_type(col)
+        Tier::One | Tier::Three => first_field_type(col)?
             .map(|dt| duckdb_scalar_name(&dt).to_string())
             .unwrap_or_else(|| "VARCHAR".to_string()),
-    }
+    })
 }
 
-fn first_field_type(col: &PgColumn) -> Option<DataType> {
-    schema::emit_fields(col)
-        .ok()
-        .and_then(|fields| fields.first().map(|f| f.data_type().clone()))
+fn first_field_type(col: &PgColumn) -> Result<Option<DataType>, Error> {
+    Ok(schema::emit_fields(col)?
+        .first()
+        .map(|f| f.data_type().clone()))
 }
 
 /// Parquet-ish emit-suffix name (matches the §2.6 interval example `INT32`/`INT64`).
-fn arrow_emit_name(dt: &DataType) -> String {
+///
+/// Every fixed name stays [`Cow::Borrowed`] — the sibling [`duckdb_scalar_name`] is a plain
+/// `&'static str` for exactly that reason. Only the three parameterised forms (`DECIMAL(p,s)`,
+/// `FIXEDBINARY(n)`, and the `{other:?}` fallback) have to build a string.
+fn arrow_emit_name(dt: &DataType) -> Cow<'static, str> {
     match dt {
-        DataType::Boolean => "BOOLEAN".to_string(),
-        DataType::Int16 => "INT16".to_string(),
-        DataType::Int32 => "INT32".to_string(),
-        DataType::Int64 => "INT64".to_string(),
-        DataType::Float32 => "FLOAT".to_string(),
-        DataType::Float64 => "DOUBLE".to_string(),
-        DataType::Decimal128(p, s) => format!("DECIMAL({p},{s})"),
-        DataType::Utf8 => "VARCHAR".to_string(),
-        DataType::Binary => "BLOB".to_string(),
-        DataType::FixedSizeBinary(n) => format!("FIXEDBINARY({n})"),
-        DataType::Date32 => "DATE".to_string(),
-        DataType::Time64(_) => "TIME".to_string(),
-        DataType::Timestamp(_, Some(_)) => "TIMESTAMPTZ".to_string(),
-        DataType::Timestamp(_, None) => "TIMESTAMP".to_string(),
-        DataType::Struct(_) => "STRUCT".to_string(),
-        DataType::List(_) => "LIST".to_string(),
-        other => format!("{other:?}"),
+        DataType::Boolean => Cow::Borrowed("BOOLEAN"),
+        DataType::Int16 => Cow::Borrowed("INT16"),
+        DataType::Int32 => Cow::Borrowed("INT32"),
+        DataType::Int64 => Cow::Borrowed("INT64"),
+        DataType::Float32 => Cow::Borrowed("FLOAT"),
+        DataType::Float64 => Cow::Borrowed("DOUBLE"),
+        DataType::Decimal128(p, s) => Cow::Owned(format!("DECIMAL({p},{s})")),
+        DataType::Utf8 => Cow::Borrowed("VARCHAR"),
+        DataType::Binary => Cow::Borrowed("BLOB"),
+        DataType::FixedSizeBinary(n) => Cow::Owned(format!("FIXEDBINARY({n})")),
+        DataType::Date32 => Cow::Borrowed("DATE"),
+        DataType::Time64(_) => Cow::Borrowed("TIME"),
+        DataType::Timestamp(_, Some(_)) => Cow::Borrowed("TIMESTAMPTZ"),
+        DataType::Timestamp(_, None) => Cow::Borrowed("TIMESTAMP"),
+        DataType::Struct(_) => Cow::Borrowed("STRUCT"),
+        DataType::List(_) => Cow::Borrowed("LIST"),
+        other => Cow::Owned(format!("{other:?}")),
     }
 }
 
 /// DuckDB scalar type name for a Tier-1/Tier-3 single-field column.
-fn duckdb_scalar_name(dt: &DataType) -> &'static str {
+const fn duckdb_scalar_name(dt: &DataType) -> &'static str {
     match dt {
         DataType::Boolean => "BOOLEAN",
         DataType::Int16 => "SMALLINT",
@@ -192,7 +222,7 @@ fn duckdb_scalar_name(dt: &DataType) -> &'static str {
 }
 
 /// The Postgres type name for an OID (informational descriptor field). Non-builtin → `enum`.
-fn pg_type_name(oid: u32) -> &'static str {
+const fn pg_type_name(oid: u32) -> &'static str {
     match oid {
         oids::BOOL => "bool",
         oids::BYTEA => "bytea",

@@ -1,4 +1,10 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::print_stderr,
+    reason = "integration test — unwrap/expect fine in setup + helpers; the concurrency \
+              high-water mark is reported, not asserted, so stderr is its destination"
+)]
 //! End-to-end: N-table reloads at scale on ONE slot (PR 6.12, reload §2/§5). Three tables are
 //! seeded and streamed by the real sink+loader, then reloaded concurrently with the sink's
 //! `max_concurrent_reloads = 2`. The load-bearing assertions: never more than 2 `exporting` at any
@@ -54,7 +60,7 @@ async fn n_table_reloads_respect_the_cap_on_one_slot() {
     for t in TABLES {
         let id = control::reload::request(
             &pool,
-            epoch,
+            epoch.into(),
             "public",
             t,
             control::reload::ReloadFlavor::Reload,
@@ -100,7 +106,7 @@ async fn n_table_reloads_respect_the_cap_on_one_slot() {
         .fetch_one(&pool)
         .await
         .unwrap();
-        if complete == TABLES.len() as i64 {
+        if complete == i64::try_from(TABLES.len()).unwrap() {
             break;
         }
         assert!(

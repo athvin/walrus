@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Reload observability against compose (`#[ignore]` — source + control PG + MinIO). Proves the
 //! PR 6.11 metrics MOVE during a reload: chunk/row counters and the echo-wait histogram tick as an
 //! export runs; the failed counter ticks on an echo timeout; the active gauge rises to 1 while an
@@ -22,12 +27,22 @@ use std::time::Duration;
 use tokio_postgres::NoTls;
 use tokio_util::sync::CancellationToken;
 
+use common::EpochNo;
 use control::reload::{self, ReloadFlavor, ReloadStatus};
 
 static SOURCE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const SOURCE_0001: &str = include_str!("../../../migrations/source/0001_publication.sql");
 const SOURCE_0003: &str = include_str!("../../../migrations/source/0003_reload_signal.sql");
 const TABLE: &str = "_walrus_met_orders";
+
+#[track_caller]
+fn assert_approx_eq(got: f64, want: f64) {
+    const EPSILON: f64 = 1e-9;
+    assert!(
+        (got - want).abs() < EPSILON,
+        "{got} != {want} (absolute tolerance {EPSILON})"
+    );
+}
 
 fn source_url() -> String {
     std::env::var("WALRUS_SOURCE_DB_URL")
@@ -47,7 +62,7 @@ async fn admin() -> tokio_postgres::Client {
     c
 }
 
-fn minio(epoch: i64) -> ParquetSink {
+fn minio(epoch: EpochNo) -> ParquetSink {
     ParquetSink::new(
         Arc::new(
             object_store::aws::AmazonS3Builder::new()
@@ -60,7 +75,7 @@ fn minio(epoch: i64) -> ParquetSink {
                 .build()
                 .unwrap(),
         ),
-        "walrus".to_string(),
+        "walrus",
         epoch,
     )
 }
@@ -75,7 +90,7 @@ async fn drop_slot(admin: &tokio_postgres::Client, slot: &str) {
         .await;
 }
 
-async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: i64, n: i64) {
+async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: EpochNo, n: i64) {
     admin
         .batch_execute(&format!(
             "DROP TABLE IF EXISTS public.{TABLE};
@@ -93,8 +108,8 @@ async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: i64, n
             epoch,
             source_schema: "public".to_string(),
             source_table: TABLE.to_string(),
-            schema_version: 1,
-            descriptors: pg_to_arrow::descriptor::describe_relation(&rel),
+            schema_version: common::SchemaVersionNo(1),
+            descriptors: pg_to_arrow::describe_relation(&rel).unwrap(),
             columns: serde_json::to_value(&rel).unwrap(),
         },
     )
@@ -102,7 +117,7 @@ async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: i64, n
     .unwrap();
 }
 
-async fn scrub(pool: &sqlx::PgPool, epoch: i64) {
+async fn scrub(pool: &sqlx::PgPool, epoch: EpochNo) {
     for tbl in ["file_manifest", "table_reload", "schema_registry"] {
         sqlx::query(&format!("DELETE FROM walrus.{tbl} WHERE epoch = $1"))
             .bind(epoch)
@@ -144,7 +159,7 @@ fn spawn_echo_resolver(
                     xid,
                 } if internal.is_reload_signal(*relation_oid) => {
                     let rel = internal.reload_signal_rel().unwrap();
-                    if let Some(sig) = PendingSignal::from_tuple(rel, new, *xid) {
+                    if let Ok(sig) = PendingSignal::from_tuple(rel, new, *xid) {
                         pending.push(sig);
                     }
                 }
@@ -159,13 +174,13 @@ fn spawn_echo_resolver(
 
 async fn await_resolver_ready(
     admin: &tokio_postgres::Client,
-    waiters: &Arc<WatermarkWaiters>,
-    epoch: i64,
+    waiters: &WatermarkWaiters,
+    epoch: EpochNo,
 ) {
-    let sentinel = -epoch;
+    let sentinel = -epoch.0;
     let mut ready = false;
     for _ in 0..20 {
-        let rx = waiters.subscribe(sentinel, 1);
+        let rx = waiters.subscribe(common::ReloadId(sentinel), 1);
         admin
             .batch_execute(&format!(
                 "DELETE FROM walrus.reload_signal WHERE reload_id = {sentinel}; \
@@ -191,16 +206,16 @@ async fn await_resolver_ready(
         .unwrap();
 }
 
-fn export_cfg(epoch: i64, chunk_rows: u64, echo_timeout: Duration) -> ChunkExportConfig {
+fn export_cfg(epoch: EpochNo, chunk_rows: u64, echo_timeout: Duration) -> ChunkExportConfig {
     ChunkExportConfig {
-        chunk_rows,
+        chunk_rows: std::num::NonZeroU64::new(chunk_rows).unwrap(),
         echo_timeout,
         instance: "walrus-sink-test".to_string(),
         epoch,
     }
 }
 
-async fn request_and_claim(pool: &sqlx::PgPool, epoch: i64) -> control::ReloadRow {
+async fn request_and_claim(pool: &sqlx::PgPool, epoch: EpochNo) -> control::ReloadRow {
     reload::request(pool, epoch, "public", TABLE, ReloadFlavor::Reload)
         .await
         .unwrap();
@@ -219,23 +234,22 @@ fn metric_sum(name: &str) -> f64 {
         if line.starts_with('#') {
             continue;
         }
-        if let Some(rest) = line.strip_prefix(name) {
-            if rest.starts_with(' ') || rest.starts_with('{') {
-                if let Some(v) = rest.split_whitespace().last() {
-                    total += v.parse::<f64>().unwrap_or(0.0);
-                }
-            }
+        if let Some(rest) = line.strip_prefix(name)
+            && (rest.starts_with(' ') || rest.starts_with('{'))
+            && let Some(v) = rest.split_whitespace().last()
+        {
+            total += v.parse::<f64>().unwrap_or(0.0);
         }
     }
     total
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires docker compose up --wait (source + control PG + MinIO)"]
 async fn chunk_export_moves_chunk_row_and_echo_metrics() {
     let _g = SOURCE_LOCK.lock().await;
     common::metrics::init();
-    let epoch = 700_001;
+    let epoch = EpochNo(700_001);
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
@@ -246,7 +260,7 @@ async fn chunk_export_moves_chunk_row_and_echo_metrics() {
 
     let waiters = Arc::new(WatermarkWaiters::default());
     let token = CancellationToken::new();
-    let resolver = spawn_echo_resolver("walrus_met_export", waiters.clone(), token.clone());
+    let resolver = spawn_echo_resolver("walrus_met_export", Arc::clone(&waiters), token.clone());
     await_resolver_ready(&admin, &waiters, epoch).await;
 
     let chunks_before = metric_sum(common::metrics::names::RELOAD_CHUNKS_TOTAL);
@@ -259,7 +273,7 @@ async fn chunk_export_moves_chunk_row_and_echo_metrics() {
     let mut exporter = ChunkExporter::connect(
         &source_url(),
         pool.clone(),
-        waiters.clone(),
+        Arc::clone(&waiters),
         minio(epoch),
         export_cfg(epoch, 2, Duration::from_secs(20)),
         &req,
@@ -268,24 +282,21 @@ async fn chunk_export_moves_chunk_row_and_echo_metrics() {
     .unwrap();
     exporter.run().await.unwrap();
 
-    assert_eq!(
+    assert_approx_eq(
         metric_sum(common::metrics::names::RELOAD_CHUNKS_TOTAL) - chunks_before,
         3.0,
-        "three chunk files ⇒ chunks_total += 3"
     );
-    assert_eq!(
+    assert_approx_eq(
         metric_sum(common::metrics::names::RELOAD_ROWS_EXPORTED_TOTAL) - rows_before,
         5.0,
-        "all 5 rows counted"
     );
     assert!(
         metric_sum("walrus_reload_echo_wait_seconds_count") - echo_before >= 3.0,
         "the echo-wait histogram observed at least one round-trip per chunk"
     );
-    assert_eq!(
+    assert_approx_eq(
         metric_sum(common::metrics::names::RELOAD_CROSSCHECK_VIOLATIONS) - crosscheck_before,
         0.0,
-        "a healthy export raises zero cross-check violations"
     );
 
     token.cancel();
@@ -302,7 +313,7 @@ async fn chunk_export_moves_chunk_row_and_echo_metrics() {
 async fn echo_timeout_moves_the_failed_metric() {
     let _g = SOURCE_LOCK.lock().await;
     common::metrics::init();
-    let epoch = 700_002;
+    let epoch = EpochNo(700_002);
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
@@ -336,10 +347,9 @@ async fn echo_timeout_moves_the_failed_metric() {
             .status,
         ReloadStatus::Failed
     );
-    assert_eq!(
+    assert_approx_eq(
         metric_sum(common::metrics::names::RELOAD_FAILED_TOTAL) - failed_before,
         1.0,
-        "the failed counter ticked for this table"
     );
 
     scrub(&pool, epoch).await;
@@ -354,7 +364,7 @@ async fn echo_timeout_moves_the_failed_metric() {
 async fn active_gauge_rises_and_returns_to_zero() {
     let _g = SOURCE_LOCK.lock().await;
     common::metrics::init();
-    let epoch = 700_003;
+    let epoch = EpochNo(700_003);
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
@@ -374,12 +384,12 @@ async fn active_gauge_rises_and_returns_to_zero() {
         minio(epoch),
         ReloadControllerConfig {
             poll_interval: Duration::from_millis(200),
-            max_concurrent_reloads: 2,
+            max_concurrent_reloads: std::num::NonZeroUsize::new(2).unwrap(),
             lease_ttl: Duration::from_secs(6),
             instance: "walrus-sink-test".to_string(),
             publication_name: "walrus_pub".to_string(),
             epoch,
-            chunk_rows: 1000,
+            chunk_rows: std::num::NonZeroU64::new(1000).unwrap(),
             echo_timeout: Duration::from_secs(3600), // park forever, no resolver
             reload_max_restarts: 3,
         },
@@ -401,7 +411,10 @@ async fn active_gauge_rises_and_returns_to_zero() {
     .await;
     assert!(rose.is_ok(), "reload_active never reached 1");
 
-    // Cancel: the parked exporter ends (Cancelled) and decrements the gauge back to 0.
+    // Cancel: the parked exporter ends (Cancelled) and decrements the gauge back to 0. The gauge
+    // is a balanced sum of ±1.0 steps seeded at 0.0, so every value it can hold is exact and the
+    // `== 0.0` below is a deliberate bit-exact drain check — a tolerance would swallow an
+    // unbalanced decrement, which is exactly the bug this waits to rule out.
     token.cancel();
     handle.await.unwrap();
     let fell = tokio::time::timeout(Duration::from_secs(10), async {

@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Large-transaction streaming against compose (`#[ignore]` — needs source PG with
 //! `logical_decoding_work_mem=64kB` + MinIO + control PG). An 8000-row txn arrives *before* its commit
 //! as interleaved `Stream` blocks: the demux stages speculatively (no manifest), holds
@@ -7,7 +12,7 @@
 //!
 //!   cargo test -p pg-sink --test streaming_large_txn -- --ignored
 
-use common::Lsn;
+use common::{EpochNo, Lsn};
 use pg_sink::batch::{BatchTriggers, SystemClock};
 use pg_sink::checkpoint::DurabilityCheckpoint;
 use pg_sink::consume::on_frame;
@@ -57,16 +62,40 @@ fn minio() -> Arc<dyn object_store::ObjectStore> {
 }
 
 async fn drop_slot(admin: &tokio_postgres::Client, slot: &str) {
+    // A dropped replication stream can remain active briefly while Postgres notices the closed
+    // socket. Terminate any leaked test walsender, then wait for the slot to become droppable so
+    // this integration target cannot contaminate the following E2E slot-count assertions.
     let _ = admin
         .execute(
-            "SELECT pg_drop_replication_slot(slot_name)
-             FROM pg_replication_slots WHERE slot_name = $1 AND NOT active",
+            "SELECT pg_terminate_backend(active_pid)
+             FROM pg_replication_slots WHERE slot_name = $1 AND active_pid IS NOT NULL",
             &[&slot],
         )
         .await;
+    for _ in 0..50 {
+        let active = admin
+            .query_opt(
+                "SELECT active FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot],
+            )
+            .await
+            .ok()
+            .flatten()
+            .map(|row| row.get::<_, bool>(0));
+        match active {
+            None => return,
+            Some(false) => {
+                let _ = admin
+                    .execute("SELECT pg_drop_replication_slot($1)", &[&slot])
+                    .await;
+                return;
+            }
+            Some(true) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
 }
 
-async fn ready_count(pool: &sqlx::PgPool, epoch: i64) -> i64 {
+async fn ready_count(pool: &sqlx::PgPool, epoch: EpochNo) -> i64 {
     sqlx::query_scalar(
         "SELECT count(*) FROM walrus.file_manifest WHERE epoch = $1 AND status = 'ready'",
     )
@@ -76,7 +105,7 @@ async fn ready_count(pool: &sqlx::PgPool, epoch: i64) -> i64 {
     .unwrap()
 }
 
-async fn cleanup(pool: &sqlx::PgPool, admin: &tokio_postgres::Client, epoch: i64, slot: &str) {
+async fn cleanup(pool: &sqlx::PgPool, admin: &tokio_postgres::Client, epoch: EpochNo, slot: &str) {
     let uris: Vec<String> =
         sqlx::query_scalar("SELECT s3_uri FROM walrus.file_manifest WHERE epoch = $1")
             .bind(epoch)
@@ -107,7 +136,7 @@ async fn cleanup(pool: &sqlx::PgPool, admin: &tokio_postgres::Client, epoch: i64
 async fn large_txn_single_ready_file_only_after_stream_commit() {
     let _g = SOURCE_LOCK.lock().await;
     let slot = "walrus_stream";
-    let epoch = 2_300_001;
+    let epoch = EpochNo(2_300_001);
     let admin = source().await;
     admin.batch_execute(SOURCE_MIGRATION).await.unwrap();
     admin
@@ -119,28 +148,31 @@ async fn large_txn_single_ready_file_only_after_stream_commit() {
         .unwrap();
     drop_slot(&admin, slot).await;
     let resume = verify_or_create_slot(&admin, slot).await.unwrap();
-    let mut stream =
-        ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
-            .await
-            .unwrap();
-    let sink = ParquetSink::new(minio(), "walrus".to_string(), epoch);
+    let sink = ParquetSink::new(minio(), "walrus", epoch);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     let mut demux = StreamDemux::new(
         // Small caps → the open txn spills speculatively (no manifest) many times before commit.
         BatchTriggers {
-            max_rows: 500,
-            max_bytes: u64::MAX,
+            max_rows: std::num::NonZeroU64::new(500).unwrap(),
+            max_bytes: std::num::NonZeroU64::MAX,
             max_fill: Duration::from_secs(3600),
         },
         Arc::new(SystemClock),
         epoch,
         "test".to_string(),
-        u64::MAX,
+        std::num::NonZeroU64::MAX,
     );
     let mut checkpoint = DurabilityCheckpoint::new(resume.start_lsn());
     let mut cache = RelationCache::default();
     let mut ctx = StreamCtx::default();
+
+    // Delay opening replication until setup is complete so the compose
+    // source's five-second `wal_sender_timeout` cannot expire an idle sender.
+    let mut stream =
+        ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
+            .await
+            .unwrap();
 
     // 8000 rows in ONE transaction → exceeds logical_decoding_work_mem=64kB → streams before commit.
     admin
@@ -166,7 +198,9 @@ async fn large_txn_single_ready_file_only_after_stream_commit() {
             };
             match &msg {
                 Message::Relation { relation, .. } => {
-                    cache.upsert_from_relation(relation.clone(), 1).unwrap();
+                    cache
+                        .upsert_from_relation(relation.clone(), common::SchemaVersionNo(1))
+                        .unwrap();
                 }
                 Message::StreamStart { xid, first_segment } => {
                     demux.on_stream_start(*xid, *first_segment, frame_lsn);
@@ -259,8 +293,8 @@ async fn large_txn_single_ready_file_only_after_stream_commit() {
         "confirmed_flush advances on commit"
     );
 
-    cleanup(&pool, &admin, epoch, slot).await;
     drop(stream);
+    cleanup(&pool, &admin, epoch, slot).await;
 }
 
 #[tokio::test]
@@ -268,7 +302,7 @@ async fn large_txn_single_ready_file_only_after_stream_commit() {
 async fn whole_txn_abort_writes_no_ready_row() {
     let _g = SOURCE_LOCK.lock().await;
     let slot = "walrus_stream_abort";
-    let epoch = 2_300_002;
+    let epoch = EpochNo(2_300_002);
     let admin = source().await;
     admin.batch_execute(SOURCE_MIGRATION).await.unwrap();
     admin
@@ -280,26 +314,29 @@ async fn whole_txn_abort_writes_no_ready_row() {
         .unwrap();
     drop_slot(&admin, slot).await;
     let resume = verify_or_create_slot(&admin, slot).await.unwrap();
-    let mut stream =
-        ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
-            .await
-            .unwrap();
-    let sink = ParquetSink::new(minio(), "walrus".to_string(), epoch);
+    let sink = ParquetSink::new(minio(), "walrus", epoch);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     let mut demux = StreamDemux::new(
         BatchTriggers {
-            max_rows: 500,
-            max_bytes: u64::MAX,
+            max_rows: std::num::NonZeroU64::new(500).unwrap(),
+            max_bytes: std::num::NonZeroU64::MAX,
             max_fill: Duration::from_secs(3600),
         },
         Arc::new(SystemClock),
         epoch,
         "test".to_string(),
-        u64::MAX,
+        std::num::NonZeroU64::MAX,
     );
     let mut cache = RelationCache::default();
     let mut ctx = StreamCtx::default();
+
+    // Delay opening replication until setup is complete so the compose
+    // source's five-second `wal_sender_timeout` cannot expire an idle sender.
+    let mut stream =
+        ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
+            .await
+            .unwrap();
 
     // A big txn that ROLLS BACK: a live walsender streams the rows (proto §9a) then Stream Abort.
     admin
@@ -334,7 +371,9 @@ async fn whole_txn_abort_writes_no_ready_row() {
             };
             match &msg {
                 Message::Relation { relation, .. } => {
-                    cache.upsert_from_relation(relation.clone(), 1).unwrap();
+                    cache
+                        .upsert_from_relation(relation.clone(), common::SchemaVersionNo(1))
+                        .unwrap();
                 }
                 Message::StreamStart { xid, first_segment } => {
                     demux.on_stream_start(*xid, *first_segment, frame_lsn);
@@ -365,6 +404,6 @@ async fn whole_txn_abort_writes_no_ready_row() {
         "an aborted streamed txn writes NO ready row"
     );
 
-    cleanup(&pool, &admin, epoch, slot).await;
     drop(stream);
+    cleanup(&pool, &admin, epoch, slot).await;
 }

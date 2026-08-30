@@ -9,8 +9,8 @@ Run them yourself on a quiet machine with `just bench`.
 
 - **Harness**: [criterion.rs] 0.5 (`harness = false` targets, `criterion_main!`). `default-features`
   off (no plotters/rayon/html_reports) — we read the stdout stats, and keep the dev-dep tree lean.
-- **Profile**: the `bench` profile (inherits `release`: opt-level 3, LTO off). `black_box` guards every
-  measured input/output so the optimiser can't hoist or elide the work.
+- **Profile**: the `bench` profile (inherits `release`: opt-level 3, LTO thin (inherited from release,
+  PR 5.7)). `black_box` guards every measured input/output so the optimiser can't hoist or elide the work.
 - **Throughput**: `Throughput::Elements(rows)`, so results read directly as **rows/s** (`Melem/s`).
 - **Inputs**: generated *outside* the timed loop. Decoder benches synthesize valid pgoutput byte
   streams (`Begin/Relation/Insert/Commit`, and a streamed `StreamStart/…/StreamStop` variant) from the
@@ -26,14 +26,92 @@ Run them yourself on a quiet machine with `just bench`.
 ### How to re-run
 
 ```
-just bench                                   # both crates, criterion defaults
+just bench                                   # all three crates, criterion defaults
 cargo bench -p pg-sink --bench decode        # decoder only
 cargo bench -p pg-to-arrow --bench batch     # Arrow only
+cargo bench -p loader --bench transform      # loader transform only (the 1M grid takes minutes)
+cargo bench -p loader --bench append         # loader Phase-A append only
 # faster, still stable:
 cargo bench -p pg-sink -p pg-to-arrow -- --warm-up-time 1 --measurement-time 3
 ```
 
 Criterion writes per-bench estimates under `target/criterion/` (gitignored).
+
+### Comparing a change against a baseline
+
+Absolute medians drift between runs even on one machine — several entries below had to discount that
+drift after the fact (PR 16.3's Arrow control moved backward with no timed code changed; PR 11.12
+compared against a baseline taken many PRs earlier). Read an optimisation as a **delta measured
+back-to-back**, not as two absolute numbers taken weeks apart:
+
+```
+just bench-baseline before   # on the commit you want to beat; saves target/criterion/**/before
+just bench-compare before    # on the change; criterion prints the per-bench delta
+```
+
+Criterion re-runs each bench against the stored sample and reports the change plus whether it clears
+its noise threshold, which is what "within noise" in the tables below should mean from here on.
+Baselines live under `target/criterion/`, so `cargo clean` discards them.
+
+## Profiling — finding the hot spot
+
+The benches say **how fast** a path is; they do not say **where the time goes inside it**. The order
+this file records is: bench the path, profile it, change one thing, re-measure against a saved
+baseline. Every entry under [History](#history) cites a measured delta for that reason — including
+the honest nulls (PR 5.7's thin LTO, PR 5.8's TOAST back-scan) and the declines (PR 11.13 `SmallVec`,
+PR 11.16 compact strings), which are only defensible because a measurement exists. None of the below
+is a CI gate, and none of it adds a dependency: each profiler attaches to a binary the recipes above
+already build.
+
+### Debug info, per invocation
+
+`[profile.release]` carries only `lto = "thin"`, so release and `bench` builds compile without debug
+info and profiles come back with thin, cross-crate-inlined frames. Ask for symbols through the
+environment rather than the manifest — a committed `.cargo/config.toml` is forbidden anywhere in the
+workspace (`crates/common/tests/build_profile.rs::no_cargo_config_exists`), and the release artifact
+should stay the one the numbers here describe:
+
+```
+CARGO_PROFILE_BENCH_DEBUG=1 cargo bench -p pg-sink --bench decode -- --profile-time 10
+CARGO_PROFILE_RELEASE_DEBUG=1 cargo build --release -p pg-sink -p loader
+```
+
+`--profile-time N` is criterion's external-profiler mode: it iterates each bench for ~N seconds and
+skips the statistical analysis, so the samples belong to the routine rather than to criterion.
+
+### One path (a criterion bench)
+
+macOS (the reference machine), after `cargo install cargo-instruments` (needs Xcode):
+
+```
+cargo instruments -p pg-sink -t time --bench decode -- --profile-time 10       # CPU
+cargo instruments -p pg-to-arrow -t alloc --bench batch -- --profile-time 10   # allocations
+```
+
+Linux — run the bench binary whose path `cargo bench` prints, under `perf`:
+
+```
+perf record -g target/release/deps/decode-<hash> --profile-time 10
+perf script | inferno-collapse-perf | inferno-flamegraph > flamegraph.svg
+```
+
+### The whole service, under load
+
+A micro-bench ranks suspects inside one function; it cannot see a bottleneck that appears only with
+the real stack attached — which is how PR 5.6 found the loader saturating first while the sink's
+`inflight` stayed 0. Run `just bench-e2e <scenario>` and sample the *running* release process:
+`sample <pid>` or Instruments' attach on macOS, `perf record -g -p <pid>` on Linux. The script starts
+`target/release/walrus-pg-sink` and `target/release/walrus-loader` and holds both PIDs.
+
+### Two walrus-specific caveats
+
+- **The loader's time is mostly not Rust.** PR 5.5's `EXPLAIN ANALYZE` (below) is the profiler for
+  the transform: the cost centre is DuckDB's window/group-by, so a Rust sampler mostly shows the
+  worker parked in `duckdb` FFI. Profile the SQL first and the Rust caller second.
+- **Allocation questions need an allocation profiler, not a guess.** PR 11.16 defers `SinkMeta`
+  compact strings *until allocation profiling shows those strings limit the sink end to end*; the
+  measurement that re-opens it is `-t alloc` above (or `heaptrack` on Linux) over `append_row` plus a
+  `bench-e2e` sink run — not a new global-allocator dev-dependency taken on spec.
 
 ## Baselines (PR 5.4)
 
@@ -207,6 +285,93 @@ taking. Net: **5.8 for throughput, 5.7 for a low-risk per-row win.**
 
 Before/after deltas from PR 5.7 (sink) and PR 5.8 (loader) land here, each citing the baseline row it
 improves and the commit that made the change.
+
+### PR 16.8 — merged cache footprints
+
+Measured with `std::mem::size_of` on the pinned Rust 1.95.0 64-bit toolchain after the Phase 11
+boxing work. The cache-line column uses an ideal aligned 64-byte span, `ceil(total bytes / 64)`:
+
+| type | size | multiplicity | `narrow_int4` (4 cols) | `wide30` (30 cols) | `text_heavy` (10 cols) |
+|---|---:|---|---:|---:|---:|
+| `Emit` | 1 B | once per source column in the shared batch plan | 4 B → 1 line | 30 B → 1 line | 10 B → 1 line |
+| `TupleValue` | 40 B | once per decoded cell | 160 B → 3 lines | 1,200 B → 19 lines | 400 B → 7 lines |
+| `Message` | 88 B | once per decoded WAL record | 88 B → 2 lines | 88 B → 2 lines | 88 B → 2 lines |
+
+These are inline container footprints: heap storage owned by `Vec`, `String`, and `Bytes` is not
+included. The existing `TupleValue` and `Message` guards remain the owners of those layouts; this
+change adds only the missing exact 64-bit guard for the one-byte `Emit` plan element.
+
+### PR 16.3 — `#[inline]` on the cross-crate accessors
+
+`common::Lsn::{new, as_u64}` and the eight mechanically small `Reader` accessors now carry
+`#[inline]`, so downstream compilation units can see their bodies without depending on thin LTO.
+Measured back-to-back on the reference machine (median ns/row, `--warm-up-time 1`,
+`--measurement-time 3`):
+
+| bench | shape | before (16.2) | after (16.3) | Δ |
+|---|---|---:|---:|---:|
+| `parse_tuple` | `narrow_int4` | 246.55 | 199.34 | **−19.1 %** |
+| `parse_tuple` | `wide30` | 1,741.2 | 1,577.0 | **−9.4 %** |
+| `parse_tuple` | `text_heavy` | 736.15 | 602.99 | **−18.1 %** |
+| `append_row` | `narrow_int4` | 691.98 | 771.07 | +11.4 % |
+
+All three decoder shapes improved, including the allocation-heavy case, so exporting the small
+cursor bodies produced a real cross-crate decode win. The Arrow control moved backward even though
+this PR changes no timed `BatchBuilder` body; that result is recorded as run-to-run machine drift,
+not attributed to the inline hints. No larger reader or `#[inline(always)]` exception was added to
+chase either number.
+
+### PR 11.16 — `SinkMeta` compact strings deferred
+
+The unchanged `pg-to-arrow` batch suite was re-run after PR 11.3 made the repeated `batch_id`
+assignment reuse its existing `String` allocation with `clone_from` (median, 1,000 rows per
+iteration, Apple M2, macOS 26.5.2, rustc 1.95.0, Criterion defaults):
+
+| `arrow/append_row` shape | median | ns/row |
+|---|---:|---:|
+| `narrow_int4` | 757.89 µs | 757.89 |
+| `wide30` | 1.4492 ms | 1,449.2 |
+| `text_heavy` | 1.1449 ms | 1,144.9 |
+| `tier2_fanout` | 1.3677 ms | 1,367.7 |
+
+These are fresh absolute medians, not evidence for a compact-string change: the benchmark contains
+no candidate implementation, and the committed PR 5.6 system profile still shows the loader
+saturating while sink inflight stays at zero. `Arc<str>` and compact-string crates remain deferred
+until allocation profiling identifies `SinkMeta` strings as an end-to-end sink limiter.
+
+### PR 11.13 — key-column scratch (`SmallVec` declined)
+
+`PgRelation::key_columns()` was measured in isolation for the common one-key shape and a composite
+three-key shape (median, Apple M2, macOS 26.5.2, rustc 1.95.0):
+
+| `loader/keycols` shape | median | fastest committed transform cycle | share of cycle |
+|---|---:|---:|---:|
+| one key | 41.554 ns | 25.1 ms | 0.00017 % |
+| three keys | 45.635 ns | 25.1 ms | 0.00018 % |
+
+An initial run measured 43.083 ns / 43.061 ns; Criterion found no performance change between runs.
+Both shapes are within noise of each other, and even the faster 25.1 ms transform baseline is over
+550,000× larger. `SmallVec` is therefore declined: its dependency/API/branching cost cannot move
+the loader's DuckDB-dominated end-to-end profile.
+
+### PR 11.12 — decoder text cells
+
+**Single-copy `'t'` cells (landed; measured regression).** `Reader::str` validates UTF-8 directly on
+the borrowed frame, so a text cell is copied once into `TupleValue::Text` instead of first copying
+into an intermediate `Bytes`. The allocation/copy removal is mechanically covered by the Reader
+tests and source probe, but it did not improve this short micro-benchmark run (median ns/row, Apple
+M2, macOS 26.5.2, rustc 1.95.0, `--warm-up-time 1 --measurement-time 3`):
+
+| bench | shape | before (5.4) | after (11.12) | Δ |
+|---|---|---:|---:|---:|
+| `parse_tuple` | `narrow_int4` | 236 | 295 | **+25.0 %** |
+| `parse_tuple` | `wide30` | 1 822 | 1 878 | +3.1 % |
+| `parse_tuple` | `text_heavy` | 710 | 759 | +6.9 % |
+
+This is an honest negative result rather than evidence of a throughput win. The absolute historical
+baseline predates intervening decoder changes, and the largest regression is on the smallest cells;
+the change is retained for its single-allocation invariant and simpler one-primitive cursor, not on
+the strength of this timing sample.
 
 ### PR 5.7 — sink hot path
 

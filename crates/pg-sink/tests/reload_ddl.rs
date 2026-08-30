@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Restart-on-DDL against compose (`#[ignore]` — needs source PG + control PG + MinIO). A schema
 //! change landing BETWEEN chunks invalidates the attempt: the exporter's per-chunk staleness check
 //! returns `SchemaChanged`, and the controller fails-and-reissues in one transaction — the old row
@@ -15,14 +20,14 @@
 //!   cargo test -p pg-sink --test reload_ddl -- --ignored --test-threads=1
 
 use bytes::Bytes;
-use common::Lsn;
-use object_store::path::Path;
+use common::{EpochNo, Lsn, ReloadId, SchemaVersionNo};
 use object_store::ObjectStore;
+use object_store::path::Path;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use pg_sink::consume::on_frame;
 use pg_sink::heartbeat::InternalTables;
 use pg_sink::pgoutput::{Message, StreamCtx};
-use pg_sink::reload::{handle_ddl_restart, RestartDecision};
+use pg_sink::reload::{RestartDecision, handle_ddl_restart};
 use pg_sink::reload_export::{ChunkExportConfig, ChunkExporter, RunOutcome};
 use pg_sink::reload_signal::{PendingSignal, PendingSignals, WatermarkWaiters};
 use pg_sink::replication::ReplicationStream;
@@ -37,6 +42,15 @@ static SOURCE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const SOURCE_0001: &str = include_str!("../../../migrations/source/0001_publication.sql");
 const SOURCE_0003: &str = include_str!("../../../migrations/source/0003_reload_signal.sql");
 const TABLE: &str = "_walrus_ddl_orders";
+
+#[track_caller]
+fn assert_approx_eq(got: f64, want: f64) {
+    const EPSILON: f64 = 1e-9;
+    assert!(
+        (got - want).abs() < EPSILON,
+        "{got} != {want} (absolute tolerance {EPSILON})"
+    );
+}
 
 fn source_url() -> String {
     std::env::var("WALRUS_SOURCE_DB_URL")
@@ -81,7 +95,7 @@ async fn drop_slot(admin: &tokio_postgres::Client, slot: &str) {
 }
 
 /// Seed the target table (a plain 2-column table) with `n` rows and register its shape at v1.
-async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: i64, n: i64) {
+async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: EpochNo, n: i64) {
     admin
         .batch_execute(&format!(
             "DROP TABLE IF EXISTS public.{TABLE};
@@ -90,12 +104,17 @@ async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: i64, n
         ))
         .await
         .unwrap();
-    register(admin, pool, epoch, 1).await;
+    register(admin, pool, epoch, SchemaVersionNo(1)).await;
 }
 
 /// (Re)register the table's CURRENT source shape at `version` — the sink's decode loop does this on
 /// a Relation message; here the test does it directly to simulate DDL bumping the structural version.
-async fn register(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: i64, version: i64) {
+async fn register(
+    admin: &tokio_postgres::Client,
+    pool: &sqlx::PgPool,
+    epoch: EpochNo,
+    version: SchemaVersionNo,
+) {
     let rel = pg_sink::snapshot::describe_source_relation(admin, "public", TABLE)
         .await
         .unwrap();
@@ -106,7 +125,7 @@ async fn register(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: i6
             source_schema: "public".to_string(),
             source_table: TABLE.to_string(),
             schema_version: version,
-            descriptors: pg_to_arrow::descriptor::describe_relation(&rel),
+            descriptors: pg_to_arrow::describe_relation(&rel).unwrap(),
             columns: serde_json::to_value(&rel).unwrap(),
         },
     )
@@ -114,7 +133,7 @@ async fn register(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: i6
     .unwrap();
 }
 
-async fn scrub(pool: &sqlx::PgPool, epoch: i64) {
+async fn scrub(pool: &sqlx::PgPool, epoch: EpochNo) {
     for tbl in ["file_manifest", "table_reload", "schema_registry"] {
         sqlx::query(&format!("DELETE FROM walrus.{tbl} WHERE epoch = $1"))
             .bind(epoch)
@@ -158,7 +177,7 @@ fn spawn_echo_resolver(
                     xid,
                 } if internal.is_reload_signal(*relation_oid) => {
                     let rel = internal.reload_signal_rel().unwrap();
-                    if let Some(sig) = PendingSignal::from_tuple(rel, new, *xid) {
+                    if let Ok(sig) = PendingSignal::from_tuple(rel, new, *xid) {
                         pending.push(sig);
                     }
                 }
@@ -174,13 +193,13 @@ fn spawn_echo_resolver(
 /// Prove the resolver is live before the exporter signals through it (a handshake, not a sleep).
 async fn await_resolver_ready(
     admin: &tokio_postgres::Client,
-    waiters: &Arc<WatermarkWaiters>,
-    epoch: i64,
+    waiters: &WatermarkWaiters,
+    epoch: EpochNo,
 ) {
-    let sentinel = -epoch;
+    let sentinel = -epoch.0;
     let mut ready = false;
     for _ in 0..20 {
-        let rx = waiters.subscribe(sentinel, 1);
+        let rx = waiters.subscribe(ReloadId(sentinel), 1);
         admin
             .batch_execute(&format!(
                 "DELETE FROM walrus.reload_signal WHERE reload_id = {sentinel}; \
@@ -206,16 +225,16 @@ async fn await_resolver_ready(
         .unwrap();
 }
 
-fn export_cfg(epoch: i64, chunk_rows: u64) -> ChunkExportConfig {
+fn export_cfg(epoch: EpochNo, chunk_rows: u64) -> ChunkExportConfig {
     ChunkExportConfig {
-        chunk_rows,
+        chunk_rows: std::num::NonZeroU64::new(chunk_rows).unwrap(),
         echo_timeout: Duration::from_secs(20),
         instance: "walrus-sink-test".to_string(),
         epoch,
     }
 }
 
-async fn request_and_claim(pool: &sqlx::PgPool, epoch: i64) -> control::ReloadRow {
+async fn request_and_claim(pool: &sqlx::PgPool, epoch: EpochNo) -> control::ReloadRow {
     control::reload::request(
         pool,
         epoch,
@@ -232,7 +251,7 @@ async fn request_and_claim(pool: &sqlx::PgPool, epoch: i64) -> control::ReloadRo
         .unwrap()
 }
 
-async fn reload_rows(pool: &sqlx::PgPool, epoch: i64) -> Vec<control::ReloadRow> {
+async fn reload_rows(pool: &sqlx::PgPool, epoch: EpochNo) -> Vec<control::ReloadRow> {
     let ids: Vec<i64> = sqlx::query_scalar(
         "SELECT reload_id FROM walrus.table_reload
          WHERE epoch = $1 AND source_table = $2 ORDER BY reload_id",
@@ -244,33 +263,45 @@ async fn reload_rows(pool: &sqlx::PgPool, epoch: i64) -> Vec<control::ReloadRow>
     .unwrap();
     let mut out = Vec::new();
     for id in ids {
-        out.push(control::reload::get(pool, id).await.unwrap().unwrap());
+        out.push(
+            control::reload::get(pool, ReloadId(id))
+                .await
+                .unwrap()
+                .unwrap(),
+        );
     }
     out
 }
 
-async fn manifest_count(pool: &sqlx::PgPool, epoch: i64, reload_id: i64) -> i64 {
+async fn manifest_count(pool: &sqlx::PgPool, epoch: EpochNo, reload_id: ReloadId) -> i64 {
     sqlx::query_scalar(
         "SELECT count(*) FROM walrus.file_manifest WHERE epoch = $1 AND reload_id = $2",
     )
     .bind(epoch)
-    .bind(reload_id)
+    .bind(reload_id.0)
     .fetch_one(pool)
     .await
     .unwrap()
 }
 
 /// The (uri, schema_version) of a reload's chunk files, in claim order.
-async fn reload_files(pool: &sqlx::PgPool, epoch: i64, reload_id: i64) -> Vec<(String, i64)> {
-    sqlx::query_as::<_, (String, i64)>(
+async fn reload_files(
+    pool: &sqlx::PgPool,
+    epoch: EpochNo,
+    reload_id: ReloadId,
+) -> Vec<(String, SchemaVersionNo)> {
+    let rows = sqlx::query_as::<_, (String, i64)>(
         "SELECT s3_uri, schema_version FROM walrus.file_manifest
          WHERE epoch = $1 AND reload_id = $2 ORDER BY lsn_end, id",
     )
     .bind(epoch)
-    .bind(reload_id)
+    .bind(reload_id.0)
     .fetch_all(pool)
     .await
-    .unwrap()
+    .unwrap();
+    rows.into_iter()
+        .map(|(uri, version)| (uri, SchemaVersionNo(version)))
+        .collect()
 }
 
 /// The Arrow column names of a chunk Parquet file — proves which shape it was exported at.
@@ -301,24 +332,23 @@ fn counter_value(name: &str) -> f64 {
         if line.starts_with('#') {
             continue;
         }
-        if let Some(rest) = line.strip_prefix(name) {
-            // The metric name must end exactly here — the next char is a space (no labels) or `{`.
-            if rest.starts_with(' ') || rest.starts_with('{') {
-                if let Some(v) = rest.split_whitespace().last() {
-                    total += v.parse::<f64>().unwrap_or(0.0);
-                }
-            }
+        // The metric name must end exactly here — the next char is a space (no labels) or `{`.
+        if let Some(rest) = line.strip_prefix(name)
+            && (rest.starts_with(' ') || rest.starts_with('{'))
+            && let Some(v) = rest.split_whitespace().last()
+        {
+            total += v.parse::<f64>().unwrap_or(0.0);
         }
     }
     total
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires docker compose up --wait (source + control PG + MinIO)"]
 async fn mid_export_ddl_restarts_fresh_attempt_at_new_schema() {
     let _g = SOURCE_LOCK.lock().await;
     common::metrics::init();
-    let epoch = 680_001;
+    let epoch = EpochNo(680_001);
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
@@ -329,7 +359,7 @@ async fn mid_export_ddl_restarts_fresh_attempt_at_new_schema() {
 
     let waiters = Arc::new(WatermarkWaiters::default());
     let token = CancellationToken::new();
-    let resolver = spawn_echo_resolver("walrus_ddl_restart", waiters.clone(), token.clone());
+    let resolver = spawn_echo_resolver("walrus_ddl_restart", Arc::clone(&waiters), token.clone());
     await_resolver_ready(&admin, &waiters, epoch).await;
 
     // Chunk 1 at v1 (freezes schema_version=1), then DDL lands: ALTER + re-register at v2.
@@ -338,8 +368,8 @@ async fn mid_export_ddl_restarts_fresh_attempt_at_new_schema() {
     let mut exporter = ChunkExporter::connect(
         &source_url(),
         pool.clone(),
-        waiters.clone(),
-        ParquetSink::new(store(), "walrus".to_string(), epoch),
+        Arc::clone(&waiters),
+        ParquetSink::new(store(), "walrus", epoch),
         export_cfg(epoch, 2),
         &req,
     )
@@ -352,26 +382,30 @@ async fn mid_export_ddl_restarts_fresh_attempt_at_new_schema() {
         ))
         .await
         .unwrap();
-    register(&admin, &pool, epoch, 2).await;
+    register(&admin, &pool, epoch, SchemaVersionNo(2)).await;
 
     // The next chunk's staleness check trips: the run returns SchemaChanged (no chunk 2 at v1).
     let restarts_before = counter_value(common::metrics::names::RELOAD_RESTARTS_TOTAL);
     let outcome = exporter.run().await.unwrap();
-    assert_eq!(outcome, RunOutcome::SchemaChanged { new_version: 2 });
+    assert_eq!(
+        outcome,
+        RunOutcome::SchemaChanged {
+            new_version: SchemaVersionNo(2)
+        }
+    );
 
     // The controller fails-and-reissues in one transaction.
     let old_after_chunk1 = control::reload::get(&pool, old_id).await.unwrap().unwrap();
-    let decision = handle_ddl_restart(&pool, &old_after_chunk1, 2, 3)
+    let decision = handle_ddl_restart(&pool, &old_after_chunk1, SchemaVersionNo(2), 3)
         .await
         .unwrap();
     let new_id = match decision {
         RestartDecision::Restarted(id) => id,
         RestartDecision::Capped => panic!("cap of 3 must not be reached on the first DDL"),
     };
-    assert_eq!(
+    assert_approx_eq(
         counter_value(common::metrics::names::RELOAD_RESTARTS_TOTAL) - restarts_before,
         1.0,
-        "the restart counter incremented"
     );
 
     // Old: failed + superseded reason + zero chunk files. New: exporting, restart_count 1, fresh.
@@ -409,8 +443,8 @@ async fn mid_export_ddl_restarts_fresh_attempt_at_new_schema() {
     let mut resumed = ChunkExporter::connect(
         &source_url(),
         pool.clone(),
-        waiters.clone(),
-        ParquetSink::new(store(), "walrus".to_string(), epoch),
+        Arc::clone(&waiters),
+        ParquetSink::new(store(), "walrus", epoch),
         export_cfg(epoch, 2),
         &new,
     )
@@ -422,11 +456,15 @@ async fn mid_export_ddl_restarts_fresh_attempt_at_new_schema() {
     ));
 
     let done = control::reload::get(&pool, new_id).await.unwrap().unwrap();
-    assert_eq!(done.schema_version, Some(2), "the attempt froze at v2");
+    assert_eq!(
+        done.schema_version,
+        Some(SchemaVersionNo(2)),
+        "the attempt froze at v2"
+    );
     let files = reload_files(&pool, epoch, new_id).await;
     assert_eq!(files.len(), 3, "5 rows at chunk_rows=2 ⇒ 3 files");
     assert!(
-        files.iter().all(|f| f.1 == 2),
+        files.iter().all(|f| f.1 == SchemaVersionNo(2)),
         "every successor file stamped v2"
     );
     let cols = chunk_columns(&files[0].0).await;
@@ -444,12 +482,12 @@ async fn mid_export_ddl_restarts_fresh_attempt_at_new_schema() {
         .unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires docker compose up --wait (source + control PG + MinIO)"]
 async fn restart_cap_exhaustion_fails_loudly() {
     let _g = SOURCE_LOCK.lock().await;
     common::metrics::init();
-    let epoch = 680_002;
+    let epoch = EpochNo(680_002);
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
@@ -460,7 +498,7 @@ async fn restart_cap_exhaustion_fails_loudly() {
 
     let waiters = Arc::new(WatermarkWaiters::default());
     let token = CancellationToken::new();
-    let resolver = spawn_echo_resolver("walrus_ddl_cap", waiters.clone(), token.clone());
+    let resolver = spawn_echo_resolver("walrus_ddl_cap", Arc::clone(&waiters), token.clone());
     await_resolver_ready(&admin, &waiters, epoch).await;
 
     let req = request_and_claim(&pool, epoch).await;
@@ -468,8 +506,8 @@ async fn restart_cap_exhaustion_fails_loudly() {
     let mut exporter = ChunkExporter::connect(
         &source_url(),
         pool.clone(),
-        waiters.clone(),
-        ParquetSink::new(store(), "walrus".to_string(), epoch),
+        Arc::clone(&waiters),
+        ParquetSink::new(store(), "walrus", epoch),
         export_cfg(epoch, 2),
         &req,
     )
@@ -482,26 +520,27 @@ async fn restart_cap_exhaustion_fails_loudly() {
         ))
         .await
         .unwrap();
-    register(&admin, &pool, epoch, 2).await;
+    register(&admin, &pool, epoch, SchemaVersionNo(2)).await;
     assert_eq!(
         exporter.run().await.unwrap(),
-        RunOutcome::SchemaChanged { new_version: 2 }
+        RunOutcome::SchemaChanged {
+            new_version: SchemaVersionNo(2)
+        }
     );
 
     // Cap 0: the first mid-export DDL fails the reload outright — no successor.
     let cap_before = counter_value(common::metrics::names::RELOAD_RESTART_CAP_EXHAUSTED_TOTAL);
     let old_after_chunk1 = control::reload::get(&pool, old_id).await.unwrap().unwrap();
-    let decision = handle_ddl_restart(&pool, &old_after_chunk1, 2, 0)
+    let decision = handle_ddl_restart(&pool, &old_after_chunk1, SchemaVersionNo(2), 0)
         .await
         .unwrap();
     assert!(
         matches!(decision, RestartDecision::Capped),
         "cap 0 caps the first DDL"
     );
-    assert_eq!(
+    assert_approx_eq(
         counter_value(common::metrics::names::RELOAD_RESTART_CAP_EXHAUSTED_TOTAL) - cap_before,
         1.0,
-        "the cap-exhausted counter incremented"
     );
 
     let rows = reload_rows(&pool, epoch).await;

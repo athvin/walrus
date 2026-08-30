@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Durability step (b) against compose (`#[ignore]` — needs MinIO + control PG). After a durable PUT,
 //! a `file_manifest` `ready` row is committed with `lsn_end` = the **commit** LSN. Each test runs in a
 //! rolled-back transaction (control DB) under a unique epoch, and cleans up its S3 object.
@@ -6,15 +11,16 @@
 //!   cargo test -p pg-sink --test manifest_insert -- --ignored
 
 use common::{
-    Kind, Lsn, Op, PgColumn, PgRelation, ReplicaIdentity, SinkMeta, TupleValue, UtcTimestamp,
+    EpochNo, Kind, Lsn, Op, PgColumn, PgRelation, ReplicaIdentity, SinkMeta, TupleValue,
+    UtcTimestamp,
 };
 use control::{connect, run_migrations};
-use object_store::aws::AmazonS3Builder;
 use object_store::ObjectStore;
+use object_store::aws::AmazonS3Builder;
 use pg_sink::batch::SealedBatch;
 use pg_sink::consume::flush_batch;
 use pg_sink::sink::ParquetSink;
-use pg_to_arrow::{oids, BatchBuilder};
+use pg_to_arrow::{BatchBuilder, oids};
 use sqlx::postgres::PgPool;
 use std::sync::Arc;
 
@@ -68,15 +74,15 @@ fn meta() -> SinkMeta {
         op: Op::Insert,
         lsn: "0/10".parse().unwrap(),
         commit_lsn: "0/10".parse().unwrap(),
-        commit_ts: UtcTimestamp::parse_rfc3339("2026-07-07T12:00:00Z").unwrap(),
+        commit_ts: "2026-07-07T12:00:00Z".parse::<UtcTimestamp>().unwrap(),
         xid: 1,
-        epoch: 1,
+        epoch: EpochNo(1),
         batch_id: "b".to_string(),
-        schema_version: 1,
+        schema_version: common::SchemaVersionNo(1),
         source_schema: "public".to_string(),
         source_table: "orders".to_string(),
         kind: Kind::Stream,
-        unchanged_toast: vec![],
+        unchanged_toast: Box::default(),
         sink_instance: "walrus-pg-sink-0".to_string(),
         sink_processed_at: UtcTimestamp::now(),
     }
@@ -91,10 +97,10 @@ fn sealed(lsn_end: &str) -> SealedBatch {
     )
     .unwrap();
     SealedBatch {
-        record_batch: bb.finish().unwrap(),
+        record_batch: bb.into_record_batch().unwrap(),
         schema: "public".to_string(),
         table: "orders".to_string(),
-        schema_version: 5,
+        schema_version: common::SchemaVersionNo(5),
         lsn_start: "0/A000".parse().unwrap(),
         lsn_end: lsn_end.parse().unwrap(),
         row_count: 1,
@@ -107,8 +113,8 @@ async fn object_and_manifest_row_both_exist_after_flush() {
     let store = minio_store();
     let pool = control_pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let epoch = 2_250_001;
-    let sink = ParquetSink::new(store.clone(), "walrus".to_string(), epoch);
+    let epoch = EpochNo(2_250_001);
+    let sink = ParquetSink::new(Arc::clone(&store), "walrus", epoch);
 
     let obj = flush_batch(&sink, &mut *tx, epoch, sealed("0/A100"))
         .await
@@ -136,8 +142,8 @@ async fn manifest_lsn_end_equals_commit_lsn_not_row_lsn() {
     let store = minio_store();
     let pool = control_pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let epoch = 2_250_002;
-    let sink = ParquetSink::new(store.clone(), "walrus".to_string(), epoch);
+    let epoch = EpochNo(2_250_002);
+    let sink = ParquetSink::new(Arc::clone(&store), "walrus", epoch);
 
     // Commit LSN 0/A100; the batch's rows carry row LSN 0/10.
     let obj = flush_batch(&sink, &mut *tx, epoch, sealed("0/A100"))
@@ -165,8 +171,8 @@ async fn row_is_ready_kind_stream_and_epoch_stamped() {
     let store = minio_store();
     let pool = control_pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let epoch = 2_250_003;
-    let sink = ParquetSink::new(store.clone(), "walrus".to_string(), epoch);
+    let epoch = EpochNo(2_250_003);
+    let sink = ParquetSink::new(Arc::clone(&store), "walrus", epoch);
 
     let obj = flush_batch(&sink, &mut *tx, epoch, sealed("0/B200"))
         .await

@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! End-to-end crash safety (`architecture.md` "Crash safety" + §1.5): `SIGKILL` the sink mid-batch and
 //! the loader mid-MERGE, restart both, and prove the pipeline reaches the **same** state it would have
 //! without the crash — **effectively-once, no loss, no dupes, no resurrected deletes**. This is the payoff
@@ -113,7 +117,7 @@ async fn loader_killed_mid_merge_is_idempotent() {
         .expect("delete converges");
 
     // A fresh batch (300..700) to give the loader Phase-A work to be killed in the middle of.
-    let raw_before = control::read_checkpoint(h.control_pool(), h.epoch, "public", "orders")
+    let raw_before = control::read_checkpoint(h.control_pool(), h.epoch.into(), "public", "orders")
         .await
         .unwrap()
         .unwrap()

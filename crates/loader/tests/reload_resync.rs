@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! The `resync` flavor against compose (`#[ignore]` — needs control PG + MinIO). Unlike `reload`
 //! (clear + rebuild, PR 6.7), `resync` merges chunks over the LIVE mirror: no pause, no
 //! `CREATE OR REPLACE`, no purge, no meta latch, raw history preserved. It repairs stale and
@@ -9,11 +14,11 @@
 //!
 //!   cargo test -p loader --test reload_resync -- --ignored --test-threads=1
 
-use common::{Lsn, PgColumn, PgRelation, ReplicaIdentity};
+use common::{EpochNo, Lsn, PgColumn, PgRelation, ReplicaIdentity};
 use control::reload::{self, ReloadFlavor};
 use loader::duck::{S3Access, TableDb};
 use loader::health::LoaderState;
-use loader::phase_a::{run_phase_a, TableCtx};
+use loader::phase_a::{TableCtx, run_phase_a};
 use loader::phase_b::run_phase_b;
 use std::time::Duration;
 
@@ -51,14 +56,14 @@ fn orders() -> PgRelation {
     }
 }
 
-fn tmpdir(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("walrus-loader-rs-{name}"));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+/// A scratch directory for one test's `.duckdb` file. The returned guard deletes it on drop — even
+/// when an assertion panics, which a trailing `remove_dir_all` would skip.
+fn tmpdir(name: &str) -> tempfile::TempDir {
+    let prefix = format!("walrus-loader-rs-{name}-");
+    tempfile::Builder::new().prefix(&prefix).tempdir().unwrap()
 }
 
-fn write_rows(epoch: i64, name: &str, rows: &[(i32, &str, &str, &str, &str)]) -> String {
+fn write_rows(epoch: EpochNo, name: &str, rows: &[(i32, &str, &str, &str, &str)]) -> String {
     let w = duckdb::Connection::open_in_memory().unwrap();
     let a = s3();
     w.execute_batch(&format!(
@@ -66,7 +71,10 @@ fn write_rows(epoch: i64, name: &str, rows: &[(i32, &str, &str, &str, &str)]) ->
          SET s3_url_style='path'; SET s3_use_ssl=false; \
          SET s3_access_key_id='{}'; SET s3_secret_access_key='{}'; \
          CREATE TABLE fixture (id INTEGER, status VARCHAR, walrus_pg_sink_meta VARCHAR);",
-        a.region, a.endpoint, a.access_key_id, a.secret_access_key
+        a.region,
+        a.endpoint,
+        a.access_key_id,
+        a.secret_access_key.expose()
     ))
     .unwrap();
     for (id, status, op, commit, lsn) in rows {
@@ -85,11 +93,11 @@ fn write_rows(epoch: i64, name: &str, rows: &[(i32, &str, &str, &str, &str)]) ->
 
 async fn seed_file(
     pool: &sqlx::PgPool,
-    epoch: i64,
+    epoch: EpochNo,
     uri: &str,
     kind: &str,
     lsn_end: &str,
-    reload_id: Option<i64>,
+    reload_id: Option<common::ReloadId>,
 ) -> i64 {
     control::insert_ready(
         pool,
@@ -102,7 +110,7 @@ async fn seed_file(
             row_count: 1,
             lsn_start: lsn_end.parse().unwrap(),
             lsn_end: lsn_end.parse().unwrap(),
-            schema_version: 1,
+            schema_version: common::SchemaVersionNo(1),
             reload_id,
         },
     )
@@ -111,7 +119,7 @@ async fn seed_file(
     .0
 }
 
-async fn setup(epoch: i64) -> (TableCtx, std::path::PathBuf) {
+async fn setup(epoch: EpochNo) -> (TableCtx, tempfile::TempDir) {
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     for tbl in [
@@ -131,7 +139,7 @@ async fn setup(epoch: i64) -> (TableCtx, std::path::PathBuf) {
             epoch,
             slot_name: "walrus_slot".into(),
             created_lsn: "0/0".parse().unwrap(),
-            status: "streaming".into(),
+            status: control::ReplicationStatus::Streaming,
         },
     )
     .await
@@ -140,18 +148,21 @@ async fn setup(epoch: i64) -> (TableCtx, std::path::PathBuf) {
         .await
         .unwrap();
     let dir = tmpdir(&epoch.to_string());
-    let db = TableDb::open(&dir.join("orders.duckdb")).unwrap();
-    db.ensure_tables(&orders(), 1).unwrap();
+    let db = TableDb::open(dir.path().join("orders.duckdb")).unwrap();
+    db.ensure_tables(&orders(), common::SchemaVersionNo(1))
+        .unwrap();
     db.configure_s3(&s3()).unwrap();
     let ctx = TableCtx {
         pool,
         epoch,
+        epoch_rx: loader::epoch::fixed_epoch_watch(epoch),
         schema: "public".into(),
         table: "orders".into(),
+        series: "public.orders".into(),
         rel: orders(),
         db,
         state: LoaderState::new(),
-        max_files: 100,
+        max_files: std::num::NonZeroI64::new(100).unwrap(),
         poll_interval: Duration::from_secs(5),
         compaction_interval: Duration::from_secs(3600),
         retention_lsn_lag: 16 << 20,
@@ -162,7 +173,12 @@ async fn setup(epoch: i64) -> (TableCtx, std::path::PathBuf) {
 }
 
 /// Walk a `resync` reload through the real transitions to `export_complete` at `first_lsn = l1`.
-async fn drained_resync(pool: &sqlx::PgPool, epoch: i64, l1: &str, h: &str) -> i64 {
+async fn drained_resync(
+    pool: &sqlx::PgPool,
+    epoch: EpochNo,
+    l1: &str,
+    h: &str,
+) -> common::ReloadId {
     let id = reload::request(pool, epoch, "public", "orders", ReloadFlavor::Resync)
         .await
         .unwrap();
@@ -175,7 +191,7 @@ async fn drained_resync(pool: &sqlx::PgPool, epoch: i64, l1: &str, h: &str) -> i
         1,
         &serde_json::json!(["999"]),
         l1.parse::<Lsn>().unwrap(),
-        1,
+        common::SchemaVersionNo(1),
     )
     .await
     .unwrap();
@@ -211,7 +227,11 @@ fn raw_has(ctx: &TableCtx, id: i32) -> bool {
 }
 
 /// Establish a live mirror {1,2,3} via a stream file at 0/50, then update id 2 nowhere yet.
-async fn seed_live_mirror(ctx: &TableCtx, epoch: i64) {
+#[allow(
+    clippy::future_not_send,
+    reason = "this helper borrows a TableCtx containing a Send + !Sync TableDb across awaits"
+)]
+async fn seed_live_mirror(ctx: &TableCtx, epoch: EpochNo) {
     let live = write_rows(
         epoch,
         "live",
@@ -231,8 +251,8 @@ async fn seed_live_mirror(ctx: &TableCtx, epoch: i64) {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn resync_repairs_drift_but_phantoms_survive() {
     let _g = LOCK.lock().await;
-    let epoch = 660_001;
-    let (ctx, dir) = setup(epoch).await;
+    let epoch = EpochNo(660_001);
+    let (ctx, _dir) = setup(epoch).await;
     seed_live_mirror(&ctx, epoch).await;
 
     // Drift the mirror both ways, directly in DuckDB: a MISSING row (delete id 1) and a PHANTOM
@@ -289,23 +309,21 @@ async fn resync_repairs_drift_but_phantoms_survive() {
     // No rebuild happened: no meta latch, raw history preserved.
     assert_eq!(
         ctx.db.recorded_reload_id().unwrap(),
-        0,
+        None,
         "resync never writes the reload_id latch"
     );
     assert!(
         raw_has(&ctx, 1) && raw_has(&ctx, 3),
         "chunk rows flowed through raw (preserved)"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn resync_never_pauses_the_table() {
     let _g = LOCK.lock().await;
-    let epoch = 660_002;
-    let (ctx, dir) = setup(epoch).await;
+    let epoch = EpochNo(660_002);
+    let (ctx, _dir) = setup(epoch).await;
     seed_live_mirror(&ctx, epoch).await;
 
     // A LIVE (non-terminal) resync — requested → exporting, never driven to completion.
@@ -334,7 +352,7 @@ async fn resync_never_pauses_the_table() {
         Some("streamed"),
         "the stream kept flowing over the live table during the resync"
     );
-    assert_eq!(*ctx.pause_logged.lock(), None, "no pause was ever latched");
+    assert_eq!(ctx.pause_logged.get(), None, "no pause was ever latched");
     let cp = control::read_checkpoint(&ctx.pool, epoch, "public", "orders")
         .await
         .unwrap()
@@ -344,16 +362,14 @@ async fn resync_never_pauses_the_table() {
         "0/200".parse().unwrap(),
         "the frontier advanced (no freeze at W)"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn resync_chunks_flow_through_raw() {
     let _g = LOCK.lock().await;
-    let epoch = 660_003;
-    let (ctx, dir) = setup(epoch).await;
+    let epoch = EpochNo(660_003);
+    let (ctx, _dir) = setup(epoch).await;
     seed_live_mirror(&ctx, epoch).await;
 
     // The open-question decision, pinned: a resync chunk row lands in `<table>_raw` like any file
@@ -378,17 +394,15 @@ async fn resync_chunks_flow_through_raw() {
         "the pre-resync stream rows are still in raw — no rebuild discarded them"
     );
     assert_eq!(mirror_status(&ctx, 7).as_deref(), Some("from-chunk"));
-    assert_eq!(ctx.db.recorded_reload_id().unwrap(), 0, "no latch");
-
-    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(ctx.db.recorded_reload_id().unwrap(), None, "no latch");
 }
 
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (control PG)"]
 async fn resync_ddl_restart_preserves_the_resync_flavor() {
     let _g = LOCK.lock().await;
-    let epoch = 660_004;
-    let (ctx, dir) = setup(epoch).await;
+    let epoch = EpochNo(660_004);
+    let (ctx, _dir) = setup(epoch).await;
 
     // A mid-resync DDL restart (PR 6.8) reissues the attempt — the successor must stay `resync`
     // (restart_for_ddl copies the flavor via INSERT…SELECT), else a refresh would silently become a
@@ -405,14 +419,14 @@ async fn resync_ddl_restart_preserves_the_resync_flavor() {
         1,
         &serde_json::json!(["10"]),
         "0/100".parse().unwrap(),
-        1,
+        common::SchemaVersionNo(1),
     )
     .await
     .unwrap();
     let old_row = reload::get(&ctx.pool, old).await.unwrap().unwrap();
 
     let mut conn = ctx.pool.acquire().await.unwrap();
-    let new_id = reload::restart_for_ddl(&mut conn, &old_row, 2, 3)
+    let new_id = reload::restart_for_ddl(&mut conn, &old_row, common::SchemaVersionNo(2), 3)
         .await
         .unwrap()
         .expect("cap 3 leaves room for the first restart");
@@ -436,5 +450,4 @@ async fn resync_ddl_restart_preserves_the_resync_flavor() {
         .execute(&ctx.pool)
         .await
         .unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
 }

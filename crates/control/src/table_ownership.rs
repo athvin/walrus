@@ -7,21 +7,30 @@
 //! side never needs a timestamp type.
 
 use crate::ControlError;
+use common::EpochNo;
 use sqlx::PgExecutor;
 
 /// A held lease. The `fencing_token` bumps only when ownership changes hands (dormant at `replicas=1`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lease {
+    /// Monotonic token, bumped by 1 only when the lease changes hands. A holder that stalls past
+    /// its TTL and comes back can tell it was fenced by comparing this against what it acquired.
     pub fencing_token: i64,
+    /// The instance identity holding the lease — the loader's configured `instance`.
     pub owner_pod: String,
 }
 
 /// Conditionally acquire (or renew) the lease for `ttl_secs`: succeeds iff the lease is **free**
 /// (expired) or **already ours**. Returns `Ok(None)` when a *live* owner holds it — the caller maps
 /// that to the terminal [`common::ExitCode::LeaseContended`]. On a change of owner the token bumps by 1.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the conditional lease upsert cannot execute, or
+/// [`ControlError::CheckViolation`] if a lease invariant is violated.
 pub async fn acquire_lease(
     ex: impl PgExecutor<'_>,
-    epoch: i64,
+    epoch: EpochNo,
     schema: &str,
     table: &str,
     self_pod: &str,
@@ -49,8 +58,7 @@ pub async fn acquire_lease(
     .bind(self_pod)
     .bind(ttl_secs as f64)
     .fetch_optional(ex)
-    .await
-    .map_err(ControlError::from_sqlx)?;
+    .await?;
     Ok(row.map(|(fencing_token, owner_pod)| Lease {
         fencing_token,
         owner_pod,
@@ -59,9 +67,13 @@ pub async fn acquire_lease(
 
 /// Renew our lease (extend `lease_expiry`), off the apply-loop thread and well under the TTL. Fails to
 /// affect any row if we are no longer the owner (a phantom writer must not renew).
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the guarded renewal update cannot execute.
 pub async fn renew_lease(
     ex: impl PgExecutor<'_>,
-    epoch: i64,
+    epoch: EpochNo,
     schema: &str,
     table: &str,
     self_pod: &str,
@@ -80,16 +92,19 @@ pub async fn renew_lease(
     .bind(self_pod)
     .bind(ttl_secs as f64)
     .execute(ex)
-    .await
-    .map_err(ControlError::from_sqlx)?;
+    .await?;
     Ok(done.rows_affected() > 0)
 }
 
 /// Release our lease on graceful shutdown (expire it immediately) so a replacement pod need not wait
 /// out the TTL. A no-op if we no longer own it.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the guarded expiry update cannot execute.
 pub async fn release_lease(
     ex: impl PgExecutor<'_>,
-    epoch: i64,
+    epoch: EpochNo,
     schema: &str,
     table: &str,
     self_pod: &str,
@@ -106,7 +121,6 @@ pub async fn release_lease(
     .bind(table)
     .bind(self_pod)
     .execute(ex)
-    .await
-    .map_err(ControlError::from_sqlx)?;
+    .await?;
     Ok(())
 }

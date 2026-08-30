@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Aggregate `max_inflight_bytes` ceiling (§1.3) against compose (`#[ignore]` — needs source PG with
 //! `logical_decoding_work_mem=64kB` + MinIO + control PG). A large open transaction under a
 //! deliberately **low** ceiling spills its buffer speculatively (bounding memory) while
@@ -7,7 +12,7 @@
 //!
 //!   cargo test -p pg-sink --test max_inflight_bytes -- --ignored
 
-use common::Lsn;
+use common::{EpochNo, Lsn};
 use pg_sink::batch::{BatchTriggers, SystemClock};
 use pg_sink::checkpoint::DurabilityCheckpoint;
 use pg_sink::consume::on_frame;
@@ -71,7 +76,7 @@ async fn drop_slot(admin: &tokio_postgres::Client, slot: &str) {
 async fn large_txn_low_ceiling_spills_and_stays_bounded() {
     let _g = SOURCE_LOCK.lock().await;
     let slot = "walrus_inflight";
-    let epoch = 2_320_001;
+    let epoch = EpochNo(2_320_001);
     let admin = source().await;
     admin.batch_execute(SOURCE_MIGRATION).await.unwrap();
     admin
@@ -83,11 +88,7 @@ async fn large_txn_low_ceiling_spills_and_stays_bounded() {
         .unwrap();
     drop_slot(&admin, slot).await;
     let resume = verify_or_create_slot(&admin, slot).await.unwrap();
-    let mut stream =
-        ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
-            .await
-            .unwrap();
-    let sink = ParquetSink::new(minio(), "walrus".to_string(), epoch);
+    let sink = ParquetSink::new(minio(), "walrus", epoch);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     sqlx::query("DELETE FROM walrus.file_manifest WHERE epoch = $1")
@@ -99,18 +100,26 @@ async fn large_txn_low_ceiling_spills_and_stays_bounded() {
     let ceiling: u64 = 64 * 1024;
     let mut demux = StreamDemux::new(
         BatchTriggers {
-            max_rows: 100_000,
-            max_bytes: u64::MAX,
+            max_rows: std::num::NonZeroU64::new(100_000).unwrap(),
+            max_bytes: std::num::NonZeroU64::MAX,
             max_fill: Duration::from_secs(3600),
         },
         Arc::new(SystemClock),
         epoch,
         "test".to_string(),
-        ceiling,
+        std::num::NonZeroU64::new(ceiling).unwrap(),
     );
     let mut checkpoint = DurabilityCheckpoint::new(resume.start_lsn());
     let mut cache = RelationCache::default();
     let mut ctx = StreamCtx::default();
+
+    // Open replication only after the control-plane cleanup and demux setup.
+    // The compose source has a five-second `wal_sender_timeout`, so an idle
+    // stream created before that work can expire before frame consumption.
+    let mut stream =
+        ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
+            .await
+            .unwrap();
 
     // 8000 rows in one txn (~640 KiB of Arrow) ≫ the 64 KiB ceiling → repeated speculative spills.
     admin
@@ -135,7 +144,9 @@ async fn large_txn_low_ceiling_spills_and_stays_bounded() {
             };
             match &msg {
                 Message::Relation { relation, .. } => {
-                    cache.upsert_from_relation(relation.clone(), 1).unwrap();
+                    cache
+                        .upsert_from_relation(relation.clone(), common::SchemaVersionNo(1))
+                        .unwrap();
                 }
                 Message::StreamStart { xid, first_segment } => {
                     demux.on_stream_start(*xid, *first_segment, frame_lsn);

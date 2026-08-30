@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+publish.workspace = true # the shipped artifact is the walrus-loader image, not a registry package
 
 [lib]
 name = "loader"
@@ -16,8 +17,8 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-common = { path = "../common" }
-control = { path = "../control" }
+common = { workspace = true }
+control = { workspace = true }
 sqlx = { workspace = true, features = ["runtime-tokio", "tls-rustls", "postgres"] }
 # The loader materialises Parquet into DuckDB; `bundled` compiles DuckDB from source (cached in CI).
 duckdb = { workspace = true, features = ["bundled"] }
@@ -27,7 +28,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 figment = { workspace = true, features = ["env", "toml", "yaml"] }
 humantime-serde = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "net", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "net", "time", "fs", "sync"] }
 tokio-util = { workspace = true }
 axum = { workspace = true }
 object_store = { workspace = true, features = ["aws"] }
@@ -36,12 +37,16 @@ tracing = { workspace = true }
 parking_lot = { workspace = true }
 
 [dev-dependencies]
+# `test` feature adds figment::Jail for hermetic env/file config tests (dev-only).
+figment = { workspace = true, features = ["test"] }
 # Raw-HTTP scrape test (metrics_scrape.rs) reads the /metrics body via AsyncReadExt/AsyncWriteExt.
 tokio = { workspace = true, features = ["io-util"] }
 # Micro-benches (PR 5.5): transform scaling / TOAST back-scan / Phase-A append against in-memory DuckDB.
 criterion = { workspace = true }
 # The append bench generates a local Parquet fixture with the sink's own writer (Arrow → Parquet).
-pg-to-arrow = { path = "../pg-to-arrow" }
+pg-to-arrow = { workspace = true }
+# RAII scratch fixtures: the bench's Parquet file and every test that needs a real `.duckdb` file.
+# The guard deletes the directory on drop, so a panicking assertion cannot leak it.
 tempfile = { workspace = true }
 
 # `harness = false` hands the bench binary to criterion_main! instead of the libtest bench harness.

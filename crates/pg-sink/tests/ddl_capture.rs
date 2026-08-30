@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! DDL capture against compose (`#[ignore]` — needs source PG + MinIO + control PG). An `ALTER TABLE …
 //! ADD COLUMN` on the source writes a `ddl_manifest` row (stamped with the DDL's `c_lsn`), bumps the
 //! table's structural `schema_version`, and cuts a fresh Parquet file — so the prior file carries the
@@ -8,9 +13,9 @@
 //!
 //!   cargo test -p pg-sink --test ddl_capture -- --ignored
 
-use common::Lsn;
+use common::{EpochNo, Lsn};
 use pg_sink::batch::{BatchTriggers, SystemClock};
-use pg_sink::consume::{flush_batch, on_frame, on_relation, BatchRouter};
+use pg_sink::consume::{BatchRouter, flush_batch, on_frame, on_relation};
 use pg_sink::ddl::{DdlConsumer, DdlEvent};
 use pg_sink::heartbeat::InternalTables;
 use pg_sink::pgoutput::{Message, StreamCtx};
@@ -73,7 +78,7 @@ async fn drop_slot(admin: &tokio_postgres::Client, slot: &str) {
 async fn alter_add_column_bumps_version_and_cuts_file() {
     let _g = SOURCE_LOCK.lock().await;
     let slot = "walrus_ddl";
-    let epoch = 2_330_001;
+    let epoch = EpochNo(2_330_001);
     let admin = source().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0002).await.unwrap();
@@ -93,11 +98,13 @@ async fn alter_add_column_bumps_version_and_cuts_file() {
         .unwrap();
     drop_slot(&admin, slot).await;
     let resume = verify_or_create_slot(&admin, slot).await.unwrap();
-    let mut stream =
-        ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
-            .await
-            .unwrap();
-    let sink = ParquetSink::new(minio(), "walrus".to_string(), epoch);
+    // The control-plane setup happens BEFORE the CopyBoth stream opens. Nothing reads the
+    // replication socket or sends standby feedback until the decode loop below, and the harness runs
+    // `wal_sender_timeout=5s`, so connecting + migrating + clearing the epoch while the stream is
+    // already open is enough for the walsender to terminate it under a loaded serial sweep ("source
+    // closed the replication connection" on the first `next()`). The slot — created above — retains
+    // the WAL, so opening the stream later replays every frame from `resume.start_lsn()`.
+    let sink = ParquetSink::new(minio(), "walrus", epoch);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     for tbl in ["file_manifest", "ddl_manifest", "schema_registry"] {
@@ -107,11 +114,15 @@ async fn alter_add_column_bumps_version_and_cuts_file() {
             .await
             .unwrap();
     }
+    let mut stream =
+        ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
+            .await
+            .unwrap();
     // High row cap → the pre-DDL row stays buffered until the DDL CUTS it (the interesting path).
     let mut router = BatchRouter::new(
         BatchTriggers {
-            max_rows: u64::MAX,
-            max_bytes: u64::MAX,
+            max_rows: std::num::NonZeroU64::MAX,
+            max_bytes: std::num::NonZeroU64::MAX,
             max_fill: Duration::from_secs(3600),
         },
         Arc::new(SystemClock),
@@ -188,14 +199,19 @@ async fn alter_add_column_bumps_version_and_cuts_file() {
                     }
                 }
                 Message::Insert { new, .. } => {
-                    router.route(&cache, &msg, frame_lsn, 1).unwrap();
+                    router
+                        .route(&cache, &msg, frame_lsn, common::SchemaVersionNo(1))
+                        .unwrap();
                     // The last row (850003) is our stop marker.
                     if matches!(new.first(), Some(common::TupleValue::Text(s)) if s == "850003") {
                         saw_end = true;
                     }
                 }
                 Message::Commit { .. } => {
-                    for sealed in router.route(&cache, &msg, frame_lsn, 1).unwrap() {
+                    for sealed in router
+                        .route(&cache, &msg, frame_lsn, common::SchemaVersionNo(1))
+                        .unwrap()
+                    {
                         flush_batch(&sink, &pool, epoch, sealed).await.unwrap();
                     }
                 }

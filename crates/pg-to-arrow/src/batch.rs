@@ -1,31 +1,37 @@
-//! `BatchBuilder`: decoded `TupleValue`s + a `SinkMeta` → an Arrow `RecordBatch`.
+#![deny(clippy::indexing_slicing)] // PR 16.2: the 460 ns/row append path carries width proofs.
+
+//! [`BatchBuilder`] — decoded [`TupleValue`]s + a [`SinkMeta`] → an Arrow [`RecordBatch`].
 //!
 //! pgoutput ships values as canonical **text**; this builder parses each into its Tier-1 Arrow
-//! representation, maps `Null` and `UnchangedToast` onto the validity bitmap (a null in both cases —
-//! the TOAST placeholder's column name is recorded in `SinkMeta.unchanged_toast` upstream and echoed
-//! into the meta JSON; *resolving* it is the loader's back-scan, PR 3.6), and serializes the
-//! provenance into the trailing `walrus_pg_sink_meta` column. All column builders (including meta)
+//! representation, maps [`TupleValue::Null`] and [`TupleValue::UnchangedToast`] onto the validity
+//! bitmap (a null in both cases — the TOAST placeholder's column name is recorded in
+//! [`SinkMeta::unchanged_toast`] upstream and echoed into the meta JSON; *resolving* it is the
+//! loader's back-scan, PR 3.6), and serializes the provenance into the trailing
+//! `walrus_pg_sink_meta` column. All column builders (including meta)
 //! move in lockstep — every `append_row` pushes exactly one slot to every column.
 
 use crate::error::Error;
 use crate::geometric::GeoKind;
 use crate::oids;
 use crate::range::RangeFamily;
-use crate::schema::{build_schema, tier1_data_type, SINK_META_COLUMN};
+use crate::schema::{SINK_META_COLUMN, build_schema, tier1_data_type};
 use arrow::array::{
-    make_builder, ArrayBuilder, ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder,
-    Decimal128Builder, FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder,
-    Int32Builder, Int64Builder, ListBuilder, RecordBatch, StringBuilder, StructBuilder,
-    Time64MicrosecondBuilder, TimestampMicrosecondBuilder,
+    ArrayBuilder, ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder,
+    FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder,
+    Int64Builder, ListBuilder, PrimitiveBuilder, RecordBatch, StringBuilder, StructBuilder,
+    Time64MicrosecondBuilder, TimestampMicrosecondBuilder, make_builder,
 };
-use arrow::datatypes::{DataType, Field, FieldRef, SchemaRef, TimeUnit};
+use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, FieldRef, SchemaRef, TimeUnit};
 use common::{PgColumn, PgRelation, SinkMeta, TupleValue};
+use std::fmt;
 use std::sync::Arc;
 
 /// How one source column's `TupleValue` fans out onto the flat builder list. Tier-1 consumes one
 /// builder (the existing `append_value` path); Tier-2 spreads a single value across several sibling
 /// builders (PR 2.12). Ordering here MUST match `emit_fields` / `build_schema` (§2.4, PR 2.17's
 /// descriptor `emit[]` lists the same suffixes in the same order).
+/// The batch plan stores one compact `Emit` per source column, independent of its row count.
+#[derive(Debug)]
 enum Emit {
     Scalar,             // 1 builder
     Interval,           // 3 builders: _months(i32), _days(i32), _micros(i64)
@@ -33,6 +39,37 @@ enum Emit {
     Range,              // 5 builders: _lower, _upper, _lower_inc, _upper_inc, _empty
     Multirange,         // 1 builder: ListBuilder<StructBuilder>
     Geometric(GeoKind), // 1 builder: a nested STRUCT / LIST<STRUCT> of doubles
+}
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+    std::mem::size_of::<Emit>() == 1,
+    "Emit is stored once per source column"
+);
+
+impl Emit {
+    /// Number of flat builders consumed by this source-column shape.
+    const fn width(&self) -> usize {
+        match self {
+            Self::Scalar | Self::Multirange | Self::Geometric(_) => 1,
+            Self::Interval => 3,
+            Self::Timetz => 2,
+            Self::Range => 5,
+        }
+    }
+}
+
+/// Arrow's erased builders do not implement [`Debug`](fmt::Debug); report only their arity so the
+/// public [`BatchBuilder`] can derive `Debug` without inspecting foreign trait-object contents.
+///
+/// `Box<[_]>`, not `Vec`: the flat builder list is fixed by the schema in [`BatchBuilder::new`], and
+/// `append_row`'s width proofs hold only because nothing can add or remove a builder afterwards.
+struct Builders(Box<[Box<dyn ArrayBuilder>]>);
+
+impl fmt::Debug for Builders {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[{} column builders]", self.0.len())
+    }
 }
 
 /// Classify a source column into its fan-out shape. MUST stay in lockstep with `emit_fields` — the
@@ -69,21 +106,29 @@ fn emit_kind(col: &PgColumn) -> Result<Emit, Error> {
     })
 }
 
-/// Accumulates decoded rows for ONE relation into a single Arrow `RecordBatch`.
+/// Accumulates decoded rows for ONE relation into a single Arrow [`RecordBatch`].
+#[derive(Debug)]
 pub struct BatchBuilder {
     schema: SchemaRef,
-    builders: Vec<Box<dyn ArrayBuilder>>, // one per EMITTED field, flat, in schema order
-    plan: Vec<Emit>,                      // one per SOURCE column: how its value fans out
-    meta: StringBuilder,                  // the trailing walrus_pg_sink_meta column
+    builders: Builders,  // one per EMITTED field, flat, in schema order
+    plan: Box<[Emit]>,   // one per SOURCE column: how its value fans out
+    meta: StringBuilder, // the trailing walrus_pg_sink_meta column
     rows: usize,
     /// The batch-constant meta JSON fragment, serialized once from the first row (PR 5.7).
     meta_const: Option<String>,
     /// Reused scratch for assembling each row's `{const,row}` meta JSON (avoids a per-row alloc).
     meta_buf: String,
+    /// Reused scratch for RFC-3339 candidates handed to `jiff`, cleared and refilled per cell.
+    ts_buf: String,
 }
 
 impl BatchBuilder {
     /// Build empty typed builders from the relation's Arrow schema (PR 2.9; Tier-2 fan-out, PR 2.12).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::EmptyRelation`] for a relation without columns, [`Error::NotTier1`] for an
+    /// unsupported source type, or [`Error::Arrow`] if Arrow rejects a typed builder configuration.
     pub fn new(rel: &PgRelation) -> Result<Self, Error> {
         let schema = Arc::new(build_schema(rel)?);
         // One flat builder per data field (every field except the trailing meta column).
@@ -99,54 +144,75 @@ impl BatchBuilder {
         }
         Ok(BatchBuilder {
             schema,
-            builders,
-            plan,
+            builders: Builders(builders.into_boxed_slice()),
+            plan: plan.into_boxed_slice(),
             meta: StringBuilder::new(),
             rows: 0,
             meta_const: None,
             meta_buf: String::new(),
+            ts_buf: String::new(),
         })
     }
 
     /// Append one decoded tuple + its provenance. `values.len()` must equal the source column count
-    /// (one `TupleValue` per source column — Tier-2 values fan out to several builders internally).
+    /// (one [`TupleValue`] per source column — Tier-2 values fan out to several builders internally).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::RowLenMismatch`] when the tuple width differs from the relation, and
+    /// [`Error::ValueParse`], [`Error::Downcast`], or [`Error::Arrow`] when a value cannot be
+    /// converted into its planned Arrow builder or its provenance cannot be serialized.
     pub fn append_row(&mut self, values: &[TupleValue], meta: &SinkMeta) -> Result<(), Error> {
         if values.len() != self.plan.len() {
-            return Err(Error::RowLenMismatch {
-                expected: self.plan.len(),
-                got: values.len(),
-            });
+            return Err(row_len_error(self.plan.len(), values.len()));
         }
-        // Clone the Fields (Arc) so we can read the field types while mutably borrowing `builders`.
-        let fields = self.schema.fields().clone();
-        let mut bi = 0; // flat builder index; advances by each column's emit width
+        // Read the field types straight out of the schema — `schema`, `builders`, and `ts_buf` are
+        // disjoint fields, so the shared borrow coexists with the mutable ones (as `plan` already
+        // does below). Cloning `Fields` here would be an Arc refcount round-trip on every row.
+        let mut builders: &mut [Box<dyn ArrayBuilder>] = &mut self.builders.0;
+        let mut remaining_fields: &[FieldRef] = self.schema.fields();
         for (emit, value) in self.plan.iter().zip(values) {
+            let width = emit.width();
+            let column = remaining_fields
+                .first()
+                .map_or("<unknown>", |field| field.name());
+            let (current_builders, rest) = std::mem::take(&mut builders)
+                .split_at_mut_checked(width)
+                .ok_or_else(|| downcast_error(column))?;
+            let (current_fields, fields_rest) = remaining_fields
+                .split_at_checked(width)
+                .ok_or_else(|| downcast_error(column))?;
             match emit {
                 Emit::Scalar => {
-                    append_value(self.builders[bi].as_mut(), &fields[bi], value)?;
-                    bi += 1;
+                    let ([builder], [field]) = (current_builders, current_fields) else {
+                        return Err(downcast_error(column));
+                    };
+                    append_value(builder.as_mut(), field, value, &mut self.ts_buf)?;
                 }
                 Emit::Interval => {
-                    append_interval(&mut self.builders[bi..bi + 3], fields[bi].name(), value)?;
-                    bi += 3;
+                    append_interval(current_builders, column, value)?;
                 }
                 Emit::Timetz => {
-                    append_timetz(&mut self.builders[bi..bi + 2], fields[bi].name(), value)?;
-                    bi += 2;
+                    append_timetz(current_builders, column, value)?;
                 }
                 Emit::Range => {
-                    append_range(&mut self.builders[bi..bi + 5], &fields[bi..bi + 5], value)?;
-                    bi += 5;
+                    append_range(current_builders, current_fields, value, &mut self.ts_buf)?;
                 }
                 Emit::Multirange => {
-                    append_multirange(self.builders[bi].as_mut(), &fields[bi], value)?;
-                    bi += 1;
+                    let ([builder], [field]) = (current_builders, current_fields) else {
+                        return Err(downcast_error(column));
+                    };
+                    append_multirange(builder.as_mut(), field, value, &mut self.ts_buf)?;
                 }
                 Emit::Geometric(kind) => {
-                    append_geometric(self.builders[bi].as_mut(), &fields[bi], value, *kind)?;
-                    bi += 1;
+                    let ([builder], [field]) = (current_builders, current_fields) else {
+                        return Err(downcast_error(column));
+                    };
+                    append_geometric(builder.as_mut(), field, value, *kind)?;
                 }
             }
+            builders = rest;
+            remaining_fields = fields_rest;
         }
         self.append_meta(meta)?;
         self.rows += 1;
@@ -158,13 +224,15 @@ impl BatchBuilder {
     /// buffer. Byte-equivalent to `serde_json::to_string(meta)` (key order aside) — see
     /// `common::sink_meta`'s `amortized_meta_matches_full` test.
     fn append_meta(&mut self, meta: &SinkMeta) -> Result<(), Error> {
-        let meta_err = |e: serde_json::Error| Error::ValueParse {
-            column: SINK_META_COLUMN.to_string(),
-            value: e.to_string(),
-            data_type: "json".to_string(),
+        // The meta column is walrus's own JSON, never a source cell, so the serde reason is safe to
+        // print — but `value_parse` withholds its value slot from every formatter for every caller
+        // (that is the point), so the reason rides `data_type`, the slot `Display` still renders.
+        let meta_err = |e: serde_json::Error| {
+            let target = format!("json ({e})");
+            Error::value_parse(SINK_META_COLUMN, "", target)
         };
         if self.meta_const.is_none() {
-            self.meta_const = Some(meta.const_json_inner().map_err(meta_err)?);
+            self.meta_const = Some(meta.to_const_json_inner().map_err(meta_err)?);
         }
         self.meta_buf.clear();
         self.meta_buf.push('{');
@@ -181,22 +249,38 @@ impl BatchBuilder {
         Ok(())
     }
 
-    pub fn len(&self) -> usize {
+    /// Rows appended so far. This is the batch's *fill*, which the sink's size triggers read; it is
+    /// not the length of any one column builder.
+    #[must_use]
+    pub const fn len(&self) -> usize {
         self.rows
     }
 
-    pub fn is_empty(&self) -> bool {
+    /// Whether no row has been appended yet — so sealing would produce an empty file.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
         self.rows == 0
     }
 
-    /// Finish all builders into arrays and assemble the schema-checked `RecordBatch`.
-    pub fn finish(mut self) -> Result<RecordBatch, Error> {
-        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(self.builders.len() + 1);
-        for builder in &mut self.builders {
+    /// Consume the builder, finishing all column builders into arrays and assembling the
+    /// schema-checked [`RecordBatch`].
+    ///
+    /// `into_`, not `finish`: arrow-rs's [`ArrayBuilder::finish`] takes `&mut self` and leaves the
+    /// builder reusable, but this takes `self` by value and spends it — one [`BatchBuilder`] per
+    /// sealed micro-batch. The names differ because the ownership does. Callers that hold the
+    /// builder behind a `&mut` (see `pg_sink::batch::TableBatcher::seal`) must `mem::replace` it out
+    /// first; the name is what tells them so.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Arrow`] if the finished arrays do not match the planned schema or row count.
+    pub fn into_record_batch(mut self) -> Result<RecordBatch, Error> {
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(self.builders.0.len() + 1);
+        for builder in self.builders.0.iter_mut() {
             arrays.push(builder.finish());
         }
         arrays.push(Arc::new(self.meta.finish()));
-        Ok(RecordBatch::try_new(self.schema.clone(), arrays)?)
+        Ok(RecordBatch::try_new(Arc::clone(&self.schema), arrays)?)
     }
 }
 
@@ -247,22 +331,12 @@ fn struct_child_builders(
     fields.iter().map(|f| column_builder(f)).collect()
 }
 
-macro_rules! downcast {
-    ($builder:expr, $ty:ty, $col:expr) => {
-        $builder
-            .as_any_mut()
-            .downcast_mut::<$ty>()
-            .ok_or_else(|| Error::Downcast {
-                column: $col.to_string(),
-            })?
-    };
-}
-
 /// Append one `TupleValue` to one typed builder. `Null`/`UnchangedToast` → `append_null`.
 fn append_value(
     builder: &mut dyn ArrayBuilder,
     field: &Field,
     value: &TupleValue,
+    scratch: &mut String,
 ) -> Result<(), Error> {
     let col: &str = field.name();
     let dt = field.data_type();
@@ -272,76 +346,76 @@ fn append_value(
 
     match dt {
         DataType::Boolean => {
-            let b = downcast!(builder, BooleanBuilder, col);
-            match is_null {
-                true => b.append_null(),
-                false => b.append_value(parse_bool(text(value, col, dt)?, col)?),
-            }
-        }
-        DataType::Int16 => append_num::<Int16Builder, i16>(builder, value, col, dt, is_null)?,
-        DataType::Int32 => append_num::<Int32Builder, i32>(builder, value, col, dt, is_null)?,
-        DataType::Int64 => append_num::<Int64Builder, i64>(builder, value, col, dt, is_null)?,
-        DataType::Float32 => append_num::<Float32Builder, f32>(builder, value, col, dt, is_null)?,
-        DataType::Float64 => append_num::<Float64Builder, f64>(builder, value, col, dt, is_null)?,
-        DataType::Decimal128(_, scale) => {
-            let b = downcast!(builder, Decimal128Builder, col);
-            match is_null {
-                true => b.append_null(),
-                false => b.append_value(parse_decimal(text(value, col, dt)?, *scale, col)?),
-            }
-        }
-        DataType::Utf8 => {
-            let b = downcast!(builder, StringBuilder, col);
-            match is_null {
-                true => b.append_null(),
-                false => b.append_value(text(value, col, dt)?),
-            }
-        }
-        DataType::Binary => {
-            let b = downcast!(builder, BinaryBuilder, col);
+            let b = downcast::<BooleanBuilder>(builder, col)?;
             if is_null {
                 b.append_null();
             } else {
-                match value {
-                    TupleValue::Binary(bytes) => b.append_value(bytes),
-                    // bytea text is `\x…` hex under text mode.
-                    TupleValue::Text(s) => b.append_value(&parse_bytea(s, col)?),
-                    _ => unreachable!("is_null covers Null/UnchangedToast"),
-                }
+                b.append_value(parse_bool(text(value, col, dt)?, col)?);
+            }
+        }
+        DataType::Int16 => append_num::<Int16Builder>(builder, value, col, dt, is_null)?,
+        DataType::Int32 => append_num::<Int32Builder>(builder, value, col, dt, is_null)?,
+        DataType::Int64 => append_num::<Int64Builder>(builder, value, col, dt, is_null)?,
+        DataType::Float32 => append_num::<Float32Builder>(builder, value, col, dt, is_null)?,
+        DataType::Float64 => append_num::<Float64Builder>(builder, value, col, dt, is_null)?,
+        DataType::Decimal128(_, scale) => {
+            let b = downcast::<Decimal128Builder>(builder, col)?;
+            if is_null {
+                b.append_null();
+            } else {
+                b.append_value(parse_decimal(text(value, col, dt)?, *scale, col)?);
+            }
+        }
+        DataType::Utf8 => {
+            let b = downcast::<StringBuilder>(builder, col)?;
+            if is_null {
+                b.append_null();
+            } else {
+                b.append_value(text(value, col, dt)?);
+            }
+        }
+        DataType::Binary => {
+            let b = downcast::<BinaryBuilder>(builder, col)?;
+            match value {
+                TupleValue::Null | TupleValue::UnchangedToast => b.append_null(),
+                TupleValue::Binary(bytes) => b.append_value(bytes),
+                // bytea text is `\x…` hex under text mode.
+                TupleValue::Text(s) => b.append_value(&parse_bytea(s, col)?),
             }
         }
         DataType::Date32 => {
-            let b = downcast!(builder, Date32Builder, col);
-            match is_null {
-                true => b.append_null(),
-                false => b.append_value(parse_date_days(text(value, col, dt)?, col)?),
+            let b = downcast::<Date32Builder>(builder, col)?;
+            if is_null {
+                b.append_null();
+            } else {
+                b.append_value(parse_date_days(text(value, col, dt)?, col, scratch)?);
             }
         }
         DataType::Time64(TimeUnit::Microsecond) => {
-            let b = downcast!(builder, Time64MicrosecondBuilder, col);
-            match is_null {
-                true => b.append_null(),
-                false => b.append_value(parse_time_micros(text(value, col, dt)?, col)?),
+            let b = downcast::<Time64MicrosecondBuilder>(builder, col)?;
+            if is_null {
+                b.append_null();
+            } else {
+                b.append_value(parse_time_micros(text(value, col, dt)?, col, scratch)?);
             }
         }
         DataType::Timestamp(TimeUnit::Microsecond, tz) => {
-            let b = downcast!(builder, TimestampMicrosecondBuilder, col);
-            match is_null {
-                true => b.append_null(),
-                false => {
-                    let s = text(value, col, dt)?;
-                    let micros = if tz.is_some() {
-                        parse_timestamptz_micros(s, col)?
-                    } else {
-                        parse_timestamp_micros(s, col)?
-                    };
-                    b.append_value(micros);
-                }
+            let b = downcast::<TimestampMicrosecondBuilder>(builder, col)?;
+            if is_null {
+                b.append_null();
+            } else {
+                let s = text(value, col, dt)?;
+                let micros = if tz.is_some() {
+                    parse_timestamptz_micros(s, col, scratch)?
+                } else {
+                    parse_timestamp_micros(s, col, scratch)?
+                };
+                b.append_value(micros);
             }
         }
         // uuid: parse canonical text → 16 bytes, append as fixed-width binary (PR 2.16).
         DataType::FixedSizeBinary(_) => {
-            let b = downcast!(builder, FixedSizeBinaryBuilder, col);
+            let b = downcast::<FixedSizeBinaryBuilder>(builder, col)?;
             if is_null {
                 b.append_null();
             } else {
@@ -352,9 +426,7 @@ fn append_value(
         // `append_value` runs for `Emit::Scalar` (Tier-1 + Tier-3 Utf8 + uuid) columns; the Tier-2
         // fan-out shapes have their own `append_*`. So no other Arrow type reaches this arm.
         _ => {
-            return Err(Error::Downcast {
-                column: col.to_string(),
-            })
+            return Err(downcast_error(col));
         }
     }
     Ok(())
@@ -363,30 +435,33 @@ fn append_value(
 /// Fan a single `interval` value across its three sibling builders (`_months` i32, `_days` i32,
 /// `_micros` i64). NULL / unchanged-TOAST sets all three null in lockstep — the one shared logical
 /// NULL that keeps a real zero interval `(0,0,0)` distinguishable from absence (§2.4).
+#[deny(clippy::wildcard_enum_match_arm)]
 fn append_interval(
     builders: &mut [Box<dyn ArrayBuilder>],
     col: &str,
     value: &TupleValue,
 ) -> Result<(), Error> {
-    let parts = match value {
-        TupleValue::Null | TupleValue::UnchangedToast => None,
-        _ => Some(crate::tier2::parse_interval(text(
-            value,
-            col,
-            &DataType::Int64,
-        )?)?),
+    let [months_builder, days_builder, micros_builder] = builders else {
+        return Err(downcast_error(col));
     };
-    let months = downcast!(builders[0], Int32Builder, col);
+    let parts =
+        match value {
+            TupleValue::Null | TupleValue::UnchangedToast => None,
+            TupleValue::Text(_) | TupleValue::Binary(_) => Some(crate::tier2::parse_interval(
+                text(value, col, &DataType::Int64)?,
+            )?),
+        };
+    let months = downcast::<Int32Builder>(months_builder.as_mut(), col)?;
     match parts {
         Some((m, _, _)) => months.append_value(m),
         None => months.append_null(),
     }
-    let days = downcast!(builders[1], Int32Builder, col);
+    let days = downcast::<Int32Builder>(days_builder.as_mut(), col)?;
     match parts {
         Some((_, d, _)) => days.append_value(d),
         None => days.append_null(),
     }
-    let micros = downcast!(builders[2], Int64Builder, col);
+    let micros = downcast::<Int64Builder>(micros_builder.as_mut(), col)?;
     match parts {
         Some((_, _, us)) => micros.append_value(us),
         None => micros.append_null(),
@@ -395,25 +470,29 @@ fn append_interval(
 }
 
 /// Fan a single `timetz` value across `_micros` (i64) and `_offset_seconds` (i32); NULL sets both.
+#[deny(clippy::wildcard_enum_match_arm)]
 fn append_timetz(
     builders: &mut [Box<dyn ArrayBuilder>],
     col: &str,
     value: &TupleValue,
 ) -> Result<(), Error> {
+    let [micros_builder, offset_builder] = builders else {
+        return Err(downcast_error(col));
+    };
     let parts = match value {
         TupleValue::Null | TupleValue::UnchangedToast => None,
-        _ => Some(crate::tier2::parse_timetz(text(
+        TupleValue::Text(_) | TupleValue::Binary(_) => Some(crate::tier2::parse_timetz(text(
             value,
             col,
             &DataType::Int64,
         )?)?),
     };
-    let micros = downcast!(builders[0], Int64Builder, col);
+    let micros = downcast::<Int64Builder>(micros_builder.as_mut(), col)?;
     match parts {
         Some((us, _)) => micros.append_value(us),
         None => micros.append_null(),
     }
-    let offset = downcast!(builders[1], Int32Builder, col);
+    let offset = downcast::<Int32Builder>(offset_builder.as_mut(), col)?;
     match parts {
         Some((_, off)) => offset.append_value(off),
         None => offset.append_null(),
@@ -428,32 +507,58 @@ fn append_range(
     builders: &mut [Box<dyn ArrayBuilder>],
     fields: &[FieldRef],
     value: &TupleValue,
+    scratch: &mut String,
 ) -> Result<(), Error> {
-    let col = fields[0].name();
+    let col = fields.first().map_or("<unknown>", |field| field.name());
+    let [
+        lower_builder,
+        upper_builder,
+        lower_inc_builder,
+        upper_inc_builder,
+        empty_builder,
+    ] = builders
+    else {
+        return Err(downcast_error(col));
+    };
+    let [lower_field, upper_field, _, _, _] = fields else {
+        return Err(downcast_error(col));
+    };
     if matches!(value, TupleValue::Null | TupleValue::UnchangedToast) {
         // Whole-column NULL → every sibling null (bounds via append_value, flags via BooleanBuilder).
-        append_value(builders[0].as_mut(), &fields[0], &TupleValue::Null)?;
-        append_value(builders[1].as_mut(), &fields[1], &TupleValue::Null)?;
-        for b in builders[2..5].iter_mut() {
-            bool_builder(b.as_mut(), col)?.append_null();
+        append_value(
+            lower_builder.as_mut(),
+            lower_field,
+            &TupleValue::Null,
+            scratch,
+        )?;
+        append_value(
+            upper_builder.as_mut(),
+            upper_field,
+            &TupleValue::Null,
+            scratch,
+        )?;
+        for builder in [lower_inc_builder, upper_inc_builder, empty_builder] {
+            downcast::<BooleanBuilder>(builder.as_mut(), col)?.append_null();
         }
         return Ok(());
     }
-    let r = crate::range::parse_range(text(value, col, fields[0].data_type())?)?;
+    let r = crate::range::parse_range(text(value, col, lower_field.data_type())?)?;
     // Bounds reuse the Tier-1 text parsing; a `None` (unbounded) bound appends null.
     append_value(
-        builders[0].as_mut(),
-        &fields[0],
+        lower_builder.as_mut(),
+        lower_field,
         &opt_text_value(r.lower.as_deref()),
+        scratch,
     )?;
     append_value(
-        builders[1].as_mut(),
-        &fields[1],
+        upper_builder.as_mut(),
+        upper_field,
         &opt_text_value(r.upper.as_deref()),
+        scratch,
     )?;
-    bool_builder(builders[2].as_mut(), col)?.append_value(r.lower_inc);
-    bool_builder(builders[3].as_mut(), col)?.append_value(r.upper_inc);
-    bool_builder(builders[4].as_mut(), col)?.append_value(r.empty);
+    downcast::<BooleanBuilder>(lower_inc_builder.as_mut(), col)?.append_value(r.lower_inc);
+    downcast::<BooleanBuilder>(upper_inc_builder.as_mut(), col)?.append_value(r.upper_inc);
+    downcast::<BooleanBuilder>(empty_builder.as_mut(), col)?.append_value(r.empty);
     Ok(())
 }
 
@@ -464,9 +569,10 @@ fn append_multirange(
     builder: &mut dyn ArrayBuilder,
     field: &Field,
     value: &TupleValue,
+    scratch: &mut String,
 ) -> Result<(), Error> {
     let col = field.name();
-    let lb = downcast!(builder, ListBuilder<StructBuilder>, col);
+    let lb = downcast::<ListBuilder<StructBuilder>>(builder, col)?;
     if matches!(value, TupleValue::Null | TupleValue::UnchangedToast) {
         lb.append_null();
         return Ok(());
@@ -476,8 +582,8 @@ fn append_multirange(
     {
         let sb = lb.values();
         for m in &members {
-            append_struct_bound(sb, 0, &elem, m.lower.as_deref(), col)?;
-            append_struct_bound(sb, 1, &elem, m.upper.as_deref(), col)?;
+            append_struct_bound(sb, 0, &elem, m.lower.as_deref(), col, scratch)?;
+            append_struct_bound(sb, 1, &elem, m.upper.as_deref(), col, scratch)?;
             struct_field::<BooleanBuilder>(sb, 2, col)?.append_value(m.lower_inc);
             struct_field::<BooleanBuilder>(sb, 3, col)?.append_value(m.upper_inc);
             sb.append(true);
@@ -489,14 +595,13 @@ fn append_multirange(
 
 /// The element (`_lower`/`_upper`) Arrow type carried inside a multirange's `LIST<STRUCT>` field.
 fn multirange_elem_type(field: &Field) -> Result<DataType, Error> {
-    if let DataType::List(item) = field.data_type() {
-        if let DataType::Struct(fs) = item.data_type() {
-            return Ok(fs[0].data_type().clone());
-        }
+    if let DataType::List(item) = field.data_type()
+        && let DataType::Struct(fs) = item.data_type()
+        && let Some(bound) = fs.first()
+    {
+        return Ok(bound.data_type().clone());
     }
-    Err(Error::Downcast {
-        column: field.name().clone(),
-    })
+    Err(downcast_error(field.name()))
 }
 
 /// Append one multirange member bound (parsed text, or `None` = unbounded → null) to struct child `idx`.
@@ -506,23 +611,26 @@ fn append_struct_bound(
     dt: &DataType,
     bound: Option<&str>,
     col: &str,
+    scratch: &mut String,
 ) -> Result<(), Error> {
     match dt {
         DataType::Int32 => {
             let b = struct_field::<Int32Builder>(sb, idx, col)?;
             match bound {
-                Some(s) => {
-                    b.append_value(s.parse::<i32>().map_err(|_| value_err(col, s, "Int32"))?)
-                }
+                Some(s) => b.append_value(
+                    s.parse::<i32>()
+                        .map_err(|_| Error::value_parse(col, s, "Int32"))?,
+                ),
                 None => b.append_null(),
             }
         }
         DataType::Int64 => {
             let b = struct_field::<Int64Builder>(sb, idx, col)?;
             match bound {
-                Some(s) => {
-                    b.append_value(s.parse::<i64>().map_err(|_| value_err(col, s, "Int64"))?)
-                }
+                Some(s) => b.append_value(
+                    s.parse::<i64>()
+                        .map_err(|_| Error::value_parse(col, s, "Int64"))?,
+                ),
                 None => b.append_null(),
             }
         }
@@ -536,14 +644,14 @@ fn append_struct_bound(
         DataType::Date32 => {
             let b = struct_field::<Date32Builder>(sb, idx, col)?;
             match bound {
-                Some(s) => b.append_value(parse_date_days(s, col)?),
+                Some(s) => b.append_value(parse_date_days(s, col, scratch)?),
                 None => b.append_null(),
             }
         }
         DataType::Timestamp(TimeUnit::Microsecond, tz) => {
             let micros = match bound {
-                Some(s) if tz.is_some() => Some(parse_timestamptz_micros(s, col)?),
-                Some(s) => Some(parse_timestamp_micros(s, col)?),
+                Some(s) if tz.is_some() => Some(parse_timestamptz_micros(s, col, scratch)?),
+                Some(s) => Some(parse_timestamp_micros(s, col, scratch)?),
                 None => None,
             };
             let b = struct_field::<TimestampMicrosecondBuilder>(sb, idx, col)?;
@@ -564,9 +672,7 @@ fn append_struct_bound(
             }
         }
         _ => {
-            return Err(Error::Downcast {
-                column: col.to_string(),
-            })
+            return Err(downcast_error(col));
         }
     }
     Ok(())
@@ -578,22 +684,50 @@ fn struct_field<'a, T: ArrayBuilder>(
     idx: usize,
     col: &str,
 ) -> Result<&'a mut T, Error> {
-    sb.field_builder::<T>(idx).ok_or_else(|| Error::Downcast {
-        column: col.to_string(),
-    })
+    sb.field_builder::<T>(idx)
+        .ok_or_else(|| downcast_error(col))
 }
 
-/// Downcast a boxed builder to `BooleanBuilder` (the range inclusivity / empty flags).
-fn bool_builder<'a>(
+/// Typed accessor for a `dyn` column builder, attributing a downcast failure to the column.
+///
+/// The generic sibling of [`struct_field`]: that one reaches into a `StructBuilder` child, this one
+/// re-types a whole column builder.
+fn downcast<'a, T: ArrayBuilder>(
     builder: &'a mut dyn ArrayBuilder,
     col: &str,
-) -> Result<&'a mut BooleanBuilder, Error> {
+) -> Result<&'a mut T, Error> {
     builder
         .as_any_mut()
-        .downcast_mut::<BooleanBuilder>()
-        .ok_or_else(|| Error::Downcast {
-            column: col.to_string(),
-        })
+        .downcast_mut::<T>()
+        .ok_or_else(|| downcast_error(col))
+}
+
+/// Build the "builder does not match the plan" error for a column.
+///
+/// A downcast failure is a `plan`/`builders` disagreement — an invariant break, never a per-row data
+/// outcome — so `#[cold]` marks every branch reaching it as unlikely and `#[inline(never)]` keeps the
+/// owned-`String` construction out of the 460 ns/row append path. It matters most for [`downcast`]
+/// and [`struct_field`], which are generic: without this the allocation is re-emitted into every
+/// builder-type instantiation *and* every call site. `batch_test.rs` pins the column name payload.
+#[cold]
+#[inline(never)]
+fn downcast_error(col: &str) -> Error {
+    Error::Downcast {
+        column: col.to_string(),
+    }
+}
+
+/// Build the "tuple width does not match the relation" error for [`BatchBuilder::append_row`].
+///
+/// The sibling of [`downcast_error`], and cold for the same reason: a width mismatch is a caller
+/// invariant break — every row of one relation has the same width — never a per-row data outcome. It
+/// guards the *entry* of the 460 ns/row append path, so `#[cold]` is what keeps that first branch
+/// from being laid out alongside the per-column loop it precedes. The payload is two `usize` moves
+/// with no allocation, so `#[inline(never)]` would add nothing on top. `batch_test.rs` pins the
+/// expected/got payload.
+#[cold]
+const fn row_len_error(expected: usize, got: usize) -> Error {
+    Error::RowLenMismatch { expected, got }
 }
 
 /// A range bound as a `TupleValue`: `Some(text)` → `Text`, `None` (unbounded) → `Null` (→ append_null).
@@ -607,6 +741,7 @@ fn opt_text_value(bound: Option<&str>) -> TupleValue {
 /// Append one geometric value onto its single nested builder. Each shape appends to *every* leaf for
 /// every row (a NULL appends nulls to all leaves + closes the struct/list null), keeping the nested
 /// child arrays length-locked — the invariant `StructBuilder` requires.
+#[deny(clippy::wildcard_enum_match_arm)]
 fn append_geometric(
     builder: &mut dyn ArrayBuilder,
     field: &Field,
@@ -617,16 +752,16 @@ fn append_geometric(
     let col = field.name();
     let s = match value {
         TupleValue::Null | TupleValue::UnchangedToast => None,
-        _ => Some(text(value, col, field.data_type())?),
+        TupleValue::Text(_) | TupleValue::Binary(_) => Some(text(value, col, field.data_type())?),
     };
     match kind {
         GeoKind::Point => {
-            let sb = downcast!(builder, StructBuilder, col);
+            let sb = downcast::<StructBuilder>(builder, col)?;
             let pt = s.map(geo::parse_point).transpose()?;
             push_doubles(sb, &[pt.map(|p| p.x), pt.map(|p| p.y)], col)?;
         }
         GeoKind::Line => {
-            let sb = downcast!(builder, StructBuilder, col);
+            let sb = downcast::<StructBuilder>(builder, col)?;
             let abc = s.map(geo::parse_line).transpose()?;
             push_doubles(
                 sb,
@@ -635,7 +770,7 @@ fn append_geometric(
             )?;
         }
         GeoKind::Circle => {
-            let sb = downcast!(builder, StructBuilder, col);
+            let sb = downcast::<StructBuilder>(builder, col)?;
             let xyr = s.map(geo::parse_circle).transpose()?;
             push_doubles(
                 sb,
@@ -644,18 +779,18 @@ fn append_geometric(
             )?;
         }
         GeoKind::Lseg | GeoKind::Box => {
-            let sb = downcast!(builder, StructBuilder, col);
+            let sb = downcast::<StructBuilder>(builder, col)?;
             let pts = s.map(geo::parse_box).transpose()?;
             push_point_child(sb, 0, pts.map(|(a, _)| a), col)?;
             push_point_child(sb, 1, pts.map(|(_, b)| b), col)?;
             sb.append(pts.is_some());
         }
         GeoKind::Path => {
-            let sb = downcast!(builder, StructBuilder, col);
+            let sb = downcast::<StructBuilder>(builder, col)?;
             let parsed = s.map(geo::parse_path).transpose()?;
             match &parsed {
                 Some((closed, _)) => {
-                    struct_field::<BooleanBuilder>(sb, 0, col)?.append_value(*closed)
+                    struct_field::<BooleanBuilder>(sb, 0, col)?.append_value(*closed);
                 }
                 None => struct_field::<BooleanBuilder>(sb, 0, col)?.append_null(),
             }
@@ -669,7 +804,7 @@ fn append_geometric(
             sb.append(parsed.is_some());
         }
         GeoKind::Polygon => {
-            let lb = downcast!(builder, ListBuilder<StructBuilder>, col);
+            let lb = downcast::<ListBuilder<StructBuilder>>(builder, col)?;
             match s {
                 Some(t) => push_points_list(lb, &geo::parse_polygon(t)?, col)?,
                 None => lb.append_null(),
@@ -720,7 +855,7 @@ fn push_points_list(
 }
 
 /// Append a parsed number to a `FromStr` builder, attributing a failure to the column.
-fn append_num<B, T>(
+fn append_num<B>(
     builder: &mut dyn ArrayBuilder,
     value: &TupleValue,
     col: &str,
@@ -728,88 +863,96 @@ fn append_num<B, T>(
     is_null: bool,
 ) -> Result<(), Error>
 where
-    B: ArrayBuilder + ArrowNumBuilder<T>,
-    T: std::str::FromStr,
+    B: ArrayBuilder + ArrowNumBuilder,
 {
-    let b = builder
-        .as_any_mut()
-        .downcast_mut::<B>()
-        .ok_or_else(|| Error::Downcast {
-            column: col.to_string(),
-        })?;
+    let b = downcast::<B>(builder, col)?;
     if is_null {
         b.append_null_val();
     } else {
         let s = text(value, col, dt)?;
-        let parsed = s.parse::<T>().map_err(|_| Error::ValueParse {
-            column: col.to_string(),
-            value: s.to_string(),
-            data_type: dt.to_string(),
-        })?;
+        let parsed = s
+            .parse::<B::Val>()
+            .map_err(|_| Error::value_parse(col, s, dt.to_string()))?;
         b.append_val(parsed);
     }
     Ok(())
 }
 
-/// Tiny bridge so `append_num` can be generic over the numeric builders.
-trait ArrowNumBuilder<T> {
-    fn append_val(&mut self, v: T);
+/// Tiny bridge so `append_num` can be generic over the numeric builders. Each Arrow numeric
+/// builder accepts exactly one Rust scalar, so the value type is associated with the builder.
+trait ArrowNumBuilder {
+    /// The one scalar this builder appends.
+    type Val: std::str::FromStr;
+
+    fn append_val(&mut self, v: Self::Val);
     fn append_null_val(&mut self);
 }
-macro_rules! num_builder {
-    ($b:ty, $t:ty) => {
-        impl ArrowNumBuilder<$t> for $b {
-            fn append_val(&mut self, v: $t) {
-                self.append_value(v);
-            }
-            fn append_null_val(&mut self) {
-                self.append_null();
-            }
-        }
-    };
-}
-num_builder!(Int16Builder, i16);
-num_builder!(Int32Builder, i32);
-num_builder!(Int64Builder, i64);
-num_builder!(Float32Builder, f32);
-num_builder!(Float64Builder, f64);
 
-/// Extract the text of a value (for the text-format Tier-1 types).
-fn text<'a>(value: &'a TupleValue, col: &str, dt: &DataType) -> Result<&'a str, Error> {
-    match value {
-        TupleValue::Text(s) => Ok(s),
-        other => Err(Error::ValueParse {
-            column: col.to_string(),
-            value: format!("{other:?}"),
-            data_type: dt.to_string(),
-        }),
+/// One impl for every Arrow primitive builder whose native scalar parses from text.
+///
+/// `Int16Builder` … `Float64Builder` are not five unrelated types needing five hand-written (or
+/// macro-expanded) impls: each is an alias for `PrimitiveBuilder<T>`, whose inherent
+/// `append_value`/`append_null` are themselves generic over `T: ArrowPrimitiveType`. The bound is
+/// therefore all the bodies below need, and a numeric Arrow type added to [`append_value`]'s
+/// dispatch gets its impl for free.
+///
+/// `T::Native: FromStr` is the gate: it excludes the builders whose native scalar has no text
+/// parse (`i256`, the interval structs) and it is what lets `Val` satisfy the trait's own bound.
+/// The impl does cover more builders than [`append_num`] is called with — `Date32Builder` is also
+/// `PrimitiveBuilder<_>` over an `i32` — but which builder a column reaches is decided by the
+/// `DataType` arm in [`append_value`], and the temporal/decimal arms bind their own converters
+/// instead of `str::parse`. Being blanket, this also forecloses a per-builder override (E0119),
+/// which is the intent: every numeric builder appends through the same two forwarding calls.
+impl<T> ArrowNumBuilder for PrimitiveBuilder<T>
+where
+    T: ArrowPrimitiveType,
+    T::Native: std::str::FromStr,
+{
+    type Val = T::Native;
+
+    fn append_val(&mut self, v: Self::Val) {
+        self.append_value(v);
     }
+    fn append_null_val(&mut self) {
+        self.append_null();
+    }
+}
+
+/// Extract the text of a value (for the text-format Tier-1 types). The non-text images are listed
+/// rather than absorbed by a wildcard, so a new `TupleValue` variant is a compile error here — the
+/// same rule its callers above already follow.
+///
+/// The image *kind* is walrus's own wire vocabulary and is the whole diagnostic here, so it rides
+/// `data_type` next to the target type; `{value:?}` no longer names it, because the payload behind
+/// `Binary` is a verbatim source cell and the value slot is withheld from every formatter.
+#[deny(clippy::wildcard_enum_match_arm)]
+fn text<'a>(value: &'a TupleValue, col: &str, dt: &DataType) -> Result<&'a str, Error> {
+    let kind = match value {
+        TupleValue::Text(s) => return Ok(s),
+        TupleValue::Null => "null",
+        TupleValue::UnchangedToast => "unchanged-toast",
+        TupleValue::Binary(_) => "binary",
+    };
+    let target = format!("{dt} (from a {kind} image)");
+    Err(Error::value_parse(col, "", target))
 }
 
 fn parse_bool(s: &str, col: &str) -> Result<bool, Error> {
     match s {
         "t" | "true" => Ok(true),
         "f" | "false" => Ok(false),
-        _ => Err(Error::ValueParse {
-            column: col.to_string(),
-            value: s.to_string(),
-            data_type: "Boolean".to_string(),
-        }),
+        _ => Err(Error::value_parse(col, s, "Boolean")),
     }
 }
 
 /// Parse `"19.99"` at the field's scale into the unscaled `i128`. Rejects a value carrying more
 /// fractional digits than the declared scale (rounding is out of scope).
 fn parse_decimal(s: &str, scale: i8, col: &str) -> Result<i128, Error> {
-    let err = || Error::ValueParse {
-        column: col.to_string(),
-        value: s.to_string(),
-        data_type: format!("Decimal128(scale {scale})"),
-    };
+    let err = || Error::value_parse(col, s, format!("Decimal128(scale {scale})"));
     if scale < 0 {
         return Err(err());
     }
-    let scale = scale as usize;
+    let scale = usize::try_from(scale).map_err(|_| err())?;
     let (sign, rest) = match s.strip_prefix('-') {
         Some(r) => (-1i128, r),
         None => (1, s.strip_prefix('+').unwrap_or(s)),
@@ -824,71 +967,73 @@ fn parse_decimal(s: &str, scale: i8, col: &str) -> Result<i128, Error> {
     let mut digits = String::with_capacity(int_part.len() + scale);
     digits.push_str(int_part);
     digits.push_str(frac_part);
-    for _ in 0..(scale - frac_part.len()) {
-        digits.push('0');
-    }
+    digits.extend(std::iter::repeat_n('0', scale - frac_part.len()));
     let magnitude: i128 = digits.parse().map_err(|_| err())?;
     Ok(sign * magnitude)
 }
 
 fn parse_bytea(s: &str, col: &str) -> Result<Vec<u8>, Error> {
-    let hex = s.strip_prefix("\\x").ok_or_else(|| Error::ValueParse {
-        column: col.to_string(),
-        value: s.to_string(),
-        data_type: "Binary".to_string(),
-    })?;
-    hex::decode(hex).map_err(|_| Error::ValueParse {
-        column: col.to_string(),
-        value: s.to_string(),
-        data_type: "Binary".to_string(),
-    })
+    let hex = s
+        .strip_prefix("\\x")
+        .ok_or_else(|| Error::value_parse(col, s, "Binary"))?;
+    hex::decode(hex).map_err(|_| Error::value_parse(col, s, "Binary"))
 }
 
 /// Micros since the Unix epoch for an RFC-3339 string.
 fn rfc3339_micros(s: &str) -> Option<i64> {
     s.parse::<jiff::Timestamp>()
         .ok()
-        .map(|t| t.as_microsecond())
+        .map(jiff::Timestamp::as_microsecond)
 }
 
-fn value_err(col: &str, s: &str, dt: &str) -> Error {
-    Error::ValueParse {
-        column: col.to_string(),
-        value: s.to_string(),
-        data_type: dt.to_string(),
-    }
-}
-
-/// `"2024-01-02"` → days since 1970-01-01.
-fn parse_date_days(s: &str, col: &str) -> Result<i32, Error> {
-    let micros =
-        rfc3339_micros(&format!("{s}T00:00:00Z")).ok_or_else(|| value_err(col, s, "Date32"))?;
-    i32::try_from(micros / 86_400_000_000).map_err(|_| value_err(col, s, "Date32"))
+/// `"2024-01-02"` → days since 1970-01-01, using a cleared and reused RFC-3339 scratch buffer.
+fn parse_date_days(s: &str, col: &str, scratch: &mut String) -> Result<i32, Error> {
+    scratch.clear();
+    scratch.push_str(s);
+    scratch.push_str("T00:00:00Z");
+    let micros = rfc3339_micros(scratch).ok_or_else(|| Error::value_parse(col, s, "Date32"))?;
+    i32::try_from(micros / 86_400_000_000).map_err(|_| Error::value_parse(col, s, "Date32"))
 }
 
 /// `"03:04:05.678901"` → micros since midnight.
-fn parse_time_micros(s: &str, col: &str) -> Result<i64, Error> {
-    rfc3339_micros(&format!("1970-01-01T{s}Z")).ok_or_else(|| value_err(col, s, "Time64"))
+fn parse_time_micros(s: &str, col: &str, scratch: &mut String) -> Result<i64, Error> {
+    scratch.clear();
+    scratch.push_str("1970-01-01T");
+    scratch.push_str(s);
+    scratch.push('Z');
+    rfc3339_micros(scratch).ok_or_else(|| Error::value_parse(col, s, "Time64"))
 }
 
 /// `"2024-01-02 03:04:05.678901"` (no offset) → micros since epoch, treated as UTC.
-fn parse_timestamp_micros(s: &str, col: &str) -> Result<i64, Error> {
-    let normalized = s.replacen(' ', "T", 1);
-    rfc3339_micros(&format!("{normalized}Z")).ok_or_else(|| value_err(col, s, "Timestamp"))
+fn parse_timestamp_micros(s: &str, col: &str, scratch: &mut String) -> Result<i64, Error> {
+    scratch.clear();
+    scratch.push_str(s);
+    if let Some(i) = scratch.find(' ') {
+        scratch.replace_range(i..i + 1, "T");
+    }
+    scratch.push('Z');
+    rfc3339_micros(scratch).ok_or_else(|| Error::value_parse(col, s, "Timestamp"))
 }
 
-/// Canonical Postgres `timestamptz` (`"…+00"`, already UTC upstream) → micros since epoch.
-fn parse_timestamptz_micros(s: &str, col: &str) -> Result<i64, Error> {
-    let mut n = s.replacen(' ', "T", 1);
-    // Postgres prints whole-hour offsets as `+HH`; jiff wants `+HH:MM`.
-    if let Some(t) = n.find('T') {
-        if let Some(sign) = n[t..].rfind(['+', '-']) {
-            if n[t + sign..].len() == 3 {
-                n.push_str(":00");
-            }
-        }
+/// Canonical Postgres `timestamptz` (`"…+00"`, already UTC upstream) → micros since epoch, through
+/// the same cleared and reused scratch its offset-less sibling uses — a `replacen` here would mean a
+/// fresh `String` per timestamptz cell, i.e. once per row per column.
+fn parse_timestamptz_micros(s: &str, col: &str, scratch: &mut String) -> Result<i64, Error> {
+    scratch.clear();
+    scratch.push_str(s);
+    if let Some(i) = scratch.find(' ') {
+        scratch.replace_range(i..i + 1, "T");
     }
-    rfc3339_micros(&n).ok_or_else(|| value_err(col, s, "TimestampTz"))
+    // Postgres prints whole-hour offsets as `+HH`; jiff wants `+HH:MM`.
+    if let Some(t) = scratch.find('T')
+        && let Some(sign) = scratch.get(t..).and_then(|suffix| suffix.rfind(['+', '-']))
+        && t.checked_add(sign)
+            .and_then(|start| scratch.get(start..))
+            .is_some_and(|offset| offset.len() == 3)
+    {
+        scratch.push_str(":00");
+    }
+    rfc3339_micros(scratch).ok_or_else(|| Error::value_parse(col, s, "TimestampTz"))
 }
 
 #[cfg(test)]

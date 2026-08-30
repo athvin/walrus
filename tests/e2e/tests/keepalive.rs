@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! End-to-end keepalive-vs-durability (`architecture.md` "Keepalive vs durability" + §1.9): stall the S3
 //! flush past `wal_sender_timeout` and assert keepalive feedback keeps the walsender **connected** (no
 //! `terminating walsender` reconnect churn) while `confirmed_flush_lsn` does **not** advance until the
@@ -63,11 +67,11 @@ async fn stalled_flush_keeps_connection_without_advancing() {
 
     // (1) Connected past the timeout — no `terminating walsender` reconnect churn.
     assert!(
-        h.slot_active().await.unwrap(),
+        h.is_slot_active().await.unwrap(),
         "walsender stays connected past wal_sender_timeout during the stall (keepalive)"
     );
     assert!(
-        h.sink_running(),
+        h.is_sink_running(),
         "the sink did not exit — the replication connection was not severed"
     );
     assert!(

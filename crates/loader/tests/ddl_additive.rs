@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Additive/lossless DDL apply (loader §5.7, architecture per-change-type). The four hermetic tests
 //! (`Connection::open_in_memory()` via `TableDb`) prove the schema-DIFF + DuckDB `ALTER`s per taxonomy
 //! row; the `#[ignore]` compose test proves both tables evolve at the correct LSN relative to data.
@@ -6,11 +11,11 @@
 //!   cargo test -p loader --test ddl_additive              # hermetic
 //!   cargo test -p loader --test ddl_additive -- --ignored # + compose
 
-use common::{PgColumn, PgRelation, ReplicaIdentity};
-use loader::ddl::{apply_additive, diff_additive, AdditiveChange, CommentTarget, SchemaVersion};
+use common::{EpochNo, PgColumn, PgRelation, ReplicaIdentity};
+use loader::ddl::{AdditiveChange, CommentTarget, SchemaVersion, apply_additive, diff_additive};
 use loader::duck::{S3Access, TableDb};
 use loader::health::LoaderState;
-use loader::phase_a::{run_phase_a, TableCtx};
+use loader::phase_a::{TableCtx, run_phase_a};
 use loader::phase_b::run_phase_b;
 use std::time::Duration;
 
@@ -33,13 +38,16 @@ fn rel(name: &str, columns: Vec<PgColumn>) -> PgRelation {
     }
 }
 
-fn sv(version: i64, relation: PgRelation) -> SchemaVersion {
-    SchemaVersion { version, relation }
+const fn sv(version: i64, relation: PgRelation) -> SchemaVersion {
+    SchemaVersion {
+        version: common::SchemaVersionNo(version),
+        relation,
+    }
 }
 
 fn mem(rel: &PgRelation) -> TableDb {
-    let db = TableDb::open(std::path::Path::new(":memory:")).unwrap();
-    db.ensure_tables(rel, 1).unwrap();
+    let db = TableDb::open(":memory:").unwrap();
+    db.ensure_tables(rel, common::SchemaVersionNo(1)).unwrap();
     db
 }
 
@@ -348,23 +356,24 @@ fn orders_v2() -> PgRelation {
     )
 }
 
-fn tmpdir(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("walrus-loader-ddl-{name}"));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+/// A scratch directory for one test's `.duckdb` file. The returned guard deletes it on drop — even
+/// when an assertion panics, which a trailing `remove_dir_all` would skip.
+fn tmpdir(name: &str) -> tempfile::TempDir {
+    let prefix = format!("walrus-loader-ddl-{name}-");
+    tempfile::Builder::new().prefix(&prefix).tempdir().unwrap()
 }
 
 fn meta(op: &str, commit_hex: &str, l: u64) -> String {
     format!(
         "{{\"op\":\"{op}\",\"commit_lsn\":\"{commit_hex}\",\"lsn\":\"{:016X}\",\"sink_processed_at\":\"2026-07-07T12:00:{:02}Z\"}}",
-        l, l % 60
+        l,
+        l % 60
     )
 }
 
 /// Write a homogeneous Parquet fixture to S3. `with_note` = the v2 shape (adds the `note` column).
 fn write_fixture(
-    epoch: i64,
+    epoch: EpochNo,
     tag: &str,
     with_note: bool,
     rows: &[(i64, &str, &str, &str, u64)],
@@ -375,7 +384,10 @@ fn write_fixture(
         "INSTALL httpfs; LOAD httpfs; SET s3_region='{}'; SET s3_endpoint='{}'; \
          SET s3_url_style='path'; SET s3_use_ssl=false; \
          SET s3_access_key_id='{}'; SET s3_secret_access_key='{}';",
-        a.region, a.endpoint, a.access_key_id, a.secret_access_key
+        a.region,
+        a.endpoint,
+        a.access_key_id,
+        a.secret_access_key.expose()
     ))
     .unwrap();
     if with_note {
@@ -424,7 +436,7 @@ fn mirror3(ctx: &TableCtx) -> Vec<(i64, String, Option<String>)> {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
     let _g = LOCK.lock().await;
-    let epoch = 3_800_001;
+    let epoch = EpochNo(3_800_001);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     for tbl in [
@@ -444,7 +456,7 @@ async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
             epoch,
             slot_name: "walrus_slot".into(),
             created_lsn: "0/0".parse().unwrap(),
-            status: "streaming".into(),
+            status: control::ReplicationStatus::Streaming,
         },
     )
     .await
@@ -461,7 +473,7 @@ async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
                 epoch,
                 source_schema: "public".into(),
                 source_table: "orders".into(),
-                schema_version: v,
+                schema_version: common::SchemaVersionNo(v),
                 descriptors: Vec::new(),
                 columns: serde_json::to_value(&r).unwrap(),
             },
@@ -496,7 +508,7 @@ async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
                 row_count: 2,
                 lsn_start: lsn.parse().unwrap(),
                 lsn_end: lsn.parse().unwrap(),
-                schema_version: ver,
+                schema_version: common::SchemaVersionNo(ver),
                 reload_id: None,
             },
         )
@@ -506,18 +518,21 @@ async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
 
     // The loader starts at the v1 shape (a fresh .duckdb); Phase A reconciles across the boundary.
     let dir = tmpdir(&epoch.to_string());
-    let db = TableDb::open(&dir.join("orders.duckdb")).unwrap();
-    db.ensure_tables(&orders_v1(), 1).unwrap();
+    let db = TableDb::open(dir.path().join("orders.duckdb")).unwrap();
+    db.ensure_tables(&orders_v1(), common::SchemaVersionNo(1))
+        .unwrap();
     db.configure_s3(&s3()).unwrap();
     let ctx = TableCtx {
         pool,
         epoch,
+        epoch_rx: loader::epoch::fixed_epoch_watch(epoch),
         schema: "public".into(),
         table: "orders".into(),
+        series: "public.orders".into(),
         rel: orders_v1(),
         db,
         state: LoaderState::new(),
-        max_files: 100,
+        max_files: std::num::NonZeroI64::new(100).unwrap(),
         poll_interval: Duration::from_secs(5),
         compaction_interval: Duration::from_secs(3600),
         retention_lsn_lag: 16 << 20,
@@ -528,7 +543,7 @@ async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
     run_phase_a(&ctx).await.unwrap();
     assert_eq!(
         ctx.db.schema_version().unwrap(),
-        2,
+        common::SchemaVersionNo(2),
         "Phase A reconciled to v2 before appending the v2 file (DDL applied at the boundary)"
     );
     run_phase_b(&ctx).await.unwrap();
@@ -548,6 +563,4 @@ async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
         view.iter().any(|c| c == "note") && !view.iter().any(|c| c.starts_with("_applied")),
         "view evolved with the mirror, guard cols still hidden: {view:?}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -18,11 +18,18 @@ use common::{Lsn, PgColumn, PgRelation, ReplicaIdentity, TupleValue};
 /// streamed block (proto §7): Relation, Type, Insert, Update, Delete, Truncate, Message.
 const XID_PREFIXED: &[u8] = b"RYIUDTM";
 
+/// Convert an Int32 protocol length/count to the platform index width without wrapping.
+fn wire_usize(raw: u32) -> usize {
+    usize::try_from(raw).unwrap_or(usize::MAX)
+}
+
 /// Whether we are inside a Stream Start..Stop block. The per-message xid prefix (proto §7) exists
 /// **only** while this is true; Stream Start/Stop toggle it (from PR 2.7). It is threaded through
 /// [`parse_stream`] so context carries across messages.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StreamCtx {
+    /// Whether a Stream Start has been seen without its matching Stream Stop. While true, every
+    /// message carries an xid prefix, so the decoder must read one.
     pub in_stream: bool,
 }
 
@@ -30,8 +37,31 @@ pub struct StreamCtx {
 /// row (FULL identity).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OldTupleKind {
+    /// `'K'` — only the replica-identity key columns are present; every other value is absent.
     Key,
+    /// `'O'` — the complete old row, which the source sends only under `REPLICA IDENTITY FULL`.
     Full,
+}
+
+impl TryFrom<u8> for OldTupleKind {
+    type Error = DecodeError;
+
+    /// Classify the old-image submessage tag that precedes an Update/Delete tuple.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError::BadTupleFormat`] carrying `tag` for any byte other than `b'K'` or
+    /// `b'O'`; the frame is then unparseable, so this is terminal rather than skippable.
+    fn try_from(tag: u8) -> Result<Self, Self::Error> {
+        match tag {
+            b'K' => Ok(Self::Key),
+            b'O' => Ok(Self::Full),
+            other => {
+                std::hint::cold_path();
+                Err(DecodeError::BadTupleFormat { byte: other })
+            }
+        }
+    }
 }
 
 /// One decoded pgoutput message. Variants are added family-by-family in PRs 2.2–2.8:
@@ -180,6 +210,19 @@ pub enum Message {
     },
 }
 
+/// Move-cost budget for the one-message-per-decoded-WAL-record hot path (`own-move-large`).
+///
+/// Measured with `size_of::<Message>()` on PR 9.7. If this trips, shrink the type, box the growing
+/// variant in Phase 11, or raise the measured budget deliberately in review.
+const MESSAGE_MAX_BYTES: usize = 88;
+const _: () = assert!(size_of::<Message>() <= MESSAGE_MAX_BYTES);
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+    size_of::<Option<Vec<TupleValue>>>() == size_of::<Vec<TupleValue>>(),
+    "Option<Vec<TupleValue>> lost its niche; revisit docs/implementation/notes/rust-skills/mem-thinvec.md"
+);
+
 impl Message {
     /// For a [`Message::StreamAbort`]: `Some(true)` when the WHOLE transaction aborted (`top == sub`,
     /// §9a — drop everything), `Some(false)` for a rolled-back savepoint inside a committing txn
@@ -187,6 +230,7 @@ impl Message {
     pub fn is_whole_txn_abort(&self) -> Option<bool> {
         match self {
             Message::StreamAbort { top_xid, sub_xid } => Some(top_xid == sub_xid),
+            // Wildcard is deliberate: Message is #[non_exhaustive], and this helper ignores other families.
             _ => None,
         }
     }
@@ -197,6 +241,9 @@ impl Message {
 fn expect_n(reader: &mut Reader<'_>) -> Result<(), DecodeError> {
     let b = reader.byte1()?;
     if b != b'N' {
+        // A well-formed walsender stream never leaves the protocol's closed framing set.
+        // `cold_path` is stable on the Rust 1.95.0 toolchain pinned by this workspace.
+        std::hint::cold_path();
         return Err(DecodeError::BadTupleFormat { byte: b });
     }
     Ok(())
@@ -207,25 +254,33 @@ fn expect_n(reader: &mut Reader<'_>) -> Result<(), DecodeError> {
 /// wire), `'t'` → [`TupleValue::Text`] (Int32 length + UTF-8 bytes), `'b'` →
 /// [`TupleValue::Binary`] (Int32 length + bytes). An unexpected tag means the cursor misaligned →
 /// [`DecodeError::BadTupleFormat`] (fail loud, never guess). Shared by Insert/Update/Delete.
+///
+/// # Errors
+///
+/// Returns [`DecodeError::UnexpectedEof`] for truncated data, [`DecodeError::BadTupleFormat`] for an
+/// invalid marker, or [`DecodeError::Utf8`] for invalid textual values.
 pub fn parse_tuple(reader: &mut Reader<'_>) -> Result<Vec<TupleValue>, DecodeError> {
     let ncols = reader.int16()?;
-    let mut cols = Vec::with_capacity(ncols as usize);
+    let mut cols = Vec::with_capacity(usize::from(ncols));
     for _ in 0..ncols {
         let value = match reader.byte1()? {
             b'n' => TupleValue::Null,
             b'u' => TupleValue::UnchangedToast, // one byte total — no length, no value
             b't' => {
-                let len = reader.int32()? as usize;
-                let bytes = reader.take(len)?;
+                let len = wire_usize(reader.int32()?);
                 // `t` is the value's *text* representation; interpreting it (numeric? enum label?)
-                // is the type layer's job (pg-to-arrow). Here we only require valid UTF-8.
-                TupleValue::Text(std::str::from_utf8(&bytes)?.to_string())
+                // is the type layer's job (pg-to-arrow). Validate UTF-8 on the borrowed frame, then
+                // allocate only the owned String that must outlive it.
+                TupleValue::Text(reader.str(len)?.to_string())
             }
             b'b' => {
-                let len = reader.int32()? as usize;
+                let len = wire_usize(reader.int32()?);
                 TupleValue::Binary(reader.take(len)?)
             }
-            other => return Err(DecodeError::BadTupleFormat { byte: other }),
+            other => {
+                std::hint::cold_path();
+                return Err(DecodeError::BadTupleFormat { byte: other });
+            }
         };
         cols.push(value);
     }
@@ -236,11 +291,25 @@ pub fn parse_tuple(reader: &mut Reader<'_>) -> Result<Vec<TupleValue>, DecodeErr
 /// consulted from PR 2.3 onward (the xid prefix); Begin/Commit/Origin are never xid-prefixed —
 /// they *are* the transaction frame.
 fn parse_one(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Message, DecodeError> {
+    // Changing this count changes how the same streamed bytes are framed and decoded.
+    const {
+        assert!(
+            XID_PREFIXED.len() == 7,
+            "proto v2 §7 requires exactly 7 xid-prefixed tags (RYIUDTM) or streamed bytes misalign"
+        );
+    }
+
     let tag = reader.byte1()?;
     // The per-message (sub-transaction) xid prefix exists only while streaming (proto §7/§9b). The
     // same bytes therefore parse differently in vs. out of a stream. Begin/Commit/Origin are the
     // txn frame itself and are never prefixed.
-    let xid = if XID_PREFIXED.contains(&tag) && ctx.in_stream {
+    //
+    // `ctx.in_stream` leads deliberately (`opt-likely-hint`): only a txn over
+    // `logical_decoding_work_mem` streams, so on the overwhelmingly common non-streamed path this
+    // one bool short-circuits the test. `<[u8]>::contains` is specialised to a memchr scan, and
+    // leading with it paid that scan for every decoded message only to discard the answer. Both
+    // operands are pure reads, so the order is purely which path is laid out short.
+    let xid = if ctx.in_stream && XID_PREFIXED.contains(&tag) {
         Some(reader.int32()?)
     } else {
         None
@@ -266,10 +335,10 @@ fn parse_one(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Message, De
             let schema = reader.string()?;
             let name = reader.string()?;
             let ident_byte = reader.byte1()?;
-            let replica_identity = ReplicaIdentity::from_wire(ident_byte)
+            let replica_identity = ReplicaIdentity::try_from(ident_byte)
                 .map_err(|_| DecodeError::BadReplicaIdentity { byte: ident_byte })?;
             let ncols = reader.int16()?;
-            let mut columns = Vec::with_capacity(ncols as usize);
+            let mut columns = Vec::with_capacity(usize::from(ncols));
             for _ in 0..ncols {
                 let flags = reader.byte1()?;
                 let col_name = reader.string()?;
@@ -304,6 +373,7 @@ fn parse_one(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Message, De
             // A fixed `'N'` marker precedes the new tuple; a mismatch is an upstream framing error.
             let marker = reader.byte1()?;
             if marker != b'N' {
+                std::hint::cold_path();
                 return Err(DecodeError::BadTupleFormat { byte: marker });
             }
             Ok(Message::Insert {
@@ -317,18 +387,13 @@ fn parse_one(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Message, De
             // Branch on the byte AFTER the OID: 'K'/'O' → an old image (then a 'N' before the new
             // tuple); 'N' → no old image, and the 'N' we just read IS the new-tuple marker.
             let (old_kind, old) = match reader.byte1()? {
-                b'K' => {
-                    let old = parse_tuple(reader)?;
-                    expect_n(reader)?;
-                    (Some(OldTupleKind::Key), Some(old))
-                }
-                b'O' => {
-                    let old = parse_tuple(reader)?;
-                    expect_n(reader)?;
-                    (Some(OldTupleKind::Full), Some(old))
-                }
                 b'N' => (None, None),
-                other => return Err(DecodeError::BadTupleFormat { byte: other }),
+                tag => {
+                    let kind = OldTupleKind::try_from(tag)?;
+                    let old = parse_tuple(reader)?;
+                    expect_n(reader)?;
+                    (Some(kind), Some(old))
+                }
             };
             Ok(Message::Update {
                 xid,
@@ -340,11 +405,7 @@ fn parse_one(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Message, De
         }
         b'D' => {
             let relation_oid = reader.int32()?;
-            let old_kind = match reader.byte1()? {
-                b'K' => OldTupleKind::Key,
-                b'O' => OldTupleKind::Full,
-                other => return Err(DecodeError::BadTupleFormat { byte: other }),
-            };
+            let old_kind: OldTupleKind = reader.byte1()?.try_into()?;
             Ok(Message::Delete {
                 xid,
                 relation_oid,
@@ -353,7 +414,7 @@ fn parse_one(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Message, De
             })
         }
         b'T' => {
-            let nrel = reader.int32()? as usize;
+            let nrel = wire_usize(reader.int32()?);
             let opt = reader.byte1()?;
             // Fixed-count array: the count IS the length; no per-element framing, no tuple.
             let relations = (0..nrel)
@@ -370,7 +431,7 @@ fn parse_one(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Message, De
             let flags = reader.byte1()?;
             let lsn = reader.lsn()?;
             let prefix = reader.string()?;
-            let len = reader.int32()? as usize;
+            let len = wire_usize(reader.int32()?);
             let content = reader.take(len)?;
             Ok(Message::Message {
                 xid,
@@ -446,23 +507,43 @@ fn parse_one(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Message, De
             xid: reader.int32()?,
             gid: reader.string()?,
         }),
-        other => Err(DecodeError::UnknownMessage { byte: other }),
+        // The arms above are the protocol's whole tag set at v2+v3. Reaching here means a misaligned
+        // cursor or a peer speaking something walrus never negotiated — never a live walsender.
+        other => {
+            std::hint::cold_path();
+            Err(DecodeError::UnknownMessage { byte: other })
+        }
     }
 }
 
 /// Decode exactly one **complete** message from `reader`: parse one message, then reject any
 /// trailing unconsumed bytes (a truncated or misaligned message).
+///
+/// # Errors
+///
+/// Returns the concrete [`DecodeError`] for a malformed message, or
+/// [`DecodeError::TrailingBytes`] when a valid message does not consume the full payload.
 pub fn parse_message(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Message, DecodeError> {
     let msg = parse_one(reader, ctx)?;
     let unconsumed = reader.remaining();
     if unconsumed != 0 {
-        return Err(DecodeError::TrailingBytes { unconsumed });
+        // Every well-formed frame is consumed whole; leftovers mean the payload and the parser
+        // disagree about the message's width.
+        std::hint::cold_path();
+        return Err(DecodeError::TrailingBytes {
+            unconsumed: reader::u32c(unconsumed),
+        });
     }
     Ok(msg)
 }
 
 /// Split a raw walsender byte stream into messages, skipping the single `0x0a` that
 /// `pg_recvlogical` inserts between self-delimiting messages, threading `ctx` across them.
+///
+/// # Errors
+///
+/// Returns the first [`DecodeError`] produced by a truncated, unknown, misframed, or state-invalid
+/// message in the stream.
 pub fn parse_stream(data: &[u8], ctx: &mut StreamCtx) -> Result<Vec<Message>, DecodeError> {
     let mut reader = Reader::new(data);
     let mut out = Vec::new();
@@ -477,3 +558,7 @@ pub fn parse_stream(data: &[u8], ctx: &mut StreamCtx) -> Result<Vec<Message>, De
     }
     Ok(out)
 }
+
+#[cfg(test)]
+#[path = "mod_test.rs"]
+mod tests;

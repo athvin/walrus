@@ -12,21 +12,32 @@
 use crate::error::Error;
 use crate::oids;
 use arrow::datatypes::{DataType, TimeUnit};
+use std::borrow::Cow;
 
 /// The six built-in range/multirange families. The element type — and, in Postgres, the
 /// canonicalization — differ per family, but the wire form the sink parses is uniform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RangeFamily {
+    /// `int4range` / `int4multirange` — elements are `integer`.
     Int4,
+    /// `int8range` / `int8multirange` — elements are `bigint`.
     Int8,
+    /// `numrange` / `nummultirange` — elements are `numeric`; the only family whose element type
+    /// depends on a typmod, and in practice always the text carrier (see `elem_data_type`).
     Num,
+    /// `tsrange` / `tsmultirange` — elements are `timestamp without time zone`.
     Ts,
+    /// `tstzrange` / `tstzmultirange` — elements are `timestamp with time zone`.
     TsTz,
+    /// `daterange` / `datemultirange` — elements are `date`.
     Date,
 }
 
 impl RangeFamily {
-    pub fn from_range_oid(oid: u32) -> Option<Self> {
+    /// The family behind a *range* OID (`int4range`, `tstzrange`, …), or `None` if the OID is not
+    /// one of the six built-in range types.
+    #[must_use]
+    pub const fn from_range_oid(oid: u32) -> Option<Self> {
         Some(match oid {
             oids::INT4RANGE => Self::Int4,
             oids::INT8RANGE => Self::Int8,
@@ -38,7 +49,11 @@ impl RangeFamily {
         })
     }
 
-    pub fn from_multirange_oid(oid: u32) -> Option<Self> {
+    /// The same, for a *multirange* OID (PG14+). Kept separate from
+    /// [`from_range_oid`](Self::from_range_oid) rather than merged into one lookup, because a
+    /// column's OID says which of the two shapes it is and the caller must not lose that.
+    #[must_use]
+    pub const fn from_multirange_oid(oid: u32) -> Option<Self> {
         Some(match oid {
             oids::INT4MULTIRANGE => Self::Int4,
             oids::INT8MULTIRANGE => Self::Int8,
@@ -52,13 +67,14 @@ impl RangeFamily {
 
     /// Arrow element type for `_lower`/`_upper`. Unconstrained `numrange` falls back to `Utf8` — the
     /// Tier-3 VARCHAR carrier wired here and *proven* in PR 2.15 (a range column carries no element
-    /// typmod, so in practice `Num` is always `Utf8` today).
+    /// typmod, so in practice [`Num`](RangeFamily::Num) is always `Utf8` today).
+    #[must_use]
     pub fn elem_data_type(self, atttypmod: i32) -> DataType {
         match self {
             Self::Int4 => DataType::Int32,
             Self::Int8 => DataType::Int64,
             Self::Num => match crate::schema::numeric_precision_scale(atttypmod) {
-                Some((p, s)) if (1..=38).contains(&p) => DataType::Decimal128(p, s),
+                Some((p @ 1..=38, s)) => DataType::Decimal128(p, s),
                 _ => DataType::Utf8,
             },
             Self::Ts => DataType::Timestamp(TimeUnit::Microsecond, None),
@@ -72,27 +88,39 @@ impl RangeFamily {
 /// states are distinct: `empty` (`isempty` true, both bounds `None`), an unbounded bound (`None` with
 /// `empty=false`), and — at the column level — a whole SQL `NULL` (handled by the caller, not here).
 /// `lower_inf`/`upper_inf` are **derivable** (`bound.is_none() && !empty`) and deliberately not stored.
+///
+/// Each bound **borrows the wire literal** it was cut from: this is per-value work on the batch-build
+/// path, and a bound only ever needs its own buffer when Postgres quoted *and* escaped it — the
+/// [`Cow`] condition. Read a bound through `as_deref()`; the borrow is invisible to callers.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParsedRange {
+pub struct ParsedRange<'a> {
+    /// Postgres's `isempty`. When set, both bounds are `None` and the inclusivity flags are
+    /// meaningless — an empty range is not "unbounded on both sides".
     pub empty: bool,
-    pub lower: Option<String>,
-    pub upper: Option<String>,
+    /// Lower bound literal, or `None` for unbounded below. Borrowed from the wire text unless
+    /// unescaping forced a copy.
+    pub lower: Option<Cow<'a, str>>,
+    /// Upper bound literal, or `None` for unbounded above; same borrowing rule as `lower`.
+    pub upper: Option<Cow<'a, str>>,
+    /// Whether the lower bound is inclusive — the `[` of `[a,b)`.
     pub lower_inc: bool,
+    /// Whether the upper bound is inclusive — the `]` of `(a,b]`.
     pub upper_inc: bool,
 }
 
 fn range_err(text: &str) -> Error {
-    Error::ValueParse {
-        column: "range".to_string(),
-        value: text.to_string(),
-        data_type: "range".to_string(),
-    }
+    Error::value_parse("range", text, "range")
 }
 
-/// Parse `[1,10)` / `empty` / `(,5]` / `[2024-01-01,)` into a `ParsedRange`. An inclusivity marker on
-/// an unbounded side is forced to `false` (an infinite bound is never inclusive — matches Postgres'
-/// `lower_inc`/`upper_inc`).
-pub fn parse_range(text: &str) -> Result<ParsedRange, Error> {
+/// Parse `[1,10)` / `empty` / `(,5]` / `[2024-01-01,)` into a [`ParsedRange`]. An inclusivity marker
+/// on an unbounded side is forced to `false` (an infinite bound is never inclusive — matches
+/// Postgres' `lower_inc`/`upper_inc`).
+///
+/// # Errors
+///
+/// Returns [`Error::ValueParse`] when delimiters are invalid or the two bounds are not separated by
+/// one top-level comma.
+pub fn parse_range(text: &str) -> Result<ParsedRange<'_>, Error> {
     let t = text.trim();
     if t.eq_ignore_ascii_case("empty") {
         return Ok(ParsedRange {
@@ -107,14 +135,14 @@ pub fn parse_range(text: &str) -> Result<ParsedRange, Error> {
     if bytes.len() < 3 {
         return Err(range_err(text));
     }
-    let lower_inc = match bytes[0] {
-        b'[' => true,
-        b'(' => false,
+    let lower_inc = match bytes.first() {
+        Some(b'[') => true,
+        Some(b'(') => false,
         _ => return Err(range_err(text)),
     };
-    let upper_inc = match bytes[bytes.len() - 1] {
-        b']' => true,
-        b')' => false,
+    let upper_inc = match bytes.last() {
+        Some(b']') => true,
+        Some(b')') => false,
         _ => return Err(range_err(text)),
     };
     let inner = &t[1..t.len() - 1];
@@ -132,7 +160,11 @@ pub fn parse_range(text: &str) -> Result<ParsedRange, Error> {
 
 /// Parse `{[1,4),[7,9)}` (and `{}`) into member ranges. Members are non-empty and non-null (Postgres
 /// guarantees this); an empty multirange yields an empty `Vec` — distinct from a NULL column.
-pub fn parse_multirange(text: &str) -> Result<Vec<ParsedRange>, Error> {
+///
+/// # Errors
+///
+/// Returns [`Error::ValueParse`] if the outer braces are missing or any member is not a valid range.
+pub fn parse_multirange(text: &str) -> Result<Vec<ParsedRange<'_>>, Error> {
     let t = text.trim();
     if !t.starts_with('{') || !t.ends_with('}') {
         return Err(range_err(text));
@@ -146,19 +178,32 @@ pub fn parse_multirange(text: &str) -> Result<Vec<ParsedRange>, Error> {
 
 /// One bound literal → its value: empty (unquoted) = unbounded (`None`); otherwise the raw text with
 /// surrounding quotes stripped and `""`/`\x` un-escaped.
-fn parse_bound(s: &str) -> Option<String> {
+///
+/// An unquoted bound (`[1,10)`) is returned as [`Cow::Borrowed`] — the overwhelmingly common shape,
+/// and the one the discrete families always take.
+fn parse_bound(s: &str) -> Option<Cow<'_, str>> {
     if s.is_empty() {
         return None; // unbounded side
     }
     if s.starts_with('"') {
         return Some(unquote(s));
     }
-    Some(s.to_string())
+    Some(Cow::Borrowed(s))
 }
 
 /// Strip the surrounding `"` and un-escape `""` → `"` and `\x` → `x` (Postgres' range/element quoting).
-fn unquote(s: &str) -> String {
-    let inner = &s[1..s.len().saturating_sub(1)];
+///
+/// Un-escaping is the *only* reason a bound needs its own buffer, so a quoted body with nothing to
+/// un-escape stays [`Cow::Borrowed`] — that covers every `tsrange`/`tstzrange` bound, which Postgres
+/// quotes unconditionally.
+fn unquote(s: &str) -> Cow<'_, str> {
+    // A lone `"` (`[a,")` splits the upper bound down to one delimiter) has no body between the
+    // quotes, and `s[1..0]` is an inverted range that panics. Wire text is untrusted input, so ask
+    // for the span and treat a missing one as the empty bound it describes.
+    let inner = s.get(1..s.len().saturating_sub(1)).unwrap_or_default();
+    if !inner.contains(['"', '\\']) {
+        return Cow::Borrowed(inner);
+    }
     let mut out = String::with_capacity(inner.len());
     let mut chars = inner.chars().peekable();
     while let Some(c) = chars.next() {
@@ -175,7 +220,7 @@ fn unquote(s: &str) -> String {
             _ => out.push(c),
         }
     }
-    out
+    Cow::Owned(out)
 }
 
 /// Split `inner` at the single top-level comma (quote-aware), returning `(lower, upper)`.

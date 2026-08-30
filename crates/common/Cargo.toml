@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+publish.workspace = true # internal component; the workspace bar keeps it off every registry
 
 [lints]
 workspace = true # inherit deny(warnings) + clippy::all from the workspace root
@@ -19,7 +20,19 @@ serde = { workspace = true, features = ["derive"] }
 # SinkMeta's amortized split-serialization (PR 5.7) renders the meta JSON fragments in production.
 serde_json = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
+# walrus's ONE subscriber dependency: `common` is the shared bootstrap both binaries call, so the
+# single global install lives in src/telemetry.rs and every other crate emits through the `tracing`
+# facade alone. tests/subscriber_install_policy.rs is what fails when a second crate adds this dep.
+#
+# `tracing-log` is a default feature, named here to make it a contract rather than an accident: it
+# is what makes `SubscriberInitExt::try_init` install the `log` -> `tracing` bridge, so the records
+# tokio-postgres / sqlx / reqwest still emit through the `log` facade reach our subscriber. A future
+# `default-features = false` would otherwise silence them with no compile error.
+tracing-subscriber = { workspace = true, features = [
+    "env-filter",
+    "json",
+    "tracing-log",
+] }
 figment = { workspace = true, features = ["env", "toml", "yaml"] }
 humantime-serde = { workspace = true }
 # jiff over `time`: jiff::Timestamp is inherently a UTC instant and Displays as RFC-3339 with a
@@ -38,3 +51,6 @@ sqlx = { workspace = true, optional = true, features = [
 [dev-dependencies]
 # `test` feature adds figment::Jail for hermetic env/file config tests (dev-only).
 figment = { workspace = true, features = ["test"] }
+# Generated LSN positions for the `Lsn` properties in src/lsn_test.rs. Dev-only by construction:
+# `common` is a library, so nothing a walrus binary links can reach a test-profile dependency.
+proptest = { workspace = true }

@@ -10,25 +10,81 @@ fn col(name: &str, type_oid: u32, type_modifier: i32, is_key: bool) -> PgColumn 
 }
 
 #[test]
-fn replica_identity_from_wire_char() {
+fn replica_identity_try_from_char() {
     assert_eq!(
-        ReplicaIdentity::from_wire(b'd').unwrap(),
+        ReplicaIdentity::try_from(b'd').unwrap(),
         ReplicaIdentity::Default
     );
+    let nothing: ReplicaIdentity = b'n'.try_into().unwrap();
+    assert_eq!(nothing, ReplicaIdentity::Nothing);
     assert_eq!(
-        ReplicaIdentity::from_wire(b'n').unwrap(),
-        ReplicaIdentity::Nothing
-    );
-    assert_eq!(
-        ReplicaIdentity::from_wire(b'f').unwrap(),
+        ReplicaIdentity::try_from(b'f').unwrap(),
         ReplicaIdentity::Full
     );
-    assert_eq!(
-        ReplicaIdentity::from_wire(b'i').unwrap(),
-        ReplicaIdentity::Index
-    );
-    assert!(ReplicaIdentity::from_wire(b'x').is_err());
-    assert!(ReplicaIdentity::from_wire(0).is_err());
+    let index: ReplicaIdentity = b'i'.try_into().unwrap();
+    assert_eq!(index, ReplicaIdentity::Index);
+    assert!(ReplicaIdentity::try_from(b'x').is_err());
+    assert!(ReplicaIdentity::try_from(0).is_err());
+}
+
+#[test]
+fn replica_identity_parses_the_catalog_cast_not_the_serde_word() {
+    // `relreplident::text` is the byte above in its catalog-cast form, so both readers agree.
+    for (text, expected) in [
+        ("d", ReplicaIdentity::Default),
+        ("n", ReplicaIdentity::Nothing),
+        ("f", ReplicaIdentity::Full),
+        ("i", ReplicaIdentity::Index),
+    ] {
+        assert_eq!(text.parse::<ReplicaIdentity>().unwrap(), expected);
+    }
+
+    // The persisted word form is a different wire form and must not sneak in through this door.
+    assert!("default".parse::<ReplicaIdentity>().is_err());
+    assert!("".parse::<ReplicaIdentity>().is_err());
+    assert!("dd".parse::<ReplicaIdentity>().is_err());
+    assert!("x".parse::<ReplicaIdentity>().is_err());
+}
+
+#[test]
+fn replica_identity_wire_form_is_lowercase_and_accepts_legacy() {
+    let cases = [
+        (ReplicaIdentity::Default, "\"default\"", "\"Default\""),
+        (ReplicaIdentity::Nothing, "\"nothing\"", "\"Nothing\""),
+        (ReplicaIdentity::Full, "\"full\"", "\"Full\""),
+        (ReplicaIdentity::Index, "\"index\"", "\"Index\""),
+    ];
+
+    for (variant, lowercase, legacy) in cases {
+        assert_eq!(serde_json::to_string(&variant).unwrap(), lowercase);
+        assert_eq!(
+            serde_json::from_str::<ReplicaIdentity>(lowercase).unwrap(),
+            variant
+        );
+        assert_eq!(
+            serde_json::from_str::<ReplicaIdentity>(legacy).unwrap(),
+            variant
+        );
+    }
+
+    assert!(serde_json::from_str::<ReplicaIdentity>("\"partial\"").is_err());
+}
+
+#[test]
+fn a_legacy_registry_columns_document_still_hydrates() {
+    let legacy = r#"{
+        "oid": 42,
+        "schema": "public",
+        "name": "orders",
+        "replica_identity": "Default",
+        "columns": [{"name":"id","type_oid":23,"type_modifier":-1,"is_key":true}]
+    }"#;
+
+    let relation: PgRelation = serde_json::from_str(legacy).unwrap();
+    assert_eq!(relation.replica_identity, ReplicaIdentity::Default);
+
+    let serialized = serde_json::to_value(relation).unwrap();
+    assert_eq!(serialized["replica_identity"], "default");
 }
 
 #[test]
@@ -64,7 +120,7 @@ fn key_columns_preserve_relation_order() {
             col("name", 25, -1, false),
         ],
     };
-    assert_eq!(rel.key_columns(), vec!["region", "id"]);
+    assert_eq!(rel.to_key_columns(), vec!["region", "id"]);
 
     // A key column declared after a non-key one still keeps relation order.
     let rel2 = PgRelation {
@@ -75,7 +131,7 @@ fn key_columns_preserve_relation_order() {
         ],
         ..rel
     };
-    assert_eq!(rel2.key_columns(), vec!["b", "c"]);
+    assert_eq!(rel2.to_key_columns(), vec!["b", "c"]);
 }
 
 #[test]
@@ -94,5 +150,16 @@ fn tuple_value_null_and_unchanged_toast_are_distinct() {
     assert_ne!(
         TupleValue::Binary(Bytes::from_static(b"\x00")),
         TupleValue::Null
+    );
+}
+
+#[test]
+fn tuple_value_size_budget() {
+    // The const assert in `pg_shape` is the real gate; this exists so a breach prints the number.
+    assert!(
+        size_of::<TupleValue>() <= super::TUPLE_VALUE_MAX_BYTES,
+        "TupleValue grew to {} bytes (budget {}) — see own-move-large",
+        size_of::<TupleValue>(),
+        super::TUPLE_VALUE_MAX_BYTES,
     );
 }

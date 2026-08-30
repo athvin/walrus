@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Compose-gated integration tests for the `table_reload` state machine (PR 6.1).
 //!
 //! Same discipline as the manifest tests: every test runs inside a rolled-back transaction and
@@ -7,11 +11,11 @@
 //! savepoint, because a failed statement aborts the enclosing Postgres transaction.
 #![cfg(feature = "integration")]
 
-use common::Lsn;
+use common::{EpochNo, FailureClass, Lsn, ReloadId, SchemaVersionNo};
 use control::reload::{self, ReloadFlavor, ReloadStatus};
-use control::{claim_ready, connect, insert_ready, run_migrations, ControlError, NewManifestFile};
-use sqlx::postgres::PgPool;
+use control::{ControlError, NewManifestFile, claim_ready, connect, insert_ready, run_migrations};
 use sqlx::Connection;
+use sqlx::postgres::PgPool;
 
 fn control_dsn() -> String {
     std::env::var("WALRUS_CONTROL_DB_URL").unwrap_or_else(|_| {
@@ -28,7 +32,7 @@ async fn pool() -> PgPool {
 }
 
 /// A staged reload chunk file: `kind='reload'` carrying its `reload_id` (stamped `lsn = L_i`).
-fn chunk_file(epoch: i64, table: &str, reload_id: i64, lsn_end: &str) -> NewManifestFile {
+fn chunk_file(epoch: EpochNo, table: &str, reload_id: ReloadId, lsn_end: &str) -> NewManifestFile {
     let lsn: Lsn = lsn_end.parse().unwrap();
     NewManifestFile {
         epoch,
@@ -39,26 +43,26 @@ fn chunk_file(epoch: i64, table: &str, reload_id: i64, lsn_end: &str) -> NewMani
         row_count: 1,
         lsn_start: lsn,
         lsn_end: lsn,
-        schema_version: 1,
+        schema_version: SchemaVersionNo(1),
         reload_id: Some(reload_id),
     }
 }
 
 /// `lease_expiry` as a comparable number — the model omits the column by design (every time
 /// comparison lives in SQL), so tests that care probe it directly.
-async fn expiry_epoch(ex: impl sqlx::PgExecutor<'_>, reload_id: i64) -> f64 {
+async fn expiry_epoch(ex: impl sqlx::PgExecutor<'_>, reload_id: ReloadId) -> f64 {
     sqlx::query_scalar::<_, f64>(
         "SELECT extract(epoch FROM lease_expiry)::float8
          FROM walrus.table_reload WHERE reload_id = $1",
     )
-    .bind(reload_id)
+    .bind(reload_id.0)
     .fetch_one(ex)
     .await
     .unwrap()
 }
 
 /// An ordinary stream file — `reload_id` stays NULL, exactly like every pre-6.1 row.
-fn stream_file(epoch: i64, table: &str, lsn_end: &str) -> NewManifestFile {
+fn stream_file(epoch: EpochNo, table: &str, lsn_end: &str) -> NewManifestFile {
     let lsn: Lsn = lsn_end.parse().unwrap();
     NewManifestFile {
         epoch,
@@ -69,7 +73,7 @@ fn stream_file(epoch: i64, table: &str, lsn_end: &str) -> NewManifestFile {
         row_count: 1,
         lsn_start: lsn,
         lsn_end: lsn,
-        schema_version: 1,
+        schema_version: SchemaVersionNo(1),
         reload_id: None,
     }
 }
@@ -78,7 +82,7 @@ fn stream_file(epoch: i64, table: &str, lsn_end: &str) -> NewManifestFile {
 async fn full_status_walk_and_duplicate_request_rejected() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let epoch = 910_001;
+    let epoch = EpochNo(910_001);
 
     let id = reload::request(&mut *tx, epoch, "public", "orders", ReloadFlavor::Reload)
         .await
@@ -177,33 +181,58 @@ async fn full_status_walk_and_duplicate_request_rejected() {
 
     // The holder renews — and the lease observably extends (same frozen now(), bigger ttl);
     // a phantom does not.
-    assert!(reload::renew_lease(&mut *tx, id, "sink-a", 3600)
-        .await
-        .unwrap());
+    assert!(
+        reload::renew_lease(&mut *tx, id, "sink-a", 3600)
+            .await
+            .unwrap()
+    );
     let exp_renewed = expiry_epoch(&mut *tx, id).await;
     assert!(
         exp_renewed > exp_claim + 3000.0,
         "renew pushed lease_expiry out by the new ttl"
     );
-    assert!(!reload::renew_lease(&mut *tx, id, "sink-zombie", 60)
-        .await
-        .unwrap());
+    assert!(
+        !reload::renew_lease(&mut *tx, id, "sink-zombie", 60)
+            .await
+            .unwrap()
+    );
 
     // Chunk 1 freezes L₁ + schema_version; chunk 2's newer L₂ must NOT overwrite the frozen L₁.
     let l1: Lsn = "0/100".parse().unwrap();
     let l2: Lsn = "0/200".parse().unwrap();
-    reload::advance_cursor(&mut *tx, id, 1, &serde_json::json!([42]), l1, 7)
-        .await
-        .unwrap();
-    reload::advance_cursor(&mut *tx, id, 2, &serde_json::json!([84]), l2, 7)
-        .await
-        .unwrap();
+    reload::advance_cursor(
+        &mut *tx,
+        id,
+        1,
+        &serde_json::json!([42]),
+        l1,
+        SchemaVersionNo(7),
+    )
+    .await
+    .unwrap();
+    reload::advance_cursor(
+        &mut *tx,
+        id,
+        2,
+        &serde_json::json!([84]),
+        l2,
+        SchemaVersionNo(7),
+    )
+    .await
+    .unwrap();
 
     // A mismatched schema_version is ASSERTED, not swallowed: every attempt is single-schema by
     // construction (H9), so version 9 mid-attempt means the export engine missed a DDL restart.
-    let err = reload::advance_cursor(&mut *tx, id, 3, &serde_json::json!([99]), l2, 9)
-        .await
-        .unwrap_err();
+    let err = reload::advance_cursor(
+        &mut *tx,
+        id,
+        3,
+        &serde_json::json!([99]),
+        l2,
+        SchemaVersionNo(9),
+    )
+    .await
+    .unwrap_err();
     assert!(matches!(err, ControlError::ReloadTransition { .. }));
 
     let row = reload::get(&mut *tx, id).await.unwrap().unwrap();
@@ -212,7 +241,7 @@ async fn full_status_walk_and_duplicate_request_rejected() {
     assert_eq!(row.first_lsn, Some(l1), "first_lsn is frozen on chunk 1");
     assert_eq!(
         row.schema_version,
-        Some(7),
+        Some(SchemaVersionNo(7)),
         "schema_version is frozen on chunk 1"
     );
 
@@ -257,7 +286,7 @@ async fn full_status_walk_and_duplicate_request_rejected() {
 async fn wrong_state_transition_changes_zero_rows() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let epoch = 910_002;
+    let epoch = EpochNo(910_002);
 
     let id = reload::request(&mut *tx, epoch, "public", "t", ReloadFlavor::Reload)
         .await
@@ -271,9 +300,16 @@ async fn wrong_state_transition_changes_zero_rows() {
     assert!(matches!(err, ControlError::ReloadTransition { reload_id, .. } if reload_id == id));
     let err = reload::complete(&mut *tx, id).await.unwrap_err();
     assert!(matches!(err, ControlError::ReloadTransition { .. }));
-    let err = reload::advance_cursor(&mut *tx, id, 1, &serde_json::json!([1]), h, 1)
-        .await
-        .unwrap_err();
+    let err = reload::advance_cursor(
+        &mut *tx,
+        id,
+        1,
+        &serde_json::json!([1]),
+        h,
+        SchemaVersionNo(1),
+    )
+    .await
+    .unwrap_err();
     assert!(matches!(err, ControlError::ReloadTransition { .. }));
     let err = reload::fail(&mut tx, id, "nope").await.unwrap_err();
     assert!(matches!(err, ControlError::ReloadTransition { .. }));
@@ -293,9 +329,16 @@ async fn wrong_state_transition_changes_zero_rows() {
     assert!(matches!(err, ControlError::ReloadTransition { .. }));
 
     // An out-of-order cursor advance (chunk 2 before chunk 1) is a loud error too.
-    let err = reload::advance_cursor(&mut *tx, id, 2, &serde_json::json!([1]), h, 1)
-        .await
-        .unwrap_err();
+    let err = reload::advance_cursor(
+        &mut *tx,
+        id,
+        2,
+        &serde_json::json!([1]),
+        h,
+        SchemaVersionNo(1),
+    )
+    .await
+    .unwrap_err();
     assert!(matches!(err, ControlError::ReloadTransition { .. }));
 
     // Walk to terminal, then confirm terminal states reject everything.
@@ -313,7 +356,7 @@ async fn wrong_state_transition_changes_zero_rows() {
 async fn release_claim_returns_the_row_to_the_queue() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let epoch = 910_005;
+    let epoch = EpochNo(910_005);
 
     let id = reload::request(&mut *tx, epoch, "public", "orders", ReloadFlavor::Reload)
         .await
@@ -323,9 +366,11 @@ async fn release_claim_returns_the_row_to_the_queue() {
         .unwrap();
 
     // A phantom can't release someone else's claim; releasing a `requested` row is a no-op too.
-    assert!(!reload::release_claim(&mut *tx, id, "sink-zombie")
-        .await
-        .unwrap());
+    assert!(
+        !reload::release_claim(&mut *tx, id, "sink-zombie")
+            .await
+            .unwrap()
+    );
 
     // The claimant releases: back to `requested`, lease cleared, immediately re-claimable — the
     // controller's un-claim path for infra failures between claim and exporter spawn (PR 6.4).
@@ -351,7 +396,7 @@ async fn release_claim_returns_the_row_to_the_queue() {
 async fn fail_purges_this_reloads_manifest_rows_only() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let epoch = 910_003;
+    let epoch = EpochNo(910_003);
 
     // Two live reloads on different tables, both exporting.
     let r1 = reload::request(&mut *tx, epoch, "public", "orders", ReloadFlavor::Reload)
@@ -432,7 +477,7 @@ async fn fail_purges_this_reloads_manifest_rows_only() {
 #[tokio::test]
 async fn concurrent_claimers_partition_the_queue_via_skip_locked() {
     let pool = pool().await;
-    let epoch = 910_004;
+    let epoch = EpochNo(910_004);
 
     // SKIP LOCKED is only observable ACROSS transactions, so this test needs committed fixtures
     // (unlike the rolled-back-txn discipline above). Clean up leftovers from any crashed prior

@@ -19,48 +19,103 @@
 //! that attaches after it closes is a terminal error (`ERROR: invalid snapshot identifier`).
 
 use crate::batch::{BatchTriggers, Clock, SystemClock, TableBatcher};
+use crate::config::SlotName;
 use crate::relcache::RelationCache;
-use crate::replication::ReplicationStream;
+use crate::replication::{Idle, ReplicationStream};
 use crate::sink::{FileKind, ParquetSink};
 use anyhow::Context;
 use common::{
-    Kind, Lsn, Op, PgColumn, PgRelation, ReplicaIdentity, SinkMeta, TupleValue, UtcTimestamp,
+    EpochNo, Kind, Lsn, Op, PgColumn, PgRelation, ReplicaIdentity, SinkMeta, TupleValue,
+    UtcTimestamp,
 };
+use std::marker::PhantomData;
 use std::sync::Arc;
 use tokio_postgres::NoTls;
+
+/// Convert a catalog `::int8` OID without wrapping negative or oversized values.
+fn catalog_oid(raw: i64) -> anyhow::Result<u32> {
+    u32::try_from(raw).with_context(|| format!("catalog OID {raw} is outside the u32 range"))
+}
 
 /// The two values `CREATE_REPLICATION_SLOT … (SNAPSHOT 'export')` returns. All snapshot files share
 /// `lsn_end = consistent_point`.
 #[derive(Debug, Clone)]
 pub struct ExportedSnapshot {
+    /// The LSN the snapshot is consistent at. Every file the backfill produces carries this as its
+    /// `lsn_end`, which is why the loader's claim order cannot filter snapshot rows with a `>`.
     pub consistent_point: Lsn,
+    /// The snapshot's server-side name, to be passed to `SET TRANSACTION SNAPSHOT`. Valid only
+    /// while the exporting connection stays open.
     pub snapshot_name: String,
 }
 
+/// State marker for an idle replication connection that has not exported a snapshot.
+#[derive(Debug, Clone, Copy)]
+pub struct NotExported;
+
+/// State marker for a connection holding an exported snapshot and ready to start replication.
+#[derive(Debug, Clone, Copy)]
+pub struct Exported;
+
 /// Holds the slot-creating replication connection, which **must stay open + idle** so the exported
 /// snapshot remains valid until every backfill session has attached to it.
-pub struct SnapshotConn {
-    stream: ReplicationStream,
-    exported: Option<ExportedSnapshot>,
+///
+/// Two typestates stack here, on two independent axes: the held [`ReplicationStream`] is in its
+/// [`Idle`] state, which already forbids reading or acking CopyBoth frames before
+/// `START_REPLICATION`; `S` below forbids the handoff *to* `START_REPLICATION` before a snapshot has
+/// been exported.
+///
+/// Streaming before slot creation is forbidden:
+///
+/// ```compile_fail
+/// # async fn demo(
+/// #     dsn: &str,
+/// #     snapshot: &pg_sink::snapshot::ExportedSnapshot,
+/// # ) -> anyhow::Result<()> {
+/// let conn = pg_sink::snapshot::SnapshotConn::connect(dsn).await?;
+/// let _stream = conn
+///     .into_stream("walrus_slot", snapshot, "walrus_pub")
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug)]
+pub struct SnapshotConn<S = NotExported> {
+    stream: ReplicationStream<Idle>,
+    _state: PhantomData<S>,
 }
 
-impl SnapshotConn {
+impl SnapshotConn<NotExported> {
     /// Open a replication connection and complete startup (no `START_REPLICATION` yet).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if the replication DSN, TCP connection, or startup handshake fails.
     pub async fn connect(dsn: &str) -> anyhow::Result<Self> {
         Ok(SnapshotConn {
-            stream: ReplicationStream::connect(dsn)
+            stream: ReplicationStream::<Idle>::connect(dsn)
                 .await
                 .context("open replication connection for snapshot export")?,
-            exported: None,
+            _state: PhantomData,
         })
     }
 
-    /// `CREATE_REPLICATION_SLOT <slot> LOGICAL pgoutput (SNAPSHOT 'export')`. The connection now holds
-    /// the exported snapshot — do **not** run anything else on it until backfill is done.
+    /// `CREATE_REPLICATION_SLOT <slot> LOGICAL pgoutput (SNAPSHOT 'export')`. Consumes the idle
+    /// connection and returns its exported state with the snapshot value; do **not** run anything else
+    /// on the connection until backfill is done.
+    ///
+    /// Takes a parsed [`SlotName`] because the name reaches the command unquoted; the handoff
+    /// [`into_stream`](SnapshotConn::into_stream) below names the slot this call just created, so it
+    /// keeps taking a bare `&str`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if PostgreSQL rejects slot creation or its exported snapshot response
+    /// is missing or malformed.
     pub async fn create_slot_with_snapshot(
-        &mut self,
-        slot: &str,
-    ) -> anyhow::Result<ExportedSnapshot> {
+        mut self,
+        slot: &SlotName,
+    ) -> anyhow::Result<(SnapshotConn<Exported>, ExportedSnapshot)> {
         let (consistent_point, snapshot_name) =
             self.stream.create_replication_slot_export(slot).await?;
         let snap = ExportedSnapshot {
@@ -68,55 +123,63 @@ impl SnapshotConn {
             snapshot_name,
         };
         tracing::info!(
-            slot,
+            slot = %slot,
             consistent_point = %snap.consistent_point,
             snapshot_name = %snap.snapshot_name,
             "created replication slot with exported snapshot"
         );
-        self.exported = Some(snap.clone());
-        Ok(snap)
+        let exported = SnapshotConn {
+            stream: self.stream,
+            _state: PhantomData,
+        };
+        Ok((exported, snap))
     }
+}
 
-    /// The consistent point streaming will resume from (available after slot creation).
-    pub fn consistent_point(&self) -> Option<Lsn> {
-        self.exported.as_ref().map(|s| s.consistent_point)
-    }
-
+impl SnapshotConn<Exported> {
     /// Hand off to streaming: `START_REPLICATION` from `consistent_point` (this ends the exported
     /// snapshot, which is safe once every backfill session has attached). Consumes the connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if starting replication from the snapshot's consistent point fails.
     pub async fn into_stream(
-        mut self,
+        self,
         slot: &str,
+        snap: &ExportedSnapshot,
         publication: &str,
     ) -> anyhow::Result<ReplicationStream> {
-        let snap = self
-            .exported
-            .context("create_slot_with_snapshot must run before streaming")?;
         self.stream
-            .start_streaming(slot, snap.consistent_point, publication)
+            .into_streaming(slot, snap.consistent_point, publication)
             .await
-            .context("hand off snapshot → streaming from consistent_point")?;
-        Ok(self.stream)
+            .context("hand off snapshot → streaming from consistent_point")
     }
 }
 
 /// One serial per-table backfill over an ordinary SQL connection (distinct from the replication one).
-pub struct Backfill {
+#[derive(Debug)]
+pub struct Backfill<C> {
     client: tokio_postgres::Client,
     triggers: BatchTriggers,
-    clock: Arc<dyn Clock>,
-    epoch: i64,
+    clock: C,
+    epoch: EpochNo,
     instance: String,
 }
 
-impl Backfill {
+impl Backfill<Arc<SystemClock>> {
+    /// Open and configure an ordinary SQL connection for snapshot reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if the source connection or optional statement-timeout setup fails.
     pub async fn connect(
         dsn: &str,
-        epoch: i64,
-        instance: String,
+        epoch: EpochNo,
+        instance: impl Into<String>,
         triggers: BatchTriggers,
         statement_timeout: std::time::Duration,
     ) -> anyhow::Result<Self> {
+        let instance = instance.into();
         let (client, connection) = tokio_postgres::connect(dsn, NoTls)
             .await
             .context("open backfill SQL connection")?;
@@ -141,17 +204,35 @@ impl Backfill {
             instance,
         })
     }
+}
 
+impl<C: Clock + Clone> Backfill<C> {
     /// Copy one table under the exported snapshot into `kind='snapshot'` Parquet + manifest rows, all
     /// sharing `lsn_end = consistent_point`. Returns the row count copied. Output is chunked by the same
     /// `max_rows`/`max_bytes` caps as streamed batches (so a large table becomes many files).
+    ///
+    /// ## Cancel safety
+    ///
+    /// **Not cancel-safe — never race this future in a `select!` branch.** The rows read so far
+    /// accumulate in a [`TableBatcher`] *inside* this future, and the exported snapshot is held by a
+    /// `REPEATABLE READ` transaction on `self.client`; dropping it discards every not-yet-flushed row
+    /// and abandons that transaction without its `COMMIT`. Already-flushed chunks stay durable, so
+    /// the loss is silent — the manifest then describes a backfill that is complete except for the
+    /// tail nothing will ever re-read, because streaming resumes from `consistent_point` rather than
+    /// re-copying. Bootstrap therefore awaits this directly, unraced: a fresh-slot backfill is
+    /// bounded by the process, never by cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if attaching the exported snapshot, mapping/reading rows, Arrow
+    /// batching, S3 durability, manifest persistence, or transaction completion fails.
     pub async fn copy_table(
         &mut self,
         rel: &PgRelation,
         snap: &ExportedSnapshot,
         sink: &ParquetSink,
         pool: &sqlx::PgPool,
-        schema_version: i64,
+        schema_version: common::SchemaVersionNo,
     ) -> anyhow::Result<u64> {
         // Attach the exported snapshot — the ONLY consistency mechanism (no "COPY at an LSN"). If the
         // slot-creating connection has closed, `SET TRANSACTION SNAPSHOT` fails here (terminal).
@@ -175,11 +256,12 @@ impl Backfill {
             .context("backfill SELECT under snapshot")?;
 
         let mut copied = 0u64;
+        // One tuple buffer for the whole table: `push` copies the row into the batcher, so refilling
+        // this scratch keeps its capacity instead of allocating (and dropping) a `Vec` per row.
+        let mut tuple: Vec<TupleValue> = Vec::with_capacity(rel.columns.len());
         for row in &rows {
-            batcher.push(
-                self.snapshot_meta(rel, snap, schema_version),
-                &row_to_tuple(row, rel.columns.len()),
-            );
+            read_row_into(row, rel.columns.len(), &mut tuple);
+            batcher.push(self.snapshot_meta(rel, snap, schema_version), &tuple);
             // Snapshot rows have no per-row commit boundary: promote them all at the shared
             // consistent_point so the loader's (commit_lsn, lsn) dedup lets any later stream change win.
             // They also have no real commit *time* (pre-existing data), so commit_ts is the
@@ -212,7 +294,7 @@ impl Backfill {
         &self,
         rel: &PgRelation,
         snap: &ExportedSnapshot,
-        schema_version: i64,
+        schema_version: common::SchemaVersionNo,
     ) -> SinkMeta {
         SinkMeta {
             op: Op::Insert,
@@ -227,18 +309,18 @@ impl Backfill {
             source_schema: rel.schema.clone(),
             source_table: rel.name.clone(),
             kind: Kind::Snapshot,
-            unchanged_toast: vec![],
+            unchanged_toast: Box::default(),
             sink_instance: self.instance.clone(),
             sink_processed_at: UtcTimestamp::now(),
         }
     }
 }
 
-async fn flush_snapshot(
+async fn flush_snapshot<C: Clock>(
     sink: &ParquetSink,
     pool: &sqlx::PgPool,
-    epoch: i64,
-    batcher: &mut TableBatcher,
+    epoch: EpochNo,
+    batcher: &mut TableBatcher<C>,
 ) -> anyhow::Result<()> {
     let sealed = batcher.seal().context("seal snapshot batch")?;
     let obj =
@@ -271,17 +353,22 @@ fn select_text_sql(rel: &PgRelation) -> String {
     )
 }
 
-fn row_to_tuple(row: &tokio_postgres::Row, ncols: usize) -> Vec<TupleValue> {
-    (0..ncols)
-        .map(|i| match row.get::<_, Option<String>>(i) {
-            Some(s) => TupleValue::Text(s),
-            None => TupleValue::Null,
-        })
-        .collect()
+/// Refill `out` with one row's text values. Takes the buffer rather than returning a fresh `Vec` so
+/// the backfill loop reuses one allocation across every row of the table.
+fn read_row_into(row: &tokio_postgres::Row, ncols: usize, out: &mut Vec<TupleValue>) {
+    out.clear();
+    out.extend((0..ncols).map(|i| match row.get::<_, Option<String>>(i) {
+        Some(s) => TupleValue::Text(s),
+        None => TupleValue::Null,
+    }));
 }
 
 /// Every published **user** table (`schema ≠ walrus`) — the walrus-internal `heartbeat`/`ddl_audit`
 /// tables are control-plane and are never snapshotted.
+///
+/// # Errors
+///
+/// Returns [`anyhow::Error`] if publication membership cannot be queried or decoded.
 pub async fn published_user_tables(
     client: &tokio_postgres::Client,
     publication: &str,
@@ -303,63 +390,88 @@ pub async fn published_user_tables(
 
 /// Build a [`PgRelation`] shape from the source catalog (`pg_class`/`pg_attribute`/`pg_index`) — the
 /// snapshot path needs the shape *before* any streamed `Relation` message arrives.
+///
+/// # Errors
+///
+/// Returns [`anyhow::Error`] when the relation is absent, catalog queries/decoding fail, an OID is
+/// outside the supported integer range, or `relreplident` is invalid.
 pub async fn describe_source_relation(
     client: &tokio_postgres::Client,
     schema: &str,
     table: &str,
 ) -> anyhow::Result<PgRelation> {
-    let head = client
-        .query_one(
-            "SELECT c.oid::int8, c.relreplident::text
-             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-             WHERE n.nspname = $1 AND c.relname = $2",
-            &[&schema, &table],
-        )
-        .await
-        .with_context(|| format!("describe {schema}.{table}: relation not found"))?;
+    // The relation head and its column list are two independent catalog reads — neither consumes
+    // the other's output — so they ride ONE connection concurrently (tokio-postgres pipelines
+    // futures polled together) and cost the slower round trip instead of their sum. The backfill
+    // calls this once per published table while `/startup` still answers 503, so the saving scales
+    // with the table count; the same argument as `bootstrap::run_shared`.
+    // A missing relation still reports the head's "relation not found": the column query merely
+    // returns zero rows for one, so it cannot win the fail-fast race with a different message.
+    let (head, rows) = tokio::try_join!(
+        async {
+            client
+                .query_one(
+                    "SELECT c.oid::int8, c.relreplident::text
+                     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                     WHERE n.nspname = $1 AND c.relname = $2",
+                    &[&schema, &table],
+                )
+                .await
+                .with_context(|| format!("describe {schema}.{table}: relation not found"))
+        },
+        async {
+            client
+                .query(
+                    "SELECT a.attname,
+                            a.atttypid::int8            AS type_oid,
+                            a.atttypmod                 AS type_modifier,
+                            COALESCE(bool_or(i.indisprimary OR i.indisreplident), false) AS is_key
+                     FROM pg_class c
+                     JOIN pg_namespace n ON n.oid = c.relnamespace
+                     JOIN pg_attribute a
+                         ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+                     LEFT JOIN pg_index i
+                         ON i.indrelid = c.oid AND a.attnum = ANY (i.indkey)
+                         AND (i.indisprimary OR i.indisreplident)
+                     WHERE n.nspname = $1 AND c.relname = $2
+                     GROUP BY a.attname, a.atttypid, a.atttypmod, a.attnum
+                     ORDER BY a.attnum",
+                    &[&schema, &table],
+                )
+                .await
+                .with_context(|| format!("describe {schema}.{table}: read columns"))
+        },
+    )?;
     let oid: i64 = head.get(0);
     let relreplident: String = head.get(1);
 
-    let rows = client
-        .query(
-            "SELECT a.attname,
-                    a.atttypid::int8            AS type_oid,
-                    a.atttypmod                 AS type_modifier,
-                    COALESCE(bool_or(i.indisprimary OR i.indisreplident), false) AS is_key
-             FROM pg_class c
-             JOIN pg_namespace n ON n.oid = c.relnamespace
-             JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
-             LEFT JOIN pg_index i
-                 ON i.indrelid = c.oid AND a.attnum = ANY (i.indkey)
-                 AND (i.indisprimary OR i.indisreplident)
-             WHERE n.nspname = $1 AND c.relname = $2
-             GROUP BY a.attname, a.atttypid, a.atttypmod, a.attnum
-             ORDER BY a.attnum",
-            &[&schema, &table],
-        )
-        .await
-        .with_context(|| format!("describe {schema}.{table}: read columns"))?;
-
     let columns = rows
         .iter()
-        .map(|r| PgColumn {
-            name: r.get::<_, String>(0),
-            type_oid: r.get::<_, i64>(1) as u32,
-            type_modifier: r.get::<_, i32>(2),
-            is_key: r.get::<_, bool>(3),
+        .map(|r| {
+            let type_oid = r.get::<_, i64>(1);
+            Ok(PgColumn {
+                name: r.get::<_, String>(0),
+                type_oid: catalog_oid(type_oid)
+                    .with_context(|| format!("describe {schema}.{table}: attribute type OID"))?,
+                type_modifier: r.get::<_, i32>(2),
+                is_key: r.get::<_, bool>(3),
+            })
         })
-        .collect();
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     Ok(PgRelation {
-        oid: oid as u32,
+        oid: catalog_oid(oid)
+            .with_context(|| format!("describe {schema}.{table}: relation OID"))?,
         schema: schema.to_string(),
         name: table.to_string(),
-        replica_identity: match relreplident.as_str() {
-            "f" => ReplicaIdentity::Full,
-            "n" => ReplicaIdentity::Nothing,
-            "i" => ReplicaIdentity::Index,
-            _ => ReplicaIdentity::Default,
-        },
+        // Parsed through the shared one-character table rather than matched as raw text a second
+        // time, so this path and a Relation message's byte can never disagree — and an
+        // unrecognised code is the invalid-`relreplident` error this function already documents,
+        // not a silent `Default` that would quietly change which old-image columns the loader
+        // expects.
+        replica_identity: relreplident
+            .parse::<ReplicaIdentity>()
+            .with_context(|| format!("describe {schema}.{table}: replica identity"))?,
         columns,
     })
 }

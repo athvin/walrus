@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! The idle heartbeat + round-trip liveness against compose (`#[ignore]` — needs source PG + control
 //! PG). On an idle publication a beat fires only after `idle_after`, its `beat_seq` returns through the
 //! stream, and `confirmed_flush_lsn` advances as a result — while the beat is **never** staged to S3
@@ -171,7 +176,7 @@ async fn idle_publication_beats_and_advances_confirmed_flush() {
 
     // A completed round-trip leaves the sink un-degraded.
     assert!(
-        !heartbeat.degraded(Instant::now()),
+        !heartbeat.is_degraded(Instant::now()),
         "a fresh round-trip is not degraded"
     );
 

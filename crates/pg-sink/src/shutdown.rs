@@ -20,16 +20,29 @@
 //! The signal task also selects on the token so it exits if cancellation comes from elsewhere — it
 //! never outlives the token as a leaked handle.
 
+use crate::batch::Clock;
 use crate::checkpoint::DurabilityCheckpoint;
-use crate::consume::{flush_batch, BatchRouter};
+use crate::consume::{BatchRouter, flush_batch};
 use crate::replication::ReplicationStream;
 use crate::sink::ParquetSink;
 use anyhow::Context;
-use common::Lsn;
-use tokio::signal::unix::{signal, SignalKind};
+use common::{EpochNo, Lsn};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio_util::sync::CancellationToken;
 
-/// Outcome of a drain attempt (the caller maps this to an `ExitCode` — a completed drain is `Success`).
+/// Run `body` while holding a [`CancellationToken`] drop guard. Whether the body succeeds,
+/// returns early with an error, or unwinds, the token is cancelled before this function returns.
+/// This scope must end before callers join tasks whose shutdown waits on the token.
+pub async fn cancel_on_exit<F>(token: &CancellationToken, body: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    let _guard = token.clone().drop_guard();
+    body.await
+}
+
+/// Outcome of a drain attempt (the caller maps this to a [`common::ExitCode`] — a completed drain is
+/// [`Success`](common::ExitCode::Success)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrainOutcome {
     /// Committed batch(es) flushed + manifested, final feedback sent, connection closed — slot left
@@ -46,13 +59,24 @@ pub enum DrainOutcome {
 /// `confirmed_flush_lsn` (the checkpoint clamps it to the open-txn floor; `None` until PR 2.30) →
 /// **(4)** `CopyDone` + clean close → **(5)** return, leaving the slot in place. **Never** issues
 /// `DROP_REPLICATION_SLOT`.
-pub async fn drain(
+///
+/// ## Cancel safety
+///
+/// **Not cancel-safe.** Dropping the drain can interrupt its ordered durability and wire-close
+/// steps. The decode loop awaits it inside the already-selected cancellation branch, which Tokio
+/// runs to completion; only the process's external grace-period deadline can end it early.
+///
+/// # Errors
+///
+/// Returns [`anyhow::Error`] if sealing a committed batch, S3/manifest durability, the final standby
+/// status, or `CopyDone` fails. Open uncommitted rows are intentionally discarded, not errors.
+pub async fn drain<C: Clock + Clone>(
     stream: &mut ReplicationStream,
-    router: &mut BatchRouter,
+    router: &mut BatchRouter<C>,
     sink: &ParquetSink,
     checkpoint: &mut DurabilityCheckpoint,
     pool: &sqlx::PgPool,
-    epoch: i64,
+    epoch: EpochNo,
 ) -> anyhow::Result<DrainOutcome> {
     // (2) Seal + flush the committed batches; open speculative buffers are dropped (they re-stream).
     let sealed = router
@@ -87,6 +111,7 @@ pub async fn drain(
 
 /// Install SIGTERM/SIGINT handlers and return the token they cancel. Also returns early (without
 /// cancelling) if the token is cancelled by another source, so the task can't leak.
+#[must_use]
 pub fn install_signal_handlers() -> CancellationToken {
     let token = CancellationToken::new();
     let child = token.clone();
@@ -94,7 +119,7 @@ pub fn install_signal_handlers() -> CancellationToken {
         let mut sigterm = match signal(SignalKind::terminate()) {
             Ok(s) => s,
             Err(e) => {
-                tracing::error!("failed to install SIGTERM handler: {e}");
+                tracing::error!(error = %e, "failed to install SIGTERM handler");
                 child.cancel();
                 return;
             }
@@ -102,12 +127,16 @@ pub fn install_signal_handlers() -> CancellationToken {
         let mut sigint = match signal(SignalKind::interrupt()) {
             Ok(s) => s,
             Err(e) => {
-                tracing::error!("failed to install SIGINT handler: {e}");
+                tracing::error!(error = %e, "failed to install SIGINT handler");
                 child.cancel();
                 return;
             }
         };
         tokio::select! {
+            biased;
+            // Cancelled elsewhere (for example, a bootstrap failure): stop without claiming a
+            // signal arrived or leaking the task.
+            _ = child.cancelled() => {}
             _ = sigterm.recv() => {
                 tracing::info!("SIGTERM received; cancelling");
                 child.cancel();
@@ -116,8 +145,6 @@ pub fn install_signal_handlers() -> CancellationToken {
                 tracing::info!("SIGINT received; cancelling");
                 child.cancel();
             }
-            // Cancelled elsewhere (e.g. a bootstrap failure) — stop listening; don't leak the task.
-            _ = child.cancelled() => {}
         }
     });
     token

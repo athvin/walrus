@@ -1,10 +1,14 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! `/metrics` exposes every sink series the design enumerates (PR 4.10). Guards against a metric-name
 //! rename silently breaking the committed Grafana dashboard / Prometheus alerts: the endpoint's
 //! exposition must contain every `common::metrics::names::SINK_*` constant.
 
 use common::metrics::names;
-use pg_sink::health::{serve_on, HealthState};
+use pg_sink::health::{HealthState, serve_on};
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};

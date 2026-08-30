@@ -47,4 +47,37 @@ fn error_message_extracts_the_message_field() {
     // Fields: S<severity>\0 C<code>\0 M<message>\0 \0
     let body = b"SERROR\0C42704\0Mno such slot\0\0";
     assert_eq!(error_message(body), "no such slot");
+    // The bare NUL closes the field list, so trailing bytes are padding and never a field.
+    assert_eq!(error_message(b"SERROR\0\0Mhidden\0"), "(no message)");
+    // A frame truncated mid-field still yields the bytes that did arrive.
+    assert_eq!(error_message(b"C42704\0Mno such"), "no such");
+    // A present but empty message, and a body carrying no fields at all.
+    assert_eq!(error_message(b"M\0\0"), "");
+    assert_eq!(error_message(b""), "(no message)");
+}
+
+#[test]
+fn fixed_width_window_preserves_bytes_and_context() {
+    assert_eq!(fixed::<4>(&[0, 0, 0, 7], "word").unwrap(), [0, 0, 0, 7]);
+    assert_eq!(
+        fixed::<4>(&[0, 0, 0], "word").unwrap_err().to_string(),
+        "word: expected 4 bytes, got 3"
+    );
+}
+
+#[test]
+fn auth_sub_type_reports_a_truncated_body_instead_of_panicking() {
+    assert_eq!(auth_sub_type(&[0, 0, 0, 0]).unwrap(), 0); // AuthenticationOk
+    assert_eq!(auth_sub_type(&[0, 0, 0, 10, b'S']).unwrap(), 10); // SASL, mechanisms trail the Int32
+    assert_eq!(
+        auth_sub_type(&[0, 0, 0]).unwrap_err().to_string(),
+        "short Authentication message (3 bytes)"
+    );
+    assert!(auth_sub_type(&[]).is_err());
+}
+
+#[test]
+fn parse_dsn_rejects_a_dsn_without_a_tcp_host() {
+    let err = parse_dsn("user=walrus dbname=walrus").unwrap_err();
+    assert!(err.to_string().contains("needs a TCP host"));
 }

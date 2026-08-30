@@ -7,21 +7,36 @@
 //! so re-running over the same tail produces a byte-identical mirror. A crash between the DuckDB commit
 //! and the control advance just re-runs Phase B — no bespoke recovery.
 
+use crate::duck_ext::DuckResultExt;
 use crate::error::LoaderError;
 use crate::phase_a::TableCtx;
 use crate::plan::TablePlan;
-use crate::transform::{apply_transform, TransformSql};
+use crate::table_name::{DuckTable, Mirror};
+use crate::transform::{TransformSql, apply_transform};
 use common::{Lsn, PgRelation};
 
 /// Build the transform for a table at its CURRENT reconciled `schema_version` (PR 3.8): read the registry
 /// (columns + type descriptors) into a [`TablePlan`] (Tier-2 emit/recombine, PR 4.2); fall back to the
 /// bootstrap relation's scalar shape when there is no registry row (single-version / hermetic setups).
-pub async fn current_transform(ctx: &TableCtx) -> Result<TransformSql, LoaderError> {
+///
+/// # Errors
+///
+/// Returns [`LoaderError::Duck`] if the local schema watermark cannot be read,
+/// [`LoaderError::Control`] if the registry lookup fails, or [`LoaderError::RegistryDecode`] if the
+/// stored relation shape is invalid.
+pub(crate) async fn current_transform(ctx: &TableCtx) -> Result<TransformSql, LoaderError> {
     let ver = ctx.db.schema_version()?;
     match control::read_registry(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table, ver).await? {
         Some(r) => {
-            let rel: PgRelation = serde_json::from_value(r.columns)
-                .map_err(|e| LoaderError::Internal(format!("decode registry columns: {e}")))?;
+            // The `schema.table` label is built INSIDE the closure: `map_err` only runs it on a
+            // decode failure, so the every-cycle success path allocates nothing.
+            let rel: PgRelation = serde_json::from_value(r.columns).map_err(|source| {
+                LoaderError::RegistryDecode {
+                    table: format!("{}.{}", ctx.schema, ctx.table),
+                    version: ver.0,
+                    source,
+                }
+            })?;
             Ok(TransformSql::from_plan(&TablePlan::from_registry(
                 &rel,
                 &r.descriptors,
@@ -32,6 +47,12 @@ pub async fn current_transform(ctx: &TableCtx) -> Result<TransformSql, LoaderErr
 }
 
 /// One Phase-B pass. Returns the max `commit_lsn` applied, or `None` if the tail was empty.
+///
+/// # Errors
+///
+/// Returns [`LoaderError::Control`] for checkpoint/registry/watermark operations,
+/// [`LoaderError::Duck`] for local scan or transaction failures, [`LoaderError::LsnParse`] for an
+/// invalid stored watermark, or [`LoaderError::RegistryDecode`] for an invalid relation shape.
 pub async fn run_phase_b(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     let cp = control::read_checkpoint(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table)
         .await?
@@ -41,12 +62,7 @@ pub async fn run_phase_b(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     let after = cp.transformed_lsn;
     // Phase-B transform lag = raw_appended_lsn − transformed_lsn (PR 4.10); pure math from the checkpoint
     // just read, no extra query. Labelled per table (bounded cardinality).
-    common::metrics::set_transform_lag(
-        &format!("{}.{}", ctx.schema, ctx.table),
-        cp.raw_appended_lsn
-            .as_u64()
-            .saturating_sub(cp.transformed_lsn.as_u64()),
-    );
+    common::metrics::set_transform_lag(&ctx.series, cp.raw_appended_lsn - cp.transformed_lsn);
 
     // The max commit LSN in the tail we (re)transform, bounded `>= transformed_lsn` (16-hex text sorts as
     // the LSN, so `max` = latest). The `>=` is load-bearing for the snapshot/stream boundary (PR 3.10,
@@ -57,45 +73,54 @@ pub async fn run_phase_b(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     // (`max()` is NULL only when `<table>_raw` is empty). A source that sits idle at the boundary re-scans
     // that one commit's rows each poll; normal streaming advances `transformed_lsn` past it immediately.
     let conn = ctx.db.conn();
+    let raw = DuckTable::<Mirror>::new(&ctx.table).to_raw();
     let max_hex: Option<String> = conn
         .query_row(
             &format!(
-                "SELECT max(\"_walrus_commit_lsn\") FROM \"{}_raw\" WHERE \"_walrus_commit_lsn\" >= ?",
-                ctx.table
+                "SELECT max(\"_walrus_commit_lsn\") FROM \"{}\" WHERE \"_walrus_commit_lsn\" >= ?",
+                raw.as_str()
             ),
             [after.to_string()],
             |r| r.get(0),
         )
-        .map_err(|e| LoaderError::Duck(format!("scan un-transformed tail: {e}")))?;
+        .duck("scan un-transformed tail")?;
     let Some(max_hex) = max_hex else {
         return Ok(None); // <table>_raw is empty — nothing to transform yet
     };
-    let max_lsn: Lsn = max_hex
-        .parse()
-        .map_err(|e| LoaderError::Internal(format!("parse max commit_lsn {max_hex:?}: {e:?}")))?;
+    let max_lsn: Lsn = max_hex.parse().map_err(|source| LoaderError::LsnParse {
+        field: "max commit_lsn",
+        source,
+    })?;
 
     // The transform must reference exactly the columns the reconciled tables now have — i.e. the shape at
     // the DuckDB tables' CURRENT reconciled `schema_version` (Phase A advanced it, PR 3.8), NOT the stale
     // bootstrap shape (and, PR 4.2, with the Tier-2 emit/recombine from the descriptors).
     let t = current_transform(ctx).await?;
-    conn.execute_batch("BEGIN TRANSACTION;")
-        .map_err(|e| LoaderError::Duck(format!("begin transform txn: {e}")))?;
-    if let Err(e) = apply_transform(conn, &t, &after) {
-        let _ = conn.execute_batch("ROLLBACK;");
-        return Err(e);
-    }
-    conn.execute_batch("COMMIT;")
-        .map_err(|e| LoaderError::Duck(format!("commit transform txn: {e}")))?;
+    ctx.db
+        .in_txn("transform", |conn| apply_transform(conn, &t, after))?;
 
     // Advance the watermark AFTER the DuckDB commit. The CHECK (transformed_lsn <= raw_appended_lsn)
     // holds because Phase A ran first this cycle. `max_lsn` can equal the prior `transformed_lsn` (a
     // boundary re-transform advances it to the same value — a no-op) — that is the snapshot/stream
     // boundary being held closed (PR 3.10). The full-rebuild (PR 3.11) is the safety net regardless.
     control::advance_transformed(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table, max_lsn).await?;
-    tracing::info!(
-        table = %format_args!("{}.{}", ctx.schema, ctx.table),
-        transformed = %max_lsn,
-        "Phase B: mirror updated, transformed_lsn advanced"
-    );
+    // Only a watermark that MOVED is a lifecycle event. The boundary re-transform described above
+    // re-applies the same commit on every poll while the source sits idle (`max_lsn == after`, a
+    // no-op against the mirror), so keeping one `info!` here would emit a line per table per
+    // `poll_interval` forever — claiming an advance that did not happen — and bury the cycles that
+    // did move. The idle re-scan is diagnostic detail: `debug`.
+    if max_lsn > after {
+        tracing::info!(
+            table = %format_args!("{}.{}", ctx.schema, ctx.table),
+            transformed = %max_lsn,
+            "Phase B: mirror updated, transformed_lsn advanced"
+        );
+    } else {
+        tracing::debug!(
+            table = %format_args!("{}.{}", ctx.schema, ctx.table),
+            transformed = %max_lsn,
+            "Phase B: boundary re-transform, transformed_lsn unchanged"
+        );
+    }
     Ok(Some(max_lsn))
 }

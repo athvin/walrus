@@ -1,4 +1,14 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
+#![allow(
+    clippy::panic,
+    clippy::unreachable,
+    reason = "golden helpers: macros assert fixture/protocol invariants"
+)]
 //! Golden-vector fixtures for the pgoutput decoder — a faithful, byte-for-byte port of
 //! `docs/examples/proto-version/test_decode_pgoutput.py::VECTORS`.
 //!
@@ -7,11 +17,12 @@
 
 use common::{ReplicaIdentity, TupleValue};
 use pg_sink::pgoutput::{
-    parse_message, parse_stream, parse_tuple, DecodeError, Message, OldTupleKind, Reader, StreamCtx,
+    DecodeError, Message, OldTupleKind, Reader, StreamCtx, parse_message, parse_stream, parse_tuple,
 };
+use std::fmt::Write as _;
 
 /// A ported row of `VECTORS`: bytes in, the golden render line out.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Vector {
     pub name: &'static str,
     /// Message bytes, hex-encoded (lowercase, as captured).
@@ -31,8 +42,7 @@ pub const VECTORS: &[Vector] = &[
         name: "begin",
         hex: "42000000000199bac80002f8dc466a6b4f000002ed",
         streaming: false,
-        expected:
-            "BEGIN         final_lsn=0/199BAC8 commit_ts=2026-07-05T13:55:11.294287+00:00 xid=749",
+        expected: "BEGIN         final_lsn=0/199BAC8 commit_ts=2026-07-05T13:55:11.294287+00:00 xid=749",
     },
     Vector {
         name: "type_enum",
@@ -309,11 +319,10 @@ fn fmt_lsn(v: u64) -> String {
 /// RFC-3339 `Z` stamp (PR 1.1). Formatted by hand (not jiff's `Display`, which trims trailing
 /// fractional zeros — `.914880` would render `.91488`).
 fn fmt_ts(micros_since_2000: i64) -> String {
-    const MICROS_1970_TO_2000: i64 = 946_684_800_000_000;
-    let ts = jiff::Timestamp::from_microsecond(micros_since_2000 + MICROS_1970_TO_2000)
+    let ts = jiff::Timestamp::from_microsecond(micros_since_2000 + common::PG_EPOCH_UNIX_MICROS)
         .expect("timestamp in range");
     let dt = ts.to_zoned(jiff::tz::TimeZone::UTC).datetime();
-    let micros = (dt.subsec_nanosecond() / 1000) as u32;
+    let micros = u32::try_from(dt.subsec_nanosecond() / 1000).unwrap();
     let base = format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
         dt.year(),
@@ -476,7 +485,7 @@ fn render(m: &Message) -> String {
             };
             let rels = relations
                 .iter()
-                .map(|r| r.to_string())
+                .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("TRUNCATE      {pre}opts={opts_str} rels=[{rels}]")
@@ -601,7 +610,7 @@ fn render(m: &Message) -> String {
 }
 
 /// The old-image kind as its wire char: `Key` → `'K'`, `Full` → `'O'`.
-fn old_kind_char(k: OldTupleKind) -> char {
+const fn old_kind_char(k: OldTupleKind) -> char {
     match k {
         OldTupleKind::Key => 'K',
         OldTupleKind::Full => 'O',
@@ -619,8 +628,10 @@ fn fmt_bytes(b: &[u8]) -> String {
             b'\n' => s.push_str("\\n"),
             b'\r' => s.push_str("\\r"),
             b'\t' => s.push_str("\\t"),
-            0x20..=0x7e => s.push(byte as char),
-            _ => s.push_str(&format!("\\x{byte:02x}")),
+            0x20..=0x7e => s.push(char::from(byte)),
+            _ => {
+                let _ = write!(&mut s, "\\x{byte:02x}");
+            }
         }
     }
     s.push('\'');
@@ -744,7 +755,7 @@ fn relation_marks_only_key_columns() {
     match decode(lookup("relation_orders").hex, false) {
         Message::Relation { relation, xid } => {
             assert_eq!(xid, None, "a non-streamed Relation has no xid prefix");
-            assert_eq!(relation.key_columns(), vec!["id"]);
+            assert_eq!(relation.to_key_columns(), vec!["id"]);
             assert_eq!(relation.replica_identity, ReplicaIdentity::Default);
         }
         other => panic!("expected Relation, got {other:?}"),

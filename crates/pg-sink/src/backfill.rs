@@ -11,15 +11,18 @@
 //! concurrent `COPY` under the existing snapshot — which is why it is the cheapest of the three
 //! deferred goals to pick up first.
 //!
-//! This module is the marked seam, not an implementation: [`plan_ctid_ranges`] is where a future
-//! contributor produces the per-table range plan that [`snapshot::SourceBackfill::copy_table`] would
+//! This module is the marked seam, not an implementation: `plan_ctid_ranges` is where a future
+//! contributor produces the per-table range plan that [`snapshot::Backfill::copy_table`](crate::snapshot::Backfill::copy_table) would
 //! then be fanned out over (each range still emits `snapshot` files at `lsn_end = consistent_point`,
 //! disambiguated by `manifest_id`, so the watermark handoff is unchanged — a throughput optimisation
 //! only). See `docs/deferred-goals.md`.
 
 /// A per-table plan of disjoint CTID ranges to `COPY` concurrently under the exported snapshot.
 /// **Deferred** — nothing constructs or consumes this in v1.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "deferred CTID-range backfill plan; see docs/deferred-goals.md"
+)]
 struct CtidRangePlan {
     /// Fully-qualified `schema.table`.
     table: String,
@@ -31,7 +34,14 @@ struct CtidRangePlan {
 /// **Deferred goal — not implemented.** Would size CTID ranges from table stats (relpages / bloat)
 /// and worker count. v1 runs one serial `COPY` per table; see the module docs and
 /// `docs/deferred-goals.md`.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "deferred CTID-range backfill seam; see docs/deferred-goals.md"
+)]
+#[expect(
+    clippy::unimplemented,
+    reason = "deferred goal — parallel CTID-range backfill; see docs/deferred-goals.md"
+)]
 fn plan_ctid_ranges(_table: &str) -> CtidRangePlan {
     unimplemented!("deferred goal — parallel CTID-range backfill; see docs/deferred-goals.md")
 }

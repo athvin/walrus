@@ -3,7 +3,7 @@
 //! **before its commit**, chopped into interleaved `Stream Start … Stream Stop` blocks that finish with
 //! `Stream Commit` or `Stream Abort`. This module makes the sink correct under that:
 //!
-//! 1. **Demultiplex per top-level `xid`** — a [`StreamDemux`] of per-xid [`StreamedTxn`] buffers,
+//! 1. **Demultiplex per top-level `xid`** — a [`StreamDemux`] of per-xid `StreamedTxn` buffers,
 //!    reassembling non-contiguous segments via the `Stream Start` first-segment flag.
 //! 2. **Commit-gate visibility** — a txn's rows become a `ready` manifest file **only on `Stream
 //!    Commit`**; nothing is visible before it.
@@ -19,45 +19,66 @@
 //!
 //! **top vs sub xid (proto §7).** `Stream Start` carries the **top-level** xid; every streamed change
 //! carries its **sub**-xid. The abort names the sub-xid — each buffered/spilled row is tagged with its
-//! sub-xid so `survivors` excludes exactly the aborted ones. *Freeing memory (the spill) is NOT
+//! sub-xid so `iter_survivors` excludes exactly the aborted ones. *Freeing memory (the spill) is NOT
 //! advancing the slot or making data visible (the `ready` row).*
 
-use crate::batch::{BatchTriggers, Clock, TableBatcher};
-use crate::memory::InflightMeter;
+use crate::batch::{BatchTriggers, Clock, SystemClock, TableBatcher};
+use crate::memory::{InflightMeter, TableId};
 use crate::pgoutput::Message;
 use crate::relcache::RelationCache;
 use crate::sink::{FileKind, ParquetSink, WrittenObject};
 use anyhow::Context;
-use common::{Kind, Lsn, Op, SinkMeta, TupleValue, UtcTimestamp};
+use common::{EpochNo, Kind, Lsn, Op, SinkMeta, TupleValue, UtcTimestamp};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 /// One streamed change, tagged with **its** sub-transaction xid (proto §7).
-#[derive(Clone)]
+///
+/// `values` is the decoded tuple, fixed at its source relation's width the moment the row is
+/// buffered — nothing ever appends to it — so it is frozen into a `Box<[_]>`: the capacity word a
+/// `Vec` would carry is dead weight repeated once per buffered row.
+///
+/// Deliberately **not** `Clone`. A buffered row is only ever moved (`push_change`, then
+/// `take_stream`'s `extract_if`) or borrowed (`iter_survivors`), and [`InflightMeter`] charges its
+/// bytes exactly once against the ceiling that decides when to spill. Deriving `Clone` would let a
+/// second, unmetered deep copy of an open transaction's buffer — one `Box<[TupleValue]>` per row —
+/// compile silently, so duplication here has to be a deliberate `impl`, not a derive nobody uses.
+#[derive(Debug)]
 struct StreamedChange {
     sub_xid: u32,
-    oid: u32,
+    oid: TableId,
     op: Op,
-    values: Vec<TupleValue>,
+    values: Box<[TupleValue]>,
     lsn: Lsn,
 }
 
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+    std::mem::size_of::<StreamedChange>() == 40,
+    "StreamedChange buffers every row of an open streamed transaction"
+);
+
 /// A speculatively-spilled S3 object for one `(sub_xid)` of an open txn — no manifest row until commit.
+#[derive(Debug)]
 struct StagedSpill {
     sub_xid: u32,
     written: WrittenObject,
 }
 
 /// Per top-level xid buffer for an in-progress streamed transaction.
+#[derive(Debug)]
 struct StreamedTxn {
     /// The floor `confirmed_flush` must not pass while this txn is open (its first-segment LSN).
     begin_lsn: Lsn,
     /// Buffered (not-yet-spilled) changes in commit order, each tagged with its sub-xid.
     changes: Vec<StreamedChange>,
+    /// Exactly the distinct `(oid, sub_xid)` streams currently represented in `changes`.
+    keys: HashSet<(TableId, u32)>,
     /// Speculatively-spilled files, each homogeneous in one sub-xid (droppable on that sub-xid's abort).
     staged: Vec<StagedSpill>,
-    /// Sub-xids that rolled back (`Stream Abort {sub != top}`) — excluded from `survivors`.
+    /// Sub-xids that rolled back (`Stream Abort {sub != top}`) — excluded from `iter_survivors`.
     aborted: HashSet<u32>,
 }
 
@@ -66,13 +87,32 @@ impl StreamedTxn {
         StreamedTxn {
             begin_lsn,
             changes: Vec::new(),
+            keys: HashSet::new(),
             staged: Vec::new(),
             aborted: HashSet::new(),
         }
     }
 
     fn push_change(&mut self, change: StreamedChange) {
+        self.keys.insert((change.oid, change.sub_xid));
         self.changes.push(change);
+    }
+
+    /// Move one stream out without cloning and preserve the relative order of rows and survivors.
+    ///
+    /// PR 11.7 made this linear with `mem::take` + `partition`; `extract_if` keeps that complexity
+    /// and ordering while avoiding a fresh survivor buffer. The txn is still open and still
+    /// buffering when the ceiling sheds one of its streams, so the survivors stay in `changes`'s
+    /// own allocation — the very one the next `push_change` refills. Taking first handed that
+    /// allocation to `IntoIter`, grew a second vector for the survivors, and freed the original on
+    /// every spill. Only the returned rows allocate.
+    fn take_stream(&mut self, oid: TableId, sub_xid: u32) -> Vec<StreamedChange> {
+        let rows: Vec<StreamedChange> = self
+            .changes
+            .extract_if(.., |c| c.oid == oid && c.sub_xid == sub_xid)
+            .collect();
+        self.keys.remove(&(oid, sub_xid));
+        rows
     }
 
     fn abort_subtxn(&mut self, sub_xid: u32) {
@@ -80,39 +120,57 @@ impl StreamedTxn {
     }
 
     /// The buffered (in-memory) rows that survive to commit: every change **except** aborted sub-xids.
-    /// (Commit materialisation inlines this filter; this accessor backs the tests + `survivor_count`.)
-    #[cfg(test)]
-    fn survivors(&self) -> impl Iterator<Item = &StreamedChange> {
+    /// The single definition of survivorship — `on_stream_commit` materialises exactly this iterator,
+    /// and `survivor_count` counts it.
+    ///
+    /// `aborted` is bound to a local first: a `move` closure reading `self.aborted` would truncate
+    /// the capture path at the `*self` deref and capture the whole `&StreamedTxn` (RFC 2229).
+    ///
+    /// No `#[must_use]` here: the `Iterator` trait carries one, so an `impl Iterator` return is
+    /// already covered — unlike [`crate::relcache::Iter`], a named struct that needs its own.
+    fn iter_survivors(&self) -> impl Iterator<Item = &StreamedChange> {
+        let aborted = &self.aborted;
         self.changes
             .iter()
-            .filter(move |c| !self.aborted.contains(&c.sub_xid))
+            .filter(move |c| !aborted.contains(&c.sub_xid))
     }
 }
 
 /// Demultiplexes interleaved streamed transactions, commit-gates visibility, and spills under memory
 /// pressure. **DB-free** — `on_stream_commit` returns the objects to `record_ready`.
-pub struct StreamDemux {
+#[derive(Debug)]
+pub struct StreamDemux<C = std::sync::Arc<SystemClock>> {
     open: HashMap<u32, StreamedTxn>,
+    /// `(relation_oid, sub_xid)` maps to the one top-level xid buffering that stream.
+    ///
+    /// Postgres xids are process-global, so one stream key has one owner. Invariant:
+    /// `owner[key] == top` iff `open[top].keys` contains `key`; every owner key is metered.
+    owner: HashMap<(TableId, u32), u32>,
     /// The top-level xid of the currently-open `Stream Start … Stream Stop` block; changes route here.
     current_top: Option<u32>,
     triggers: BatchTriggers,
-    clock: Arc<dyn Clock>,
-    epoch: i64,
+    clock: C,
+    epoch: EpochNo,
     sink_instance: String,
     meter: InflightMeter,
     spill_count: u64,
 }
 
-impl StreamDemux {
+impl<C: Clock + Clone> StreamDemux<C> {
+    /// A fresh demux with no open streams. Pure, and invisible to `clippy::must_use_candidate` for
+    /// the reason [`BatchRouter::new`](crate::consume::BatchRouter::new) is.
+    #[must_use]
     pub fn new(
         triggers: BatchTriggers,
-        clock: Arc<dyn Clock>,
-        epoch: i64,
-        sink_instance: String,
-        max_inflight_bytes: u64,
+        clock: C,
+        epoch: EpochNo,
+        sink_instance: impl Into<String>,
+        max_inflight_bytes: NonZeroU64,
     ) -> Self {
+        let sink_instance = sink_instance.into();
         StreamDemux {
             open: HashMap::new(),
+            owner: HashMap::new(),
             current_top: None,
             triggers,
             clock,
@@ -124,7 +182,8 @@ impl StreamDemux {
     }
 
     /// Total speculative spills so far (metric; PR 4.10 exports it).
-    pub fn spill_count(&self) -> u64 {
+    #[must_use]
+    pub const fn spill_count(&self) -> u64 {
         self.spill_count
     }
 
@@ -137,13 +196,31 @@ impl StreamDemux {
     }
 
     /// `Stream Stop`: the block ended (the txn may resume with a later segment).
-    pub fn on_stream_stop(&mut self) {
+    pub const fn on_stream_stop(&mut self) {
         self.current_top = None;
+    }
+
+    /// Claim one buffered row's bytes and record or confirm the stream's unique owner.
+    fn claim_stream(&mut self, key: (TableId, u32), top: u32, bytes: u64) {
+        self.meter.add(key, bytes);
+        let prior = self.owner.insert(key, top);
+        debug_assert!(prior.is_none() || prior == Some(top));
+    }
+
+    /// Forget a stream in the owner index and meter as one operation.
+    fn forget_stream(&mut self, key: (TableId, u32)) {
+        self.owner.remove(&key);
+        self.meter.release(key);
     }
 
     /// A streamed change: buffer it against the current top-level xid, tagged with its sub-xid, and
     /// meter its bytes. If the aggregate ceiling is crossed, spill the largest open `(table, sub-xid)`
     /// buffer speculatively (no manifest row, slot not advanced).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if no stream block is active, the relation is unknown, batching fails,
+    /// or a speculative Parquet spill cannot be written.
     pub async fn on_change(
         &mut self,
         cache: &RelationCache,
@@ -154,24 +231,42 @@ impl StreamDemux {
         let top = self
             .current_top
             .context("streamed change arrived outside a Stream Start block")?;
+        // `clone().into_boxed_slice()` freezes the tuple at its decoded width; the clone already
+        // allocates exactly `len`, so the conversion is a header change, not a second allocation.
         let (oid, op, values, sub_xid) = match msg {
             Message::Insert {
                 relation_oid,
                 new,
                 xid,
-            } => (*relation_oid, Op::Insert, new.clone(), xid.unwrap_or(top)),
+            } => (
+                TableId(*relation_oid),
+                Op::Insert,
+                new.clone().into_boxed_slice(),
+                xid.unwrap_or(top),
+            ),
             Message::Update {
                 relation_oid,
                 new,
                 xid,
                 ..
-            } => (*relation_oid, Op::Update, new.clone(), xid.unwrap_or(top)),
+            } => (
+                TableId(*relation_oid),
+                Op::Update,
+                new.clone().into_boxed_slice(),
+                xid.unwrap_or(top),
+            ),
             Message::Delete {
                 relation_oid,
                 old,
                 xid,
                 ..
-            } => (*relation_oid, Op::Delete, old.clone(), xid.unwrap_or(top)),
+            } => (
+                TableId(*relation_oid),
+                Op::Delete,
+                old.clone().into_boxed_slice(),
+                xid.unwrap_or(top),
+            ),
+            // Wildcard is deliberate: Message is #[non_exhaustive], and this dispatcher ignores other families.
             _ => return Ok(()),
         };
         let bytes = estimate_change_bytes(&values);
@@ -186,7 +281,7 @@ impl StreamDemux {
             values,
             lsn,
         });
-        self.meter.add((oid, sub_xid), bytes);
+        self.claim_stream((oid, sub_xid), top, bytes);
         self.spill_if_over_ceiling(cache, sink).await
     }
 
@@ -197,22 +292,21 @@ impl StreamDemux {
         cache: &RelationCache,
         sink: &ParquetSink,
     ) -> anyhow::Result<()> {
-        while self.meter.over_ceiling() {
-            let Some((oid, sub_xid)) = self.meter.largest_open() else {
+        if !self.meter.is_over_ceiling() {
+            return Ok(());
+        }
+
+        // Build one snapshot per shed episode. Inside this loop priorities only ever fall: it calls
+        // `meter.release` through `forget_stream`, never `meter.add`. Each popped tuple is only a
+        // hint and its snapshot byte count is never treated as live accounting.
+        let mut candidates = self.meter.to_spill_order();
+        while self.meter.is_over_ceiling() {
+            let Some((_bytes, oid, sub_xid)) = candidates.pop() else {
                 break;
             };
-            // Find the top-level txn holding this (table, sub-xid) and drain exactly those rows.
-            let Some(top) = self
-                .open
-                .iter()
-                .find(|(_, t)| {
-                    t.changes
-                        .iter()
-                        .any(|c| c.oid == oid && c.sub_xid == sub_xid)
-                })
-                .map(|(&k, _)| k)
-            else {
-                self.meter.release((oid, sub_xid)); // stale accounting; nothing buffered
+            let key = (oid, sub_xid);
+            let Some(top) = self.owner.get(&key).copied() else {
+                self.forget_stream(key); // stale accounting; nothing buffered
                 continue;
             };
             let (triggers, clock, epoch, instance) = (
@@ -223,27 +317,19 @@ impl StreamDemux {
             );
             let (begin, rows) = {
                 let Some(txn) = self.open.get_mut(&top) else {
-                    // `top` was just derived from `self.open`'s own keys, so this is unreachable;
-                    // skip this speculative-spill iteration rather than panic.
+                    // A stale owner must be forgotten so the over-ceiling loop cannot spin.
+                    self.forget_stream(key);
                     continue;
                 };
-                let mut take = Vec::new();
-                txn.changes.retain(|c| {
-                    if c.oid == oid && c.sub_xid == sub_xid {
-                        take.push(c.clone());
-                        false
-                    } else {
-                        true
-                    }
-                });
-                (txn.begin_lsn, take)
+                (txn.begin_lsn, txn.take_stream(oid, sub_xid))
             };
-            self.meter.release((oid, sub_xid));
-            let Some(cached) = cache.latest_for(oid) else {
+            self.forget_stream(key);
+            // `RelationCache` is keyed by the decoder's raw wire OID, so unwrap at that boundary.
+            let Some(cached) = cache.latest_for(oid.0) else {
                 continue; // shape not cached (shouldn't happen mid-stream) — nothing to spill
             };
-            let mut batcher =
-                TableBatcher::new(cached.clone(), triggers, clock).context("open spill batcher")?;
+            let mut batcher = TableBatcher::new(Arc::clone(&cached), triggers, clock)
+                .context("open spill batcher")?;
             for c in &rows {
                 let meta = SinkMeta {
                     op: c.op,
@@ -261,7 +347,7 @@ impl StreamDemux {
                     source_schema: cached.relation.schema.clone(),
                     source_table: cached.relation.name.clone(),
                     kind: Kind::Stream,
-                    unchanged_toast: vec![],
+                    unchanged_toast: Box::default(),
                     sink_instance: instance.clone(),
                     sink_processed_at: UtcTimestamp::now(),
                 };
@@ -278,7 +364,10 @@ impl StreamDemux {
             // LSN is not yet known. `on_stream_commit` corrects the manifest `lsn_end` to the commit LSN;
             // the loader then reads `lsn_end` as the authoritative per-row `commit_lsn` for a `spill` file.
             let written = sink
-                .put_with_kind(batcher.seal()?, FileKind::Spill)
+                .put_with_kind(
+                    batcher.seal().context("seal speculative spill batch")?,
+                    FileKind::Spill,
+                )
                 .await
                 .context("speculative spill PUT")?;
             self.spill_count += 1;
@@ -286,7 +375,7 @@ impl StreamDemux {
             tracing::info!(
                 top_xid = top,
                 sub_xid,
-                oid,
+                oid = oid.0,
                 spill_count = self.spill_count,
                 uri = %written.s3_uri,
                 "spilled open-txn buffer speculatively (no manifest, slot held)"
@@ -310,36 +399,47 @@ impl StreamDemux {
             if self.current_top == Some(top_xid) {
                 self.current_top = None;
             }
-            if let Some(txn) = self.open.remove(&top_xid) {
-                self.release_txn_meter(&txn);
-                for s in &txn.staged {
-                    let _ = sink.delete(&s.written.key).await;
+            let Some(txn) = self.open.remove(&top_xid) else {
+                return; // never opened (or already aborted) — no buffer and no spills to delete
+            };
+            self.release_txn_meter(&txn);
+            for s in &txn.staged {
+                if let Err(error) = sink.delete(&s.written.key).await {
+                    tracing::warn!(
+                        key = %s.written.key,
+                        error = %error,
+                        "failed to delete aborted speculative spill; object orphaned in staging"
+                    );
                 }
-                tracing::info!(
-                    top_xid,
-                    rows = txn.changes.len(),
-                    staged = txn.staged.len(),
-                    "whole-txn abort"
-                );
             }
+            tracing::info!(
+                top_xid,
+                rows = txn.changes.len(),
+                staged = txn.staged.len(),
+                "whole-txn abort"
+            );
             return;
         }
-        let doomed: Vec<_> = match self.open.get_mut(&top_xid) {
-            Some(txn) => {
-                txn.abort_subtxn(sub_xid);
-                let doomed = txn
-                    .staged
-                    .iter()
-                    .filter(|s| s.sub_xid == sub_xid)
-                    .map(|s| s.written.key.clone())
-                    .collect::<Vec<_>>();
-                txn.staged.retain(|s| s.sub_xid != sub_xid);
-                doomed
-            }
-            None => return,
+        let Some(txn) = self.open.get_mut(&top_xid) else {
+            return; // the top-level txn is not open here — nothing of its savepoint to drop
         };
-        for key in &doomed {
-            let _ = sink.delete(key).await;
+        txn.abort_subtxn(sub_xid);
+        // One predicate pass both removes the rolled-back spills and hands them over: the
+        // survivors compact inside `staged`'s allocation (the txn stays open and keeps
+        // spilling), and the doomed entries move out instead of their keys being cloned
+        // to outlive the borrow the awaited deletes cannot hold.
+        let doomed = txn
+            .staged
+            .extract_if(.., |s| s.sub_xid == sub_xid)
+            .collect::<Vec<_>>();
+        for spill in &doomed {
+            if let Err(error) = sink.delete(&spill.written.key).await {
+                tracing::warn!(
+                    key = %spill.written.key,
+                    error = %error,
+                    "failed to delete rolled-back speculative spill; object orphaned in staging"
+                );
+            }
         }
         tracing::info!(
             top_xid,
@@ -351,6 +451,11 @@ impl StreamDemux {
 
     /// `Stream Commit`: publish the (non-aborted) speculative spills stamped with the real `commit_lsn`,
     /// and materialise the in-memory survivors, returning every object for the caller to `record_ready`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if survivor batching, commit timestamp propagation, or durable
+    /// Parquet publication of an in-memory group fails.
     pub async fn on_stream_commit(
         &mut self,
         top_xid: u32,
@@ -362,7 +467,7 @@ impl StreamDemux {
         if self.current_top == Some(top_xid) {
             self.current_top = None;
         }
-        let Some(txn) = self.open.remove(&top_xid) else {
+        let Some(mut txn) = self.open.remove(&top_xid) else {
             tracing::warn!(
                 top_xid,
                 "Stream Commit for an unknown xid; nothing to materialise"
@@ -370,33 +475,34 @@ impl StreamDemux {
             return Ok(Vec::new());
         };
         self.release_txn_meter(&txn);
-        let StreamedTxn {
-            changes,
-            staged,
-            aborted,
-            ..
-        } = txn;
         let mut out = Vec::new();
         // Publish speculative spills whose sub-xid did NOT abort, stamped with the real commit LSN.
-        for spill in staged {
-            if aborted.contains(&spill.sub_xid) {
-                let _ = sink.delete(&spill.written.key).await; // defensive; usually deleted on abort
+        // `take` moves the spill vector out without moving `txn`, so `txn.iter_survivors()` remains usable.
+        for spill in std::mem::take(&mut txn.staged) {
+            if txn.aborted.contains(&spill.sub_xid) {
+                if let Err(error) = sink.delete(&spill.written.key).await {
+                    tracing::warn!(
+                        key = %spill.written.key,
+                        error = %error,
+                        "failed to delete aborted speculative spill; object orphaned in staging"
+                    );
+                }
                 continue;
             }
             let mut w = spill.written;
             w.lsn_end = commit_lsn;
             out.push(w);
         }
-        // Materialise the still-in-memory survivors.
+        // Materialise the still-in-memory survivors — the same predicate the accessor defines.
         let (triggers, clock, epoch, instance) = (
             self.triggers,
             self.clock.clone(),
             self.epoch,
             self.sink_instance.clone(),
         );
-        let mut batchers: HashMap<u32, TableBatcher> = HashMap::new();
-        for c in changes.iter().filter(|c| !aborted.contains(&c.sub_xid)) {
-            let Some(cached) = cache.latest_for(c.oid) else {
+        let mut batchers: HashMap<TableId, TableBatcher<C>> = HashMap::new();
+        for c in txn.iter_survivors() {
+            let Some(cached) = cache.latest_for(c.oid.0) else {
                 continue;
             };
             let meta = SinkMeta {
@@ -411,14 +517,14 @@ impl StreamDemux {
                 source_schema: cached.relation.schema.clone(),
                 source_table: cached.relation.name.clone(),
                 kind: Kind::Stream,
-                unchanged_toast: vec![],
+                unchanged_toast: Box::default(),
                 sink_instance: instance.clone(),
                 sink_processed_at: UtcTimestamp::now(),
             };
             let batcher = match batchers.entry(c.oid) {
                 Entry::Occupied(e) => e.into_mut(),
                 Entry::Vacant(e) => e.insert(
-                    TableBatcher::new(cached.clone(), triggers, clock.clone())
+                    TableBatcher::new(Arc::clone(&cached), triggers, clock.clone())
                         .context("open streamed materialise batcher")?,
                 ),
             };
@@ -428,7 +534,7 @@ impl StreamDemux {
                 .context("promote streamed survivors")?;
             if batcher.should_flush() {
                 out.push(
-                    sink.put(batcher.seal()?)
+                    sink.put(batcher.seal().context("seal streamed sub-batch")?)
                         .await
                         .context("materialise streamed sub-batch")?,
                 );
@@ -437,7 +543,7 @@ impl StreamDemux {
         for batcher in batchers.values_mut() {
             if batcher.committed_rows() > 0 {
                 out.push(
-                    sink.put(batcher.seal()?)
+                    sink.put(batcher.seal().context("seal final streamed batch")?)
                         .await
                         .context("materialise final streamed batch")?,
                 );
@@ -448,42 +554,56 @@ impl StreamDemux {
 
     /// The oldest open txn's begin LSN — `confirmed_flush` must never pass this (§1.6). `None` when no
     /// streamed txn is open.
+    #[must_use]
     pub fn open_floor(&self) -> Option<Lsn> {
         self.open.values().map(|t| t.begin_lsn).min()
     }
 
     fn release_txn_meter(&mut self, txn: &StreamedTxn) {
-        let keys: HashSet<(u32, u32)> = txn.changes.iter().map(|c| (c.oid, c.sub_xid)).collect();
-        for key in keys {
-            self.meter.release(key);
+        for &key in &txn.keys {
+            self.forget_stream(key);
         }
+    }
+
+    #[cfg(test)]
+    fn owner_len(&self) -> usize {
+        self.owner.len()
     }
 
     #[cfg(test)]
     fn survivor_count(&self, top_xid: u32) -> usize {
         self.open
             .get(&top_xid)
-            .map(|t| t.survivors().count())
+            .map(|t| t.iter_survivors().count())
             .unwrap_or(0)
     }
 }
 
 /// A rough per-change byte estimate (Arrow-buffered size, not serialized Parquet) for the meter.
+///
+/// Saturating to match the [`InflightMeter`] it feeds, whose own `add` clamps: a wrapped sum here
+/// would hand the meter a *small* number in release and silently lift the memory ceiling, which is
+/// the backstop against an OOM-kill.
 fn estimate_change_bytes(values: &[TupleValue]) -> u64 {
     const META_OVERHEAD: u64 = 96;
-    META_OVERHEAD
-        + values
-            .iter()
-            .map(|v| match v {
-                TupleValue::Text(s) => s.len() as u64,
-                TupleValue::Binary(b) => b.len() as u64,
-                TupleValue::Null | TupleValue::UnchangedToast => 1,
-            })
-            .sum::<u64>()
+    values
+        .iter()
+        .map(|v| match v {
+            TupleValue::Text(s) => u64::try_from(s.len()).unwrap_or(u64::MAX),
+            TupleValue::Binary(b) => u64::try_from(b.len()).unwrap_or(u64::MAX),
+            TupleValue::Null | TupleValue::UnchangedToast => 1,
+        })
+        .fold(META_OVERHEAD, u64::saturating_add)
 }
 
 /// A streamed change carries its sub-xid; a non-streamed change never enters the demux.
-pub fn is_streamed_change(msg: &Message) -> bool {
+///
+/// A pure classification of `msg`, so calling it for effect is meaningless. It escapes
+/// `clippy::must_use_candidate` through the argument: a [`Message`] can hold a `TupleValue::Binary`,
+/// whose `bytes::Bytes` is not `Freeze`, and that lint reads any non-`Freeze` reference as a
+/// mutable — therefore side-effecting — argument.
+#[must_use]
+pub const fn is_streamed_change(msg: &Message) -> bool {
     matches!(
         msg,
         Message::Insert { xid: Some(_), .. }

@@ -17,7 +17,7 @@ down:
 
 # Baseline gates (mirror CI).
 fmt:
-    cargo fmt --check
+    cargo fmt --all --check
 
 clippy:
     cargo clippy --all-targets --all-features -- -D warnings
@@ -29,11 +29,25 @@ test:
 it:
     cargo test --workspace --features it
 
-# Criterion micro-benches (sink decode + Arrow batch building — PR 5.4). Run on a quiet machine;
-# results print to stdout. Never a CI gate (shared runners are too noisy) — CI only compile-checks
-# the bench targets via `clippy --all-targets`. Baselines live in docs/benchmarks.md.
+# Criterion micro-benches: sink decode + Arrow batch building (PR 5.4) and the loader's transform +
+# Phase-A append (PR 5.5). Run on a quiet machine; results print to stdout. Never a CI gate (shared
+# runners are too noisy) — CI only compile-checks the bench targets via `clippy --all-targets`.
+# Baselines *and* the profiling workflow — how to get from "this bench is slow" to a flamegraph —
+# live in docs/benchmarks.md. The loader targets build DuckDB (`bundled`), so a cold first run
+# compiles for ~20 min before it measures anything; the 1M-row transform grid takes minutes.
 bench:
-    cargo bench -p pg-sink -p pg-to-arrow
+    cargo bench -p pg-sink -p pg-to-arrow -p loader
+
+# Record a named baseline for every bench (criterion stores it under `target/criterion/**/<name>`).
+# `--` hands the flag to the bench binary (criterion), not to cargo.
+bench-baseline name="main":
+    cargo bench -p pg-sink -p pg-to-arrow -p loader -- --save-baseline {{name}}
+
+# Re-run the benches against a saved baseline: criterion prints the per-bench delta and whether it
+# clears its noise threshold. Usage: `just bench-baseline before`, apply the change, then
+# `just bench-compare before` — the only honest read on hardware that drifts between runs.
+bench-compare name="main":
+    cargo bench -p pg-sink -p pg-to-arrow -p loader -- --baseline {{name}}
 
 # End-to-end throughput harness (PR 5.6): boots the compose stack, runs the release sink + loader
 # against it, applies a load scenario, drains, and prints a per-stage summary + bottleneck ranking.

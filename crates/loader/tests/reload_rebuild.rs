@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! The rebuild trigger against compose (`#[ignore]` — needs control PG + MinIO). The first
 //! claimed `kind='reload'` file with `reload_id >` the `_walrus_meta` latch replaces both tables
 //! at the file's schema_version, clears the quarantine, purges superseded pending rows, sets the
@@ -8,11 +13,11 @@
 //!
 //!   cargo test -p loader --test reload_rebuild -- --ignored --test-threads=1
 
-use common::{Lsn, PgColumn, PgRelation, ReplicaIdentity};
+use common::{EpochNo, Lsn, PgColumn, PgRelation, ReplicaIdentity};
 use control::reload::{self, ReloadFlavor};
 use loader::duck::{S3Access, TableDb};
 use loader::health::LoaderState;
-use loader::phase_a::{run_phase_a, TableCtx};
+use loader::phase_a::{TableCtx, run_phase_a};
 use loader::phase_b::run_phase_b;
 use std::time::Duration;
 
@@ -50,16 +55,16 @@ fn orders() -> PgRelation {
     }
 }
 
-fn tmpdir(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("walrus-loader-rr-{name}"));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+/// A scratch directory for one test's `.duckdb` file. The returned guard deletes it on drop — even
+/// when an assertion panics, which a trailing `remove_dir_all` would skip.
+fn tmpdir(name: &str) -> tempfile::TempDir {
+    let prefix = format!("walrus-loader-rr-{name}-");
+    tempfile::Builder::new().prefix(&prefix).tempdir().unwrap()
 }
 
 /// Write a `(id, status, op, commit_lsn, lsn)` Parquet to MinIO. Ops use the wire values
 /// (`i`/`u`/`d`); LSNs are the sortable 16-hex text the sink emits.
-fn write_rows(epoch: i64, name: &str, rows: &[(i32, &str, &str, &str, &str)]) -> String {
+fn write_rows(epoch: EpochNo, name: &str, rows: &[(i32, &str, &str, &str, &str)]) -> String {
     let w = duckdb::Connection::open_in_memory().unwrap();
     let a = s3();
     w.execute_batch(&format!(
@@ -67,7 +72,10 @@ fn write_rows(epoch: i64, name: &str, rows: &[(i32, &str, &str, &str, &str)]) ->
          SET s3_url_style='path'; SET s3_use_ssl=false; \
          SET s3_access_key_id='{}'; SET s3_secret_access_key='{}'; \
          CREATE TABLE fixture (id INTEGER, status VARCHAR, walrus_pg_sink_meta VARCHAR);",
-        a.region, a.endpoint, a.access_key_id, a.secret_access_key
+        a.region,
+        a.endpoint,
+        a.access_key_id,
+        a.secret_access_key.expose()
     ))
     .unwrap();
     for (id, status, op, commit, lsn) in rows {
@@ -86,25 +94,34 @@ fn write_rows(epoch: i64, name: &str, rows: &[(i32, &str, &str, &str, &str)]) ->
 
 async fn seed_file(
     pool: &sqlx::PgPool,
-    epoch: i64,
+    epoch: EpochNo,
     uri: &str,
     kind: &str,
     lsn_end: &str,
-    reload_id: Option<i64>,
+    reload_id: Option<common::ReloadId>,
 ) -> i64 {
-    seed_file_v(pool, epoch, uri, kind, lsn_end, reload_id, 1).await
+    seed_file_v(
+        pool,
+        epoch,
+        uri,
+        kind,
+        lsn_end,
+        reload_id,
+        common::SchemaVersionNo(1),
+    )
+    .await
 }
 
 /// Like [`seed_file`] but at an explicit `schema_version` — a file at a version NEWER than the
 /// loader's would trigger a reconcile (PR 6.12's skip path).
 async fn seed_file_v(
     pool: &sqlx::PgPool,
-    epoch: i64,
+    epoch: EpochNo,
     uri: &str,
     kind: &str,
     lsn_end: &str,
-    reload_id: Option<i64>,
-    schema_version: i64,
+    reload_id: Option<common::ReloadId>,
+    schema_version: common::SchemaVersionNo,
 ) -> i64 {
     control::insert_ready(
         pool,
@@ -127,7 +144,7 @@ async fn seed_file_v(
 }
 
 /// Fresh control state + an owned `TableCtx` (DuckDB in a temp dir).
-async fn setup(epoch: i64) -> (TableCtx, std::path::PathBuf) {
+async fn setup(epoch: EpochNo) -> (TableCtx, tempfile::TempDir) {
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     for tbl in [
@@ -147,7 +164,7 @@ async fn setup(epoch: i64) -> (TableCtx, std::path::PathBuf) {
             epoch,
             slot_name: "walrus_slot".into(),
             created_lsn: "0/0".parse().unwrap(),
-            status: "streaming".into(),
+            status: control::ReplicationStatus::Streaming,
         },
     )
     .await
@@ -156,18 +173,21 @@ async fn setup(epoch: i64) -> (TableCtx, std::path::PathBuf) {
         .await
         .unwrap();
     let dir = tmpdir(&epoch.to_string());
-    let db = TableDb::open(&dir.join("orders.duckdb")).unwrap();
-    db.ensure_tables(&orders(), 1).unwrap();
+    let db = TableDb::open(dir.path().join("orders.duckdb")).unwrap();
+    db.ensure_tables(&orders(), common::SchemaVersionNo(1))
+        .unwrap();
     db.configure_s3(&s3()).unwrap();
     let ctx = TableCtx {
         pool,
         epoch,
+        epoch_rx: loader::epoch::fixed_epoch_watch(epoch),
         schema: "public".into(),
         table: "orders".into(),
+        series: "public.orders".into(),
         rel: orders(),
         db,
         state: LoaderState::new(),
-        max_files: 100,
+        max_files: std::num::NonZeroI64::new(100).unwrap(),
         poll_interval: Duration::from_secs(5),
         compaction_interval: Duration::from_secs(3600),
         retention_lsn_lag: 16 << 20,
@@ -182,11 +202,11 @@ async fn setup(epoch: i64) -> (TableCtx, std::path::PathBuf) {
 /// is lifted and chunks are claimable; a resync never paused anything).
 async fn drained_reload(
     pool: &sqlx::PgPool,
-    epoch: i64,
+    epoch: EpochNo,
     l1: &str,
     h: &str,
     flavor: ReloadFlavor,
-) -> i64 {
+) -> common::ReloadId {
     let id = reload::request(pool, epoch, "public", "orders", flavor)
         .await
         .unwrap();
@@ -199,7 +219,7 @@ async fn drained_reload(
         1,
         &serde_json::json!(["999"]),
         l1.parse::<Lsn>().unwrap(),
-        1,
+        common::SchemaVersionNo(1),
     )
     .await
     .unwrap();
@@ -227,8 +247,8 @@ fn mirror_count(ctx: &TableCtx) -> i64 {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn rebuild_converges_mirror_to_source_and_kills_phantoms() {
     let _g = LOCK.lock().await;
-    let epoch = 670_001;
-    let (ctx, dir) = setup(epoch).await;
+    let epoch = EpochNo(670_001);
+    let (ctx, _dir) = setup(epoch).await;
 
     // The OLD world: ids 1,2 streamed normally; then a phantom drifts into the mirror directly.
     let old = write_rows(
@@ -286,7 +306,7 @@ async fn rebuild_converges_mirror_to_source_and_kills_phantoms() {
     assert_eq!(mirror_status(&ctx, 2), None, "mid-export delete holds");
     assert_eq!(mirror_status(&ctx, 3).as_deref(), Some("c"));
     assert_eq!(mirror_count(&ctx), 2);
-    assert_eq!(ctx.db.recorded_reload_id().unwrap(), reload_id);
+    assert_eq!(ctx.db.recorded_reload_id().unwrap(), Some(reload_id));
     let cp = control::read_checkpoint(&ctx.pool, epoch, "public", "orders")
         .await
         .unwrap()
@@ -309,16 +329,14 @@ async fn rebuild_converges_mirror_to_source_and_kills_phantoms() {
     );
     assert_eq!(mirror_status(&ctx, 2), None);
     assert_eq!(mirror_count(&ctx), 2);
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn superseded_rows_are_purged_and_their_content_discarded() {
     let _g = LOCK.lock().await;
-    let epoch = 670_002;
-    let (ctx, dir) = setup(epoch).await;
+    let epoch = EpochNo(670_002);
+    let (ctx, _dir) = setup(epoch).await;
 
     // One claim batch holds the whole story: a pre-`W` stream file (sorts first), the chunk, a
     // post-`W` stream file. The pre-`W` file is applied into the OLD raw before the chunk fires
@@ -377,16 +395,14 @@ async fn superseded_rows_are_purged_and_their_content_discarded() {
         "pre-`W` content is discarded with the old raw — the chunks re-cover its commit"
     );
     assert_eq!(mirror_count(&ctx), 2);
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn delete_superseded_prunes_by_kind_and_lsn() {
     let _g = LOCK.lock().await;
-    let epoch = 670_005;
-    let (ctx, dir) = setup(epoch).await;
+    let epoch = EpochNo(670_005);
+    let (ctx, _dir) = setup(epoch).await;
 
     // The contract itself (the loop's safety net for LATE-arriving superseded rows too): every
     // non-reload row at lsn_end <= first_lsn goes; the chunk at lsn_end == first_lsn survives its
@@ -398,7 +414,15 @@ async fn delete_superseded_prunes_by_kind_and_lsn() {
     );
     let old_stream = seed_file(&ctx.pool, epoch, &f, "stream", "0/60", None).await;
     let boundary_stream = seed_file(&ctx.pool, epoch, &f, "stream", "0/100", None).await;
-    let chunk_at_boundary = seed_file(&ctx.pool, epoch, &f, "reload", "0/100", Some(42)).await;
+    let chunk_at_boundary = seed_file(
+        &ctx.pool,
+        epoch,
+        &f,
+        "reload",
+        "0/100",
+        Some(common::ReloadId(42)),
+    )
+    .await;
     let newer_stream = seed_file(&ctx.pool, epoch, &f, "stream", "0/200", None).await;
 
     let purged = control::delete_superseded(
@@ -430,24 +454,33 @@ async fn delete_superseded_prunes_by_kind_and_lsn() {
         .execute(&ctx.pool)
         .await
         .unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn stale_reload_file_is_skipped_and_retired() {
     let _g = LOCK.lock().await;
-    let epoch = 670_003;
-    let (ctx, dir) = setup(epoch).await;
+    let epoch = EpochNo(670_003);
+    let (ctx, _dir) = setup(epoch).await;
 
     // The .duckdb already rebuilt for a NEWER attempt (PR 6.8's restart hygiene, simulated).
-    ctx.db.set_recorded_reload_id(999_999).unwrap();
+    ctx.db
+        .set_recorded_reload_id(common::ReloadId(999_999))
+        .unwrap();
     let stale = write_rows(
         epoch,
         "stale",
         &[(1, "stale", "i", "0000000000000100", "0000000000000100")],
     );
-    let stale_id = seed_file(&ctx.pool, epoch, &stale, "reload", "0/100", Some(5)).await;
+    let stale_id = seed_file(
+        &ctx.pool,
+        epoch,
+        &stale,
+        "reload",
+        "0/100",
+        Some(common::ReloadId(5)),
+    )
+    .await;
 
     run_phase_a(&ctx).await.unwrap();
 
@@ -465,19 +498,17 @@ async fn stale_reload_file_is_skipped_and_retired() {
     assert_eq!(raw, 0, "retired UNAPPLIED — DuckDB untouched");
     assert_eq!(
         ctx.db.recorded_reload_id().unwrap(),
-        999_999,
+        Some(common::ReloadId(999_999)),
         "the latch never regresses (latest wins)"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn rebuild_clears_the_lossy_cast_quarantine() {
     let _g = LOCK.lock().await;
-    let epoch = 670_004;
-    let (ctx, dir) = setup(epoch).await;
+    let epoch = EpochNo(670_004);
+    let (ctx, _dir) = setup(epoch).await;
 
     // The PR 3.9 terminal state: a lossy ALTER COLUMN TYPE cast failed; /ready is degraded. (The
     // entry path is ddl_destructive.rs's covered ground; the EXIT is under test here.)
@@ -500,16 +531,14 @@ async fn rebuild_clears_the_lossy_cast_quarantine() {
         "the rebuild is the quarantine's one exit"
     );
     assert_eq!(mirror_status(&ctx, 1).as_deref(), Some("recovered"));
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn resync_flavor_never_rebuilds_and_merges_over_the_live_mirror() {
     let _g = LOCK.lock().await;
-    let epoch = 670_006;
-    let (ctx, dir) = setup(epoch).await;
+    let epoch = EpochNo(670_006);
+    let (ctx, _dir) = setup(epoch).await;
 
     // A LIVE mirror the resync must NOT clear: ids 1,2 already streamed in. And — to prove the
     // resync arm skips `clear_quarantine` (only a rebuild is that exit) — latch the quarantine.
@@ -585,23 +614,21 @@ async fn resync_flavor_never_rebuilds_and_merges_over_the_live_mirror() {
     // quarantine exit (only a rebuild clears it).
     assert_eq!(
         ctx.db.recorded_reload_id().unwrap(),
-        0,
+        None,
         "resync never sets the reload_id latch"
     );
     assert!(
         ctx.state.is_quarantined(),
         "resync is not a quarantine exit — the latch still holds"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn superseded_version_crossing_file_is_skipped_not_reconciled() {
     let _g = LOCK.lock().await;
-    let epoch = 670_007;
-    let (ctx, dir) = setup(epoch).await;
+    let epoch = EpochNo(670_007);
+    let (ctx, _dir) = setup(epoch).await;
 
     // A live mirror {1} at the loader's current schema_version (1).
     let live = write_rows(
@@ -622,7 +649,16 @@ async fn superseded_version_crossing_file_is_skipped_not_reconciled() {
         "blocker",
         &[(8, "blocker", "i", "0000000000000060", "0000000000000060")],
     );
-    let blocker_id = seed_file_v(&ctx.pool, epoch, &blocker, "stream", "0/60", None, 2).await;
+    let blocker_id = seed_file_v(
+        &ctx.pool,
+        epoch,
+        &blocker,
+        "stream",
+        "0/60",
+        None,
+        common::SchemaVersionNo(2),
+    )
+    .await;
 
     // A drained rebuild reload at first_lsn = 0/100 (>= the blocker's 0/60 ⇒ supersedes it).
     let reload_id = drained_reload(&ctx.pool, epoch, "0/100", "0/100", ReloadFlavor::Reload).await;
@@ -662,6 +698,4 @@ async fn superseded_version_crossing_file_is_skipped_not_reconciled() {
             .await
             .unwrap();
     assert_eq!(blocker_gone, 0, "the rebuild purged the skipped blocker");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

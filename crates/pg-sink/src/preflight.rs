@@ -3,8 +3,9 @@
 //! Assert every server-side precondition before a single byte of WAL is read: the connecting role has
 //! the `REPLICATION` privilege, `wal_level = logical`, server ≥ 14, slot / wal-sender headroom, the
 //! publication covers `walrus.ddl_audit` + `walrus.heartbeat`, and every published **user** table has
-//! a usable replica identity (a PK for `DEFAULT`). Any mismatch is **terminal** — a `PreflightError`
-//! mapped to a distinct, greppable `ExitCode` (`CrashLoopBackOff`, not a silent slow failure).
+//! a usable replica identity (a PK for `DEFAULT`). Any mismatch is **terminal** — a
+//! [`PreflightError`] mapped to a distinct, greppable [`common::ExitCode`] (`CrashLoopBackOff`, not
+//! a silent slow failure).
 //!
 //! **Connection note:** `tokio-postgres` 0.7 has no API to open a `replication=database` connection
 //! (and its config parser rejects the param), so the preflight runs its catalog checks over an
@@ -15,52 +16,76 @@
 //! `version()`.
 
 use crate::config::SinkConfig;
+use common::ReplicaIdentity;
+use common::sql::{SqlIdent, SqlStrExt};
 use std::collections::HashSet;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 
 /// A published table, `schema.table`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TableId {
+    /// Schema name.
     pub schema: String,
+    /// Table name.
     pub table: String,
 }
 
 /// What the server reported for the two headline settings.
 #[derive(Debug, Clone)]
 pub struct ServerInfo {
+    /// `server_version_num`, e.g. `140009`. Compared numerically, never against the version string.
     pub version_num: i32,
+    /// `wal_level`, which must be `logical` for logical replication to be possible at all.
     pub wal_level: String,
 }
 
 /// Strict rejects a keyless table; lenient quarantines and continues.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PkMode {
+    /// A keyless published table fails preflight, so the sink refuses to start.
     Strict,
+    /// A keyless table is quarantined and the sink starts without it, so one bad table does not
+    /// block every other one.
     Lenient,
 }
 
 /// Outcome of the per-table PK preflight.
 #[derive(Debug, Default, Clone)]
 pub struct PkReport {
+    /// Tables with a usable replica-identity key — the set that will be replicated.
     pub ok: Vec<TableId>,
+    /// Keyless tables skipped under [`PkMode::Lenient`]. Always empty under
+    /// [`PkMode::Strict`], which errors instead of reporting.
     pub quarantined: Vec<TableId>,
 }
 
-/// A terminal source-preflight mismatch. `main` maps it (via `common::Error`) to a distinct exit code.
+/// A terminal source-preflight mismatch. `main` maps it (via [`common::Error`]) to a distinct exit
+/// code.
+/// This taxonomy is still growing; new variants must remain additive for downstream crates.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum PreflightError {
+    /// `wal_level` is not `logical`, so no logical slot can stream. Changing it needs a restart of
+    /// the source, which is why this is terminal rather than retried.
     #[error("wal_level is {found}, need 'logical'")]
     WalLevel { found: String },
+    /// The source predates PG14 and cannot speak pgoutput protocol v2, which walrus requires for
+    /// streamed transactions.
     #[error("server_version_num {found} < 140000 (proto v2 needs PG14+)")]
     ServerTooOld { found: i32 },
+    /// The source is already at its `max_replication_slots` or `max_wal_senders` limit, so creating
+    /// walrus's slot would fail later, in a worse place.
     #[error("no headroom: {kind} {used}/{max}")]
     NoHeadroom {
         kind: &'static str,
         used: i32,
         max: i32,
     },
+    /// The configured publication does not exist on the source.
     #[error("publication {pub_name} does not exist")]
     PublicationMissing { pub_name: String },
+    /// The publication exists but does not cover a table walrus was told to replicate. The message
+    /// carries the `ALTER PUBLICATION` that fixes it, since that is the operator's next action.
     #[error(
         "publication {pub_name} missing table {schema}.{table} \
          (fix: ALTER PUBLICATION {pub_name} ADD TABLE {schema}.{table})"
@@ -70,29 +95,66 @@ pub enum PreflightError {
         schema: String,
         table: String,
     },
+    /// A published table has no key, so its updates and deletes could not be applied downstream.
+    /// Raised only under [`PkMode::Strict`]; [`PkMode::Lenient`] reports it in a [`PkReport`].
     #[error("table {schema}.{table} has no PRIMARY KEY / usable replica identity")]
     NoPrimaryKey { schema: String, table: String },
+    /// The connecting role lacks `REPLICATION`, so it cannot open a replication connection.
     #[error("missing REPLICATION privilege")]
     NoReplicationPriv,
+    /// The `walrus.ddl_audit` tap is absent or incomplete, so schema changes would drift silently.
+    /// `detail` names which half is missing (the table or an event trigger).
     #[error("DDL capture not installed: {detail} (apply migrations/source/0002_ddl_triggers.sql)")]
     DdlCaptureMissing { detail: &'static str },
+    /// The `walrus.reload_signal` table is absent, so no chunk export could ever learn its
+    /// watermark. `detail` names what was missing.
     #[error(
         "reload signal table not installed: {detail} \
          (apply migrations/source/0003_reload_signal.sql)"
     )]
     ReloadSignalMissing { detail: &'static str },
+    /// A catalog query failed on the wire. `source` keeps tokio-postgres's typed failure — SQLSTATE,
+    /// severity, hint — reachable by [`source()`](std::error::Error::source)/`downcast_ref`, exactly
+    /// as [`HeartbeatError`](crate::heartbeat::HeartbeatError) already does for the same client.
+    ///
+    /// `#[from]` rather than `#[source]`: every catalog read goes through one helper, so `?` there
+    /// is the only conversion and there is nothing for a second one to be confused with.
     #[error("preflight query failed: {0}")]
-    Query(String),
+    Query(#[from] tokio_postgres::Error),
+    /// The catalog answered, but not with a value the preflight can read (no rows, a non-numeric
+    /// setting). The assertion itself failed, so there is no underlying error to chain — and it is
+    /// not a [`PreflightError::Query`]: the query worked.
+    #[error("preflight catalog result unusable: {0}")]
+    UnusableResult(String),
+    /// A configured name cannot be rendered as a SQL identifier. `source` keeps *which* rule it
+    /// broke, so a caller can branch on it instead of matching on the message. Also not a
+    /// [`PreflightError::Query`]: the rejection happens before any statement reaches the server.
+    #[error("invalid SQL identifier: {0}")]
+    Ident(#[source] common::sql::IdentError),
 }
 
 impl From<PreflightError> for common::Error {
+    /// The terminal class of a mismatch is data, never a guess — so this match is exhaustive (no
+    /// `_` arm): a new variant must choose its class here, and its exit code in
+    /// [`crate::exit::code_for`], instead of silently inheriting the generic ones.
+    #[deny(clippy::wildcard_enum_match_arm)]
     fn from(e: PreflightError) -> Self {
-        match e {
+        match &e {
             // A keyless table has its own dedicated terminal class + exit code.
             PreflightError::NoPrimaryKey { schema, table } => common::Error::KeylessTable {
                 table: format!("{schema}.{table}"),
             },
-            other => common::Error::Preflight(other.to_string()),
+            PreflightError::WalLevel { .. }
+            | PreflightError::ServerTooOld { .. }
+            | PreflightError::NoHeadroom { .. }
+            | PreflightError::PublicationMissing { .. }
+            | PreflightError::PublicationGap { .. }
+            | PreflightError::NoReplicationPriv
+            | PreflightError::DdlCaptureMissing { .. }
+            | PreflightError::ReloadSignalMissing { .. }
+            | PreflightError::Query(_)
+            | PreflightError::UnusableResult(_)
+            | PreflightError::Ident(_) => common::Error::Preflight(e.to_string()),
         }
     }
 }
@@ -101,6 +163,12 @@ impl From<PreflightError> for common::Error {
 /// up) is a *transient* [`common::Error::SourceDb`]; a server-side rejection (auth/config) is a
 /// *terminal* [`common::Error::Preflight`]. The `REPLICATION` privilege itself is asserted from the
 /// catalog by [`SourcePreflight::assert_server_prereqs`], not inferred from the connect succeeding.
+///
+/// # Errors
+///
+/// Returns [`common::Error::SourceDb`] for a transport-level connection failure (transient), or
+/// [`common::Error::Preflight`] when the server responds with a terminal authentication/configuration
+/// rejection.
 pub async fn connect_source(url: &str) -> Result<Client, common::Error> {
     let (client, connection) = tokio_postgres::connect(url, NoTls).await.map_err(|e| {
         if e.as_db_error().is_some() {
@@ -114,25 +182,35 @@ pub async fn connect_source(url: &str) -> Result<Client, common::Error> {
     // Drive the connection in the background; it lives as long as `client` is held.
     tokio::spawn(async move {
         if let Err(e) = connection.await {
-            tracing::warn!("source connection closed: {e}");
+            tracing::warn!(error = %e, "source connection closed");
         }
     });
     Ok(client)
 }
 
 /// The catalog assertions the sink runs over the source connection before reading WAL.
+#[derive(Debug)]
 pub struct SourcePreflight<'a> {
     client: &'a Client,
     cfg: &'a SinkConfig,
 }
 
 impl<'a> SourcePreflight<'a> {
-    pub fn new(client: &'a Client, cfg: &'a SinkConfig) -> Self {
+    /// Borrow a connected source client and the config whose expectations will be asserted against
+    /// it. Borrows rather than owns: preflight runs once and the caller keeps using both.
+    #[must_use]
+    pub const fn new(client: &'a Client, cfg: &'a SinkConfig) -> Self {
         SourcePreflight { client, cfg }
     }
 
     /// The DDL-capture tap is installed (PR 2.33): the `walrus.ddl_audit` table has the sink's columns
     /// and **both** event triggers exist. Missing → terminal (schema changes would silently drift).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PreflightError::DdlCaptureMissing`] when the audit shape or either trigger is absent,
+    /// [`PreflightError::Query`] when a catalog query fails, or [`PreflightError::UnusableResult`]
+    /// when one answers with no row to read.
     pub async fn assert_ddl_capture(&self) -> Result<(), PreflightError> {
         if self
             .first_text(
@@ -168,6 +246,13 @@ impl<'a> SourcePreflight<'a> {
 
     /// The role has `REPLICATION`, `wal_level = logical`, `server_version_num ≥ 140000`, and free
     /// slot / wal-sender headroom.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PreflightError::NoReplicationPriv`], [`PreflightError::WalLevel`],
+    /// [`PreflightError::ServerTooOld`], or [`PreflightError::NoHeadroom`] for a terminal prerequisite
+    /// mismatch; catalog failures return [`PreflightError::Query`], and a setting that is missing or
+    /// non-numeric returns [`PreflightError::UnusableResult`].
     pub async fn assert_server_prereqs(&self) -> Result<ServerInfo, PreflightError> {
         // The role must be able to start a WAL sender (rolreplication, or a superuser).
         let can_replicate = self
@@ -211,6 +296,12 @@ impl<'a> SourcePreflight<'a> {
     /// `manage_publication`) by [`Self::assert_publication_covers`], which treats `reload_signal`
     /// as the third walrus-internal table; this existence check runs FIRST so a missing table gets
     /// the migration-naming error, not a failed `ALTER PUBLICATION`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PreflightError::ReloadSignalMissing`] when the table or primary key is absent,
+    /// [`PreflightError::Query`] when a catalog query fails, or [`PreflightError::UnusableResult`]
+    /// when one answers with no row to read.
     pub async fn assert_reload_signal(&self) -> Result<(), PreflightError> {
         if self
             .first_text(
@@ -249,21 +340,32 @@ impl<'a> SourcePreflight<'a> {
     /// and `reload_signal` (create/extend when `manage_publication`, else a gap is terminal, with
     /// the exact `ALTER PUBLICATION` fix in the error). `pg_publication_tables` already expands
     /// `FOR ALL TABLES` and partition roots, so we read it directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PreflightError::PublicationMissing`] or [`PreflightError::PublicationGap`] when
+    /// automatic publication management is disabled, [`PreflightError::Query`] when inspection or
+    /// an authorized create/alter statement fails, [`PreflightError::UnusableResult`] when a catalog
+    /// answer cannot be read, and [`PreflightError::Ident`] when a configured publication or table
+    /// name is not a legal SQL identifier.
     pub async fn assert_publication_covers(&self) -> Result<(), PreflightError> {
         let pubname = &self.cfg.publication_name;
+        // Parse once, up front: both statements below that name the publication as an *identifier*
+        // reuse this proven value instead of re-running `SqlIdent::new` per call site (the create
+        // path plus one per missing table — up to four validations of the same string).
+        let pub_ident = ident(pubname)?;
         let exists = self
             .count(&format!(
                 "SELECT count(*) FROM pg_publication WHERE pubname = {}",
-                lit(pubname)
+                pubname.to_quoted_literal()
             ))
             .await?
             > 0;
         if !exists {
             if self.cfg.manage_publication {
                 self.exec(&format!(
-                    "CREATE PUBLICATION {} FOR TABLE walrus.heartbeat, walrus.ddl_audit, \
-                     walrus.reload_signal WITH (publish_via_partition_root = true)",
-                    ident(pubname)
+                    "CREATE PUBLICATION {pub_ident} FOR TABLE walrus.heartbeat, walrus.ddl_audit, \
+                     walrus.reload_signal WITH (publish_via_partition_root = true)"
                 ))
                 .await?;
             } else {
@@ -286,10 +388,9 @@ impl<'a> SourcePreflight<'a> {
             if !published.contains(&id) {
                 if self.cfg.manage_publication {
                     self.exec(&format!(
-                        "ALTER PUBLICATION {} ADD TABLE {}.{}",
-                        ident(pubname),
-                        ident(schema),
-                        ident(table)
+                        "ALTER PUBLICATION {pub_ident} ADD TABLE {}.{}",
+                        ident(schema)?,
+                        ident(table)?
                     ))
                     .await?;
                 } else {
@@ -307,6 +408,12 @@ impl<'a> SourcePreflight<'a> {
     /// Every published **user** table (schema ≠ `walrus`) has a usable replica identity: `DEFAULT`
     /// requires a PRIMARY KEY; `FULL`/`INDEX` are fine; `NOTHING` is never usable. Strict → terminal on
     /// the first offender; lenient → quarantine + alert + continue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PreflightError::NoPrimaryKey`] for the first unusable table in strict mode, or
+    /// [`PreflightError::Query`] / [`PreflightError::UnusableResult`] when publication/catalog rows
+    /// cannot be read.
     pub async fn assert_tables_have_pk(&self, mode: PkMode) -> Result<PkReport, PreflightError> {
         let sql = format!(
             r#"SELECT pt.schemaname, pt.tablename, c.relreplident::text AS relreplident,
@@ -316,40 +423,43 @@ impl<'a> SourcePreflight<'a> {
                JOIN pg_namespace n ON n.nspname = pt.schemaname
                JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = pt.tablename
                WHERE pt.pubname = {} AND pt.schemaname <> 'walrus'"#,
-            lit(&self.cfg.publication_name)
+            self.cfg.publication_name.to_quoted_literal()
         );
         let mut report = PkReport::default();
         for msg in self.query(&sql).await? {
-            if let SimpleQueryMessage::Row(row) = msg {
-                let schema = row.get("schemaname").unwrap_or_default().to_string();
-                let table = row.get("tablename").unwrap_or_default().to_string();
-                let relreplident = row.get("relreplident").unwrap_or_default();
-                // `boolean::text` renders as "true"/"false" (not "t"/"f") over the simple protocol.
-                let has_pk = row.get("has_pk") == Some("true");
-                // 'd' (default) needs a PK; 'f'/'i' carry a full/index identity; 'n' (nothing) never.
-                let usable = match relreplident {
-                    "n" => false,
-                    "d" => has_pk,
-                    _ => true,
-                };
-                let id = TableId { schema, table };
-                if usable {
-                    report.ok.push(id);
-                } else {
-                    match mode {
-                        PkMode::Strict => {
-                            return Err(PreflightError::NoPrimaryKey {
-                                schema: id.schema,
-                                table: id.table,
-                            })
-                        }
-                        PkMode::Lenient => {
-                            tracing::warn!(
-                                schema = %id.schema, table = %id.table,
-                                "ALERT: published table has no usable replica identity — quarantined (lenient)"
-                            );
-                            report.quarantined.push(id);
-                        }
+            // Only `Row` carries catalog data; the command tag and row description carry none.
+            let SimpleQueryMessage::Row(row) = msg else {
+                continue;
+            };
+            let schema = row.get("schemaname").unwrap_or_default().to_string();
+            let table = row.get("tablename").unwrap_or_default().to_string();
+            let relreplident = row.get("relreplident").unwrap_or_default();
+            // `boolean::text` renders as "true"/"false" (not "t"/"f") over the simple protocol.
+            let has_pk = row.get("has_pk") == Some("true");
+            // The catalog code is parsed into the shared enum rather than matched as raw text, so
+            // `identity_is_usable` can be exhaustive. A code outside the catalog's four cannot
+            // occur for a real `pg_class` row, and a gate that cannot classify a table's identity
+            // must quarantine it rather than wave it through.
+            let usable = relreplident
+                .parse::<ReplicaIdentity>()
+                .is_ok_and(|identity| identity_is_usable(identity, has_pk));
+            let id = TableId { schema, table };
+            if usable {
+                report.ok.push(id);
+            } else {
+                match mode {
+                    PkMode::Strict => {
+                        return Err(PreflightError::NoPrimaryKey {
+                            schema: id.schema,
+                            table: id.table,
+                        });
+                    }
+                    PkMode::Lenient => {
+                        tracing::warn!(
+                            schema = %id.schema, table = %id.table,
+                            "ALERT: published table has no usable replica identity — quarantined (lenient)"
+                        );
+                        report.quarantined.push(id);
                     }
                 }
             }
@@ -360,10 +470,7 @@ impl<'a> SourcePreflight<'a> {
     // ---- helpers ------------------------------------------------------------------------------
 
     async fn query(&self, sql: &str) -> Result<Vec<SimpleQueryMessage>, PreflightError> {
-        self.client
-            .simple_query(sql)
-            .await
-            .map_err(|e| PreflightError::Query(e.to_string()))
+        Ok(self.client.simple_query(sql).await?)
     }
 
     async fn exec(&self, sql: &str) -> Result<(), PreflightError> {
@@ -377,20 +484,23 @@ impl<'a> SourcePreflight<'a> {
                 return Ok(row.get(0).unwrap_or_default().to_string());
             }
         }
-        Err(PreflightError::Query(format!("no rows for `{sql}`")))
+        Err(PreflightError::UnusableResult(format!(
+            "no rows for `{sql}`"
+        )))
     }
 
     async fn setting(&self, name: &str) -> Result<String, PreflightError> {
-        self.first_text(&format!("SELECT current_setting({})", lit(name)))
-            .await
+        self.first_text(&format!(
+            "SELECT current_setting({})",
+            name.to_quoted_literal()
+        ))
+        .await
     }
 
     async fn setting_i32(&self, name: &str) -> Result<i32, PreflightError> {
-        self.setting(name)
-            .await?
-            .trim()
-            .parse()
-            .map_err(|_| PreflightError::Query(format!("setting {name} is not an integer")))
+        self.setting(name).await?.trim().parse().map_err(|_| {
+            PreflightError::UnusableResult(format!("setting {name} is not an integer"))
+        })
     }
 
     async fn count(&self, sql: &str) -> Result<i32, PreflightError> {
@@ -398,7 +508,7 @@ impl<'a> SourcePreflight<'a> {
             .await?
             .trim()
             .parse()
-            .map_err(|_| PreflightError::Query(format!("`{sql}` did not return a count")))
+            .map_err(|_| PreflightError::UnusableResult(format!("`{sql}` did not return a count")))
     }
 
     async fn assert_headroom(
@@ -418,7 +528,7 @@ impl<'a> SourcePreflight<'a> {
     async fn published_tables(&self, pubname: &str) -> Result<HashSet<TableId>, PreflightError> {
         let sql = format!(
             "SELECT schemaname, tablename FROM pg_publication_tables WHERE pubname = {}",
-            lit(pubname)
+            pubname.to_quoted_literal()
         );
         let mut set = HashSet::new();
         for msg in self.query(&sql).await? {
@@ -433,14 +543,24 @@ impl<'a> SourcePreflight<'a> {
     }
 }
 
-/// A SQL string literal (single-quoted, quotes doubled).
-fn lit(s: &str) -> String {
-    format!("'{}'", common::sql::sql_literal(s))
+/// Can a published table's replica identity source a key? `DEFAULT` supplies one only with a
+/// PRIMARY KEY; `FULL` and `INDEX` carry their own old image; `NOTHING` never carries one.
+///
+/// Exhaustive (no `_` arm) for the same reason the `From<PreflightError>` conversion above is:
+/// which identities the sink can decode is data, never a guess, so a new [`ReplicaIdentity`]
+/// variant must be classified here instead of silently inheriting "usable".
+#[deny(clippy::wildcard_enum_match_arm)]
+const fn identity_is_usable(identity: ReplicaIdentity, has_pk: bool) -> bool {
+    match identity {
+        ReplicaIdentity::Default => has_pk,
+        ReplicaIdentity::Full | ReplicaIdentity::Index => true,
+        ReplicaIdentity::Nothing => false,
+    }
 }
 
-/// A SQL identifier (double-quoted, quotes doubled).
-fn ident(s: &str) -> String {
-    format!("\"{}\"", s.replace('"', "\"\""))
+/// Validate a SQL identifier before its [`std::fmt::Display`] implementation quotes it.
+fn ident(s: &str) -> Result<SqlIdent, PreflightError> {
+    SqlIdent::new(s).map_err(PreflightError::Ident)
 }
 
 #[cfg(test)]

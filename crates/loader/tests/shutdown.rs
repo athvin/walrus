@@ -1,17 +1,22 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Graceful SIGTERM drain (loader §8.5) — compose (`#[ignore]`). On cancel each worker finishes the
 //! in-flight Phase A + Phase B (both watermarks committed), the lease is released and the file is
 //! checkpointed + closed (no stale lock), and an in-flight full-rebuild is aborted (rolled back).
 //!
 //!   cargo test -p loader --test shutdown -- --ignored
 
-use common::{Lsn, PgColumn, PgRelation, ReplicaIdentity};
+use common::{EpochNo, Lsn, PgColumn, PgRelation, ReplicaIdentity};
 use loader::apply_loop::apply_loop;
 use loader::compaction::full_rebuild_abortable;
 use loader::duck::{S3Access, TableDb};
 use loader::health::LoaderState;
 use loader::phase_a::TableCtx;
-use loader::transform::{apply_transform, TransformSql};
+use loader::transform::{TransformSql, apply_transform};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -49,22 +54,23 @@ fn orders() -> PgRelation {
     }
 }
 
-fn tmpdir(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("walrus-loader-shut-{name}"));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+/// A scratch directory for one test's `.duckdb` file. The returned guard deletes it on drop — even
+/// when an assertion panics, which a trailing `remove_dir_all` would skip.
+fn tmpdir(name: &str) -> tempfile::TempDir {
+    let prefix = format!("walrus-loader-shut-{name}-");
+    tempfile::Builder::new().prefix(&prefix).tempdir().unwrap()
 }
 
 fn meta(op: &str, commit_hex: &str, l: u64) -> String {
     format!(
         "{{\"op\":\"{op}\",\"commit_lsn\":\"{commit_hex}\",\"lsn\":\"{:016X}\",\"sink_processed_at\":\"2026-07-08T12:00:{:02}Z\"}}",
-        l, l % 60
+        l,
+        l % 60
     )
 }
 
 fn write_row(
-    epoch: i64,
+    epoch: EpochNo,
     tag: &str,
     id: i64,
     status: &str,
@@ -78,7 +84,10 @@ fn write_row(
         "INSTALL httpfs; LOAD httpfs; SET s3_region='{}'; SET s3_endpoint='{}'; \
          SET s3_url_style='path'; SET s3_use_ssl=false; \
          SET s3_access_key_id='{}'; SET s3_secret_access_key='{}';",
-        a.region, a.endpoint, a.access_key_id, a.secret_access_key
+        a.region,
+        a.endpoint,
+        a.access_key_id,
+        a.secret_access_key.expose()
     ))
     .unwrap();
     w.execute_batch(
@@ -96,7 +105,7 @@ fn write_row(
     uri
 }
 
-async fn clean(pool: &sqlx::PgPool, epoch: i64) {
+async fn clean(pool: &sqlx::PgPool, epoch: EpochNo) {
     for tbl in [
         "file_manifest",
         "loader_checkpoint",
@@ -114,7 +123,7 @@ async fn clean(pool: &sqlx::PgPool, epoch: i64) {
             epoch,
             slot_name: "walrus_slot".into(),
             created_lsn: "0/0".parse().unwrap(),
-            status: "streaming".into(),
+            status: control::ReplicationStatus::Streaming,
         },
     )
     .await
@@ -126,23 +135,26 @@ async fn clean(pool: &sqlx::PgPool, epoch: i64) {
 
 fn ctx_on(
     pool: sqlx::PgPool,
-    epoch: i64,
+    epoch: EpochNo,
     path: &std::path::Path,
     poll: Duration,
     compaction: Duration,
 ) -> TableCtx {
     let db = TableDb::open(path).unwrap();
-    db.ensure_tables(&orders(), 1).unwrap();
+    db.ensure_tables(&orders(), common::SchemaVersionNo(1))
+        .unwrap();
     db.configure_s3(&s3()).unwrap();
     TableCtx {
         pool,
         epoch,
+        epoch_rx: loader::epoch::fixed_epoch_watch(epoch),
         schema: "public".into(),
         table: "orders".into(),
+        series: "public.orders".into(),
         rel: orders(),
         db,
         state: LoaderState::new(),
-        max_files: 100,
+        max_files: std::num::NonZeroI64::new(100).unwrap(),
         poll_interval: poll,
         compaction_interval: compaction,
         retention_lsn_lag: 16 << 20,
@@ -152,6 +164,10 @@ fn ctx_on(
 }
 
 /// Run one worker until it drains: cancel the token after `cancel_after` (SIGTERM), then await the loop.
+#[allow(
+    clippy::future_not_send,
+    reason = "apply_loop borrows a Send + !Sync TableDb across awaits and this loader test drives it locally"
+)]
 async fn run_until_drain(ctx: TableCtx, cancel_after: Duration) {
     let token = CancellationToken::new();
     let tc = token.clone();
@@ -162,7 +178,7 @@ async fn run_until_drain(ctx: TableCtx, cancel_after: Duration) {
     apply_loop(ctx, token).await.unwrap();
 }
 
-async fn lease_is_live(pool: &sqlx::PgPool, epoch: i64) -> bool {
+async fn lease_is_live(pool: &sqlx::PgPool, epoch: EpochNo) -> bool {
     sqlx::query_scalar::<_, bool>(
         "SELECT lease_expiry > now() FROM walrus.table_ownership \
          WHERE epoch = $1 AND source_table = 'orders'",
@@ -179,7 +195,7 @@ async fn lease_is_live(pool: &sqlx::PgPool, epoch: i64) -> bool {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn sigterm_mid_apply_commits_both_watermarks_and_releases_lease() {
     let _g = LOCK.lock().await;
-    let epoch = 3_120_001;
+    let epoch = EpochNo(3_120_001);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     clean(&pool, epoch).await;
@@ -196,7 +212,7 @@ async fn sigterm_mid_apply_commits_both_watermarks_and_releases_lease() {
             row_count: 1,
             lsn_start: "0/64".parse().unwrap(),
             lsn_end: "0/64".parse().unwrap(),
-            schema_version: 1,
+            schema_version: common::SchemaVersionNo(1),
             reload_id: None,
         },
     )
@@ -209,7 +225,7 @@ async fn sigterm_mid_apply_commits_both_watermarks_and_releases_lease() {
         .expect("free lease acquired");
 
     let dir = tmpdir(&epoch.to_string());
-    let path = dir.join("orders.duckdb");
+    let path = dir.path().join("orders.duckdb");
     // Long poll so exactly ONE cycle runs (first tick fires immediately), then the drain returns.
     let ctx = ctx_on(
         pool.clone(),
@@ -243,7 +259,6 @@ async fn sigterm_mid_apply_commits_both_watermarks_and_releases_lease() {
         TableDb::open(&path).is_ok(),
         "file closed cleanly — no stale lock"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---- An in-flight full-rebuild is aborted (rolled back) on SIGTERM, not waited on. ----
@@ -251,8 +266,9 @@ async fn sigterm_mid_apply_commits_both_watermarks_and_releases_lease() {
 #[ignore = "requires a real .duckdb file (interrupt across threads)"]
 async fn in_flight_full_rebuild_is_aborted_on_sigterm() {
     let dir = tmpdir("abort");
-    let db = TableDb::open(&dir.join("orders.duckdb")).unwrap();
-    db.ensure_tables(&orders(), 1).unwrap();
+    let db = TableDb::open(dir.path().join("orders.duckdb")).unwrap();
+    db.ensure_tables(&orders(), common::SchemaVersionNo(1))
+        .unwrap();
     let t = TransformSql::from_relation(&orders());
 
     // A committed baseline the rebuild must NOT lose or partially replace.
@@ -264,7 +280,7 @@ async fn in_flight_full_rebuild_is_aborted_on_sigterm() {
             [],
         )
         .unwrap();
-    apply_transform(db.conn(), &t, &Lsn::ZERO).unwrap();
+    apply_transform(db.conn(), &t, Lsn::ZERO).unwrap();
 
     // Bloat raw with a LOT of wide rows across many keys (one fast bulk insert) so the rebuild's
     // CREATE OR REPLACE runs for well over a second — long enough to be reliably interrupted mid-flight
@@ -287,7 +303,7 @@ async fn in_flight_full_rebuild_is_aborted_on_sigterm() {
         tokio::time::sleep(Duration::from_millis(150)).await;
         tc.cancel();
     });
-    full_rebuild_abortable(db.conn(), &t, &token)
+    full_rebuild_abortable(&db, &t, &token)
         .await
         .expect("an aborted rebuild is Ok (rolled back), not an error");
 
@@ -308,7 +324,6 @@ async fn in_flight_full_rebuild_is_aborted_on_sigterm() {
         s, "ORIGINAL",
         "the committed value is intact after the abort"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---- A replacement loader resumes from the two watermarks: no loss, no duplicate application. ----
@@ -316,13 +331,13 @@ async fn in_flight_full_rebuild_is_aborted_on_sigterm() {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn a_replacement_loader_resumes_from_the_two_watermarks() {
     let _g = LOCK.lock().await;
-    let epoch = 3_120_003;
+    let epoch = EpochNo(3_120_003);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     clean(&pool, epoch).await;
 
     let dir = tmpdir(&epoch.to_string());
-    let path = dir.join("orders.duckdb");
+    let path = dir.path().join("orders.duckdb");
 
     // File 1 processed by the first worker, then SIGTERM drains it.
     let f1 = write_row(epoch, "f1", 1, "v1", "i", "0000000000000064", 1);
@@ -337,7 +352,7 @@ async fn a_replacement_loader_resumes_from_the_two_watermarks() {
             row_count: 1,
             lsn_start: "0/64".parse().unwrap(),
             lsn_end: "0/64".parse().unwrap(),
-            schema_version: 1,
+            schema_version: common::SchemaVersionNo(1),
             reload_id: None,
         },
     )
@@ -365,7 +380,7 @@ async fn a_replacement_loader_resumes_from_the_two_watermarks() {
             row_count: 1,
             lsn_start: "0/C8".parse().unwrap(),
             lsn_end: "0/C8".parse().unwrap(),
-            schema_version: 1,
+            schema_version: common::SchemaVersionNo(1),
             reload_id: None,
         },
     )
@@ -401,5 +416,4 @@ async fn a_replacement_loader_resumes_from_the_two_watermarks() {
         .unwrap()
         .unwrap();
     assert_eq!(cp.transformed_lsn, "0/C8".parse::<Lsn>().unwrap());
-    let _ = std::fs::remove_dir_all(&dir);
 }

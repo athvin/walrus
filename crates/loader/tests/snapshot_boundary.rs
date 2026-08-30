@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Snapshot/stream boundary through the transform (loader §7, architecture §1.7) — compose (`#[ignore]`).
 //! The loader has **no special snapshot mode**: `kind='snapshot'` files append into `<table>_raw` like
 //! any `ready` file, and the transform collapses the overlap by `(commit_lsn, lsn)`. Two edges proven
@@ -10,10 +15,10 @@
 //!
 //!   cargo test -p loader --test snapshot_boundary -- --ignored
 
-use common::{PgColumn, PgRelation, ReplicaIdentity};
+use common::{EpochNo, PgColumn, PgRelation, ReplicaIdentity};
 use loader::duck::{S3Access, TableDb};
 use loader::health::LoaderState;
-use loader::phase_a::{run_phase_a, TableCtx};
+use loader::phase_a::{TableCtx, run_phase_a};
 use loader::phase_b::run_phase_b;
 use std::time::Duration;
 
@@ -51,23 +56,24 @@ fn orders() -> PgRelation {
     }
 }
 
-fn tmpdir(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("walrus-loader-snap-{name}"));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+/// A scratch directory for one test's `.duckdb` file. The returned guard deletes it on drop — even
+/// when an assertion panics, which a trailing `remove_dir_all` would skip.
+fn tmpdir(name: &str) -> tempfile::TempDir {
+    let prefix = format!("walrus-loader-snap-{name}-");
+    tempfile::Builder::new().prefix(&prefix).tempdir().unwrap()
 }
 
 fn meta(op: &str, commit_hex: &str, l: u64) -> String {
     format!(
         "{{\"op\":\"{op}\",\"commit_lsn\":\"{commit_hex}\",\"lsn\":\"{:016X}\",\"sink_processed_at\":\"2026-07-07T12:00:{:02}Z\"}}",
-        l, l % 60
+        l,
+        l % 60
     )
 }
 
 /// Write a single-row (id, status, walrus_pg_sink_meta) Parquet fixture to S3.
 fn write_row(
-    epoch: i64,
+    epoch: EpochNo,
     tag: &str,
     id: i64,
     status: &str,
@@ -81,7 +87,10 @@ fn write_row(
         "INSTALL httpfs; LOAD httpfs; SET s3_region='{}'; SET s3_endpoint='{}'; \
          SET s3_url_style='path'; SET s3_use_ssl=false; \
          SET s3_access_key_id='{}'; SET s3_secret_access_key='{}';",
-        a.region, a.endpoint, a.access_key_id, a.secret_access_key
+        a.region,
+        a.endpoint,
+        a.access_key_id,
+        a.secret_access_key.expose()
     ))
     .unwrap();
     w.execute_batch(
@@ -99,7 +108,7 @@ fn write_row(
     uri
 }
 
-async fn insert_file(pool: &sqlx::PgPool, epoch: i64, uri: String, kind: &str, lsn_end: &str) {
+async fn insert_file(pool: &sqlx::PgPool, epoch: EpochNo, uri: String, kind: &str, lsn_end: &str) {
     control::insert_ready(
         pool,
         &control::NewManifestFile {
@@ -111,7 +120,7 @@ async fn insert_file(pool: &sqlx::PgPool, epoch: i64, uri: String, kind: &str, l
             row_count: 1,
             lsn_start: lsn_end.parse().unwrap(),
             lsn_end: lsn_end.parse().unwrap(),
-            schema_version: 1,
+            schema_version: common::SchemaVersionNo(1),
             reload_id: None,
         },
     )
@@ -119,7 +128,7 @@ async fn insert_file(pool: &sqlx::PgPool, epoch: i64, uri: String, kind: &str, l
     .unwrap();
 }
 
-async fn setup(epoch: i64, max_files: i64) -> (TableCtx, std::path::PathBuf) {
+async fn setup(epoch: EpochNo, max_files: i64) -> (TableCtx, tempfile::TempDir) {
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     for tbl in ["file_manifest", "loader_checkpoint", "replication_state"] {
@@ -134,7 +143,7 @@ async fn setup(epoch: i64, max_files: i64) -> (TableCtx, std::path::PathBuf) {
             epoch,
             slot_name: "walrus_slot".into(),
             created_lsn: "0/64".parse().unwrap(), // consistent_point
-            status: "streaming".into(),
+            status: control::ReplicationStatus::Streaming,
         },
     )
     .await
@@ -144,18 +153,21 @@ async fn setup(epoch: i64, max_files: i64) -> (TableCtx, std::path::PathBuf) {
         .unwrap();
 
     let dir = tmpdir(&epoch.to_string());
-    let db = TableDb::open(&dir.join("orders.duckdb")).unwrap();
-    db.ensure_tables(&orders(), 1).unwrap();
+    let db = TableDb::open(dir.path().join("orders.duckdb")).unwrap();
+    db.ensure_tables(&orders(), common::SchemaVersionNo(1))
+        .unwrap();
     db.configure_s3(&s3()).unwrap();
     let ctx = TableCtx {
         pool,
         epoch,
+        epoch_rx: loader::epoch::fixed_epoch_watch(epoch),
         schema: "public".into(),
         table: "orders".into(),
+        series: "public.orders".into(),
         rel: orders(),
         db,
         state: LoaderState::new(),
-        max_files,
+        max_files: std::num::NonZeroI64::new(max_files).unwrap(),
         poll_interval: Duration::from_secs(5),
         compaction_interval: Duration::from_secs(3600),
         retention_lsn_lag: 16 << 20,
@@ -180,8 +192,8 @@ fn mirror(ctx: &TableCtx) -> Vec<(i64, String)> {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn snapshot_then_overlapping_stream_yields_stream_value() {
     let _g = LOCK.lock().await;
-    let epoch = 3_105_001;
-    let (ctx, dir) = setup(epoch, 100).await;
+    let epoch = EpochNo(3_105_001);
+    let (ctx, _dir) = setup(epoch, 100).await;
 
     // Snapshot file (commit_lsn = consistent_point 0x64) then an overlapping stream update (0xC8).
     let snap = write_row(epoch, "snap", 1, "snap", "i", "0000000000000064", 1);
@@ -197,7 +209,6 @@ async fn snapshot_then_overlapping_stream_yields_stream_value() {
         vec![(1, "streamed".to_string())],
         "the overlapping stream change wins; zero loss, zero dupes"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Two equal-`lsn_end` snapshot files, one per loader batch (`max_files=1`), must BOTH land — none
@@ -207,8 +218,8 @@ async fn snapshot_then_overlapping_stream_yields_stream_value() {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn equal_lsn_end_snapshot_files_split_across_batches_all_applied() {
     let _g = LOCK.lock().await;
-    let epoch = 3_105_002;
-    let (ctx, dir) = setup(epoch, 1).await; // max_files=1 forces the split across batches
+    let epoch = EpochNo(3_105_002);
+    let (ctx, _dir) = setup(epoch, 1).await; // max_files=1 forces the split across batches
 
     // Two snapshot files at the SAME lsn_end (= consistent_point 0/64), distinct keys.
     let f1 = write_row(epoch, "snapA", 1, "A", "i", "0000000000000064", 1);
@@ -228,5 +239,4 @@ async fn equal_lsn_end_snapshot_files_split_across_batches_all_applied() {
         vec![(1, "A".to_string()), (2, "B".to_string())],
         "BOTH equal-lsn_end snapshot files applied — none skipped by the watermark"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }

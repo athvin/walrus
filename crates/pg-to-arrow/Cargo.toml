@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+publish.workspace = true # internal component; the workspace bar keeps it off every registry
 
 [lints]
 workspace = true
@@ -15,7 +16,7 @@ workspace = true
 conformance = ["dep:duckdb"]
 
 [dependencies]
-common = { path = "../common" }
+common = { workspace = true }
 # `canonical_extension_types` exposes the `Uuid` extension so the parquet writer emits the UUID
 # logical type (a plain FixedSizeBinary(16) reads back as BLOB, not UUID). §2.4 uuid, PR 2.16.
 arrow = { workspace = true, features = ["canonical_extension_types"] }

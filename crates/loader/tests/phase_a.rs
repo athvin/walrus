@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Phase A against compose (`#[ignore]` — needs control PG + MinIO). A seeded `ready` Parquet is
 //! claimed and appended **verbatim** to `<table>_raw` (meta intact + op/commit_lsn/lsn/sink_processed_at
 //! promoted), the watermark advances and the queue row is deleted in one control txn, and a replay of
@@ -6,10 +11,10 @@
 //!
 //!   cargo test -p loader --test phase_a -- --ignored
 
-use common::{Lsn, PgColumn, PgRelation, ReplicaIdentity};
+use common::{EpochNo, Lsn, PgColumn, PgRelation, ReplicaIdentity};
 use loader::duck::{S3Access, TableDb};
 use loader::health::LoaderState;
-use loader::phase_a::{run_phase_a, TableCtx};
+use loader::phase_a::{TableCtx, run_phase_a};
 use std::time::Duration;
 
 static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -46,21 +51,24 @@ fn orders() -> PgRelation {
     }
 }
 
-fn tmpdir(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("walrus-loader-pa-{name}"));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+/// A scratch directory for one test's `.duckdb` file. The returned guard deletes it on drop — even
+/// when an assertion panics, which a trailing `remove_dir_all` would skip.
+fn tmpdir(name: &str) -> tempfile::TempDir {
+    let prefix = format!("walrus-loader-pa-{name}-");
+    tempfile::Builder::new().prefix(&prefix).tempdir().unwrap()
 }
 
-fn write_fixture(epoch: i64) -> String {
+fn write_fixture(epoch: EpochNo) -> String {
     let w = duckdb::Connection::open_in_memory().unwrap();
     let a = s3();
     w.execute_batch(&format!(
         "INSTALL httpfs; LOAD httpfs; SET s3_region='{}'; SET s3_endpoint='{}'; \
          SET s3_url_style='path'; SET s3_use_ssl=false; \
          SET s3_access_key_id='{}'; SET s3_secret_access_key='{}';",
-        a.region, a.endpoint, a.access_key_id, a.secret_access_key
+        a.region,
+        a.endpoint,
+        a.access_key_id,
+        a.secret_access_key.expose()
     ))
     .unwrap();
     w.execute_batch(
@@ -76,7 +84,7 @@ fn write_fixture(epoch: i64) -> String {
     uri
 }
 
-async fn seed_manifest(pool: &sqlx::PgPool, epoch: i64, uri: &str) {
+async fn seed_manifest(pool: &sqlx::PgPool, epoch: EpochNo, uri: &str) {
     control::insert_ready(
         pool,
         &control::NewManifestFile {
@@ -88,7 +96,7 @@ async fn seed_manifest(pool: &sqlx::PgPool, epoch: i64, uri: &str) {
             row_count: 2,
             lsn_start: "0/64".parse().unwrap(),
             lsn_end: "0/64".parse().unwrap(),
-            schema_version: 1,
+            schema_version: common::SchemaVersionNo(1),
             reload_id: None,
         },
     )
@@ -97,7 +105,7 @@ async fn seed_manifest(pool: &sqlx::PgPool, epoch: i64, uri: &str) {
 }
 
 /// Fresh control state + an owned `TableCtx` (DuckDB in a temp dir).
-async fn setup(epoch: i64) -> (TableCtx, std::path::PathBuf) {
+async fn setup(epoch: EpochNo) -> (TableCtx, tempfile::TempDir) {
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     for tbl in ["file_manifest", "loader_checkpoint", "replication_state"] {
@@ -112,7 +120,7 @@ async fn setup(epoch: i64) -> (TableCtx, std::path::PathBuf) {
             epoch,
             slot_name: "walrus_slot".into(),
             created_lsn: "0/0".parse().unwrap(),
-            status: "streaming".into(),
+            status: control::ReplicationStatus::Streaming,
         },
     )
     .await
@@ -121,18 +129,21 @@ async fn setup(epoch: i64) -> (TableCtx, std::path::PathBuf) {
         .await
         .unwrap();
     let dir = tmpdir(&epoch.to_string());
-    let db = TableDb::open(&dir.join("orders.duckdb")).unwrap();
-    db.ensure_tables(&orders(), 1).unwrap();
+    let db = TableDb::open(dir.path().join("orders.duckdb")).unwrap();
+    db.ensure_tables(&orders(), common::SchemaVersionNo(1))
+        .unwrap();
     db.configure_s3(&s3()).unwrap();
     let ctx = TableCtx {
         pool,
         epoch,
+        epoch_rx: loader::epoch::fixed_epoch_watch(epoch),
         schema: "public".into(),
         table: "orders".into(),
+        series: "public.orders".into(),
         rel: orders(),
         db,
         state: LoaderState::new(),
-        max_files: 100,
+        max_files: std::num::NonZeroI64::new(100).unwrap(),
         poll_interval: Duration::from_secs(5),
         compaction_interval: Duration::from_secs(3600),
         retention_lsn_lag: 16 << 20,
@@ -153,9 +164,9 @@ fn raw_count(ctx: &TableCtx) -> i64 {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn appends_rows_verbatim_with_promoted_columns_and_meta_intact() {
     let _g = LOCK.lock().await;
-    let epoch = 3_200_001;
+    let epoch = EpochNo(3_200_001);
     let uri = write_fixture(epoch);
-    let (ctx, dir) = setup(epoch).await;
+    let (ctx, _dir) = setup(epoch).await;
     seed_manifest(&ctx.pool, epoch, &uri).await;
 
     let lsn = run_phase_a(&ctx).await.unwrap();
@@ -180,17 +191,15 @@ async fn appends_rows_verbatim_with_promoted_columns_and_meta_intact() {
         promoted_lsn, "0000000000000064",
         "lsn promoted (sortable 16-hex)"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn advances_raw_watermark_and_deletes_the_claimed_manifest_rows() {
     let _g = LOCK.lock().await;
-    let epoch = 3_200_002;
+    let epoch = EpochNo(3_200_002);
     let uri = write_fixture(epoch);
-    let (ctx, dir) = setup(epoch).await;
+    let (ctx, _dir) = setup(epoch).await;
     seed_manifest(&ctx.pool, epoch, &uri).await;
 
     run_phase_a(&ctx).await.unwrap();
@@ -217,17 +226,15 @@ async fn advances_raw_watermark_and_deletes_the_claimed_manifest_rows() {
         .query_row("SELECT count(*) FROM orders", [], |r| r.get(0))
         .unwrap();
     assert_eq!(mirror, 0, "Phase A never writes the mirror");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn re_running_the_same_file_appends_zero_rows() {
     let _g = LOCK.lock().await;
-    let epoch = 3_200_003;
+    let epoch = EpochNo(3_200_003);
     let uri = write_fixture(epoch);
-    let (ctx, dir) = setup(epoch).await;
+    let (ctx, _dir) = setup(epoch).await;
 
     seed_manifest(&ctx.pool, epoch, &uri).await;
     run_phase_a(&ctx).await.unwrap();
@@ -240,17 +247,15 @@ async fn re_running_the_same_file_appends_zero_rows() {
         2,
         "ON CONFLICT DO NOTHING on the composite PK → zero new rows"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn pause_withholds_claims_and_lifts_on_failed() {
     let _g = LOCK.lock().await;
-    let epoch = 3_200_004;
+    let epoch = EpochNo(3_200_004);
     let uri = write_fixture(epoch);
-    let (ctx, dir) = setup(epoch).await;
+    let (ctx, _dir) = setup(epoch).await;
     seed_manifest(&ctx.pool, epoch, &uri).await;
     sqlx::query("DELETE FROM walrus.table_reload WHERE epoch = $1")
         .bind(epoch)
@@ -287,14 +292,14 @@ async fn pause_withholds_claims_and_lifts_on_failed() {
         .unwrap();
     assert_eq!(cp.raw_appended_lsn, Lsn::ZERO, "frontier frozen at W");
     assert_eq!(
-        *ctx.pause_logged.lock(),
+        ctx.pause_logged.get(),
         Some(reload_id),
         "the pause is latched (logged once)"
     );
 
     // A second poll changes nothing — same latch value means no re-log.
     assert_eq!(run_phase_a(&ctx).await.unwrap(), None);
-    assert_eq!(*ctx.pause_logged.lock(), Some(reload_id));
+    assert_eq!(ctx.pause_logged.get(), Some(reload_id));
 
     // `failed` lifts the pause: the backlog drains and the latch clears.
     control::reload::claim_requested(&ctx.pool, epoch, "sink-t", 60, 10)
@@ -313,7 +318,7 @@ async fn pause_withholds_claims_and_lifts_on_failed() {
         "the paused backlog drained after the lift"
     );
     assert_eq!(
-        *ctx.pause_logged.lock(),
+        ctx.pause_logged.get(),
         None,
         "the latch clears when claiming resumes"
     );
@@ -323,5 +328,4 @@ async fn pause_withholds_claims_and_lifts_on_failed() {
         .execute(&ctx.pool)
         .await
         .unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
 }

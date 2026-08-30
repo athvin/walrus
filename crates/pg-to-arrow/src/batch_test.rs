@@ -1,8 +1,9 @@
 use super::*;
+use crate::approx::assert_approx_eq;
 use crate::oids;
 use arrow::array::{
-    Array, AsArray, Decimal128Array, Int32Array, Int64Array, ListArray, StringArray, StructArray,
-    TimestampMicrosecondArray,
+    Array, AsArray, BinaryArray, Decimal128Array, Int32Array, Int64Array, ListArray, StringArray,
+    StructArray, TimestampMicrosecondArray,
 };
 use common::{Kind, Op, PgColumn, PgRelation, ReplicaIdentity, SinkMeta, UtcTimestamp};
 
@@ -35,17 +36,17 @@ fn meta(unchanged_toast: Vec<String>) -> SinkMeta {
         op: Op::Insert,
         lsn: "0/10".parse().unwrap(),
         commit_lsn: "0/20".parse().unwrap(),
-        commit_ts: UtcTimestamp::parse_rfc3339("2026-07-04T12:00:00Z").unwrap(),
+        commit_ts: "2026-07-04T12:00:00Z".parse::<UtcTimestamp>().unwrap(),
         xid: 1,
-        epoch: 7,
+        epoch: common::EpochNo(7),
         batch_id: "b1".to_string(),
-        schema_version: 1,
+        schema_version: common::SchemaVersionNo(1),
         source_schema: "public".to_string(),
         source_table: "orders".to_string(),
         kind: Kind::Stream,
-        unchanged_toast,
+        unchanged_toast: unchanged_toast.into_boxed_slice(),
         sink_instance: "walrus-pg-sink-0".to_string(),
-        sink_processed_at: UtcTimestamp::parse_rfc3339("2026-07-04T12:00:00.123Z").unwrap(),
+        sink_processed_at: "2026-07-04T12:00:00.123Z".parse::<UtcTimestamp>().unwrap(),
     }
 }
 
@@ -53,6 +54,35 @@ fn text_vals(vals: &[&str]) -> Vec<TupleValue> {
     vals.iter()
         .map(|s| TupleValue::Text(s.to_string()))
         .collect()
+}
+
+#[test]
+fn downcast_mismatch_names_the_column() {
+    let mut b = BooleanBuilder::new();
+    let err = downcast::<Int64Builder>(&mut b, "total_cents").expect_err("type mismatch");
+    assert!(
+        matches!(err, Error::Downcast { column } if column == "total_cents"),
+        "a builder mismatch must name the offending column"
+    );
+}
+
+#[test]
+fn float8_nan_and_infinities_survive_the_text_parse_path() {
+    let relation = one_col_rel("d", oids::FLOAT8, -1);
+    let mut builder = BatchBuilder::new(&relation).unwrap();
+    for raw in ["NaN", "Infinity", "-Infinity"] {
+        builder
+            .append_row(&[TupleValue::Text(raw.to_string())], &meta(vec![]))
+            .unwrap();
+    }
+
+    let batch = builder.into_record_batch().unwrap();
+    let values = batch
+        .column(0)
+        .as_primitive::<arrow::datatypes::Float64Type>();
+    assert!(values.value(0).is_nan(), "NaN must not become zero");
+    assert!(values.value(1).is_infinite() && values.value(1).is_sign_positive());
+    assert!(values.value(2).is_infinite() && values.value(2).is_sign_negative());
 }
 
 #[test]
@@ -64,7 +94,7 @@ fn builds_a_batch_from_an_orders_insert() {
     )
     .unwrap();
     assert_eq!(b.len(), 1);
-    let batch = b.finish().unwrap();
+    let batch = b.into_record_batch().unwrap();
 
     assert_eq!(batch.num_columns(), 5); // 4 data + meta
     assert_eq!(*batch.schema(), super::build_schema(&orders()).unwrap());
@@ -93,6 +123,27 @@ fn builds_a_batch_from_an_orders_insert() {
     assert_eq!(note.value(0), "hi");
 }
 
+/// The `timestamptz` parse borrows the SAME RFC-3339 scratch every other temporal parse uses, so it
+/// must refill it rather than append to it: whole-hour offsets still gain their `:00`, an explicit
+/// `+HH:MM` is left alone, and a short value parsed after a longer one is not contaminated by the
+/// previous contents.
+#[test]
+fn timestamptz_offsets_parse_through_the_reused_scratch() {
+    let mut scratch = String::new();
+    for (text, expected) in [
+        ("2024-01-02 03:04:05.678901+05:30", 1_704_144_845_678_901),
+        ("2024-01-02 03:04:05.678901+00", 1_704_164_645_678_901),
+        ("2024-01-02 03:04:05-05", 1_704_182_645_000_000),
+        ("2024-01-02 03:04:05+00", 1_704_164_645_000_000),
+    ] {
+        assert_eq!(
+            parse_timestamptz_micros(text, "created_at", &mut scratch).unwrap(),
+            expected,
+            "{text} must parse the same however the scratch was left"
+        );
+    }
+}
+
 #[test]
 fn null_value_sets_validity_false() {
     let mut b = BatchBuilder::new(&orders()).unwrap();
@@ -104,13 +155,52 @@ fn null_value_sets_validity_false() {
         TupleValue::Null,
     ];
     b.append_row(&vals, &meta(vec![])).unwrap();
-    let batch = b.finish().unwrap();
+    let batch = b.into_record_batch().unwrap();
     let note = batch
         .column(3)
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
     assert!(note.is_null(0));
+}
+
+#[test]
+fn binary_column_accepts_binary_text_and_null() {
+    let relation = one_col_rel("payload", oids::BYTEA, -1);
+    let mut builder = BatchBuilder::new(&relation).unwrap();
+    builder
+        .append_row(
+            &[TupleValue::Binary(vec![0xca, 0xfe].into())],
+            &meta(vec![]),
+        )
+        .unwrap();
+    builder
+        .append_row(
+            &[TupleValue::Text("\\xdeadbeef".to_string())],
+            &meta(vec![]),
+        )
+        .unwrap();
+    builder
+        .append_row(&[TupleValue::Null], &meta(vec![]))
+        .unwrap();
+
+    let batch = builder.into_record_batch().unwrap();
+    let payload = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .unwrap();
+    assert_eq!(payload.value(0), &[0xca, 0xfe]);
+    assert_eq!(payload.value(1), &[0xde, 0xad, 0xbe, 0xef]);
+    assert!(payload.is_null(2));
+}
+
+#[test]
+fn binary_arm_has_no_runtime_unreachable() {
+    assert!(
+        !include_str!("batch.rs").contains("unreachable!("),
+        "the Binary arm must be exhaustive over TupleValue"
+    );
 }
 
 #[test]
@@ -124,7 +214,7 @@ fn unchanged_toast_appends_null_and_is_listed_in_meta() {
     ];
     b.append_row(&vals, &meta(vec!["note".to_string()]))
         .unwrap();
-    let batch = b.finish().unwrap();
+    let batch = b.into_record_batch().unwrap();
     let note = batch
         .column(3)
         .as_any()
@@ -165,9 +255,61 @@ fn bad_int_text_reports_the_column_name() {
         )
         .unwrap_err();
     match err {
-        Error::ValueParse { column, .. } => assert_eq!(column, "id"),
+        Error::ValueParse(detail) => assert_eq!(detail.column, "id"),
         other => panic!("expected ValueParse, got {other:?}"),
     }
+}
+
+/// The offending cell is customer data, and this error rides `?` to the sink's one
+/// `tracing::error!`. Both formatters must name the column and the target type and nothing else —
+/// `Debug` included, because the services log their own errors with `?e` as well as `{e:#}`. The
+/// value stays reachable for a caller that destructures the detail, which no log line does.
+#[test]
+fn a_bad_cell_is_diagnosed_without_reproducing_its_value() {
+    let mut b = BatchBuilder::new(&orders()).unwrap();
+    let cell = "alice@example.com";
+
+    let err = b
+        .append_row(
+            &text_vals(&[cell, "1.00", "2024-01-02 03:04:05+00", "hi"]),
+            &meta(vec![]),
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        err.to_string(),
+        "column id: cannot parse [redacted] as Int32"
+    );
+    assert!(!format!("{err:?}").contains(cell), "{err:?}");
+    match err {
+        Error::ValueParse(detail) => assert_eq!(detail.value.expose(), cell),
+        other => panic!("expected ValueParse, got {other:?}"),
+    }
+}
+
+/// A non-text image fails the same conversion, and *which* image it was is walrus's own wire
+/// vocabulary — so that much stays in the message even though the payload behind it does not.
+#[test]
+fn a_non_text_image_names_its_kind_but_not_its_payload() {
+    let mut b = BatchBuilder::new(&orders()).unwrap();
+    let mut vals = text_vals(&["1", "1.00", "2024-01-02 03:04:05+00"]);
+    vals.push(TupleValue::Binary(bytes::Bytes::from_static(
+        b"\xde\xad\xbe\xef",
+    )));
+
+    let err = b.append_row(&vals, &meta(vec![])).unwrap_err();
+
+    let rendered = err.to_string();
+
+    assert!(
+        rendered.starts_with("column note: cannot parse "),
+        "{rendered}"
+    );
+    assert!(
+        rendered.ends_with(" as Utf8 (from a binary image)"),
+        "{rendered}"
+    );
+    assert!(rendered.contains(common::REDACTED), "{rendered}");
 }
 
 #[test]
@@ -179,7 +321,7 @@ fn meta_column_holds_serialized_sink_meta_json() {
         &m,
     )
     .unwrap();
-    let batch = b.finish().unwrap();
+    let batch = b.into_record_batch().unwrap();
     let meta_col = batch
         .column(4)
         .as_any()
@@ -221,7 +363,7 @@ fn interval_fans_out_to_three_builders() {
         &meta(vec![]),
     )
     .unwrap();
-    let batch = b.finish().unwrap();
+    let batch = b.into_record_batch().unwrap();
     assert_eq!(batch.num_columns(), 4); // months + days + micros + meta
     let months = batch
         .column(0)
@@ -252,7 +394,7 @@ fn timetz_fans_out_to_two_builders() {
         &meta(vec![]),
     )
     .unwrap();
-    let batch = b.finish().unwrap();
+    let batch = b.into_record_batch().unwrap();
     assert_eq!(batch.num_columns(), 3); // micros + offset + meta
     let micros = batch
         .column(0)
@@ -273,7 +415,7 @@ fn interval_null_maps_all_three_columns_null() {
     let rel = one_col_rel("dur", oids::INTERVAL, -1);
     let mut b = BatchBuilder::new(&rel).unwrap();
     b.append_row(&[TupleValue::Null], &meta(vec![])).unwrap();
-    let batch = b.finish().unwrap();
+    let batch = b.into_record_batch().unwrap();
     let months = batch
         .column(0)
         .as_any()
@@ -301,7 +443,7 @@ fn range_fans_out_to_five_builders() {
     let mut b = BatchBuilder::new(&rel).unwrap();
     b.append_row(&[TupleValue::Text("[1,10)".to_string())], &meta(vec![]))
         .unwrap();
-    let batch = b.finish().unwrap();
+    let batch = b.into_record_batch().unwrap();
     assert_eq!(batch.num_columns(), 6); // 5 range cols + meta
     let lower = batch
         .column(0)
@@ -328,7 +470,7 @@ fn range_empty_unbounded_and_null_are_three_distinct_states() {
     b.append_row(&[TupleValue::Text("(,10)".to_string())], &meta(vec![]))
         .unwrap(); // row 1: unbounded lower
     b.append_row(&[TupleValue::Null], &meta(vec![])).unwrap(); // row 2: whole NULL
-    let batch = b.finish().unwrap();
+    let batch = b.into_record_batch().unwrap();
     let lower = batch
         .column(0)
         .as_primitive::<arrow::datatypes::Int32Type>();
@@ -356,7 +498,7 @@ fn multirange_builds_list_of_structs_empty_vs_null() {
     b.append_row(&[TupleValue::Text("{}".to_string())], &meta(vec![]))
         .unwrap(); // row 1: empty list
     b.append_row(&[TupleValue::Null], &meta(vec![])).unwrap(); // row 2: NULL list
-    let batch = b.finish().unwrap();
+    let batch = b.into_record_batch().unwrap();
     let list = batch
         .column(0)
         .as_any()
@@ -382,7 +524,7 @@ fn geometric_point_round_trips_and_nulls() {
     b.append_row(&[TupleValue::Text("(1,2)".to_string())], &meta(vec![]))
         .unwrap();
     b.append_row(&[TupleValue::Null], &meta(vec![])).unwrap();
-    let batch = b.finish().unwrap();
+    let batch = b.into_record_batch().unwrap();
     let s = batch
         .column(0)
         .as_any()
@@ -390,8 +532,8 @@ fn geometric_point_round_trips_and_nulls() {
         .unwrap();
     let x = s.column(0).as_primitive::<arrow::datatypes::Float64Type>();
     let y = s.column(1).as_primitive::<arrow::datatypes::Float64Type>();
-    assert_eq!(x.value(0), 1.0);
-    assert_eq!(y.value(0), 2.0);
+    assert_approx_eq(x.value(0), 1.0);
+    assert_approx_eq(y.value(0), 2.0);
     assert!(s.is_null(1), "a NULL point is a null struct row");
 }
 
@@ -404,7 +546,7 @@ fn geometric_box_nests_two_points() {
         &meta(vec![]),
     )
     .unwrap();
-    let batch = b.finish().unwrap();
+    let batch = b.into_record_batch().unwrap();
     let s = batch
         .column(0)
         .as_any()
@@ -412,18 +554,18 @@ fn geometric_box_nests_two_points() {
         .unwrap();
     let p1 = s.column(0).as_any().downcast_ref::<StructArray>().unwrap();
     let p2 = s.column(1).as_any().downcast_ref::<StructArray>().unwrap();
-    assert_eq!(
+    assert_approx_eq(
         p1.column(0)
             .as_primitive::<arrow::datatypes::Float64Type>()
             .value(0),
-        2.0
-    ); // p1.x
-    assert_eq!(
+        2.0,
+    );
+    assert_approx_eq(
         p2.column(1)
             .as_primitive::<arrow::datatypes::Float64Type>()
             .value(0),
-        1.0
-    ); // p2.y
+        1.0,
+    );
 }
 
 #[test]
@@ -440,7 +582,7 @@ fn geometric_path_open_vs_closed_only_differs_by_is_closed() {
         &meta(vec![]),
     )
     .unwrap(); // closed
-    let batch = b.finish().unwrap();
+    let batch = b.into_record_batch().unwrap();
     let s = batch
         .column(0)
         .as_any()
@@ -464,7 +606,7 @@ fn geometric_polygon_is_list_of_points() {
         &meta(vec![]),
     )
     .unwrap();
-    let batch = b.finish().unwrap();
+    let batch = b.into_record_batch().unwrap();
     let list = batch
         .column(0)
         .as_any()
@@ -474,5 +616,5 @@ fn geometric_polygon_is_list_of_points() {
     let members = list.value(0);
     let s = members.as_any().downcast_ref::<StructArray>().unwrap();
     let y = s.column(1).as_primitive::<arrow::datatypes::Float64Type>();
-    assert_eq!(y.value(2), 1.0);
+    assert_approx_eq(y.value(2), 1.0);
 }

@@ -23,26 +23,40 @@ use std::sync::OnceLock;
 /// edit that the tests catch. Loader series are per-table, labelled by [`names::TABLE_LABEL`].
 pub mod names {
     // --- sink (global) ---
+    /// WAL not yet confirmed: `pg_current_wal_lsn − confirmed_flush_lsn`.
     pub const SINK_REPLICATION_LAG_BYTES: &str = "walrus_sink_replication_lag_bytes";
+    /// WAL bytes the replication slot pins on the source's disk.
     pub const SINK_SLOT_RETAINED_WAL_BYTES: &str = "walrus_sink_slot_retained_wal_bytes";
     /// Categorical gauge: 0 reserved · 1 unreserved · 2 lost (alert on ≥ 1).
     pub const SINK_WAL_STATUS: &str = "walrus_sink_wal_status";
+    /// Seconds since the last heartbeat round-trip confirmed.
     pub const SINK_HEARTBEAT_CONFIRMED_AGE_SECONDS: &str =
         "walrus_sink_heartbeat_confirmed_age_seconds";
+    /// Age of the last heartbeat write→observe-return — the slot-liveness signal.
     pub const SINK_HEARTBEAT_ROUNDTRIP_AGE_SECONDS: &str =
         "walrus_sink_heartbeat_roundtrip_age_seconds";
+    /// Gap between the latest sent and the last observed heartbeat `beat_seq`.
     pub const SINK_BEAT_SEQ_GAP: &str = "walrus_sink_beat_seq_gap";
+    /// Seconds since the last standby-status feedback — keep well under `wal_sender_timeout`.
     pub const SINK_FEEDBACK_AGE_SECONDS: &str = "walrus_sink_feedback_age_seconds";
+    /// Batch flush latency: encode → Parquet → S3 PUT → manifest commit. Global histogram.
     pub const SINK_BATCH_FLUSH_LATENCY_SECONDS: &str = "walrus_sink_batch_flush_latency_seconds";
+    /// Rows PUT to object storage as Parquet — the sink's throughput counter.
     pub const SINK_PARQUET_ROWS_WRITTEN: &str = "walrus_sink_parquet_rows_written_total";
+    /// Aggregate in-memory buffered bytes across all Arrow builders.
     pub const SINK_INFLIGHT_BYTES: &str = "walrus_sink_inflight_bytes";
+    /// Memory-ceiling flush / speculative spill events.
     pub const SINK_SPILL_COUNT: &str = "walrus_sink_spill_total";
+    /// Bytes staged speculatively for open streamed transactions.
     pub const SINK_SPECULATIVE_OPEN_TXN_BYTES: &str = "walrus_sink_speculative_open_txn_bytes";
+    /// Back-pressure pause-poll activations — the last-resort shed step.
     pub const SINK_PAUSE_POLL_COUNT: &str = "walrus_sink_pause_poll_total";
+    /// Streamed transactions (or subtransactions) that aborted.
     pub const SINK_ABORTED_TXN_COUNT: &str = "walrus_sink_aborted_txn_total";
+    /// Files that failed to write / PUT.
     pub const SINK_FAILED_FILE_COUNT: &str = "walrus_sink_failed_file_total";
     // --- reload (single-table-reload subsystem, PR 6.3/6.8/6.11) ---
-    /// Non-terminal reloads in flight, labelled by `FLAVOR_LABEL` — a gauge the controller inc/decs
+    /// Non-terminal reloads in flight, labelled by [`FLAVOR_LABEL`] — a gauge the controller inc/decs
     /// as exporters start and end; returns to 0 when the queue drains (PR 6.11).
     pub const RELOAD_ACTIVE: &str = "walrus_reload_active";
     /// Chunk files exported, per table (PR 6.11).
@@ -73,12 +87,19 @@ pub mod names {
     pub const FLAVOR_LABEL: &str = "flavor";
 
     // --- loader (per-table; labelled by TABLE_LABEL = "schema.table") ---
+    /// Manifest files in state `ready` awaiting apply.
     pub const LOADER_FILES_READY: &str = "walrus_loader_files_ready";
+    /// Phase-A backlog: the sink's `lsn_end` − `raw_appended_lsn`.
     pub const LOADER_RAW_APPEND_LAG_BYTES: &str = "walrus_loader_raw_append_lag_bytes";
+    /// Phase-B backlog: `raw_appended_lsn` − `transformed_lsn`.
     pub const LOADER_TRANSFORM_LAG_BYTES: &str = "walrus_loader_transform_lag_bytes";
+    /// Row count of the `<table>_raw` landing table.
     pub const LOADER_RAW_ROW_COUNT: &str = "walrus_loader_raw_row_count";
+    /// Size of the table's `.duckdb` file on disk.
     pub const LOADER_RAW_FILE_BYTES: &str = "walrus_loader_raw_file_bytes";
+    /// DDL events recorded for the table but not yet applied.
     pub const LOADER_DDL_PENDING: &str = "walrus_loader_ddl_pending";
+    /// Files the loader failed to apply.
     pub const LOADER_FAILED_FILE_COUNT: &str = "walrus_loader_failed_file_total";
 
     /// The one label on every loader series — a fully-qualified `schema.table`. Bounded cardinality:
@@ -108,8 +129,9 @@ pub mod names {
         RELOAD_LEASE_STALE,
     ];
 
-    /// Every per-table reload series (PR 6.11) — labelled by `TABLE_LABEL`, like the loader set. Not
-    /// zero-inited globally (reloads are rare operator events); each appears on its first emission.
+    /// Every per-table reload series (PR 6.11) — labelled by [`TABLE_LABEL`], like the loader set.
+    /// Not zero-inited globally (reloads are rare operator events); each appears on its first
+    /// emission.
     pub const RELOAD_PER_TABLE: &[&str] = &[
         RELOAD_CHUNKS_TOTAL,
         RELOAD_ROWS_EXPORTED_TOTAL,
@@ -134,6 +156,14 @@ static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 /// Install the process-wide Prometheus recorder and register every global series. Idempotent: safe to
 /// call from `main` and from each scrape test; later calls are no-ops. Until this runs, the call-site
 /// helpers below do nothing.
+///
+/// # Panics
+///
+/// Panics if some *other* global `metrics` recorder was already installed. That is a programming
+/// error rather than a runtime condition, so it aborts loudly instead of returning a `Result` no
+/// caller could act on — contrast [`crate::telemetry::init_tracing`], whose already-installed case
+/// is a legitimate outcome and is therefore swallowed. The `OnceLock` below runs the install at most
+/// once, so repeated `init` calls never reach it; only a foreign recorder can.
 pub fn init() {
     HANDLE.get_or_init(|| {
         // Install-once at process init: `install_recorder` only errors if a *different* global
@@ -141,10 +171,14 @@ pub fn init() {
         // guarantees this closure runs at most once — so the panic is unreachable in practice. `init`
         // is infallible by signature and called from `main`/scrape-test setup; threading a `Result`
         // out (stable `OnceLock` has no `get_or_try_init`) would ripple with no recoverable path.
-        #[allow(clippy::expect_used)]
+        #[expect(
+            clippy::expect_used,
+            reason = "install-once invariant: OnceLock::get_or_init runs this closure at most once, \
+                      so install_recorder can only fail if another global recorder exists — a bug"
+        )]
         let handle = PrometheusBuilder::new()
             .install_recorder()
-            .expect("install a global Prometheus recorder exactly once");
+            .expect("BUG: a second global Prometheus recorder was installed");
         describe_all();
         zero_init_global();
         // The reload-active gauge is flavor-labelled: seed both flavors at 0 so the panel shows a
@@ -157,6 +191,12 @@ pub fn init() {
 }
 
 /// Render the current Prometheus text exposition. Empty until [`init`] installs the recorder.
+///
+/// Rendering allocates a fresh exposition string and changes nothing, so a discarded call is pure
+/// waste. `clippy::must_use_candidate` cannot say so — reading the `HANDLE` static counts as
+/// touching a mutable static, which makes the lint treat this function as side-effecting — so the
+/// attribute is spelled out.
+#[must_use]
 pub fn render() -> String {
     HANDLE
         .get()
@@ -178,7 +218,7 @@ pub fn init_table_series(table: &str) {
 }
 
 fn describe_all() {
-    use metrics::{describe_counter, describe_gauge, describe_histogram, Unit};
+    use metrics::{Unit, describe_counter, describe_gauge, describe_histogram};
     describe_gauge!(
         names::SINK_REPLICATION_LAG_BYTES,
         Unit::Bytes,
@@ -342,7 +382,7 @@ fn zero_init_global() {
 
 /// Slot `wal_status` as the categorical gauge (0 reserved / 1 unreserved / 2 lost).
 pub fn set_wal_status(code: u8) {
-    metrics::gauge!(names::SINK_WAL_STATUS).set(code as f64);
+    metrics::gauge!(names::SINK_WAL_STATUS).set(f64::from(code));
 }
 
 /// One reload echo cross-check violation (`embedded >= commit`, PR 6.3) — the watermark model is
@@ -367,6 +407,7 @@ pub fn record_reload_restart_cap_exhausted() {
 pub fn inc_reload_active(flavor: &str) {
     metrics::gauge!(names::RELOAD_ACTIVE, names::FLAVOR_LABEL => flavor.to_string()).increment(1.0);
 }
+/// The decrement half of that pair — see [`inc_reload_active`] for the balance it maintains.
 pub fn dec_reload_active(flavor: &str) {
     metrics::gauge!(names::RELOAD_ACTIVE, names::FLAVOR_LABEL => flavor.to_string()).decrement(1.0);
 }

@@ -3,13 +3,15 @@
 //! file: if a still-live owner held it we'd fail opaquely here, which is why the ordered bootstrap
 //! proves the lease is reclaimable *before* calling [`TableDb::open`].
 
+use crate::duck_ext::DuckResultExt;
 use crate::error::LoaderError;
 use crate::plan::TablePlan;
 use common::oids::{
     BOOL, BYTEA, DATE, FLOAT4, FLOAT8, INT2, INT4, INT8, JSON, JSONB, NUMERIC, TIMESTAMP,
     TIMESTAMPTZ, UUID,
 };
-use common::PgRelation;
+use common::sql::SqlStrExt;
+use common::{EpochNo, PgRelation, Redacted, ReloadId, SchemaVersionNo};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
@@ -29,23 +31,51 @@ const RELOAD_REBUILD_DROP: &str = include_str!("../sql/duckdb/templates/reload_r
 const WIPE_GENERATION: &str = include_str!("../sql/duckdb/templates/wipe_generation.sql");
 
 /// Owns one table's `.duckdb` connection (mirror `<table>` + CDC log `<table>_raw`).
+///
+/// The owned handles are `Send`, but their shared references are not: `&T: Send` requires `T: Sync`,
+/// while both types contain a `RefCell`. These compile-fail guards pin the boundary that prevents the
+/// current borrowed connection API from satisfying `spawn_blocking`'s closure bound.
+///
+/// ```compile_fail,E0277
+/// fn requires_send<T: Send>() {}
+/// requires_send::<&'static duckdb::Connection>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// fn requires_send<T: Send>() {}
+/// requires_send::<&'static loader::duck::TableDb>();
+/// ```
+#[derive(Debug)]
 pub struct TableDb {
     conn: duckdb::Connection,
     /// Parquet column lists by `schema_version` (PR 5.8). A version's file shape is immutable — the
     /// sink's homogeneous-file rule (walrus-pg-sink §3.5) cuts a fresh file at every DDL bump, so all
     /// files at one version share their columns and a DDL bump is a *new* key. So this cache never
     /// invalidates, and a Phase-A cycle claiming N same-version files runs one `DESCRIBE`, not N.
-    /// `RefCell` for interior mutability: `TableDb` is used single-threaded (DuckDB `Connection` is
-    /// `!Send`, one per apply worker on a `LocalSet`).
-    parquet_cols: RefCell<HashMap<i64, Arc<Vec<String>>>>,
+    /// `RefCell` provides interior mutability behind `&self`. `TableDb` is `Send + !Sync`:
+    /// duckdb-rs declares `Connection: Send`, but the connection's `RefCell<InnerConnection>` and
+    /// this cache's `RefCell` prevent shared access. That `!Sync` makes a future holding `&TableCtx`
+    /// non-`Send`, hence one apply worker per `.duckdb` file on a `LocalSet`. See the bound analysis
+    /// and shared-thread open finding in
+    /// `docs/implementation/notes/rust-skills/async-spawn-blocking.md`.
+    /// `Arc<[String]>` keeps reads to one indirection while preserving `TableDb: Send`. The `Rc`
+    /// this `LocalSet`-confined cache would otherwise invite is declined: `Rc` is `!Send`, so it
+    /// would break `assert_send::<TableDb>()` below and foreclose the owned-move redesign that
+    /// note leaves open.
+    parquet_cols: RefCell<HashMap<SchemaVersionNo, Arc<[String]>>>,
 }
 
 impl TableDb {
     /// Open (or create) the file read-write, taking DuckDB's file lock. A stale lock behind an expired
     /// lease has already been reclaimed by the caller; a *live* owner would make this fail.
-    pub fn open(path: &Path) -> Result<Self, LoaderError> {
-        let conn = duckdb::Connection::open(path)
-            .map_err(|e| LoaderError::Duck(format!("open {}: {e}", path.display())))?;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] if DuckDB cannot open the file or acquire its writer lock.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, LoaderError> {
+        let path = path.as_ref();
+        let conn =
+            duckdb::Connection::open(path).duck_with(|| format!("open {}", path.display()))?;
         Ok(TableDb {
             conn,
             parquet_cols: RefCell::new(HashMap::new()),
@@ -57,17 +87,29 @@ impl TableDb {
     /// `_walrus_meta` row seeding this table's `schema_version` (PR 3.8's DDL-reconcile watermark).
     /// The seed is `ON CONFLICT DO NOTHING`, so an EXISTING `.duckdb` keeps its persisted, already-
     /// reconciled version across restarts — the additive DDL applier ([`crate::ddl`]) advances it.
-    pub fn ensure_tables(&self, rel: &PgRelation, schema_version: i64) -> Result<(), LoaderError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] if DuckDB cannot create or reconcile the planned tables and view.
+    pub fn ensure_tables(
+        &self,
+        rel: &PgRelation,
+        schema_version: SchemaVersionNo,
+    ) -> Result<(), LoaderError> {
         self.ensure_tables_planned(&crate::plan::TablePlan::tier1(rel), schema_version)
     }
 
     /// As [`TableDb::ensure_tables`], but from a full [`TablePlan`] — the mirror carries the recombined
     /// target types and `<table>_raw` the verbatim emit columns (Tier-2 decomposition, PR 4.2). The
     /// Tier-1 plan produces exactly the scalar shape `ensure_tables` always built.
-    pub fn ensure_tables_planned(
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] if any mirror, raw-table, view, or metadata DDL statement fails.
+    pub(crate) fn ensure_tables_planned(
         &self,
         plan: &TablePlan,
-        schema_version: i64,
+        schema_version: SchemaVersionNo,
     ) -> Result<(), LoaderError> {
         let cols: Vec<String> = plan
             .mirror_cols
@@ -125,13 +167,17 @@ impl TableDb {
 
         self.conn
             .execute_batch(&format!("{mirror} {applied_cols} {raw} {user_view} {meta}"))
-            .map_err(|e| LoaderError::Duck(format!("ensure tables for {table}: {e}")))?;
+            .duck_with(|| format!("ensure tables for {table}"))?;
         Ok(())
     }
 
     /// Configure DuckDB's bundled httpfs for the S3/MinIO staging bucket — **once per connection**, so
     /// `read_parquet('s3://…')` then needs no per-call credentials. For MinIO the endpoint is
     /// `host:port` (no scheme), path-style, TLS off.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] when DuckDB rejects the httpfs/S3 configuration statements.
     pub fn configure_s3(&self, s3: &S3Access) -> Result<(), LoaderError> {
         let esc = common::sql::sql_literal;
         let use_ssl = if s3.use_ssl { "true" } else { "false" };
@@ -140,10 +186,8 @@ impl TableDb {
             .replace("{endpoint}", &esc(&s3.endpoint))
             .replace("{use_ssl}", use_ssl)
             .replace("{access_key}", &esc(&s3.access_key_id))
-            .replace("{secret_key}", &esc(&s3.secret_access_key));
-        self.conn
-            .execute_batch(&sql)
-            .map_err(|e| LoaderError::Duck(format!("configure S3: {e}")))
+            .replace("{secret_key}", &esc(s3.secret_access_key.expose()));
+        self.conn.execute_batch(&sql).duck("configure S3")
     }
 
     /// Phase A (PR 3.2): append one Parquet file **verbatim** into `<table>_raw`, promoting
@@ -156,11 +200,17 @@ impl TableDb {
     /// the file's `lsn_end` (stamped on the manifest at `Stream Commit`); passing `Some(lsn_end)` here
     /// stamps every appended row with it, so a concurrently-committed neighbour txn is never dropped by
     /// the transform's commit-LSN window (architecture.md §1.6). `None` keeps the verbatim per-row value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Ident`] if the Parquet schema contains a column name that cannot be
+    /// represented as a SQL identifier, or [`LoaderError::Duck`] if the schema cannot be inspected
+    /// or its rows cannot be appended into the raw table.
     pub fn append_parquet(
         &self,
         table: &str,
         s3_uri: &str,
-        schema_version: i64,
+        schema_version: SchemaVersionNo,
         commit_lsn_override: Option<&str>,
     ) -> Result<u64, LoaderError> {
         let uri = common::sql::sql_literal(s3_uri);
@@ -173,11 +223,18 @@ impl TableDb {
         let file_cols = self.columns_for(&uri, schema_version)?;
         let quoted = file_cols
             .iter()
-            .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
-            .collect::<Vec<_>>()
+            .map(|column| {
+                common::sql::SqlIdent::new(column)
+                    .map(|ident| ident.to_string())
+                    .map_err(|source| LoaderError::Ident {
+                        uri: s3_uri.to_string(),
+                        source,
+                    })
+            })
+            .collect::<Result<Vec<_>, LoaderError>>()?
             .join(", ");
         let commit_lsn_expr = match commit_lsn_override {
-            Some(lsn) => format!("'{}'", common::sql::sql_literal(lsn)),
+            Some(lsn) => lsn.to_quoted_literal(),
             None => "json_extract_string(walrus_pg_sink_meta, '$.commit_lsn')".to_string(),
         };
         let sql = APPEND_PARQUET
@@ -188,17 +245,24 @@ impl TableDb {
         let n = self
             .conn
             .execute(&sql, [])
-            .map_err(|e| LoaderError::Duck(format!("append {s3_uri} → {table}_raw: {e}")))?;
-        Ok(n as u64)
+            .duck_with(|| format!("append {s3_uri} → {table}_raw"))?;
+        Ok(u64::try_from(n).unwrap_or(u64::MAX))
     }
 
     /// The Parquet column list for `schema_version`, introspecting `uri` **once** per version and
     /// caching it (PR 5.8; sound by the homogeneous-file rule — see [`TableDb::parquet_cols`]).
-    fn columns_for(&self, uri: &str, schema_version: i64) -> Result<Arc<Vec<String>>, LoaderError> {
-        if let Some(cols) = self.parquet_cols.borrow().get(&schema_version) {
-            return Ok(Arc::clone(cols));
+    fn columns_for(
+        &self,
+        uri: &str,
+        schema_version: SchemaVersionNo,
+    ) -> Result<Arc<[String]>, LoaderError> {
+        // The shared borrow is released before the miss path: an `entry` call would hold the
+        // `RefCell` across the DESCRIBE below, and one saved hash is nothing beside that query.
+        let cached = { self.parquet_cols.borrow().get(&schema_version).cloned() };
+        if let Some(columns) = cached {
+            return Ok(columns);
         }
-        let cols = Arc::new(self.parquet_columns(uri)?);
+        let cols: Arc<[String]> = self.parquet_columns(uri)?.into();
         self.parquet_cols
             .borrow_mut()
             .insert(schema_version, Arc::clone(&cols));
@@ -216,40 +280,132 @@ impl TableDb {
         let mut stmt = self
             .conn
             .prepare(&format!("DESCRIBE SELECT * FROM read_parquet('{uri}')"))
-            .map_err(|e| LoaderError::Duck(format!("describe {uri}: {e}")))?;
+            .duck_with(|| format!("describe {uri}"))?;
         let cols = stmt
             .query_map([], |r| r.get::<_, String>(0))
-            .map_err(|e| LoaderError::Duck(format!("describe {uri}: {e}")))?
+            .duck_with(|| format!("describe {uri}"))?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| LoaderError::Duck(format!("describe {uri}: {e}")))?;
+            .duck_with(|| format!("describe {uri}"))?;
         Ok(cols)
     }
 
     /// The `.duckdb` connection (later PRs run the transform SQL through it).
-    pub fn conn(&self) -> &duckdb::Connection {
+    ///
+    /// Handing out the borrow does nothing on its own — the caller still has to run something
+    /// through it — so a discarded call is a no-op. `clippy::must_use_candidate` cannot say so: the
+    /// `parquet_cols` `RefCell` behind `&self` reads to that lint as a mutable — therefore
+    /// side-effecting — argument, so the attribute is spelled out.
+    #[must_use]
+    pub const fn conn(&self) -> &duckdb::Connection {
         &self.conn
+    }
+
+    /// Run `f` inside one DuckDB transaction. Commits on success and attempts a best-effort rollback
+    /// on error, so callers cannot forget the unhappy path. `what` names the transaction in the
+    /// begin/commit error contexts and rollback warning.
+    ///
+    /// Bounded [`FnOnce`] because the body runs exactly once and may consume what it captured. This
+    /// is the weakest bound that works, accepting move-consuming closures too. There is no `Send`
+    /// bound: the body runs inline on the owning worker's `LocalSet` and never crosses a task or
+    /// thread boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] if beginning or committing the transaction fails, or returns
+    /// the body's error unchanged after attempting to roll back.
+    pub fn in_txn<T>(
+        &self,
+        what: &str,
+        f: impl FnOnce(&duckdb::Connection) -> Result<T, LoaderError>,
+    ) -> Result<T, LoaderError> {
+        self.conn
+            .execute_batch("BEGIN TRANSACTION;")
+            .duck_with(|| format!("begin {what} txn"))?;
+        match f(&self.conn) {
+            Ok(value) => {
+                self.conn
+                    .execute_batch("COMMIT;")
+                    .duck_with(|| format!("commit {what} txn"))?;
+                Ok(value)
+            }
+            Err(error) => {
+                if let Err(rollback) = self.conn.execute_batch("ROLLBACK;") {
+                    tracing::warn!(
+                        error = %rollback,
+                        transaction = what,
+                        "transaction rollback failed; connection may be wedged"
+                    );
+                }
+                Err(error)
+            }
+        }
     }
 
     /// This table's currently-reconciled `schema_version` (the `_walrus_meta` watermark). Persisted in
     /// the `.duckdb` file, so a restart resumes at the exact version its columns are already at.
-    pub fn schema_version(&self) -> Result<i64, LoaderError> {
-        self.conn
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] if the metadata watermark cannot be read.
+    pub fn schema_version(&self) -> Result<SchemaVersionNo, LoaderError> {
+        let version = self
+            .conn
             .query_row(
                 "SELECT v FROM \"_walrus_meta\" WHERE k = 'schema_version'",
                 [],
                 |r| r.get(0),
             )
-            .map_err(|e| LoaderError::Duck(format!("read schema_version: {e}")))
+            .duck("read schema_version")?;
+        Ok(SchemaVersionNo(version))
+    }
+
+    /// The persisted watermark read **before** the seeding `ensure_tables*`, or `None` when this
+    /// `.duckdb` has none yet (a brand-new file has no `_walrus_meta` at all). Only bootstrap needs
+    /// this: it asks what version a file is already at while deciding whether to reconcile it
+    /// forward, so it meets both a fresh and a resumed file. Every later caller runs after the seed
+    /// and uses the probe-free [`TableDb::schema_version`], which Phase A reads per file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] if the metadata table probe or the watermark read fails — a
+    /// real DuckDB fault, kept distinct from the absent watermark `Ok(None)` reports.
+    pub fn stored_schema_version(&self) -> Result<Option<SchemaVersionNo>, LoaderError> {
+        // A brand-new file has no `_walrus_meta` yet — probe first, exactly as `built_epoch` does.
+        let has_meta: i64 = self
+            .conn
+            .query_row(
+                "SELECT count(*) FROM information_schema.tables WHERE table_name = '_walrus_meta'",
+                [],
+                |r| r.get(0),
+            )
+            .duck("probe _walrus_meta")?;
+        if has_meta == 0 {
+            return Ok(None);
+        }
+        // `max(v)` yields one row with NULL (→ `None`) when the key is absent, as in `built_epoch`.
+        let v: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT max(v) FROM \"_walrus_meta\" WHERE k = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .duck("read stored schema_version")?;
+        Ok(v.map(SchemaVersionNo))
     }
 
     /// Advance the reconcile watermark after the additive DDL for `v` has been applied to both tables.
-    pub fn set_schema_version(&self, v: i64) -> Result<(), LoaderError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] if updating the persisted schema watermark fails.
+    pub fn set_schema_version(&self, version: SchemaVersionNo) -> Result<(), LoaderError> {
         self.conn
             .execute(
                 "UPDATE \"_walrus_meta\" SET v = ? WHERE k = 'schema_version'",
-                duckdb::params![v],
+                duckdb::params![version.0],
             )
-            .map_err(|e| LoaderError::Duck(format!("set schema_version: {e}")))?;
+            .duck("set schema_version")?;
         Ok(())
     }
 
@@ -257,7 +413,11 @@ impl TableDb {
     /// if never stamped (a brand-new file — no `_walrus_meta` yet — or a pre-4.6 file). A value below the
     /// control-plane epoch means the mirror + raw hold a **retired generation** (total-restart, §1.8) and
     /// must be wiped before the new-epoch snapshot reloads.
-    pub fn built_epoch(&self) -> Result<Option<i64>, LoaderError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] if the metadata table probe or epoch read fails.
+    pub fn built_epoch(&self) -> Result<Option<EpochNo>, LoaderError> {
         // A brand-new file has no `_walrus_meta` yet — probe first so this never errors on it.
         let has_meta: i64 = self
             .conn
@@ -266,7 +426,7 @@ impl TableDb {
                 [],
                 |r| r.get(0),
             )
-            .map_err(|e| LoaderError::Duck(format!("probe _walrus_meta: {e}")))?;
+            .duck("probe _walrus_meta")?;
         if has_meta == 0 {
             return Ok(None);
         }
@@ -278,27 +438,36 @@ impl TableDb {
                 [],
                 |r| r.get(0),
             )
-            .map_err(|e| LoaderError::Duck(format!("read built epoch: {e}")))?;
-        Ok(v)
+            .duck("read built epoch")?;
+        Ok(v.map(EpochNo))
     }
 
     /// Stamp the generation this `.duckdb` is now built for (`_walrus_meta['epoch']`). Upserts, so it both
     /// records a fresh file's epoch and re-stamps a rebuilt file's new epoch.
-    pub fn set_built_epoch(&self, epoch: i64) -> Result<(), LoaderError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] if the epoch upsert fails.
+    pub fn set_built_epoch(&self, epoch: EpochNo) -> Result<(), LoaderError> {
         self.conn
             .execute(
                 "INSERT INTO \"_walrus_meta\" (k, v) VALUES ('epoch', ?) \
                  ON CONFLICT (k) DO UPDATE SET v = excluded.v",
-                duckdb::params![epoch],
+                duckdb::params![epoch.0],
             )
-            .map_err(|e| LoaderError::Duck(format!("set built epoch: {e}")))?;
+            .duck("set built epoch")?;
         Ok(())
     }
 
     /// The highest `reload_id` this `.duckdb` has rebuilt for — the H8 idempotency latch (PR 6.7).
-    /// Absent ⇒ 0, so any real (bigserial ≥ 1) reload triggers. `max(v)` yields NULL (→ 0) when
-    /// the key is missing, mirroring [`TableDb::built_epoch`]'s probe-free read.
-    pub fn recorded_reload_id(&self) -> Result<i64, LoaderError> {
+    /// `None` when the latch was never set, so the first attempt of any kind triggers a rebuild; a
+    /// caller can no longer confuse "never rebuilt" with a real id. `max(v)` yields NULL (→ `None`)
+    /// when the key is missing, mirroring [`TableDb::built_epoch`]'s probe-free read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] if the reload latch cannot be read.
+    pub fn recorded_reload_id(&self) -> Result<Option<ReloadId>, LoaderError> {
         let v: Option<i64> = self
             .conn
             .query_row(
@@ -306,20 +475,24 @@ impl TableDb {
                 [],
                 |r| r.get(0),
             )
-            .map_err(|e| LoaderError::Duck(format!("read recorded reload_id: {e}")))?;
-        Ok(v.unwrap_or(0))
+            .duck("read recorded reload_id")?;
+        Ok(v.map(ReloadId))
     }
 
     /// Latch the reload generation this `.duckdb` is now rebuilt for. With a monotonic bigserial
     /// id, "latest wins" (H9) is this upsert plus a numeric compare at the trigger.
-    pub fn set_recorded_reload_id(&self, reload_id: i64) -> Result<(), LoaderError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] if the reload-id upsert fails.
+    pub fn set_recorded_reload_id(&self, reload_id: ReloadId) -> Result<(), LoaderError> {
         self.conn
             .execute(
                 "INSERT INTO \"_walrus_meta\" (k, v) VALUES ('reload_id', ?) \
                  ON CONFLICT (k) DO UPDATE SET v = excluded.v",
-                duckdb::params![reload_id],
+                duckdb::params![reload_id.0],
             )
-            .map_err(|e| LoaderError::Duck(format!("set recorded reload_id: {e}")))?;
+            .duck("set recorded reload_id")?;
         Ok(())
     }
 
@@ -337,15 +510,19 @@ impl TableDb {
     /// `_walrus_meta` survives (the epoch + reload_id latches live there); the schema_version
     /// watermark is set to the FILE's version explicitly — `ensure_tables_planned`'s seed is
     /// `ON CONFLICT DO NOTHING` and the pre-rebuild watermark may differ in either direction.
-    pub fn rebuild_for_reload(
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] if dropping, recreating, or stamping either table fails.
+    pub(crate) fn rebuild_for_reload(
         &self,
         plan: &TablePlan,
-        schema_version: i64,
+        schema_version: SchemaVersionNo,
     ) -> Result<(), LoaderError> {
         let table = &plan.table;
         self.conn
             .execute_batch(&RELOAD_REBUILD_DROP.replace("{table}", table))
-            .map_err(|e| LoaderError::Duck(format!("reload rebuild drop for {table}: {e}")))?;
+            .duck_with(|| format!("reload rebuild drop for {table}"))?;
         self.ensure_tables_planned(plan, schema_version)?;
         self.set_schema_version(schema_version)?;
         Ok(())
@@ -355,10 +532,14 @@ impl TableDb {
     /// the CDC log, and `_walrus_meta`. The caller then re-runs `ensure_tables*` to recreate them empty, so
     /// the fresh new-epoch snapshot re-appends into `<table>_raw` and the transform re-derives `<table>`
     /// from scratch (both watermarks reset — the new epoch's `loader_checkpoint` is a fresh `0/0`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] if DuckDB cannot drop the retired generation's objects.
     pub fn wipe_generation(&self, table: &str) -> Result<(), LoaderError> {
         self.conn
             .execute_batch(&WIPE_GENERATION.replace("{table}", table))
-            .map_err(|e| LoaderError::Duck(format!("wipe generation for {table}: {e}")))?;
+            .duck_with(|| format!("wipe generation for {table}"))?;
         Ok(())
     }
 }
@@ -371,18 +552,28 @@ pub(crate) fn user_view_sql(table: &str) -> String {
 }
 
 /// DuckDB S3/httpfs credentials for reading the staging bucket.
+///
+/// Only the secret half is [`Redacted`]: an access key id is an identifier that already appears in
+/// bucket policies and audit trails, while `secret_access_key` *is* the credential — and this
+/// struct derives `Debug`, which would otherwise put it one `?s3` away from a log line.
 #[derive(Debug, Clone)]
 pub struct S3Access {
+    /// Host:port DuckDB's httpfs extension should talk to (MinIO in dev, S3 in production).
     pub endpoint: String,
+    /// Region used to sign requests.
     pub region: String,
+    /// Access key id.
     pub access_key_id: String,
-    pub secret_access_key: String,
+    /// Secret access key. Held only long enough to configure the connection; the wrapper is what
+    /// keeps "never logged" a property of the type rather than a promise in a doc comment.
+    pub secret_access_key: Redacted<String>,
+    /// Whether to reach the endpoint over TLS. `false` for a plain-HTTP local MinIO.
     pub use_ssl: bool,
 }
 
 /// Map a Postgres type OID to a DuckDB column type. Unknown types fall back to `VARCHAR` (the loader
 /// stages *text*-format tuples; the exact numeric/temporal fidelity is refined as the transform lands).
-pub(crate) fn duck_type(oid: u32) -> &'static str {
+pub(crate) const fn duck_type(oid: u32) -> &'static str {
     match oid {
         INT2 => "SMALLINT",
         INT4 => "INTEGER",
@@ -400,6 +591,41 @@ pub(crate) fn duck_type(oid: u32) -> &'static str {
         _ => "VARCHAR", // text, varchar, enums, and everything else
     }
 }
+
+// Compile-time proof of the loader's threading model. This closure is type-checked but never run or
+// code-generated. The compiler derives every bound; no manual auto-trait implementation is needed.
+const _: fn() = || {
+    const fn assert_send<T: Send + ?Sized>() {}
+    const fn assert_sync<T: Sync + ?Sized>() {}
+
+    // Moves into `TableCtx` and then into the worker future.
+    assert_send::<TableDb>();
+    // The one value handed from a local worker to `tokio::spawn` during compaction drain.
+    assert_send::<duckdb::InterruptHandle>();
+    assert_sync::<duckdb::InterruptHandle>();
+    // Shared by the health server and every worker.
+    assert_send::<Arc<crate::health::LoaderState>>();
+    assert_sync::<Arc<crate::health::LoaderState>>();
+
+    // Pin walrus's own source of `!Sync`; DuckDB independently keeps the overall type `!Sync`.
+    const fn cache_refcell(db: &TableDb) -> &RefCell<HashMap<SchemaVersionNo, Arc<[String]>>> {
+        &db.parquet_cols
+    }
+    let _cache_refcell_fn = cache_refcell;
+};
+
+// Negative assertion: while the overall `TableDb` is not `Sync`, only the `()` impl applies and `_`
+// resolves. If every source of `!Sync` is removed, both impls apply and this line is ambiguous. This
+// is `static_assertions::assert_not_impl_all!` hand-rolled to avoid a direct dependency.
+const _: fn() = || {
+    trait AmbiguousIfSync<A> {
+        fn some_item() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+    impl<T: ?Sized + Sync> AmbiguousIfSync<u8> for T {}
+
+    let _some_item = <TableDb as AmbiguousIfSync<_>>::some_item;
+};
 
 #[cfg(test)]
 #[path = "duck_test.rs"]

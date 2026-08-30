@@ -33,6 +33,7 @@ pub struct HeartbeatConfig {
 /// OIDs (and layout) of walrus's own published tables — consumed for control, never materialised.
 #[derive(Debug, Default, Clone)]
 pub struct InternalTables {
+    /// `walrus.heartbeat`'s OID, learned from its `Relation` message; `None` until one arrives.
     pub heartbeat_oid: Option<u32>,
     /// Column index of `walrus.heartbeat.beat_seq`, learned from its `Relation` message.
     heartbeat_beat_seq_col: Option<usize>,
@@ -54,6 +55,7 @@ impl InternalTables {
     /// Is this relation OID one of walrus's own control tables (never staged as user data)?
     /// `walrus.heartbeat`, `walrus.ddl_audit`, and `walrus.reload_signal` are all consumed
     /// specially, never materialised.
+    #[must_use]
     pub fn is_internal(&self, rel_oid: u32) -> bool {
         self.heartbeat_oid == Some(rel_oid)
             || self.ddl_audit_oid == Some(rel_oid)
@@ -61,16 +63,19 @@ impl InternalTables {
     }
 
     /// Whether this OID is the DDL-audit table (its INSERTs drive [`crate::ddl::DdlConsumer`]).
+    #[must_use]
     pub fn is_ddl_audit(&self, rel_oid: u32) -> bool {
         self.ddl_audit_oid == Some(rel_oid)
     }
 
     /// Whether this OID is the heartbeat table (only its tuples carry a `beat_seq`).
+    #[must_use]
     pub fn is_heartbeat(&self, rel_oid: u32) -> bool {
         self.heartbeat_oid == Some(rel_oid)
     }
 
     /// Whether this OID is the reload signal table (its INSERTs resolve watermark waiters).
+    #[must_use]
     pub fn is_reload_signal(&self, rel_oid: u32) -> bool {
         self.reload_signal_oid == Some(rel_oid)
     }
@@ -95,21 +100,28 @@ impl InternalTables {
     }
 
     /// The `ddl_audit` relation shape, once its `Relation` message has been seen.
-    pub fn ddl_audit_rel(&self) -> Option<&common::PgRelation> {
+    #[must_use]
+    pub const fn ddl_audit_rel(&self) -> Option<&common::PgRelation> {
         self.ddl_audit_rel.as_ref()
     }
 
     /// The `reload_signal` relation shape, once its `Relation` message has been seen.
-    pub fn reload_signal_rel(&self) -> Option<&common::PgRelation> {
+    #[must_use]
+    pub const fn reload_signal_rel(&self) -> Option<&common::PgRelation> {
         self.reload_signal_rel.as_ref()
     }
 
     /// Extract the returned `beat_seq` from a decoded `walrus.heartbeat` new-tuple (text format).
+    ///
+    /// The non-text images are listed rather than absorbed by a wildcard: a new [`TupleValue`]
+    /// variant must decide here whether it can carry a beat seq, instead of silently reading as
+    /// "no beat".
+    #[deny(clippy::wildcard_enum_match_arm)]
     pub fn beat_seq_of(&self, new: &[TupleValue]) -> Option<i64> {
         let idx = self.heartbeat_beat_seq_col?;
         match new.get(idx)? {
             TupleValue::Text(s) => s.parse::<i64>().ok(),
-            _ => None,
+            TupleValue::Null | TupleValue::UnchangedToast | TupleValue::Binary(_) => None,
         }
     }
 }
@@ -127,7 +139,7 @@ struct BeatState {
 }
 
 impl BeatState {
-    fn new(cfg: HeartbeatConfig) -> Self {
+    const fn new(cfg: HeartbeatConfig) -> Self {
         BeatState {
             cfg,
             last_beat: None,
@@ -146,7 +158,7 @@ impl BeatState {
         idle_activity && idle_beat
     }
 
-    fn on_beat_sent(&mut self, seq: i64, now: Instant) {
+    const fn on_beat_sent(&mut self, seq: i64, now: Instant) {
         self.last_beat = Some(now);
         self.pending_seq = Some(seq);
     }
@@ -162,19 +174,19 @@ impl BeatState {
 
     /// Non-gating: an outstanding beat that has not returned within `roundtrip_deadline`. Under steady
     /// traffic (no pending beat) this is always `false` — the stream itself proves liveness.
-    fn degraded(&self, now: Instant) -> bool {
-        match (self.pending_seq, self.last_beat) {
-            (Some(_), Some(sent)) => {
-                now.saturating_duration_since(sent) > self.cfg.roundtrip_deadline
-            }
-            _ => false,
-        }
+    fn is_degraded(&self, now: Instant) -> bool {
+        matches!(
+            (self.pending_seq, self.last_beat),
+            (Some(_), Some(sent))
+                if now.saturating_duration_since(sent) > self.cfg.roundtrip_deadline
+        )
     }
 }
 
 /// Owns a *separate* ordinary SQL connection to the source (distinct from the read-only replication
-/// connection) plus the pure [`BeatState`]. The beat **must** ride the published `walrus.heartbeat`
+/// connection) plus the pure `BeatState`. The beat **must** ride the published `walrus.heartbeat`
 /// table or `pgoutput` filters it out and there is no round-trip.
+#[derive(Debug)]
 pub struct Heartbeat {
     sql: tokio_postgres::Client,
     instance: String,
@@ -184,11 +196,16 @@ pub struct Heartbeat {
 impl Heartbeat {
     /// Open the ordinary SQL connection and drive it in the background (`NoTls` — the dev/source auth
     /// is `trust`; TLS is the operator's network concern, not this control path).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HeartbeatError::Connect`] if the source SQL connection or startup handshake fails.
     pub async fn connect(
         dsn: &str,
-        instance: String,
+        instance: impl Into<String>,
         cfg: HeartbeatConfig,
     ) -> Result<Self, HeartbeatError> {
+        let instance = instance.into();
         let (sql, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
             .await
             .map_err(HeartbeatError::Connect)?;
@@ -205,12 +222,24 @@ impl Heartbeat {
     }
 
     /// The idle window — the decode loop uses it to pace its beat check.
-    pub fn idle_after(&self) -> Duration {
+    #[must_use]
+    pub const fn idle_after(&self) -> Duration {
         self.state.cfg.idle_after
     }
 
     /// Fire exactly one beat iff idle on both clocks; returns the seq written, or `None` (suppressed).
     /// The `UPDATE` rides the **published** `walrus.heartbeat` so it decodes back to us.
+    ///
+    /// ## Cancel safety
+    ///
+    /// **Not cancel-safe as a logical beat.** PostgreSQL may commit the update before a dropped query
+    /// future returns, leaving the local sent-sequence state unchanged. The decode loop awaits this
+    /// inside the selected heartbeat arm, so sibling frame readiness cannot cancel it; a retry would
+    /// only advance the monotonic beat sequence again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HeartbeatError::Beat`] if the heartbeat update or returned sequence read fails.
     pub async fn maybe_beat(
         &mut self,
         now: Instant,
@@ -239,18 +268,30 @@ impl Heartbeat {
         self.state.observe_return(beat_seq, now);
     }
 
-    /// Non-gating health signal (see [`BeatState::degraded`]).
-    pub fn degraded(&self, now: Instant) -> bool {
-        self.state.degraded(now)
+    /// Non-gating health signal (see `BeatState::is_degraded`).
+    #[must_use]
+    pub fn is_degraded(&self, now: Instant) -> bool {
+        self.state.is_degraded(now)
     }
 }
 
+/// This taxonomy is still growing; new variants must remain additive for downstream crates.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum HeartbeatError {
+    /// The heartbeat's own SQL connection could not be opened. Separate from the replication
+    /// connection on purpose: a beat is an ordinary write, not a stream operation.
     #[error("connect heartbeat SQL connection: {0}")]
     Connect(#[source] tokio_postgres::Error),
+    /// The heartbeat UPDATE failed, or its returned sequence could not be read.
     #[error("fire heartbeat UPDATE: {0}")]
     Beat(#[source] tokio_postgres::Error),
+}
+
+impl From<HeartbeatError> for common::Error {
+    fn from(e: HeartbeatError) -> Self {
+        common::Error::SourceDb(e.to_string())
+    }
 }
 
 #[cfg(test)]

@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Destructive DDL apply (loader §5.7, PR 3.9) — where mirror and raw **diverge**. Three hermetic tests
 //! (in-memory / temp-file `TableDb`) prove the per-taxonomy behaviour; the `#[ignore]` compose test
 //! proves a lossy-cast failure quarantines the table and degrades `/ready`.
@@ -6,13 +11,14 @@
 //!   cargo test -p loader --test ddl_destructive              # hermetic
 //!   cargo test -p loader --test ddl_destructive -- --ignored # + compose (quarantine)
 
-use common::{PgColumn, PgRelation, ReplicaIdentity};
-use loader::ddl::{apply_destructive, retire_file, DestructiveChange};
+use common::{EpochNo, PgColumn, PgRelation, ReplicaIdentity};
+use loader::ddl::{DestructiveChange, apply_destructive, retire_file};
 use loader::duck::{S3Access, TableDb};
 use loader::error::LoaderError;
 use loader::health::LoaderState;
-use loader::phase_a::{run_phase_a, TableCtx};
+use loader::phase_a::{TableCtx, run_phase_a};
 use loader::phase_b::run_phase_b;
+use std::sync::Arc;
 use std::time::Duration;
 
 fn col(name: &str, oid: u32, is_key: bool) -> PgColumn {
@@ -35,8 +41,8 @@ fn rel(name: &str, columns: Vec<PgColumn>) -> PgRelation {
 }
 
 fn mem(rel: &PgRelation) -> TableDb {
-    let db = TableDb::open(std::path::Path::new(":memory:")).unwrap();
-    db.ensure_tables(rel, 1).unwrap();
+    let db = TableDb::open(":memory:").unwrap();
+    db.ensure_tables(rel, common::SchemaVersionNo(1)).unwrap();
     db
 }
 
@@ -71,11 +77,11 @@ fn table_exists(conn: &duckdb::Connection, name: &str) -> bool {
     n > 0
 }
 
-fn tmpdir(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("walrus-loader-ddld-{name}"));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+/// A scratch directory for one test's `.duckdb` file. The returned guard deletes it on drop — even
+/// when an assertion panics, which a trailing `remove_dir_all` would skip.
+fn tmpdir(name: &str) -> tempfile::TempDir {
+    let prefix = format!("walrus-loader-ddld-{name}-");
+    tempfile::Builder::new().prefix(&prefix).tempdir().unwrap()
 }
 
 // ---- DROP COLUMN: physical on the mirror, retained-nullable on raw. ----
@@ -115,9 +121,11 @@ fn drop_column_physical_on_mirror_retained_nullable_on_raw() {
         .unwrap();
     assert_eq!(x, None, "post-drop file NULL-fills the retained raw column");
     // The user view refreshed — no dropped column.
-    assert!(!columns_of(db.conn(), "orders_current")
-        .iter()
-        .any(|c| c == "x"));
+    assert!(
+        !columns_of(db.conn(), "orders_current")
+            .iter()
+            .any(|c| c == "x")
+    );
 }
 
 // ---- Lossy ALTER TYPE: raw widens to VARCHAR (history preserved), never re-cast. ----
@@ -169,10 +177,10 @@ fn lossy_type_change_widens_raw_to_varchar_without_recasting() {
 }
 
 // ---- DROP TABLE: retire both DuckDB tables + the .duckdb file (idempotent). ----
-#[test]
-fn drop_table_retires_both_tables_and_the_file() {
+#[tokio::test]
+async fn drop_table_retires_both_tables_and_the_file() {
     let dir = tmpdir("drop");
-    let path = dir.join("orders.duckdb");
+    let path = dir.path().join("orders.duckdb");
     {
         let db = TableDb::open(&path).unwrap();
         db.ensure_tables(
@@ -180,7 +188,7 @@ fn drop_table_retires_both_tables_and_the_file() {
                 "orders",
                 vec![col("id", 23, true), col("status", 25, false)],
             ),
-            1,
+            common::SchemaVersionNo(1),
         )
         .unwrap();
         apply_destructive(
@@ -196,10 +204,12 @@ fn drop_table_retires_both_tables_and_the_file() {
     } // drop the connection → release the DuckDB file lock
 
     assert!(path.exists(), "file present until explicitly retired");
-    retire_file(&path).unwrap();
+    retire_file(&path).await.unwrap();
     assert!(!path.exists(), "the .duckdb file is retired");
-    retire_file(&path).unwrap(); // idempotent — a crash-mid-retire re-run is a no-op
-    let _ = std::fs::remove_dir_all(&dir);
+    // Idempotent — a crash-mid-retire re-run is a no-op. Spelled as a bare `&str` here (the call
+    // above passes `&PathBuf`) because `retire_file` takes a borrowed path view, not one exact type.
+    retire_file(path.to_str().unwrap()).await.unwrap();
+    assert!(!path.exists(), "the retire re-run left the file absent");
 }
 
 // ---- Compose: a lossy cast that fails quarantines the table and degrades /ready. ----
@@ -225,19 +235,23 @@ fn s3() -> S3Access {
 fn meta(commit_hex: &str, l: u64) -> String {
     format!(
         "{{\"op\":\"i\",\"commit_lsn\":\"{commit_hex}\",\"lsn\":\"{:016X}\",\"sink_processed_at\":\"2026-07-07T12:00:{:02}Z\"}}",
-        l, l % 60
+        l,
+        l % 60
     )
 }
 
 /// Write an (id, n, walrus_pg_sink_meta) Parquet fixture to S3.
-fn write_fixture(epoch: i64, tag: &str, id: i64, n: i64, commit_hex: &str, l: u64) -> String {
+fn write_fixture(epoch: EpochNo, tag: &str, id: i64, n: i64, commit_hex: &str, l: u64) -> String {
     let w = duckdb::Connection::open_in_memory().unwrap();
     let a = s3();
     w.execute_batch(&format!(
         "INSTALL httpfs; LOAD httpfs; SET s3_region='{}'; SET s3_endpoint='{}'; \
          SET s3_url_style='path'; SET s3_use_ssl=false; \
          SET s3_access_key_id='{}'; SET s3_secret_access_key='{}';",
-        a.region, a.endpoint, a.access_key_id, a.secret_access_key
+        a.region,
+        a.endpoint,
+        a.access_key_id,
+        a.secret_access_key.expose()
     ))
     .unwrap();
     w.execute_batch("CREATE TABLE fixture (id INTEGER, n INTEGER, walrus_pg_sink_meta VARCHAR);")
@@ -257,7 +271,7 @@ fn write_fixture(epoch: i64, tag: &str, id: i64, n: i64, commit_hex: &str, l: u6
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn lossy_cast_failure_quarantines_the_table_and_alerts() {
     let _g = LOCK.lock().await;
-    let epoch = 3_900_001;
+    let epoch = EpochNo(3_900_001);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     for tbl in [
@@ -277,7 +291,7 @@ async fn lossy_cast_failure_quarantines_the_table_and_alerts() {
             epoch,
             slot_name: "walrus_slot".into(),
             created_lsn: "0/0".parse().unwrap(),
-            status: "streaming".into(),
+            status: control::ReplicationStatus::Streaming,
         },
     )
     .await
@@ -294,7 +308,7 @@ async fn lossy_cast_failure_quarantines_the_table_and_alerts() {
             epoch,
             source_schema: "public".into(),
             source_table: "orders".into(),
-            schema_version: 1,
+            schema_version: common::SchemaVersionNo(1),
             descriptors: Vec::new(),
             columns: serde_json::to_value(&orders_v1).unwrap(),
         },
@@ -313,7 +327,7 @@ async fn lossy_cast_failure_quarantines_the_table_and_alerts() {
             row_count: 1,
             lsn_start: "0/64".parse().unwrap(),
             lsn_end: "0/64".parse().unwrap(),
-            schema_version: 1,
+            schema_version: common::SchemaVersionNo(1),
             reload_id: None,
         },
     )
@@ -321,19 +335,22 @@ async fn lossy_cast_failure_quarantines_the_table_and_alerts() {
     .unwrap();
 
     let dir = tmpdir(&epoch.to_string());
-    let db = TableDb::open(&dir.join("orders.duckdb")).unwrap();
-    db.ensure_tables(&orders_v1, 1).unwrap();
+    let db = TableDb::open(dir.path().join("orders.duckdb")).unwrap();
+    db.ensure_tables(&orders_v1, common::SchemaVersionNo(1))
+        .unwrap();
     db.configure_s3(&s3()).unwrap();
     let state = LoaderState::new();
     let ctx = TableCtx {
         pool,
         epoch,
+        epoch_rx: loader::epoch::fixed_epoch_watch(epoch),
         schema: "public".into(),
         table: "orders".into(),
+        series: "public.orders".into(),
         rel: orders_v1,
         db,
-        state: state.clone(),
-        max_files: 100,
+        state: Arc::clone(&state),
+        max_files: std::num::NonZeroI64::new(100).unwrap(),
         poll_interval: Duration::from_secs(5),
         compaction_interval: Duration::from_secs(3600),
         retention_lsn_lag: 16 << 20,
@@ -355,7 +372,7 @@ async fn lossy_cast_failure_quarantines_the_table_and_alerts() {
             epoch,
             source_schema: "public".into(),
             source_table: "orders".into(),
-            schema_version: 2,
+            schema_version: common::SchemaVersionNo(2),
             descriptors: Vec::new(),
             columns: serde_json::to_value(&orders_v2).unwrap(),
         },
@@ -374,7 +391,7 @@ async fn lossy_cast_failure_quarantines_the_table_and_alerts() {
             row_count: 1,
             lsn_start: "0/C8".parse().unwrap(),
             lsn_end: "0/C8".parse().unwrap(),
-            schema_version: 2,
+            schema_version: common::SchemaVersionNo(2),
             reload_id: None,
         },
     )
@@ -404,6 +421,4 @@ async fn lossy_cast_failure_quarantines_the_table_and_alerts() {
         )
         .unwrap();
     assert_eq!(raw_type, "VARCHAR", "raw widened to VARCHAR, not re-cast");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

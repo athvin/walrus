@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Compose-gated integration tests for the loader-pause claim predicate (PR 6.6).
 //!
 //! "Pausing is not claiming" (reload §2): a live `flavor='reload'` reload in
@@ -8,10 +12,10 @@
 //! never pauses. Rolled-back transactions + unique epochs, like the manifest tests.
 #![cfg(feature = "integration")]
 
-use common::Lsn;
+use common::{EpochNo, Lsn, SchemaVersionNo};
 use control::reload::{self, ReloadFlavor};
-use control::{claim_ready, connect, insert_ready, max_ready_lsn_end, run_migrations};
 use control::{ManifestRow, NewManifestFile};
+use control::{claim_ready, connect, insert_ready, max_ready_lsn_end, run_migrations};
 use sqlx::postgres::PgPool;
 
 fn control_dsn() -> String {
@@ -28,7 +32,7 @@ async fn pool() -> PgPool {
     pool
 }
 
-fn stream_file(epoch: i64, table: &str, lsn_end: &str) -> NewManifestFile {
+fn stream_file(epoch: EpochNo, table: &str, lsn_end: &str) -> NewManifestFile {
     let lsn: Lsn = lsn_end.parse().unwrap();
     NewManifestFile {
         epoch,
@@ -39,7 +43,7 @@ fn stream_file(epoch: i64, table: &str, lsn_end: &str) -> NewManifestFile {
         row_count: 1,
         lsn_start: lsn,
         lsn_end: lsn,
-        schema_version: 1,
+        schema_version: SchemaVersionNo(1),
         reload_id: None,
     }
 }
@@ -52,7 +56,7 @@ fn ids(rows: &[ManifestRow]) -> Vec<common::ManifestId> {
 async fn live_rebuild_pauses_claims_for_that_table_only() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let epoch = 920_001;
+    let epoch = EpochNo(920_001);
 
     insert_ready(&mut *tx, &stream_file(epoch, "orders", "0/10"))
         .await
@@ -79,10 +83,12 @@ async fn live_rebuild_pauses_claims_for_that_table_only() {
     reload::claim_requested(&mut *tx, epoch, "sink-a", 60, 10)
         .await
         .unwrap();
-    assert!(claim_ready(&mut *tx, epoch, "public", "orders", 100)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        claim_ready(&mut *tx, epoch, "public", "orders", 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
     // The OTHER table claims normally the whole time, and the paused table's backlog stays
     // visible (the lag gauge SHOULD grow during a pause — PR 6.11 documents it).
@@ -107,7 +113,7 @@ async fn live_rebuild_pauses_claims_for_that_table_only() {
 async fn export_complete_and_terminal_states_lift_the_pause() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let epoch = 920_002;
+    let epoch = EpochNo(920_002);
 
     // Backlog inserted OUT of order, so the lift must return it in (lsn_end, id) order.
     let c = insert_ready(&mut *tx, &stream_file(epoch, "orders", "0/30"))
@@ -126,10 +132,12 @@ async fn export_complete_and_terminal_states_lift_the_pause() {
     reload::claim_requested(&mut *tx, epoch, "sink-a", 60, 10)
         .await
         .unwrap();
-    assert!(claim_ready(&mut *tx, epoch, "public", "orders", 100)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        claim_ready(&mut *tx, epoch, "public", "orders", 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
     // export_complete lifts the pause — exactly then the loader MUST claim again to reach the
     // chunk files and trigger the rebuild (pausing through export_complete deadlocks, PR 6.7).
@@ -162,10 +170,12 @@ async fn export_complete_and_terminal_states_lift_the_pause() {
     reload::claim_requested(&mut *tx, epoch, "sink-a", 60, 10)
         .await
         .unwrap();
-    assert!(claim_ready(&mut *tx, epoch, "public", "customers", 100)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        claim_ready(&mut *tx, epoch, "public", "customers", 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     reload::fail(&mut tx, cust, "demo").await.unwrap();
     assert_eq!(
         ids(&claim_ready(&mut *tx, epoch, "public", "customers", 100)
@@ -182,7 +192,7 @@ async fn export_complete_and_terminal_states_lift_the_pause() {
 async fn resync_flavor_never_pauses() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let epoch = 920_003;
+    let epoch = EpochNo(920_003);
 
     let id = insert_ready(&mut *tx, &stream_file(epoch, "orders", "0/10"))
         .await

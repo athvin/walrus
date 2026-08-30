@@ -1,19 +1,23 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // bench (harness=false, not test-cfg)
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "bench (harness=false, not test-cfg)"
+)]
 //! PR 5.4 — criterion micro-benches for the Arrow batch-building hot path.
 //!
 //! Measures `BatchBuilder::append_row` across Tier-1 shapes (narrow/wide/text-heavy) and a Tier-2
-//! fan-out shape (interval + range + timetz), plus a whole-batch `finish()`. It also isolates the
-//! per-row `serde_json::to_string(meta)` cost that the design flags as a suspect: two identical
-//! micro-benches append the meta column, one serialising the `SinkMeta` per row and one appending a
-//! pre-serialised constant, so the JSON cost reads as a direct subtraction. No production code is
-//! touched — this is the baseline PR 5.7 optimises against.
+//! fan-out shape (interval + range + timetz), plus a whole-batch `into_record_batch()`. It also
+//! isolates the per-row `serde_json::to_string(meta)` cost that the design flags as a suspect: two
+//! identical micro-benches append the meta column, one serialising the `SinkMeta` per row and one
+//! appending a pre-serialised constant, so the JSON cost reads as a direct subtraction. No
+//! production code is touched — this is the baseline PR 5.7 optimises against.
 //!
 //! Run: `cargo bench -p pg-to-arrow --bench batch` (or `just bench`).
 
 use arrow::array::StringBuilder;
 use common::{Kind, Op, PgColumn, PgRelation, ReplicaIdentity, SinkMeta, TupleValue, UtcTimestamp};
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
-use pg_to_arrow::{oids, BatchBuilder};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use pg_to_arrow::{BatchBuilder, oids};
 use std::hint::black_box;
 
 /// Rows appended per measured iteration (throughput reads as rows/s).
@@ -24,17 +28,17 @@ fn meta() -> SinkMeta {
         op: Op::Insert,
         lsn: "0/10".parse().unwrap(),
         commit_lsn: "0/20".parse().unwrap(),
-        commit_ts: UtcTimestamp::parse_rfc3339("2026-07-04T12:00:00Z").unwrap(),
+        commit_ts: "2026-07-04T12:00:00Z".parse::<UtcTimestamp>().unwrap(),
         xid: 1,
-        epoch: 7,
+        epoch: common::EpochNo(7),
         batch_id: "3f2a0000-0000-0000-0000-000000000001".to_string(),
-        schema_version: 1,
+        schema_version: common::SchemaVersionNo(1),
         source_schema: "public".to_string(),
         source_table: "orders".to_string(),
         kind: Kind::Stream,
-        unchanged_toast: vec![],
+        unchanged_toast: Box::default(),
         sink_instance: "walrus-pg-sink-0".to_string(),
-        sink_processed_at: UtcTimestamp::parse_rfc3339("2026-07-04T12:00:00.123Z").unwrap(),
+        sink_processed_at: "2026-07-04T12:00:00.123Z".parse::<UtcTimestamp>().unwrap(),
     }
 }
 
@@ -47,7 +51,7 @@ enum Shape {
 }
 
 impl Shape {
-    fn name(self) -> &'static str {
+    const fn name(self) -> &'static str {
         match self {
             Shape::NarrowInt4 => "narrow_int4",
             Shape::Wide30 => "wide30",
@@ -127,6 +131,10 @@ const SHAPES: [Shape; 4] = [
     Shape::Tier2Fanout,
 ];
 
+/// Per-row `append_row` cost. Both operands are `black_box`ed *inside* the loop: they are captured
+/// loop-invariants (criterion only guards `setup()` output and the closure's return), and under the
+/// bench profile's thin LTO the optimiser could otherwise hoist the per-row text parse and meta
+/// serialisation out and measure `ROWS` copies of a single result.
 fn bench_append_row(c: &mut Criterion) {
     let m = meta();
     let mut g = c.benchmark_group("arrow/append_row");
@@ -139,7 +147,7 @@ fn bench_append_row(c: &mut Criterion) {
                 || BatchBuilder::new(&rel).unwrap(),
                 |mut bb| {
                     for _ in 0..ROWS {
-                        bb.append_row(&row, &m).unwrap();
+                        bb.append_row(black_box(&row), black_box(&m)).unwrap();
                     }
                     black_box(bb.len());
                 },
@@ -150,7 +158,8 @@ fn bench_append_row(c: &mut Criterion) {
     g.finish();
 }
 
-/// The whole-batch cost: append `ROWS` rows (setup, untimed) then `finish()` → RecordBatch (timed).
+/// The whole-batch cost: append `ROWS` rows (setup, untimed) then `into_record_batch()` →
+/// RecordBatch (timed).
 fn bench_finish(c: &mut Criterion) {
     let m = meta();
     let mut g = c.benchmark_group("arrow/finish");
@@ -167,7 +176,7 @@ fn bench_finish(c: &mut Criterion) {
                     }
                     bb
                 },
-                |bb| black_box(bb.finish().unwrap()),
+                |bb| black_box(bb.into_record_batch().unwrap()),
                 BatchSize::SmallInput,
             );
         });

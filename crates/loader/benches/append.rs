@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // bench (harness=false, not test-cfg)
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "bench (harness=false, not test-cfg)"
+)]
 //! PR 5.5 — criterion micro-benches for the loader's Phase-A append (`TableDb::append_parquet`).
 //!
 //! Generates a local Parquet fixture with the sink's own Arrow→Parquet writer, then benches
@@ -9,14 +13,14 @@
 //! Run: `cargo bench -p loader --bench append` (or `just bench`).
 
 use common::{
-    Kind, Lsn, Op, PgColumn, PgRelation, ReplicaIdentity, SinkMeta, TupleValue, UtcTimestamp,
+    EpochNo, Kind, Lsn, Op, PgColumn, PgRelation, ReplicaIdentity, SinkMeta, TupleValue,
+    UtcTimestamp,
 };
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use loader::duck::TableDb;
-use pg_to_arrow::{write_parquet_bytes, BatchBuilder};
+use pg_to_arrow::{BatchBuilder, write_parquet_bytes};
 use std::hint::black_box;
 use std::io::Write;
-use std::path::Path;
 
 const ROWS: usize = 50_000;
 
@@ -64,7 +68,7 @@ fn row_values(rel: &PgRelation, i: usize) -> Vec<TupleValue> {
         .map(|c| {
             let v = match c.type_oid {
                 23 if c.is_key => i.to_string(),
-                23 => (i as i64 * 2).to_string(),
+                23 => (i64::try_from(i).unwrap() * 2).to_string(),
                 _ => format!("{}_{i}", c.name),
             };
             TupleValue::Text(v)
@@ -76,19 +80,19 @@ fn row_values(rel: &PgRelation, i: usize) -> Vec<TupleValue> {
 fn meta(i: usize) -> SinkMeta {
     SinkMeta {
         op: Op::Insert,
-        lsn: Lsn::new(i as u64 + 1),
-        commit_lsn: Lsn::new(i as u64 + 1),
-        commit_ts: UtcTimestamp::parse_rfc3339("2026-07-04T12:00:00Z").unwrap(),
+        lsn: Lsn::new(u64::try_from(i).unwrap() + 1),
+        commit_lsn: Lsn::new(u64::try_from(i).unwrap() + 1),
+        commit_ts: "2026-07-04T12:00:00Z".parse::<UtcTimestamp>().unwrap(),
         xid: 1,
-        epoch: 7,
+        epoch: EpochNo(7),
         batch_id: "3f2a0000-0000-0000-0000-000000000001".to_string(),
-        schema_version: 1,
+        schema_version: common::SchemaVersionNo(1),
         source_schema: "public".to_string(),
         source_table: "orders".to_string(),
         kind: Kind::Stream,
-        unchanged_toast: vec![],
+        unchanged_toast: Box::default(),
         sink_instance: "walrus-pg-sink-0".to_string(),
-        sink_processed_at: UtcTimestamp::parse_rfc3339("2026-07-04T12:00:00.123Z").unwrap(),
+        sink_processed_at: "2026-07-04T12:00:00.123Z".parse::<UtcTimestamp>().unwrap(),
     }
 }
 
@@ -98,7 +102,7 @@ fn gen_parquet(rel: &PgRelation) -> tempfile::NamedTempFile {
     for i in 0..ROWS {
         bb.append_row(&row_values(rel, i), &meta(i)).unwrap();
     }
-    let bytes = write_parquet_bytes(&bb.finish().unwrap()).unwrap();
+    let bytes = write_parquet_bytes(&bb.into_record_batch().unwrap()).unwrap();
     let mut f = tempfile::Builder::new()
         .suffix(".parquet")
         .tempfile()
@@ -117,11 +121,16 @@ fn bench_append(c: &mut Criterion) {
         g.bench_with_input(BenchmarkId::from_parameter(name), &rel, |b, rel| {
             b.iter_batched(
                 || {
-                    let db = TableDb::open(Path::new(":memory:")).unwrap();
-                    db.ensure_tables(rel, 1).unwrap();
+                    let db = TableDb::open(":memory:").unwrap();
+                    db.ensure_tables(rel, common::SchemaVersionNo(1)).unwrap();
                     db
                 },
-                |db| black_box(db.append_parquet("orders", &uri, 1, None).unwrap()),
+                |db| {
+                    black_box(
+                        db.append_parquet("orders", &uri, common::SchemaVersionNo(1), None)
+                            .unwrap(),
+                    )
+                },
                 BatchSize::PerIteration,
             );
         });
@@ -139,7 +148,7 @@ fn bench_describe(c: &mut Criterion) {
         let sql = format!("DESCRIBE SELECT * FROM read_parquet('{uri}')");
         g.bench_with_input(BenchmarkId::from_parameter(name), &sql, |b, sql| {
             b.iter_batched(
-                || TableDb::open(Path::new(":memory:")).unwrap(),
+                || TableDb::open(":memory:").unwrap(),
                 |db| {
                     let mut stmt = db.conn().prepare(sql).unwrap();
                     let cols: Vec<String> = stmt

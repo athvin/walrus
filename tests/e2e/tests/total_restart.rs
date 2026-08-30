@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! End-to-end total-restart (`architecture.md` "Slot loss / total-restart" + §1.8): when the single
 //! lifelong slot is **lost** on a successful connection, the sink bumps the epoch, opens a new slot with
 //! a fresh exported snapshot, and re-snapshots every table under the new generation; the loaders detect
@@ -83,7 +87,7 @@ async fn dropping_the_slot_triggers_epoch_bump_and_full_rebuild() {
 
     // Both watermarks reset then advanced under the NEW epoch — the epoch-2 checkpoint is a fresh row that
     // has moved off `0/0` (its predecessor was epoch 1, untouched).
-    let cp = control::read_checkpoint(h.control_pool(), 2, "public", "orders")
+    let cp = control::read_checkpoint(h.control_pool(), 2_i64.into(), "public", "orders")
         .await
         .unwrap()
         .expect("epoch-2 checkpoint exists");

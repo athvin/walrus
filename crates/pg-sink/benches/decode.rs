@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // bench (harness=false, not test-cfg)
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "bench (harness=false, not test-cfg)"
+)]
 //! PR 5.4 — criterion micro-benches for the pgoutput decoder hot path.
 //!
 //! We synthesize *valid* pgoutput byte streams programmatically (the same message layouts the golden
@@ -10,8 +14,8 @@
 //!
 //! Run: `cargo bench -p pg-sink --bench decode` (or `just bench`).
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use pg_sink::pgoutput::{parse_stream, parse_tuple, Reader, StreamCtx};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use pg_sink::pgoutput::{Reader, StreamCtx, parse_stream, parse_tuple};
 use std::hint::black_box;
 
 const ROWS: usize = 10_000;
@@ -45,7 +49,7 @@ enum TableShape {
 }
 
 impl TableShape {
-    fn name(self) -> &'static str {
+    const fn name(self) -> &'static str {
         match self {
             TableShape::NarrowInt4 => "narrow_int4",
             TableShape::Wide30 => "wide30",
@@ -102,7 +106,7 @@ fn relation(out: &mut Vec<u8>, oid: u32, cols: &[(String, u32)], streaming: bool
     cstr(out, "public");
     cstr(out, "bench_tbl");
     out.push(b'd'); // replica identity DEFAULT
-    be16(out, cols.len() as u16);
+    be16(out, u16::try_from(cols.len()).unwrap());
     for (name, coid) in cols {
         out.push(0); // flags (not a key column)
         cstr(out, name);
@@ -118,10 +122,10 @@ fn insert(out: &mut Vec<u8>, oid: u32, values: &[String], streaming: bool, xid: 
     }
     be32(out, oid);
     out.push(b'N'); // new-tuple marker
-    be16(out, values.len() as u16);
+    be16(out, u16::try_from(values.len()).unwrap());
     for v in values {
         out.push(b't'); // text value
-        be32(out, v.len() as u32);
+        be32(out, u32::try_from(v.len()).unwrap());
         out.extend_from_slice(v.as_bytes());
     }
 }
@@ -163,10 +167,10 @@ fn synth_streamed(shape: TableShape, rows: usize) -> Vec<u8> {
 fn synth_tuple(shape: TableShape) -> Vec<u8> {
     let values = shape.row_values();
     let mut out = Vec::new();
-    be16(&mut out, values.len() as u16);
+    be16(&mut out, u16::try_from(values.len()).unwrap());
     for v in &values {
         out.push(b't');
-        be32(&mut out, v.len() as u32);
+        be32(&mut out, u32::try_from(v.len()).unwrap());
         out.extend_from_slice(v.as_bytes());
     }
     out

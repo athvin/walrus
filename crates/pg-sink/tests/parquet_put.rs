@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Arrow → Parquet → S3 PUT against compose MinIO (`#[ignore]`). A flush lands an object at the
 //! epoch-namespaced key; it reads back with MICROS temporals + values intact. (DuckDB's *type
 //! inference* over this exact Parquet is proven by pg-to-arrow's conformance suite; here we verify
@@ -9,12 +14,12 @@
 use arrow::array::{Array, StringArray};
 use arrow::datatypes::{DataType, TimeUnit};
 use common::{Kind, Op, PgColumn, PgRelation, ReplicaIdentity, SinkMeta, TupleValue, UtcTimestamp};
-use object_store::aws::AmazonS3Builder;
 use object_store::ObjectStore;
+use object_store::aws::AmazonS3Builder;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use pg_sink::batch::SealedBatch;
 use pg_sink::sink::{FileKind, ParquetSink};
-use pg_to_arrow::{oids, BatchBuilder, SINK_META_COLUMN};
+use pg_to_arrow::{BatchBuilder, SINK_META_COLUMN, oids};
 use std::sync::Arc;
 
 fn minio_store() -> Arc<dyn ObjectStore> {
@@ -57,15 +62,15 @@ fn meta() -> SinkMeta {
         op: Op::Insert,
         lsn: "0/10".parse().unwrap(),
         commit_lsn: "0/20".parse().unwrap(),
-        commit_ts: UtcTimestamp::parse_rfc3339("2026-07-07T12:00:00Z").unwrap(),
+        commit_ts: "2026-07-07T12:00:00Z".parse::<UtcTimestamp>().unwrap(),
         xid: 1,
-        epoch: 7,
+        epoch: common::EpochNo(7),
         batch_id: "public.orders-0/10".to_string(),
-        schema_version: 1,
+        schema_version: common::SchemaVersionNo(1),
         source_schema: "public".to_string(),
         source_table: "orders".to_string(),
         kind: Kind::Stream,
-        unchanged_toast: vec![],
+        unchanged_toast: Box::default(),
         sink_instance: "walrus-pg-sink-0".to_string(),
         sink_processed_at: UtcTimestamp::now(),
     }
@@ -84,10 +89,10 @@ fn sealed(lsn_end: &str) -> SealedBatch {
     )
     .unwrap();
     SealedBatch {
-        record_batch: bb.finish().unwrap(),
+        record_batch: bb.into_record_batch().unwrap(),
         schema: "public".to_string(),
         table: "orders".to_string(),
-        schema_version: 1,
+        schema_version: common::SchemaVersionNo(1),
         lsn_start: "0/100".parse().unwrap(),
         lsn_end: lsn_end.parse().unwrap(),
         row_count: 1,
@@ -98,7 +103,7 @@ fn sealed(lsn_end: &str) -> SealedBatch {
 #[ignore = "requires docker compose up --wait (MinIO)"]
 async fn flush_writes_object_at_expected_key() {
     let store = minio_store();
-    let sink = ParquetSink::new(store.clone(), "walrus".to_string(), 7);
+    let sink = ParquetSink::new(Arc::clone(&store), "walrus", common::EpochNo(7));
     let written = sink.put(sealed("0/2A0")).await.unwrap();
 
     let lsn_end: common::Lsn = "0/2A0".parse().unwrap();
@@ -119,7 +124,7 @@ async fn flush_writes_object_at_expected_key() {
 #[ignore = "requires docker compose up --wait (MinIO)"]
 async fn object_reads_back_with_micros_temporals_and_values() {
     let store = minio_store();
-    let sink = ParquetSink::new(store.clone(), "walrus".to_string(), 7);
+    let sink = ParquetSink::new(Arc::clone(&store), "walrus", common::EpochNo(7));
     let written = sink.put(sealed("0/300")).await.unwrap();
 
     let bytes = store
@@ -135,7 +140,13 @@ async fn object_reads_back_with_micros_temporals_and_values() {
         .unwrap()
         .map(|r| r.unwrap())
         .collect();
-    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    assert_eq!(
+        batches
+            .iter()
+            .map(arrow::record_batch::RecordBatch::num_rows)
+            .sum::<usize>(),
+        1
+    );
 
     let schema = batches[0].schema();
     // §2.1: created_at survives as a MICROS timestamp carrying UTC (what DuckDB reads as tz-aware).
@@ -166,7 +177,7 @@ async fn object_reads_back_with_micros_temporals_and_values() {
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (grouped; pure)"]
 async fn key_is_epoch_namespaced_and_lsn_sortable() {
-    let sink = ParquetSink::new(minio_store(), "walrus".to_string(), 9);
+    let sink = ParquetSink::new(minio_store(), "walrus", common::EpochNo(9));
     let a = sink.object_key("public", "orders", "0/100".parse().unwrap(), "u1");
     let b = sink.object_key("public", "orders", "1/0".parse().unwrap(), "u2");
     assert!(a.as_ref().starts_with("9/public/orders/"));

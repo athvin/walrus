@@ -17,22 +17,34 @@ use std::path::Path;
 /// The two commit-LSN watermarks for one table.
 #[derive(Debug, Clone, Copy)]
 pub struct Checkpoints {
+    /// Phase A frontier — the `<table>_raw` CDC log is durable up to this commit LSN.
     pub raw_appended_lsn: Lsn,
+    /// Phase B frontier — the mirror is derived up to this commit LSN. Never ahead of the above.
     pub transformed_lsn: Lsn,
 }
 
 /// One table this loader instance owns after bootstrap.
+#[derive(Debug)]
 pub struct OwnedTable {
+    /// Source schema of the owned table.
     pub schema: String,
+    /// Source table name.
     pub table: String,
+    /// The table's shape at the version bootstrap resolved, used to render the transform SQL.
     pub relation: PgRelation,
+    /// The lease token held for this table — the first of the two fences, taken before the file.
     pub fencing_token: i64,
+    /// The open DuckDB handle. Holding it *is* the second fence: DuckDB's read-write file lock.
     pub db: TableDb,
+    /// Where the two phases had reached when bootstrap read them.
     pub checkpoints: Checkpoints,
 }
 
 impl OwnedTable {
-    pub fn key(&self) -> (String, String) {
+    /// The `(schema, table)` identity as an owned pair. Clones both names — hence `to_`; callers
+    /// that only need to read them can borrow the fields directly.
+    #[must_use]
+    pub fn to_key(&self) -> (String, String) {
         (self.schema.clone(), self.table.clone())
     }
 }
@@ -40,6 +52,19 @@ impl OwnedTable {
 /// Run the ordered bootstrap for the current epoch's registered tables. Returns the owned tables (with
 /// their open DuckDB connections and lease tokens). Any terminal step returns a classified
 /// [`LoaderError`] that `main` maps to an exit code.
+///
+/// # Errors
+///
+/// Returns [`LoaderError::Internal`] when no epoch exists, [`LoaderError::RegistryDecode`] for an
+/// invalid stored relation, [`LoaderError::LeaseContended`] for a live competing owner, or the
+/// classified [`LoaderError::Control`], [`LoaderError::Duck`], [`LoaderError::ObjectStore`], and
+/// [`LoaderError::CorruptCheckpoint`] variants from the ordered dependency and invariant checks.
+///
+/// `store` is `&dyn`, not `&impl ObjectStore`, deliberately: this is a once-per-process async fn
+/// whose whole use of the store is one `head` (step 5), so the vtable costs a single indirect call
+/// on a cold path — while a generic parameter would monomorphize this entire state machine per
+/// store type for nothing. Callers pass their concrete client (`app::build_store`'s `AmazonS3`) and
+/// the coercion happens here, at the boundary.
 pub async fn bootstrap(
     cfg: &LoaderConfig,
     pool: &sqlx::PgPool,
@@ -55,11 +80,16 @@ pub async fn bootstrap(
         .epoch;
 
     let registry = control::read_all_latest_registry(pool, epoch).await?;
-    let mut owned = Vec::new();
+    let mut owned = Vec::with_capacity(registry.len());
     for row in registry {
         let version = row.schema_version;
-        let rel: PgRelation = serde_json::from_value(row.columns)
-            .map_err(|e| LoaderError::Internal(format!("decode registry columns: {e}")))?;
+        let table = format!("{}.{}", row.source_schema, row.source_table);
+        let rel: PgRelation =
+            serde_json::from_value(row.columns).map_err(|source| LoaderError::RegistryDecode {
+                table,
+                version: version.0,
+                source,
+            })?;
 
         // (1) FIRST FENCE: the ownership lease — before we ever touch the file.
         let lease = lease::acquire(
@@ -97,24 +127,34 @@ pub async fn bootstrap(
                 .await?
                 .is_some();
         if pending_rebuild {
-            let cur = db.schema_version().unwrap_or(version);
-            let cur_plan = match control::read_registry(pool, epoch, &rel.schema, &rel.name, cur)
-                .await?
-            {
-                Some(r) => {
-                    let rel_cur: PgRelation = serde_json::from_value(r.columns).map_err(|e| {
-                        LoaderError::Internal(format!("decode registry columns: {e}"))
-                    })?;
-                    crate::plan::TablePlan::from_registry(&rel_cur, &r.descriptors)
-                }
-                None => crate::plan::TablePlan::from_registry(&rel, &row.descriptors),
-            };
+            // A brand-new `.duckdb` has no persisted version to hold at, so it falls back to the
+            // registry's. A *failed* read must not answer with that same fallback: it would send
+            // this branch to the exact reconcile target the branch exists to avoid, so the DuckDB
+            // error propagates and fails the bootstrap instead.
+            let cur = db.stored_schema_version()?.unwrap_or(version);
+            let cur_plan =
+                match control::read_registry(pool, epoch, &rel.schema, &rel.name, cur).await? {
+                    Some(r) => {
+                        let decode_table = format!("{}.{}", r.source_schema, r.source_table);
+                        let decode_version = r.schema_version;
+                        let rel_cur: PgRelation =
+                            serde_json::from_value(r.columns).map_err(|source| {
+                                LoaderError::RegistryDecode {
+                                    table: decode_table,
+                                    version: decode_version.0,
+                                    source,
+                                }
+                            })?;
+                        crate::plan::TablePlan::from_registry(&rel_cur, &r.descriptors)
+                    }
+                    None => crate::plan::TablePlan::from_registry(&rel, &row.descriptors),
+                };
             db.ensure_tables_planned(&cur_plan, cur)?;
             db.set_built_epoch(epoch)?;
             tracing::warn!(
                 table = %format_args!("{}.{}", rel.schema, rel.name),
-                current_version = cur,
-                registry_version = version,
+                current_version = %cur,
+                registry_version = %version,
                 "bootstrap: a rebuild reload is pending — skipping the forward reconcile (Phase A rebuilds this table)"
             );
         } else {
@@ -181,8 +221,9 @@ async fn verify_s3_read(store: &dyn ObjectStore) -> Result<(), LoaderError> {
     match store.head(&probe).await {
         Ok(_) => Ok(()),
         Err(object_store::Error::NotFound { .. }) => Ok(()),
-        Err(e) => Err(LoaderError::ObjectStore(format!(
-            "staging bucket not readable: {e}"
-        ))),
+        Err(source) => Err(LoaderError::ObjectStore {
+            op: "staging bucket not readable",
+            source: Box::new(source),
+        }),
     }
 }

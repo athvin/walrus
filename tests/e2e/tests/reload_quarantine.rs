@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! End-to-end: the anchor use case (reload §2) — a lossy `ALTER COLUMN TYPE` quarantine recovered
 //! via `just reload`, while the other tables stream on. The real sink+loader run; the lossy
 //! narrowing is INJECTED (a v2 int2 registry + a v2 manifest file, as `ddl_destructive.rs` does)
@@ -9,7 +14,7 @@
 //!
 //! Then: `reload` the table, restart the loader, and it recovers. Three PR 6.12 loader fixes make
 //! recovery possible: (1) a worker error cancels the shutdown token so a multi-table quarantine
-//! *exits* the loader instead of deadlocking (`main.rs`); (2) bootstrap SKIPS the forward reconcile
+//! *exits* the loader instead of deadlocking (`app.rs`); (2) bootstrap SKIPS the forward reconcile
 //! when a rebuild reload is pending, so the restart doesn't re-quarantine before Phase A runs
 //! (`bootstrap.rs`); (3) Phase A skips the superseded version-crossing blocker so the reload chunk's
 //! rebuild clears the quarantine (`phase_a.rs`). The other tables' `transformed_lsn` strictly
@@ -71,7 +76,7 @@ fn write_v2_file(epoch: i64, uri_key: &str) -> String {
 }
 
 async fn transformed(h: &Harness, table: &str) -> Lsn {
-    control::read_checkpoint(h.control_pool(), h.epoch, "public", table)
+    control::read_checkpoint(h.control_pool(), h.epoch.into(), "public", table)
         .await
         .unwrap()
         .map(|c| c.transformed_lsn)
@@ -117,11 +122,14 @@ async fn quarantined_table_recovers_via_reload_without_stalling_others() {
     }
 
     // A low-rate writer keeps rl1/rl2 advancing across the whole window (else their transformed_lsn
-    // legitimately sits still and the recovery assertion proves nothing).
+    // legitimately sits still and the recovery assertion proves nothing). It runs until `churn.abort()`
+    // below rather than for a fixed number of rounds: the freeze sample is taken when the loader
+    // *exits*, so a writer that stops earlier leaves the others with nothing new to apply after the
+    // restart, and the recovery assertion fails on a slow quarantine instead of on a real stall.
     let churn = {
         let src = h.source_pool().clone();
         tokio::spawn(async move {
-            for r in 0..60 {
+            for r in 0u32.. {
                 for t in OTHERS {
                     let _ = sqlx::query(&format!(
                         "UPDATE public.{t} SET status = 'c{r}' WHERE id = ((random()*199)::int + 1)"
@@ -143,10 +151,10 @@ async fn quarantined_table_recovers_via_reload_without_stalling_others() {
     control::upsert_registry(
         &pool,
         &control::RegistryRow {
-            epoch,
+            epoch: epoch.into(),
             source_schema: "public".into(),
             source_table: "q_target".into(),
-            schema_version: 2,
+            schema_version: common::SchemaVersionNo(2),
             descriptors: Vec::new(),
             columns: serde_json::to_value(q_target_rel(21)).unwrap(),
         },
@@ -157,7 +165,7 @@ async fn quarantined_table_recovers_via_reload_without_stalling_others() {
     control::insert_ready(
         &pool,
         &control::NewManifestFile {
-            epoch,
+            epoch: epoch.into(),
             source_schema: "public".into(),
             source_table: "q_target".into(),
             s3_uri: uri,
@@ -165,7 +173,7 @@ async fn quarantined_table_recovers_via_reload_without_stalling_others() {
             row_count: 1,
             lsn_start: "0/C8".parse().unwrap(),
             lsn_end: "0/C8".parse().unwrap(),
-            schema_version: 2,
+            schema_version: common::SchemaVersionNo(2),
             reload_id: None,
         },
     )
@@ -192,7 +200,7 @@ async fn quarantined_table_recovers_via_reload_without_stalling_others() {
         .unwrap();
     let reload_id = control::reload::request(
         &pool,
-        epoch,
+        epoch.into(),
         "public",
         "q_target",
         control::reload::ReloadFlavor::Reload,

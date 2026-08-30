@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Graceful SIGTERM drain against compose (`#[ignore]` — needs source PG + MinIO + control PG). A
 //! committed-but-unflushed batch, on drain, is flushed to S3 + manifested, `confirmed_flush_lsn`
 //! advances via a final standby update, `CopyDone` closes the connection, and the **slot is never
@@ -8,16 +13,16 @@
 //!
 //!   cargo test -p pg-sink --test graceful_shutdown -- --ignored
 
-use common::{Lsn, TupleValue};
-use object_store::path::Path;
+use common::{EpochNo, Lsn, TupleValue};
 use object_store::ObjectStore;
+use object_store::path::Path;
 use pg_sink::batch::{BatchTriggers, SystemClock};
 use pg_sink::checkpoint::DurabilityCheckpoint;
-use pg_sink::consume::{on_frame, BatchRouter};
+use pg_sink::consume::{BatchRouter, on_frame};
 use pg_sink::pgoutput::{Message, StreamCtx};
 use pg_sink::relcache::RelationCache;
 use pg_sink::replication::{ReplicationMessage, ReplicationStream};
-use pg_sink::shutdown::{drain, DrainOutcome};
+use pg_sink::shutdown::{DrainOutcome, drain};
 use pg_sink::sink::ParquetSink;
 use pg_sink::slot::verify_or_create_slot;
 use std::sync::Arc;
@@ -105,7 +110,7 @@ fn orders_id(new: &[TupleValue]) -> Option<i32> {
 async fn sigterm_mid_stream_drains_commits_and_resumes() {
     let _g = SOURCE_LOCK.lock().await;
     let slot = "walrus_drain";
-    let epoch = 2_280_001;
+    let epoch = EpochNo(2_280_001);
     let admin = source().await;
     admin.batch_execute(SOURCE_MIGRATION).await.unwrap();
     admin
@@ -118,19 +123,15 @@ async fn sigterm_mid_stream_drains_commits_and_resumes() {
     drop_slot(&admin, slot).await;
     let resume = verify_or_create_slot(&admin, slot).await.unwrap();
 
-    let mut stream =
-        ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
-            .await
-            .unwrap();
     let mut checkpoint = DurabilityCheckpoint::new(resume.start_lsn());
-    let sink = ParquetSink::new(minio(), "walrus".to_string(), epoch);
+    let sink = ParquetSink::new(minio(), "walrus", epoch);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     // Thresholds so high nothing auto-flushes: the batch is committed but stays in flight.
     let mut router = BatchRouter::new(
         BatchTriggers {
-            max_rows: u64::MAX,
-            max_bytes: u64::MAX,
+            max_rows: std::num::NonZeroU64::MAX,
+            max_bytes: std::num::NonZeroU64::MAX,
             max_fill: Duration::from_secs(3600),
         },
         Arc::new(SystemClock),
@@ -139,6 +140,15 @@ async fn sigterm_mid_stream_drains_commits_and_resumes() {
     );
     let mut cache = RelationCache::default();
     let mut ctx = StreamCtx::default();
+
+    // Open replication only after control-plane and sink setup. The compose
+    // source uses a five-second `wal_sender_timeout`; starting the stream
+    // before migrations/router construction can let an otherwise idle sender
+    // expire before this test begins consuming frames.
+    let mut stream =
+        ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
+            .await
+            .unwrap();
 
     // A single committed txn — flush-eligible only via drain (below every threshold).
     admin
@@ -163,10 +173,14 @@ async fn sigterm_mid_stream_drains_commits_and_resumes() {
                         if relation.name == "orders" {
                             orders_oid = Some(relation.oid);
                         }
-                        cache.upsert_from_relation(relation.clone(), 1).unwrap();
+                        cache
+                            .upsert_from_relation(relation.clone(), common::SchemaVersionNo(1))
+                            .unwrap();
                     }
                     other => {
-                        router.route(&cache, other, frame_lsn, 1).unwrap();
+                        router
+                            .route(&cache, other, frame_lsn, common::SchemaVersionNo(1))
+                            .unwrap();
                         // Stop once the insert has committed but is still un-durable.
                         if matches!(other, Message::Commit { .. })
                             && router.undurable_floor().is_some()
@@ -262,10 +276,10 @@ async fn sigterm_mid_stream_drains_commits_and_resumes() {
             if let Some(Message::Insert {
                 relation_oid, new, ..
             }) = on_frame(&mut ctx2, frame).unwrap()
+                && orders_oid == Some(relation_oid)
+                && orders_id(&new) == Some(980002)
             {
-                if orders_oid == Some(relation_oid) && orders_id(&new) == Some(980002) {
-                    return true;
-                }
+                return true;
             }
         }
     })

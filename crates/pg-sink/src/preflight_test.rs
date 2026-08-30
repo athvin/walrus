@@ -1,4 +1,6 @@
 use super::*;
+use common::FailureClass;
+use common::sql::IdentError;
 
 #[test]
 fn preflight_errors_map_to_exit_codes() {
@@ -32,6 +34,8 @@ fn preflight_errors_map_to_exit_codes() {
         PreflightError::ReloadSignalMissing {
             detail: "walrus.reload_signal table absent",
         },
+        PreflightError::UnusableResult("no rows for `SELECT 1`".into()),
+        PreflightError::Ident(IdentError::Empty),
     ] {
         let e: common::Error = pe.into();
         assert_eq!(e.exit_code(), common::ExitCode::Preflight);
@@ -40,10 +44,36 @@ fn preflight_errors_map_to_exit_codes() {
 }
 
 #[test]
-fn sql_quoting_escapes() {
-    assert_eq!(lit("wal_level"), "'wal_level'");
-    assert_eq!(lit("a'b"), "'a''b'");
-    assert_eq!(ident("walrus_pub"), "\"walrus_pub\"");
+fn quoting_doubles_delimiters_and_rejects_unusable_idents() {
+    assert_eq!("wal_level".to_quoted_literal(), "'wal_level'");
+    assert_eq!("a'b".to_quoted_literal(), "'a''b'");
+    assert_eq!(ident("walrus_pub").unwrap().to_string(), "\"walrus_pub\"");
+    assert_eq!(ident("a\"b").unwrap().to_string(), "\"a\"\"b\"");
+
+    // A rejected name never reached the server, so it is its own class — and the rule it broke
+    // stays typed in the chain rather than being re-read out of a message.
+    let empty = ident("").unwrap_err();
+    assert!(matches!(&empty, PreflightError::Ident(IdentError::Empty)));
+    let cause = std::error::Error::source(&empty).expect("ident keeps the rule it broke");
+    assert!(cause.to_string().contains("must not be empty"));
+    assert!(matches!(
+        ident("a\0b").unwrap_err(),
+        PreflightError::Ident(IdentError::InteriorNul(name)) if name == "a\0b"
+    ));
+}
+
+#[test]
+fn only_a_keyless_default_identity_is_unusable() {
+    // `DEFAULT` is the one identity whose usability depends on the PK; the other three answer on
+    // their own, so `has_pk` must not change their verdict.
+    assert!(identity_is_usable(ReplicaIdentity::Default, true));
+    assert!(!identity_is_usable(ReplicaIdentity::Default, false));
+
+    for has_pk in [true, false] {
+        assert!(identity_is_usable(ReplicaIdentity::Full, has_pk));
+        assert!(identity_is_usable(ReplicaIdentity::Index, has_pk));
+        assert!(!identity_is_usable(ReplicaIdentity::Nothing, has_pk));
+    }
 }
 
 #[test]
@@ -54,14 +84,17 @@ fn gap_and_signal_errors_name_their_remediation() {
         schema: "walrus".into(),
         table: "reload_signal".into(),
     };
-    assert!(gap
-        .to_string()
-        .contains("ALTER PUBLICATION walrus_pub ADD TABLE walrus.reload_signal"));
+    assert!(
+        gap.to_string()
+            .contains("ALTER PUBLICATION walrus_pub ADD TABLE walrus.reload_signal")
+    );
 
     let missing = PreflightError::ReloadSignalMissing {
         detail: "walrus.reload_signal table absent",
     };
-    assert!(missing
-        .to_string()
-        .contains("migrations/source/0003_reload_signal.sql"));
+    assert!(
+        missing
+            .to_string()
+            .contains("migrations/source/0003_reload_signal.sql")
+    );
 }

@@ -94,6 +94,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Seconds, no toolchain needed — fail before paying for the DuckDB build (PR 9.12).
+      - name: Lock-choice guard
+        run: bash scripts/check-lock-choice.sh
+
       # Reclaim disk for the bundled-DuckDB test build (composite action; must follow checkout).
       - uses: ./.github/actions/free-disk-space
 
@@ -112,17 +116,46 @@ jobs:
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
 
-      # Cheapest gate first: fail fast on formatting before spending time on clippy/test. There is no
-      # standalone `cargo build` step — `clippy --all-targets` type-checks every target and `test`
-      # builds + runs them, so a third dev-profile compile adds cost without new signal (PR 5.1).
-      - name: cargo fmt --check
-        run: cargo fmt --check
+      # Cheapest gates first: fail on sub-second repository invariants, then formatting, before
+      # spending time on clippy/test. There is no standalone `cargo build` step — `clippy
+      # --all-targets` type-checks every target and `test` builds + runs them, so a third dev-profile
+      # compile adds cost without new signal (PR 5.1).
+      # Repo invariant (PR 12.6): first-party Rust never constructs fake initialized memory.
+      # `scripts/**` is in the changes filter, so editing this guard reruns the job.
+      - name: Unsafe invariants (scripts/check-unsafe-invariants.sh)
+        run: bash scripts/check-unsafe-invariants.sh
+
+      # `--all` states the scope instead of leaving it to whatever package this step's directory
+      # resolves to: every workspace member, always. crates/common/tests/fmt_gate.rs is what fails
+      # if this step — or its `just fmt` mirror — ever stops gating.
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check
+
+      # Fragment-specifier guard (PR 24.3). The checker recognizes `$name:tt` captures after
+      # ignoring comments/string contents; bare prose `:tt` is not a finding. PR 24.6's deliberate
+      # compile_error! fallback is the only intended user of same-line `tt-fallback-ok`.
+      - name: guard — macro fragment specifiers (no untyped `:tt` capture)
+        run: bash scripts/check-macro-fragment-specifiers.sh --check
 
       - name: cargo clippy --all-targets --all-features -- -D warnings
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      # PR 15.4: production concurrency is Tokio task topology scoped by CancellationToken. Direct
+      # std::thread::available_parallelism queries and test/bench thread assertions remain allowed; creating an
+      # OS thread in non-test production requires the explicit ownership redesign recorded in the
+      # rationale: docs/implementation/notes/rust-skills/conc-scoped-threads.md.
+      - name: No OS threads in production sources
+        run: bash scripts/check-no-os-threads.sh
+
       - name: cargo test --workspace
         run: cargo test --workspace
+
+      # The ONLY build in which `common` is isolated with its optional `sqlx` feature off.
+      # Workspace feature unification turns it on through `control`, while `--all-features` does
+      # so directly. Package isolation is what exercises the off state; disabling defaults states
+      # the intent and preserves it if `common` gains default features later.
+      - name: common feature seam (sqlx off)
+        run: cargo check -p common --no-default-features --all-targets
 
       - name: sccache stats
         if: always()
@@ -508,6 +541,19 @@ jobs:
 
       - name: cargo deny check
         run: cargo deny check
+
+      # PR 24.7/24.8: walrus authors no proc-macros. Three workspace-shape invariants: no direct
+      # syn/quote/proc-macro2 dependency, no proc-macro member, and exactly six workspace packages.
+      - name: No proc-macro toolchain (direct deps · proc-macro crate · member count)
+        run: bash scripts/proc-macro-guard.sh --check
+
+      # PR 11.17: Phase 11 declined five allocator/container crates, the `perf-ahash` audit declined
+      # the three faster-hasher crates, and the `anti-premature-optimize` audit the four
+      # global-allocator swaps — each with an ADR under docs/implementation/notes/. This keeps them
+      # out of member manifests; transitive presence in Cargo.lock is fine and expected (ahash
+      # already arrives through arrow).
+      - name: No speculative allocator/container/hasher deps (declined-crate ADRs)
+        run: bash scripts/no-speculative-deps.sh
 
   # PR 4.7: MSRV drift guard. walrus pins one exact stable in rust-toolchain.toml and every job above
   # builds + tests on it, so CI already builds on the MSRV — this job's role is to fail fast if the

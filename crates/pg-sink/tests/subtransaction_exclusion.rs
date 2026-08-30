@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! The flagship correctness test (§1.6, proto §9b) against compose (`#[ignore]` — needs source PG with
 //! `logical_decoding_work_mem=64kB` + MinIO + control PG). A rolled-back **savepoint** inside an
 //! otherwise-committing streamed transaction is *still streamed*; only `Stream Abort {sub != top}` tells
@@ -9,7 +14,7 @@
 //!
 //!   cargo test -p pg-sink --test subtransaction_exclusion -- --ignored
 
-use common::Lsn;
+use common::{EpochNo, Lsn};
 use pg_sink::batch::{BatchTriggers, SystemClock};
 use pg_sink::consume::on_frame;
 use pg_sink::pgoutput::{Message, StreamCtx};
@@ -72,7 +77,7 @@ async fn drop_slot(admin: &tokio_postgres::Client, slot: &str) {
 async fn savepoint_rollback_ready_file_has_exactly_6000_rows() {
     let _g = SOURCE_LOCK.lock().await;
     let slot = "walrus_subtxn";
-    let epoch = 2_310_001;
+    let epoch = EpochNo(2_310_001);
     let admin = source().await;
     admin.batch_execute(SOURCE_MIGRATION).await.unwrap();
     admin
@@ -84,11 +89,7 @@ async fn savepoint_rollback_ready_file_has_exactly_6000_rows() {
         .unwrap();
     drop_slot(&admin, slot).await;
     let resume = verify_or_create_slot(&admin, slot).await.unwrap();
-    let mut stream =
-        ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
-            .await
-            .unwrap();
-    let sink = ParquetSink::new(minio(), "walrus".to_string(), epoch);
+    let sink = ParquetSink::new(minio(), "walrus", epoch);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     // Start clean: a prior failed run may have left ready rows for this epoch.
@@ -99,17 +100,24 @@ async fn savepoint_rollback_ready_file_has_exactly_6000_rows() {
         .unwrap();
     let mut demux = StreamDemux::new(
         BatchTriggers {
-            max_rows: 100_000,
-            max_bytes: u64::MAX,
+            max_rows: std::num::NonZeroU64::new(100_000).unwrap(),
+            max_bytes: std::num::NonZeroU64::MAX,
             max_fill: Duration::from_secs(3600),
         },
         Arc::new(SystemClock),
         epoch,
         "test".to_string(),
-        u64::MAX,
+        std::num::NonZeroU64::MAX,
     );
     let mut cache = RelationCache::default();
     let mut ctx = StreamCtx::default();
+
+    // Delay opening replication until setup is complete so the compose
+    // source's five-second `wal_sender_timeout` cannot expire an idle sender.
+    let mut stream =
+        ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
+            .await
+            .unwrap();
 
     // proto §9b: kept-A (3000, top branch) · rolled-back savepoint (3000, streamed then discarded) ·
     // kept-B (3000, new savepoint after the rollback). The whole thing exceeds work_mem → streams.
@@ -140,7 +148,9 @@ async fn savepoint_rollback_ready_file_has_exactly_6000_rows() {
             };
             match &msg {
                 Message::Relation { relation, .. } => {
-                    cache.upsert_from_relation(relation.clone(), 1).unwrap();
+                    cache
+                        .upsert_from_relation(relation.clone(), common::SchemaVersionNo(1))
+                        .unwrap();
                 }
                 Message::StreamStart { xid, first_segment } => {
                     demux.on_stream_start(*xid, *first_segment, frame_lsn);

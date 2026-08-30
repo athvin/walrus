@@ -1,10 +1,11 @@
 use super::*;
+use crate::FailureClass;
 
 /// A config that passes `validate()`, so a test can mutate exactly one field to prove the
 /// bound it targets.
 fn valid_config() -> CommonConfig {
     CommonConfig {
-        control_db_url: "postgres://localhost/walrus".to_string(),
+        control_db_url: "postgres://localhost/walrus".into(),
         object_store: ObjectStoreConfig {
             bucket: "walrus".to_string(),
             endpoint: None,
@@ -16,11 +17,38 @@ fn valid_config() -> CommonConfig {
     }
 }
 
+/// `#[serde(default)]` makes these the shipped values for omitted fields; changing one is a
+/// deliberate product configuration change, not a test-maintenance detail.
+#[test]
+fn defaults_are_the_shipped_contract() {
+    let cfg = CommonConfig::default();
+    assert_eq!(cfg.control_db_url.expose(), "");
+    assert_eq!(cfg.object_store.bucket, "");
+    assert_eq!(cfg.object_store.endpoint, None);
+    assert_eq!(cfg.object_store.region, "us-east-1");
+    assert!(!cfg.telemetry.json);
+    assert_eq!(cfg.telemetry.filter, "info");
+    assert_eq!(cfg.startup_deadline, Duration::from_secs(60));
+    assert_eq!(cfg.instance, "");
+
+    let object_store = ObjectStoreConfig::default();
+    assert_eq!(object_store.bucket, "");
+    assert_eq!(object_store.endpoint, None);
+    assert_eq!(object_store.region, "us-east-1");
+
+    let telemetry = TelemetryConfig::default();
+    assert!(!telemetry.json);
+    assert_eq!(telemetry.filter, "info");
+}
+
 /// Run `body` inside a hermetic `figment::Jail` (fresh temp CWD + scoped env), so config tests
 /// don't leak env across the shared test process. The one `#[allow]` lives here: `Jail`'s
 /// closure must return `Result<(), figment::Error>`, and that error type is large — a
 /// constraint of figment's API, not of our code.
-#[allow(clippy::result_large_err)]
+#[allow(
+    clippy::result_large_err,
+    reason = "figment Jail requires Result<(), figment::Error>, whose error variant is intentionally large"
+)]
 fn in_jail(body: impl FnOnce(&mut figment::Jail)) {
     figment::Jail::expect_with(|jail| {
         body(jail);
@@ -50,7 +78,7 @@ fn loads_from_env_over_file() {
         jail.set_env("WALRUS_OBJECT_STORE__BUCKET", "env-bucket");
 
         let cfg = CommonConfig::load().expect("valid config should load");
-        assert_eq!(cfg.control_db_url, "postgres://env/db"); // env wins
+        assert_eq!(cfg.control_db_url.expose(), "postgres://env/db"); // env wins
         assert_eq!(cfg.object_store.bucket, "env-bucket"); // env wins (nested, deep-merged)
         assert_eq!(cfg.object_store.region, "eu-west-1"); // untouched → from file
         assert_eq!(cfg.instance, "from-file"); // from file
@@ -69,6 +97,51 @@ fn humantime_durations_parse() {
         let cfg = CommonConfig::load().expect("valid config should load");
         assert_eq!(cfg.startup_deadline, Duration::from_millis(250));
     });
+}
+
+/// Serde-deserialized duration knobs, counted in both shapes `humantime_serde` supports. A needle
+/// spelled only `": Duration,"` would miss an `Option<Duration>` knob entirely — it would be neither
+/// counted as a field nor caught by the field-count assertion, so an optional timeout could skip its
+/// attribute in silence.
+fn duration_fields(src: &str) -> usize {
+    src.matches(": Duration,").count() + src.matches(": Option<Duration>,").count()
+}
+
+/// `#[serde(with = "humantime_serde")]` occurrences, matched as the attribute rather than the bare
+/// crate name so prose naming the crate cannot pad the count over a missing attribute. Whitespace
+/// is stripped first, so the attribute counts the same however rustfmt wraps it.
+fn humantime_attributes(src: &str) -> usize {
+    let compact: String = src.chars().filter(|ch| !ch.is_whitespace()).collect();
+    compact.matches(r#"with="humantime_serde""#).count()
+}
+
+#[test]
+fn every_duration_field_carries_humantime() {
+    const SRC: &str = include_str!("config.rs");
+    let fields = duration_fields(SRC);
+    assert_eq!(fields, 1, "CommonConfig Duration field count changed");
+    assert_eq!(
+        humantime_attributes(SRC),
+        fields,
+        "every Duration field needs humantime serde"
+    );
+}
+
+/// The guard must see both duration shapes and must not accept a mention for an attribute.
+#[test]
+fn the_humantime_guard_bites_on_both_duration_shapes() {
+    for fixture in [
+        "struct C { missing: Duration, }",
+        "struct C { missing: Option<Duration>, }",
+        "/// Parsed by humantime_serde.\n    missing: Duration,",
+    ] {
+        assert_eq!(duration_fields(fixture), 1, "{fixture}");
+        assert_eq!(humantime_attributes(fixture), 0, "{fixture}");
+    }
+
+    let attributed = "#[serde(with = \"humantime_serde\")]\n    present: Option<Duration>,";
+    assert_eq!(duration_fields(attributed), 1);
+    assert_eq!(humantime_attributes(attributed), 1);
 }
 
 #[test]
@@ -90,9 +163,25 @@ fn unknown_key_is_rejected() {
 #[test]
 fn empty_control_db_url_is_config_error() {
     let mut cfg = valid_config();
-    cfg.control_db_url = String::new();
+    cfg.control_db_url = Redacted::default();
     let err = cfg.validate().unwrap_err();
     assert!(matches!(err, Error::Config(_)) && err.is_terminal());
+}
+
+/// The DSN carries its password inline and `CommonConfig` derives `Debug`, so a single `?cfg`
+/// anywhere would put the control-plane credential in the log aggregator. Wrapping the field is
+/// what makes that impossible; this pins it against a future unwrapping.
+#[test]
+fn debug_does_not_render_the_control_dsn() {
+    let cfg = CommonConfig {
+        control_db_url: "postgres://walrus:hunter2@control-pg/walrus".into(),
+        ..valid_config()
+    };
+
+    let rendered = format!("{cfg:?}");
+
+    assert!(!rendered.contains("hunter2"), "{rendered}");
+    assert!(rendered.contains(crate::REDACTED), "{rendered}");
 }
 
 #[test]

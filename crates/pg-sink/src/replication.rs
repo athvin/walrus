@@ -7,25 +7,33 @@
 //! prescribes: a Startup handshake, `START_REPLICATION`, then the CopyBoth byte stream (`'w'`
 //! XLogData / `'k'` primary keepalive), replying with `'r'` standby-status updates. The dev harness
 //! uses `trust` auth so the handshake carries no SCRAM (SCRAM would be added here if a
-//! password-authed source were required). The `ReplicationStream` / `ReplicationMessage` /
-//! `StandbyStatus` seam is unchanged for callers, so PR 2.21's decoder plugs in regardless.
+//! password-authed source were required). The [`ReplicationStream`] / [`ReplicationMessage`] /
+//! [`StandbyStatus`] seam is unchanged for callers, so PR 2.21's decoder plugs in regardless.
 //!
 //! **Two LSNs, kept apart (§1.9):** the *received* LSN (sent as `write` to stay connected) advances
 //! here on every frame; `flush`/`apply` (= `confirmed_flush_lsn`, which releases source WAL) only
 //! advance on durability — PR 2.26 — so we hold them at the durable baseline. Keepalive feedback is
 //! **unconditional**: it goes out well under `wal_sender_timeout`, never gated on S3 durability, or
 //! the walsender severs us with a reconnect storm.
+//!
+//! **The connection's two states are two types.** A `replication=database` connection that has only
+//! completed the startup handshake is *not* in CopyBoth: reading a frame or writing a `'r'`
+//! standby-status there is a wire-protocol violation, and the walsender's reply would be decoded as
+//! garbage rather than rejected. So [`ReplicationStream`] carries which state it is in
+//! ([`Idle`] vs [`Streaming`]) as a type parameter, and the only way to reach the streaming API is
+//! [`ReplicationStream::into_streaming`], which consumes the idle connection and is the Rust half of
+//! `START_REPLICATION`'s `CopyBothResponse`. "Forgot to `START_REPLICATION`" is a compile error, not
+//! a torn stream.
 
-use anyhow::{anyhow, bail, Context};
+use crate::config::SlotName;
+use anyhow::{Context, anyhow, bail};
 use bytes::{Bytes, BytesMut};
-use common::Lsn;
+use common::{Lsn, PG_EPOCH_UNIX_MICROS};
+use std::marker::PhantomData;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::Instant;
-
-/// Postgres' epoch (2000-01-01) as seconds after the Unix epoch.
-const PG_EPOCH_UNIX_SECS: i64 = 946_684_800;
 
 /// Default feedback cadence: well under any sane `wal_sender_timeout` (the dev harness uses 5s).
 const DEFAULT_FEEDBACK_INTERVAL: Duration = Duration::from_secs(1);
@@ -53,14 +61,44 @@ pub enum ReplicationMessage {
 /// (the received LSN); durability (PR 2.26) is the only thing that advances `flush`/`apply`.
 #[derive(Clone, Copy, Debug)]
 pub struct StandbyStatus {
+    /// Highest LSN received. Moved by the keepalive path, and it does **not** free WAL.
     pub write: Lsn,
+    /// Highest LSN made durable. This is what lets the source discard WAL, so only a completed
+    /// durability step may advance it.
     pub flush: Lsn,
+    /// Highest LSN applied. walrus keeps it equal to `flush`; it has no separate apply stage.
     pub apply: Lsn,
+    /// Ask the server to reply immediately rather than at its own cadence — set when the server
+    /// demanded a reply, or when a prompt answer keeps the connection from timing out.
     pub reply_requested: bool,
 }
 
-/// A live `START_REPLICATION` CopyBoth stream over a hand-rolled connection.
-pub struct ReplicationStream {
+/// State marker: the startup handshake is done but no `START_REPLICATION` has been issued, so the
+/// connection is in the simple-query state, not CopyBoth.
+#[derive(Debug, Clone, Copy)]
+pub struct Idle;
+
+/// State marker: `START_REPLICATION` returned `CopyBothResponse`, so CopyBoth frames may flow.
+#[derive(Debug, Clone, Copy)]
+pub struct Streaming;
+
+/// A hand-rolled replication connection, typed by which protocol state it is in. [`Streaming`] is the
+/// default because every consumer of this module ([`crate::consume`], [`crate::shutdown`],
+/// [`crate::checkpoint`]) only ever holds a live CopyBoth stream; the [`Idle`] form exists for the
+/// snapshot-export handoff (PR 2.29) and exposes nothing that would tear the wire.
+///
+/// Frames cannot be read before `START_REPLICATION`:
+///
+/// ```compile_fail
+/// # use pg_sink::replication::{Idle, ReplicationStream};
+/// # async fn demo(dsn: &str) -> anyhow::Result<()> {
+/// let mut conn = ReplicationStream::<Idle>::connect(dsn).await?;
+/// let _frame = conn.next().await?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug)]
+pub struct ReplicationStream<S = Streaming> {
     stream: TcpStream,
     rbuf: BytesMut,
     /// The highest LSN we've received (sent as `write` in feedback).
@@ -71,27 +109,21 @@ pub struct ReplicationStream {
     feedback_interval: Duration,
     /// When the next unconditional feedback is due.
     feedback_deadline: Instant,
+    /// Which protocol state the connection is in. Stores nothing — the compiler reads it, the wire
+    /// never does.
+    _state: PhantomData<S>,
 }
 
-impl ReplicationStream {
-    /// Connect, hand-shake, and issue `START_REPLICATION SLOT … LOGICAL <lsn> (proto_version '2',
-    /// streaming 'on', publication_names '<publication>')`. `dsn` is parsed for host/port/user/db
-    /// (its auth is `trust` in the dev harness).
-    pub async fn start(
-        dsn: &str,
-        slot: &str,
-        start_lsn: Lsn,
-        publication: &str,
-    ) -> anyhow::Result<Self> {
-        let mut this = Self::connect(dsn).await?;
-        this.start_streaming(slot, start_lsn, publication).await?;
-        Ok(this)
-    }
-
+impl ReplicationStream<Idle> {
     /// Open a `replication=database` connection and complete the startup handshake **without** yet
     /// issuing `START_REPLICATION` — the idle state a snapshot export needs (PR 2.29). The caller then
     /// either [`create_replication_slot_export`](Self::create_replication_slot_export) or
-    /// [`start_streaming`](Self::start_streaming).
+    /// [`into_streaming`](Self::into_streaming).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if the DSN is invalid, the TCP connection fails, or the replication
+    /// startup handshake is rejected or malformed.
     pub async fn connect(dsn: &str) -> anyhow::Result<Self> {
         let (host, port, user, database) = parse_dsn(dsn)?;
         let stream = TcpStream::connect((host.as_str(), port))
@@ -104,23 +136,44 @@ impl ReplicationStream {
             durable: Lsn::ZERO,
             feedback_interval: DEFAULT_FEEDBACK_INTERVAL,
             feedback_deadline: Instant::now() + DEFAULT_FEEDBACK_INTERVAL,
+            _state: PhantomData,
         };
         this.startup(&user, &database).await?;
         Ok(this)
     }
 
-    /// Issue `START_REPLICATION` from `start_lsn`, seeding the received/durable baselines. On its own
-    /// (after [`connect`](Self::connect)) this is the snapshot handoff: stream from `consistent_point`.
-    pub async fn start_streaming(
-        &mut self,
+    /// Issue `START_REPLICATION` from `start_lsn`, seeding the received/durable baselines, and hand
+    /// back the streaming half of the connection. On its own (after [`connect`](Self::connect)) this
+    /// is the snapshot handoff: stream from `consistent_point`.
+    ///
+    /// `into_`, not `start_`: the idle connection is **spent** here. Only one of the two states may
+    /// exist at a time, so the idle handle cannot linger and issue a second simple query into what is
+    /// now a CopyBoth stream. A failed transition drops the connection rather than leaving a
+    /// half-started one behind.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if PostgreSQL rejects the replication command or the CopyBoth
+    /// response cannot be written, read, or decoded.
+    pub async fn into_streaming(
+        mut self,
         slot: &str,
         start_lsn: Lsn,
         publication: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<ReplicationStream<Streaming>> {
         self.last_received = start_lsn;
         self.durable = start_lsn;
         self.feedback_deadline = Instant::now() + self.feedback_interval;
-        self.begin_replication(slot, start_lsn, publication).await
+        self.begin_replication(slot, start_lsn, publication).await?;
+        Ok(ReplicationStream {
+            stream: self.stream,
+            rbuf: self.rbuf,
+            last_received: self.last_received,
+            durable: self.durable,
+            feedback_interval: self.feedback_interval,
+            feedback_deadline: self.feedback_deadline,
+            _state: PhantomData,
+        })
     }
 
     /// `CREATE_REPLICATION_SLOT <slot> LOGICAL pgoutput (SNAPSHOT 'export')` (PR 2.29). Returns
@@ -129,9 +182,18 @@ impl ReplicationStream {
     /// command on it (e.g. `START_REPLICATION`) ends the snapshot. Unlike
     /// `pg_create_logical_replication_slot()` (the SQL helper), the replication command is the *only*
     /// way to export a `snapshot_name`.
+    ///
+    /// The name is interpolated **unquoted** into the command, so this takes a parsed [`SlotName`]
+    /// rather than a bare `&str`: the parameter *is* the proof that the text is one Postgres accepts,
+    /// checked once at the config edge instead of hoped for here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] for socket/protocol failures, a PostgreSQL error response, a missing
+    /// result column, or an invalid `consistent_point` LSN.
     pub async fn create_replication_slot_export(
         &mut self,
-        slot: &str,
+        slot: &SlotName,
     ) -> anyhow::Result<(Lsn, String)> {
         // `NOEXPORT_SNAPSHOT`/`USE_SNAPSHOT` are the alternatives; `EXPORT` is what backfill needs.
         let sql = format!("CREATE_REPLICATION_SLOT {slot} LOGICAL pgoutput (SNAPSHOT 'export')");
@@ -148,7 +210,7 @@ impl ReplicationStream {
                 b'E' => bail!("CREATE_REPLICATION_SLOT failed: {}", error_message(&body)),
                 other => bail!(
                     "unexpected reply '{}' to CREATE_REPLICATION_SLOT",
-                    other as char
+                    char::from(other)
                 ),
             }
         }
@@ -162,10 +224,34 @@ impl ReplicationStream {
             .get(2)
             .and_then(Clone::clone)
             .context("CREATE_REPLICATION_SLOT row missing snapshot_name")?;
+        // Context, not `anyhow!("…: {e:?}")`: the typed `LsnParseError` already prints the offending
+        // text, and keeping it as the cause leaves it in `{:#}` and reachable by `downcast_ref`.
         let consistent_point: Lsn = consistent
             .parse()
-            .map_err(|e| anyhow!("parse consistent_point {consistent:?}: {e:?}"))?;
+            .context("parse the slot's consistent_point as a Postgres LSN")?;
         Ok((consistent_point, snapshot_name))
+    }
+}
+
+impl ReplicationStream<Streaming> {
+    /// Connect, hand-shake, and issue `START_REPLICATION SLOT … LOGICAL <lsn> (proto_version '2',
+    /// streaming 'on', publication_names '<publication>')` — the resume path, which needs no exported
+    /// snapshot. `dsn` is parsed for host/port/user/db (its auth is `trust` in the dev harness).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if the DSN is invalid, TCP/startup negotiation fails, or PostgreSQL
+    /// rejects `START_REPLICATION`.
+    pub async fn start(
+        dsn: &str,
+        slot: &str,
+        start_lsn: Lsn,
+        publication: &str,
+    ) -> anyhow::Result<Self> {
+        ReplicationStream::<Idle>::connect(dsn)
+            .await?
+            .into_streaming(slot, start_lsn, publication)
+            .await
     }
 
     /// Override the unconditional-feedback cadence (must stay under the source's `wal_sender_timeout`).
@@ -178,6 +264,12 @@ impl ReplicationStream {
     /// Time remaining until the next unconditional feedback is due. The flush path (PR 2.26) races this
     /// against a slow S3 PUT so keepalive keeps flowing while the read loop is busy — a stalled flush
     /// must never starve the walsender past `wal_sender_timeout` (§1.9). Saturates to zero when overdue.
+    ///
+    /// This read and the two watermark reads below compute a value and touch no wire state, so each
+    /// carries `#[must_use]` explicitly. `clippy::must_use_candidate` reaches none of them: the
+    /// [`TcpStream`] inside `&self` reads to that lint as a mutable — therefore side-effecting —
+    /// argument, which is why this module has no lint-driven annotation to inherit.
+    #[must_use]
     pub fn feedback_budget(&self) -> Duration {
         self.feedback_deadline
             .saturating_duration_since(Instant::now())
@@ -185,45 +277,72 @@ impl ReplicationStream {
 
     /// Read one frame. Sends unconditional feedback whenever the interval elapses (so an idle stream
     /// stays alive), and answers a `reply_requested` keepalive immediately. `None` on stream end.
+    ///
+    /// ## Cancel safety
+    ///
+    /// **Not cancel-safe.** Buffered reads retain partial bytes in `self.rbuf`, but this operation
+    /// also calls [`Self::send_received_feedback`], whose direct socket write can be left as a
+    /// partial standby-status frame if the future is dropped. Callers must pin one `next()` future
+    /// and poll it by mutable reference across sibling `select!` branches.
+    ///
+    /// The remaining drop point is decode-loop cancellation. If it tears a frame, the connection
+    /// may remain unrecoverable until disconnect/reconnect: after flushing committed data, the drain
+    /// attempts a standby-status frame and `CopyDone`, but those writes are best-effort and cannot
+    /// repair framing. Fully eliminating the residual requires resumable outbound staging in a
+    /// `wbuf` field mirroring `rbuf`, which is deferred.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if reading or parsing a backend frame fails, PostgreSQL reports an
+    /// error, an unexpected CopyBoth message arrives, or periodic feedback cannot be sent.
     pub async fn next(&mut self) -> anyhow::Result<Option<ReplicationMessage>> {
         loop {
             let budget = self
                 .feedback_deadline
                 .saturating_duration_since(Instant::now());
-            match tokio::time::timeout(budget, self.read_message()).await {
+            let Ok(frame) = tokio::time::timeout(budget, self.read_message()).await else {
                 // Feedback due — send it (received LSN as write) and keep waiting.
-                Err(_elapsed) => {
-                    self.send_received_feedback(false).await?;
-                }
-                Ok(Err(e)) => return Err(e),
-                Ok(Ok((tag, body))) => match tag {
-                    b'd' => {
-                        if let Some(msg) = self.handle_copy_data(body).await? {
-                            return Ok(Some(msg));
-                        }
+                self.send_received_feedback(false).await?;
+                continue;
+            };
+            let (tag, body) = frame?;
+            match tag {
+                b'd' => {
+                    if let Some(msg) = self.handle_copy_data(body).await? {
+                        return Ok(Some(msg));
                     }
-                    // CopyDone / ReadyForQuery — the stream ended.
-                    b'c' | b'Z' => return Ok(None),
-                    // CommandComplete / NoticeResponse / ParameterStatus — keep going.
-                    b'C' | b'N' | b'S' => {}
-                    b'E' => bail!("replication stream error: {}", error_message(&body)),
-                    other => bail!(
-                        "unexpected message '{}' on the CopyBoth stream",
-                        other as char
-                    ),
-                },
+                }
+                // CopyDone / ReadyForQuery — the stream ended.
+                b'c' | b'Z' => return Ok(None),
+                // CommandComplete / NoticeResponse / ParameterStatus — keep going.
+                b'C' | b'N' | b'S' => {}
+                b'E' => bail!("replication stream error: {}", error_message(&body)),
+                other => bail!(
+                    "unexpected message '{}' on the CopyBoth stream",
+                    char::from(other)
+                ),
             }
         }
     }
 
     /// Send an `'r'` standby status update. Callers (PR 2.26) use this to advance `flush`/`apply` on
     /// durability; the keepalive path uses [`Self::send_received_feedback`].
+    ///
+    /// ## Cancel safety
+    ///
+    /// **Not cancel-safe.** Dropping during `write_all` or `flush` can leave a partial frame on the
+    /// CopyBoth socket. Callers await it to completion inside a selected branch body, or through a
+    /// pinned [`Self::next`] future, so a sibling branch cannot tear the write.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if writing or flushing the status frame to PostgreSQL fails.
     pub async fn send_standby_status(&mut self, s: StandbyStatus) -> anyhow::Result<()> {
         self.stream
             .write_all(&build_standby_status(s))
             .await
             .context("write standby status")?;
-        self.stream.flush().await?;
+        self.stream.flush().await.context("flush standby status")?;
         self.feedback_deadline = Instant::now() + self.feedback_interval;
         Ok(())
     }
@@ -231,17 +350,22 @@ impl ReplicationStream {
     /// Send `CopyDone` and flush — end our side of the CopyBoth stream on a graceful drain (PR 2.28).
     /// The replication **slot is untouched** (never `DROP_REPLICATION_SLOT`); a replacement pod
     /// resumes from `confirmed_flush_lsn`. `CopyDone` is a bare frame: tag `'c'`, Int32 length `4`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if writing or flushing the `CopyDone` frame fails.
     pub async fn copy_done(&mut self) -> anyhow::Result<()> {
         self.stream
             .write_all(&[b'c', 0, 0, 0, 4])
             .await
             .context("write CopyDone")?;
-        self.stream.flush().await?;
+        self.stream.flush().await.context("flush CopyDone")?;
         Ok(())
     }
 
     /// The highest received LSN (what the keepalive path reports as `write`).
-    pub fn last_received(&self) -> Lsn {
+    #[must_use]
+    pub const fn last_received(&self) -> Lsn {
         self.last_received
     }
 
@@ -252,11 +376,12 @@ impl ReplicationStream {
     }
 
     /// The current durable (`confirmed_flush`) baseline.
-    pub fn durable(&self) -> Lsn {
+    #[must_use]
+    pub const fn durable(&self) -> Lsn {
         self.durable
     }
 
-    // ---- internals --------------------------------------------------------------------------
+    // ---- CopyBoth internals -------------------------------------------------------------------
 
     async fn handle_copy_data(
         &mut self,
@@ -307,6 +432,16 @@ impl ReplicationStream {
     /// Public so the flush path can pump keepalive while a slow S3 PUT blocks the read loop — the PUT
     /// touches the object store, not this socket, so feedback rides concurrently (§1.9: keepalive is
     /// unconditional, never gated on durability). Resets the feedback deadline on each send.
+    ///
+    /// ## Cancel safety
+    ///
+    /// **Not cancel-safe.** It delegates to [`Self::send_standby_status`], whose socket write must
+    /// finish once started. The decode loop preserves the enclosing [`Self::next`] future across
+    /// heartbeat ticks, and the flush keepalive branch awaits this method to completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if [`Self::send_standby_status`] cannot write or flush the feedback.
     pub async fn send_received_feedback(&mut self, reply_requested: bool) -> anyhow::Result<()> {
         self.send_standby_status(StandbyStatus {
             write: self.last_received,
@@ -316,7 +451,17 @@ impl ReplicationStream {
         })
         .await
     }
+}
 
+/// Framing and simple-query plumbing, shared by both states: reading a framed backend message and
+/// writing a `'Q'` are the same bytes whether or not CopyBoth has started, so they are the one impl
+/// block that does not name a state.
+///
+/// `S: Send` is not a state-machine requirement — it is what keeps these `async fn`s' futures `Send`
+/// for the multi-thread scheduler. Auto traits leak through `PhantomData<S>`, so an unbounded `S`
+/// would make `&mut Self` (and every future holding it) conditionally `Send`. Both markers are ZSTs,
+/// so the bound costs callers nothing.
+impl<S: Send> ReplicationStream<S> {
     /// Buffered, cancellation-safe read of one backend message (`tag`, `body`). Retained bytes in
     /// `rbuf` survive a cancelled `read_buf`, so the feedback timer can cancel this mid-wait.
     async fn read_message(&mut self) -> anyhow::Result<(u8, Bytes)> {
@@ -337,16 +482,17 @@ impl ReplicationStream {
 
     /// Protocol-3.0 startup with `replication=database`; the dev harness answers `trust` (no SCRAM).
     async fn startup(&mut self, user: &str, database: &str) -> anyhow::Result<()> {
+        let startup_message = build_startup(user, database)?;
         self.stream
-            .write_all(&build_startup(user, database))
+            .write_all(&startup_message)
             .await
             .context("send StartupMessage")?;
-        self.stream.flush().await?;
+        self.stream.flush().await.context("flush StartupMessage")?;
         loop {
             let (tag, body) = self.read_message().await?;
             match tag {
                 b'R' => {
-                    let sub = read_i32(&body[0..4])?;
+                    let sub = auth_sub_type(&body)?;
                     if sub != 0 {
                         bail!(
                             "source demands auth type {sub}; the dev harness must use trust auth \
@@ -358,7 +504,7 @@ impl ReplicationStream {
                 b'S' | b'K' | b'N' => {}
                 b'Z' => return Ok(()), // ReadyForQuery
                 b'E' => bail!("startup failed: {}", error_message(&body)),
-                other => bail!("unexpected startup message '{}'", other as char),
+                other => bail!("unexpected startup message '{}'", char::from(other)),
             }
         }
     }
@@ -381,32 +527,53 @@ impl ReplicationStream {
                 b'W' => return Ok(()), // CopyBothResponse — streaming has begun
                 b'N' | b'S' => {}
                 b'E' => bail!("START_REPLICATION failed: {}", error_message(&body)),
-                other => bail!("unexpected reply '{}' to START_REPLICATION", other as char),
+                other => bail!(
+                    "unexpected reply '{}' to START_REPLICATION",
+                    char::from(other)
+                ),
             }
         }
     }
 
     async fn send_query(&mut self, sql: &str) -> anyhow::Result<()> {
-        let mut msg = Vec::with_capacity(6 + sql.len());
+        let capacity = sql
+            .len()
+            .checked_add(6)
+            .context("query too large to buffer for the wire protocol")?;
+        let len = sql
+            .len()
+            .checked_add(5)
+            .and_then(|len| u32::try_from(len).ok())
+            .with_context(|| {
+                format!("query too long for the wire protocol: {} bytes", sql.len())
+            })?;
+        let mut msg = Vec::with_capacity(capacity);
         msg.push(b'Q');
-        msg.extend_from_slice(&((4 + sql.len() + 1) as u32).to_be_bytes());
+        msg.extend_from_slice(&len.to_be_bytes());
         msg.extend_from_slice(sql.as_bytes());
         msg.push(0);
         self.stream.write_all(&msg).await.context("send Query")?;
-        self.stream.flush().await?;
+        self.stream.flush().await.context("flush Query")?;
         Ok(())
     }
 }
 
 /// Micros since the Postgres epoch (2000-01-01), for the standby-status timestamp.
 fn pg_epoch_micros() -> i64 {
+    // INTENTIONAL discard: `duration_since` fails only on a clock set before 1970, this runs once
+    // per feedback frame (so a log would flood rather than inform), and there is no `Result` to
+    // return through — a keepalive must not fail on a clock quirk. Zero back-dates the stamp, which
+    // Postgres reads for `pg_stat_replication` lag only; slot advancement rides the LSNs beside it.
     let unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    (unix.as_micros() as i64) - PG_EPOCH_UNIX_SECS * 1_000_000
+    // The offset is `common`'s derived constant, not a product recomputed per feedback frame.
+    i64::try_from(unix.as_micros())
+        .unwrap_or(i64::MAX)
+        .saturating_sub(PG_EPOCH_UNIX_MICROS)
 }
 
-fn build_startup(user: &str, database: &str) -> Vec<u8> {
+fn build_startup(user: &str, database: &str) -> anyhow::Result<Vec<u8>> {
     let mut params = Vec::new();
     for (k, v) in [
         ("user", user),
@@ -420,27 +587,37 @@ fn build_startup(user: &str, database: &str) -> Vec<u8> {
         params.push(0);
     }
     params.push(0); // parameter-list terminator
-    let len = 4 + 4 + params.len();
+    let len = params
+        .len()
+        .checked_add(8)
+        .context("startup message length overflow")?;
+    let wire_len = u32::try_from(len).context("startup message exceeds the Int32 wire limit")?;
     let mut msg = Vec::with_capacity(len);
-    msg.extend_from_slice(&(len as u32).to_be_bytes());
+    msg.extend_from_slice(&wire_len.to_be_bytes());
     msg.extend_from_slice(&196_608u32.to_be_bytes()); // protocol 3.0
     msg.extend_from_slice(&params);
-    msg
+    Ok(msg)
 }
 
-fn build_standby_status(s: StandbyStatus) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(34);
-    payload.push(b'r');
-    payload.extend_from_slice(&s.write.as_u64().to_be_bytes());
-    payload.extend_from_slice(&s.flush.as_u64().to_be_bytes());
-    payload.extend_from_slice(&s.apply.as_u64().to_be_bytes());
-    payload.extend_from_slice(&pg_epoch_micros().to_be_bytes());
-    payload.push(u8::from(s.reply_requested));
+/// A whole `'r'` frame: the `'d'` tag, its 4-byte length, and the fixed 34-byte CopyData payload.
+/// The protocol fixes every field, so this is a compile-time width, not a capacity hint.
+const STANDBY_STATUS_FRAME_BYTES: usize = 39;
 
-    let mut msg = Vec::with_capacity(5 + payload.len());
-    msg.push(b'd'); // CopyData
-    msg.extend_from_slice(&((4 + payload.len()) as u32).to_be_bytes());
-    msg.extend_from_slice(&payload);
+/// Build the fixed-width `'r'` frame in a stack array — no field is variable-width, so the feedback
+/// path allocates nothing (`copy_done` writes its bare frame the same way). The offsets below are
+/// the wire layout; `replication_test::standby_status_frame_layout` reads them back.
+fn build_standby_status(s: StandbyStatus) -> [u8; STANDBY_STATUS_FRAME_BYTES] {
+    let mut msg = [0u8; STANDBY_STATUS_FRAME_BYTES];
+    msg[0] = b'd';
+    // CopyData's payload is fixed: one tag + three LSNs + one timestamp + one reply byte = 34 bytes,
+    // and the self-inclusive length adds its own 4 bytes but excludes the tag.
+    msg[1..5].copy_from_slice(&38_u32.to_be_bytes());
+    msg[5] = b'r';
+    msg[6..14].copy_from_slice(&s.write.as_u64().to_be_bytes());
+    msg[14..22].copy_from_slice(&s.flush.as_u64().to_be_bytes());
+    msg[22..30].copy_from_slice(&s.apply.as_u64().to_be_bytes());
+    msg[30..38].copy_from_slice(&pg_epoch_micros().to_be_bytes());
+    msg[38] = u8::from(s.reply_requested);
     msg
 }
 
@@ -448,10 +625,11 @@ fn build_standby_status(s: StandbyStatus) -> Vec<u8> {
 /// NULL) and that many bytes (UTF-8 text values, since walrus never enables binary output).
 fn parse_data_row(body: &[u8]) -> anyhow::Result<Vec<Option<String>>> {
     let mut out = Vec::new();
-    if body.len() < 2 {
+    // The column count is a fixed `Int16` header; a body too short to hold it carries no columns.
+    let Some(&head) = body.first_chunk::<2>() else {
         return Ok(out);
-    }
-    let ncols = u16::from_be_bytes([body[0], body[1]]) as usize;
+    };
+    let ncols = usize::from(u16::from_be_bytes(head));
     let mut i = 2;
     for _ in 0..ncols {
         if i + 4 > body.len() {
@@ -463,14 +641,15 @@ fn parse_data_row(body: &[u8]) -> anyhow::Result<Vec<Option<String>>> {
             out.push(None);
             continue;
         }
-        let len = len as usize;
-        if i + len > body.len() {
+        let len = usize::try_from(len).context("negative DataRow length escaped validation")?;
+        let Some(end) = i.checked_add(len) else {
+            break;
+        };
+        if end > body.len() {
             break;
         }
-        out.push(Some(
-            String::from_utf8_lossy(&body[i..i + len]).into_owned(),
-        ));
-        i += len;
+        out.push(Some(String::from_utf8_lossy(&body[i..end]).into_owned()));
+        i = end;
     }
     Ok(out)
 }
@@ -478,12 +657,12 @@ fn parse_data_row(body: &[u8]) -> anyhow::Result<Vec<Option<String>>> {
 /// Take one framed backend message (`tag` + 4-byte self-inclusive length + body) from `buf`, or
 /// `None` if a full message is not yet buffered.
 fn take_message(buf: &mut BytesMut) -> Option<(u8, Bytes)> {
-    if buf.len() < 5 {
-        return None;
-    }
-    let tag = buf[0];
-    let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
-    let total = 1 + len; // tag + (length field + body)
+    // The header is a compile-time width, so one `first_chunk` proves the tag and the length field
+    // together — `None` is a buffer too short to hold them. Only the body that follows is
+    // variable-width, which is what the runtime check below is for.
+    let [tag, len_be @ ..] = *buf.first_chunk::<5>()?;
+    let len = usize::try_from(u32::from_be_bytes(len_be)).ok()?;
+    let total = len.checked_add(1)?; // tag + (length field + body)
     if buf.len() < total {
         return None;
     }
@@ -497,48 +676,50 @@ fn lsn_xy(lsn: Lsn) -> String {
     format!("{:X}/{:X}", v >> 32, v & 0xFFFF_FFFF)
 }
 
+fn fixed<const N: usize>(b: &[u8], what: &str) -> anyhow::Result<[u8; N]> {
+    b.try_into()
+        .map_err(|_| anyhow!("{what}: expected {N} bytes, got {}", b.len()))
+}
+
 fn read_lsn(b: &[u8]) -> anyhow::Result<Lsn> {
-    let arr = b
-        .try_into()
-        .map_err(|_| anyhow!("read_lsn: expected 8 bytes, got {}", b.len()))?;
-    Ok(Lsn::new(u64::from_be_bytes(arr)))
+    Ok(Lsn::new(u64::from_be_bytes(fixed(b, "read_lsn")?)))
 }
 fn read_i64(b: &[u8]) -> anyhow::Result<i64> {
-    let arr = b
-        .try_into()
-        .map_err(|_| anyhow!("read_i64: expected 8 bytes, got {}", b.len()))?;
-    Ok(i64::from_be_bytes(arr))
+    Ok(i64::from_be_bytes(fixed(b, "read_i64")?))
 }
 fn read_i32(b: &[u8]) -> anyhow::Result<i32> {
-    let arr = b
-        .try_into()
-        .map_err(|_| anyhow!("read_i32: expected 4 bytes, got {}", b.len()))?;
-    Ok(i32::from_be_bytes(arr))
+    Ok(i32::from_be_bytes(fixed(b, "read_i32")?))
+}
+
+/// The `Int32` sub-type of an Authentication ('R') body. `take_message` frames on the 4-byte length
+/// header only, so the body it hands back may be shorter than the sub-type field — a truncated frame
+/// is a protocol error the handshake reports, never an out-of-bounds slice that aborts the sink.
+fn auth_sub_type(body: &[u8]) -> anyhow::Result<i32> {
+    let head = body
+        .get(..4)
+        .with_context(|| format!("short Authentication message ({} bytes)", body.len()))?;
+    read_i32(head)
 }
 
 /// The `'M'` (human message) field of an ErrorResponse/NoticeResponse body.
 fn error_message(body: &[u8]) -> String {
-    let mut i = 0;
-    while i < body.len() && body[i] != 0 {
-        let field_type = body[i];
-        let start = i + 1;
-        let mut end = start;
-        while end < body.len() && body[end] != 0 {
-            end += 1;
-        }
-        if field_type == b'M' {
-            return String::from_utf8_lossy(&body[start..end]).into_owned();
-        }
-        i = end + 1;
-    }
-    "(no message)".to_string()
+    // The body is a run of NUL-terminated `(type byte, text)` fields closed by a bare NUL, so a
+    // split on NUL yields exactly one field per element and the terminator surfaces as the first
+    // empty one. A frame truncated mid-field simply ends the iterator on the same span the byte
+    // cursor would have stopped at.
+    body.split(|&b| b == 0)
+        .take_while(|field| !field.is_empty())
+        .find_map(|field| match field {
+            [b'M', text @ ..] => Some(String::from_utf8_lossy(text).into_owned()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "(no message)".to_string())
 }
 
 fn parse_dsn(dsn: &str) -> anyhow::Result<(String, u16, String, String)> {
     let cfg: tokio_postgres::Config = dsn.parse().context("parse source DSN")?;
-    let host = match cfg.get_hosts().first() {
-        Some(tokio_postgres::config::Host::Tcp(h)) => h.clone(),
-        _ => bail!("replication DSN needs a TCP host"),
+    let Some(tokio_postgres::config::Host::Tcp(host)) = cfg.get_hosts().first() else {
+        bail!("replication DSN needs a TCP host");
     };
     let port = cfg.get_ports().first().copied().unwrap_or(5432);
     let user = cfg
@@ -549,7 +730,7 @@ fn parse_dsn(dsn: &str) -> anyhow::Result<(String, u16, String, String)> {
         .get_dbname()
         .ok_or_else(|| anyhow!("replication DSN needs a dbname"))?
         .to_string();
-    Ok((host, port, user, database))
+    Ok((host.clone(), port, user, database))
 }
 
 #[cfg(test)]

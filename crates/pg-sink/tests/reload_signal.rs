@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Compose tests for the reload signal table (PR 6.2, `#[ignore]` — needs the compose source PG).
 //!
 //!   cargo test -p pg-sink --test reload_signal -- --ignored
@@ -8,11 +13,11 @@
 //! snapshot file can ever exist for it), and preflight refuses a missing/unpublished signal table
 //! loudly (reload H11) — or heals it under `manage_publication=true`.
 
-use common::{Lsn, TupleValue};
+use common::{FailureClass, Lsn, TupleValue};
 use pg_sink::config::SinkConfig;
 use pg_sink::consume::on_frame;
 use pg_sink::pgoutput::{Message, StreamCtx};
-use pg_sink::preflight::{connect_source, PreflightError, SourcePreflight};
+use pg_sink::preflight::{PreflightError, SourcePreflight, connect_source};
 use pg_sink::replication::{ReplicationMessage, ReplicationStream};
 use pg_sink::slot::verify_or_create_slot;
 use pg_sink::snapshot::published_user_tables;
@@ -209,11 +214,11 @@ async fn missing_signal_table_is_terminal_and_manage_publication_heals_the_gap()
         .await
         .unwrap();
     let cfg = SinkConfig {
-        source_db_url: source_url(),
+        source_db_url: source_url().into(),
         publication_name: "walrus_pub".to_string(),
         ..SinkConfig::default()
     };
-    let client = connect_source(&cfg.source_db_url).await.unwrap();
+    let client = connect_source(cfg.source_db_url.expose()).await.unwrap();
     let pf = SourcePreflight::new(&client, &cfg);
     let err = pf.assert_reload_signal().await.unwrap_err();
     assert!(
@@ -235,7 +240,7 @@ async fn missing_signal_table_is_terminal_and_manage_publication_heals_the_gap()
         .await
         .unwrap();
     let cfg_gap = SinkConfig {
-        source_db_url: source_url(),
+        source_db_url: source_url().into(),
         publication_name: "walrus_pf62".to_string(),
         ..SinkConfig::default()
     };
@@ -245,13 +250,14 @@ async fn missing_signal_table_is_terminal_and_manage_publication_heals_the_gap()
         PreflightError::PublicationGap { table, .. } => assert_eq!(table, "reload_signal"),
         other => panic!("expected PublicationGap for reload_signal, got {other:?}"),
     }
-    assert!(err
-        .to_string()
-        .contains("ALTER PUBLICATION walrus_pf62 ADD TABLE walrus.reload_signal"));
+    assert!(
+        err.to_string()
+            .contains("ALTER PUBLICATION walrus_pf62 ADD TABLE walrus.reload_signal")
+    );
 
     // (c) The same gap under manage_publication=true self-heals via the existing auto-add path.
     let cfg_manage = SinkConfig {
-        source_db_url: source_url(),
+        source_db_url: source_url().into(),
         publication_name: "walrus_pf62".to_string(),
         manage_publication: true,
         ..SinkConfig::default()

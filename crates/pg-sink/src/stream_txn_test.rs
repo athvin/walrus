@@ -2,7 +2,12 @@ use super::*;
 use crate::batch::SystemClock;
 use common::{PgColumn, PgRelation, ReplicaIdentity};
 use pg_to_arrow::oids;
+use std::num::NonZeroU64;
 use std::time::Duration;
+
+fn nz(value: u64) -> NonZeroU64 {
+    NonZeroU64::new(value).unwrap()
+}
 
 fn cache() -> RelationCache {
     let rel = PgRelation {
@@ -26,7 +31,8 @@ fn cache() -> RelationCache {
         ],
     };
     let mut c = RelationCache::default();
-    c.upsert_from_relation(rel, 1).unwrap();
+    c.upsert_from_relation(rel, common::SchemaVersionNo(1))
+        .unwrap();
     c
 }
 
@@ -44,23 +50,125 @@ fn insert_id(id: i32, sub_xid: u32) -> Message {
 fn demux(ceiling: u64) -> StreamDemux {
     StreamDemux::new(
         BatchTriggers {
-            max_rows: 100_000,
-            max_bytes: u64::MAX,
+            max_rows: nz(100_000),
+            max_bytes: NonZeroU64::MAX,
             max_fill: Duration::from_secs(3600),
         },
         Arc::new(SystemClock),
-        1,
-        "test".into(),
-        ceiling,
+        common::EpochNo(1),
+        "test",
+        nz(ceiling),
     )
 }
 
 fn mem_sink() -> ParquetSink {
     ParquetSink::new(
         Arc::new(object_store::memory::InMemory::new()),
-        "walrus".into(),
-        1,
+        "walrus",
+        common::EpochNo(1),
     )
+}
+
+#[tokio::test]
+async fn spill_resolves_the_owning_txn_without_scanning_buffered_changes() {
+    let (cache, sink) = (cache(), mem_sink());
+    let mut d = demux(105_000);
+
+    for (top, rows) in [(100_u32, 500_u32), (200, 550), (300, 500)] {
+        d.on_stream_start(top, true, Lsn::new(u64::from(top)));
+        for row in 0..rows {
+            let values = vec![
+                TupleValue::Text((top * 10_000 + row).to_string()),
+                TupleValue::Text("n".into()),
+            ];
+            d.claim_stream((TableId(42), top), top, estimate_change_bytes(&values));
+            d.open.get_mut(&top).unwrap().push_change(StreamedChange {
+                sub_xid: top,
+                oid: TableId(42),
+                op: Op::Insert,
+                values: values.into_boxed_slice(),
+                lsn: Lsn::new(u64::from(row)),
+            });
+        }
+    }
+
+    assert_eq!(d.owner_len(), 3);
+    d.spill_if_over_ceiling(&cache, &sink).await.unwrap();
+
+    assert_eq!(d.spill_count(), 1);
+    assert_eq!(d.owner_len(), 2);
+    assert_eq!(d.survivor_count(200), 0);
+    for top in [100_u32, 300] {
+        assert_eq!(d.survivor_count(top), 500);
+        let lsns: Vec<Lsn> = d.open[&top]
+            .changes
+            .iter()
+            .map(|change| change.lsn)
+            .collect();
+        assert_eq!(lsns, (0_u64..500).map(Lsn::new).collect::<Vec<_>>());
+    }
+}
+
+#[tokio::test]
+async fn owner_index_is_emptied_by_stream_commit() {
+    let (cache, sink) = (cache(), mem_sink());
+    let mut d = demux(u64::MAX);
+    d.on_stream_start(100, true, Lsn::new(100));
+    for (id, sub_xid, lsn) in [(1, 100, Lsn::new(1)), (2, 101, Lsn::new(2))] {
+        d.on_change(&cache, &insert_id(id, sub_xid), &sink, lsn)
+            .await
+            .unwrap();
+    }
+    assert_eq!(d.owner_len(), 2);
+
+    d.on_stream_commit(100, Lsn::new(900), UtcTimestamp::now(), &cache, &sink)
+        .await
+        .unwrap();
+
+    assert_eq!(d.owner_len(), 0);
+}
+
+#[tokio::test]
+async fn owner_index_is_emptied_by_a_whole_txn_abort() {
+    let (cache, sink) = (cache(), mem_sink());
+    let mut d = demux(u64::MAX);
+    d.on_stream_start(100, true, Lsn::new(100));
+    for (id, sub_xid, lsn) in [(1, 100, Lsn::new(1)), (2, 101, Lsn::new(2))] {
+        d.on_change(&cache, &insert_id(id, sub_xid), &sink, lsn)
+            .await
+            .unwrap();
+    }
+    assert_eq!(d.owner_len(), 2);
+
+    d.on_stream_abort(100, 100, &sink).await;
+
+    assert_eq!(d.owner_len(), 0);
+}
+
+#[tokio::test]
+async fn a_subtxn_abort_leaves_the_index_and_the_buffer_alone() {
+    let (cache, sink) = (cache(), mem_sink());
+    let mut d = demux(u64::MAX);
+    d.on_stream_start(100, true, Lsn::new(100));
+    for (id, sub_xid, lsn) in [(1, 101, Lsn::new(1)), (2, 102, Lsn::new(2))] {
+        d.on_change(&cache, &insert_id(id, sub_xid), &sink, lsn)
+            .await
+            .unwrap();
+    }
+    let owner_len = d.owner_len();
+    let buffered_len = d.open[&100].changes.len();
+
+    d.on_stream_abort(100, 101, &sink).await;
+
+    assert_eq!(d.owner_len(), owner_len);
+    assert_eq!(d.open[&100].changes.len(), buffered_len);
+    assert_eq!(d.survivor_count(100), 1);
+    let files = d
+        .on_stream_commit(100, Lsn::new(900), UtcTimestamp::now(), &cache, &sink)
+        .await
+        .unwrap();
+    assert_eq!(files.iter().map(|file| file.row_count).sum::<u64>(), 1);
+    assert_eq!(d.owner_len(), 0);
 }
 
 #[tokio::test]
@@ -116,6 +224,62 @@ async fn stream_commit_materialises_survivors_stamped_with_commit_lsn() {
     assert_eq!(files.iter().map(|f| f.row_count).sum::<u64>(), 2);
     assert!(files.iter().all(|f| f.lsn_end == commit));
     assert_eq!(d.open_floor(), None);
+}
+
+#[tokio::test]
+async fn commit_materialises_exactly_what_survivors_reports() {
+    let (cache, sink) = (cache(), mem_sink());
+    let mut d = demux(u64::MAX);
+    let top_xid = 857;
+    d.on_stream_start(top_xid, true, "0/100".parse().unwrap());
+    for (id, sub_xid, lsn) in [
+        (1, top_xid, "0/101"),
+        (2, 858, "0/102"),
+        (3, top_xid, "0/103"),
+    ] {
+        d.on_change(&cache, &insert_id(id, sub_xid), &sink, lsn.parse().unwrap())
+            .await
+            .unwrap();
+    }
+    d.on_stream_abort(top_xid, 858, &sink).await;
+    let expected = d.survivor_count(top_xid);
+
+    let files = d
+        .on_stream_commit(
+            top_xid,
+            "0/900".parse().unwrap(),
+            UtcTimestamp::now(),
+            &cache,
+            &sink,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        files.iter().map(|f| f.row_count).sum::<u64>(),
+        u64::try_from(expected).unwrap()
+    );
+}
+
+#[test]
+fn survivors_borrows_only_the_aborted_set() {
+    assert!(include_str!("stream_txn.rs").contains("let aborted = &self.aborted;"));
+
+    let mut txn = StreamedTxn::new("0/100".parse().unwrap());
+    txn.push_change(StreamedChange {
+        sub_xid: 857,
+        oid: TableId(42),
+        op: Op::Insert,
+        values: Box::default(),
+        lsn: "0/101".parse().unwrap(),
+    });
+    let survivors = txn.iter_survivors();
+    let begin_lsn = txn.begin_lsn;
+    let staged_len = txn.staged.len();
+
+    assert_eq!(begin_lsn, "0/100".parse().unwrap());
+    assert_eq!(staged_len, 0);
+    assert_eq!(survivors.count(), 1);
 }
 
 #[tokio::test]
@@ -220,3 +384,89 @@ async fn low_ceiling_spills_yet_still_excludes_the_aborted_subxid() {
         "every file carries the real commit LSN in lsn_end"
     );
 }
+
+#[tokio::test]
+async fn spill_preserves_commit_order_of_the_surviving_rows() {
+    // The spill drain still moves rows instead of cloning them, and now leaves the
+    // survivors in the buffer's own allocation rather than rebuilding one per shed.
+    let source = include_str!("stream_txn.rs");
+    assert!(source.contains(".extract_if(.., |c| c.oid == oid"));
+    assert!(!source.contains("std::mem::take(&mut self.changes)"));
+
+    let (cache, sink) = (cache(), mem_sink());
+    let mut d = demux(250);
+    let top = 857;
+    d.on_stream_start(top, true, "0/100".parse().unwrap());
+
+    for (id, sub_xid, lsn) in [
+        (1, 858, "0/101"),
+        (2, 857, "0/102"),
+        (3, 859, "0/103"),
+        (4, 857, "0/104"),
+        (5, 857, "0/105"),
+    ] {
+        let values = vec![
+            TupleValue::Text(id.to_string()),
+            TupleValue::Text("n".into()),
+        ];
+        d.claim_stream((TableId(42), sub_xid), top, estimate_change_bytes(&values));
+        d.open.get_mut(&top).unwrap().push_change(StreamedChange {
+            sub_xid,
+            oid: TableId(42),
+            op: Op::Insert,
+            values: values.into_boxed_slice(),
+            lsn: lsn.parse().unwrap(),
+        });
+    }
+
+    d.spill_if_over_ceiling(&cache, &sink).await.unwrap();
+
+    let surviving_lsns: Vec<Lsn> = d.open[&top].changes.iter().map(|c| c.lsn).collect();
+    assert_eq!(
+        surviving_lsns,
+        vec!["0/101".parse().unwrap(), "0/103".parse().unwrap()],
+        "draining the spill candidate must preserve survivor commit order"
+    );
+}
+
+/// The shed loop drains one `(table, sub-xid)` stream out of a transaction that keeps buffering, so
+/// the survivors must hold both their order and the allocation the next `push_change` refills.
+#[test]
+fn take_stream_drains_in_place_and_keeps_both_relative_orders() {
+    let lsn = |raw: &str| raw.parse::<Lsn>().unwrap();
+    let mut txn = StreamedTxn::new(lsn("0/100"));
+    txn.changes.reserve(64);
+    for (sub_xid, at) in [
+        (857, "0/101"),
+        (858, "0/102"),
+        (857, "0/103"),
+        (859, "0/104"),
+        (857, "0/105"),
+    ] {
+        txn.push_change(StreamedChange {
+            sub_xid,
+            oid: TableId(42),
+            op: Op::Insert,
+            values: Box::default(),
+            lsn: lsn(at),
+        });
+    }
+    let capacity = txn.changes.capacity();
+
+    let rows = txn.take_stream(TableId(42), 857);
+
+    let drained: Vec<Lsn> = rows.iter().map(|c| c.lsn).collect();
+    let survivors: Vec<Lsn> = txn.changes.iter().map(|c| c.lsn).collect();
+    assert_eq!(drained, [lsn("0/101"), lsn("0/103"), lsn("0/105")]);
+    assert_eq!(survivors, [lsn("0/102"), lsn("0/104")]);
+    assert_eq!(
+        txn.changes.capacity(),
+        capacity,
+        "the survivors keep the allocation the next push_change refills"
+    );
+    assert!(!txn.keys.contains(&(TableId(42), 857)));
+}
+
+// Regression note (PR 26.2): the existing HashSet/BTreeSet membership indexes in loader/ddl.rs,
+// pg-sink/preflight.rs, and pg-sink/reload_export.rs stay sets. XID_PREFIXED stays a 7-byte slice
+// scan, and reload_signal/heartbeat/ddl column lookups stay Vec::position because they need indices.

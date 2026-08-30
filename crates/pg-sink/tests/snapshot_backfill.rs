@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Snapshot / backfill bootstrap against compose (`#[ignore]` — needs source PG + MinIO + control PG).
 //! Rows that exist before the slot's `consistent_point` are backfilled as `kind='snapshot'` Parquet +
 //! manifest rows (all sharing `lsn_end = consistent_point`); a row written *after* the export is not in
@@ -7,14 +12,15 @@
 //!
 //!   cargo test -p pg-sink --test snapshot_backfill -- --ignored
 
-use common::{Lsn, TupleValue};
-use object_store::path::Path;
+use common::{EpochNo, Lsn, TupleValue};
 use object_store::ObjectStore;
+use object_store::path::Path;
 use pg_sink::batch::BatchTriggers;
+use pg_sink::config::SlotName;
 use pg_sink::consume::on_frame;
 use pg_sink::pgoutput::{Message, StreamCtx};
 use pg_sink::replication::ReplicationMessage;
-use pg_sink::snapshot::{describe_source_relation, published_user_tables, Backfill, SnapshotConn};
+use pg_sink::snapshot::{Backfill, SnapshotConn, describe_source_relation, published_user_tables};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_postgres::NoTls;
@@ -76,7 +82,7 @@ fn orders_id(new: &[TupleValue]) -> Option<i32> {
 async fn backfill_preloaded_rows_then_streams_post_consistent_point() {
     let _g = SOURCE_LOCK.lock().await;
     let slot = "walrus_snapshot";
-    let epoch = 2_290_001;
+    let epoch = EpochNo(2_290_001);
     let admin = source().await;
     admin.batch_execute(SOURCE_MIGRATION).await.unwrap();
     admin
@@ -96,9 +102,14 @@ async fn backfill_preloaded_rows_then_streams_post_consistent_point() {
         .unwrap();
     drop_slot(&admin, slot).await;
 
-    // Create the slot with an exported snapshot — this fixes consistent_point.
-    let mut snap_conn = SnapshotConn::connect(&source_url()).await.unwrap();
-    let snapshot = snap_conn.create_slot_with_snapshot(slot).await.unwrap();
+    // Create the slot with an exported snapshot — this fixes consistent_point. Creation takes the
+    // parsed name; the catalog helpers and the streaming handoff keep taking the bare `&str`.
+    let (snap_conn, snapshot) = SnapshotConn::connect(&source_url())
+        .await
+        .unwrap()
+        .create_slot_with_snapshot(&SlotName::new(slot).unwrap())
+        .await
+        .unwrap();
 
     // A row written AFTER the export: absent from the snapshot, must stream on handoff.
     admin
@@ -110,7 +121,7 @@ async fn backfill_preloaded_rows_then_streams_post_consistent_point() {
         .unwrap();
 
     // Backfill every published user table under the exported snapshot.
-    let sink = pg_sink::sink::ParquetSink::new(minio(), "walrus".to_string(), epoch);
+    let sink = pg_sink::sink::ParquetSink::new(minio(), "walrus", epoch);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     let mut backfill = Backfill::connect(
@@ -118,8 +129,8 @@ async fn backfill_preloaded_rows_then_streams_post_consistent_point() {
         epoch,
         "walrus-snapshot-test".to_string(),
         BatchTriggers {
-            max_rows: u64::MAX,
-            max_bytes: u64::MAX,
+            max_rows: std::num::NonZeroU64::MAX,
+            max_bytes: std::num::NonZeroU64::MAX,
             max_fill: Duration::from_secs(3600),
         },
         Duration::ZERO,
@@ -144,7 +155,7 @@ async fn backfill_preloaded_rows_then_streams_post_consistent_point() {
             orders_oid = Some(rel.oid);
         }
         backfill
-            .copy_table(&rel, &snapshot, &sink, &pool, 1)
+            .copy_table(&rel, &snapshot, &sink, &pool, common::SchemaVersionNo(1))
             .await
             .unwrap();
     }
@@ -179,7 +190,10 @@ async fn backfill_preloaded_rows_then_streams_post_consistent_point() {
 
     // Hand off to streaming from consistent_point → the post-export row arrives as a STREAM change
     // (it was never in the snapshot: no double count).
-    let mut stream = snap_conn.into_stream(slot, "walrus_pub").await.unwrap();
+    let mut stream = snap_conn
+        .into_stream(slot, &snapshot, "walrus_pub")
+        .await
+        .unwrap();
     let mut ctx = StreamCtx::default();
     let saw_streamed = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
@@ -191,10 +205,10 @@ async fn backfill_preloaded_rows_then_streams_post_consistent_point() {
             if let Some(Message::Insert {
                 relation_oid, new, ..
             }) = on_frame(&mut ctx, frame).unwrap()
+                && orders_oid == Some(relation_oid)
+                && orders_id(&new) == Some(990002)
             {
-                if orders_oid == Some(relation_oid) && orders_id(&new) == Some(990002) {
-                    return true;
-                }
+                return true;
             }
         }
     })

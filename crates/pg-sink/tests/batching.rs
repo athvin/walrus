@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Micro-batching against the live stream (`#[ignore]` — needs source PG on `trust`). A stream of
 //! inserts forms and seals ≥ 1 batch. The fake-clock threshold logic is unit-tested inline in
 //! `src/batch.rs`; this proves the routing seals a real batch end to end.
@@ -6,7 +11,7 @@
 //!   cargo test -p pg-sink --test batching -- --ignored
 
 use pg_sink::batch::{BatchTriggers, SystemClock};
-use pg_sink::consume::{on_frame, BatchRouter};
+use pg_sink::consume::{BatchRouter, on_frame};
 use pg_sink::pgoutput::{Message, StreamCtx};
 use pg_sink::relcache::RelationCache;
 use pg_sink::replication::{ReplicationMessage, ReplicationStream};
@@ -76,11 +81,11 @@ async fn a_stream_of_inserts_forms_and_seals_a_batch() {
     }
 
     let triggers = BatchTriggers {
-        max_rows: 1,
-        max_bytes: u64::MAX,
+        max_rows: std::num::NonZeroU64::MIN,
+        max_bytes: std::num::NonZeroU64::MAX,
         max_fill: Duration::from_secs(3600),
     };
-    let mut router = BatchRouter::new(triggers, Arc::new(SystemClock), 1, "test".to_string());
+    let mut router = BatchRouter::new(triggers, Arc::new(SystemClock), common::EpochNo(1), "test");
     let mut cache = RelationCache::default();
     let mut ctx = StreamCtx::default();
     let mut sealed_total = 0u64;
@@ -95,13 +100,21 @@ async fn a_stream_of_inserts_forms_and_seals_a_batch() {
             if let Some(msg) = on_frame(&mut ctx, frame).expect("decode") {
                 match &msg {
                     Message::Relation { relation, .. } => {
-                        cache.upsert_from_relation(relation.clone(), 1).unwrap();
+                        cache
+                            .upsert_from_relation(relation.clone(), common::SchemaVersionNo(1))
+                            .unwrap();
                     }
                     other => {
-                        for sealed in router.route(&cache, other, frame_lsn, 1).unwrap() {
+                        for sealed in router
+                            .route(&cache, other, frame_lsn, common::SchemaVersionNo(1))
+                            .unwrap()
+                        {
                             assert_eq!(sealed.table, "orders");
                             assert!(sealed.row_count >= 1);
-                            assert_eq!(sealed.record_batch.num_rows(), sealed.row_count as usize);
+                            assert_eq!(
+                                sealed.record_batch.num_rows(),
+                                usize::try_from(sealed.row_count).unwrap()
+                            );
                             sealed_total += 1;
                         }
                     }

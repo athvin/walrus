@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // bench (harness=false, not test-cfg)
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "bench (harness=false, not test-cfg)"
+)]
 //! PR 5.5 — criterion micro-benches for the loader's raw→mirror transform.
 //!
 //! Runs the **production** SQL (`loader::transform::apply_transform` over `TransformSql`) against an
@@ -13,9 +17,10 @@
 //! Run: `cargo bench -p loader --bench transform` (or `just bench`). The 1M grid takes minutes.
 
 use common::{Lsn, PgColumn, PgRelation, ReplicaIdentity};
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use duckdb::Connection;
-use loader::transform::{apply_transform, TransformSql};
+use loader::transform::{TransformSql, apply_transform};
+use std::hint::black_box;
 
 fn col(name: &str, oid: u32, is_key: bool) -> PgColumn {
     PgColumn {
@@ -49,6 +54,21 @@ fn toast_rel() -> PgRelation {
             col("t1", 25, false),
             col("t2", 25, false),
             col("t3", 25, false),
+        ],
+    }
+}
+
+fn three_key_rel() -> PgRelation {
+    PgRelation {
+        oid: 43,
+        schema: "public".into(),
+        name: "line_items".into(),
+        replica_identity: ReplicaIdentity::Default,
+        columns: vec![
+            col("tenant_id", 23, true),
+            col("order_id", 23, true),
+            col("line_no", 23, true),
+            col("description", 25, false),
         ],
     }
 }
@@ -148,7 +168,7 @@ fn bench_transform_scaling(c: &mut Criterion) {
                             seed_scaling(&db, n, k);
                             db
                         },
-                        |db| apply_transform(&db, &t, &Lsn::ZERO).unwrap(),
+                        |db| apply_transform(&db, &t, Lsn::ZERO).unwrap(),
                         BatchSize::PerIteration,
                     );
                 },
@@ -173,7 +193,7 @@ fn bench_toast_backscan(c: &mut Criterion) {
                     seed_toast(&db, n, pct);
                     db
                 },
-                |db| apply_transform(&db, &t, &Lsn::ZERO).unwrap(),
+                |db| apply_transform(&db, &t, Lsn::ZERO).unwrap(),
                 BatchSize::PerIteration,
             );
         });
@@ -199,9 +219,22 @@ fn bench_mirror_size(c: &mut Criterion) {
                     seed_scaling(&db, tail, 1);
                     db
                 },
-                |db| apply_transform(&db, &t, &Lsn::ZERO).unwrap(),
+                |db| apply_transform(&db, &t, Lsn::ZERO).unwrap(),
                 BatchSize::PerIteration,
             );
+        });
+    }
+    g.finish();
+}
+
+fn bench_keycols(c: &mut Criterion) {
+    let one_key = orders_rel();
+    let three_keys = three_key_rel();
+    let mut g = c.benchmark_group("loader/keycols");
+    for (label, relation) in [("one_key", one_key), ("three_keys", three_keys)] {
+        g.bench_with_input(BenchmarkId::from_parameter(label), &relation, |b, rel| {
+            // Input guarded too — the only non-FFI bench here, so it *can* be const-folded.
+            b.iter(|| black_box(black_box(rel).to_key_columns()));
         });
     }
     g.finish();
@@ -211,6 +244,7 @@ criterion_group!(
     benches,
     bench_transform_scaling,
     bench_toast_backscan,
-    bench_mirror_size
+    bench_mirror_size,
+    bench_keycols
 );
 criterion_main!(benches);

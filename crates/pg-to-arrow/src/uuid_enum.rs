@@ -9,8 +9,9 @@
 //!
 //! **enum.** Values are lossless as `VARCHAR`; the **ordered label set** is lost on the wire and is
 //! carried by the descriptor (PR 2.17), from which the loader recreates the DuckDB `ENUM`. Enum OIDs
-//! are dynamic (≥ `FIRST_NORMAL_OID`), so we treat a non-builtin OID as `enum → VARCHAR` for now
-//! ([`is_enum_oid`]); PR 2.22 resolves enum-ness from the source catalog / the decoder's `Type` message.
+//! are dynamic (≥ [`oids::FIRST_NORMAL_OID`]), so we treat a non-builtin OID as `enum → VARCHAR` for
+//! now ([`is_enum_oid`]); PR 2.22 resolves enum-ness from the source catalog / the decoder's `Type`
+//! message.
 
 use crate::error::Error;
 use crate::oids;
@@ -22,6 +23,7 @@ pub const ARROW_UUID_EXTENSION: &str = "arrow.uuid";
 
 /// `FixedSizeBinary(16)` carrying the `arrow.uuid` canonical extension → Parquet UUID → DuckDB `UUID`.
 /// The extension metadata is the *only* thing that makes DuckDB see `UUID` rather than `BLOB`.
+#[must_use]
 pub fn uuid_field(name: &str) -> Field {
     Field::new(name, DataType::FixedSizeBinary(16), true).with_metadata(HashMap::from([(
         "ARROW:extension:name".to_string(),
@@ -31,31 +33,34 @@ pub fn uuid_field(name: &str) -> Field {
 
 /// Fallback if a pinned arrow-rs release ever drops the UUID annotation on the normal column path:
 /// carry the canonical text as `Utf8` and `CAST(x AS UUID)` on load.
+#[must_use]
 pub fn uuid_as_varchar(name: &str) -> Field {
     Field::new(name, DataType::Utf8, true)
 }
 
 /// `enum` → nullable `Utf8`; the ordered label set is carried by the descriptor (PR 2.17), not here.
+#[must_use]
 pub fn enum_field(name: &str) -> Field {
     Field::new(name, DataType::Utf8, true)
 }
 
-/// Interim enum detection: a non-builtin OID (≥ `FIRST_NORMAL_OID`) is treated as an enum carrier.
-/// PR 2.22 replaces this with a catalog-derived marker (the decoder's `Type` message).
-pub fn is_enum_oid(type_oid: u32) -> bool {
+/// Interim enum detection: a non-builtin OID (≥ [`oids::FIRST_NORMAL_OID`]) is treated as an enum
+/// carrier. PR 2.22 replaces this with a catalog-derived marker (the decoder's `Type` message).
+#[must_use]
+pub const fn is_enum_oid(type_oid: u32) -> bool {
     type_oid >= oids::FIRST_NORMAL_OID
 }
 
 /// Parse canonical UUID text (`"550e8400-e29b-41d4-a716-446655440000"`) into 16 bytes. Rejects
-/// malformed input with `ValueParse` (no silent zero-padding).
+/// malformed input with [`Error::ValueParse`] (no silent zero-padding).
+///
+/// # Errors
+///
+/// Returns [`Error::ValueParse`] when `text` is not a canonical UUID accepted by `uuid::Uuid`.
 pub fn parse_uuid_bytes(text: &str) -> Result<[u8; 16], Error> {
     uuid::Uuid::parse_str(text)
-        .map(|u| u.into_bytes())
-        .map_err(|_| Error::ValueParse {
-            column: "uuid".to_string(),
-            value: text.to_string(),
-            data_type: "uuid".to_string(),
-        })
+        .map(uuid::Uuid::into_bytes)
+        .map_err(|_| Error::value_parse("uuid", text, "uuid"))
 }
 
 #[cfg(test)]

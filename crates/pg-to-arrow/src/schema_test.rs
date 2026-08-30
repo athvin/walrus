@@ -86,6 +86,52 @@ fn numeric_typmod_minus_one_is_unconstrained() {
 }
 
 #[test]
+fn numeric_typmod_out_of_range_is_unconstrained() {
+    // 294 does not fit the decoder's u8 precision. The old `as u8` wrapped it to 38 and silently
+    // selected Decimal128(38, 0), changing the source type instead of taking the lossless text path.
+    let numeric_294_0 = (294_i32 << 16) + 4;
+    assert_eq!(numeric_precision_scale(numeric_294_0), None);
+    assert_eq!(tier1_data_type(oids::NUMERIC, numeric_294_0), None);
+}
+
+#[test]
+fn numeric_precision_38_is_the_tier1_boundary_at_both_call_sites() {
+    const P0: i32 = 4;
+    const P1: i32 = (1_i32 << 16) + 4;
+    const P38: i32 = (38_i32 << 16) + 4;
+    const P39: i32 = (39_i32 << 16) + 4;
+
+    for (typmod, expected) in [
+        (P0, None),
+        (P1, Some(DataType::Decimal128(1, 0))),
+        (P38, Some(DataType::Decimal128(38, 0))),
+        (P39, None),
+        (-1, None),
+    ] {
+        assert_eq!(tier1_data_type(oids::NUMERIC, typmod), expected);
+    }
+
+    use crate::range::RangeFamily;
+    for (typmod, expected) in [
+        (P0, DataType::Utf8),
+        (P1, DataType::Decimal128(1, 0)),
+        (P38, DataType::Decimal128(38, 0)),
+        (P39, DataType::Utf8),
+        (-1, DataType::Utf8),
+    ] {
+        assert_eq!(RangeFamily::Num.elem_data_type(typmod), expected);
+    }
+
+    assert_eq!(numeric_precision_scale(P38), Some((38, 0)));
+    assert!(crate::tier3::is_tier3_text(oids::NUMERIC, P39));
+    assert!(!crate::tier3::is_tier3_text(oids::NUMERIC, P38));
+
+    let at_pattern = "Some((p @ 1..=38, s)) => DataType::Decimal128(p, s)";
+    assert!(include_str!("schema.rs").contains(at_pattern));
+    assert!(include_str!("range.rs").contains(at_pattern));
+}
+
+#[test]
 fn unconstrained_and_over_38_numeric_emit_one_utf8_field() {
     // The Tier-3 numeric branch (PR 2.15): a single Utf8 carrier, not Decimal128.
     for typmod in [-1, ((40 << 16) | 10) + 4] {
@@ -133,7 +179,7 @@ fn interval_emits_three_signed_int_fields() {
             ("dur_micros", &DataType::Int64),
         ]
     );
-    assert!(fields.iter().all(|f| f.is_nullable()));
+    assert!(fields.iter().all(Field::is_nullable));
 }
 
 #[test]

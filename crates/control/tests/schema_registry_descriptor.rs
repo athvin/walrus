@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Compose round-trip: a *generated* `pg-to-arrow` `TypeDescriptor` set persists to
 //! `schema_registry` and reads back equal. This exercises the sink↔loader seam end to end and proves
 //! `control` may dev-depend on `pg-to-arrow` with **no DAG cycle** (pg-to-arrow → common only).
@@ -11,9 +15,9 @@
 //! cargo test -p control -- --ignored schema_registry_roundtrips_a_type_descriptor
 //! ```
 
-use common::{PgColumn, PgRelation, ReplicaIdentity};
-use control::{connect, read_registry, run_migrations, upsert_registry, RegistryRow};
-use pg_to_arrow::descriptor::describe_relation;
+use common::{PgColumn, PgRelation, ReplicaIdentity, SchemaVersionNo};
+use control::{RegistryRow, connect, read_registry, run_migrations, upsert_registry};
+use pg_to_arrow::describe_relation;
 
 fn control_dsn() -> String {
     std::env::var("WALRUS_CONTROL_DB_URL").unwrap_or_else(|_| {
@@ -51,14 +55,14 @@ async fn schema_registry_roundtrips_a_type_descriptor() {
             col("code", 1042, 9, false),  // char(5): bpchar, typmod = 5 + VARHDRSZ(4)
         ],
     };
-    let descriptors = describe_relation(&rel);
+    let descriptors = describe_relation(&rel).unwrap();
     assert_eq!(descriptors.len(), 3);
 
     let row = RegistryRow {
-        epoch: 2_170_017,
+        epoch: common::EpochNo(2_170_017),
         source_schema: "public".to_string(),
         source_table: "widgets".to_string(),
-        schema_version: 1,
+        schema_version: SchemaVersionNo(1),
         descriptors: descriptors.clone(),
         columns: serde_json::json!([]),
     };
@@ -66,7 +70,7 @@ async fn schema_registry_roundtrips_a_type_descriptor() {
     // Isolate in a rolled-back transaction (matches the other control integration tests).
     let mut tx = pool.begin().await.unwrap();
     upsert_registry(&mut *tx, &row).await.unwrap();
-    let back = read_registry(&mut *tx, row.epoch, "public", "widgets", 1)
+    let back = read_registry(&mut *tx, row.epoch, "public", "widgets", SchemaVersionNo(1))
         .await
         .unwrap()
         .expect("registry row present after upsert");

@@ -1,4 +1,5 @@
 use super::*;
+use crate::FailureClass;
 
 /// Every variant, paired with its DoD-mandated terminal classification.
 fn one_of_each() -> Vec<(Error, bool)> {
@@ -94,4 +95,33 @@ fn exit_code_zero_is_success_only() {
 
     // The seam bins use in `main` exists and compiles for a real code.
     let _process_code: std::process::ExitCode = ExitCode::Success.into();
+}
+
+#[test]
+fn every_exit_code_variant_fits_a_u8() {
+    for code in [
+        ExitCode::Success,
+        ExitCode::Config,
+        ExitCode::ControlDb,
+        ExitCode::ObjectStore,
+        ExitCode::Preflight,
+        ExitCode::KeylessTable,
+        ExitCode::LeaseContended,
+        ExitCode::SourceDb,
+        ExitCode::Quarantine,
+        ExitCode::Internal,
+    ] {
+        let raw = code as i32;
+        assert!(u8::try_from(raw).is_ok(), "{code:?} no longer fits a u8");
+    }
+}
+
+#[test]
+fn every_exit_code_round_trips_through_its_i32() {
+    for (err, _) in one_of_each() {
+        let code = err.exit_code();
+        assert_eq!(ExitCode::try_from(code as i32), Ok(code), "{err:?}");
+    }
+    assert_eq!(ExitCode::try_from(0), Ok(ExitCode::Success));
+    assert_eq!(ExitCode::try_from(99), Err(UnknownExitCode(99)));
 }

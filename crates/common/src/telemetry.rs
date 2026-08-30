@@ -1,15 +1,17 @@
 //! Tracing setup and the structured-field convention.
 //!
-//! walrus never `println!`s. Every log line is a [`tracing`] event with **structured fields** so a
-//! Grafana/Loki query can follow one transaction through both services. [`init_tracing`] installs
-//! the process-wide subscriber once at the top of `main`; the [`fields`] module fixes the canonical
+//! walrus never `println!`s — `clippy::print_stdout`/`print_stderr` are denied workspace-wide, and
+//! the only production carve-out is each binary's `main`, for the window before a subscriber
+//! exists. Every log line is a [`tracing`] event with **structured fields** so a Grafana/Loki query
+//! can follow one transaction through both services. [`init_tracing`] installs the
+//! process-wide subscriber once at the top of `main`; the [`fields`] module fixes the canonical
 //! field-key spellings (`xid`, `commit_lsn`, `lsn`, `batch_uuid`, …) that every later PR must use
 //! at its call sites — e.g. `info!({XID} = xid, {COMMIT_LSN} = %commit_lsn, "flushed batch")`.
 
 use serde::Deserialize;
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
 
 /// Canonical structured-field keys. Use these constants at every `tracing` call site so dashboards
 /// and log queries key on **one** spelling across both services — never a free-form format string.
@@ -36,12 +38,14 @@ const DEFAULT_FILTER: &str = "info";
 
 /// How to render logs. `json` on in the cluster, off (pretty) for local dev.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+// Defaults permit omitted keys; strict field checking makes present-but-misspelled keys fatal.
+#[serde(deny_unknown_fields, default)]
 pub struct TelemetryConfig {
     /// Emit newline-delimited JSON (one object per event) instead of the pretty formatter.
     pub json: bool,
-    /// `EnvFilter` directive, e.g. `"info,walrus=debug"`. Empty → fall back to `RUST_LOG`, then
-    /// [`DEFAULT_FILTER`].
+    /// [`EnvFilter`] directive, e.g. `"info,pg_sink=debug,loader=debug"` — targets are matched by
+    /// prefix against the **lib** crate names, so `walrus=…` would reach only the two `main.rs`
+    /// roots. Empty → fall back to `RUST_LOG`, then `DEFAULT_FILTER`.
     pub filter: String,
 }
 
@@ -54,7 +58,7 @@ impl Default for TelemetryConfig {
     }
 }
 
-/// Build the `EnvFilter`: an explicit `cfg.filter` wins; an empty one falls back to `RUST_LOG`,
+/// Build the [`EnvFilter`]: an explicit `cfg.filter` wins; an empty one falls back to `RUST_LOG`,
 /// then to [`DEFAULT_FILTER`]. A malformed directive degrades to the default rather than silently
 /// disabling logging.
 fn build_env_filter(cfg: &TelemetryConfig) -> EnvFilter {
@@ -65,12 +69,31 @@ fn build_env_filter(cfg: &TelemetryConfig) -> EnvFilter {
     }
 }
 
-/// Build the `EnvFilter` + fmt layer (pretty or JSON per `cfg.json`) and install it as the global
+/// Build the [`EnvFilter`] + fmt layer (pretty or JSON per `cfg.json`) and install it as the global
 /// default subscriber.
+///
+/// **Only a binary's `main` may call this.** A subscriber is process-wide and installs once, so
+/// `common` is the one crate here that depends on `tracing-subscriber` and holds the one install;
+/// every other crate — `control`, `pg-to-arrow`, and the sink and loader *libraries* beneath the
+/// two `main`s — emits through the `tracing` facade alone, leaving format, level filter and
+/// destination to whoever owns `main`. `crates/common/tests/subscriber_install_policy.rs` is what
+/// goes red when a library takes that choice back.
+///
+/// Installing through [`SubscriberInitExt::try_init`] — rather than `set_global_default` — is what
+/// also registers `tracing_log::LogTracer`, so the dependencies that still emit through the `log`
+/// facade (`tokio-postgres`, `sqlx` and `object_store`'s HTTP client among them) arrive here as
+/// events instead of being dropped. That bridge rides `tracing-subscriber`'s `tracing-log`
+/// feature, which `crates/common/Cargo.toml` names explicitly for exactly this reason.
 ///
 /// Idempotent: a global subscriber can only be installed once per process, so a second call is a
 /// **handled outcome** — it logs at `debug` and returns `Ok(())` rather than panicking, keeping
 /// tests and re-entrant bootstraps safe.
+///
+/// # Errors
+///
+/// This function currently produces no [`crate::Error`] variant: malformed filters fall back to
+/// `DEFAULT_FILTER`, and an already-installed global subscriber is treated as an idempotent
+/// success. The `Result` return preserves the bootstrap API contract for future fallible layers.
 pub fn init_tracing(cfg: &TelemetryConfig) -> crate::Result<()> {
     let filter = build_env_filter(cfg);
     let registry = tracing_subscriber::registry().with(filter);

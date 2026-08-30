@@ -6,6 +6,7 @@
 //! terminal [`Error::Config`] *at the edge* — never a panic three modules later. Service-specific
 //! knobs (`SinkConfig`, `LoaderConfig`) embed [`CommonConfig`] in their own crates.
 
+use crate::redact::Redacted;
 use crate::telemetry::TelemetryConfig;
 use crate::{Error, Result};
 use serde::Deserialize;
@@ -16,11 +17,14 @@ use std::time::Duration;
 const MAX_STARTUP_DEADLINE: Duration = Duration::from_secs(60 * 60);
 
 /// Configuration shared by both walrus services. Service-specific knobs embed this.
+/// Flattening is deferred; see `docs/implementation/notes/rust-skills/serde-flatten.md`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct CommonConfig {
-    /// Control Postgres connection string (holds manifest/checkpoint/registry).
-    pub control_db_url: String,
+    /// Control Postgres connection string (holds manifest/checkpoint/registry). [`Redacted`]
+    /// because a libpq URL carries its password inline and this struct derives `Debug`, so one
+    /// `?cfg` would otherwise ship the credential to the log aggregator.
+    pub control_db_url: Redacted<String>,
     /// S3/MinIO staging bucket + endpoint.
     pub object_store: ObjectStoreConfig,
     /// Logging setup (PR 0.4).
@@ -36,16 +40,18 @@ pub struct CommonConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ObjectStoreConfig {
+    /// Bucket the sink writes Parquet into and the loader reads it back from.
     pub bucket: String,
     /// `None` = real AWS; `Some` = MinIO / localstack.
     pub endpoint: Option<String>,
+    /// Region sent with every request. Still required against MinIO, which validates the signature.
     pub region: String,
 }
 
 impl Default for CommonConfig {
     fn default() -> Self {
         CommonConfig {
-            control_db_url: String::new(),
+            control_db_url: Redacted::default(),
             object_store: ObjectStoreConfig::default(),
             telemetry: TelemetryConfig::default(),
             startup_deadline: Duration::from_secs(60),
@@ -68,19 +74,28 @@ impl CommonConfig {
     /// Load config: an optional file at `WALRUS_CONFIG` (TOML or YAML by extension) underneath,
     /// `WALRUS_`-prefixed environment on top (`__` marks nesting), then [`validate`](Self::validate).
     /// An invalid config can never escape as `Ok`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] — always terminal — when the configured file is unreadable or
+    /// invalid, an environment value cannot be deserialized (including unknown fields), or the
+    /// merged configuration fails [`Self::validate`].
     pub fn load() -> Result<Self> {
-        use figment::providers::{Env, Format, Toml, Yaml};
         use figment::Figment;
+        use figment::providers::{Env, Format, Toml, Yaml};
 
         let mut figment = Figment::new();
 
-        // Optional file underneath, chosen by extension (default TOML).
-        if let Ok(path) = std::env::var("WALRUS_CONFIG") {
+        // Optional file underneath, chosen by extension (default TOML). `var_os`, not `var`: the
+        // only thing the `Result` adds here is a `VarError` for an `if let Ok` to drop, and its two
+        // variants are not the same event. `NotPresent` is the documented no-file case; `NotUnicode`
+        // is an operator who set a path this process then ignored in silence, leaving `validate()`
+        // to blame a missing field instead. `Option` is the honest type — `None` *is* "unset" —
+        // and `PathBuf: From<OsString>`, so a path the OS accepts is simply opened.
+        if let Some(path) = std::env::var_os("WALRUS_CONFIG") {
             let path = std::path::PathBuf::from(path);
-            let is_yaml = matches!(
-                path.extension().and_then(|e| e.to_str()),
-                Some("yaml") | Some("yml")
-            );
+            let ext = path.extension().and_then(|e| e.to_str());
+            let is_yaml = matches!(ext, Some("yaml" | "yml"));
             figment = if is_yaml {
                 figment.merge(Yaml::file(&path))
             } else {
@@ -105,8 +120,21 @@ impl CommonConfig {
 
     /// Bounds-check every field. Pure and offline — no sockets. Any violation is a terminal
     /// [`Error::Config`]; connectivity is a separate *transient* bootstrap check in the bins.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] when a required string is empty, `startup_deadline` is zero, or
+    /// that deadline exceeds the supported ceiling. All such failures are terminal.
     pub fn validate(&self) -> Result<()> {
-        if self.control_db_url.trim().is_empty() {
+        // Assert the constant ceiling; configured input remains runtime, Result-returning data.
+        const {
+            assert!(
+                !MAX_STARTUP_DEADLINE.is_zero(),
+                "MAX_STARTUP_DEADLINE must be nonzero or every positive deadline exceeds the ceiling"
+            );
+        }
+
+        if self.control_db_url.expose().trim().is_empty() {
             return Err(Error::Config(
                 "control_db_url must not be empty".to_string(),
             ));

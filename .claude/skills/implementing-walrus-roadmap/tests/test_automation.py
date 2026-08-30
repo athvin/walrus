@@ -328,6 +328,53 @@ class GateRunnerTests(unittest.TestCase):
         self.assertIn("CHECK:not-a-gate=FAIL", result.stdout)
         self.assertNotIn("SKIP", result.stdout)
 
+    def test_digit_in_supported_e2e_gate_passes_list_validation(self) -> None:
+        result = self.run_gate("e2e,not-a-gate")
+        self.assertEqual(2, result.returncode)
+        self.assertIn("CHECK:not-a-gate=FAIL", result.stdout)
+        self.assertNotIn("invalid comma-separated gate list", result.stdout)
+
+    def test_sqlx_gate_migrates_before_prepare_check(self) -> None:
+        script = (SKILL_ROOT / "scripts/run_gate.sh").read_text()
+        sqlx_case = script[script.index("    sqlx)") : script.index("    conformance)")]
+        self.assertLess(
+            sqlx_case.index("sqlx migrate run --source migrations/control"),
+            sqlx_case.index("run_check sqlx-prepare cargo sqlx prepare --check --workspace"),
+        )
+
+    def test_ignored_integration_gate_runs_only_discovered_test_targets(self) -> None:
+        script = (SKILL_ROOT / "scripts/run_gate.sh").read_text()
+        helper = script[
+            script.index("run_ignored_integration_tests()") : script.index("docker_up()")
+        ]
+        integration_case = script[
+            script.index("    integration)") : script.index("    e2e)")
+        ]
+        self.assertIn("rg -l '#\\[ignore'", helper)
+        self.assertIn('cargo test -p "$package" --test "$target"', helper)
+        self.assertIn(
+            "run_check integration-ignored run_ignored_integration_tests",
+            integration_case,
+        )
+        self.assertNotIn("cargo test --workspace -- --ignored", integration_case)
+
+    def test_control_integration_gate_serializes_the_shared_database(self) -> None:
+        script = (SKILL_ROOT / "scripts/run_gate.sh").read_text()
+        integration_case = script[
+            script.index("    integration)") : script.index("    e2e)")
+        ]
+        self.assertIn(
+            "cargo test -p control --features integration -- --test-threads=1",
+            integration_case,
+        )
+
+    def test_e2e_gate_builds_reload_targets_in_one_cargo_invocation(self) -> None:
+        script = (SKILL_ROOT / "scripts/run_gate.sh").read_text()
+        e2e_case = script[script.index("    e2e)") : script.index("    manifests)")]
+        self.assertEqual(1, e2e_case.count("cargo test -p e2e"))
+        self.assertIn("--test reload_quarantine --test reload_scale", e2e_case)
+        self.assertIn("--test-threads=1", e2e_case)
+
 
 class CheckClassifierTests(unittest.TestCase):
     def run_classifier(self, checks: list[dict]) -> subprocess.CompletedProcess[str]:

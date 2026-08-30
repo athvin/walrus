@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Hermetic raw→mirror transform tests (loader §6) — `Connection::open_in_memory()`, **no docker
 //! compose, no Postgres, no S3**. They replay every worked case from `walrus-loader.md §6` against the
 //! *production* template (`loader::transform`), so test and Phase B (PR 3.4) share one source of truth.
@@ -6,7 +10,7 @@
 use common::{PgColumn, PgRelation, ReplicaIdentity};
 use duckdb::Connection;
 use loader::duck::TableDb;
-use loader::transform::{apply_transform, TransformSql};
+use loader::transform::{TransformSql, apply_transform};
 
 fn orders_rel() -> PgRelation {
     let col = |name: &str, oid: u32, is_key: bool| PgColumn {
@@ -78,7 +82,7 @@ fn transform(c: &Connection) {
     apply_transform(
         c,
         &TransformSql::from_relation(&orders_rel()),
-        &common::Lsn::ZERO,
+        common::Lsn::ZERO,
     )
     .unwrap();
 }
@@ -99,12 +103,13 @@ fn n_keys_insert_delete_insert_each_row_equals_last_insert_and_count_is_n() {
     let c = db();
     let n = 50i64;
     for id in 1..=n {
+        let unsigned_id = u64::try_from(id).unwrap();
         seed(
             &c,
             &[
-                (id, 'i', 1, 3 * id as u64, "first"),
-                (id, 'd', 1, 3 * id as u64 + 1, "first"),
-                (id, 'i', 1, 3 * id as u64 + 2, "last"),
+                (id, 'i', 1, 3 * unsigned_id, "first"),
+                (id, 'd', 1, 3 * unsigned_id + 1, "first"),
+                (id, 'i', 1, 3 * unsigned_id + 2, "last"),
             ],
         );
     }
@@ -271,7 +276,7 @@ fn composite_pk_partition_and_join_expand_to_all_key_columns() {
         )
         .unwrap();
     }
-    apply_transform(&c, &TransformSql::from_relation(&rel), &common::Lsn::ZERO).unwrap();
+    apply_transform(&c, &TransformSql::from_relation(&rel), common::Lsn::ZERO).unwrap();
 
     let n: i64 = c
         .query_row("SELECT count(*) FROM kv", [], |r| r.get(0))
@@ -385,10 +390,10 @@ fn transformed_lsn_advances_past_a_truncate_only_tail() {
         "the max scan sees the truncate → watermark advances"
     );
     let b = TransformSql::from_relation(&orders_rel())
-        .latest_truncate(&c, &common::Lsn::ZERO)
+        .latest_truncate(&c, common::Lsn::ZERO)
         .unwrap();
     assert_eq!(
-        b.ct,
+        b.map(|b| b.ct),
         Some("0/64".parse().unwrap()),
         "latest_truncate resolves the bare truncate"
     );
@@ -449,7 +454,10 @@ fn docs_db() -> Connection {
 }
 
 /// `toast` is the JSON array text of the unchanged_toast list, e.g. `[]` or `["big"]`.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "test fixture seeds every raw-row field explicitly"
+)]
 fn docs_seed(
     c: &Connection,
     id: i64,
@@ -472,7 +480,7 @@ fn docs_transform(c: &Connection) {
     apply_transform(
         c,
         &TransformSql::from_relation(&docs_rel()),
-        &common::Lsn::ZERO,
+        common::Lsn::ZERO,
     )
     .unwrap();
 }
@@ -613,7 +621,7 @@ fn equal_commit_lsn_snapshot_row_is_still_applied() {
         "a strict `>` bound would exclude the snapshot row"
     );
 
-    apply_transform(&c, &TransformSql::from_relation(&orders_rel()), &after).unwrap();
+    apply_transform(&c, &TransformSql::from_relation(&orders_rel()), after).unwrap();
     assert_eq!(
         status_of(&c, 1).as_deref(),
         Some("snap"),
@@ -662,8 +670,9 @@ fn guard_applies_newer_and_rejects_stale_by_tuple() {
 /// `<table>_current` projection (DoD §7). Exercises the production `ensure_tables` schema.
 #[test]
 fn applied_columns_are_hidden_from_user_projections() {
-    let db = TableDb::open(std::path::Path::new(":memory:")).unwrap();
-    db.ensure_tables(&orders_rel(), 1).unwrap();
+    let db = TableDb::open(":memory:").unwrap();
+    db.ensure_tables(&orders_rel(), common::SchemaVersionNo(1))
+        .unwrap();
     let conn = db.conn();
 
     let mirror_cols = columns_of(conn, "orders");
@@ -728,7 +737,7 @@ fn no_stream_key_snapshot_row_at_boundary_is_applied() {
     let c = db();
     let after: common::Lsn = "0/64".parse().unwrap(); // consistent_point == transformed_lsn == 100
     seed(&c, &[(2, 'i', 100, 3, "only-snap")]);
-    apply_transform(&c, &TransformSql::from_relation(&orders_rel()), &after).unwrap();
+    apply_transform(&c, &TransformSql::from_relation(&orders_rel()), after).unwrap();
     assert_eq!(
         status_of(&c, 2).as_deref(),
         Some("only-snap"),

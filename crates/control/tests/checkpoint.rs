@@ -1,14 +1,18 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Compose-gated integration tests for `loader_checkpoint` and `replication_state`.
 //!
 //! Each test runs inside a rolled-back transaction under a unique `epoch`, so tests are isolated
 //! and idempotent across runs. Gated behind the `integration` feature (needs the PR 0.6 control PG).
 #![cfg(feature = "integration")]
 
-use common::Lsn;
+use common::{EpochNo, FailureClass, Lsn};
 use control::{
-    advance_raw_appended, advance_transformed, connect, ensure_checkpoint, insert_epoch,
-    read_checkpoint, read_current_epoch, run_migrations, ControlError, ReplicationState,
+    ControlError, ReplicationState, ReplicationStatus, advance_raw_appended, advance_transformed,
+    connect, ensure_checkpoint, insert_epoch, read_checkpoint, read_current_epoch, run_migrations,
 };
 use sqlx::postgres::PgPool;
 
@@ -34,7 +38,7 @@ fn lsn(s: &str) -> Lsn {
 async fn ensure_then_advance_raw_then_transformed() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let (e, s, t) = (700_001, "public", "c1");
+    let (e, s, t) = (EpochNo(700_001), "public", "c1");
 
     // Absent before ensure.
     assert!(read_checkpoint(&mut *tx, e, s, t).await.unwrap().is_none());
@@ -63,7 +67,7 @@ async fn ensure_then_advance_raw_then_transformed() {
 async fn check_rejects_transformed_ahead_of_raw() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let (e, s, t) = (700_002, "public", "c2");
+    let (e, s, t) = (EpochNo(700_002), "public", "c2");
 
     ensure_checkpoint(&mut *tx, e, s, t).await.unwrap();
     advance_raw_appended(&mut *tx, e, s, t, lsn("0/100"))
@@ -76,8 +80,14 @@ async fn check_rejects_transformed_ahead_of_raw() {
         .await
         .expect_err("transformed ahead of raw must be rejected");
     assert!(
-        matches!(err, ControlError::CheckViolation(_)) && err.is_terminal(),
+        matches!(err, ControlError::CheckViolation { .. }) && err.is_terminal(),
         "expected a terminal CheckViolation, got {err:?}"
+    );
+    // Against a real server the chain is what carries the SQLSTATE and constraint name; the
+    // one-line verdict above is a summary of it.
+    assert!(
+        std::error::Error::source(&err).is_some(),
+        "the driver error must survive classification, got {err:?}"
     );
 
     tx.rollback().await.unwrap();
@@ -87,7 +97,7 @@ async fn check_rejects_transformed_ahead_of_raw() {
 async fn advances_are_idempotent_and_monotonic() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let (e, s, t) = (700_003, "public", "c3");
+    let (e, s, t) = (EpochNo(700_003), "public", "c3");
 
     ensure_checkpoint(&mut *tx, e, s, t).await.unwrap();
     advance_raw_appended(&mut *tx, e, s, t, lsn("0/100"))
@@ -121,10 +131,10 @@ async fn read_current_epoch_returns_highest_generation() {
     insert_epoch(
         &mut *tx,
         &ReplicationState {
-            epoch: 700_010,
+            epoch: EpochNo(700_010),
             slot_name: "walrus_slot".to_string(),
             created_lsn: lsn("0/10"),
-            status: "bootstrapping".to_string(),
+            status: ReplicationStatus::Bootstrapping,
         },
     )
     .await
@@ -132,10 +142,10 @@ async fn read_current_epoch_returns_highest_generation() {
     insert_epoch(
         &mut *tx,
         &ReplicationState {
-            epoch: 700_011,
+            epoch: EpochNo(700_011),
             slot_name: "walrus_slot".to_string(),
             created_lsn: lsn("0/20"),
-            status: "streaming".to_string(),
+            status: ReplicationStatus::Streaming,
         },
     )
     .await
@@ -143,10 +153,11 @@ async fn read_current_epoch_returns_highest_generation() {
 
     let current = read_current_epoch(&mut *tx).await.unwrap().unwrap();
     assert_eq!(
-        current.epoch, 700_011,
+        current.epoch,
+        EpochNo(700_011),
         "highest epoch is the current generation"
     );
-    assert_eq!(current.status, "streaming");
+    assert_eq!(current.status, ReplicationStatus::Streaming);
     assert_eq!(current.created_lsn, lsn("0/20"));
 
     tx.rollback().await.unwrap();

@@ -17,6 +17,11 @@ pub const SINK_META_COLUMN: &str = "walrus_pg_sink_meta";
 
 /// Full Arrow schema for `rel`: one field per Tier-1 column, then `walrus_pg_sink_meta` (Utf8,
 /// non-null). Data fields are `nullable`; the meta column is not.
+///
+/// # Errors
+///
+/// Returns [`Error::EmptyRelation`] when `rel` has no columns, or [`Error::NotTier1`] when a column
+/// has no supported native, expanded, or canonical-text representation.
 pub fn build_schema(rel: &PgRelation) -> Result<Schema, Error> {
     if rel.columns.is_empty() {
         return Err(Error::EmptyRelation {
@@ -39,6 +44,10 @@ pub fn build_schema(rel: &PgRelation) -> Result<Schema, Error> {
 /// (§2.4). **Data fields stay `nullable(true)`**: delete old-images and unchanged-TOAST placeholders
 /// arrive partial, so even a PK column can be absent on the wire; the mirror's PK-not-null is enforced
 /// downstream in the loader, not here.
+///
+/// # Errors
+///
+/// Returns [`Error::NotTier1`] when the column OID and typmod do not map to any supported tier.
 pub fn emit_fields(col: &PgColumn) -> Result<Vec<Field>, Error> {
     if let Some(dt) = tier1_data_type(col.type_oid, col.type_modifier) {
         return Ok(vec![Field::new(col.name.clone(), dt, true)]);
@@ -85,6 +94,7 @@ pub fn emit_fields(col: &PgColumn) -> Result<Vec<Field>, Error> {
 }
 
 /// Arrow `DataType` for a Tier-1 OID+typmod, or `None` if the type is not (yet) Tier-1.
+#[must_use]
 pub fn tier1_data_type(type_oid: u32, atttypmod: i32) -> Option<DataType> {
     Some(match type_oid {
         oids::BOOL => DataType::Boolean,
@@ -95,13 +105,10 @@ pub fn tier1_data_type(type_oid: u32, atttypmod: i32) -> Option<DataType> {
         oids::FLOAT8 => DataType::Float64,
         // Two numeric cases, kept strictly apart (§2.3): p ≤ 38 is a lossless Decimal128;
         // unconstrained (typmod -1) or p > 38 is a Tier-3 VARCHAR carrier (PR 2.15) — NOT here.
-        oids::NUMERIC => {
-            let (precision, scale) = numeric_precision_scale(atttypmod)?;
-            if precision == 0 || precision > 38 {
-                return None;
-            }
-            DataType::Decimal128(precision, scale)
-        }
+        oids::NUMERIC => match numeric_precision_scale(atttypmod) {
+            Some((p @ 1..=38, s)) => DataType::Decimal128(p, s),
+            _ => return None,
+        },
         oids::TEXT | oids::VARCHAR | oids::BPCHAR | oids::CHAR => DataType::Utf8,
         oids::BYTEA => DataType::Binary,
         // json / jsonb ride as UTF-8 text (DuckDB infers JSON from the string).
@@ -117,13 +124,14 @@ pub fn tier1_data_type(type_oid: u32, atttypmod: i32) -> Option<DataType> {
 
 /// Decode a `numeric` `atttypmod` into `(precision, scale)`, or `None` for unconstrained (`-1`).
 /// `numeric(p,s)` packs `((p << 16) | s) + VARHDRSZ`; subtract `VARHDRSZ` (4) before unpacking.
+#[must_use]
 pub fn numeric_precision_scale(atttypmod: i32) -> Option<(u8, i8)> {
     if atttypmod < 4 {
         return None; // -1 (unconstrained) or an invalid value
     }
-    let packed = (atttypmod - 4) as u32;
-    let precision = ((packed >> 16) & 0xFFFF) as u8;
-    let scale = (packed & 0xFFFF) as i8;
+    let packed = u32::try_from(atttypmod - 4).ok()?;
+    let precision = u8::try_from((packed >> 16) & 0xFFFF).ok()?;
+    let scale = i8::try_from(packed & 0xFFFF).ok()?;
     Some((precision, scale))
 }
 

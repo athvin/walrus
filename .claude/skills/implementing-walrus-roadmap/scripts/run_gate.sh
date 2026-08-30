@@ -46,7 +46,7 @@ done
 # to produce SKIP and a false-green final verdict; it is now an anomaly.
 supported_gates="fmt clippy test sqlx conformance deny msrv compose integration e2e manifests images"
 if [[ "$gates" == ,* ]] || [[ "$gates" == *, ]] || [[ "$gates" == *,,* ]] \
-   || [[ "$gates" =~ [^a-z,-] ]]; then
+   || [[ "$gates" =~ [^a-z0-9,-] ]]; then
   echo "GATE=FAIL"
   echo "ANOMALY=invalid comma-separated gate list $gates"
   exit 2
@@ -115,6 +115,27 @@ run_check() { # run_check NAME cmd...
   if "$@" >"$tmpdir/$name.log" 2>&1; then pass "$name"; else failed "$name"; fi
 }
 
+run_ignored_integration_tests() {
+  # `cargo test --workspace -- --ignored` starts every workspace test binary,
+  # including the many policy/unit targets that have no ignored tests. On
+  # macOS, each newly linked binary can incur a substantial syspolicyd scan.
+  # Discover the integration targets that actually contain `#[ignore]` and
+  # run those targets serially: the test coverage and shared-stack isolation
+  # are unchanged, while zero-match binaries are never launched.
+  local package path target
+  local found=no
+  for package in control pg-sink loader; do
+    while IFS= read -r path; do
+      [ -n "$path" ] || continue
+      found=yes
+      target=${path##*/}
+      target=${target%.rs}
+      cargo test -p "$package" --test "$target" -- --ignored --test-threads=1 || return 1
+    done < <(rg -l '#\[ignore' "crates/$package/tests" --glob '*.rs' | LC_ALL=C sort)
+  done
+  [ "$found" = yes ]
+}
+
 docker_up() { command -v docker >/dev/null && timeout 20 docker info >/dev/null 2>&1; }
 
 ensure_stack() { # boot compose once per run; returns 1 if it cannot
@@ -169,7 +190,16 @@ for gate in ${gates//,/ }; do
       fi
       if command -v sqlx >/dev/null && docker_up && ensure_stack; then
         export DATABASE_URL="$CONTROL_DB_URL"
-        run_check sqlx-prepare cargo sqlx prepare --check --workspace
+        # `prepare --check` re-type-checks every query against a LIVE schema, and a freshly booted
+        # control-pg is empty (compose mounts no init SQL for it). Migrate first — otherwise every
+        # `sqlx::query_file!` fails with `relation "walrus.…" does not exist`, because the
+        # `integration` gate's migrate step runs only later in the list. `migrate run` is
+        # idempotent, so running it in both places is a no-op the second time.
+        if sqlx migrate run --source migrations/control >"$tmpdir/sqlx-prepare.log" 2>&1; then
+          run_check sqlx-prepare cargo sqlx prepare --check --workspace
+        else
+          failed sqlx-prepare
+        fi
       else
         skip sqlx-prepare "needs sqlx-cli + a running control PG (docker daemon)"
       fi ;;
@@ -215,10 +245,14 @@ for gate in ${gates//,/ }; do
         else
           skip control-migrations "sqlx-cli not installed"
         fi
-        run_check integration-control cargo test -p control --features integration
-        # pg-sink's integration tests are #[ignore]d, not feature-gated; CI runs
-        # them one file at a time. Locally, one serialized sweep is the mirror.
-        run_check integration-ignored cargo test --workspace -- --ignored --test-threads=1
+        # These tests share one live control database and derive fixture epochs
+        # from its current state. Serial execution prevents two binaries/tests
+        # from choosing the same next epoch and claiming each other's rows.
+        run_check integration-control cargo test -p control --features integration -- --test-threads=1
+        # Compose-backed integration tests are #[ignore]d, not feature-gated;
+        # run only targets that contain ignored tests, one file at a time like
+        # CI, rather than launching every zero-match workspace test binary.
+        run_check integration-ignored run_ignored_integration_tests
       else
         cp "$tmpdir/compose-up.log" "$tmpdir/integration.log" 2>/dev/null || true
         failed integration
@@ -227,8 +261,11 @@ for gate in ${gates//,/ }; do
     e2e)
       if ! docker_up; then skip e2e "docker daemon not running — CI covers this job"
       elif ensure_stack; then
-        run_check e2e-quarantine cargo test -p e2e --features it --test reload_quarantine -- --ignored --test-threads=1
-        run_check e2e-scale      cargo test -p e2e --features it --test reload_scale      -- --ignored --test-threads=1
+        # Build both reload executables before either harness starts its nested production-binary
+        # build. Separate cargo invocations alternate dependency feature sets and relink the entire
+        # E2E graph twice; repeated --test selectors keep execution serialized without that churn.
+        run_check e2e-reload cargo test -p e2e --features it \
+          --test reload_quarantine --test reload_scale -- --ignored --test-threads=1
       else
         cp "$tmpdir/compose-up.log" "$tmpdir/e2e.log" 2>/dev/null || true
         failed e2e

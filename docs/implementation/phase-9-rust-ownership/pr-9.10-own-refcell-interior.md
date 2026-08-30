@@ -79,6 +79,8 @@ or outcome.
 - The four integration-test assertions that read the latch through the lock
   (`crates/loader/tests/phase_a.rs:290,297,316` and `crates/loader/tests/reload_resync.rs:337`)
   become `ctx.pause_logged.get()`.
+- The sibling unit test's latch constructor (`crates/loader/src/phase_a_test.rs:26`) becomes
+  `Cell::new(None)` so it exercises the required `pause_began(&Cell<_>, …)` signature.
 
 **Explicitly deferred** (do *not* build these here)
 
@@ -95,8 +97,11 @@ or outcome.
 ## Files to create / modify
 
 ```
+docs/implementation/phase-9-rust-ownership/pr-9.10-own-refcell-interior.md
+                                       # reauthor the exhaustive allowlist for the sibling unit test
 crates/loader/src/phase_a.rs           # :41 Cell, :46 RefCell, :53 pause_began signature + body,
                                        #   :248/:270 borrow()/borrow_mut(); + use std::cell::{Cell, RefCell}
+crates/loader/src/phase_a_test.rs      # :26 — Mutex::new(None) → Cell::new(None)
 crates/loader/tests/phase_a.rs         # :290, :297, :316 — *ctx.pause_logged.lock() → .get()
 crates/loader/tests/reload_resync.rs   # :337 — same
 ```
@@ -187,7 +192,8 @@ A reviewer merges this PR when **all** of the following hold:
       a new reload latches and returns `Some(id)`, the same reload returns `None`, `None` clears.
 - [ ] `route_reload_file` uses `borrow()` / `borrow_mut()`, and **no** `Ref`/`RefMut` is alive across
       an `.await` (each borrow is confined to one condition or one statement).
-- [ ] The four test assertions read `ctx.pause_logged.get()`; no test needed a semantic change.
+- [ ] The sibling unit test constructs a `Cell` latch and the four integration-test assertions read
+      `ctx.pause_logged.get()`; no test needed a semantic change.
 - [ ] `crates/loader/src/main.rs` is untouched — `Default::default()` still initialises both fields.
 - [ ] `parking_lot` remains a `loader` dependency (still used by `health.rs`) and
       `crates/loader/src/health.rs:28` is unchanged.

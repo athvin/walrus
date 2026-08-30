@@ -58,13 +58,13 @@ fn snapshot_rows_carry_kind_snapshot_and_consistent_point_commit_lsn() {
         commit_lsn: Lsn::ZERO,
         commit_ts: UtcTimestamp::now(),
         xid: 0,
-        epoch: 7,
+        epoch: common::EpochNo(7),
         batch_id: String::new(),
-        schema_version: 1,
+        schema_version: common::SchemaVersionNo(1),
         source_schema: "public".into(),
         source_table: "orders".into(),
         kind: Kind::Snapshot,
-        unchanged_toast: vec![],
+        unchanged_toast: Box::default(),
         sink_instance: "t".into(),
         sink_processed_at: UtcTimestamp::now(),
     };
@@ -75,13 +75,13 @@ fn snapshot_rows_carry_kind_snapshot_and_consistent_point_commit_lsn() {
     );
 
     let cached = RelationCache::default()
-        .upsert_from_relation(orders(), 1)
+        .upsert_from_relation(orders(), common::SchemaVersionNo(1))
         .unwrap();
     let mut b = TableBatcher::new(
         cached,
         BatchTriggers {
-            max_rows: u64::MAX,
-            max_bytes: u64::MAX,
+            max_rows: std::num::NonZeroU64::MAX,
+            max_bytes: std::num::NonZeroU64::MAX,
             max_fill: std::time::Duration::from_secs(3600),
         },
         Arc::new(SystemClock),
@@ -100,7 +100,7 @@ fn snapshot_rows_carry_kind_snapshot_and_consistent_point_commit_lsn() {
 fn all_snapshot_manifest_files_share_lsn_end() {
     let cp: Lsn = "0/500".parse().unwrap();
     let cached = RelationCache::default()
-        .upsert_from_relation(orders(), 1)
+        .upsert_from_relation(orders(), common::SchemaVersionNo(1))
         .unwrap();
     let meta = |lsn: Lsn| SinkMeta {
         op: Op::Insert,
@@ -108,23 +108,23 @@ fn all_snapshot_manifest_files_share_lsn_end() {
         commit_lsn: Lsn::ZERO,
         commit_ts: UtcTimestamp::now(),
         xid: 0,
-        epoch: 7,
+        epoch: common::EpochNo(7),
         batch_id: String::new(),
-        schema_version: 1,
+        schema_version: common::SchemaVersionNo(1),
         source_schema: "public".into(),
         source_table: "orders".into(),
         kind: Kind::Snapshot,
-        unchanged_toast: vec![],
+        unchanged_toast: Box::default(),
         sink_instance: "t".into(),
         sink_processed_at: UtcTimestamp::now(),
     };
     let mut lsn_ends = Vec::new();
     for _file in 0..2 {
         let mut b = TableBatcher::new(
-            cached.clone(),
+            Arc::clone(&cached),
             BatchTriggers {
-                max_rows: 1,
-                max_bytes: u64::MAX,
+                max_rows: std::num::NonZeroU64::MIN,
+                max_bytes: std::num::NonZeroU64::MAX,
                 max_fill: std::time::Duration::from_secs(3600),
             },
             Arc::new(SystemClock),
@@ -141,5 +141,16 @@ fn all_snapshot_manifest_files_share_lsn_end() {
         lsn_ends,
         vec![cp, cp],
         "every snapshot file shares lsn_end = consistent_point"
+    );
+}
+
+#[test]
+fn out_of_range_catalog_oid_is_reported_not_wrapped() {
+    let raw = i64::from(u32::MAX) + 1;
+    let err = catalog_oid(raw).unwrap_err();
+    let message = format!("{err:#}");
+    assert!(
+        message.contains(&raw.to_string()),
+        "error includes {raw}: {message}"
     );
 }

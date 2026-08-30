@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Completion & crash recovery against compose (`#[ignore]` — needs source PG + control PG +
 //! MinIO). Three proofs (reload H7/H10, PR 6.9):
 //!
@@ -13,7 +18,7 @@
 //!
 //!   cargo test -p pg-sink --test reload_recovery -- --ignored --test-threads=1
 
-use common::Lsn;
+use common::{EpochNo, Lsn, ReloadId, SchemaVersionNo};
 use pg_sink::consume::on_frame;
 use pg_sink::heartbeat::InternalTables;
 use pg_sink::pgoutput::{Message, StreamCtx};
@@ -77,7 +82,7 @@ async fn drop_slot(admin: &tokio_postgres::Client, slot: &str) {
         .await;
 }
 
-async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: i64, n: i64) {
+async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: EpochNo, n: i64) {
     admin
         .batch_execute(&format!(
             "DROP TABLE IF EXISTS public.{TABLE};
@@ -95,8 +100,8 @@ async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: i64, n
             epoch,
             source_schema: "public".to_string(),
             source_table: TABLE.to_string(),
-            schema_version: 1,
-            descriptors: pg_to_arrow::descriptor::describe_relation(&rel),
+            schema_version: SchemaVersionNo(1),
+            descriptors: pg_to_arrow::describe_relation(&rel).unwrap(),
             columns: serde_json::to_value(&rel).unwrap(),
         },
     )
@@ -104,7 +109,7 @@ async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: i64, n
     .unwrap();
 }
 
-async fn scrub(pool: &sqlx::PgPool, epoch: i64) {
+async fn scrub(pool: &sqlx::PgPool, epoch: EpochNo) {
     for tbl in [
         "file_manifest",
         "table_reload",
@@ -151,7 +156,7 @@ fn spawn_echo_resolver(
                     xid,
                 } if internal.is_reload_signal(*relation_oid) => {
                     let rel = internal.reload_signal_rel().unwrap();
-                    if let Some(sig) = PendingSignal::from_tuple(rel, new, *xid) {
+                    if let Ok(sig) = PendingSignal::from_tuple(rel, new, *xid) {
                         pending.push(sig);
                     }
                 }
@@ -166,13 +171,13 @@ fn spawn_echo_resolver(
 
 async fn await_resolver_ready(
     admin: &tokio_postgres::Client,
-    waiters: &Arc<WatermarkWaiters>,
-    epoch: i64,
+    waiters: &WatermarkWaiters,
+    epoch: EpochNo,
 ) {
-    let sentinel = -epoch;
+    let sentinel = -epoch.0;
     let mut ready = false;
     for _ in 0..20 {
-        let rx = waiters.subscribe(sentinel, 1);
+        let rx = waiters.subscribe(ReloadId(sentinel), 1);
         admin
             .batch_execute(&format!(
                 "DELETE FROM walrus.reload_signal WHERE reload_id = {sentinel}; \
@@ -198,16 +203,20 @@ async fn await_resolver_ready(
         .unwrap();
 }
 
-fn export_cfg(epoch: i64, chunk_rows: u64) -> ChunkExportConfig {
+fn export_cfg(epoch: EpochNo, chunk_rows: u64) -> ChunkExportConfig {
     ChunkExportConfig {
-        chunk_rows,
+        chunk_rows: std::num::NonZeroU64::new(chunk_rows).unwrap(),
         echo_timeout: Duration::from_secs(20),
         instance: HOLDER.to_string(),
         epoch,
     }
 }
 
-async fn request_and_claim(pool: &sqlx::PgPool, epoch: i64, holder: &str) -> control::ReloadRow {
+async fn request_and_claim(
+    pool: &sqlx::PgPool,
+    epoch: EpochNo,
+    holder: &str,
+) -> control::ReloadRow {
     control::reload::request(pool, epoch, "public", TABLE, ReloadFlavor::Reload)
         .await
         .unwrap();
@@ -218,12 +227,12 @@ async fn request_and_claim(pool: &sqlx::PgPool, epoch: i64, holder: &str) -> con
         .unwrap()
 }
 
-async fn reload_file_count(pool: &sqlx::PgPool, epoch: i64, reload_id: i64) -> i64 {
+async fn reload_file_count(pool: &sqlx::PgPool, epoch: EpochNo, reload_id: ReloadId) -> i64 {
     sqlx::query_scalar(
         "SELECT count(*) FROM walrus.file_manifest WHERE epoch = $1 AND reload_id = $2",
     )
     .bind(epoch)
-    .bind(reload_id)
+    .bind(reload_id.0)
     .fetch_one(pool)
     .await
     .unwrap()
@@ -232,7 +241,7 @@ async fn reload_file_count(pool: &sqlx::PgPool, epoch: i64, reload_id: i64) -> i
 /// Simulate the loader reaching a watermark: seed the checkpoint and advance both frontiers (the
 /// `raw >= transformed` CHECK needs raw first). Never applies a file — this exercises the
 /// completion PREDICATE, not the mirror content (that is the loader's own suites).
-async fn set_transformed(pool: &sqlx::PgPool, epoch: i64, lsn: Lsn) {
+async fn set_transformed(pool: &sqlx::PgPool, epoch: EpochNo, lsn: Lsn) {
     control::ensure_checkpoint(pool, epoch, "public", TABLE)
         .await
         .unwrap();
@@ -244,7 +253,7 @@ async fn set_transformed(pool: &sqlx::PgPool, epoch: i64, lsn: Lsn) {
         .unwrap();
 }
 
-async fn status(pool: &sqlx::PgPool, reload_id: i64) -> ReloadStatus {
+async fn status(pool: &sqlx::PgPool, reload_id: ReloadId) -> ReloadStatus {
     control::reload::get(pool, reload_id)
         .await
         .unwrap()
@@ -252,11 +261,11 @@ async fn status(pool: &sqlx::PgPool, reload_id: i64) -> ReloadStatus {
         .status
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires docker compose up --wait (source + control PG + MinIO)"]
 async fn kill_mid_export_resumes_from_cursor_and_completes() {
     let _g = SOURCE_LOCK.lock().await;
-    let epoch = 690_001;
+    let epoch = EpochNo(690_001);
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
@@ -267,7 +276,7 @@ async fn kill_mid_export_resumes_from_cursor_and_completes() {
 
     let waiters = Arc::new(WatermarkWaiters::default());
     let token = CancellationToken::new();
-    let resolver = spawn_echo_resolver("walrus_rec_resume", waiters.clone(), token.clone());
+    let resolver = spawn_echo_resolver("walrus_rec_resume", Arc::clone(&waiters), token.clone());
     await_resolver_ready(&admin, &waiters, epoch).await;
 
     // requested → exporting, chunk 1 (2 of 5 rows), then "crash": drop the exporter mid-flight.
@@ -277,8 +286,8 @@ async fn kill_mid_export_resumes_from_cursor_and_completes() {
     let mut crashed = ChunkExporter::connect(
         &source_url(),
         pool.clone(),
-        waiters.clone(),
-        ParquetSink::new(store(), "walrus".to_string(), epoch),
+        Arc::clone(&waiters),
+        ParquetSink::new(store(), "walrus", epoch),
         export_cfg(epoch, 2),
         &req,
     )
@@ -304,8 +313,8 @@ async fn kill_mid_export_resumes_from_cursor_and_completes() {
     let mut resumed = ChunkExporter::connect(
         &source_url(),
         pool.clone(),
-        waiters.clone(),
-        ParquetSink::new(store(), "walrus".to_string(), epoch),
+        Arc::clone(&waiters),
+        ParquetSink::new(store(), "walrus", epoch),
         export_cfg(epoch, 2),
         &row,
     )
@@ -313,7 +322,9 @@ async fn kill_mid_export_resumes_from_cursor_and_completes() {
     .unwrap();
     let h = match resumed.run().await.unwrap() {
         RunOutcome::Drained { final_lsn } => final_lsn,
-        other => panic!("expected drain, got {other:?}"),
+        RunOutcome::SchemaChanged { new_version } => {
+            panic!("expected drain, got SchemaChanged(new_version = {new_version})")
+        }
     };
 
     // The sink's last act: export_complete(H). No chunk at/before the cursor was re-exported.
@@ -362,11 +373,11 @@ async fn kill_mid_export_resumes_from_cursor_and_completes() {
         .unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires docker compose up --wait (source + control PG + MinIO)"]
 async fn complete_waits_for_transformed_lsn_to_reach_h() {
     let _g = SOURCE_LOCK.lock().await;
-    let epoch = 690_002;
+    let epoch = EpochNo(690_002);
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
@@ -377,7 +388,7 @@ async fn complete_waits_for_transformed_lsn_to_reach_h() {
 
     let waiters = Arc::new(WatermarkWaiters::default());
     let token = CancellationToken::new();
-    let resolver = spawn_echo_resolver("walrus_rec_wait", waiters.clone(), token.clone());
+    let resolver = spawn_echo_resolver("walrus_rec_wait", Arc::clone(&waiters), token.clone());
     await_resolver_ready(&admin, &waiters, epoch).await;
 
     // A clean full export to export_complete(H).
@@ -386,8 +397,8 @@ async fn complete_waits_for_transformed_lsn_to_reach_h() {
     let mut exporter = ChunkExporter::connect(
         &source_url(),
         pool.clone(),
-        waiters.clone(),
-        ParquetSink::new(store(), "walrus".to_string(), epoch),
+        Arc::clone(&waiters),
+        ParquetSink::new(store(), "walrus", epoch),
         export_cfg(epoch, 10),
         &req,
     )
@@ -395,7 +406,9 @@ async fn complete_waits_for_transformed_lsn_to_reach_h() {
     .unwrap();
     let h = match exporter.run().await.unwrap() {
         RunOutcome::Drained { final_lsn } => final_lsn,
-        other => panic!("expected drain, got {other:?}"),
+        RunOutcome::SchemaChanged { new_version } => {
+            panic!("expected drain, got SchemaChanged(new_version = {new_version})")
+        }
     };
     control::reload::complete_export(&pool, reload_id, h)
         .await
@@ -443,7 +456,7 @@ async fn complete_waits_for_transformed_lsn_to_reach_h() {
 #[ignore = "requires docker compose up --wait (control PG)"]
 async fn adoption_respects_live_leases_but_takes_expired_ones() {
     let _g = SOURCE_LOCK.lock().await;
-    let epoch = 690_003;
+    let epoch = EpochNo(690_003);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     scrub(&pool, epoch).await;
@@ -473,7 +486,7 @@ async fn adoption_respects_live_leases_but_takes_expired_ones() {
 
     // Expire it (a dead instance): now it is adoptable, and the guarded UPDATE re-acquires it.
     sqlx::query("UPDATE walrus.table_reload SET lease_expiry = now() - interval '1 hour' WHERE reload_id = $1")
-        .bind(reload_id)
+        .bind(reload_id.0)
         .execute(&pool)
         .await
         .unwrap();

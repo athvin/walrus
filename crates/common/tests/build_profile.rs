@@ -1,0 +1,680 @@
+//! Guards PR 5.7's workspace release-profile decision against silent drift.
+
+use std::path::Path;
+
+const WORKSPACE_MANIFEST: &str = include_str!("../../../Cargo.toml");
+const CI_WORKFLOW: &str = include_str!("../../../.github/workflows/ci.yml");
+const DOCKERFILE_PG_SINK: &str = include_str!("../../../deploy/docker/Dockerfile.pg-sink");
+const DOCKERFILE_LOADER: &str = include_str!("../../../deploy/docker/Dockerfile.loader");
+const JUSTFILE: &str = include_str!("../../../justfile");
+const BENCH_E2E: &str = include_str!("../../../scripts/bench-e2e.sh");
+const SINK_SMOKE: &str = include_str!("../../../scripts/sink-smoke.sh");
+const CODEGEN_UNITS_ADR: &str = "docs/implementation/notes/rust-skills/opt-codegen-units.md";
+const CODEGEN_UNITS_NOTE: &str =
+    include_str!("../../../docs/implementation/notes/rust-skills/opt-codegen-units.md");
+const TARGET_CPU_ADR: &str = "docs/implementation/notes/rust-skills/opt-target-cpu.md";
+const TARGET_CPU_NOTE: &str =
+    include_str!("../../../docs/implementation/notes/rust-skills/opt-target-cpu.md");
+const PGO_ADR: &str = "docs/implementation/notes/rust-skills/opt-pgo-profile.md";
+const PGO_NOTE: &str =
+    include_str!("../../../docs/implementation/notes/rust-skills/opt-pgo-profile.md");
+const RELEASE_PROFILE_ADR: &str = "docs/implementation/notes/rust-skills/perf-release-profile.md";
+const RELEASE_PROFILE_NOTE: &str =
+    include_str!("../../../docs/implementation/notes/rust-skills/perf-release-profile.md");
+// Every surface that can hand a target-CPU or ISA flag to a cargo invocation: the manifest, the
+// sole workflow, both shipped Dockerfiles, and the three developer entry points that build a
+// walrus binary. The rule's own Cargo-config example is titled "native builds for development", so
+// the local recipes are a first-class drift vector. This list is wider than CARGO_BUILD_SURFACES
+// because it also covers debug-only `scripts/sink-smoke.sh`: an ISA floor is not a release-profile
+// knob, so a "native" flag on *any* build produces a host-specific binary.
+const TARGET_CPU_SURFACES: &[(&str, &str)] = &[
+    ("Cargo.toml", WORKSPACE_MANIFEST),
+    (".github/workflows/ci.yml", CI_WORKFLOW),
+    ("deploy/docker/Dockerfile.pg-sink", DOCKERFILE_PG_SINK),
+    ("deploy/docker/Dockerfile.loader", DOCKERFILE_LOADER),
+    ("justfile", JUSTFILE),
+    ("scripts/bench-e2e.sh", BENCH_E2E),
+    ("scripts/sink-smoke.sh", SINK_SMOKE),
+];
+// Every surface that invokes cargo to build a shipped artifact or a benchmark, which is where a
+// profile key — a codegen-unit count, a panic strategy, a strip setting — can be reinstated from
+// outside the manifest. The manifest is deliberately absent: its rejection prose names those keys,
+// and `profile_key_declaration` already parses the tables there.
+const CARGO_BUILD_SURFACES: &[(&str, &str)] = &[
+    (".github/workflows/ci.yml", CI_WORKFLOW),
+    ("deploy/docker/Dockerfile.pg-sink", DOCKERFILE_PG_SINK),
+    ("deploy/docker/Dockerfile.loader", DOCKERFILE_LOADER),
+    ("justfile", JUSTFILE),
+    ("scripts/bench-e2e.sh", BENCH_E2E),
+];
+const PGO_SURFACES: &[(&str, &str)] = &[
+    ("Cargo.toml", WORKSPACE_MANIFEST),
+    (".github/workflows/ci.yml", CI_WORKFLOW),
+    ("deploy/docker/Dockerfile.pg-sink", DOCKERFILE_PG_SINK),
+    ("deploy/docker/Dockerfile.loader", DOCKERFILE_LOADER),
+    ("justfile", JUSTFILE),
+    ("scripts/bench-e2e.sh", BENCH_E2E),
+];
+
+fn table_body<'a>(manifest: &'a str, header: &str) -> Option<&'a str> {
+    let mut offset = 0;
+    let mut body_start: Option<usize> = None;
+
+    for line in manifest.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if let Some(start) = body_start {
+            if trimmed.starts_with('[') {
+                return Some(&manifest[start..offset]);
+            }
+        } else if trimmed == header {
+            body_start = Some(offset + line.len());
+        }
+        offset += line.len();
+    }
+
+    body_start.map(|start| &manifest[start..])
+}
+
+fn assignment_value<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+    body.lines().find_map(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return None;
+        }
+
+        let (name, value) = line.split_once('=')?;
+        if name.trim() != key {
+            return None;
+        }
+
+        Some(value.split('#').next()?.trim())
+    })
+}
+
+fn release_lto(manifest: &str) -> Result<&str, &'static str> {
+    let release = table_body(manifest, "[profile.release]").ok_or("missing [profile.release]")?;
+    let value = assignment_value(release, "lto").ok_or("missing lto")?;
+    let value = value.trim_matches('"');
+
+    if matches!(value, "false" | "off") {
+        Err("lto disabled")
+    } else {
+        Ok(value)
+    }
+}
+
+/// The `[profile.…]` header that declares `key`, if any. *Every* profile table counts, not only
+/// `[profile.release]`: the rules park an override in a `bench`, `production` or
+/// `release-with-debug` table just as readily, and `bench` inherits `release` — an override there
+/// would quietly de-couple `docs/benchmarks.md`'s numbers from the shipped artifact. Per-package
+/// tables (`[profile.release.package.…]`) accept the keys too. Comments are not assignments, so the
+/// rationale above the table may keep naming them, and a key that doubles as a lint name — `panic`
+/// sits in `[workspace.lints.clippy]` — counts only under a `[profile…]` header.
+fn profile_key_declaration<'a>(manifest: &'a str, key: &str) -> Option<&'a str> {
+    let mut profile = None;
+
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            profile = line.starts_with("[profile").then_some(line);
+        } else if let Some(header) = profile
+            && assignment_value(line, key).is_some()
+        {
+            return Some(header);
+        }
+    }
+
+    None
+}
+
+fn codegen_units_policy(manifest: &str) -> Result<(), &'static str> {
+    if profile_key_declaration(manifest, "codegen-units").is_some() {
+        Err("codegen-units declared")
+    } else if !manifest.contains(CODEGEN_UNITS_ADR) {
+        Err("missing codegen-units ADR link")
+    } else {
+        Ok(())
+    }
+}
+
+/// Cargo also reads the setting from outside the manifest: `CARGO_PROFILE_<name>_CODEGEN_UNITS` in
+/// the environment, `-C codegen-units` in a rustc flag, or a `--config` override on the command
+/// line. Each of those reinstates the rejected setting with the manifest guard still green.
+fn codegen_units_override_policy(body: &str) -> Result<(), &'static str> {
+    for (needle, diagnostic) in [
+        ("CODEGEN_UNITS", "a codegen-units env override is set"),
+        ("codegen-units", "a codegen-units build flag is set"),
+    ] {
+        if body.contains(needle) {
+            return Err(diagnostic);
+        }
+    }
+    Ok(())
+}
+
+/// The two knobs the release-profile rule adds beyond LTO and codegen units. Both are rejected on
+/// behaviour rather than build cost: `panic = "abort"` deletes `crates/pg-sink/src/reload.rs`'s
+/// `JoinError::is_panic` arm from the shipped binary, so one panicking exporter task would take the
+/// pod down instead of leaving a classified log line and an expiring lease; `strip` removes the
+/// symbol table that names the frames in a profile of the release — and, by inheritance, `bench` —
+/// binary, which `docs/benchmarks.md` pins as its methodology.
+fn release_profile_policy(manifest: &str) -> Result<(), &'static str> {
+    for (key, diagnostic) in [
+        ("panic", "a panic strategy is declared"),
+        ("strip", "symbol stripping is declared"),
+    ] {
+        if profile_key_declaration(manifest, key).is_some() {
+            return Err(diagnostic);
+        }
+    }
+
+    if manifest.contains(RELEASE_PROFILE_ADR) {
+        Ok(())
+    } else {
+        Err("missing release-profile ADR link")
+    }
+}
+
+/// The out-of-manifest half, one environment needle and one build-flag needle per key, exactly as
+/// `codegen_units_override_policy` has. The trailing `=` is what makes the second pair safe: unlike
+/// `codegen-units`, these key names are ordinary English words, so a bare needle would reject any
+/// surface whose comments discussed a panic. `-C panic=abort` is caught twice over — here, and by
+/// `target_cpu_policy` below, which rejects *any* rustflags variable on all of these surfaces.
+fn profile_key_override_policy(body: &str) -> Result<(), &'static str> {
+    for (needle, diagnostic) in [
+        ("_PANIC", "a panic-strategy env override is set"),
+        ("_STRIP", "a symbol-stripping env override is set"),
+        ("panic=", "a panic-strategy build flag is set"),
+        ("strip=", "a symbol-stripping build flag is set"),
+    ] {
+        if body.contains(needle) {
+            return Err(diagnostic);
+        }
+    }
+    Ok(())
+}
+
+/// `target-feature` is the fourth spelling and needs its own needle: `cargo rustc --release --
+/// -C target-feature=+avx2,+fma` establishes the same ISA floor as a named CPU — the AVX2/FMA
+/// instructions the rule's "What Changes" section is about — while mentioning neither `target-cpu`
+/// nor either rustflags variable, so the first three needles all miss it.
+fn target_cpu_policy(body: &str) -> Result<(), &'static str> {
+    for (needle, diagnostic) in [
+        ("target-cpu", "target-cpu is set"),
+        ("RUSTFLAGS", "RUSTFLAGS is set"),
+        ("rustflags", "rustflags is set"),
+        ("target-feature", "a target-feature flag is set"),
+    ] {
+        if body.contains(needle) {
+            return Err(diagnostic);
+        }
+    }
+    Ok(())
+}
+
+/// The paths named by `[workspace] members`. Cargo discovers configuration from the *invocation's*
+/// directory upwards, so a `.cargo/config.toml` dropped inside a member crate injects its
+/// `rustflags` into every `cargo build` run from there while the workspace root stays clean.
+/// Reading the list from the manifest keeps the check honest when a member is added.
+fn workspace_members(manifest: &str) -> Vec<&str> {
+    let Some(body) = table_body(manifest, "[workspace]") else {
+        return Vec::new();
+    };
+    let Some(members) = assignment_value(body, "members") else {
+        return Vec::new();
+    };
+
+    members
+        .trim_matches(['[', ']'])
+        .split(',')
+        .map(|entry| entry.trim().trim_matches('"'))
+        .filter(|entry| !entry.is_empty())
+        .collect()
+}
+
+const fn cargo_config_policy(
+    config_toml_exists: bool,
+    legacy_config_exists: bool,
+) -> Result<(), &'static str> {
+    if config_toml_exists {
+        Err(".cargo/config.toml exists")
+    } else if legacy_config_exists {
+        Err(".cargo/config exists")
+    } else {
+        Ok(())
+    }
+}
+
+/// The build-surface half of the PGO rejection. `-Cprofile-generate` and `-Cprofile-use` are the
+/// instrument and optimize passes; `llvm-profdata` is the merge between them. `llvm-bolt` needs its
+/// own needle because the rule's post-link follow-on reorders blocks and functions from a
+/// `perf.data` profile *after* the linker has run: a bare `RUN llvm-bolt …` layer carries none of
+/// the `-Cprofile-*` flags the first three look for and applies to an ordinary release binary, so
+/// nothing above would see it.
+fn pgo_policy(body: &str) -> Result<(), &'static str> {
+    for (needle, diagnostic) in [
+        ("profile-generate", "PGO profile generation is enabled"),
+        ("profile-use", "PGO profile use is enabled"),
+        ("llvm-profdata", "llvm-profdata is invoked"),
+        ("llvm-bolt", "a BOLT post-link step is added"),
+    ] {
+        if body.contains(needle) {
+            return Err(diagnostic);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn workspace_release_profile_keeps_thin_lto() {
+    assert_eq!(release_lto(WORKSPACE_MANIFEST), Ok("thin"));
+}
+
+#[test]
+fn lto_policy_rejects_disabled_missing_and_comment_only_values() {
+    let cases = [
+        (
+            "[workspace]\nmembers = []\n",
+            Err("missing [profile.release]"),
+        ),
+        ("[profile.release]\nopt-level = 3\n", Err("missing lto")),
+        ("[profile.release]\nlto = false\n", Err("lto disabled")),
+        ("[profile.release]\nlto = \"off\"\n", Err("lto disabled")),
+        (
+            "[profile.release]\n# lto = \"thin\"\ncodegen-units = 16\n",
+            Err("missing lto"),
+        ),
+    ];
+
+    for (manifest, expected) in cases {
+        assert_eq!(release_lto(manifest), expected, "manifest:\n{manifest}");
+    }
+}
+
+#[test]
+fn profile_comment_does_not_declare_codegen_units() {
+    let release = table_body(WORKSPACE_MANIFEST, "[profile.release]").expect("release profile");
+    assert_eq!(assignment_value(release, "codegen-units"), None);
+}
+
+#[test]
+fn no_profile_table_declares_codegen_units() {
+    assert_eq!(
+        profile_key_declaration(WORKSPACE_MANIFEST, "codegen-units"),
+        None,
+        "walrus keeps the default codegen-unit count; see {CODEGEN_UNITS_ADR}"
+    );
+}
+
+#[test]
+fn no_build_surface_overrides_codegen_units() {
+    for (name, body) in CARGO_BUILD_SURFACES {
+        assert_eq!(
+            codegen_units_override_policy(body),
+            Ok(()),
+            "{name} must leave codegen-units at the default; see {CODEGEN_UNITS_ADR}"
+        );
+    }
+}
+
+#[test]
+fn codegen_units_rejection_rationale_is_still_recorded() {
+    assert_eq!(codegen_units_policy(WORKSPACE_MANIFEST), Ok(()));
+    assert!(
+        !CODEGEN_UNITS_NOTE.trim().is_empty(),
+        "{CODEGEN_UNITS_ADR} must contain the recorded decision"
+    );
+}
+
+#[test]
+fn codegen_units_policy_rejects_fabricated_input() {
+    let linked_default = concat!(
+        "# docs/implementation/notes/rust-skills/opt-codegen-units.md\n",
+        "[profile.release]\n",
+        "lto = \"thin\"\n",
+    );
+    let linked_override = concat!(
+        "# docs/implementation/notes/rust-skills/opt-codegen-units.md\n",
+        "[profile.release]\n",
+        "lto = \"thin\"\n",
+        "codegen-units = 1\n",
+    );
+    let linked_comment = concat!(
+        "# docs/implementation/notes/rust-skills/opt-codegen-units.md\n",
+        "[profile.release]\n",
+        "lto = \"thin\"\n",
+        "# codegen-units = 1\n",
+    );
+    let bench_override = concat!(
+        "# docs/implementation/notes/rust-skills/opt-codegen-units.md\n",
+        "[profile.release]\n",
+        "lto = \"thin\"\n",
+        "\n",
+        "[profile.bench]\n",
+        "inherits = \"release\"\n",
+        "codegen-units = 1\n",
+    );
+    let package_override = concat!(
+        "# docs/implementation/notes/rust-skills/opt-codegen-units.md\n",
+        "[profile.release]\n",
+        "lto = \"thin\"\n",
+        "\n",
+        "[profile.release.package.duckdb]\n",
+        "codegen-units = 1\n",
+    );
+    let missing_link = "[profile.release]\nlto = \"thin\"\n";
+
+    let cases = [
+        (linked_default, Ok(())),
+        (linked_comment, Ok(())),
+        (linked_override, Err("codegen-units declared")),
+        (bench_override, Err("codegen-units declared")),
+        (package_override, Err("codegen-units declared")),
+        (missing_link, Err("missing codegen-units ADR link")),
+    ];
+
+    for (manifest, expected) in cases {
+        assert_eq!(
+            codegen_units_policy(manifest),
+            expected,
+            "manifest:\n{manifest}"
+        );
+    }
+}
+
+#[test]
+fn codegen_units_override_policy_rejects_fabricated_input() {
+    let cases = [
+        ("RUN cargo build --release", Ok(())),
+        (
+            "ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1",
+            Err("a codegen-units env override is set"),
+        ),
+        (
+            "RUSTFLAGS=\"-C codegen-units=1\" cargo build --release",
+            Err("a codegen-units build flag is set"),
+        ),
+        (
+            "cargo build --release --config profile.release.codegen-units=1",
+            Err("a codegen-units build flag is set"),
+        ),
+    ];
+
+    for (body, expected) in cases {
+        assert_eq!(
+            codegen_units_override_policy(body),
+            expected,
+            "surface:\n{body}"
+        );
+    }
+}
+
+#[test]
+fn no_profile_table_declares_panic_or_strip() {
+    assert_eq!(
+        release_profile_policy(WORKSPACE_MANIFEST),
+        Ok(()),
+        "walrus keeps unwinding and its symbol table; see {RELEASE_PROFILE_ADR}"
+    );
+}
+
+#[test]
+fn release_profile_policy_rejects_fabricated_input() {
+    let linked_default = concat!(
+        "# docs/implementation/notes/rust-skills/perf-release-profile.md\n",
+        "[profile.release]\n",
+        "lto = \"thin\"\n",
+    );
+    // The workspace's own `panic = "deny"` clippy entry is not a profile key.
+    let lint_table_panic = concat!(
+        "# docs/implementation/notes/rust-skills/perf-release-profile.md\n",
+        "[workspace.lints.clippy]\n",
+        "panic = \"deny\"\n",
+        "\n",
+        "[profile.release]\n",
+        "lto = \"thin\"\n",
+    );
+    let abort_panic = concat!(
+        "# docs/implementation/notes/rust-skills/perf-release-profile.md\n",
+        "[profile.release]\n",
+        "lto = \"thin\"\n",
+        "panic = \"abort\"\n",
+    );
+    // `bench` inherits `release`, so stripping it alone still costs the benchmark its frames.
+    let stripped_bench = concat!(
+        "# docs/implementation/notes/rust-skills/perf-release-profile.md\n",
+        "[profile.release]\n",
+        "lto = \"thin\"\n",
+        "\n",
+        "[profile.bench]\n",
+        "inherits = \"release\"\n",
+        "strip = true\n",
+    );
+    let missing_link = "[profile.release]\nlto = \"thin\"\n";
+
+    let cases = [
+        (linked_default, Ok(())),
+        (lint_table_panic, Ok(())),
+        (abort_panic, Err("a panic strategy is declared")),
+        (stripped_bench, Err("symbol stripping is declared")),
+        (missing_link, Err("missing release-profile ADR link")),
+    ];
+
+    for (manifest, expected) in cases {
+        assert_eq!(
+            release_profile_policy(manifest),
+            expected,
+            "manifest:\n{manifest}"
+        );
+    }
+}
+
+#[test]
+fn no_build_surface_overrides_panic_or_strip() {
+    for (name, body) in CARGO_BUILD_SURFACES {
+        assert_eq!(
+            profile_key_override_policy(body),
+            Ok(()),
+            "{name} must build the profile the manifest declares; see {RELEASE_PROFILE_ADR}"
+        );
+    }
+}
+
+#[test]
+fn profile_key_override_policy_rejects_fabricated_input() {
+    let cases = [
+        ("RUN cargo build --release", Ok(())),
+        // Prose about a panicking task is not an override; only the two shapes below are.
+        ("# the exporter panics, the lease expires", Ok(())),
+        (
+            "ENV CARGO_PROFILE_RELEASE_PANIC=abort",
+            Err("a panic-strategy env override is set"),
+        ),
+        (
+            "ENV CARGO_PROFILE_RELEASE_STRIP=true",
+            Err("a symbol-stripping env override is set"),
+        ),
+        (
+            "RUSTFLAGS=\"-C panic=abort\" cargo build --release",
+            Err("a panic-strategy build flag is set"),
+        ),
+        (
+            "cargo build --release --config profile.bench.strip=true",
+            Err("a symbol-stripping build flag is set"),
+        ),
+    ];
+
+    for (body, expected) in cases {
+        assert_eq!(
+            profile_key_override_policy(body),
+            expected,
+            "surface:\n{body}"
+        );
+    }
+}
+
+#[test]
+fn release_profile_decision_is_recorded() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    assert!(
+        root.join(RELEASE_PROFILE_ADR).is_file(),
+        "missing release-profile decision at {RELEASE_PROFILE_ADR}"
+    );
+    assert!(
+        !RELEASE_PROFILE_NOTE.trim().is_empty(),
+        "{RELEASE_PROFILE_ADR} must contain the recorded decision and re-open trigger"
+    );
+}
+
+#[test]
+fn no_build_surface_sets_a_target_cpu() {
+    for (name, body) in TARGET_CPU_SURFACES {
+        assert_eq!(
+            target_cpu_policy(body),
+            Ok(()),
+            "{name} must remain portable; see {TARGET_CPU_ADR}"
+        );
+    }
+}
+
+#[test]
+fn no_cargo_config_exists() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let members = workspace_members(WORKSPACE_MANIFEST);
+    assert!(
+        !members.is_empty(),
+        "the member list must stay parseable, or this check silently shrinks to the root"
+    );
+
+    for dir in std::iter::once(".").chain(members) {
+        let path = root.join(dir);
+        assert_eq!(
+            cargo_config_policy(
+                path.join(".cargo/config.toml").exists(),
+                path.join(".cargo/config").exists(),
+            ),
+            Ok(()),
+            "{dir}/.cargo must remain absent; see {TARGET_CPU_ADR}"
+        );
+    }
+}
+
+#[test]
+fn workspace_members_reads_every_declared_member() {
+    let manifest = concat!(
+        "[workspace]\n",
+        "resolver = \"2\"\n",
+        "members = [\"crates/common\", \"tests/e2e\"] # one crate at a time\n",
+        "\n",
+        "[workspace.package]\n",
+        "edition = \"2024\"\n",
+    );
+
+    assert_eq!(workspace_members(manifest), ["crates/common", "tests/e2e"]);
+    assert_eq!(
+        workspace_members("[package]\nname = \"common\"\n"),
+        Vec::<&str>::new()
+    );
+    assert!(workspace_members(WORKSPACE_MANIFEST).contains(&"crates/loader"));
+}
+
+#[test]
+fn target_cpu_policy_rejects_fabricated_input() {
+    let surface_cases = [
+        ("RUN cargo build --release", Ok(())),
+        (
+            "ENV RUSTFLAGS=\"-C target-cpu=native\"",
+            Err("target-cpu is set"),
+        ),
+        ("ENV RUSTFLAGS=-Copt-level=3", Err("RUSTFLAGS is set")),
+        (
+            "rustflags = [\"-C\", \"target-feature=+avx2\"]",
+            Err("rustflags is set"),
+        ),
+        // Neither `target-cpu` nor a rustflags variable appears here, so only the fourth needle
+        // rejects this ISA floor.
+        (
+            "cargo rustc --release -p loader -- -C target-feature=+avx2,+fma",
+            Err("a target-feature flag is set"),
+        ),
+    ];
+    for (body, expected) in surface_cases {
+        assert_eq!(target_cpu_policy(body), expected, "surface:\n{body}");
+    }
+
+    let config_cases = [
+        ((false, false), Ok(())),
+        ((true, false), Err(".cargo/config.toml exists")),
+        ((false, true), Err(".cargo/config exists")),
+    ];
+    for ((config_toml_exists, legacy_config_exists), expected) in config_cases {
+        assert_eq!(
+            cargo_config_policy(config_toml_exists, legacy_config_exists),
+            expected
+        );
+    }
+}
+
+#[test]
+fn target_cpu_rejection_is_recorded() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    assert!(
+        root.join(TARGET_CPU_ADR).is_file(),
+        "missing target-CPU decision at {TARGET_CPU_ADR}"
+    );
+    assert!(
+        !TARGET_CPU_NOTE.trim().is_empty(),
+        "{TARGET_CPU_ADR} must contain the recorded decision"
+    );
+}
+
+#[test]
+fn no_build_surface_enables_pgo() {
+    for (name, body) in PGO_SURFACES {
+        assert_eq!(
+            pgo_policy(body),
+            Ok(()),
+            "{name} must remain free of PGO instrumentation; see {PGO_ADR}"
+        );
+    }
+}
+
+#[test]
+fn pgo_policy_rejects_fabricated_input() {
+    let cases = [
+        ("RUN cargo build --release", Ok(())),
+        (
+            "ENV RUSTFLAGS=\"-Cprofile-generate=/tmp/pgo\"",
+            Err("PGO profile generation is enabled"),
+        ),
+        (
+            "RUSTFLAGS=\"-Cprofile-use=/tmp/pgo.profdata\" cargo build",
+            Err("PGO profile use is enabled"),
+        ),
+        (
+            "pgo:\n    llvm-profdata merge -o merged.profdata raw",
+            Err("llvm-profdata is invoked"),
+        ),
+        (
+            "RUN llvm-bolt target/release/walrus-loader -o walrus-loader.bolt -data=perf.data",
+            Err("a BOLT post-link step is added"),
+        ),
+    ];
+
+    for (body, expected) in cases {
+        assert_eq!(pgo_policy(body), expected, "surface:\n{body}");
+    }
+}
+
+#[test]
+fn pgo_decision_is_still_recorded() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    assert!(
+        root.join(PGO_ADR).is_file(),
+        "missing PGO decision at {PGO_ADR}"
+    );
+    assert!(
+        !PGO_NOTE.trim().is_empty(),
+        "{PGO_ADR} must contain the recorded decision and re-open trigger"
+    );
+}

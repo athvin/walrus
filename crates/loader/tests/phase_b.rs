@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Phase B against compose (`#[ignore]` — needs control PG + MinIO). Append a seeded Parquet with
 //! intra-batch PK churn, then transform: the mirror `<table>` ends equal to the **current** source
 //! (one row per PK, latest values, deletes absent), `transformed_lsn` advances to `max(commit_lsn)`
@@ -6,10 +11,10 @@
 //!
 //!   cargo test -p loader --test phase_b -- --ignored
 
-use common::{Lsn, PgColumn, PgRelation, ReplicaIdentity};
+use common::{EpochNo, Lsn, PgColumn, PgRelation, ReplicaIdentity};
 use loader::duck::{S3Access, TableDb};
 use loader::health::LoaderState;
-use loader::phase_a::{run_phase_a, TableCtx};
+use loader::phase_a::{TableCtx, run_phase_a};
 use loader::phase_b::run_phase_b;
 use std::time::Duration;
 
@@ -47,29 +52,33 @@ fn orders() -> PgRelation {
     }
 }
 
-fn tmpdir(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("walrus-loader-pb-{name}"));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+/// A scratch directory for one test's `.duckdb` file. The returned guard deletes it on drop — even
+/// when an assertion panics, which a trailing `remove_dir_all` would skip.
+fn tmpdir(name: &str) -> tempfile::TempDir {
+    let prefix = format!("walrus-loader-pb-{name}-");
+    tempfile::Builder::new().prefix(&prefix).tempdir().unwrap()
 }
 
 fn meta(op: &str, l: u64) -> String {
     format!(
         "{{\"op\":\"{op}\",\"commit_lsn\":\"0000000000000064\",\"lsn\":\"{:016X}\",\"sink_processed_at\":\"2026-07-07T12:00:{:02}Z\"}}",
-        l, l % 60
+        l,
+        l % 60
     )
 }
 
 /// Fixture with intra-batch churn: key 1 (i→i final), key 2 (lone i), key 3 (i→d, deleted).
-fn write_fixture(epoch: i64) -> String {
+fn write_fixture(epoch: EpochNo) -> String {
     let w = duckdb::Connection::open_in_memory().unwrap();
     let a = s3();
     w.execute_batch(&format!(
         "INSTALL httpfs; LOAD httpfs; SET s3_region='{}'; SET s3_endpoint='{}'; \
          SET s3_url_style='path'; SET s3_use_ssl=false; \
          SET s3_access_key_id='{}'; SET s3_secret_access_key='{}';",
-        a.region, a.endpoint, a.access_key_id, a.secret_access_key
+        a.region,
+        a.endpoint,
+        a.access_key_id,
+        a.secret_access_key.expose()
     ))
     .unwrap();
     w.execute_batch(
@@ -95,7 +104,7 @@ fn write_fixture(epoch: i64) -> String {
     uri
 }
 
-async fn setup(epoch: i64) -> (TableCtx, std::path::PathBuf) {
+async fn setup(epoch: EpochNo) -> (TableCtx, tempfile::TempDir) {
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     for tbl in ["file_manifest", "loader_checkpoint", "replication_state"] {
@@ -110,7 +119,7 @@ async fn setup(epoch: i64) -> (TableCtx, std::path::PathBuf) {
             epoch,
             slot_name: "walrus_slot".into(),
             created_lsn: "0/0".parse().unwrap(),
-            status: "streaming".into(),
+            status: control::ReplicationStatus::Streaming,
         },
     )
     .await
@@ -130,25 +139,28 @@ async fn setup(epoch: i64) -> (TableCtx, std::path::PathBuf) {
             row_count: 5,
             lsn_start: "0/64".parse().unwrap(),
             lsn_end: "0/64".parse().unwrap(),
-            schema_version: 1,
+            schema_version: common::SchemaVersionNo(1),
             reload_id: None,
         },
     )
     .await
     .unwrap();
     let dir = tmpdir(&epoch.to_string());
-    let db = TableDb::open(&dir.join("orders.duckdb")).unwrap();
-    db.ensure_tables(&orders(), 1).unwrap();
+    let db = TableDb::open(dir.path().join("orders.duckdb")).unwrap();
+    db.ensure_tables(&orders(), common::SchemaVersionNo(1))
+        .unwrap();
     db.configure_s3(&s3()).unwrap();
     let ctx = TableCtx {
         pool,
         epoch,
+        epoch_rx: loader::epoch::fixed_epoch_watch(epoch),
         schema: "public".into(),
         table: "orders".into(),
+        series: "public.orders".into(),
         rel: orders(),
         db,
         state: LoaderState::new(),
-        max_files: 100,
+        max_files: std::num::NonZeroI64::new(100).unwrap(),
         poll_interval: Duration::from_secs(5),
         compaction_interval: Duration::from_secs(3600),
         retention_lsn_lag: 16 << 20,
@@ -172,8 +184,8 @@ fn mirror(ctx: &TableCtx) -> Vec<(i64, String)> {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn mirror_equals_current_source_after_transform() {
     let _g = LOCK.lock().await;
-    let epoch = 3_400_001;
-    let (ctx, dir) = setup(epoch).await;
+    let epoch = EpochNo(3_400_001);
+    let (ctx, _dir) = setup(epoch).await;
 
     run_phase_a(&ctx).await.unwrap();
     run_phase_b(&ctx).await.unwrap();
@@ -183,15 +195,14 @@ async fn mirror_equals_current_source_after_transform() {
         vec![(1, "final1".to_string()), (2, "keep2".to_string())],
         "mirror = current source: key 1 latest insert, key 2 kept, key 3 (i→d) absent"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn transformed_lsn_advances_to_max_applied_commit_lsn() {
     let _g = LOCK.lock().await;
-    let epoch = 3_400_002;
-    let (ctx, dir) = setup(epoch).await;
+    let epoch = EpochNo(3_400_002);
+    let (ctx, _dir) = setup(epoch).await;
 
     run_phase_a(&ctx).await.unwrap();
     let applied = run_phase_b(&ctx).await.unwrap();
@@ -210,15 +221,14 @@ async fn transformed_lsn_advances_to_max_applied_commit_lsn() {
         cp.transformed_lsn <= cp.raw_appended_lsn,
         "the CHECK invariant holds"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn re_running_phase_b_is_idempotent() {
     let _g = LOCK.lock().await;
-    let epoch = 3_400_003;
-    let (ctx, dir) = setup(epoch).await;
+    let epoch = EpochNo(3_400_003);
+    let (ctx, _dir) = setup(epoch).await;
 
     run_phase_a(&ctx).await.unwrap();
     run_phase_b(&ctx).await.unwrap();
@@ -236,6 +246,4 @@ async fn re_running_phase_b_is_idempotent() {
         first,
         "re-transforming the same tail is byte-identical"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

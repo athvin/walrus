@@ -447,7 +447,7 @@ duplicated OID literals (Tier 2), the opt-in domain-ID newtype sweep (Tier 3), a
 |---|---|---|---|
 | ☐ | [12.1](./phase-12-rust-unsafe/pr-12.1-unsafe-safety-comment.md) | Forbid unsafe code workspace-wide and require SAFETY comments if it ever returns | `unsafe-safety-comment` |
 | ☐ | [12.2](./phase-12-rust-unsafe/pr-12.2-unsafe-minimize-scope.md) | Deny unsafe_op_in_unsafe_fn and multiple unsafe ops per block | `unsafe-minimize-scope` |
-| ☐ | [12.3](./phase-12-rust-unsafe/pr-12.3-unsafe-extern-block.md) | Deny missing_unsafe_on_extern and document the one native FFI boundary | `unsafe-extern-block` |
+| ☐ | [12.3](./phase-12-rust-unsafe/pr-12.3-unsafe-extern-block.md) | Deny missing_unsafe_on_extern and document bundled DuckDB's FFI boundary | `unsafe-extern-block` |
 | ☐ | [12.4](./phase-12-rust-unsafe/pr-12.4-unsafe-no-mangle-unsafe.md) | Deny unsafe_attr_outside_unsafe so exported symbols stay auditable | `unsafe-no-mangle-unsafe` |
 | ☐ | [12.5](./phase-12-rust-unsafe/pr-12.5-unsafe-send-sync-manual.md) | Correct the loader's Send/Sync claims and pin them with compile-time assertions | `unsafe-send-sync-manual` |
 | ☐ | [12.6](./phase-12-rust-unsafe/pr-12.6-unsafe-maybeuninit.md) | Guard against fake initialization and record why walrus never needs MaybeUninit | `unsafe-maybeuninit` |
@@ -620,7 +620,7 @@ duplicated OID literals (Tier 2), the opt-in domain-ID newtype sweep (Tier 3), a
 
 | ☐ | PR | Delivers | Rust rule |
 |---|---|---|---|
-| ☐ | [25.1](./phase-25-rust-closures/pr-25.1-closure-impl-fn-return.md) | Return an impl FnOnce error mapper for the loader's DuckDB map_err closures | `closure-impl-fn-return` |
+| ☐ | [25.1](./phase-25-rust-closures/pr-25.1-closure-impl-fn-return.md) | Record why DuckResultExt supersedes a returned closure mapper | `closure-impl-fn-return` |
 | ☐ | [25.2](./phase-25-rust-closures/pr-25.2-closure-fn-trait-bounds.md) | Add a FnOnce transaction seam to TableDb so rollback cannot be forgotten | `closure-fn-trait-bounds` |
 | ☐ | [25.3](./phase-25-rust-closures/pr-25.3-closure-disjoint-capture.md) | Narrow the streamed-txn survivor closure from &self to the aborted set | `closure-disjoint-capture` |
 | ☐ | [25.4](./phase-25-rust-closures/pr-25.4-closure-move-capture.md) | Gate the clone-before-move discipline with clippy::redundant_clone | `closure-move-capture` |
@@ -639,11 +639,11 @@ duplicated OID literals (Tier 2), the opt-in domain-ID newtype sweep (Tier 3), a
 
 | ☐ | PR | Delivers | Rust rule |
 |---|---|---|---|
-| ☐ | [27.1](./phase-27-rust-naming/pr-27.1-name-as-free.md) | Rename the allocating `LoaderError::as_common` to `to_common` | `name-as-free` |
+| ☐ | [27.1](./phase-27-rust-naming/pr-27.1-name-as-free.md) | Record PR 13.4 as owner of the LoaderError conversion | `name-as-free` |
 | ☐ | [27.2](./phase-27-rust-naming/pr-27.2-name-to-expensive.md) | Give the allocating column projections a `to_` cost signal | `name-to-expensive` |
 | ☐ | [27.3](./phase-27-rust-naming/pr-27.3-name-into-ownership.md) | Rename `BatchBuilder::finish` to `into_record_batch` to signal the move | `name-into-ownership` |
 | ☐ | [27.4](./phase-27-rust-naming/pr-27.4-name-is-has-bool.md) | Prefix the predicate methods with `is_` | `name-is-has-bool` |
-| ☐ | [27.5](./phase-27-rust-naming/pr-27.5-name-lifetime-short.md) | Elide the two nameable-but-pointless sqlx encoder lifetimes and deny `elidable_lifetime_names` | `name-lifetime-short` |
+| ☐ | [27.5](./phase-27-rust-naming/pr-27.5-name-lifetime-short.md) | Record PR 9.6 as owner of SQLx encoder lifetime elision | `name-lifetime-short` |
 | ☐ | [27.6](./phase-27-rust-naming/pr-27.6-name-iter-method.md) | Give `PgRelation` `iter()` and `iter_mut()` over its columns | `name-iter-method` |
 | ☐ | [27.7](./phase-27-rust-naming/pr-27.7-name-iter-convention.md) | Implement `IntoIterator` for `PgRelation` and its two reference forms | `name-iter-convention` |
 | ☐ | [27.8](./phase-27-rust-naming/pr-27.8-name-iter-type-match.md) | Name the `PgRelation` iterator types `Iter`, `IterMut`, `IntoIter` | `name-iter-type-match` |

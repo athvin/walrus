@@ -29,19 +29,25 @@ pub struct DurabilityCheckpoint {
 }
 
 impl DurabilityCheckpoint {
-    pub fn new(resume_lsn: Lsn) -> Self {
+    /// A checkpoint starting at the LSN the slot is resuming from — the position already known
+    /// durable, not zero, so a restart never re-confirms ground the source has moved past.
+    #[must_use]
+    pub const fn new(resume_lsn: Lsn) -> Self {
         DurabilityCheckpoint {
             confirmed_flush: resume_lsn,
             open_txn_floor: None,
         }
     }
 
-    pub fn confirmed_flush(&self) -> Lsn {
+    /// The LSN it is safe to tell the source it may discard. This is what frees WAL on the source,
+    /// so it must never run ahead of what walrus has actually made durable.
+    #[must_use]
+    pub const fn confirmed_flush(&self) -> Lsn {
         self.confirmed_flush
     }
 
     /// Set the open-txn floor (PR 2.30). `None` = no open streamed txn; small/whole txns leave it unset.
-    pub fn set_open_txn_floor(&mut self, floor: Option<Lsn>) {
+    pub const fn set_open_txn_floor(&mut self, floor: Option<Lsn>) {
         self.open_txn_floor = floor;
     }
 
@@ -57,7 +63,8 @@ impl DurabilityCheckpoint {
 
     /// The standby reply: `write` = the stream's received/keepalive LSN (unconditional), `flush`/`apply`
     /// = `confirmed_flush` (durable). A stalled flush advances `write` (via the stream) but not these.
-    pub fn standby_status(&self, received: Lsn, reply_requested: bool) -> StandbyStatus {
+    #[must_use]
+    pub const fn standby_status(&self, received: Lsn, reply_requested: bool) -> StandbyStatus {
         StandbyStatus {
             write: received,
             flush: self.confirmed_flush,
@@ -68,6 +75,10 @@ impl DurabilityCheckpoint {
 
     /// Send a standby status carrying the durable `confirmed_flush`, and sync it onto the stream so the
     /// stream's own periodic keepalive reports the same `flush` (never a stale one).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if the replication socket cannot write or flush the standby status.
     pub async fn send(
         &self,
         stream: &mut ReplicationStream,

@@ -1,6 +1,38 @@
 use super::*;
 
 #[test]
+fn loader_phase_decoding_is_exhaustive() {
+    assert_eq!(LoaderPhase::try_from(0), Ok(LoaderPhase::Bootstrapping));
+    assert_eq!(LoaderPhase::try_from(1), Ok(LoaderPhase::Ready));
+    assert_eq!(LoaderPhase::try_from(2), Ok(LoaderPhase::Quarantined));
+    assert_eq!(LoaderPhase::try_from(7), Err(InvalidPhase(7)));
+}
+
+#[test]
+fn clearing_quarantine_does_not_promote_bootstrapping() {
+    let s = LoaderState::new();
+    s.clear_quarantine();
+
+    assert!(!s.is_started());
+    assert!(!s.is_ready());
+    assert!(!s.is_quarantined());
+}
+
+#[test]
+fn quarantine_from_bootstrapping_implies_startup_completed() {
+    let s = LoaderState::new();
+    s.quarantine();
+
+    assert!(s.is_started());
+    assert!(!s.is_ready());
+    assert!(s.is_quarantined());
+
+    s.clear_quarantine();
+    assert!(s.is_ready());
+    assert!(!s.is_quarantined());
+}
+
+#[test]
 fn ready_and_live_are_independent() {
     let s = LoaderState::new();
     assert!(!s.is_ready(), "not ready until bootstrap");

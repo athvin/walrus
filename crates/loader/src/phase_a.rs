@@ -12,23 +12,42 @@
 use crate::duck::TableDb;
 use crate::error::LoaderError;
 use crate::health::LoaderState;
-use common::{Lsn, PgRelation};
+use common::{EpochNo, Lsn, PgRelation, ReloadId, SchemaVersionNo};
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
+use std::num::NonZeroI64;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Everything one owned table's apply worker needs — **owned** (one `TableDb`/DuckDB connection per
+/// Everything one owned table's apply worker needs — **owned** (one [`TableDb`]/DuckDB connection per
 /// table, never shared), so it can move into a `spawn_local`'d [`crate::apply_loop::apply_loop`].
+#[derive(Debug)]
 pub struct TableCtx {
+    /// Control-Postgres handle. Cloning a pool shares the same connections, so every worker's copy
+    /// draws on one set.
     pub pool: sqlx::PgPool,
-    pub epoch: i64,
+    /// The generation this worker was started for. Compared against `epoch_rx` to detect a bump.
+    pub epoch: EpochNo,
+    /// Latest global control-plane epoch, broadcast by the loader's one shared poller.
+    pub epoch_rx: tokio::sync::watch::Receiver<EpochNo>,
+    /// Source schema of the table this worker owns.
     pub schema: String,
+    /// Source table this worker owns.
     pub table: String,
+    /// The `table` metric label (`"<schema>.<table>"`), precomputed at construction. Cardinality is
+    /// bounded by the tables this pod owns, and the value is constant per worker.
+    pub series: String,
     /// The table shape — the transform (Phase B) renders its SQL from this.
     pub rel: PgRelation,
+    /// The `.duckdb` writer connection — the ownership fence DuckDB itself enforces. Its **drop** is
+    /// observable across processes: dropping this [`TableCtx`] closes the file and frees the writer
+    /// lock, which is the "close" step of the drain contract (see [`crate::shutdown`]).
+    /// `app::pipeline` therefore joins every worker — dropping each ctx — before releasing the leases.
     pub db: TableDb,
+    /// The process-wide probe state. Shared, not owned: one table's quarantine degrades the pod.
     pub state: Arc<LoaderState>,
     /// Files claimed per cycle.
-    pub max_files: i64,
+    pub max_files: NonZeroI64,
     /// The apply-loop poll cadence.
     pub poll_interval: Duration,
     /// The compaction cadence — full-rebuild + prune, on this worker thread after an apply cycle (PR 3.11).
@@ -36,57 +55,85 @@ pub struct TableCtx {
     /// Raw retention as an LSN-byte lag behind `transformed_lsn` (the prune floor).
     pub retention_lsn_lag: u64,
     /// The reload_id whose claim pause was already logged (PR 6.6) — a paused table says *why* it
-    /// is idle once per pause, not once per poll. Per-table by construction (one `TableCtx` per
-    /// worker); interior mutability so `run_phase_a(&ctx)` keeps its shared-ref signature.
-    pub pause_logged: parking_lot::Mutex<Option<i64>>,
+    /// is idle once per pause, not once per poll. Per-table by construction (one [`TableCtx`] per
+    /// worker, with `!Sync` interior state), so this needs interior mutability behind
+    /// `run_phase_a(&ctx)`, not synchronisation. `Option<ReloadId>` is `Copy`, so `Cell` has no borrow
+    /// flag or runtime panic path.
+    pub pause_logged: Cell<Option<ReloadId>>,
     /// reload_ids already identified as `resync` (PR 6.10). A resync never sets the meta latch, so
     /// every one of its chunk files would otherwise re-enter `route_reload_file`'s "greater" arm and
     /// re-fetch the reload row; caching the flavor here makes chunks 2…n a plain append with no
-    /// per-file lookup. Per-table interior mutability, like `pause_logged`.
-    pub resync_ids: parking_lot::Mutex<std::collections::HashSet<i64>>,
+    /// per-file lookup. `HashSet` is not `Copy`, so this uses `RefCell`; it remains confined to the
+    /// same single worker and every borrow ends before an await.
+    pub resync_ids: RefCell<HashSet<ReloadId>>,
 }
 
 /// The once-per-pause transition: `Some(reload_id)` exactly when a NEW pause begins (a different
 /// reload than last logged, or the first). A lifted pause (no live rebuild) clears the latch so
 /// the next reload logs again.
 pub(crate) fn pause_began(
-    logged: &parking_lot::Mutex<Option<i64>>,
-    live: Option<i64>,
-) -> Option<i64> {
-    let mut slot = logged.lock();
-    match (*slot, live) {
+    logged: &Cell<Option<ReloadId>>,
+    live: Option<ReloadId>,
+) -> Option<ReloadId> {
+    match (logged.get(), live) {
         (prev, Some(id)) if prev != Some(id) => {
-            *slot = Some(id);
+            logged.set(Some(id));
             Some(id)
         }
         (_, None) => {
-            *slot = None;
+            logged.set(None);
             None
         }
         _ => None,
     }
 }
 
+/// Read the two independent inputs to the Phase-A backlog gauge concurrently.
+///
+/// Neither indexed control-plane read consumes the other's output or runs inside a transaction, so
+/// concurrency changes their latency from the sum of two round trips to the maximum while retaining
+/// two SQL queries. This uses one task rather than spawning, which remains valid on the loader's
+/// `LocalSet`.
+///
+/// Each read may hold one of `control::connect`'s five default pool connections. With many owned
+/// tables that can queue, but it cannot deadlock here: neither future holds an open transaction while
+/// waiting to acquire another connection.
+async fn read_lag_inputs(ctx: &TableCtx) -> Result<(Option<Lsn>, Lsn), LoaderError> {
+    let (max_ready, checkpoint) = tokio::try_join!(
+        control::max_ready_lsn_end(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table),
+        control::read_checkpoint(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table),
+    )?;
+    Ok((
+        max_ready,
+        checkpoint.map_or(Lsn::ZERO, |cp| cp.raw_appended_lsn),
+    ))
+}
+
 /// One Phase-A pass. Returns the max `lsn_end` appended, or `None` if the queue was empty.
+///
+/// # Errors
+///
+/// Returns [`LoaderError::Control`] or [`LoaderError::ControlTxn`] for control-plane reads and the
+/// advance/delete transaction, [`LoaderError::Duck`] for local append/reconcile failures,
+/// [`LoaderError::RegistryDecode`] for an invalid stored shape, [`LoaderError::Quarantine`] for an
+/// unsafe DDL cast, or [`LoaderError::Internal`] for an inconsistent reload manifest.
 pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     // Observability (PR 5.6): set the Phase-A backlog gauge every poll (0 when caught up) —
     // `max(lsn_end over ready files) − raw_appended_lsn`. Both operands are cheap indexed control-DB
     // reads; doing this before the claim means idle polls report a truthful 0.
-    let max_ready =
-        control::max_ready_lsn_end(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table).await?;
-    let raw_appended = control::read_checkpoint(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table)
-        .await?
-        .map(|cp| cp.raw_appended_lsn)
-        .unwrap_or(Lsn::ZERO);
-    common::metrics::set_raw_append_lag(
-        &format!("{}.{}", ctx.schema, ctx.table),
-        raw_append_lag_bytes(max_ready, raw_appended),
-    );
+    let (max_ready, raw_appended) = read_lag_inputs(ctx).await?;
+    common::metrics::set_raw_append_lag(&ctx.series, raw_append_lag_bytes(max_ready, raw_appended));
 
     // 1. Claim in (lsn_end, id) order — NEVER `lsn_end > raw_appended_lsn` (that skips equal-lsn_end
     //    snapshot files forever).
-    let claimed =
-        control::claim_ready(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table, ctx.max_files).await?;
+    let claimed = control::claim_ready(
+        &ctx.pool,
+        ctx.epoch,
+        &ctx.schema,
+        &ctx.table,
+        ctx.max_files.get(),
+    )
+    .await?;
     if claimed.is_empty() {
         // Distinguish IDLE from PAUSED (PR 6.6): a live rebuild-flavor reload withholds this
         // table's claims (reload §2 — claiming would retire post-`W` files the rebuild must
@@ -100,7 +147,7 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
             if let Some(reload_id) = pause_began(&ctx.pause_logged, live) {
                 tracing::info!(
                     table = %format_args!("{}.{}", ctx.schema, ctx.table),
-                    reload_id,
+                    reload_id = %reload_id,
                     reason = "rebuild-in-flight",
                     "claims paused: ready rows accumulate (frontier frozen at W) until export_complete"
                 );
@@ -138,7 +185,7 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
             tracing::debug!(
                 table = %format_args!("{}.{}", ctx.schema, ctx.table),
                 manifest_id = f.id.0,
-                stale_reload_id = f.reload_id,
+                stale_reload_id = ?f.reload_id,
                 "stale reload file retired unapplied (latest-id wins)"
             );
             ids.push(f.id);
@@ -157,13 +204,13 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
                 table = %format_args!("{}.{}", ctx.schema, ctx.table),
                 manifest_id = f.id.0,
                 lsn_end = %f.lsn_end,
-                schema_version = f.schema_version,
+                schema_version = %f.schema_version,
                 "skipping a version-crossing file superseded by a pending reload rebuild (quarantine-recovery in flight)"
             );
             continue;
         }
-        if f.schema_version > ctx.db.schema_version()? {
-            if let Err(e) = crate::ddl::reconcile_to_version(
+        if f.schema_version > ctx.db.schema_version()?
+            && let Err(e) = crate::ddl::reconcile_to_version(
                 &ctx.db,
                 &ctx.pool,
                 ctx.epoch,
@@ -172,19 +219,19 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
                 f.schema_version,
             )
             .await
-            {
-                // A lossy DDL cast that fails is a QUARANTINE (PR 3.9): latch the state so `/ready`
-                // degrades, fire a loud error-level alert, and stop — never a silent continue.
-                if matches!(e, LoaderError::Quarantine { .. }) {
-                    ctx.state.quarantine();
-                    tracing::error!(
-                        table = %format_args!("{}.{}", ctx.schema, ctx.table),
-                        error = %e,
-                        "QUARANTINE: lossy schema change could not be applied — /ready degraded, processing stopped"
-                    );
-                }
-                return Err(e);
+        {
+            // A lossy DDL cast that fails is a QUARANTINE (PR 3.9): latch the state so `/ready`
+            // degrades, fire a loud error-level alert, and stop — never a silent continue. The alert
+            // names the table and the latch, not the error: this worker's `Err` drains the loader, so
+            // `main` logs the failure itself (reason included) exactly once on the way out.
+            if matches!(e, LoaderError::Quarantine { .. }) {
+                ctx.state.quarantine();
+                tracing::error!(
+                    table = %format_args!("{}.{}", ctx.schema, ctx.table),
+                    "QUARANTINE: lossy schema change could not be applied — /ready degraded, processing stopped"
+                );
             }
+            return Err(e);
         }
         // A `spill` file is one streamed txn written before its commit LSN was known, so its per-row
         // `commit_lsn` is a placeholder; `lsn_end` (corrected on `Stream Commit`) is the real commit LSN
@@ -208,12 +255,18 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
         .pool
         .begin()
         .await
-        .map_err(|e| LoaderError::Internal(format!("begin advance+delete txn: {e}")))?;
+        .map_err(|source| LoaderError::ControlTxn {
+            op: "begin advance+delete txn",
+            source,
+        })?;
     control::advance_raw_appended(&mut *tx, ctx.epoch, &ctx.schema, &ctx.table, max_lsn).await?;
     control::delete_claimed(&mut *tx, &ids).await?;
     tx.commit()
         .await
-        .map_err(|e| LoaderError::Internal(format!("commit advance+delete txn: {e}")))?;
+        .map_err(|source| LoaderError::ControlTxn {
+            op: "commit advance+delete txn",
+            source,
+        })?;
 
     tracing::info!(
         table = %format_args!("{}.{}", ctx.schema, ctx.table),
@@ -245,20 +298,23 @@ async fn route_reload_file(ctx: &TableCtx, f: &control::ManifestRow) -> Result<b
     // Fast path (PR 6.10): a resync we've already classified — plain append, no `recorded` read and
     // no per-file reload-row fetch. A resync never latches, so without this cache every chunk would
     // re-enter the "greater" arm below and re-fetch.
-    if ctx.resync_ids.lock().contains(&file_reload_id) {
+    if ctx.resync_ids.borrow().contains(&file_reload_id) {
         return Ok(true);
     }
-    let recorded = ctx.db.recorded_reload_id()?;
-    if file_reload_id < recorded {
-        return Ok(false); // a superseded attempt whose purge raced the claim (H9): retire
-    }
-    if file_reload_id == recorded {
-        return Ok(true); // chunks 2…n of the attempt already rebuilt for
+    // `None` = the latch was never set, so this file can only be a NEW attempt: fall through to
+    // the "greater" arm below rather than compare it against a stand-in id.
+    if let Some(recorded) = ctx.db.recorded_reload_id()? {
+        if file_reload_id < recorded {
+            return Ok(false); // a superseded attempt whose purge raced the claim (H9): retire
+        }
+        if file_reload_id == recorded {
+            return Ok(true); // chunks 2…n of the attempt already rebuilt for
+        }
     }
 
-    // Greater: the first file of a NEW attempt. The reload row carries the flavor: a `resync` merges
-    // over the LIVE mirror (H3) — no clear, no purge, no latch, and raw history preserved (chunks
-    // flow through Phase A like any file, PR 6.10); only a `reload` triggers the rebuild.
+    // Greater (or unlatched): the first file of a NEW attempt. The reload row carries the flavor: a
+    // `resync` merges over the LIVE mirror (H3) — no clear, no purge, no latch, and raw history
+    // preserved (chunks flow through Phase A like any file, PR 6.10); only a `reload` rebuilds.
     let row = control::reload::get(&ctx.pool, file_reload_id)
         .await?
         .ok_or_else(|| {
@@ -267,7 +323,7 @@ async fn route_reload_file(ctx: &TableCtx, f: &control::ManifestRow) -> Result<b
             ))
         })?;
     if row.flavor == control::ReloadFlavor::Resync {
-        ctx.resync_ids.lock().insert(file_reload_id);
+        ctx.resync_ids.borrow_mut().insert(file_reload_id);
         return Ok(true);
     }
     let first_lsn = row.first_lsn.ok_or_else(|| {
@@ -295,8 +351,8 @@ async fn route_reload_file(ctx: &TableCtx, f: &control::ManifestRow) -> Result<b
     ctx.db.set_recorded_reload_id(file_reload_id)?;
     tracing::info!(
         table = %format_args!("{}.{}", ctx.schema, ctx.table),
-        reload_id = file_reload_id,
-        schema_version = f.schema_version,
+        reload_id = %file_reload_id,
+        schema_version = %f.schema_version,
         first_lsn = %first_lsn,
         purged,
         "reload rebuild: tables replaced at the attempt's version; superseded rows purged; latch set"
@@ -309,12 +365,19 @@ async fn route_reload_file(ctx: &TableCtx, f: &control::ManifestRow) -> Result<b
 /// single-version setups — `phase_b::current_transform`'s exact precedent.
 async fn plan_at_version(
     ctx: &TableCtx,
-    version: i64,
+    version: SchemaVersionNo,
 ) -> Result<crate::plan::TablePlan, LoaderError> {
     match control::read_registry(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table, version).await? {
         Some(r) => {
-            let rel: PgRelation = serde_json::from_value(r.columns)
-                .map_err(|e| LoaderError::Internal(format!("decode registry columns: {e}")))?;
+            // Label built inside the closure (`current_transform`'s precedent): only a decode
+            // failure pays for it.
+            let rel: PgRelation = serde_json::from_value(r.columns).map_err(|source| {
+                LoaderError::RegistryDecode {
+                    table: format!("{}.{}", ctx.schema, ctx.table),
+                    version: version.0,
+                    source,
+                }
+            })?;
             Ok(crate::plan::TablePlan::from_registry(&rel, &r.descriptors))
         }
         None => Ok(crate::plan::TablePlan::tier1(&ctx.rel)),
@@ -322,12 +385,14 @@ async fn plan_at_version(
 }
 
 /// The raw-append backlog in LSN-bytes: how far the newest ready file's commit LSN leads the Phase-A
-/// frontier. An empty queue (`None`) is 0; a frontier already at/after the head saturates to 0 and
-/// never underflows. This is the value of `walrus_loader_raw_append_lag_bytes` (PR 5.6).
+/// frontier. An empty queue (`None`) is 0; a frontier already at/after the head is 0. This is the
+/// value of `walrus_loader_raw_append_lag_bytes` (PR 5.6).
+///
+/// `max` bounds the head **up to** the frontier rather than branching on the same comparison twice:
+/// the lower bound is what makes `-` reachable only inside its defined ordered domain, and the
+/// clamped-equal case is exactly the 0 a caught-up (or momentarily stale) read should report.
 fn raw_append_lag_bytes(max_ready_lsn_end: Option<Lsn>, raw_appended: Lsn) -> u64 {
-    max_ready_lsn_end.map_or(0, |head| {
-        head.as_u64().saturating_sub(raw_appended.as_u64())
-    })
+    max_ready_lsn_end.map_or(0, |head| head.max(raw_appended) - raw_appended)
 }
 
 #[cfg(test)]

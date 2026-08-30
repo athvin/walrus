@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Loader bootstrap against compose (`#[ignore]` — needs control PG + MinIO). Bootstrap acquires the
 //! ownership lease, opens `<table>.duckdb` with both `<table>` and `<table>_raw`, loads the watermarks,
 //! and verifies S3 read. A second live-lease instance exits terminal; a stale lock behind an expired
@@ -6,14 +11,12 @@
 //!
 //!   cargo test -p loader --test bootstrap -- --ignored
 
-use common::{PgColumn, PgRelation, ReplicaIdentity};
+use common::{EpochNo, FailureClass, PgColumn, PgRelation, ReplicaIdentity};
 use loader::bootstrap::bootstrap;
 use loader::config::LoaderConfig;
 use loader::error::LoaderError;
 use loader::health::LoaderState;
-use object_store::aws::AmazonS3Builder;
-use object_store::ObjectStore;
-use std::sync::Arc;
+use object_store::aws::{AmazonS3, AmazonS3Builder};
 use std::time::Duration;
 
 static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -24,18 +27,18 @@ fn control_url() -> String {
     })
 }
 
-fn store() -> Arc<dyn ObjectStore> {
-    Arc::new(
-        AmazonS3Builder::new()
-            .with_bucket_name("walrus")
-            .with_region("us-east-1")
-            .with_endpoint("http://localhost:9000")
-            .with_access_key_id("minioadmin")
-            .with_secret_access_key("minioadmin")
-            .with_allow_http(true)
-            .build()
-            .unwrap(),
-    )
+/// The concrete MinIO client, matching what `main::build_store` hands `bootstrap`; `&store()`
+/// coerces to the `&dyn ObjectStore` parameter at the call site, exactly as production does.
+fn store() -> AmazonS3 {
+    AmazonS3Builder::new()
+        .with_bucket_name("walrus")
+        .with_region("us-east-1")
+        .with_endpoint("http://localhost:9000")
+        .with_access_key_id("minioadmin")
+        .with_secret_access_key("minioadmin")
+        .with_allow_http(true)
+        .build()
+        .unwrap()
 }
 
 fn orders() -> PgRelation {
@@ -56,8 +59,8 @@ fn orders() -> PgRelation {
 
 fn cfg(pod: &str, dir: &std::path::Path, ttl: Duration) -> LoaderConfig {
     LoaderConfig {
-        control_db_url: control_url(),
-        object_store: common::config::ObjectStoreConfig {
+        control_db_url: control_url().into(),
+        object_store: common::ObjectStoreConfig {
             bucket: "walrus".into(),
             endpoint: Some("http://localhost:9000".into()),
             region: "us-east-1".into(),
@@ -70,7 +73,7 @@ fn cfg(pod: &str, dir: &std::path::Path, ttl: Duration) -> LoaderConfig {
 }
 
 /// Seed a fresh epoch as the current one + register `orders`, cleaning any prior control state.
-async fn seed(pool: &sqlx::PgPool, epoch: i64) {
+async fn seed(pool: &sqlx::PgPool, epoch: EpochNo) {
     for tbl in [
         "table_ownership",
         "loader_checkpoint",
@@ -88,7 +91,7 @@ async fn seed(pool: &sqlx::PgPool, epoch: i64) {
             epoch,
             slot_name: "walrus_slot".into(),
             created_lsn: "0/0".parse().unwrap(),
-            status: "streaming".into(),
+            status: control::ReplicationStatus::Streaming,
         },
     )
     .await
@@ -100,7 +103,7 @@ async fn seed(pool: &sqlx::PgPool, epoch: i64) {
             epoch,
             source_schema: rel.schema.clone(),
             source_table: rel.name.clone(),
-            schema_version: 1,
+            schema_version: common::SchemaVersionNo(1),
             descriptors: Vec::new(),
             columns: serde_json::to_value(&rel).unwrap(),
         },
@@ -109,14 +112,14 @@ async fn seed(pool: &sqlx::PgPool, epoch: i64) {
     .unwrap();
 }
 
-fn tmpdir(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("walrus-loader-{name}"));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+/// A scratch directory for one test's `.duckdb` file. The returned guard deletes it on drop — even
+/// when an assertion panics, which a trailing `remove_dir_all` would skip.
+fn tmpdir(name: &str) -> tempfile::TempDir {
+    let prefix = format!("walrus-loader-{name}-");
+    tempfile::Builder::new().prefix(&prefix).tempdir().unwrap()
 }
 
-async fn table_exists(db: &loader::duck::TableDb, name: &str) -> bool {
+fn table_exists(db: &loader::duck::TableDb, name: &str) -> bool {
     let conn = db.conn();
     let n: i64 = conn
         .query_row(
@@ -132,25 +135,20 @@ async fn table_exists(db: &loader::duck::TableDb, name: &str) -> bool {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn bootstrap_creates_duckdb_with_both_tables_and_takes_the_lease() {
     let _g = LOCK.lock().await;
-    let epoch = 3_100_101;
+    let epoch = EpochNo(3_100_101);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     seed(&pool, epoch).await;
     let dir = tmpdir("bootstrap");
-    let cfg = cfg("loader-a", &dir, Duration::from_secs(30));
+    let cfg = cfg("loader-a", dir.path(), Duration::from_secs(30));
     let state = LoaderState::new();
 
-    let owned = bootstrap(&cfg, &pool, store().as_ref(), &state)
-        .await
-        .unwrap();
+    let owned = bootstrap(&cfg, &pool, &store(), &state).await.unwrap();
     assert_eq!(owned.len(), 1, "owns the one registered table");
     let orders = &owned[0];
+    assert!(table_exists(&orders.db, "orders"), "mirror table exists");
     assert!(
-        table_exists(&orders.db, "orders").await,
-        "mirror table exists"
-    );
-    assert!(
-        table_exists(&orders.db, "orders_raw").await,
+        table_exists(&orders.db, "orders_raw"),
         "CDC log table exists"
     );
     assert!(
@@ -175,15 +173,13 @@ async fn bootstrap_creates_duckdb_with_both_tables_and_takes_the_lease() {
         orders.db.conn().execute_batch("SELECT 1").is_ok(),
         ".duckdb file lock is held (open RW)"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn second_instance_with_live_lease_exits_terminal() {
     let _g = LOCK.lock().await;
-    let epoch = 3_100_102;
+    let epoch = EpochNo(3_100_102);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     seed(&pool, epoch).await;
@@ -192,9 +188,9 @@ async fn second_instance_with_live_lease_exits_terminal() {
 
     // Instance A takes the lease (live, 30s) and keeps its DuckDB connection open.
     let _owned_a = bootstrap(
-        &cfg("loader-a", &dir_a, Duration::from_secs(30)),
+        &cfg("loader-a", dir_a.path(), Duration::from_secs(30)),
         &pool,
-        store().as_ref(),
+        &store(),
         &state,
     )
     .await
@@ -203,28 +199,25 @@ async fn second_instance_with_live_lease_exits_terminal() {
     // Instance B, while A's lease is live, must fail terminal with LeaseContended.
     let dir_b = tmpdir("live-b");
     let res = bootstrap(
-        &cfg("loader-b", &dir_b, Duration::from_secs(30)),
+        &cfg("loader-b", dir_b.path(), Duration::from_secs(30)),
         &pool,
-        store().as_ref(),
+        &store(),
         &LoaderState::new(),
     )
     .await;
-    let err = res.err().expect("a live lease must be terminal");
+    let err = res.expect_err("a live lease must be terminal");
     assert!(
         matches!(err, LoaderError::LeaseContended { .. }),
         "a live lease is terminal: {err:?}"
     );
     assert_eq!(err.exit_code(), common::ExitCode::LeaseContended);
-
-    let _ = std::fs::remove_dir_all(&dir_a);
-    let _ = std::fs::remove_dir_all(&dir_b);
 }
 
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn stale_lock_expired_lease_is_reclaimed_and_opened() {
     let _g = LOCK.lock().await;
-    let epoch = 3_100_103;
+    let epoch = EpochNo(3_100_103);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     seed(&pool, epoch).await;
@@ -234,9 +227,9 @@ async fn stale_lock_expired_lease_is_reclaimed_and_opened() {
     // Instance A takes a SHORT-TTL lease then "dies": dropping its TableDb releases the DuckDB lock.
     {
         let owned_a = bootstrap(
-            &cfg("loader-dead", &dir, Duration::from_millis(500)),
+            &cfg("loader-dead", dir.path(), Duration::from_millis(500)),
             &pool,
-            store().as_ref(),
+            &store(),
             &state,
         )
         .await
@@ -248,9 +241,9 @@ async fn stale_lock_expired_lease_is_reclaimed_and_opened() {
 
     // Instance B reclaims the expired lease and opens the (now-unlocked) file. Token bumps to 2.
     let owned_b = bootstrap(
-        &cfg("loader-b", &dir, Duration::from_secs(30)),
+        &cfg("loader-b", dir.path(), Duration::from_secs(30)),
         &pool,
-        store().as_ref(),
+        &store(),
         &LoaderState::new(),
     )
     .await
@@ -259,7 +252,5 @@ async fn stale_lock_expired_lease_is_reclaimed_and_opened() {
         owned_b[0].fencing_token, 2,
         "reclaim by a new owner bumps the fencing token"
     );
-    assert!(table_exists(&owned_b[0].db, "orders").await);
-
-    let _ = std::fs::remove_dir_all(&dir);
+    assert!(table_exists(&owned_b[0].db, "orders"));
 }

@@ -17,6 +17,7 @@ use arrow::datatypes::{DataType, Field};
 ///
 /// **NOTE:** `numeric` with `p ≤ 38` is *not* Tier-3 — it stays Tier-1 `Decimal128`. Only unconstrained
 /// (`numeric_precision_scale` → `None`) or `p > 38` numeric is Tier-3; `p == 38` is the Tier-1 boundary.
+#[must_use]
 pub fn is_tier3_text(type_oid: u32, atttypmod: i32) -> bool {
     match type_oid {
         oids::NUMERIC => matches!(
@@ -41,6 +42,7 @@ pub fn is_tier3_text(type_oid: u32, atttypmod: i32) -> bool {
 }
 
 /// A single nullable `Utf8` field carrying the canonical text.
+#[must_use]
 pub fn tier3_field(name: &str) -> Field {
     Field::new(name, DataType::Utf8, true)
 }

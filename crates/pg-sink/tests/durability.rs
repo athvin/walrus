@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! The durability checkpoint against compose (`#[ignore]` — needs source PG + MinIO + control PG). The
 //! slot's `confirmed_flush_lsn` reaches a batch's `lsn_end` only *after* the S3 PUT + manifest commit;
 //! and a crash between the PUT and the standby update re-streams the batch (at-least-once, no loss).
@@ -6,10 +11,10 @@
 //!
 //!   cargo test -p pg-sink --test durability -- --ignored
 
-use common::Lsn;
+use common::{EpochNo, Lsn};
 use pg_sink::batch::{BatchTriggers, SystemClock};
 use pg_sink::checkpoint::DurabilityCheckpoint;
-use pg_sink::consume::{flush_batch, on_frame, BatchRouter};
+use pg_sink::consume::{BatchRouter, flush_batch, on_frame};
 use pg_sink::pgoutput::{Message, StreamCtx};
 use pg_sink::relcache::RelationCache;
 use pg_sink::replication::{ReplicationMessage, ReplicationStream};
@@ -96,19 +101,15 @@ async fn slot_advances_only_after_s3_and_manifest_durable() {
     drop_slot(&admin, slot).await;
     let resume = verify_or_create_slot(&admin, slot).await.unwrap();
 
-    let mut stream =
-        ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
-            .await
-            .unwrap();
-    let epoch = 2_260_001;
-    let sink = ParquetSink::new(minio(), "walrus".to_string(), epoch);
+    let epoch = EpochNo(2_260_001);
+    let sink = ParquetSink::new(minio(), "walrus", epoch);
     let pool = control_pool().await;
     let mut tx = pool.begin().await.unwrap();
     let mut checkpoint = DurabilityCheckpoint::new(resume.start_lsn());
     let mut router = BatchRouter::new(
         BatchTriggers {
-            max_rows: 1,
-            max_bytes: u64::MAX,
+            max_rows: std::num::NonZeroU64::MIN,
+            max_bytes: std::num::NonZeroU64::MAX,
             max_fill: Duration::from_secs(3600),
         },
         Arc::new(SystemClock),
@@ -117,6 +118,15 @@ async fn slot_advances_only_after_s3_and_manifest_durable() {
     );
     let mut cache = RelationCache::default();
     let mut ctx = StreamCtx::default();
+
+    // Open CopyBoth only after the control-plane and batching setup is complete. The compose source
+    // uses `wal_sender_timeout=5s`; opening earlier leaves nobody reading the socket or sending
+    // standby feedback while migrations and setup run, so a loaded serial sweep can lose the
+    // connection before the first `next()`. The slot already retains everything from `start_lsn`.
+    let mut stream =
+        ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
+            .await
+            .unwrap();
 
     admin
         .execute(
@@ -138,10 +148,15 @@ async fn slot_advances_only_after_s3_and_manifest_durable() {
             if let Some(msg) = on_frame(&mut ctx, frame).unwrap() {
                 match &msg {
                     Message::Relation { relation, .. } => {
-                        cache.upsert_from_relation(relation.clone(), 1).unwrap();
+                        cache
+                            .upsert_from_relation(relation.clone(), common::SchemaVersionNo(1))
+                            .unwrap();
                     }
                     other => {
-                        for sealed in router.route(&cache, other, frame_lsn, 1).unwrap() {
+                        for sealed in router
+                            .route(&cache, other, frame_lsn, common::SchemaVersionNo(1))
+                            .unwrap()
+                        {
                             let obj = flush_batch(&sink, &mut *tx, epoch, sealed).await.unwrap(); // (a)+(b)
                             checkpoint.on_batch_durable(obj.lsn_end); // (c)
                             checkpoint.send(&mut stream, false).await.unwrap();
@@ -193,14 +208,14 @@ async fn crash_between_put_and_standby_restreams_without_loss() {
     drop_slot(&admin, slot).await;
     let resume = verify_or_create_slot(&admin, slot).await.unwrap();
 
-    let epoch = 2_260_002;
-    let sink = ParquetSink::new(minio(), "walrus".to_string(), epoch);
+    let epoch = EpochNo(2_260_002);
+    let sink = ParquetSink::new(minio(), "walrus", epoch);
     let pool = control_pool().await;
     let mut cache = RelationCache::default();
     let mut router = BatchRouter::new(
         BatchTriggers {
-            max_rows: 1,
-            max_bytes: u64::MAX,
+            max_rows: std::num::NonZeroU64::MIN,
+            max_bytes: std::num::NonZeroU64::MAX,
             max_fill: Duration::from_secs(3600),
         },
         Arc::new(SystemClock),
@@ -235,10 +250,15 @@ async fn crash_between_put_and_standby_restreams_without_loss() {
                 if let Some(msg) = on_frame(&mut ctx, frame).unwrap() {
                     match &msg {
                         Message::Relation { relation, .. } => {
-                            cache.upsert_from_relation(relation.clone(), 1).unwrap();
+                            cache
+                                .upsert_from_relation(relation.clone(), common::SchemaVersionNo(1))
+                                .unwrap();
                         }
                         other => {
-                            for sealed in router.route(&cache, other, frame_lsn, 1).unwrap() {
+                            for sealed in router
+                                .route(&cache, other, frame_lsn, common::SchemaVersionNo(1))
+                                .unwrap()
+                            {
                                 let obj =
                                     flush_batch(&sink, &mut *tx, epoch, sealed).await.unwrap();
                                 key = Some(obj.key); // PUT + manifest done...
@@ -252,7 +272,7 @@ async fn crash_between_put_and_standby_restreams_without_loss() {
         .await
         .expect("a PUT within 15s");
         tx.rollback().await.unwrap(); // the crash lost the uncommitted manifest too
-                                      // stream dropped here = the connection dies (the "crash").
+        // stream dropped here = the connection dies (the "crash").
     }
 
     // confirmed_flush never advanced (we never sent a durable standby update).

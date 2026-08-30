@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test — unwrap/expect fine in setup + helpers
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    reason = "integration test — unwrap/expect fine in setup + helpers"
+)]
 //! Source-side preflight against the compose stack (`#[ignore]` — needs source + control PG).
 //!
 //! After `docker compose up --wait`:
@@ -7,11 +12,13 @@
 //! The tests mutate shared source-pg state (a keyless table, the walrus schema), so they hold a
 //! process-wide async lock to run serially; each sets up its own preconditions under that lock.
 
+use common::FailureClass;
 use pg_sink::config::SinkConfig;
-use pg_sink::preflight::{connect_source, PkMode, PreflightError, SourcePreflight};
+use pg_sink::preflight::{PkMode, PreflightError, SourcePreflight, connect_source};
 use tokio_postgres::NoTls;
 
 const SOURCE_MIGRATION: &str = include_str!("../../../migrations/source/0001_publication.sql");
+const SOURCE_DDL_MIGRATION: &str = include_str!("../../../migrations/source/0002_ddl_triggers.sql");
 const SOURCE_MIGRATION_0003: &str =
     include_str!("../../../migrations/source/0003_reload_signal.sql");
 
@@ -30,7 +37,7 @@ fn control_url() -> String {
 
 fn cfg_for(url: &str) -> SinkConfig {
     SinkConfig {
-        source_db_url: url.to_string(),
+        source_db_url: url.into(),
         publication_name: "walrus_pub".to_string(),
         ..SinkConfig::default()
     }
@@ -60,7 +67,7 @@ async fn good_source_passes_all_assertions() {
         .unwrap();
 
     let cfg = cfg_for(&source_url());
-    let client = connect_source(&cfg.source_db_url)
+    let client = connect_source(cfg.source_db_url.expose())
         .await
         .expect("replication connect to source-pg");
     let pf = SourcePreflight::new(&client, &cfg);
@@ -94,7 +101,7 @@ async fn wrong_wal_level_is_terminal() {
     let _guard = SOURCE_LOCK.lock().await;
     // control-pg runs with the default wal_level = replica, so the assertion is terminal.
     let cfg = cfg_for(&control_url());
-    let client = connect_source(&cfg.source_db_url)
+    let client = connect_source(cfg.source_db_url.expose())
         .await
         .expect("replication connect to control-pg");
     let pf = SourcePreflight::new(&client, &cfg);
@@ -125,7 +132,7 @@ async fn keyless_table_is_terminal_in_strict_and_quarantined_in_lenient() {
         .unwrap();
 
     let cfg = cfg_for(&source_url());
-    let client = connect_source(&cfg.source_db_url).await.unwrap();
+    let client = connect_source(cfg.source_db_url.expose()).await.unwrap();
     let pf = SourcePreflight::new(&client, &cfg);
 
     // Strict → terminal on the offender.
@@ -167,7 +174,7 @@ async fn publication_missing_heartbeat_is_terminal() {
         .unwrap();
 
     let cfg = cfg_for(&source_url());
-    let client = connect_source(&cfg.source_db_url).await.unwrap();
+    let client = connect_source(cfg.source_db_url.expose()).await.unwrap();
     let pf = SourcePreflight::new(&client, &cfg);
 
     let err = pf.assert_publication_covers().await.unwrap_err();
@@ -179,6 +186,9 @@ async fn publication_missing_heartbeat_is_terminal() {
     }
     assert!(common::Error::from(err).is_terminal());
 
-    // Restore the internal tables for the other tests (idempotent).
+    // Restore the internal tables and the audit table's full shape for the other tests
+    // (idempotent). The event triggers survive dropping the tables, so restoring only the
+    // 0001 stub leaves them targeting columns that no longer exist.
     setup.batch_execute(SOURCE_MIGRATION).await.unwrap();
+    setup.batch_execute(SOURCE_DDL_MIGRATION).await.unwrap();
 }
