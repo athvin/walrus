@@ -12,7 +12,13 @@ check_sources() {
   local output
   local status
 
-  output=$(rg -n --glob '*.rs' --glob '!*_test.rs' "$THREAD_PATTERN" "$@" 2>&1) && status=0 || status=$?
+  if command -v rg >/dev/null 2>&1; then
+    output=$(rg -n --glob '*.rs' --glob '!*_test.rs' "$THREAD_PATTERN" "$@" 2>&1) && status=0 || status=$?
+  else
+    # GitHub's runner image does not guarantee ripgrep is installed. Keep the guard self-contained
+    # instead of making a late CI step depend on an unrelated preinstalled package.
+    output=$(grep -RInE --include='*.rs' --exclude='*_test.rs' "$THREAD_PATTERN" "$@" 2>&1) && status=0 || status=$?
+  fi
   if [ "$status" -eq 0 ]; then
     while IFS=: read -r file line rest; do
       echo "::error file=${file},line=${line}::production OS-thread creation/import is forbidden: ${rest}"
