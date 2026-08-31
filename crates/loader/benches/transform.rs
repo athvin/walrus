@@ -19,6 +19,7 @@
 use common::{Lsn, PgColumn, PgRelation, ReplicaIdentity};
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use duckdb::Connection;
+use loader::duck::TableDb;
 use loader::transform::{TransformSql, apply_transform};
 use std::hint::black_box;
 
@@ -70,6 +71,22 @@ fn three_key_rel() -> PgRelation {
             col("line_no", 23, true),
             col("description", 25, false),
         ],
+    }
+}
+
+/// A representative wide schema for isolating SQL-render cost without DuckDB execution.
+fn wide_rel() -> PgRelation {
+    let mut columns = Vec::with_capacity(30);
+    columns.push(col("id", 23, true));
+    for index in 1..30 {
+        columns.push(col(&format!("text_{index}"), 25, false));
+    }
+    PgRelation {
+        oid: 44,
+        schema: "public".into(),
+        name: "wide_orders".into(),
+        replica_identity: ReplicaIdentity::Default,
+        columns,
     }
 }
 
@@ -131,6 +148,26 @@ fn seed_mirror(c: &Connection, m: usize) {
          FROM range({m}) t(i);"
     ))
     .unwrap();
+}
+
+/// Build the production raw schema and seed a fixed new tail behind `history` older rows. Unlike the
+/// original scaling grid, this exposes whether retained history makes an identical transform slower.
+fn seed_production_history(history: usize, tail: usize) -> (TableDb, Lsn) {
+    let db = TableDb::open(":memory:").unwrap();
+    db.ensure_tables(&orders_rel(), common::SchemaVersionNo(1))
+        .unwrap();
+    db.conn().execute_batch("SET threads = 4;").unwrap();
+    let total = history + tail;
+    let lsn = lsn_hex("i");
+    db.conn()
+        .execute_batch(&format!(
+            "INSERT INTO orders_raw
+             SELECT i::INTEGER AS id, 'v' || i AS status, '{{}}', 'i', {lsn}, {lsn},
+                    '2026-07-04T12:00:00.123Z'
+             FROM range({total}) t(i);"
+        ))
+        .unwrap();
+    (db, Lsn::new(u64::try_from(history).unwrap()))
 }
 
 /// Seed `n` raw rows over `n/2` PKs (K=2: a setter `'i'` then a winner `'u'`). `pct` % of winners
@@ -227,6 +264,29 @@ fn bench_mirror_size(c: &mut Criterion) {
     g.finish();
 }
 
+fn bench_raw_history(c: &mut Criterion) {
+    let rel = orders_rel();
+    let transform = TransformSql::from_relation(&rel);
+    let tail = 5_000usize;
+    let mut g = c.benchmark_group("loader/raw_history");
+    g.sample_size(10);
+    g.throughput(Throughput::Elements(tail as u64));
+    for history in [0usize, 100_000, 1_000_000] {
+        g.bench_with_input(
+            BenchmarkId::from_parameter(history),
+            &history,
+            |b, &history| {
+                b.iter_batched(
+                    || seed_production_history(history, tail),
+                    |(db, after)| apply_transform(db.conn(), &transform, after).unwrap(),
+                    BatchSize::PerIteration,
+                );
+            },
+        );
+    }
+    g.finish();
+}
+
 fn bench_keycols(c: &mut Criterion) {
     let one_key = orders_rel();
     let three_keys = three_key_rel();
@@ -240,11 +300,27 @@ fn bench_keycols(c: &mut Criterion) {
     g.finish();
 }
 
+fn bench_render(c: &mut Criterion) {
+    let cases = [
+        ("orders_2_cols", TransformSql::from_relation(&orders_rel())),
+        ("wide_30_cols", TransformSql::from_relation(&wide_rel())),
+    ];
+    let mut g = c.benchmark_group("loader/render");
+    for (label, transform) in &cases {
+        g.bench_function(*label, |b| {
+            b.iter(|| black_box(transform.render(black_box(Lsn::ZERO), black_box(None))));
+        });
+    }
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_transform_scaling,
     bench_toast_backscan,
     bench_mirror_size,
-    bench_keycols
+    bench_raw_history,
+    bench_keycols,
+    bench_render
 );
 criterion_main!(benches);

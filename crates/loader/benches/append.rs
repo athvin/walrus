@@ -7,7 +7,7 @@
 //!
 //! Generates a local Parquet fixture with the sink's own Arrow→Parquet writer, then benches
 //! `append_parquet` from a `file` path (no MinIO/httpfs — this isolates DuckDB ingest + the
-//! `ON CONFLICT` composite-PK cost, not S3 latency). A second bench times the per-file `DESCRIBE`
+//! file-ledger transaction cost, not S3 latency). A second bench times the per-file `DESCRIBE`
 //! introspection alone, so its overhead is a separate line item. No production code is touched.
 //!
 //! Run: `cargo bench -p loader --bench append` (or `just bench`).
@@ -127,8 +127,14 @@ fn bench_append(c: &mut Criterion) {
                 },
                 |db| {
                     black_box(
-                        db.append_parquet("orders", &uri, common::SchemaVersionNo(1), None)
-                            .unwrap(),
+                        db.append_parquet(
+                            "orders",
+                            common::ManifestId(1),
+                            &uri,
+                            common::SchemaVersionNo(1),
+                            None,
+                        )
+                        .unwrap(),
                     )
                 },
                 BatchSize::PerIteration,

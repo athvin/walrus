@@ -8,7 +8,10 @@ const DOCKERFILE_PG_SINK: &str = include_str!("../../../deploy/docker/Dockerfile
 const DOCKERFILE_LOADER: &str = include_str!("../../../deploy/docker/Dockerfile.loader");
 const JUSTFILE: &str = include_str!("../../../justfile");
 const BENCH_E2E: &str = include_str!("../../../scripts/bench-e2e.sh");
+const PROFILE_BENCH: &str = include_str!("../../../scripts/profile-bench.sh");
 const SINK_SMOKE: &str = include_str!("../../../scripts/sink-smoke.sh");
+const PG_SINK_MAIN: &str = include_str!("../../pg-sink/src/main.rs");
+const LOADER_MAIN: &str = include_str!("../../loader/src/main.rs");
 const CODEGEN_UNITS_ADR: &str = "docs/implementation/notes/rust-skills/opt-codegen-units.md";
 const TARGET_CPU_ADR: &str = "docs/implementation/notes/rust-skills/opt-target-cpu.md";
 const PGO_ADR: &str = "docs/implementation/notes/rust-skills/opt-pgo-profile.md";
@@ -26,6 +29,7 @@ const TARGET_CPU_SURFACES: &[(&str, &str)] = &[
     ("deploy/docker/Dockerfile.loader", DOCKERFILE_LOADER),
     ("justfile", JUSTFILE),
     ("scripts/bench-e2e.sh", BENCH_E2E),
+    ("scripts/profile-bench.sh", PROFILE_BENCH),
     ("scripts/sink-smoke.sh", SINK_SMOKE),
 ];
 // Every surface that invokes cargo to build a shipped artifact or a benchmark, which is where a
@@ -38,6 +42,7 @@ const CARGO_BUILD_SURFACES: &[(&str, &str)] = &[
     ("deploy/docker/Dockerfile.loader", DOCKERFILE_LOADER),
     ("justfile", JUSTFILE),
     ("scripts/bench-e2e.sh", BENCH_E2E),
+    ("scripts/profile-bench.sh", PROFILE_BENCH),
 ];
 const PGO_SURFACES: &[(&str, &str)] = &[
     ("Cargo.toml", WORKSPACE_MANIFEST),
@@ -46,6 +51,7 @@ const PGO_SURFACES: &[(&str, &str)] = &[
     ("deploy/docker/Dockerfile.loader", DOCKERFILE_LOADER),
     ("justfile", JUSTFILE),
     ("scripts/bench-e2e.sh", BENCH_E2E),
+    ("scripts/profile-bench.sh", PROFILE_BENCH),
 ];
 
 fn table_body<'a>(manifest: &'a str, header: &str) -> Option<&'a str> {
@@ -93,6 +99,29 @@ fn release_lto(manifest: &str) -> Result<&str, &'static str> {
     } else {
         Ok(value)
     }
+}
+
+fn profiling_profile_policy(manifest: &str) -> Result<(), &'static str> {
+    let body = table_body(manifest, "[profile.profiling]").ok_or("missing profiling profile")?;
+    if assignment_value(body, "inherits") != Some("\"release\"") {
+        return Err("profiling profile must inherit release");
+    }
+    if assignment_value(body, "debug") != Some("true") {
+        return Err("profiling profile must carry full debug info");
+    }
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, _)) = line.split_once('=') else {
+            return Err("unparseable profiling profile entry");
+        };
+        if !matches!(key.trim(), "inherits" | "debug") {
+            return Err("profiling profile changes code generation");
+        }
+    }
+    Ok(())
 }
 
 /// The `[profile.…]` header that declares `key`, if any. *Every* profile table counts, not only
@@ -171,7 +200,7 @@ fn release_profile_policy(manifest: &str) -> Result<(), &'static str> {
 /// `codegen_units_override_policy` has. The trailing `=` is what makes the second pair safe: unlike
 /// `codegen-units`, these key names are ordinary English words, so a bare needle would reject any
 /// surface whose comments discussed a panic. `-C panic=abort` is caught twice over — here, and by
-/// `target_cpu_policy` below, which rejects *any* rustflags variable on all of these surfaces.
+/// `target_cpu_policy` below, whose sole rustflags exception is the exact Tokio diagnostic cfg.
 fn profile_key_override_policy(body: &str) -> Result<(), &'static str> {
     for (needle, diagnostic) in [
         ("_PANIC", "a panic-strategy env override is set"),
@@ -190,15 +219,32 @@ fn profile_key_override_policy(body: &str) -> Result<(), &'static str> {
 /// -C target-feature=+avx2,+fma` establishes the same ISA floor as a named CPU — the AVX2/FMA
 /// instructions the rule's "What Changes" section is about — while mentioning neither `target-cpu`
 /// nor either rustflags variable, so the first three needles all miss it.
+fn rustflags_value(line: &str) -> Option<&str> {
+    let (_, suffix) = line.split_once("RUSTFLAGS")?;
+    let suffix = suffix.trim_start();
+    let value = suffix
+        .strip_prefix('=')
+        .or_else(|| suffix.strip_prefix(':'))?;
+    let value = value.trim_start();
+    if let Some(quoted) = value.strip_prefix('"') {
+        return quoted.split_once('"').map(|(value, _)| value);
+    }
+    value.split_whitespace().next()
+}
+
 fn target_cpu_policy(body: &str) -> Result<(), &'static str> {
-    for (needle, diagnostic) in [
-        ("target-cpu", "target-cpu is set"),
-        ("RUSTFLAGS", "RUSTFLAGS is set"),
-        ("rustflags", "rustflags is set"),
-        ("target-feature", "a target-feature flag is set"),
-    ] {
-        if body.contains(needle) {
-            return Err(diagnostic);
+    if body.contains("target-cpu") {
+        return Err("target-cpu is set");
+    }
+    if body.contains("rustflags") {
+        return Err("rustflags is set");
+    }
+    if body.contains("target-feature") {
+        return Err("a target-feature flag is set");
+    }
+    for line in body.lines().filter(|line| line.contains("RUSTFLAGS")) {
+        if rustflags_value(line) != Some("--cfg tokio_unstable") {
+            return Err("RUSTFLAGS contains a non-diagnostic flag");
         }
     }
     Ok(())
@@ -260,6 +306,58 @@ fn pgo_policy(body: &str) -> Result<(), &'static str> {
 #[test]
 fn workspace_release_profile_keeps_thin_lto() {
     assert_eq!(release_lto(WORKSPACE_MANIFEST), Ok("thin"));
+}
+
+#[test]
+fn workspace_has_one_release_equivalent_profiling_profile() {
+    assert_eq!(profiling_profile_policy(WORKSPACE_MANIFEST), Ok(()));
+}
+
+#[test]
+fn dhat_output_stays_outside_the_strict_application_config_namespace() {
+    for (name, body) in [
+        ("scripts/bench-e2e.sh", BENCH_E2E),
+        ("crates/pg-sink/src/main.rs", PG_SINK_MAIN),
+        ("crates/loader/src/main.rs", LOADER_MAIN),
+    ] {
+        assert!(
+            body.contains("DHAT_OUTPUT"),
+            "{name} must share the diagnostic output variable"
+        );
+        assert!(
+            !body.contains("WALRUS_DHAT_OUTPUT"),
+            "{name} must not feed a diagnostic-only key into strict WALRUS_ config"
+        );
+    }
+}
+
+#[test]
+fn profiling_profile_policy_rejects_missing_symbols_or_codegen_drift() {
+    let cases = [
+        (
+            "[profile.release]\nlto = \"thin\"\n",
+            Err("missing profiling profile"),
+        ),
+        (
+            "[profile.profiling]\ninherits = \"dev\"\ndebug = true\n",
+            Err("profiling profile must inherit release"),
+        ),
+        (
+            "[profile.profiling]\ninherits = \"release\"\ndebug = \"line-tables-only\"\n",
+            Err("profiling profile must carry full debug info"),
+        ),
+        (
+            "[profile.profiling]\ninherits = \"release\"\ndebug = true\nopt-level = 2\n",
+            Err("profiling profile changes code generation"),
+        ),
+    ];
+    for (manifest, expected) in cases {
+        assert_eq!(
+            profiling_profile_policy(manifest),
+            expected,
+            "manifest:\n{manifest}"
+        );
+    }
 }
 
 #[test]
@@ -566,7 +664,18 @@ fn target_cpu_policy_rejects_fabricated_input() {
             "ENV RUSTFLAGS=\"-C target-cpu=native\"",
             Err("target-cpu is set"),
         ),
-        ("ENV RUSTFLAGS=-Copt-level=3", Err("RUSTFLAGS is set")),
+        (
+            "ENV RUSTFLAGS=-Copt-level=3",
+            Err("RUSTFLAGS contains a non-diagnostic flag"),
+        ),
+        (
+            "RUSTFLAGS=\"--cfg tokio_unstable\" cargo clippy --all-features",
+            Ok(()),
+        ),
+        (
+            "RUSTFLAGS=\"--cfg tokio_unstable -C target-cpu=native\" cargo build",
+            Err("target-cpu is set"),
+        ),
         (
             "rustflags = [\"-C\", \"target-feature=+avx2\"]",
             Err("rustflags is set"),

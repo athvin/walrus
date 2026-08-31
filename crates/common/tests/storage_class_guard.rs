@@ -10,7 +10,9 @@
 //!
 //! A `thread_local!` static is exempt from the second invariant: it is one value per thread,
 //! never shared, so `Cell`/`RefCell` inside one is the safe replacement for a mutable global
-//! rather than a violation of it (`conc-thread-local`).
+//! rather than a violation of it (`conc-thread-local`). A `#[global_allocator]` item is the other
+//! narrow exception: Rust requires that allocator entry point to be a `static`, and the
+//! `GlobalAlloc` contract is specifically for globally shared allocators.
 
 use std::path::{Path, PathBuf};
 
@@ -106,6 +108,28 @@ fn thread_local_mask(source: &str) -> Vec<bool> {
     mask
 }
 
+/// Per-line flag for the `static` item carrying `#[global_allocator]`. Attribute lines may be
+/// separated from the item by other attributes, blank lines, or comments, but the exemption is
+/// consumed by the next declaration and never leaks to a following ordinary static.
+fn global_allocator_mask(source: &str) -> Vec<bool> {
+    let mut mask = Vec::new();
+    let mut pending = false;
+    for line in source.lines() {
+        let trimmed = line.trim();
+        let is_declaration = static_declaration(line).is_some();
+        mask.push(pending && is_declaration);
+
+        if trimmed == "#[global_allocator]" {
+            pending = true;
+        } else if is_declaration
+            || (!trimmed.is_empty() && !trimmed.starts_with("//") && !trimmed.starts_with("#["))
+        {
+            pending = false;
+        }
+    }
+    mask
+}
+
 fn mutable_global_offences(path: &str, source: &str) -> Vec<String> {
     source
         .lines()
@@ -142,9 +166,10 @@ fn plain_static_offences(path: &str, source: &str) -> Vec<String> {
     source
         .lines()
         .zip(thread_local_mask(source))
+        .zip(global_allocator_mask(source))
         .enumerate()
-        .filter_map(|(index, (line, in_thread_local))| {
-            if in_thread_local {
+        .filter_map(|(index, ((line, in_thread_local), is_global_allocator))| {
+            if in_thread_local || is_global_allocator {
                 return None;
             }
             let (name, type_name) = static_declaration(line)?;
@@ -255,6 +280,31 @@ fn synthetic_inline_thread_local_is_accepted() {
         "one line opens and closes it: {diagnostic}"
     );
     assert!(diagnostic.contains("fixture/inline_thread_local.rs:2"));
+}
+
+#[test]
+fn synthetic_global_allocator_is_accepted_without_exempting_the_next_static() {
+    let source = "#[cfg(feature = \"heap\")]\n\
+                  #[global_allocator]\n\
+                  // Rust requires this allocator entry point to be a static.\n\
+                  static ALLOC: heap::Alloc = heap::Alloc;\n\
+                  static TIMEOUT_MS: u64 = 5_000;";
+    let offences = plain_static_offences("fixture/global_allocator.rs", source);
+    let diagnostic = offences.join("\n");
+
+    assert_eq!(offences.len(), 1, "only the ordinary static: {diagnostic}");
+    assert!(!diagnostic.contains("ALLOC:"), "{diagnostic}");
+    assert!(diagnostic.contains("TIMEOUT_MS"), "{diagnostic}");
+}
+
+#[test]
+fn a_commented_global_allocator_attribute_does_not_exempt_a_static() {
+    let source = "// #[global_allocator]\nstatic ALLOC: heap::Alloc = heap::Alloc;";
+    let offences = plain_static_offences("fixture/commented_allocator.rs", source);
+    let diagnostic = offences.join("\n");
+
+    assert_eq!(offences.len(), 1, "{diagnostic}");
+    assert!(diagnostic.contains("ALLOC"), "{diagnostic}");
 }
 
 #[test]

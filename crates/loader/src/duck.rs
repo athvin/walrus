@@ -11,8 +11,8 @@ use common::oids::{
     TIMESTAMPTZ, UUID,
 };
 use common::sql::SqlStrExt;
-use common::{EpochNo, PgRelation, Redacted, ReloadId, SchemaVersionNo};
-use std::cell::RefCell;
+use common::{EpochNo, ManifestId, PgRelation, Redacted, ReloadId, SchemaVersionNo};
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -23,12 +23,15 @@ use std::sync::Arc;
 const CREATE_MIRROR: &str = include_str!("../sql/duckdb/templates/create_mirror.sql");
 const ALTER_ADD_APPLIED: &str = include_str!("../sql/duckdb/templates/alter_add_applied.sql");
 const CREATE_RAW: &str = include_str!("../sql/duckdb/templates/create_raw.sql");
+const CREATE_INGEST_LEDGER: &str = include_str!("../sql/duckdb/templates/create_ingest_ledger.sql");
 const CREATE_USER_VIEW: &str = include_str!("../sql/duckdb/templates/create_user_view.sql");
 const CREATE_META: &str = include_str!("../sql/duckdb/templates/create_meta.sql");
 const CONFIGURE_S3: &str = include_str!("../sql/duckdb/templates/configure_s3.sql");
 const APPEND_PARQUET: &str = include_str!("../sql/duckdb/templates/append_parquet.sql");
 const RELOAD_REBUILD_DROP: &str = include_str!("../sql/duckdb/templates/reload_rebuild_drop.sql");
 const WIPE_GENERATION: &str = include_str!("../sql/duckdb/templates/wipe_generation.sql");
+const MIGRATE_RAW_REPLAY_FENCE: &str =
+    include_str!("../sql/duckdb/templates/migrate_raw_replay_fence.sql");
 
 /// Owns one table's `.duckdb` connection (mirror `<table>` + CDC log `<table>_raw`).
 ///
@@ -63,6 +66,10 @@ pub struct TableDb {
     /// would break `assert_send::<TableDb>()` below and foreclose the owned-move redesign that
     /// note leaves open.
     parquet_cols: RefCell<HashMap<SchemaVersionNo, Arc<[String]>>>,
+    /// `true` only for a database created by a pre-ledger Walrus release. Such a raw table keeps
+    /// its row-level primary key until Phase A has drained every possibly replayed manifest, then a
+    /// one-time transactional CTAS removes it. Fresh databases never pay the per-row index cost.
+    legacy_raw_replay_pk: Cell<bool>,
 }
 
 impl TableDb {
@@ -79,12 +86,14 @@ impl TableDb {
         Ok(TableDb {
             conn,
             parquet_cols: RefCell::new(HashMap::new()),
+            legacy_raw_replay_pk: Cell::new(false),
         })
     }
 
     /// `CREATE TABLE IF NOT EXISTS` for BOTH the mirror `<table>` and the CDC log `<table>_raw`
-    /// (composite PK for at-least-once dedup), the user-facing `<table>_current` view, and a
-    /// `_walrus_meta` row seeding this table's `schema_version` (PR 3.8's DDL-reconcile watermark).
+    /// (a heap; file-level replay is fenced by `_walrus_ingested_files`), the user-facing
+    /// `<table>_current` view, and a `_walrus_meta` row seeding this table's `schema_version`
+    /// (PR 3.8's DDL-reconcile watermark).
     /// The seed is `ON CONFLICT DO NOTHING`, so an EXISTING `.duckdb` keeps its persisted, already-
     /// reconciled version across restarts — the additive DDL applier ([`crate::ddl`]) advances it.
     ///
@@ -152,22 +161,24 @@ impl TableDb {
         // The per-table DDL-reconcile watermark (PR 3.8). Seeded once; the applier advances it.
         let meta = CREATE_META.replace("{schema_version}", &schema_version.to_string());
 
-        // The CDC log: every change verbatim (the emit columns), with the intact `walrus_pg_sink_meta`
-        // JSON plus four columns PROMOTED out of it (op / commit_lsn / lsn / sink_processed_at) as sortable
-        // 16-hex / RFC-3339 text. **Composite PK = source key + sink_processed_at + lsn** — the load-bearing
-        // idempotency fence (a ms-resolution `sink_processed_at` collision is broken by the always-distinct
-        // `lsn`): `ON CONFLICT DO NOTHING` makes a crash-window replay a no-op.
-        let mut raw_pk = keys;
-        raw_pk.push("\"_walrus_sink_processed_at\"".into());
-        raw_pk.push("\"_walrus_lsn\"".into());
+        // The CDC log: every change verbatim (the emit columns), with the intact
+        // `walrus_pg_sink_meta` JSON plus four promoted columns. It is deliberately a HEAP: a
+        // per-row composite primary key made each append build an ART index even though replay is a
+        // per-file event. `_walrus_ingested_files` is the much smaller idempotency fence.
         let raw = CREATE_RAW
             .replace("{table}", table)
-            .replace("{raw_cols}", &raw_cols.join(", "))
-            .replace("{raw_pk}", &raw_pk.join(", "));
+            .replace("{raw_cols}", &raw_cols.join(", "));
 
         self.conn
-            .execute_batch(&format!("{mirror} {applied_cols} {raw} {user_view} {meta}"))
+            .execute_batch(&format!(
+                "{mirror} {applied_cols} {raw} {user_view} {meta} {CREATE_INGEST_LEDGER}"
+            ))
             .duck_with(|| format!("ensure tables for {table}"))?;
+        // `CREATE TABLE IF NOT EXISTS` intentionally leaves an upgraded raw table's old primary
+        // key intact. Phase A uses it as a compatibility fence until all potentially pre-appended
+        // manifests have drained, then calls `migrate_legacy_replay_fence` exactly once.
+        self.legacy_raw_replay_pk
+            .set(self.raw_has_primary_key(table)?);
         Ok(())
     }
 
@@ -191,8 +202,9 @@ impl TableDb {
     }
 
     /// Phase A (PR 3.2): append one Parquet file **verbatim** into `<table>_raw`, promoting
-    /// `op`/`commit_lsn`/`lsn`/`sink_processed_at` out of `walrus_pg_sink_meta`. `ON CONFLICT DO NOTHING`
-    /// on the composite PK makes a replay idempotent. Returns rows appended. **Never touches the mirror.**
+    /// `op`/`commit_lsn`/`lsn`/`sink_processed_at` out of `walrus_pg_sink_meta`. The append and a
+    /// marker in `_walrus_ingested_files` commit in one DuckDB transaction; a replay of the same
+    /// immutable object URI returns zero without reopening the Parquet. **Never touches the mirror.**
     ///
     /// `commit_lsn_override` (PR 4.3 fix): for a **speculative-spill** file (manifest `kind = 'spill'`)
     /// the per-row `commit_lsn` in the Parquet is a *placeholder* — the file was written before its txn's
@@ -209,44 +221,102 @@ impl TableDb {
     pub fn append_parquet(
         &self,
         table: &str,
+        manifest_id: ManifestId,
         s3_uri: &str,
         schema_version: SchemaVersionNo,
         commit_lsn_override: Option<&str>,
     ) -> Result<u64, LoaderError> {
         let uri = common::sql::sql_literal(s3_uri);
-        // Map the file's columns into `<table>_raw` **by name**, not by position (PR 3.8). After an
-        // `ADD COLUMN`, DuckDB appends the new column at the physical END of `<table>_raw` (after the
-        // promoted columns), while the homogeneous file carries it in source order — a positional
-        // `SELECT *` would then shift the promoted extracts by one. An explicit column list also lets an
-        // OLDER-version file (fewer columns) NULL-fill the columns a later version added.
-        // The list is cached per `schema_version` (PR 5.8) — introspected once, not per file.
-        let file_cols = self.columns_for(&uri, schema_version)?;
-        let quoted = file_cols
-            .iter()
-            .map(|column| {
-                common::sql::SqlIdent::new(column)
-                    .map(|ident| ident.to_string())
-                    .map_err(|source| LoaderError::Ident {
-                        uri: s3_uri.to_string(),
-                        source,
-                    })
-            })
-            .collect::<Result<Vec<_>, LoaderError>>()?
-            .join(", ");
-        let commit_lsn_expr = match commit_lsn_override {
-            Some(lsn) => lsn.to_quoted_literal(),
-            None => "json_extract_string(walrus_pg_sink_meta, '$.commit_lsn')".to_string(),
+        let on_conflict = if self.legacy_raw_replay_pk.get() {
+            " ON CONFLICT DO NOTHING"
+        } else {
+            ""
         };
-        let sql = APPEND_PARQUET
-            .replace("{table}", table)
-            .replace("{quoted}", &quoted)
-            .replace("{commit_lsn_expr}", &commit_lsn_expr)
-            .replace("{uri}", &uri);
-        let n = self
-            .conn
-            .execute(&sql, [])
-            .duck_with(|| format!("append {s3_uri} → {table}_raw"))?;
-        Ok(u64::try_from(n).unwrap_or(u64::MAX))
+        self.in_txn("append manifest", |conn| {
+            let ingested: bool = conn
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM \"_walrus_ingested_files\" WHERE s3_uri = ?)",
+                    [s3_uri],
+                    |row| row.get(0),
+                )
+                .duck_with(|| format!("check ingest marker for {s3_uri}"))?;
+            if ingested {
+                return Ok(0);
+            }
+
+            // Map the file's columns into `<table>_raw` **by name**, not by position (PR 3.8).
+            // The list is cached per `schema_version` (PR 5.8). This happens after the marker check,
+            // so a crash-window replay does not require the staged object to remain readable.
+            let file_cols = self.columns_for(&uri, schema_version)?;
+            let quoted = file_cols
+                .iter()
+                .map(|column| {
+                    common::sql::SqlIdent::new(column)
+                        .map(|ident| ident.to_string())
+                        .map_err(|source| LoaderError::Ident {
+                            uri: s3_uri.to_string(),
+                            source,
+                        })
+                })
+                .collect::<Result<Vec<_>, LoaderError>>()?
+                .join(", ");
+            let commit_lsn_expr = match commit_lsn_override {
+                Some(lsn) => lsn.to_quoted_literal(),
+                None => "json_extract_string(walrus_pg_sink_meta, '$.commit_lsn')".to_string(),
+            };
+            let sql = APPEND_PARQUET
+                .replace("{table}", table)
+                .replace("{quoted}", &quoted)
+                .replace("{commit_lsn_expr}", &commit_lsn_expr)
+                .replace("{uri}", &uri)
+                .replace("{on_conflict}", on_conflict);
+            let n = conn
+                .execute(&sql, [])
+                .duck_with(|| format!("append {s3_uri} → {table}_raw"))?;
+            conn.execute(
+                "INSERT INTO \"_walrus_ingested_files\" (s3_uri, manifest_id) VALUES (?, ?)",
+                duckdb::params![s3_uri, manifest_id.0],
+            )
+            .duck_with(|| format!("record ingest marker for {s3_uri}"))?;
+            Ok(u64::try_from(n).unwrap_or(u64::MAX))
+        })
+    }
+
+    /// Whether this upgraded database still carries the old per-row replay index.
+    #[must_use]
+    pub(crate) const fn has_legacy_replay_fence(&self) -> bool {
+        self.legacy_raw_replay_pk.get()
+    }
+
+    /// Replace an upgraded raw table with an identical heap after Phase A has proved there are no
+    /// pending manifests that might have been appended by the old implementation. The CTAS
+    /// replacement is transactional, so a crash leaves either the indexed old table or the complete
+    /// heap, never a partial copy. Returns whether a migration ran.
+    pub(crate) fn migrate_legacy_replay_fence(&self, table: &str) -> Result<bool, LoaderError> {
+        if !self.legacy_raw_replay_pk.get() {
+            return Ok(false);
+        }
+        if !self.raw_has_primary_key(table)? {
+            self.legacy_raw_replay_pk.set(false);
+            return Ok(false);
+        }
+        self.in_txn("migrate raw replay fence", |conn| {
+            conn.execute_batch(&MIGRATE_RAW_REPLAY_FENCE.replace("{table}", table))
+                .duck_with(|| format!("remove legacy replay primary key from {table}_raw"))
+        })?;
+        self.legacy_raw_replay_pk.set(false);
+        Ok(true)
+    }
+
+    fn raw_has_primary_key(&self, table: &str) -> Result<bool, LoaderError> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM duckdb_constraints() \
+                 WHERE table_name = ? AND constraint_type = 'PRIMARY KEY')",
+                [format!("{table}_raw")],
+                |row| row.get(0),
+            )
+            .duck_with(|| format!("inspect replay constraint on {table}_raw"))
     }
 
     /// The Parquet column list for `schema_version`, introspecting `uri` **once** per version and
@@ -540,6 +610,7 @@ impl TableDb {
         self.conn
             .execute_batch(&WIPE_GENERATION.replace("{table}", table))
             .duck_with(|| format!("wipe generation for {table}"))?;
+        self.legacy_raw_replay_pk.set(false);
         Ok(())
     }
 }

@@ -16,6 +16,11 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+# Diagnostic-only instrumentation. Both are off in shipping/default builds.
+dhat-heap = ["dep:dhat"]
+tokio-console = ["common/tokio-console", "tokio/tracing"]
+
 [dependencies]
 common = { workspace = true }
 control = { workspace = true }
@@ -35,6 +40,7 @@ object_store = { workspace = true, features = ["aws"] }
 tracing = { workspace = true }
 # Non-poisoning mutex for the health / Phase-A shared state (PR 7.6).
 parking_lot = { workspace = true }
+dhat = { workspace = true, optional = true }
 
 [dev-dependencies]
 # `test` feature adds figment::Jail for hermetic env/file config tests (dev-only).

@@ -20,6 +20,40 @@ use duckdb::OptionalExt;
 /// The transform template (single source of truth). Rendered by [`TransformSql::render`].
 pub const TRANSFORM_SQL: &str = include_str!("../sql/duckdb/templates/transform.sql");
 
+/// Substitute every transform placeholder in one pass. `str::replace` allocates and copies the
+/// whole (increasingly large) SQL string once per placeholder; the transform has eleven of them.
+/// Counting against the static template first gives the final string an exact capacity, then this
+/// traversal copies each literal and replacement only once.
+fn render_transform_template(replacements: &[(&str, &str)]) -> String {
+    let capacity = replacements
+        .iter()
+        .fold(TRANSFORM_SQL.len(), |length, (placeholder, value)| {
+            let occurrences = TRANSFORM_SQL.matches(placeholder).count();
+            length - occurrences * placeholder.len() + occurrences * value.len()
+        });
+    let mut rendered = String::with_capacity(capacity);
+    let mut remaining = TRANSFORM_SQL;
+
+    while let Some(open) = remaining.find('{') {
+        rendered.push_str(&remaining[..open]);
+        let token_start = &remaining[open..];
+        let Some(close) = token_start.find('}') else {
+            rendered.push_str(token_start);
+            return rendered;
+        };
+        let token_end = open + close + 1;
+        let token = &remaining[open..token_end];
+        let replacement = replacements
+            .iter()
+            .find_map(|(placeholder, value)| (*placeholder == token).then_some(*value))
+            .unwrap_or(token);
+        rendered.push_str(replacement);
+        remaining = &remaining[token_end..];
+    }
+    rendered.push_str(remaining);
+    rendered
+}
+
 /// The latest `TRUNCATE` tuple `(Ct, Lt)` in the un-transformed tail. The wipe boundary is the
 /// **tuple**, never the scalar `commit_lsn`.
 ///
@@ -263,18 +297,20 @@ impl TransformSql {
             ),
             None => (String::new(), String::new()),
         };
-        TRANSFORM_SQL
-            .replace("{table}", table)
-            .replace("{pk_list}", &pk_list)
-            .replace("{pk_join}", &pk_join)
-            .replace("{set_cols}", &set_cols)
-            .replace("{insert_cols}", &insert_cols)
-            .replace("{insert_vals}", &insert_vals)
-            .replace("{after_lsn}", &after_lsn.to_string())
-            .replace("{truncate_wipe}", &truncate_wipe)
-            .replace("{truncate_bound}", &truncate_bound)
-            .replace("{resolved_select}", &resolved_select)
-            .replace("{guard}", guard)
+        let after_lsn = after_lsn.to_string();
+        render_transform_template(&[
+            ("{table}", table),
+            ("{pk_list}", &pk_list),
+            ("{pk_join}", &pk_join),
+            ("{set_cols}", &set_cols),
+            ("{insert_cols}", &insert_cols),
+            ("{insert_vals}", &insert_vals),
+            ("{after_lsn}", &after_lsn),
+            ("{truncate_wipe}", &truncate_wipe),
+            ("{truncate_bound}", &truncate_bound),
+            ("{resolved_select}", &resolved_select),
+            ("{guard}", guard),
+        ])
     }
 
     /// The table name (for compaction / prune SQL that lives outside the template).

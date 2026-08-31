@@ -13,6 +13,9 @@ workspace = true # inherit deny(warnings) + clippy::all from the workspace root
 # Opt-in sqlx `Type`/`Encode`/`Decode` for `Lsn` <-> Postgres `pg_lsn` (delegating to sqlx's
 # PgLsn). Off by default so non-DB consumers of `common` don't pull sqlx; `control`/`loader` enable it.
 sqlx = ["dep:sqlx"]
+# The one global subscriber remains owned here. Binary-local `tokio-console` features turn this on
+# only for diagnostic builds and choose the console-aware initializer from their own `main`.
+tokio-console = ["dep:console-subscriber"]
 
 [dependencies]
 thiserror = { workspace = true }
@@ -33,6 +36,7 @@ tracing-subscriber = { workspace = true, features = [
     "json",
     "tracing-log",
 ] }
+console-subscriber = { workspace = true, optional = true }
 figment = { workspace = true, features = ["env", "toml", "yaml"] }
 humantime-serde = { workspace = true }
 # jiff over `time`: jiff::Timestamp is inherently a UTC instant and Displays as RFC-3339 with a

@@ -159,6 +159,22 @@ fn commit_lsns(db: &TableDb, ids: (i64, i64)) -> Vec<String> {
         .collect()
 }
 
+fn raw_rows(db: &TableDb) -> i64 {
+    db.conn
+        .query_row("SELECT count(*) FROM orders_raw", [], |row| row.get(0))
+        .unwrap()
+}
+
+fn ingest_markers(db: &TableDb) -> i64 {
+    db.conn
+        .query_row(
+            "SELECT count(*) FROM \"_walrus_ingested_files\"",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
 /// PR 12.5: `TableDb` is `Send`. The apply worker moves one into `TableCtx` and then into a
 /// `spawn_local` future; this test exercises the bound by moving the database across an OS thread.
 #[test]
@@ -221,7 +237,13 @@ fn spill_override_stamps_lsn_end_but_verbatim_otherwise() {
     let lsn_end = "00000000000000C8";
     let spill = write_local_fixture(dir.path(), "spill.parquet", (1, 2), placeholder);
     let n = db
-        .append_parquet("orders", &spill, common::SchemaVersionNo(1), Some(lsn_end))
+        .append_parquet(
+            "orders",
+            common::ManifestId(1),
+            &spill,
+            common::SchemaVersionNo(1),
+            Some(lsn_end),
+        )
         .unwrap();
     assert_eq!(n, 2);
     assert_eq!(
@@ -233,7 +255,13 @@ fn spill_override_stamps_lsn_end_but_verbatim_otherwise() {
     // A non-spill (verbatim) file: the per-row placeholder is preserved.
     let batch = write_local_fixture(dir.path(), "batch.parquet", (3, 4), placeholder);
     let n = db
-        .append_parquet("orders", &batch, common::SchemaVersionNo(1), None)
+        .append_parquet(
+            "orders",
+            common::ManifestId(2),
+            &batch,
+            common::SchemaVersionNo(1),
+            None,
+        )
         .unwrap();
     assert_eq!(n, 2);
     assert_eq!(
@@ -248,6 +276,150 @@ fn spill_override_stamps_lsn_end_but_verbatim_otherwise() {
         1,
         "two v1 files → one cached introspection, not per-file"
     );
+}
+
+#[test]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous unit test removes its local fixture to prove replay does not reopen it"
+)]
+fn fresh_raw_is_a_heap_and_uri_replay_skips_the_parquet_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = TableDb::open(dir.path().join("orders.duckdb")).unwrap();
+    db.ensure_tables(&orders(), common::SchemaVersionNo(1))
+        .unwrap();
+    db.conn.execute_batch("INSTALL json; LOAD json;").unwrap();
+
+    assert!(!db.raw_has_primary_key("orders").unwrap());
+    assert!(!db.has_legacy_replay_fence());
+    let parquet = write_local_fixture(dir.path(), "once.parquet", (1, 2), "1");
+    assert_eq!(
+        db.append_parquet(
+            "orders",
+            common::ManifestId(101),
+            &parquet,
+            common::SchemaVersionNo(1),
+            None,
+        )
+        .unwrap(),
+        2
+    );
+    assert_eq!((raw_rows(&db), ingest_markers(&db)), (2, 1));
+
+    // A retry can carry a newly allocated control-row id but the immutable object URI is the
+    // durable identity. Removing it proves the ledger check happens before DESCRIBE/read_parquet.
+    std::fs::remove_file(dir.path().join("once.parquet")).unwrap();
+    assert_eq!(
+        db.append_parquet(
+            "orders",
+            common::ManifestId(102),
+            &parquet,
+            common::SchemaVersionNo(1),
+            None,
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!((raw_rows(&db), ingest_markers(&db)), (2, 1));
+}
+
+#[test]
+fn marker_failure_rolls_back_the_raw_append() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = TableDb::open(dir.path().join("orders.duckdb")).unwrap();
+    db.ensure_tables(&orders(), common::SchemaVersionNo(1))
+        .unwrap();
+    db.conn.execute_batch("INSTALL json; LOAD json;").unwrap();
+    let parquet = write_local_fixture(dir.path(), "rollback.parquet", (1, 2), "1");
+
+    // Force the SECOND statement in append_parquet (the marker insert) to fail. If the file append
+    // and marker were separate auto-commits, the two raw rows would leak through this failure.
+    db.conn
+        .execute_batch(
+            "DROP TABLE \"_walrus_ingested_files\"; \
+             CREATE TABLE \"_walrus_ingested_files\" (s3_uri VARCHAR PRIMARY KEY, \
+                 manifest_id BIGINT NOT NULL CHECK (manifest_id > 0));",
+        )
+        .unwrap();
+    let error = db
+        .append_parquet(
+            "orders",
+            common::ManifestId(-1),
+            &parquet,
+            common::SchemaVersionNo(1),
+            None,
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("record ingest marker"),
+        "{error:?}"
+    );
+    assert_eq!(
+        (raw_rows(&db), ingest_markers(&db)),
+        (0, 0),
+        "the marker failure rolls the raw insert back with it"
+    );
+}
+
+#[test]
+fn legacy_primary_key_absorbs_the_upgrade_replay_then_migrates_losslessly() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = TableDb::open(dir.path().join("orders.duckdb")).unwrap();
+    // Pre-ledger on-disk shape. `ensure_tables` must recognize it without removing its only replay
+    // fence before a possibly pre-appended control row has had a chance to replay.
+    db.conn
+        .execute_batch(
+            "CREATE TABLE orders_raw (id INTEGER, status VARCHAR, walrus_pg_sink_meta VARCHAR, \
+                 _walrus_op VARCHAR, _walrus_commit_lsn VARCHAR, _walrus_lsn VARCHAR, \
+                 _walrus_sink_processed_at VARCHAR, \
+                 PRIMARY KEY (id, _walrus_sink_processed_at, _walrus_lsn));",
+        )
+        .unwrap();
+    db.ensure_tables(&orders(), common::SchemaVersionNo(1))
+        .unwrap();
+    db.conn.execute_batch("INSTALL json; LOAD json;").unwrap();
+    assert!(db.has_legacy_replay_fence());
+
+    let parquet = write_local_fixture(dir.path(), "legacy.parquet", (1, 2), "1");
+    let uri = common::sql::sql_literal(&parquet);
+    // Simulate the old loader having committed this file just before crashing, with the manifest
+    // row still ready in Postgres and no new-ledger marker yet.
+    db.conn
+        .execute_batch(&format!(
+            "INSERT INTO orders_raw \
+                 SELECT id, status, walrus_pg_sink_meta, \
+                    json_extract_string(walrus_pg_sink_meta, '$.op'), \
+                    json_extract_string(walrus_pg_sink_meta, '$.commit_lsn'), \
+                    json_extract_string(walrus_pg_sink_meta, '$.lsn'), \
+                    json_extract_string(walrus_pg_sink_meta, '$.sink_processed_at') \
+                 FROM read_parquet('{uri}') ON CONFLICT DO NOTHING;"
+        ))
+        .unwrap();
+    assert_eq!(raw_rows(&db), 2);
+
+    assert_eq!(
+        db.append_parquet(
+            "orders",
+            common::ManifestId(201),
+            &parquet,
+            common::SchemaVersionNo(1),
+            None,
+        )
+        .unwrap(),
+        0,
+        "the compatibility PK absorbs a pre-ledger crash replay"
+    );
+    assert_eq!((raw_rows(&db), ingest_markers(&db)), (2, 1));
+
+    assert!(db.migrate_legacy_replay_fence("orders").unwrap());
+    assert!(!db.has_legacy_replay_fence());
+    assert!(!db.raw_has_primary_key("orders").unwrap());
+    assert_eq!(
+        (raw_rows(&db), ingest_markers(&db)),
+        (2, 1),
+        "the transactional CTAS preserves both data and replay markers"
+    );
+    assert!(!db.migrate_legacy_replay_fence("orders").unwrap());
 }
 
 #[test]
