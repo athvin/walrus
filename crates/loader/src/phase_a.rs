@@ -4,10 +4,11 @@
 //! claimed queue rows. No transform: this ends with a faithful, idempotent CDC log.
 //!
 //! **Two guards, both load-bearing (§4 crash-window):** (1) the queue *deletion* is what advances the
-//! frontier (not the watermark alone); (2) the `<table>_raw` composite PK + `ON CONFLICT DO NOTHING`
-//! absorbs a replay. DuckDB and control Postgres cannot share a transaction, so the ordering is strict:
-//! the DuckDB append **commits first**, then the Postgres advance+delete txn. A crash between them
-//! re-claims the still-`ready` file — which the row-level PK makes a no-op.
+//! frontier (not the watermark alone); (2) the per-file DuckDB ingest ledger commits atomically with
+//! each raw append and absorbs a replay. DuckDB and control Postgres cannot share a transaction, so
+//! the ordering is strict: the DuckDB append + marker **commit first**, then the Postgres
+//! advance+delete txn. A crash between them re-claims the still-`ready` file, finds its marker, and
+//! returns zero without rebuilding a per-row index.
 
 use crate::duck::TableDb;
 use crate::error::LoaderError;
@@ -155,6 +156,15 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
         } else {
             pause_began(&ctx.pause_logged, None); // caught up — clear the latch
         }
+        // An upgraded database keeps its legacy row-level replay PK until the control queue is
+        // empty. Only then can we prove there is no old-version crash-window append lacking a file
+        // marker. New files arriving after this observation have not been appended and are safe.
+        if max_ready.is_none() && ctx.db.migrate_legacy_replay_fence(&ctx.table)? {
+            tracing::info!(
+                table = %format_args!("{}.{}", ctx.schema, ctx.table),
+                "migrated raw replay fence from a per-row primary key to the file ingest ledger"
+            );
+        }
         return Ok(None);
     }
     pause_began(&ctx.pause_logged, None); // claiming again — any pause has lifted
@@ -241,6 +251,7 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
             (f.kind == control::ManifestKind::Spill).then(|| f.lsn_end.to_string());
         appended += ctx.db.append_parquet(
             &ctx.table,
+            f.id,
             &f.s3_uri,
             f.schema_version,
             commit_lsn_override.as_deref(),
@@ -267,6 +278,21 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
             op: "commit advance+delete txn",
             source,
         })?;
+
+    // Migration is intentionally deferred until a fresh control-plane read proves the queue is
+    // empty. A prior release may have appended more files than this process's current `max_files`,
+    // then crashed before deleting them; migrating after merely one batch would duplicate the rest.
+    if ctx.db.has_legacy_replay_fence()
+        && control::max_ready_lsn_end(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table)
+            .await?
+            .is_none()
+        && ctx.db.migrate_legacy_replay_fence(&ctx.table)?
+    {
+        tracing::info!(
+            table = %format_args!("{}.{}", ctx.schema, ctx.table),
+            "migrated raw replay fence from a per-row primary key to the file ingest ledger"
+        );
+    }
 
     tracing::info!(
         table = %format_args!("{}.{}", ctx.schema, ctx.table),

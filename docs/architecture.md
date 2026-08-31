@@ -68,7 +68,8 @@ consumer of this stream, and Component 1 is organized around that.
 - a **Data Sink** (`walrus-loader`) that polls the control table on a user-chosen cadence,
   pulls Parquet from S3, **appends each change verbatim into a `<table>_raw` CDC log**, then
   **transforms that log into `<table>`** — the current-state mirror. One `.duckdb` file per
-  source table still holds; it now contains **two tables** (the raw log + the derived mirror).
+  source table still holds; it now contains **two data tables** (the raw log + the derived mirror)
+  plus small internal metadata/replay-ledger tables.
 
 **Two non-negotiable missions, cleanly split.** The sink's one job is **speed and safety off the
 WAL**: take work off the WAL and land it in storage on the operator's terms (cadence / memory
@@ -84,11 +85,11 @@ up, correctly, on its own schedule.
 | Decision | Choice | Consequence for the design |
 |---|---|---|
 | CDC transport | **One pgoutput stream at `proto_version '2'` + `streaming 'on'`** | Every change flows over this single stream — the foundation of the design. Negotiated per-connection on `START_REPLICATION` (not a slot property); large in-progress txns stream incrementally so they never buffer whole, small txns still arrive at commit ([§1.1](#11-source-side-setup-one-time-via-migrationjob), [§1.6](#16-large-transaction-safety)). The consumer is **hand-rolled** — no framework owns slot management ([§1.2](#12-replication-consumer--hand-rolled)). |
-| DuckDB layout | **One `.duckdb` file per source table** — holding **two tables**: `<table>_raw` (append-only CDC log) + `<table>` (derived mirror) | Per-table single-writer loaders → natural parallelism & isolation; each file carries **two watermarks** (`raw_appended_lsn` ≥ `transformed_lsn`, both **commit-LSN** valued); cross-table point-in-time consistency is *relaxed*. |
+| DuckDB layout | **One `.duckdb` file per source table** — holding **two data tables**: `<table>_raw` (append-only CDC log) + `<table>` (derived mirror), plus internal metadata/file-ledger tables | Per-table single-writer loaders → natural parallelism & isolation; each file carries **two watermarks** (`raw_appended_lsn` ≥ `transformed_lsn`, both **commit-LSN** valued); cross-table point-in-time consistency is *relaxed*. |
 | Target semantics | **Current-state mirror (upsert/delete)** | The `<table>` mirror is the current state; the loader **first appends CDC rows verbatim to `<table>_raw`** (no dedup, meta retained), **then derives `<table>`** by dedup-to-latest + `MERGE INTO` on the (possibly composite) PK. Makes PK metadata, `REPLICA IDENTITY`, TOAST handling, and the DDL-audit table load-bearing. |
 | Transform primitive | **`MERGE INTO` (DuckDB ≥ 1.4.0 LTS)** | Single-statement insert/update/delete from `<table>_raw` → `<table>`; incremental-from-watermark by default, periodic full-rebuild (`CREATE OR REPLACE … AS SELECT`) for self-heal + compaction. `INSERT … ON CONFLICT` + `DELETE` is the < 1.4.0 fallback. |
 | Raw retention | **Append-only, retained behind a rolling window** | `<table>_raw` keeps history behind `transformed_lsn` (default ~7 days / last-K batches) for debug + cheap replay; pruned + compacted below the floor. Not prune-immediately-after-transform. |
-| History-table key | **`<table>_raw` PK = source PK + `sink_processed_at` + `lsn`** | The source PK repeats across CDC events, so the history table needs its own composite key; `lsn` guarantees uniqueness and enables `ON CONFLICT DO NOTHING` idempotent appends. |
+| History-table replay fence | **`<table>_raw` is an append-only heap; `_walrus_ingested_files.s3_uri` is the file-level PK** | Replay occurs at staged-object granularity. The raw append and URI marker commit in one DuckDB transaction, avoiding a per-row ART index while preserving crash-window idempotency. |
 | Bootstrap | **Consistent snapshot → then stream** | Backfill runs under the slot's **exported snapshot** (`CREATE_REPLICATION_SLOT … SNAPSHOT 'export'` → `snapshot_name` + `consistent_point`), *not* a "COPY at an LSN"; a watermark handoff dedups streamed changes against the snapshot ([§1.7](#17-snapshot--backfill-bootstrap)). |
 | Primary key | **Mandatory** | Keyless tables are rejected at preflight — no `REPLICA IDENTITY FULL`, no full reloads ([§1.1](#11-source-side-setup-one-time-via-migrationjob)). |
 | Replication slot | **Exactly one slot, for the system's life** | Sink is a single-slot / single-consumer service; if the slot is deleted/invalidated the system enters **total-restart** ([§1.8](#18-single-slot-for-life--total-restart)). |
@@ -494,9 +495,9 @@ compression but higher slot lag. This trade-off is the knob the user tunes.
   columns** there. **`commit_lsn` is the progress/order key** — the transform filters on it and
   the loader watermarks on it, because it is monotonic with commit/delivery order. **`lsn` (row)
   is only the per-PK last-writer tiebreaker** (safe because row-level locking serializes writes to
-  a single PK, so per-PK row-LSN order equals commit order); together with the source PK and
-  `sink_processed_at` it also forms the composite primary key of the raw history table (`lsn`
-  guarantees uniqueness), see [§2.1](#21-the-raw-to-mirror-transform-model). The meta is **dropped
+  a single PK, so per-PK row-LSN order equals commit order). Append replay is fenced separately by
+  the staged object's immutable URI in `_walrus_ingested_files`; see
+  [§2.1](#21-the-raw-to-mirror-transform-model). The meta is **dropped
   from the derived `<table>` mirror by default** (it's provenance, not current state); it stays
   queryable in `<table>_raw` for the retention window (and in the staged Parquet under the S3
   lifecycle TTL). For deletes, only key columns are guaranteed populated in the source columns
@@ -1037,7 +1038,7 @@ writes to a single PK, so per-PK row-LSN order equals commit order — see
 `<table>_raw`** — because `<table>_raw` (not the staged Parquet) is now the source of truth for
 the transform, the queue row's job is done once the append commits. Because DuckDB and the
 control Postgres are separate databases, the delete can't share the DuckDB write's transaction;
-the crash-safe order is: **append the file's rows to `<table>_raw` and commit the DuckDB write →
+the crash-safe order is: **append the file's rows and URI marker in one DuckDB transaction →
 then, in one control-DB transaction, advance `loader_checkpoint.raw_appended_lsn` *and* `DELETE`
 the claimed rows together.** The **transform** (`<table>_raw` → `<table>`) runs afterward off the
 raw log and advances `transformed_lsn` on its own commit — it never re-reads the manifest. A
@@ -1049,14 +1050,14 @@ are the schema history needed to reconstruct a table at any `schema_version`.
 idempotent** — replaying a file would duplicate raw rows — so it rests on **two** guards, and it
 matters to be precise about which does what. **(1)** The manifest is a **work queue**: a file is
 **deleted** the moment its rows are appended, so an already-applied file is simply gone and cannot
-be re-claimed. **(2)** In the **crash window** between the DuckDB append-commit and the control-DB
+be re-claimed. **(2)** In the **crash window** between the DuckDB append+marker commit and the control-DB
 transaction that advances `raw_appended_lsn` + deletes the queue rows, the file is still in the
-queue and **will be re-claimed and re-appended** — and here the **file-level watermark does *not*
-save us** (it was never advanced, precisely because that txn didn't commit). What makes the
-re-append safe is the **row-level `ON CONFLICT DO NOTHING`** on `<table>_raw`'s real composite PK
-(source PK + `sink_processed_at` + `lsn`). **That row-level PK is therefore load-bearing, not a
-mere backstop** — do not demote it to a non-enforced key without an equivalent row-dedup (see the
-caveat in [§2.1](#21-the-raw-to-mirror-transform-model)). The `raw_appended_lsn` watermark's job is
+queue and **will be re-claimed** — and here the **file-level watermark does *not* save us** (it was
+never advanced, precisely because that txn didn't commit). What makes the retry safe is
+`_walrus_ingested_files`: its immutable-URI marker commits in the **same DuckDB transaction** as the
+raw rows. Re-claiming that object finds the marker and returns zero before reopening Parquet. The
+ledger is therefore load-bearing, not a cache; never separate its commit from the append. The
+`raw_appended_lsn` watermark's job is
 **ordering and resume** (process files in `(lsn_end, id)` commit order; give the transform its
 floor), *not* append-dedup. The **transform**, by contrast, *is* naturally idempotent: it scans
 only `<table>_raw` rows with **`commit_lsn > transformed_lsn`**, dedups to the latest op per PK by
@@ -1094,7 +1095,7 @@ single-writer) — and that one writer owns **both** tables in the file (`<table
    the next batch of files **in commit order** (`id` breaks ties between equal-`lsn_end` files,
    e.g. the snapshot files that all share `consistent_point`). Applied files are **deleted** from
    the queue, so what remains is exactly the un-applied (or crash-window) tail — the non-idempotent
-   append is made safe by that deletion **plus** the row-level `ON CONFLICT DO NOTHING`, *not* by an
+   append is made safe by that deletion **plus** the transactional URI ledger, *not* by an
    `lsn_end > raw_appended_lsn` filter (which would wrongly skip equal-`lsn_end` snapshot files).
 2. For each file in LSN order: `GET` Parquet from S3 (or let DuckDB read it directly via
    `read_parquet` + `httpfs`/`SET s3_*` [10][11]) and **`APPEND` its rows verbatim** into
@@ -1134,27 +1135,23 @@ reclaim space, and prune `<table>_raw` below the retention floor — see
 
 ### 2.1 The raw-to-mirror transform model
 
-Each `.duckdb` file holds **two tables** for one source table:
+Each `.duckdb` file holds **two data tables** for one source table plus the internal replay ledger:
 
 - **`<table>_raw` — the append-only CDC log / history table (bronze).** The verbatim
   union-superset of every source column ever seen (dropped columns kept nullable, incompatible
   type changes widened to `VARCHAR`, renames tracked by `attnum`), **plus** `walrus_pg_sink_meta`
   stored verbatim, **plus** promoted typed `op` / `commit_lsn` / `lsn` / `sink_processed_at`
   columns (`commit_lsn` is the order/watermark key; `lsn` the intra-txn tiebreaker). Rows are
-  appended, never updated; snapshot rows land here too (`kind='snapshot'`).
-  Its **primary key is composite**: the **source table's PK column(s) + `sink_processed_at` (the
-  walrus-pg-sink sink time) + `lsn`**. The source PK alone repeats across events (this *is* a
-  history log), so it can't be the key; `sink_processed_at` + the source PK is the natural key,
-  and **`lsn` is the deterministic tiebreaker that guarantees uniqueness** — two events for one
-  source PK can share a millisecond-resolution sink time, but every WAL change has a distinct LSN
-  (and snapshot rows are unique by source PK). This real PK also lets the append use
-  `INSERT … ON CONFLICT DO NOTHING` for **row-level idempotency** — which is the **load-bearing**
-  dedup in the crash window between the DuckDB append-commit and the queue-delete (the file-level
-  watermark does **not** cover that window; see the
-  [coordination contract](#coordination-contract-control-plane-tables)). *(If PK-index maintenance
-  on the append-hot path proves costly it can be a `UNIQUE` constraint instead, but it must stay
-  **enforced** — do **not** demote it to a logical-only / non-enforced key without an equivalent
-  row-dedup, or crash-window replays will duplicate raw rows.)*
+  appended, never updated; snapshot rows land here too (`kind='snapshot'`). It is intentionally a
+  heap: source keys repeat throughout history, and a composite uniqueness index made every ordinary
+  append pay for a crash-only path.
+- **`_walrus_ingested_files` — the append replay ledger.** One row per staged object:
+  `s3_uri VARCHAR PRIMARY KEY, manifest_id BIGINT NOT NULL`. Object keys are epoch-namespaced and
+  include a UUID, so the URI is the durable identity even if a control row is recreated with a new
+  numeric id. The raw insert and marker insert are one DuckDB transaction. A crash before commit
+  leaves neither; a crash after it makes the still-ready manifest return zero. Existing indexed raw
+  tables retain their old fence until the pending queue drains, then migrate transactionally to the
+  heap. The ledger is cleared on a total-epoch wipe and survives ordinary reload rebuilds.
 - **`<table>` — the derived current-state mirror (silver).** Exactly the current source shape;
   the meta column is dropped. Produced *only* by the transform below.
 
@@ -1284,8 +1281,8 @@ unresolved — see [Open questions](#open-questions--risks).
 
 - **At-least-once + two-stage idempotency = effectively-once.** Both hops (WAL→S3 and
   S3→DuckDB) are at-least-once. Correctness rests on **two** guarantees, not one MERGE: (a) the
-  **raw append** is de-duplicated by the manifest **work-queue deletion** plus the row-level
-  `ON CONFLICT DO NOTHING` on `<table>_raw`'s composite PK — a verbatim append is not itself
+  **raw append** is de-duplicated by the manifest **work-queue deletion** plus the transactional
+  `_walrus_ingested_files` URI marker — a verbatim append is not itself
   idempotent, and the file-level watermark is for *ordering/resume*, not dedup (see the
   [coordination contract](#coordination-contract-control-plane-tables)); and (b) the
   **raw→mirror transform** is idempotent (PK-keyed, last-writer-wins dedup by `(commit_lsn, lsn)`

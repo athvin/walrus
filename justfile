@@ -20,7 +20,7 @@ fmt:
     cargo fmt --all --check
 
 clippy:
-    cargo clippy --all-targets --all-features -- -D warnings
+    RUSTFLAGS="--cfg tokio_unstable" cargo clippy --all-targets --all-features -- -D warnings
 
 test:
     cargo test --workspace
@@ -49,11 +49,35 @@ bench-baseline name="main":
 bench-compare name="main":
     cargo bench -p pg-sink -p pg-to-arrow -p loader -- --baseline {{name}}
 
-# End-to-end throughput harness (PR 5.6): boots the compose stack, runs the release sink + loader
-# against it, applies a load scenario, drains, and prints a per-stage summary + bottleneck ranking.
-# LOCAL-ONLY (never a CI job — numbers are hardware-relative). Scenario: mixed | wide_text | large_txn.
+# End-to-end release measurement. The structured run bundle under target/perf includes the workload
+# knobs, host/toolchain identity, one-second samples, CPU-seconds/1k rows and peak process RSS.
+perf-e2e scenario="mixed":
+    PERF_MODE=measure bash scripts/bench-e2e.sh {{scenario}}
+
+# Compatibility name for the original PR 5.6 entry point; it now delegates to the structured run.
 bench-e2e scenario="mixed":
-    bash scripts/bench-e2e.sh {{scenario}}
+    @just perf-e2e {{scenario}}
+
+# Direction-aware comparison. It refuses different workloads, CPU/OS, toolchains or build modes.
+perf-compare baseline candidate:
+    python3 scripts/perf_report.py compare {{baseline}} {{candidate}}
+
+# Profile one Criterion target, excluding Cargo/compilation from the captured process.
+# Examples: `just profile-bench pg-sink decode parse_tuple 10`, `just profile-bench loader transform`.
+profile-bench package bench filter="" seconds="10":
+    bash scripts/profile-bench.sh {{package}} {{bench}} '{{filter}}' {{seconds}}
+
+# Profile exactly one service while the complete real pipeline is under load.
+profile-e2e target="loader" scenario="mixed":
+    PERF_MODE=cpu PERF_TARGET={{target}} bash scripts/bench-e2e.sh {{scenario}}
+
+# Allocation profile for exactly one service. Timing/CPU numbers in this bundle are diagnostic only.
+profile-heap target="loader" scenario="mixed":
+    PERF_MODE=heap PERF_TARGET={{target}} bash scripts/bench-e2e.sh {{scenario}}
+
+# Tokio task/resource diagnostics for exactly one service. Connect the UI to 127.0.0.1:6669.
+profile-async target="loader" scenario="mixed":
+    PERF_MODE=async PERF_TARGET={{target}} bash scripts/bench-e2e.sh {{scenario}}
 
 # Request a single-table reload (flavor: reload | resync) — the operator entry point (reload §5.1).
 # INSERTs the request into control-pg's walrus.table_reload at the current epoch; the sink's reload

@@ -14,6 +14,8 @@
 //! - **`sqlx`** *(off by default)* — SQLx `Type`/`Encode`/`Decode` for [`Lsn`] (Postgres `pg_lsn`)
 //!   and for the [`ids`] newtypes (`int8`). `control` and `loader` enable it; a consumer that needs
 //!   only the domain types never links SQLx.
+//! - **`tokio-console`** *(off by default, diagnostic only)* — adds the console layer used by the
+//!   two binaries' own `tokio-console` features. It still leaves the one subscriber install here.
 //!
 //! Serde is deliberately *not* a feature. [`SinkMeta`], [`TypeDescriptor`], [`Lsn`] and
 //! [`CommonConfig`] **are** the wire and bootstrap contracts, and `figment`, `serde_json`,
@@ -64,6 +66,8 @@ pub use lsn::Lsn;
 pub use pg_shape::{PgColumn, PgRelation, ReplicaIdentity, TupleValue};
 pub use redact::{REDACTED, Redacted};
 pub use sink_meta::{Kind, Op, PG_EPOCH_UNIX_MICROS, PG_EPOCH_UNIX_SECS, SinkMeta, UtcTimestamp};
+#[cfg(feature = "tokio-console")]
+pub use telemetry::init_tracing_with_console;
 pub use telemetry::{TelemetryConfig, init_tracing};
 pub use type_descriptor::{Tier, TypeDescriptor, TypeMeta};
 

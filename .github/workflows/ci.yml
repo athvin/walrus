@@ -119,6 +119,9 @@ jobs:
       - name: Unsafe invariants (scripts/check-unsafe-invariants.sh)
         run: bash scripts/check-unsafe-invariants.sh
 
+      - name: Performance report helper tests
+        run: python3 -m unittest scripts/test_perf_report.py
+
       - name: cargo fmt --all --check
         run: cargo fmt --all --check
 
@@ -141,6 +144,9 @@ jobs:
       CXX: sccache c++
       SCCACHE_GHA_ENABLED: "true"
       CARGO_INCREMENTAL: "0"
+      # `--all-features` compile-checks the diagnostic tokio-console layer. Tokio exposes the task
+      # instrumentation it consumes behind this cfg; default/release artifacts never enable it.
+      RUSTFLAGS: "--cfg tokio_unstable"
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/free-disk-space

@@ -10,6 +10,8 @@
 
 use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
+#[cfg(feature = "tokio-console")]
+use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -109,6 +111,42 @@ pub fn init_tracing(cfg: &TelemetryConfig) -> crate::Result<()> {
     if let Err(e) = installed {
         // A global subscriber is already installed (expected under test / a re-entrant bootstrap).
         // Keep the existing one; this is not a failure.
+        tracing::debug!(error = %e, "tracing subscriber already initialised; keeping the existing one");
+    }
+    Ok(())
+}
+
+/// Install the normal Walrus logging layers plus a local [`console_subscriber`] server.
+///
+/// This is available only to binaries built with their `tokio-console` diagnostic feature. The
+/// console layer carries its own Tokio/runtime filter; the regular [`EnvFilter`] is attached only
+/// to the formatting layer so an ordinary `info` log filter cannot discard the trace-level task
+/// events the console needs. The caller must also compile Tokio with `--cfg tokio_unstable`.
+///
+/// As with [`init_tracing`], a pre-existing subscriber is an idempotent success.
+///
+/// # Errors
+///
+/// Reserved for future fallible layers; current setup handles an existing subscriber internally.
+#[cfg(feature = "tokio-console")]
+pub fn init_tracing_with_console(cfg: &TelemetryConfig) -> crate::Result<()> {
+    let filter = build_env_filter(cfg);
+    let console = console_subscriber::ConsoleLayer::builder()
+        .with_default_env()
+        .spawn();
+    let registry = tracing_subscriber::registry().with(console);
+
+    let installed = if cfg.json {
+        registry
+            .with(tracing_subscriber::fmt::layer().json().with_filter(filter))
+            .try_init()
+    } else {
+        registry
+            .with(tracing_subscriber::fmt::layer().with_filter(filter))
+            .try_init()
+    };
+
+    if let Err(e) = installed {
         tracing::debug!(error = %e, "tracing subscriber already initialised; keeping the existing one");
     }
     Ok(())

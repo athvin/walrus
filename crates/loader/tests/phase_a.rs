@@ -245,7 +245,7 @@ async fn re_running_the_same_file_appends_zero_rows() {
     assert_eq!(
         raw_count(&ctx),
         2,
-        "ON CONFLICT DO NOTHING on the composite PK → zero new rows"
+        "the immutable object URI's ingest marker makes the second manifest a no-op"
     );
 }
 

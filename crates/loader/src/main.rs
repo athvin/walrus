@@ -9,6 +9,10 @@ use common::FailureClass;
 use loader::config::LoaderConfig;
 use std::process::ExitCode;
 
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 // The pre-subscriber window, and the only stderr in this binary: config validation and
 // `init_tracing` both run before any `tracing` event has a subscriber to reach, so their failures
 // would be silent as events. Everything from the runtime build down is a `tracing` event.
@@ -17,6 +21,11 @@ use std::process::ExitCode;
     reason = "config and tracing-init failures precede the subscriber they would otherwise log to"
 )]
 fn main() -> ExitCode {
+    #[cfg(feature = "dhat-heap")]
+    let _dhat_profiler = dhat::Profiler::builder()
+        .file_name(std::env::var_os("DHAT_OUTPUT").unwrap_or_else(|| "dhat-heap.json".into()))
+        .build();
+
     let cfg = match LoaderConfig::load() {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -24,7 +33,11 @@ fn main() -> ExitCode {
             return common::ExitCode::Config.into();
         }
     };
-    if let Err(e) = common::init_tracing(&cfg.telemetry) {
+    #[cfg(feature = "tokio-console")]
+    let tracing_result = common::init_tracing_with_console(&cfg.telemetry);
+    #[cfg(not(feature = "tokio-console"))]
+    let tracing_result = common::init_tracing(&cfg.telemetry);
+    if let Err(e) = tracing_result {
         eprintln!("walrus-loader: tracing init failed: {e}");
         return common::ExitCode::Internal.into();
     }

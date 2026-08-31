@@ -32,7 +32,7 @@
 - [3. Commit-gating — the loader only ever sees committed data, by contract](#3-commit-gating--the-loader-only-ever-sees-committed-data-by-contract)
 - [4. Two-phase apply — append, then transform](#4-two-phase-apply--append-then-transform)
 - [5. The raw→mirror transform — correctness in depth](#5-the-rawmirror-transform--correctness-in-depth)
-  - [5.1 The two tables and the composite raw primary key](#51-the-two-tables-and-the-composite-raw-primary-key)
+  - [5.1 The two data tables and file ingest ledger](#51-the-two-data-tables-and-file-ingest-ledger)
   - [5.2 Dedup-to-latest per primary key (the window)](#52-dedup-to-latest-per-primary-key-the-window)
   - [5.3 Deletes are filtered AFTER ranking (the resurrection guard)](#53-deletes-are-filtered-after-ranking-the-resurrection-guard)
   - [5.4 The MERGE branches (and composite keys)](#54-the-merge-branches-and-composite-keys)
@@ -163,7 +163,7 @@ LIMIT  :max_files_per_cycle;   -- batch several files per cycle to amortize over
 Note what the filter is **not**: it is **not** `lsn_end > raw_appended_lsn`. Such a predicate would wrongly skip
 the many **snapshot files that all share `consistent_point`** as their `lsn_end`
 ([architecture.md §1.7](./architecture.md#17-snapshot--backfill-bootstrap)). What advances the frontier is the
-**queue deletion** (an applied file is gone and cannot be re-claimed), backstopped by row-level idempotency
+**queue deletion** (an applied file is gone and cannot be re-claimed), backstopped by the transactional URI ledger
 ([§4](#4-two-phase-apply--append-then-transform)). The watermarks exist for **ordering and resume**, not dedup.
 
 ### Why `lsn_end` is a COMMIT LSN, never a max row LSN (correctness-critical)
@@ -292,19 +292,25 @@ Every apply cycle, per table, is two phases with two independent watermarks. The
 1. **Claim** the next `ready` files in `(lsn_end, id)` order ([§2](#2-the-work-handoff-contract--the-file_manifest-as-a-work-queue)).
 2. For each file in LSN order, DuckDB reads the Parquet — either `read_parquet` from S3 directly (`httpfs`/`SET
    s3_*` [8][9]) or via the `duckdb-rs` Appender API [10] ([§9.2](#92-the-levers)) — and **appends its rows verbatim**
-   into `<table>_raw`: no dedup, `walrus_pg_sink_meta` kept verbatim, and `op` / `commit_lsn` / `lsn` /
-   `sink_processed_at` **promoted to typed columns**. Row-level idempotency comes from `ON CONFLICT DO NOTHING` on
-   `<table>_raw`'s composite PK (source PK + `sink_processed_at` + `lsn` — [§5.1](#51-the-two-tables-and-the-composite-raw-primary-key)):
+   into `<table>_raw`: no row dedup, `walrus_pg_sink_meta` kept verbatim, and `op` / `commit_lsn` / `lsn` /
+   `sink_processed_at` **promoted to typed columns**. File-level idempotency comes from a small
+   `_walrus_ingested_files` ledger keyed by the staged object's immutable, epoch+UUID-namespaced URI
+   ([§5.1](#51-the-two-data-tables-and-file-ingest-ledger)). The raw append and marker are one DuckDB
+   transaction:
 
    ```sql
-   INSERT INTO <table>_raw
-   SELECT *,                                        -- source columns + walrus_pg_sink_meta (verbatim)
-          json_extract_string(walrus_pg_sink_meta,'$.op')                AS op,
-          json_extract_string(walrus_pg_sink_meta,'$.commit_lsn')        AS commit_lsn,
-          json_extract_string(walrus_pg_sink_meta,'$.lsn')               AS lsn,
-          json_extract_string(walrus_pg_sink_meta,'$.sink_processed_at') AS sink_processed_at
-   FROM   read_parquet(:s3_uri)
-   ON CONFLICT DO NOTHING;                          -- row-level idempotency (crash-window safe)
+   BEGIN;
+     -- If this URI is already present, commit no work and return zero rows.
+     INSERT INTO <table>_raw
+     SELECT *,                                      -- source columns + meta + promoted fields
+            json_extract_string(walrus_pg_sink_meta,'$.op'),
+            json_extract_string(walrus_pg_sink_meta,'$.commit_lsn'),
+            json_extract_string(walrus_pg_sink_meta,'$.lsn'),
+            json_extract_string(walrus_pg_sink_meta,'$.sink_processed_at')
+     FROM read_parquet(:s3_uri);
+     INSERT INTO _walrus_ingested_files (s3_uri, manifest_id)
+     VALUES (:s3_uri, :manifest_id);
+   COMMIT;
    ```
 3. **After the DuckDB append commits**, in **one control-DB transaction**, advance the watermark **and** delete the
    claimed queue rows together — the crash-safe ordering across two databases (DuckDB and control Postgres cannot
@@ -332,11 +338,10 @@ At-least-once on both hops (WAL→S3 and S3→DuckDB) becomes effectively-once t
 matters to be precise about which does what:
 
 - **Append idempotency** rests on (1) the **work-queue deletion** (an applied file is gone, cannot be re-claimed)
-  **plus** (2) the **row-level `ON CONFLICT DO NOTHING`** on `<table>_raw`'s real composite PK. Guard (2) is
-  **load-bearing, not a backstop**: in the crash window between the DuckDB append-commit and the control-DB
-  txn, the file is still queued and *will* be re-claimed and re-appended, and the file-level watermark does **not**
-  cover that window (it was never advanced, precisely because that txn didn't commit). Do **not** demote that PK to
-  a non-enforced key without an equivalent row-dedup.
+  **plus** (2) `_walrus_ingested_files`. Guard (2) is load-bearing: in the crash window between the DuckDB
+  append+marker commit and the control-DB txn, the file is still queued and *will* be re-claimed. Its URI marker
+  makes that retry return zero before `DESCRIBE`/`read_parquet`; the file-level watermark does **not** cover that
+  window because it was deliberately not advanced. The marker and raw rows must remain in one DuckDB transaction.
 - **Transform idempotency** is natural: it scans only `commit_lsn > transformed_lsn`, dedups by `(commit_lsn DESC,
   lsn DESC)`, and `MERGE`s — so re-running it produces the same winners.
 
@@ -345,12 +350,11 @@ matters to be precise about which does what:
 | Crash point | State on restart | What re-runs | What keeps it correct |
 |---|---|---|---|
 | Mid Phase-A append (DuckDB txn open) | DuckDB rolls back; file still `ready` in queue | re-claim + re-append | clean append (nothing partially committed) |
-| After DuckDB append-commit, **before** control-DB txn | file still `ready`; `raw_appended_lsn` **not** advanced | re-claim + re-append the same file | **row-level `ON CONFLICT DO NOTHING`** (the watermark can't help here) |
+| After DuckDB append+marker commit, **before** control-DB txn | file still `ready`; `raw_appended_lsn` **not** advanced | re-claim the same file | **URI marker returns zero** (the watermark cannot help here) |
 | After control-DB txn, before Phase B | file gone; `transformed_lsn` behind `raw_appended_lsn` | Phase B over the tail | **idempotent transform** (`commit_lsn > transformed_lsn`) |
 | Mid Phase-B `MERGE` | `transformed_lsn` not advanced | whole window re-transforms | LWW dedup → same winners |
 
-Cross-refs: [architecture.md coordination contract](./architecture.md#coordination-contract-control-plane-tables)
-("that row-level PK is therefore load-bearing, not a mere backstop"),
+Cross-refs: [architecture.md coordination contract](./architecture.md#coordination-contract-control-plane-tables),
 [Delivery semantics](./architecture.md#delivery-semantics-ordering--idempotency),
 [`walrus-pg-sink.md` §4.6](./walrus-pg-sink.md#46-the-loaders-shutdown-differs).
 
@@ -363,21 +367,25 @@ source table. It is **pure DuckDB SQL** parameterized only by the table, its pri
 `:transformed_lsn` — which is what makes it fast ([§9.2](#92-the-levers)) *and* unit-testable
 ([§6.4](#64-why-it-is-unit-testable-by-construction)).
 
-### 5.1 The two tables and the composite raw primary key
+### 5.1 The two data tables and file ingest ledger
 
 | | `<table>_raw` — the CDC log (bronze) | `<table>` — the mirror (silver) |
 |---|---|---|
 | Contents | verbatim union-superset of every source column ever seen (dropped cols kept nullable, incompatible type changes widened to `VARCHAR`, renames tracked by `attnum`) + `walrus_pg_sink_meta` verbatim + promoted `op` / `commit_lsn` / `lsn` / `sink_processed_at` | exactly the current source shape; meta dropped |
 | Rows | append-only; snapshot rows too (`kind='snapshot'`); never updated | one row per PK; produced **only** by the transform |
-| Primary key | **composite: source PK + `sink_processed_at` + `lsn`** | the source primary key |
+| Primary key | none (append-only heap) | the source primary key |
 | Order/watermark key | `commit_lsn` (delivery order); `lsn` = intra-txn tiebreaker | — |
 
-The raw PK deserves emphasis: the source PK alone repeats across CDC events (this *is* a history log), so it cannot
-be the key. `sink_processed_at` + source PK is the natural key, and **`lsn` is the deterministic tiebreaker that
-guarantees uniqueness** (every WAL change has a distinct LSN; snapshot rows are unique by source PK). This real PK
-is what enables the `ON CONFLICT DO NOTHING` that makes Phase A crash-window-safe
-([§4](#4-two-phase-apply--append-then-transform)). If PK-index maintenance on the append-hot path proves costly it
-may be a `UNIQUE` constraint instead — but it must stay **enforced**.
+`<table>_raw` deliberately has no row index: indexing every history row made narrow 50k-row appends about 20%
+slower while replay happens at file granularity. `_walrus_ingested_files (s3_uri PRIMARY KEY, manifest_id)` is one
+small row per staged object, and the sink's epoch+LSN+UUID key makes the URI immutable and globally unique for the
+generation. Its insert commits atomically with the raw append ([§4](#4-two-phase-apply--append-then-transform)).
+Markers survive reload rebuilds and are cleared with a total-epoch wipe.
+
+An upgraded database may still have the former raw composite PK. The loader keeps it as a compatibility fence,
+replays/drains every pending manifest into the file ledger, and only performs the transactional CTAS to a heap
+after a fresh control-plane read proves the queue empty. Thus a file appended just before upgrading cannot be
+duplicated during the migration.
 
 The loader rebuilds Tier-2/Tier-3 types (interval, range, enum, bit, char length, …) from the per-column **type
 descriptor** the sink wrote into `schema_registry` — see
@@ -812,7 +820,7 @@ On `SIGTERM`, each per-table worker drains **in order** before exit:
 6. **Never drop the slot** — the loader doesn't own it; decommission is separate ([§8.6](#86-decommission-and-node-drain)).
 
 Every restart is a **resume** from the two watermarks: an ungraceful `SIGKILL` mid-append is absorbed by the
-work-queue + `ON CONFLICT DO NOTHING`, and mid-`MERGE` by the idempotent transform
+work-queue + transactional file-ingest ledger, and mid-`MERGE` by the idempotent transform
 ([§4](#4-two-phase-apply--append-then-transform)). Graceful drain merely minimizes replay and, critically, avoids
 leaving a **stale DuckDB lock** for [§8.2](#82-startup--the-ordered-fail-fast-bootstrap) to untangle. Make the Rust
 process **PID 1 / under `tini` / exec-form** so `SIGTERM` reaches it and isn't swallowed by a shell entrypoint [16].

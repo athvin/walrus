@@ -418,6 +418,12 @@ serde = "1"
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+# Local-only async diagnostics. Kept optional in `common`; the two binary crates expose the
+# `tokio-console` feature that activates it and Tokio's matching tracing feature together.
+console-subscriber = "0.5.0"
+# Local-only heap diagnostics. Each binary opts into this allocator with its own `dhat-heap`
+# feature, so the shipped/default allocator and runtime cost stay unchanged.
+dhat = "0.3.3"
 figment = "0.10"
 humantime-serde = "1"
 jiff = "0.2"
@@ -476,7 +482,15 @@ proptest = { version = "1", default-features = false, features = ["std"] }
 # behavioural rather than build-cost reasons: unwinding is what lets crates/pg-sink/src/reload.rs
 # classify a panicking reload exporter instead of taking the whole sink down with it, and the symbol
 # table is what names the frames in a profile of the release — and, by inheritance, `bench` — binary.
-# Recorded, with the custom-profile and dev-override rejections, in
-# docs/implementation/notes/rust-skills/perf-release-profile.md — same guard.
+# Recorded, with the dedicated symbolized-profiling exception and dev-override rejections, in
+# docs/implementation/notes/rust-skills/perf-release-profile.md and docs/benchmarks.md — the same
+# guard requires that exception to inherit release without changing code generation.
 [profile.release]
 lto = "thin"
+
+# Symbolized, otherwise release-equivalent binaries for Samply, DHAT and tokio-console runs. The
+# ordinary release and bench profiles remain the performance baseline; this profile is diagnostic
+# and intentionally produces larger local artifacts under target/profiling.
+[profile.profiling]
+inherits = "release"
+debug = true

@@ -48,8 +48,9 @@ const INIT_DEFINITION: &str = "fn init_tracing(";
 
 /// Dependency names that install (or bridge into) a subscriber or logger. Plain `tracing` and `log`
 /// are absent on purpose: they are the facade, and every crate here is welcome to emit through one.
-const SUBSCRIBER_CRATES: [&str; 6] = [
+const SUBSCRIBER_CRATES: [&str; 7] = [
     "tracing-subscriber",
+    "console-subscriber",
     "tracing-log",
     "env_logger",
     "env-logger",
@@ -249,6 +250,10 @@ fn the_bootstrap_crate_still_owns_the_subscriber_dependency() {
     assert!(
         declares(body, "tracing-subscriber"),
         "{SUBSCRIBER_OWNER} owns the one subscriber dependency, so the scan's spelling must match"
+    );
+    assert!(
+        declares(body, "console-subscriber"),
+        "{SUBSCRIBER_OWNER} owns the optional console layer beside the normal subscriber"
     );
 }
 

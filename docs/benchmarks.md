@@ -1,9 +1,9 @@
 # walrus benchmarks
 
-The living record of the sink/loader hot-path micro-benchmarks: methodology, the recorded baseline,
-and — from PR 5.7/5.8 on — before/after deltas for each optimisation. Benches are **never a CI gate**
-(shared runners are too noisy); CI only compile-checks the bench targets via `clippy --all-targets`.
-Run them yourself on a quiet machine with `just bench`.
+The living record of Walrus performance measurements: Criterion micro-benchmarks, release-mode
+end-to-end efficiency runs, and CPU/allocation/async diagnostics. Timed benchmarks are **never a CI
+gate** (shared runners are too noisy); CI compile-checks every target and diagnostic feature. Run
+measurements on a quiet machine and compare like-for-like run bundles.
 
 ## Methodology
 
@@ -37,6 +37,20 @@ cargo bench -p pg-sink -p pg-to-arrow -- --warm-up-time 1 --measurement-time 3
 
 Criterion writes per-bench estimates under `target/criterion/` (gitignored).
 
+The system harness measures the shipping release binaries and writes a self-describing bundle:
+
+```
+just perf-e2e mixed
+just perf-e2e wide_text
+just perf-e2e large_txn
+```
+
+Each run lands under `target/perf/<timestamp>-<scenario>-measure-<pid>/` with `metadata.json`,
+`summary.json`, `samples.csv`, service logs, load-generator output, and any diagnostic artifact.
+`summary.json` includes rows/s, CPU-seconds per 1,000 drained input rows, sampled peak RSS for each
+Walrus process, flush cost, spills, and peak lag at each pipeline stage. It deliberately excludes
+the Compose Postgres and MinIO processes from CPU/RSS accounting.
+
 ### Comparing a change against a baseline
 
 Absolute medians drift between runs even on one machine — several entries below had to discount that
@@ -53,65 +67,165 @@ Criterion re-runs each bench against the stored sample and reports the change pl
 its noise threshold, which is what "within noise" in the tables below should mean from here on.
 Baselines live under `target/criterion/`, so `cargo clean` discards them.
 
+End-to-end bundles are compared with:
+
+```
+just perf-compare target/perf/<baseline> target/perf/<candidate>
+```
+
+The comparison is direction-aware and has no pass/fail threshold. It refuses differences in mode,
+scenario, workload knobs, OS/architecture/CPU, Rust version, or build profile. For an explicitly
+non-authoritative look across unlike runs, call `python3 scripts/perf_report.py compare ...
+--allow-mismatch`; the warning is intentionally impossible to miss.
+
 ## Profiling — finding the hot spot
 
-The benches say **how fast** a path is; they do not say **where the time goes inside it**. The order
-this file records is: bench the path, profile it, change one thing, re-measure against a saved
-baseline. Every entry under [History](#history) cites a measured delta for that reason — including
-the honest nulls (PR 5.7's thin LTO, PR 5.8's TOAST back-scan) and the declines (PR 11.13 `SmallVec`,
-PR 11.16 compact strings), which are only defensible because a measurement exists. None of the below
-is a CI gate, and none of it adds a dependency: each profiler attaches to a binary the recipes above
-already build.
+The release and Criterion runs answer **whether** performance changed. Diagnostic builds answer
+**where** the cost lives. `[profile.profiling]` inherits release, keeps thin LTO and all shipping
+code-generation choices, and adds full debug information. It never supplies baseline timing data.
+The profile guard rejects any additional code-generation override, and the repository still forbids
+a committed `.cargo/config.toml` and host-specific ISA flags.
 
-### Debug info, per invocation
+Install Samply once (`cargo install --locked samply`). On macOS, run `samply setup` after each Samply
+upgrade so attach mode is signed correctly. On Linux, perf-event permissions must allow the current
+user. Profiles stay local until explicitly uploaded.
 
-`[profile.release]` carries only `lto = "thin"`, so release and `bench` builds compile without debug
-info and profiles come back with thin, cross-crate-inlined frames. Ask for symbols through the
-environment rather than the manifest — a committed `.cargo/config.toml` is forbidden anywhere in the
-workspace (`crates/common/tests/build_profile.rs::no_cargo_config_exists`), and the release artifact
-should stay the one the numbers here describe:
+### One Criterion path
 
 ```
-CARGO_PROFILE_BENCH_DEBUG=1 cargo bench -p pg-sink --bench decode -- --profile-time 10
-CARGO_PROFILE_RELEASE_DEBUG=1 cargo build --release -p pg-sink -p loader
+just profile-bench pg-sink decode parse_tuple 10
+just profile-bench pg-to-arrow batch append_row 10
+just profile-bench loader transform transform 10
+just profile-bench loader append append_parquet 10
 ```
 
-`--profile-time N` is criterion's external-profiler mode: it iterates each bench for ~N seconds and
-skips the statistical analysis, so the samples belong to the routine rather than to criterion.
+The helper builds first, resolves the exact hashed benchmark executable from Cargo's JSON messages,
+then runs that executable under Samply with Criterion's `--profile-time`. Compilation and Cargo are
+therefore absent from the samples. The bundle contains `profile.json.gz`; open it with `samply load`.
 
-### One path (a criterion bench)
-
-macOS (the reference machine), after `cargo install cargo-instruments` (needs Xcode):
-
-```
-cargo instruments -p pg-sink -t time --bench decode -- --profile-time 10       # CPU
-cargo instruments -p pg-to-arrow -t alloc --bench batch -- --profile-time 10   # allocations
-```
-
-Linux — run the bench binary whose path `cargo bench` prints, under `perf`:
+### One service in the real pipeline
 
 ```
-perf record -g target/release/deps/decode-<hash> --profile-time 10
-perf script | inferno-collapse-perf | inferno-flamegraph > flamegraph.svg
+just profile-e2e loader wide_text
+just profile-e2e sink large_txn
 ```
 
-### The whole service, under load
+The complete source Postgres → sink → object store → loader → DuckDB workload still runs. Samply
+attaches only to the selected Rust process and stops after drain, while the ordinary sampler captures
+context metrics. On Linux Samply reports on-CPU samples; macOS can also expose off-CPU waits.
 
-A micro-bench ranks suspects inside one function; it cannot see a bottleneck that appears only with
-the real stack attached — which is how PR 5.6 found the loader saturating first while the sink's
-`inflight` stayed 0. Run `just bench-e2e <scenario>` and sample the *running* release process:
-`sample <pid>` or Instruments' attach on macOS, `perf record -g -p <pid>` on Linux. The script starts
-`target/release/walrus-pg-sink` and `target/release/walrus-loader` and holds both PIDs.
+### Allocations
 
-### Two walrus-specific caveats
+```
+just profile-heap sink wide_text
+just profile-heap loader mixed
+```
 
-- **The loader's time is mostly not Rust.** PR 5.5's `EXPLAIN ANALYZE` (below) is the profiler for
-  the transform: the cost centre is DuckDB's window/group-by, so a Rust sampler mostly shows the
-  worker parked in `duckdb` FFI. Profile the SQL first and the Rust caller second.
-- **Allocation questions need an allocation profiler, not a guess.** PR 11.16 defers `SinkMeta`
-  compact strings *until allocation profiling shows those strings limit the sink end to end*; the
-  measurement that re-opens it is `-t alloc` above (or `heaptrack` on Linux) over `append_row` plus a
-  `bench-e2e` sink run — not a new global-allocator dev-dependency taken on spec.
+Only the selected binary enables the `dhat-heap` feature and global tracking allocator. The resulting
+`<service>-dhat-heap.json` opens in DHAT's viewer. DHAT changes allocator behavior and slows execution,
+so the run is marked non-comparable: use it to rank allocation sites, then return to Criterion and a
+release `perf-e2e` run to prove the change helped.
+
+### Async scheduling
+
+```
+cargo install --locked tokio-console
+just profile-async loader mixed
+```
+
+The recipe builds only the selected binary's console initializer with Tokio tracing and the required
+`tokio_unstable` cfg, binds the console server to `127.0.0.1:6669`, and waits briefly before applying
+load. Connect the UI from a second terminal. The recording is retained in the run bundle. This mode
+is also non-comparable because task instrumentation changes the observed program.
+
+### Walrus-specific interpretation
+
+- **The loader's transform is mostly DuckDB.** If the sampled stack ends in DuckDB FFI, use the
+  production SQL's `EXPLAIN ANALYZE` below to distinguish window/group-by, joins, and merge work.
+- **Async and CPU profiles answer different questions.** Samply locates CPU consumption;
+  tokio-console locates long polls, wakeups, and starvation. A blocked `LocalSet` can be serious
+  without being wide in an on-CPU flame graph.
+- **CPU efficiency is the cost signal.** Require an improvement in CPU-seconds/1,000 drained rows,
+  not only elapsed time; RSS and backlog must not regress enough to move the bottleneck elsewhere.
+
+### Future deterministic CI
+
+The next regression-gating phase will use `iai-callgrind` on Linux for the smallest existing decode,
+Arrow append, and transform cases. It will begin as a manual or scheduled job; thresholds become a PR
+gate only after repeated runs establish stable instruction/cache baselines. No `iai-callgrind`
+dependency or performance gate is part of the current local framework.
+
+## Optimization log
+
+### 2026-08-30 — one-pass loader transform rendering
+
+The loader DHAT bundle `20260830T233544Z-mixed-heap-loader-90161` identified the eleven chained
+`str::replace` calls in `TransformSql::render` as the largest application-owned allocation stream:
+1,478,664 bytes across 253 allocations in that short run. The renderer now computes the final SQL
+capacity and substitutes every template token in one traversal, copying the growing statement once
+instead of once per token.
+
+A dedicated Criterion benchmark captured `render-before` before the production change and compared
+the new implementation against those saved samples:
+
+| render shape | before | after | Criterion change |
+|---|---:|---:|---:|
+| 2 columns | 10.818 µs | 7.760 µs | **−28.70%**, `p < 0.05` |
+| 30 columns | 35.284 µs | 26.798 µs | **−23.86%**, `p < 0.05` |
+
+The matching post-change DHAT bundle `20260830T234946Z-mixed-heap-loader-98863` contains zero
+`str::replace` allocations; the final rendered string is one allocation per call. Both DHAT runs
+processed 20,000 rows, but they performed different numbers of polling cycles, so the removed
+allocation site—not a percentage computed from whole-run allocation totals—is the valid comparison.
+
+The release bundles `20260830T232444Z-mixed-measure-78627` (before) and
+`20260830T235146Z-mixed-measure-297` (after) each drained 435,000 rows in 66 seconds. Loader CPU fell
+from 0.1287 to 0.1265 seconds per 1,000 rows (**−1.71%**); total Walrus CPU fell from 0.1479 to 0.1455
+(**−1.62%**), while loader peak RSS changed by +0.11%. That single back-to-back pair demonstrates no
+system regression and is directionally consistent with the microbenchmark, but it is not a
+statistical end-to-end claim; repeat alternating release runs before using the 1.71% figure for
+capacity planning.
+
+### 2026-08-30 — file-level replay ledger removes the raw per-row index
+
+The release samples showed the loader dominating Walrus CPU while its RSS rose throughout the run;
+a fixed 5,000-row transform tail changed by only 5.4% between an empty raw table and one million
+historical rows, ruling out raw-history scan growth as the main cause. A direct
+DuckDB isolation test made the real cost obvious: inserting one million synthetic raw rows took
+0.72–1.08 seconds with the old composite primary key and 0.25–0.28 seconds into a heap.
+
+Phase A now commits each raw file and one `_walrus_ingested_files` URI marker in the same DuckDB
+transaction. Replays return zero before reopening Parquet. The raw log is a heap, so ordinary rows
+no longer maintain a per-row ART index for a file-granularity failure mode. Existing databases keep
+the old key until their pending control queue is empty, using it to absorb any pre-upgrade crash
+replay; a transactional CTAS then preserves all columns/rows while removing the constraint.
+
+The saved Criterion baseline `replay-before` and the identical post-change benchmark show:
+
+| 50k-row append | before | after | Criterion change |
+|---|---:|---:|---:|
+| narrow (3 columns) | 109.23 ms | 87.83 ms | **−19.60%**, `p < 0.05` (+24.37% throughput) |
+| wide (30 columns) | 196.99 ms | 193.18 ms | −1.94%, within the configured noise threshold |
+
+The fixed-tail `raw_history` controls remained unchanged at 0, 100k, and 1M historical rows
+(`p = 0.81`, `0.70`, and `0.43`), so the improvement is isolated to append rather than a transform
+trade-off. Correctness tests cover marker-before-Parquet replay, rollback when the marker insert
+fails after raw insertion, legacy crash replay, lossless migration, and migration idempotency.
+
+Two independent release bundles compared with the immediate pre-ledger bundle
+`20260830T235146Z-mixed-measure-297`:
+
+| bundle | rows / elapsed | loader CPU s/1k | change | total CPU s/1k | change | loader peak RSS |
+|---|---:|---:|---:|---:|---:|---:|
+| pre-ledger | 435k / 66s | 0.1265 | — | 0.1455 | — | 762.81 MiB |
+| `20260831T005451Z-mixed-measure-37250` | 435k / 67s | 0.1183 | **−6.43%** | 0.1377 | **−5.42%** | 753.50 MiB |
+| `20260831T005719Z-mixed-measure-38947` | 430k / 66s | 0.1221 | **−3.43%** | 0.1412 | **−3.01%** | 723.91 MiB |
+
+The two candidate runs average 0.1202 loader CPU-seconds per 1,000 rows (**−4.93%**) and 0.1394
+total CPU-seconds per 1,000 rows (**−4.21%**). Rows are normalized because the time-bounded load
+generator produced 430k–435k. Wall throughput was 1.15–1.49% lower, so this is an efficiency win,
+not a latency/throughput claim. RSS moved in the right direction but remains too sample-sensitive to
+claim as a proven capacity reduction.
 
 ## Baselines (PR 5.4)
 
