@@ -1,4 +1,4 @@
-#![deny(clippy::indexing_slicing)] // PR 16.2: the 460 ns/row append path carries width proofs.
+#![deny(clippy::indexing_slicing)] // the 460 ns/row append path carries width proofs.
 
 //! [`BatchBuilder`] — decoded [`TupleValue`]s + a [`SinkMeta`] → an Arrow [`RecordBatch`].
 //!
@@ -6,7 +6,7 @@
 //! representation, maps [`TupleValue::Null`] and [`TupleValue::UnchangedToast`] onto the validity
 //! bitmap (a null in both cases — the TOAST placeholder's column name is recorded in
 //! [`SinkMeta::unchanged_toast`] upstream and echoed into the meta JSON; *resolving* it is the
-//! loader's back-scan, PR 3.6), and serializes the provenance into the trailing
+//! loader's back-scan), and serializes the provenance into the trailing
 //! `walrus_pg_sink_meta` column. All column builders (including meta)
 //! move in lockstep — every `append_row` pushes exactly one slot to every column.
 
@@ -28,8 +28,8 @@ use std::sync::Arc;
 
 /// How one source column's `TupleValue` fans out onto the flat builder list. Tier-1 consumes one
 /// builder (the existing `append_value` path); Tier-2 spreads a single value across several sibling
-/// builders (PR 2.12). Ordering here MUST match `emit_fields` / `build_schema` (§2.4, PR 2.17's
-/// descriptor `emit[]` lists the same suffixes in the same order).
+/// builders. Ordering here MUST match `emit_fields` / `build_schema`; the descriptor's `emit[]`
+/// list records the same suffixes in the same order (§2.4).
 /// The batch plan stores one compact `Emit` per source column, independent of its row count.
 #[derive(Debug)]
 enum Emit {
@@ -78,11 +78,11 @@ fn emit_kind(col: &PgColumn) -> Result<Emit, Error> {
     if tier1_data_type(col.type_oid, col.type_modifier).is_some() {
         return Ok(Emit::Scalar);
     }
-    // Tier-3 carriers are a single Utf8 column → the same Scalar/append_value path (PR 2.15).
+    // Tier-3 carriers are a single Utf8 column → the same Scalar/append_value path.
     if crate::tier3::is_tier3_text(col.type_oid, col.type_modifier) {
         return Ok(Emit::Scalar);
     }
-    // uuid (FixedSizeBinary) and enum (Utf8) are both single columns → Scalar/append_value (PR 2.16).
+    // uuid (FixedSizeBinary) and enum (Utf8) are both single columns → Scalar/append_value.
     if col.type_oid == oids::UUID || crate::uuid_enum::is_enum_oid(col.type_oid) {
         return Ok(Emit::Scalar);
     }
@@ -114,7 +114,7 @@ pub struct BatchBuilder {
     plan: Box<[Emit]>,   // one per SOURCE column: how its value fans out
     meta: StringBuilder, // the trailing walrus_pg_sink_meta column
     rows: usize,
-    /// The batch-constant meta JSON fragment, serialized once from the first row (PR 5.7).
+    /// The batch-constant meta JSON fragment, serialized once from the first row.
     meta_const: Option<String>,
     /// Reused scratch for assembling each row's `{const,row}` meta JSON (avoids a per-row alloc).
     meta_buf: String,
@@ -123,7 +123,7 @@ pub struct BatchBuilder {
 }
 
 impl BatchBuilder {
-    /// Build empty typed builders from the relation's Arrow schema (PR 2.9; Tier-2 fan-out, PR 2.12).
+    /// Build empty typed builders from the relation's Arrow schema, including Tier-2 fan-out.
     ///
     /// # Errors
     ///
@@ -219,7 +219,7 @@ impl BatchBuilder {
         Ok(())
     }
 
-    /// Append the row's `walrus_pg_sink_meta` JSON, amortizing the batch-constant fields (PR 5.7):
+    /// Append the row's `walrus_pg_sink_meta` JSON, amortizing the batch-constant fields:
     /// serialize them once (from the first row), then per row splice `{const,row}` into a reused
     /// buffer. Byte-equivalent to `serde_json::to_string(meta)` (key order aside) — see
     /// `common::sink_meta`'s `amortized_meta_matches_full` test.
@@ -286,7 +286,7 @@ impl BatchBuilder {
 
 /// A typed builder matching `field`'s Arrow type. `make_builder` covers most types; Decimal128 and
 /// Timestamp are built explicitly so `finish()` preserves the precision/scale and timezone that the
-/// schema (and DuckDB read-back, PR 2.11) require.
+/// schema and DuckDB read-back require.
 fn column_builder(field: &Field) -> Result<Box<dyn ArrayBuilder>, Error> {
     Ok(match field.data_type() {
         DataType::Decimal128(p, s) => {
@@ -314,7 +314,7 @@ fn column_builder(field: &Field) -> Result<Box<dyn ArrayBuilder>, Error> {
             }
             _ => make_builder(field.data_type(), 0),
         },
-        // Geometric STRUCTs (point/box/circle/line/path, PR 2.14). Recurse via `column_builder` so a
+        // Geometric STRUCTs (point/box/circle/line/path). Recurse via `column_builder` so a
         // nested Struct/List/Decimal/Timestamp child keeps its exact type (not `make_builder`'s default).
         DataType::Struct(struct_fields) => Box::new(StructBuilder::new(
             struct_fields.clone(),
@@ -413,7 +413,7 @@ fn append_value(
                 b.append_value(micros);
             }
         }
-        // uuid: parse canonical text → 16 bytes, append as fixed-width binary (PR 2.16).
+        // uuid: parse canonical text → 16 bytes, append as fixed-width binary.
         DataType::FixedSizeBinary(_) => {
             let b = downcast::<FixedSizeBinaryBuilder>(builder, col)?;
             if is_null {

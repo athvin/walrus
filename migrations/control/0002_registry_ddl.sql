@@ -1,6 +1,6 @@
 -- 0002_registry_ddl.sql — finalize the schema_registry / ddl_manifest columns.
 --
--- PR 1.3 (0001) created these two tables as stubs; here we ALTER them into their final shape rather
+-- Migration 0001 created these two tables as stubs; here we ALTER them into their final shape rather
 -- than drop-and-recreate — both are **history, never a queue**: they are never pruned because they
 -- are the schema record needed to reconstruct any table at any schema_version, and a DELETE/DROP
 -- here would make old-version Parquet files un-reconstructable.
@@ -12,7 +12,7 @@ ALTER TABLE walrus.schema_registry ALTER COLUMN columns DROP DEFAULT;
 -- ddl_manifest: reshape the stub into the ddl_audit-derived event row (walrus-pg-sink.md §3.3).
 -- c_lsn is the DDL's commit LSN — directly comparable to file_manifest.lsn_end / the checkpoints,
 -- so the loader crosses a schema_version boundary by applying pending DDL whose c_lsn it is about
--- to pass (PR 3.8).
+-- to pass.
 ALTER TABLE walrus.ddl_manifest RENAME COLUMN lsn TO c_lsn;
 ALTER TABLE walrus.ddl_manifest DROP COLUMN change;
 ALTER TABLE walrus.ddl_manifest

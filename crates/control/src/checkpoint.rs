@@ -4,7 +4,7 @@
 //! **commit-LSN valued** (never max-row LSN): `raw_appended_lsn` (Phase A — the `<table>_raw` CDC
 //! log is durable up to here) and `transformed_lsn` (Phase B — the `<table>` mirror is derived up
 //! to here). They advance **independently** — Phase A in the loader's control txn alongside the
-//! manifest delete (PR 3.2), Phase B on its own commit (PR 3.4) — and the mirror is never ahead of
+//! manifest delete, Phase B on its own commit — and the mirror is never ahead of
 //! the log, an invariant the DB enforces via `CHECK (transformed_lsn <= raw_appended_lsn)`.
 
 use crate::ControlError;
@@ -49,7 +49,7 @@ pub async fn read_checkpoint(
 }
 
 /// Create the row at `(0/0, 0/0)` if missing; a no-op if present. Called once at loader bootstrap
-/// (PR 3.1), kept separate from `advance_*` so a fresh table starts at zero without a spurious
+/// and kept separate from `advance_*` so a fresh table starts at zero without a spurious
 /// "advance to zero".
 ///
 /// # Errors
@@ -74,7 +74,7 @@ pub async fn ensure_checkpoint(
 }
 
 /// Phase A: advance `raw_appended_lsn` (UPSERT). The caller passes the executor so this can share
-/// the control-DB transaction that also deletes claimed manifest rows (PR 3.2). `GREATEST` makes
+/// the control-DB transaction that also deletes claimed manifest rows. `GREATEST` makes
 /// the advance **monotonic** — a re-run after a crash never moves the frontier backward.
 ///
 /// # Errors

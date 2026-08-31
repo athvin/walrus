@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# no-speculative-deps.sh — PR 11.17. Phase 11 evaluated five allocator/container crates and
-# declined each with a measurement or a structural argument; the `perf-ahash` audit added the three
-# faster-hasher crates on the same terms, and the `anti-premature-optimize` audit the four
-# global-allocator swaps. This guard keeps those decisions honest: none may become a DIRECT
-# dependency without first updating the ADR that declined it.
+# no-speculative-deps.sh — guard against unmeasured container, hasher, and allocator substitutions.
+# None may become a direct dependency until a profile identifies the relevant bottleneck and the
+# corresponding row below is updated with that evidence.
 #
 #   bash scripts/no-speculative-deps.sh
 #
@@ -14,27 +12,27 @@ set -euo pipefail
 
 REPO_ROOT=$(git rev-parse --show-toplevel)
 
-# package name | ADR that declined it | dependency-key/package spelling accepted by Cargo.
-# If a later PR adopts one on a measurement, delete its row and update that ADR. This list encodes
-# decisions, not dogma.
+# package name | current rationale | dependency-key/package spelling accepted by Cargo.
+# If a measurement supports adopting one, delete its row in the same change. This list encodes
+# current decisions, not dogma.
 #
 # The last four rows are a different axis from the rest: a global-allocator swap replaces the system
 # allocator for the whole process rather than one container or hasher, and — unlike a hand-written
 # `GlobalAlloc`, which `unsafe_code = "forbid"` rejects — installing one takes no unsafe code in
 # walrus, only a manifest line. None of the four is in Cargo.lock even transitively.
 DECLINED=(
-  "smallvec|docs/implementation/notes/rust-skills/mem-smallvec.md|smallvec"
-  "arrayvec|docs/implementation/notes/rust-skills/mem-arrayvec.md|arrayvec"
-  "thin-vec|docs/implementation/notes/rust-skills/mem-thinvec.md|thin[-_]vec"
-  "compact_str|docs/implementation/notes/rust-skills/mem-compact-string.md|compact[-_]str"
-  "bumpalo|docs/implementation/notes/rust-skills/mem-arena-allocator.md|bumpalo"
-  "ahash|docs/implementation/notes/rust-skills/perf-ahash.md|ahash"
-  "rustc-hash|docs/implementation/notes/rust-skills/perf-ahash.md|rustc[-_]hash"
-  "gxhash|docs/implementation/notes/rust-skills/perf-ahash.md|gxhash"
-  "tikv-jemallocator|docs/implementation/notes/rust-skills/anti-premature-optimize.md|tikv[-_]jemallocator"
-  "jemallocator|docs/implementation/notes/rust-skills/anti-premature-optimize.md|jemallocator"
-  "mimalloc|docs/implementation/notes/rust-skills/anti-premature-optimize.md|mimalloc"
-  "snmalloc-rs|docs/implementation/notes/rust-skills/anti-premature-optimize.md|snmalloc[-_]rs"
+  "smallvec|no measured variable-capacity bottleneck|smallvec"
+  "arrayvec|no measured fixed-capacity bottleneck|arrayvec"
+  "thin-vec|no measured vector-layout bottleneck|thin[-_]vec"
+  "compact_str|no measured small-string bottleneck|compact[-_]str"
+  "bumpalo|no measured arena-allocation workload|bumpalo"
+  "ahash|profiles do not implicate hashing; keys are source-derived|ahash"
+  "rustc-hash|profiles do not implicate hashing; keys are source-derived|rustc[-_]hash"
+  "gxhash|profiles do not implicate hashing; keys are source-derived|gxhash"
+  "tikv-jemallocator|profiles do not implicate the global allocator|tikv[-_]jemallocator"
+  "jemallocator|profiles do not implicate the global allocator|jemallocator"
+  "mimalloc|profiles do not implicate the global allocator|mimalloc"
+  "snmalloc-rs|profiles do not implicate the global allocator|snmalloc[-_]rs"
 )
 
 scan_manifests() {
@@ -52,15 +50,15 @@ scan_manifests() {
   done
 
   for entry in "${DECLINED[@]}"; do
-    local crate adr spelling pattern output
-    IFS='|' read -r crate adr spelling <<<"$entry"
+    local crate rationale spelling pattern output
+    IFS='|' read -r crate rationale spelling <<<"$entry"
     # Match ordinary dependency keys, dependency-table form, and renamed dependencies such as
     # `allocator = { package = "bumpalo", ... }`. Anchoring the key avoids comment-only hits.
     pattern="(^[[:space:]]*\"?${spelling}\"?[[:space:]]*=)|(^[[:space:]]*\[[^]]*(dependencies|dev-dependencies|build-dependencies)\.\"?${spelling}\"?\][[:space:]]*$)|(^[^#]*package[[:space:]]*=[[:space:]]*['\"]${spelling}['\"])"
     output=$(grep -nHE "$pattern" "${manifests[@]}" || true)
     while IFS=: read -r file line _rest; do
       [ -n "$file" ] || continue
-      echo "::error file=${file},line=${line}::${file}:${line}: declined direct dependency '${crate}'; decision: ${adr}" >&2
+      echo "::error file=${file},line=${line}::${file}:${line}: declined direct dependency '${crate}'; decision: ${rationale}" >&2
       fail=1
     done <<<"$output"
   done
@@ -119,12 +117,12 @@ EOF
     return 1
   fi
   if ! grep -Fq "crates/example/Cargo.toml:6" <<<"$output" ||
-    ! grep -Fq "docs/implementation/notes/rust-skills/mem-arena-allocator.md" <<<"$output"; then
+    ! grep -Fq "no measured arena-allocation workload" <<<"$output"; then
     echo "$output" >&2
-    echo "no-speculative-deps self-test: rejection omitted its file:line or ADR path" >&2
+    echo "no-speculative-deps self-test: rejection omitted its file:line or rationale" >&2
     return 1
   fi
-  echo "ok: temporary bumpalo dependency is rejected with its ADR path"
+  echo "ok: temporary bumpalo dependency is rejected with its rationale"
   echo "no-speculative-deps self-test: PASS"
 }
 

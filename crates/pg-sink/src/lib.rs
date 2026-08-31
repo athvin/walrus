@@ -9,7 +9,7 @@
 //! `pg_sink` — the walrus Postgres sink library.
 //!
 //! The hand-rolled pgoutput decoder lives in [`pgoutput`] (driven by golden byte vectors from
-//! `pg-sink/tests/`). From PR 2.18 the crate is also a **runnable service**: [`config`] loads and
+//! `pg-sink/tests/`). The crate is also a **runnable service**: [`config`] loads and
 //! validates settings, [`bootstrap`] runs the ordered fail-fast preflight, [`health`] serves the K8s
 //! probes, and [`shutdown`] fans one `CancellationToken` out of SIGTERM/SIGINT. [`app`] wires them
 //! together — [`app::run`] is the whole service lifecycle, so the `walrus-pg-sink` binary

@@ -5,8 +5,8 @@
 //! invalidated. The mitigation is a **sink-driven, idle-triggered** beat: one `UPDATE` to the
 //! published `walrus.heartbeat` table over a *separate* ordinary SQL connection. Because that table
 //! rides `walrus_pub`, the beat decodes back through the replication stream — and *that return* is a
-//! round-trip liveness signal, distinct from both the keepalive (PR 2.20) and the durability
-//! checkpoint (PR 2.26).
+//! round-trip liveness signal, distinct from both the keepalive and the durability
+//! checkpoint.
 //!
 //! **Three LSNs, kept apart:**
 //! - *keepalive/received* (`write`) — moves **unconditionally** on every frame ([`crate::replication`]);
@@ -37,13 +37,13 @@ pub struct InternalTables {
     pub heartbeat_oid: Option<u32>,
     /// Column index of `walrus.heartbeat.beat_seq`, learned from its `Relation` message.
     heartbeat_beat_seq_col: Option<usize>,
-    /// `walrus.ddl_audit`'s OID — its INSERTs are the sink's DDL signal (PR 2.33), consumed for control
+    /// `walrus.ddl_audit`'s OID — its INSERTs are the sink's DDL signal, consumed for control
     /// and NEVER materialised as a `<table>`/`<table>_raw` file.
     pub ddl_audit_oid: Option<u32>,
     /// The `ddl_audit` relation shape (its INSERTs are never cached), so [`crate::ddl::DdlEvent`] can
     /// parse a decoded tuple by column name.
     ddl_audit_rel: Option<common::PgRelation>,
-    /// `walrus.reload_signal`'s OID — its INSERTs are chunk-watermark echoes (PR 6.3), consumed to
+    /// `walrus.reload_signal`'s OID — its INSERTs are chunk-watermark echoes, consumed to
     /// resolve [`crate::reload_signal::WatermarkWaiters`] and NEVER materialised.
     pub reload_signal_oid: Option<u32>,
     /// The `reload_signal` relation shape, so [`crate::reload_signal::PendingSignal`] can parse a

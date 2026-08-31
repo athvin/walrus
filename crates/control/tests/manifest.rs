@@ -7,7 +7,7 @@
 //!
 //! Each test runs inside a rolled-back transaction and namespaces its rows by a unique `epoch`, so
 //! the tests are isolated from each other and idempotent across runs. Gated behind the
-//! `integration` feature (needs the PR 0.6 control Postgres).
+//! `integration` feature (needs the compose control Postgres).
 #![cfg(feature = "integration")]
 
 use common::{EpochNo, Lsn, SchemaVersionNo};

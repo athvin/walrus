@@ -3,15 +3,15 @@
 //! **History, never a queue** — never pruned. Because the source's `ddl_audit` INSERTs ride the
 //! same replication slot as DML, each event's `c_lsn` (commit LSN) is directly comparable to
 //! `file_manifest.lsn_end` and the checkpoints. The loader crosses a `schema_version` boundary by
-//! applying the pending DDL whose `c_lsn` it is about to pass (PR 3.8/3.9) — there is no separate
+//! applying the pending DDL whose `c_lsn` it is about to pass — there is no separate
 //! ordering.
 
 use crate::ControlError;
 use common::{DdlId, EpochNo, Lsn, SchemaVersionNo};
 use sqlx::PgExecutor;
 
-/// A decoded schema-change event. (`c_columns` / `c_dropped` gain typed fields in PRs 3.8/3.9; they
-/// are stored now but not read back here.)
+/// A decoded schema-change event. `c_columns` and `c_dropped` remain JSON because they preserve the
+/// source event payload; loader-side parsing gives the fields their operational shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DdlRow {
     /// Assigned by the DB on insert; ignored by [`insert_ddl`].
@@ -32,9 +32,9 @@ pub struct DdlRow {
     pub schema_version: SchemaVersionNo,
 }
 
-/// Record a decoded schema-change event (sink, PR 2.33). `c_rel_oid` + `c_columns` are the structured
-/// schema-diff payload (the source's post-change column snapshot) the loader applies in PR 3.8/3.9 —
-/// schema-DIFF, not a replay of the DDL text. Returns the assigned `id`.
+/// Record a decoded schema-change event from the sink. `c_rel_oid` + `c_columns` are the structured
+/// schema-diff payload (the source's post-change column snapshot) the loader applies — schema-DIFF,
+/// not a replay of the DDL text. Returns the assigned `id`.
 ///
 /// # Errors
 ///

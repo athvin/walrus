@@ -33,14 +33,14 @@ sqlx = { workspace = true, features = [
 ] }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
-# Non-poisoning mutex for the reload-signal waiters (PR 7.6).
+# Non-poisoning mutex for the reload-signal waiters.
 parking_lot = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-# Relation cache (PR 2.22): decoded PgRelation → Arrow schema + TypeDescriptors.
+# Relation cache: decoded PgRelation → Arrow schema + TypeDescriptors.
 pg-to-arrow = { workspace = true }
 arrow = { workspace = true }
-# Parquet encode → S3 (PR 2.24): AsyncArrowWriter streams into an object_store multipart writer.
+# Parquet encode → S3: AsyncArrowWriter streams into an object_store multipart writer.
 parquet = { workspace = true, features = ["async"] }
 uuid = { workspace = true, features = ["v4"] }
 figment = { workspace = true, features = ["env", "toml", "yaml"] }
@@ -71,7 +71,7 @@ tokio = { workspace = true, features = ["test-util"] }
 jiff = { workspace = true }
 # Test-only: name the seam types (ReplicaIdentity, …) the decoder produces when asserting on them.
 common = { workspace = true }
-# Micro-benches (PR 5.4): pgoutput decode throughput over synthetic frames.
+# Micro-benches: pgoutput decode throughput over synthetic frames.
 criterion = { workspace = true }
 
 # `harness = false` hands the bench binary to criterion_main! instead of the libtest bench harness.

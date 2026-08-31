@@ -3,7 +3,7 @@
     clippy::expect_used,
     reason = "integration test — unwrap/expect fine in setup + helpers"
 )]
-//! Compose-gated integration tests for the loader-pause claim predicate (PR 6.6).
+//! Compose-gated integration tests for the loader-pause claim predicate.
 //!
 //! "Pausing is not claiming" (reload §2): a live `flavor='reload'` reload in
 //! `requested|exporting` makes `claim_ready` return nothing for THAT table while its `ready`
@@ -91,7 +91,7 @@ async fn live_rebuild_pauses_claims_for_that_table_only() {
     );
 
     // The OTHER table claims normally the whole time, and the paused table's backlog stays
-    // visible (the lag gauge SHOULD grow during a pause — PR 6.11 documents it).
+    // visible (the lag gauge SHOULD grow during a pause by design).
     assert_eq!(
         ids(&claim_ready(&mut *tx, epoch, "public", "customers", 100)
             .await
@@ -140,7 +140,7 @@ async fn export_complete_and_terminal_states_lift_the_pause() {
     );
 
     // export_complete lifts the pause — exactly then the loader MUST claim again to reach the
-    // chunk files and trigger the rebuild (pausing through export_complete deadlocks, PR 6.7).
+    // chunk files and trigger the rebuild (pausing through export_complete deadlocks).
     let h: Lsn = "0/100".parse().unwrap();
     reload::complete_export(&mut *tx, orders, h).await.unwrap();
     assert_eq!(

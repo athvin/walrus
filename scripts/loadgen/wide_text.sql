@@ -1,4 +1,4 @@
--- PR 5.6 loadgen — wide-text rows: upsert `orders` with a ~1 KB `note`, exercising the decoder's
+-- Load generator — wide-text rows: upsert `orders` with a ~1 KB `note`, exercising the decoder's
 -- text path (per-cell String allocation) and larger Parquet row groups end-to-end.
 \set id random(1, 1000000)
 \set amt random(1, 1000000)

@@ -5,9 +5,8 @@
 //! version). [`ManifestId`], [`EpochNo`], [`SchemaVersionNo`], [`ReloadId`], and [`DdlId`] share the
 //! same transparent `int8` boundary while remaining distinct types inside Rust.
 //!
-//! Which bare integers deliberately stay bare — the pgoutput wire scalars (relation/type OIDs and
-//! transaction ids) — and what would reopen that, is recorded in
-//! `docs/implementation/notes/rust-skills/type-newtype-ids.md`.
+//! Pgoutput wire scalars (relation/type OIDs and transaction ids) deliberately stay bare because
+//! they are protocol fields rather than control-plane identities.
 //!
 //! All five share one formatting contract: [`Display`](std::fmt::Display),
 //! [`LowerHex`](std::fmt::LowerHex), and [`UpperHex`](std::fmt::UpperHex) hand the whole formatter

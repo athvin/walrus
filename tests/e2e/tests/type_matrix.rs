@@ -5,7 +5,7 @@
 )]
 //! End-to-end type-fidelity matrix (`architecture.md` "Types"): one wide `types_matrix` row driven
 //! through the LIVE pipeline (Postgres → Arrow → Parquet → DuckDB), asserting each mapped type's DuckDB
-//! `typeof` AND value in the mirror. Reuses the conformance expectations from PRs 2.11–2.16.
+//! `typeof` AND value in the mirror. Reuses the `pg-to-arrow` conformance expectations.
 //!
 //!   docker compose -f deploy/docker/docker-compose.yml up --wait
 //!   cargo test -p e2e --features it -- --ignored

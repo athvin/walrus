@@ -1,4 +1,4 @@
-//! DEFERRED-GOAL SEAM — parallel CTID-range snapshotting (PR 4.11). **Inert today.**
+//! DEFERRED-GOAL SEAM — parallel CTID-range snapshotting. **Inert today.**
 //!
 //! v1 backfills each published table with a **single** serial `COPY` under the exported snapshot
 //! (`snapshot::SourceBackfill::copy_table`). The *nearest-term* deferred goal

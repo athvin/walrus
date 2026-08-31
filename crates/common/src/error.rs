@@ -72,8 +72,8 @@ impl From<crate::sink_meta::TimestampParseError> for Error {
 
 /// Move-cost budget for the error value propagated through every service hot path.
 ///
-/// Measured with `size_of::<Error>()` on PR 9.7. If this trips, shrink or box the growing variant
-/// in the Phase 11 layout work, or raise the measured budget deliberately in review.
+/// The compile-time budget reflects a measured 32-byte value. If it trips, shrink or box the
+/// growing variant, or raise the budget deliberately with a new measurement.
 const ERROR_MAX_BYTES: usize = 32;
 const _: () = assert!(size_of::<Error>() <= ERROR_MAX_BYTES);
 
@@ -250,7 +250,7 @@ impl From<ExitCode> for std::process::ExitCode {
             ExitCode::Internal => ExitCode::Internal as i32,
         };
 
-        // Keep PR 17.3's checked narrowing as a defensive boundary. The compile-time range gate
+        // Keep the checked narrowing as a defensive boundary. The compile-time range gate
         // and `error_test.rs` both prove its fallback is unreachable for today's variants.
         std::process::ExitCode::from(u8::try_from(raw).unwrap_or(INTERNAL_EXIT_BYTE))
     }

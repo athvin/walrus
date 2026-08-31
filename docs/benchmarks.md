@@ -9,8 +9,8 @@ measurements on a quiet machine and compare like-for-like run bundles.
 
 - **Harness**: [criterion.rs] 0.5 (`harness = false` targets, `criterion_main!`). `default-features`
   off (no plotters/rayon/html_reports) — we read the stdout stats, and keep the dev-dep tree lean.
-- **Profile**: the `bench` profile (inherits `release`: opt-level 3, LTO thin (inherited from release,
-  PR 5.7)). `black_box` guards every measured input/output so the optimiser can't hoist or elide the work.
+- **Profile**: the `bench` profile (inherits `release`: opt-level 3 and thin LTO). `black_box` guards
+  every measured input/output so the optimiser can't hoist or elide the work.
 - **Throughput**: `Throughput::Elements(rows)`, so results read directly as **rows/s** (`Melem/s`).
 - **Inputs**: generated *outside* the timed loop. Decoder benches synthesize valid pgoutput byte
   streams (`Begin/Relation/Insert/Commit`, and a streamed `StreamStart/…/StreamStop` variant) from the
@@ -54,8 +54,8 @@ the Compose Postgres and MinIO processes from CPU/RSS accounting.
 ### Comparing a change against a baseline
 
 Absolute medians drift between runs even on one machine — several entries below had to discount that
-drift after the fact (PR 16.3's Arrow control moved backward with no timed code changed; PR 11.12
-compared against a baseline taken many PRs earlier). Read an optimisation as a **delta measured
+drift after the fact (the inline-accessor experiment's Arrow control moved backward with no timed
+code changed; the decoder text-cell experiment used a much older baseline). Read an optimisation as a **delta measured
 back-to-back**, not as two absolute numbers taken weeks apart:
 
 ```
@@ -227,7 +227,7 @@ generator produced 430k–435k. Wall throughput was 1.15–1.49% lower, so this 
 not a latency/throughput claim. RSS moved in the right direction but remains too sample-sensitive to
 claim as a proven capacity reduction.
 
-## Baselines (PR 5.4)
+## Sink and Arrow micro-benchmark baselines
 
 Medians from the reference machine. `ns/row` = median ÷ rows (10 000 for decode, 1 000 for Arrow).
 
@@ -249,7 +249,7 @@ Medians from the reference machine. `ns/row` = median ÷ rows (10 000 for decode
 row than `narrow_int4` (4 cols) — the per-cell `String` allocation in the `'t'` branch dominates. The
 **streamed variant is within noise of the non-streamed** one: the 4-byte sub-xid prefix per change is
 negligible. `text_heavy` (10 × 200-byte cols) sits between — fewer cells than wide30 but larger
-copies. First optimisation target for PR 5.7: the per-cell `String` allocation.
+copies. The first optimization target was the per-cell `String` allocation.
 
 ### Arrow batch building — `crates/pg-to-arrow/benches/batch.rs`
 
@@ -284,9 +284,9 @@ for every row in a batch** (only `op`, `lsn`, and `unchanged_toast` vary; `commi
 `xid`, `epoch`, `batch_id`, `schema_version`, source names, `sink_instance`, `sink_processed_at` are
 batch-constant). That 576 ns is **~91 % of `append_row/narrow_int4` (634 ns), ~72 % of `text_heavy`,
 and ~58 % of `wide30`.** Amortising the batch-constant part of the meta JSON is the single biggest
-sink hot-path win available — PR 5.7's primary target.
+sink hot-path win available and became the first implemented optimization.
 
-## Baselines (PR 5.5) — the loader
+## Loader micro-benchmark baselines
 
 All against an **in-memory DuckDB** with `SET threads = 4` (pinned), seeded via one
 `INSERT … SELECT range(N)` per iteration (individual inserts would dwarf the measured transform).
@@ -320,7 +320,7 @@ tracks the **distinct-PK winner count** (the MERGE side), not the raw event coun
 **The back-scan is not a bottleneck.** Same rows/PKs/LSNs; only the winner's `unchanged_toast` meta
 varies. The delta is within the confidence intervals. `EXPLAIN ANALYZE` (below) shows why: DuckDB
 **decorrelates** the per-column correlated subquery into a single `LEFT_DELIM_JOIN`, not a per-row
-loop. **Go/no-go for PR 5.8: do NOT rewrite the back-scan** — DuckDB already handles it; confirm with
+loop. **Decision: do not rewrite the back-scan** — DuckDB already handles it; confirm with
 `EXPLAIN ANALYZE` before touching it.
 
 ### Mirror-size sensitivity (100k-row tail)
@@ -344,7 +344,7 @@ scan. Mirror size is not a hot-path concern.
 
 The per-file `DESCRIBE` introspection is a **fixed ~10 ms/file** (independent of width) — **~10 % of a
 narrow-file append**, and paid once per manifest file regardless of row count. Caching the DESCRIBE
-per `(table, schema_version)` is a candidate PR 5.8 win where files are small/many.
+per `(table, schema_version)` is a worthwhile optimization where files are small and numerous.
 
 ### `EXPLAIN ANALYZE` — the 1M-row transform (K=1), which operators dominate
 
@@ -357,9 +357,9 @@ time — read the **shape**, not the total):
 - **Step 3 — `MERGE_INTO`** (`HASH_JOIN` of `_batch` to the mirror on the PK): ~1/7 the time of Step 1+2.
 
 Takeaway: the **window dedup** is the transform's cost centre, not the TOAST back-scan (decorrelated)
-nor the MERGE (index-joined). PR 5.8 should target the window/scan, if anything.
+nor the MERGE (index-joined). Future work should target the window/scan, if anything.
 
-## End-to-end throughput (PR 5.6) — the system
+## End-to-end throughput — the system baseline
 
 Where the micro-benches rank suspects inside one process, this measures the whole pipeline on the
 real compose stack (source PG → sink → S3, S3 → loader → mirror), reading the Prometheus metrics as
@@ -382,27 +382,25 @@ MAX_INFLIGHT=4MB`, loader `POLL_INTERVAL=1s`; reference machine as above.
    loader's per-cycle throughput trails the sink's, but the pipeline is stable.
 2. **Wide rows amplify the loader backlog ~6.6×** (`wide_text` 11.4 MB vs `mixed` 1.72 MB peak lag) —
    larger per-row payloads hit the loader's per-row transform + append harder, exactly the ops the
-   micro-benches (PR 5.4 `append_row`, PR 5.5 transform) flagged. The sink absorbs the wider rows with
+   micro-benches (`append_row` and transform) flagged. The sink absorbs the wider rows with
    *more, smaller* flushes (141 vs 45; mean latency actually drops to 4.9 ms).
 3. **The bulk path is loader-friendly and streams cleanly on the sink.** The 200k-row `large_txn`
    moves at 22 k rows/s with the loader never lagging (one file → per-file overhead amortised — cf. the
-   PR 5.5 finding that transform cost tracks winner count, not raw rows), and `walrus_sink_spill_total`
+   finding that transform cost tracks winner count, not raw rows), and `walrus_sink_spill_total`
    moves 0 → 5, confirming the txn is decoded **streamed** (reorder buffer spills at
    `logical_decoding_work_mem=64kB`, past the 4 MB inflight ceiling).
 
-**Where PRs 5.7/5.8 should spend effort:** the loader (PR 5.8) has the higher system-level leverage —
-it saturates first under steady load. The sink (PR 5.7) is not the throughput limiter here, but its
-per-row meta-JSON cost (PR 5.4: ~576 ns/row, batch-constant) is cheap, high-confidence, and worth
-taking. Net: **5.8 for throughput, 5.7 for a low-risk per-row win.**
+**Optimization priority:** the loader has the higher system-level leverage because it saturates first
+under steady load. The sink is not the throughput limiter here, but its batch-constant per-row
+meta-JSON cost (~576 ns/row) was a cheap, high-confidence win.
 
 ## History
 
-Before/after deltas from PR 5.7 (sink) and PR 5.8 (loader) land here, each citing the baseline row it
-improves and the commit that made the change.
+Before/after deltas land here, each citing the baseline row it improves and the change that produced it.
 
-### PR 16.8 — merged cache footprints
+### Merged cache footprints
 
-Measured with `std::mem::size_of` on the pinned Rust 1.95.0 64-bit toolchain after the Phase 11
+Measured with `std::mem::size_of` on the pinned Rust 1.95.0 64-bit toolchain after the layout
 boxing work. The cache-line column uses an ideal aligned 64-byte span, `ceil(total bytes / 64)`:
 
 | type | size | multiplicity | `narrow_int4` (4 cols) | `wide30` (30 cols) | `text_heavy` (10 cols) |
@@ -415,14 +413,14 @@ These are inline container footprints: heap storage owned by `Vec`, `String`, an
 included. The existing `TupleValue` and `Message` guards remain the owners of those layouts; this
 change adds only the missing exact 64-bit guard for the one-byte `Emit` plan element.
 
-### PR 16.3 — `#[inline]` on the cross-crate accessors
+### `#[inline]` on the cross-crate accessors
 
 `common::Lsn::{new, as_u64}` and the eight mechanically small `Reader` accessors now carry
 `#[inline]`, so downstream compilation units can see their bodies without depending on thin LTO.
 Measured back-to-back on the reference machine (median ns/row, `--warm-up-time 1`,
 `--measurement-time 3`):
 
-| bench | shape | before (16.2) | after (16.3) | Δ |
+| bench | shape | before | after | Δ |
 |---|---|---:|---:|---:|
 | `parse_tuple` | `narrow_int4` | 246.55 | 199.34 | **−19.1 %** |
 | `parse_tuple` | `wide30` | 1,741.2 | 1,577.0 | **−9.4 %** |
@@ -431,13 +429,13 @@ Measured back-to-back on the reference machine (median ns/row, `--warm-up-time 1
 
 All three decoder shapes improved, including the allocation-heavy case, so exporting the small
 cursor bodies produced a real cross-crate decode win. The Arrow control moved backward even though
-this PR changes no timed `BatchBuilder` body; that result is recorded as run-to-run machine drift,
+this change touched no timed `BatchBuilder` body; that result is recorded as run-to-run machine drift,
 not attributed to the inline hints. No larger reader or `#[inline(always)]` exception was added to
 chase either number.
 
-### PR 11.16 — `SinkMeta` compact strings deferred
+### `SinkMeta` compact strings deferred
 
-The unchanged `pg-to-arrow` batch suite was re-run after PR 11.3 made the repeated `batch_id`
+The unchanged `pg-to-arrow` batch suite was re-run after repeated `batch_id`
 assignment reuse its existing `String` allocation with `clone_from` (median, 1,000 rows per
 iteration, Apple M2, macOS 26.5.2, rustc 1.95.0, Criterion defaults):
 
@@ -449,11 +447,11 @@ iteration, Apple M2, macOS 26.5.2, rustc 1.95.0, Criterion defaults):
 | `tier2_fanout` | 1.3677 ms | 1,367.7 |
 
 These are fresh absolute medians, not evidence for a compact-string change: the benchmark contains
-no candidate implementation, and the committed PR 5.6 system profile still shows the loader
+no candidate implementation, and the committed system profile still shows the loader
 saturating while sink inflight stays at zero. `Arc<str>` and compact-string crates remain deferred
 until allocation profiling identifies `SinkMeta` strings as an end-to-end sink limiter.
 
-### PR 11.13 — key-column scratch (`SmallVec` declined)
+### Key-column scratch (`SmallVec` declined)
 
 `PgRelation::key_columns()` was measured in isolation for the common one-key shape and a composite
 three-key shape (median, Apple M2, macOS 26.5.2, rustc 1.95.0):
@@ -468,7 +466,7 @@ Both shapes are within noise of each other, and even the faster 25.1 ms transfor
 550,000× larger. `SmallVec` is therefore declined: its dependency/API/branching cost cannot move
 the loader's DuckDB-dominated end-to-end profile.
 
-### PR 11.12 — decoder text cells
+### Decoder text cells
 
 **Single-copy `'t'` cells (landed; measured regression).** `Reader::str` validates UTF-8 directly on
 the borrowed frame, so a text cell is copied once into `TupleValue::Text` instead of first copying
@@ -476,7 +474,7 @@ into an intermediate `Bytes`. The allocation/copy removal is mechanically covere
 tests and source probe, but it did not improve this short micro-benchmark run (median ns/row, Apple
 M2, macOS 26.5.2, rustc 1.95.0, `--warm-up-time 1 --measurement-time 3`):
 
-| bench | shape | before (5.4) | after (11.12) | Δ |
+| bench | shape | historical baseline | after | Δ |
 |---|---|---:|---:|---:|
 | `parse_tuple` | `narrow_int4` | 236 | 295 | **+25.0 %** |
 | `parse_tuple` | `wide30` | 1 822 | 1 878 | +3.1 % |
@@ -487,15 +485,15 @@ baseline predates intervening decoder changes, and the largest regression is on 
 the change is retained for its single-allocation invariant and simpler one-primitive cursor, not on
 the strength of this timing sample.
 
-### PR 5.7 — sink hot path
+### Sink hot path
 
 **1. Meta-JSON amortization (landed).** `BatchBuilder` now serializes the batch-constant `SinkMeta`
 fields once per sealed file and, per row, serializes only the varying fields, splicing `{const,row}`
 into a reused buffer. Byte-equivalent to `serde_json::to_string(meta)` (key order aside; proven by
-`common::sink_meta::amortized_meta_matches_full`). Measured on the PR 5.4 `append_row` suite (median
+`common::sink_meta::amortized_meta_matches_full`). Measured on the original `append_row` suite (median
 ns/row, same reference machine):
 
-| shape | before (5.4) | after (5.7) | Δ |
+| shape | before | after | Δ |
 |---|---:|---:|---:|
 | `narrow_int4` | 634 | 460 | **−27.5 %** |
 | `wide30` | 1 001 | 814 | −18.7 % |
@@ -510,29 +508,29 @@ untouched (within noise).
 `append_row` suite the delta is **within noise** (−0.8 % to +1 %, mixed sign) — single-crate
 micro-benches don't exercise the cross-crate inlining thin LTO buys. Kept as standard release-artifact
 hygiene (the pg-sink/loader binaries span crates: decode → batch → arrow → parquet); `codegen-units`
-left at default (cgu=1's few-% gain doubles the release build, wrong for a phase whose goal is *cutting*
+left at default (cgu=1's few-percent gain doubles the release build, contrary to the goal of cutting
 build time).
 
 **3. Ownership-taking `push` / clone removal (measured-context defer).** `TableBatcher::push` still
 `to_vec()`s the decoded values, and `on_commit` clones `batch_id` per row. Taking ownership cascades
 into the sink's core decode loop (`route` borrows `&Message`; owning it restructures the loop + both
 call sites + `stream_txn.rs`), and `batch_id → Arc<str>` ripples through every `SinkMeta` construction
-site. **Deferred**: PR 5.6's e2e ranking shows the **sink is not the system bottleneck** (the loader
+site. **Deferred**: the e2e ranking shows the **sink is not the system bottleneck** (the loader
 is; sink `inflight` stays 0 at 6–7 k rows/s), and the meta-amortization already removed the dominant
 per-row sink cost — so this ordering-sensitive refactor is low-leverage. Recorded here rather than
-taken, per the phase's "measure, don't guess" rule.
+taken, following the project's "measure, don't guess" rule.
 
-**System-level (PR 5.6 `mixed` re-run):** end-to-end throughput is **unchanged** — sink 6 081 rows/s,
-flush 8.0 ms (vs the 5.6 baseline's 6 250 rows/s, 8.2 ms; within run-to-run variance), the loader still
+**System-level (`mixed` re-run):** end-to-end throughput is **unchanged** — sink 6 081 rows/s,
+flush 8.0 ms (vs the baseline's 6 250 rows/s, 8.2 ms; within run-to-run variance), the loader still
 the bottleneck (`raw_append`+`transform` lag in the MBs, sink `inflight` 0). The `append_row` micro-win
 is real but invisible at the system level **because the sink was never the limiter** — which is exactly
-why candidate 3 (sink clone removal) was deferred to focus PR 5.8 on the loader.
+why candidate 3 (sink clone removal) was deferred in favor of loader work.
 
-### PR 5.8 — loader hot path
+### Loader hot path
 
 **1. Per-`schema_version` DESCRIBE cache (landed).** `append_parquet` used to run a
 `DESCRIBE SELECT * FROM read_parquet(...)` against **every** claimed file to map its columns by name
-(PR 5.5: a fixed **~10 ms/file**, ~10 % of a narrow append). By the sink's homogeneous-file rule
+(a fixed **~10 ms/file**, ~10 % of a narrow append). By the sink's homogeneous-file rule
 (walrus-pg-sink §3.5) every file at a `schema_version` has the same columns, so `TableDb` now caches
 the column list keyed on `schema_version` (a `RefCell<HashMap<i64, Arc<Vec<String>>>>`, never
 invalidated — a DDL bump is a new key). A Phase-A cycle claiming **N same-version files runs one
@@ -543,22 +541,22 @@ Delta: the ~10 ms introspection is now paid **once per (table, schema_version)**
 `append_parquet` bench is unchanged (the first file still DESCRIBEs; the win is the repeats). No
 behavioural change: the same column list, just computed once.
 
-**2. TOAST back-scan rewrite (declined — measured).** PR 5.5 measured the back-scan delta at **≈0
+**2. TOAST back-scan rewrite (declined — measured).** The baseline measured the back-scan delta at **≈0
 (within noise)** on the 100k-row / 30 %-sentinel bench: DuckDB **decorrelates** the per-column
-correlated subquery into a single `LEFT_DELIM_JOIN` (EXPLAIN ANALYZE in the PR 5.5 section), so it is
+correlated subquery into a single `LEFT_DELIM_JOIN` (see the EXPLAIN ANALYZE section), so it is
 already set-based. Rewriting it to a hand-rolled windowed `last_value(… IGNORE NULLS)` carry-forward
 would add SQL complexity and a `NULL`-vs-sentinel trap (walrus-pg-sink §2.7) for **no measured gain**.
-**Not taken** — the honest null result the phase asks for.
+**Not taken** — the measurements showed no benefit.
 
-**3. Window-rescan audit (O(tail) confirmed).** The transform's `>= after_lsn` tail scan: PR 5.5's
+**3. Window-rescan audit (O(tail) confirmed).** The transform's `>= after_lsn` tail scan: the
 scaling grid shows throughput **rising** with N (342 K → 2.11 M rows/s at K=1) — i.e. O(new events)
 with amortising fixed overhead, no superlinear term, cost tracking the distinct-PK winner count (the
-window `HASH_GROUP_BY`, per EXPLAIN ANALYZE). Bounded in practice by the retention prune (PR 3.11). No
-pathology found; the `>=` bound is **unchanged** (load-bearing for the snapshot straddle, PR 3.10).
+window `HASH_GROUP_BY`, per EXPLAIN ANALYZE). Bounded in practice by the retention prune. No
+pathology was found; the `>=` bound is **unchanged** because the snapshot straddle depends on it.
 
-**System-level (PR 5.6 `mixed` re-run):** sink 6 081 rows/s (unchanged), loader lag peak 1.97 MB —
-**within run-to-run variance** of the 5.6 baseline (1.72 MB). The DESCRIBE cache removes a genuine
+**System-level (`mixed` re-run):** sink 6 081 rows/s (unchanged), loader lag peak 1.97 MB —
+**within run-to-run variance** of the baseline (1.72 MB). The DESCRIBE cache removes a genuine
 per-cycle cost, but the loader's throughput is gated by `read_parquet` ingest + the transform window
-(PR 5.5's dominant costs), so the introspection saving doesn't visibly shift end-to-end lag; correctness
+(the baseline's dominant costs), so the introspection saving doesn't visibly shift end-to-end lag; correctness
 is unchanged (mirror transforms, lags drain to 0). The next loader throughput lever is the ingest/
-transform path, not per-file introspection — noted for future work beyond Phase 5's measured-cleanup scope.
+transform path, not per-file introspection.

@@ -2,13 +2,13 @@
 //! SQL template ([`transform.sql`](TRANSFORM_SQL)) rendered per table: a dedup window that keeps the
 //! latest change per PK (deletes stay *in* the window; the winner's `op` decides — the resurrection
 //! guard §5.3), then a three-branch `MERGE INTO` that collapses intra-batch PK churn (`i→d→i`, `i→u→d`,
-//! `d→i`, phantom `d`). The same template is used by the hermetic tests here and by Phase B (PR 3.4).
+//! `d→i`, phantom `d`). The same template is used by the hermetic tests here and by Phase B.
 //!
 //! **⚠ Extends architecture.md (§7, Open Q8/Q13):** the per-PK max-applied-`(commit_lsn, lsn)` guard.
 //! Each mutating MERGE branch is gated on `(s.commit_lsn, s.lsn) > (t._applied_commit_lsn, t._applied_lsn)`
 //! and the window low bound is relaxed to `>=`, together closing two straddle faces — (A) the
 //! equal-`commit_lsn` snapshot row and (B) a stale delete/re-insert across the watermark — while keeping
-//! the mirror idempotent (the guard makes a re-applied boundary row a no-op). The full-rebuild (PR 3.11)
+//! the mirror idempotent (the guard makes a re-applied boundary row a no-op). The full-rebuild
 //! remains the safety net regardless; this makes the *incremental* path self-correcting.
 
 use crate::duck_ext::DuckResultExt;
@@ -70,7 +70,7 @@ pub struct TruncateBoundary {
 }
 
 /// One mirror column and the SQL producing its value from the winning raw row `s` (and, for a
-/// TOAST-resolvable scalar, the current mirror `t`). PR 4.2: a Tier-2 column recombines/flattens from
+/// TOAST-resolvable scalar, the current mirror `t`). A Tier-2 column recombines/flattens from
 /// its emit columns; a Tier-1 scalar is the same TOAST-resolved passthrough the transform always used.
 #[derive(Debug)]
 struct MirrorCol {
@@ -330,7 +330,7 @@ impl TransformSql {
         self.table.to_raw()
     }
 
-    /// Render the atomic full-rebuild (PR 3.11): `CREATE OR REPLACE TABLE <table>` over **retained raw ∪
+    /// Render the atomic full-rebuild: `CREATE OR REPLACE TABLE <table>` over **retained raw ∪
     /// the current mirror injected as an LSN-floor baseline**, reusing the same dedup/collapse (TRUNCATE
     /// tuple boundary, TOAST resolution, `(commit_lsn, lsn)` ranking) as the incremental path — dropping
     /// `op='d'` winners. The mirror baseline (each row tagged at its own `_applied_*` tuple, so real newer
@@ -338,7 +338,7 @@ impl TransformSql {
     /// current value. Staged through a TEMP table so the statement never reads and replaces `<table>` at
     /// once; the swap + view recreate run inside one transaction ([`crate::compaction::full_rebuild`]).
     ///
-    /// PR 4.2: the union is over the MIRROR columns (not the raw emit columns), so a Tier-2 value's
+    /// The union is over the MIRROR columns (not the raw emit columns), so a Tier-2 value's
     /// recombine happens in the raw arm (the mirror baseline can't be decomposed back into emit columns);
     /// the final resolve then only TOAST-resolves the Tier-1 columns and passes the recombined Tier-2 ones
     /// through.
@@ -433,7 +433,7 @@ impl TransformSql {
 
 /// Run the transform against `<table>_raw`, reading only `commit_lsn > after_lsn`: resolve the latest
 /// truncate `(Ct, Lt)`, wipe the mirror if present, then dedup + MERGE the post-boundary tail. Phase B
-/// (PR 3.4) calls this inside a DuckDB transaction so the wipe + repopulation are atomic.
+/// calls this inside a DuckDB transaction so the wipe + repopulation are atomic.
 ///
 /// # Errors
 ///

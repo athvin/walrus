@@ -20,7 +20,7 @@ tokio-console = ["dep:console-subscriber"]
 [dependencies]
 thiserror = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-# SinkMeta's amortized split-serialization (PR 5.7) renders the meta JSON fragments in production.
+# SinkMeta's amortized split-serialization renders the meta JSON fragments in production.
 serde_json = { workspace = true }
 tracing = { workspace = true }
 # walrus's ONE subscriber dependency: `common` is the shared bootstrap both binaries call, so the
@@ -43,7 +43,7 @@ humantime-serde = { workspace = true }
 # `Z` suffix, so UtcTimestamp cannot accidentally emit a local/offset datetime.
 jiff = { workspace = true }
 bytes = { workspace = true }
-# Observability (PR 4.10): the `metrics` facade (call-site macros are no-ops until a recorder is
+# Observability: the `metrics` facade (call-site macros are no-ops until a recorder is
 # installed) + the Prometheus recorder whose handle renders the /metrics text exposition.
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }

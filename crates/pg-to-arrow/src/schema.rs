@@ -4,7 +4,7 @@
 //! Parquet's **native logical types**, so every distinction must be a real logical type. That means
 //! **MICROS for every temporal** (NANOS+tz silently downgrades in DuckDB; MILLIS truncates) and
 //! `Decimal128` for `numeric(p ≤ 38)`. Anything not (yet) Tier-1 returns `None`/`NotTier1` rather
-//! than a fallback field — a wrong-but-compiling mapping is the bug PR 2.11's conformance tests catch.
+//! than a fallback field — a wrong-but-compiling mapping is the bug the conformance tests catch.
 
 use crate::error::Error;
 use crate::oids;
@@ -28,8 +28,7 @@ pub fn build_schema(rel: &PgRelation) -> Result<Schema, Error> {
             relation: format!("{}.{}", rel.schema, rel.name),
         });
     }
-    // One source column may fan out to several fields (Tier-2, PR 2.12), so we `extend` rather than
-    // `push` — the seam that interval/timetz and every remaining type PR (2.13–2.16) plug into.
+    // One source column may fan out to several Tier-2 fields, so we `extend` rather than `push`.
     let mut fields: Vec<Field> = Vec::with_capacity(rel.columns.len() + 1);
     for col in &rel.columns {
         fields.extend(emit_fields(col)?);
@@ -52,7 +51,7 @@ pub fn emit_fields(col: &PgColumn) -> Result<Vec<Field>, Error> {
     if let Some(dt) = tier1_data_type(col.type_oid, col.type_modifier) {
         return Ok(vec![Field::new(col.name.clone(), dt, true)]);
     }
-    // Tier-3 canonical-text carriers → one Utf8 field (incl. unconstrained / p>38 numeric, §2.5, PR 2.15).
+    // Tier-3 canonical-text carriers → one Utf8 field (including unconstrained/p>38 numeric, §2.5).
     if crate::tier3::is_tier3_text(col.type_oid, col.type_modifier) {
         return Ok(vec![crate::tier3::tier3_field(&col.name)]);
     }
@@ -61,7 +60,7 @@ pub fn emit_fields(col: &PgColumn) -> Result<Vec<Field>, Error> {
         oids::TIMETZ => return Ok(crate::tier2::timetz_fields(&col.name)),
         _ => {}
     }
-    // Range → 5 flat sibling columns; multirange → one LIST<STRUCT> (§2.4, PR 2.13).
+    // Range → 5 flat sibling columns; multirange → one LIST<STRUCT> (§2.4).
     if let Some(fam) = RangeFamily::from_range_oid(col.type_oid) {
         return Ok(crate::tier2::range_fields(
             &col.name,
@@ -76,11 +75,11 @@ pub fn emit_fields(col: &PgColumn) -> Result<Vec<Field>, Error> {
             col.type_modifier,
         )]);
     }
-    // Geometric → one nested STRUCT/LIST-of-doubles field (§2.4, PR 2.14).
+    // Geometric → one nested STRUCT/LIST-of-doubles field (§2.4).
     if let Some(field) = crate::geometric::geometric_field(&col.name, col.type_oid) {
         return Ok(vec![field]);
     }
-    // uuid → native FixedSizeBinary(16)+arrow.uuid; enum (non-builtin OID) → Utf8 (§2.4/§2.5, PR 2.16).
+    // uuid → native FixedSizeBinary(16)+arrow.uuid; enum (non-builtin OID) → Utf8 (§2.4/§2.5).
     if col.type_oid == oids::UUID {
         return Ok(vec![crate::uuid_enum::uuid_field(&col.name)]);
     }
@@ -104,7 +103,7 @@ pub fn tier1_data_type(type_oid: u32, atttypmod: i32) -> Option<DataType> {
         oids::FLOAT4 => DataType::Float32,
         oids::FLOAT8 => DataType::Float64,
         // Two numeric cases, kept strictly apart (§2.3): p ≤ 38 is a lossless Decimal128;
-        // unconstrained (typmod -1) or p > 38 is a Tier-3 VARCHAR carrier (PR 2.15) — NOT here.
+        // unconstrained (typmod -1) or p > 38 is a Tier-3 VARCHAR carrier — NOT here.
         oids::NUMERIC => match numeric_precision_scale(atttypmod) {
             Some((p @ 1..=38, s)) => DataType::Decimal128(p, s),
             _ => return None,

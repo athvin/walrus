@@ -8,7 +8,7 @@ fn numeric_typmod(p: i32, s: i32) -> i32 {
 
 #[test]
 fn numeric_p_le_38_is_not_tier3() {
-    // numeric(10,2) and the p==38 boundary both stay Tier-1 Decimal128 (PR 2.9).
+    // numeric(10,2) and the p==38 boundary both stay Tier-1 Decimal128.
     assert!(!is_tier3_text(oids::NUMERIC, numeric_typmod(10, 2)));
     assert!(!is_tier3_text(oids::NUMERIC, numeric_typmod(38, 0)));
     assert_eq!(
@@ -50,6 +50,6 @@ fn bit_and_inet_and_pglsn_are_varchar() {
         assert!(is_tier3_text(oid, -1), "oid {oid} should be Tier-3 VARCHAR");
     }
     assert_eq!(tier3_field("x").data_type(), &DataType::Utf8);
-    // uuid (2950) is deferred to PR 2.16 — NOT Tier-3 here.
+    // uuid (2950) has its own native mapping and is not a Tier-3 text carrier.
     assert!(!is_tier3_text(2950, -1));
 }

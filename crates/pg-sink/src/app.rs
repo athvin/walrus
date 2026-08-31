@@ -29,7 +29,7 @@ use tokio::time::Instant;
 pub async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
     let token = shutdown::install_signal_handlers();
     let state = health::HealthState::new();
-    // Install the Prometheus recorder before anything can serve /metrics or emit a series (PR 4.10).
+    // Install the Prometheus recorder before anything can serve /metrics or emit a series.
     common::metrics::init();
 
     // Bind health *after* config validated (no half-open port on a config crash) but *before* the
@@ -118,11 +118,11 @@ async fn pipeline(
     // DDL capture (§3): consume walrus.ddl_audit INSERTs → ddl_manifest + per-table structural version.
     let mut ddl = crate::ddl::DdlConsumer::new(epoch);
 
-    // Reload echo waiters (PR 6.3): Arc-shared so the reload controller's exporter tasks (PR 6.5)
+    // Reload echo waiters: Arc-shared so the reload controller's exporter tasks
     // can subscribe while the decode loop resolves.
     let waiters = std::sync::Arc::new(crate::reload_signal::WatermarkWaiters::default());
 
-    // The reload controller (PR 6.4): a side task off the decode path — own connections, polls
+    // The reload controller: a side task off the decode path — own connections, polls
     // table_reload on the heartbeat cadence, schedules exporters under max_concurrent_reloads.
     let reload_controller = crate::reload::ReloadController::spawn(
         ctx.control_pool.clone(),
@@ -353,8 +353,8 @@ async fn establish_stream(
     })
 }
 
-/// Resume the current epoch generation (§1.8), or establish the first one for this slot. Epoch bump /
-/// total-restart is PR 4.6.
+/// Resume the current epoch generation (§1.8), or establish the first one for this slot. The caller
+/// handles epoch bumps and total restarts before reaching this resume-only helper.
 async fn current_or_new_epoch(
     pool: &sqlx::PgPool,
     slot_name: &str,

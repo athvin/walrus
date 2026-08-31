@@ -1,7 +1,7 @@
 name: walrus
 
-# Dev harness for walrus: the three backing services every later "compose" Definition of Done
-# runs against (the sink writing to MinIO, the loader reading a manifest). Boot it with:
+# Dev harness for walrus: the three backing services used by integration tests and local runs
+# (the sink writes to MinIO and the loader reads the manifest). Boot it with:
 #
 #   docker compose -f deploy/docker/docker-compose.yml up --wait     # (or `just up`)
 #
@@ -14,7 +14,7 @@ services:
     environment:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: walrus
-      # Dev-harness auth: `trust` so the sink's hand-rolled replication client (PR 2.20) does a
+      # Dev-harness auth: `trust` so the sink's hand-rolled replication client does a
       # no-SCRAM startup handshake. Password-based clients (preflight/control) still connect — trust
       # ignores the credential. Never use `trust` outside the harness.
       POSTGRES_HOST_AUTH_METHOD: trust
@@ -29,11 +29,11 @@ services:
       - -c
       - max_wal_senders=10
       - -c
-      # Short walsender timeout so the "survives past wal_sender_timeout" spike test (PR 2.20) is
+      # Short walsender timeout so the "survives past wal_sender_timeout" spike test is
       # fast; the sink's standby-status feedback interval must stay well under this.
       - wal_sender_timeout=5s
       - -c
-      - logical_decoding_work_mem=64kB # tiny → streaming trips on small txns (Phase 2 tests)
+      - logical_decoding_work_mem=64kB # tiny → streaming trips on small txns in integration tests
     volumes:
       - ./initdb/source:/docker-entrypoint-initdb.d:ro
     healthcheck:

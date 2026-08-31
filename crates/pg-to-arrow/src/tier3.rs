@@ -2,10 +2,10 @@
 //!
 //! Some Postgres types have no lossless structural target in Parquet/DuckDB, so we carry their
 //! canonical text verbatim in one `VARCHAR` column — always exact as a string — and defer the lost
-//! *type metadata* (bit length, enum labels, …) to the descriptor (PR 2.17). The value is carried
+//! *type metadata* (bit length, enum labels, …) to the descriptor. The value is carried
 //! **verbatim**: the wire text is already canonical, and re-formatting risks a lossy round-trip.
 //!
-//! The headline case is `numeric`: `p ≤ 38` stays a Tier-1 `Decimal128` (PR 2.9), but **unconstrained
+//! The headline case is `numeric`: `p ≤ 38` stays a Tier-1 `Decimal128`, but **unconstrained
 //! or `p > 38` must become `VARCHAR`** — DuckDB's `DECIMAL` caps at precision 38 and its Parquet
 //! reader downcasts any decimal with precision > 38 to `DOUBLE` (verified in `parquet_reader.cpp`), so
 //! a `Decimal256` would silently lose digits. `VARCHAR` is exact.

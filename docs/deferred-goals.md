@@ -1,6 +1,7 @@
 # Deferred design goals — shapes and seams
 
-These are **intended capabilities, deliberately deferred** — not permanent
+These are **intended capabilities, deliberately deferred**, plus one completed capability retained
+for context — not permanent
 [non-goals](./architecture.md#goals--non-goals) and not open
 [unknowns/risks](./architecture.md#open-questions--risks). They are features walrus plans to own,
 sequenced after v1. This note pins each to the **exact module/seam** a future contributor extends, so
@@ -11,35 +12,28 @@ The invariant that bounds all of this: **the sink is a single consumer of the on
 ([§1.8](./architecture.md#18-single-slot-for-life--total-restart)) — horizontal scale is a **loader**
 story only, and there is deliberately **no sink-sharding seam**.
 
-## 1. Single-table reload / re-sync while streaming
+## 1. Single-table reload / re-sync while streaming (completed)
 
 **What.** Re-sync or reload **one** table — e.g. after a quarantined lossy `ALTER COLUMN TYPE`, or on
-operator demand — **without a total-restart**, while the single lifelong slot keeps streaming for every
-other table. Today the only re-sync is the whole-system
-[total-restart](./architecture.md#18-single-slot-for-life--total-restart), which rebuilds *every* table
-together; there is no per-table recovery path.
+operator demand — **without a total-restart**, while the single lifelong slot keeps streaming for
+every other table.
 
-**Likely shape.** Copy the one table under a **fresh exported snapshot**, then reconcile it against the
-live stream via a **per-table watermark handoff** ([§1.7](./architecture.md#17-snapshot--backfill-bootstrap)),
-all without disturbing the slot or the other tables' loaders.
+**Implemented shape.** The sink exports primary-key-ordered chunks with echo-derived LSN watermarks;
+the loader either rebuilds the table (`reload`) or merges chunks over the live mirror (`resync`).
+Restart-on-DDL, lease adoption, cursor-based crash recovery, and reload metrics preserve progress
+without disturbing the slot or other tables.
 
-**Seam.** No code stub in this PR — the future path reuses the existing snapshot/backfill machinery
-(`crates/pg-sink/src/snapshot.rs`) plus the per-table checkpoint watermarks
-(`crates/control/src/checkpoint.rs`), scoped to one table instead of the whole epoch. It is listed
-first by the design but is the **heaviest** of the three (it touches the snapshot↔stream boundary).
+**Implementation.** The state machine lives in `control::reload`, export in
+`pg_sink::reload_export`, orchestration in `pg_sink::reload`, and loader routing/rebuild in
+`loader::phase_a`. The operational interface and invariants are documented in
+[single-table-reload.md](./single-table-reload.md).
 
 **Design note.** [single-table-reload.md](./single-table-reload.md) critiques an in-band
 signal-table proposal for this goal and lands on a chunked, watermark-stamped shape (Debezium/DBLog
 lineage) that needs no extra slots and no stream pause.
 
-**Implemented (Phase 6).** Shipped across 12 PRs —
-[implementation curriculum, Phase 6](./implementation/README.md#the-roadmap)
-([task files](./implementation/phase-6-single-table-reload/)). Chunked, watermark-stamped reloads of
-N tables through the one lifelong slot: `reload` (rebuild — the quarantine-recovery exit) and
-`resync` (refresh over the live mirror) flavors, echo-wait watermarks, restart-on-DDL, crash recovery
-from the chunk cursor, and observability. The anchor use case — a lossy-`ALTER` quarantine recovering
-via `just reload` while every other table streams on — is proven end to end in
-[PR 6.12](./implementation/phase-6-single-table-reload/pr-6.12-e2e-quarantine-recovery.md).
+The anchor use case — a lossy-`ALTER` quarantine recovering via `just reload` while every other
+table streams on — is covered by `tests/e2e/tests/reload_quarantine.rs`.
 
 ## 2. Multi-pod loader table-sharding (horizontal scale-out)
 
@@ -51,8 +45,8 @@ files and scales **up** (CPU/memory, more per-table worker threads within the on
 against a stale owner's writes after a reshard (never a naive HPA — file ownership is exclusive).
 
 **Seam.** [`crates/loader/src/ownership.rs`](../crates/loader/src/ownership.rs) — the inert
-`TableAssignment` placeholder. The forward-compat hook already exists: the `fencing_token` minted in
-PR 3.1 (`control::table_ownership`, bumped only when ownership changes hands) is acquired at bootstrap
+`TableAssignment` placeholder. The forward-compat hook already exists: the `fencing_token` in
+`control::table_ownership` (bumped only when ownership changes hands) is acquired at bootstrap
 and carried on every `crate::bootstrap::OwnedTable`, but is **unused for routing** today (dormant at
 `replicas=1`). Sharding turns it into the fence; nothing else needs re-plumbing.
 
@@ -77,7 +71,5 @@ epoch, or ownership machinery — only concurrent `COPY` under the snapshot alre
 
 ---
 
-*v1 curriculum complete (phases 0–4) — these goals are the feature-work finish line
-([docs/implementation/README.md](./implementation/README.md); phase 5 there is post-v1 hardening —
-benchmarks, hot-path cleanup, CI speed — not new features; phase 6 plans goal §1 above as 12 PRs).
-The seams above are marked, not implemented; each changes no v1 runtime behaviour.*
+*Single-table reload (§1) is implemented. The sharding and parallel-backfill seams (§2–§3) remain
+deliberately inert and change no current runtime behavior.*

@@ -5,7 +5,7 @@
     reason = "integration test — unwrap/expect are setup assertions; synchronous source scans are \
               repository-policy checks, not runtime I/O"
 )]
-//! Storage-class guard (PR 21.2). Two invariants no compiler lint covers:
+//! Storage-class guard. Two invariants no compiler lint covers:
 //! a mutable global is never declared, and every production global is a thread-safe one.
 //!
 //! A `thread_local!` static is exempt from the second invariant: it is one value per thread,

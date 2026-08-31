@@ -16,7 +16,7 @@ fn flatten_violation(name: &str, src: &str) -> Option<String> {
     let starts_attribute = compact.contains(concat!("serde(", "flatten"));
     let later_argument = compact.contains(concat!(",", "flatten"));
     (starts_attribute || later_argument)
-        .then(|| format!("{name}: serde flatten needs the PR 22.8 decision reopened"))
+        .then(|| format!("{name}: serde flatten conflicts with the strict unknown-field policy"))
 }
 
 #[test]
@@ -31,7 +31,7 @@ fn no_serde_flatten_source_guard_rejects_a_combined_fixture() {
     let fixture = concat!("#[serde(default,", " flatten)] struct Candidate;");
     assert_eq!(
         flatten_violation("fixture/flatten.rs", fixture).as_deref(),
-        Some("fixture/flatten.rs: serde flatten needs the PR 22.8 decision reopened")
+        Some("fixture/flatten.rs: serde flatten conflicts with the strict unknown-field policy")
     );
 }
 
@@ -64,9 +64,9 @@ fn no_serde_flatten_evidence_fixture_preserves_strict_unknown_keys() {
 }
 
 #[test]
-fn no_serde_flatten_decision_is_linked_from_the_natural_site() {
+fn no_serde_flatten_decision_is_explained_at_the_natural_site() {
     assert!(
         include_str!("config.rs")
-            .contains("docs/implementation/notes/rust-skills/serde-flatten.md")
+            .contains("deny_unknown_fields` continues to reject misspelled keys")
     );
 }

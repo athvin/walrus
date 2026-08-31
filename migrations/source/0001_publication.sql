@@ -2,10 +2,10 @@
 --
 -- Applied by the operator (or by the sink when `manage_publication = true`). It creates the walrus
 -- internal tables the sink requires to ride in the publication:
---   * walrus.heartbeat — the slot-liveness round-trip target (write path is PR 2.27);
+--   * walrus.heartbeat — the slot-liveness round-trip target;
 --   * walrus.ddl_audit — a stub so the table exists in the publication now (the DDL-capture trigger
---     that fills it, plus its full column set, lands in PR 2.33 / migrations/source/0002).
--- The source-side preflight (PR 2.19) asserts both are members of `walrus_pub`.
+--     that fills it, plus its full column set, is installed by migrations/source/0002).
+-- The source-side preflight asserts both are members of `walrus_pub`.
 
 CREATE SCHEMA IF NOT EXISTS walrus;
 
@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS walrus.heartbeat (
 INSERT INTO walrus.heartbeat (id, ts) VALUES (1, now()) ON CONFLICT (id) DO NOTHING;
 
 -- Stub: must exist to be a publication member (existence-checked by preflight); the capture trigger
--- and full column set are PR 2.33.
+-- and full column set are added by migration 0002.
 CREATE TABLE IF NOT EXISTS walrus.ddl_audit (
     id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     c_lsn   pg_lsn,
@@ -35,5 +35,5 @@ CREATE TABLE IF NOT EXISTS walrus.ddl_audit (
 --       CREATE PUBLICATION walrus_pub FOR TABLE <user tables> WITH (publish_via_partition_root = true);
 --       ALTER PUBLICATION walrus_pub ADD TABLE walrus.heartbeat, walrus.ddl_audit;
 --
--- Grant the sink role write access to the heartbeat (round-trip, PR 2.27):
+-- Grant the sink role write access to the heartbeat round-trip:
 --   GRANT INSERT, UPDATE ON walrus.heartbeat TO <sink_role>;

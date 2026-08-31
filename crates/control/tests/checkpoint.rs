@@ -6,7 +6,7 @@
 //! Compose-gated integration tests for `loader_checkpoint` and `replication_state`.
 //!
 //! Each test runs inside a rolled-back transaction under a unique `epoch`, so tests are isolated
-//! and idempotent across runs. Gated behind the `integration` feature (needs the PR 0.6 control PG).
+//! and idempotent across runs. Gated behind the `integration` feature (needs the compose control PG).
 #![cfg(feature = "integration")]
 
 use common::{EpochNo, FailureClass, Lsn};

@@ -327,7 +327,7 @@ fn meta_column_holds_serialized_sink_meta_json() {
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
-    // Order-independent: the amortized serialization (PR 5.7) splices batch-constant + per-row
+    // Order-independent: the amortized serialization splices batch-constant + per-row
     // fragments, so the key ORDER may differ from `to_string(SinkMeta)`; the loader parses by key.
     let got: serde_json::Value = serde_json::from_str(meta_col.value(0)).unwrap();
     let want: serde_json::Value =

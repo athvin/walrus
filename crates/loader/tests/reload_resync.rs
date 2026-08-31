@@ -5,7 +5,7 @@
     reason = "integration test — unwrap/expect fine in setup + helpers"
 )]
 //! The `resync` flavor against compose (`#[ignore]` — needs control PG + MinIO). Unlike `reload`
-//! (clear + rebuild, PR 6.7), `resync` merges chunks over the LIVE mirror: no pause, no
+//! (clear + rebuild), `resync` merges chunks over the LIVE mirror: no pause, no
 //! `CREATE OR REPLACE`, no purge, no meta latch, raw history preserved. It repairs stale and
 //! missing rows through the ordinary Phase A/B path — but **never removes phantoms** (a row that
 //! drifted into the mirror and no longer exists upstream is in no chunk and gets no delete). That
@@ -335,7 +335,7 @@ async fn resync_never_pauses_the_table() {
         .unwrap();
 
     // A post-`W` stream file arrives while the resync is live. A `reload` would PAUSE the table
-    // here (PR 6.6); a `resync` must not — `active_rebuilds` scopes the pause to `flavor='reload'`.
+    // here; a `resync` must not — `active_rebuilds` scopes the pause to `flavor='reload'`.
     let post = write_rows(
         epoch,
         "post",
@@ -404,7 +404,7 @@ async fn resync_ddl_restart_preserves_the_resync_flavor() {
     let epoch = EpochNo(660_004);
     let (ctx, _dir) = setup(epoch).await;
 
-    // A mid-resync DDL restart (PR 6.8) reissues the attempt — the successor must stay `resync`
+    // A mid-resync DDL restart reissues the attempt — the successor must stay `resync`
     // (restart_for_ddl copies the flavor via INSERT…SELECT), else a refresh would silently become a
     // rebuild. Driven at the control layer: request → claim → chunk 1 → restart.
     let old = reload::request(&ctx.pool, epoch, "public", "orders", ReloadFlavor::Resync)

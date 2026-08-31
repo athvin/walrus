@@ -41,7 +41,7 @@ spec:
       serviceAccountName: walrus
       # Measured worst-case drain (batch encode → Parquet → S3 PUT → manifest commit → final feedback).
       # 90s sits in the design's 60–120s window. NO preStop hook: any preStop time is subtracted from
-      # this same budget, and SIGTERM already reaches PID 1 directly (tini exec-form entrypoint, PR 4.8),
+      # this same budget, and SIGTERM already reaches the binary through tini's exec-form entrypoint,
       # so the drain handler runs from T=0 with the full budget.
       terminationGracePeriodSeconds: 90
       # Ordered bootstrap: don't start the sink until the control DB answers, so its own startup-deadline

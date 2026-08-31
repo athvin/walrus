@@ -5,7 +5,7 @@
     reason = "integration test — unwrap/expect fine in setup + helpers"
 )]
 //! Completion & crash recovery against compose (`#[ignore]` — needs source PG + control PG +
-//! MinIO). Three proofs (reload H7/H10, PR 6.9):
+//! MinIO). Three proofs cover reload H7/H10:
 //!
 //! - A "crashed" export (exporter dropped mid-flight) is ADOPTED from control-pg — not WAL
 //!   redelivery — and resumes from the chunk cursor, re-exporting nothing at or before it, then

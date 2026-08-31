@@ -5,7 +5,7 @@
     reason = "integration test — unwrap/expect fine in setup + helpers; the concurrency \
               high-water mark is reported, not asserted, so stderr is its destination"
 )]
-//! End-to-end: N-table reloads at scale on ONE slot (PR 6.12, reload §2/§5). Three tables are
+//! End-to-end: N-table reloads at scale on ONE slot (reload §2/§5). Three tables are
 //! seeded and streamed by the real sink+loader, then reloaded concurrently with the sink's
 //! `max_concurrent_reloads = 2`. The load-bearing assertions: never more than 2 `exporting` at any
 //! sample, exactly **one** replication slot on the source the entire time, all three reloads reach
@@ -19,7 +19,7 @@
 use e2e::Harness;
 use std::time::Duration;
 
-// Harness-owned fixtures (created before bootstrap so the loader owns them, PR 6.12).
+// Harness-owned fixtures created before bootstrap so the loader owns them.
 const TABLES: [&str; 3] = ["rl1", "rl2", "rl3"];
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

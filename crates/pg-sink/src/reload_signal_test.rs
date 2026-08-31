@@ -97,7 +97,7 @@ fn resolve_without_subscriber_is_a_quiet_noop() {
 fn dropped_receiver_then_resolve_is_fine_and_entry_is_evicted() {
     let waiters = WatermarkWaiters::default();
     let rx = waiters.subscribe(reload(5), 1);
-    drop(rx); // the exporter timed out (PR 6.5) and walked away
+    drop(rx); // the exporter timed out and walked away
     waiters.resolve(
         reload(5),
         1,

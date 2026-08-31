@@ -12,7 +12,7 @@
 //! source WAL — the loader does not own the slot; the sink advances `confirmed_flush_lsn` on its OWN S3
 //! durability, independent of loader progress (§1.5/§1.9). So the honest way to pin `restart_lsn` and
 //! grow retained WAL is to stall the sink's S3 flush — here `docker pause walrus-minio-1`. The keepalive
-//! fix (PR #71) keeps feedback flowing while the PUT is stalled, so the walsender is never severed.
+//! fix keeps feedback flowing while the PUT is stalled, so the walsender is never severed.
 //!
 //!   docker compose -f deploy/docker/docker-compose.yml up --wait
 //!   cargo test -p e2e --features it -- --ignored
@@ -50,7 +50,7 @@ async fn wal_runaway_is_bounded_then_catches_up() {
     h.stall_s3().await.expect("pause MinIO");
 
     // Sustained workload while S3 is down. Small (< logical_decoding_work_mem = 64 kB) txns so they take
-    // the batched flush path (keepalive-wrapped, PR #71) and NOT the streamed-spill path (whose S3 PUTs
+    // the keepalive-wrapped batched flush path and NOT the streamed-spill path (whose S3 PUTs
     // are not keepalive-covered and would sever the connection under a stall). 25 × 40 rows = 1000 rows.
     for c in 0..25 {
         let start = 1000 + c * 40;
@@ -66,7 +66,7 @@ async fn wal_runaway_is_bounded_then_catches_up() {
     // The retained-WAL alert condition trips (retained rises well past the alert threshold) while the
     // walsender stays CONNECTED (keepalive) and `confirmed_flush` stays FROZEN. Bounded: we resume before
     // any real cap — the compose slot has no `max_slot_wal_keep_size`, so it never invalidates (slot loss
-    // → total-restart is PR 4.6's path, not this one).
+    // → total-restart is the path, not this one).
     const ALERT: i64 = 256 * 1024;
     let retained = h
         .await_retained_bytes_over(ALERT, Duration::from_secs(30))

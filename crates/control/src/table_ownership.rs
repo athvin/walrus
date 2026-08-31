@@ -1,4 +1,4 @@
-//! `table_ownership` — the loader's cooperative single-writer lease (loader §8.1, PR 3.1).
+//! `table_ownership` — the loader's cooperative single-writer lease (loader §8.1).
 //!
 //! The FIRST fence: a control-plane row per owned `(epoch, schema, table)` with a monotonic
 //! `fencing_token`, acquired **before** the loader takes DuckDB's read-write file lock (the second

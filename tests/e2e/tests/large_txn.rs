@@ -43,8 +43,7 @@ async fn large_txn_is_atomic_and_bounded() {
     .await
     .unwrap();
     // Bounded: the sink spilled while the txn is still OPEN — the observable proof that open-txn memory
-    // stayed capped (a real `in_flight_bytes` metric endpoint is PR 4.10). Polling keeps it open until the
-    // spill is observed.
+    // stayed capped. Polling the spill log keeps it open until the spill is observed.
     let spills = h
         .await_spill(1, Duration::from_secs(60))
         .await

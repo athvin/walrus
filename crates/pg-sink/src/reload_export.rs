@@ -1,6 +1,6 @@
-//! The chunk export engine (reload H1/H2, §5 step 3, PR 6.5).
+//! The chunk export engine (reload H1/H2, §5 step 3).
 //!
-//! Per PK-ordered chunk: INSERT a watermark signal row → await its echo ⇒ `L_i` (PR 6.3) → SELECT
+//! Per PK-ordered chunk: INSERT a watermark signal row → await its echo ⇒ `L_i` → SELECT
 //! the chunk on this exporter's own SQL connection → write Parquet with **every row stamped
 //! `commit_lsn = lsn = L_i`** → manifest row `kind='reload'`, the `reload_id`,
 //! `lsn_start = lsn_end = L_i` → advance the cursor. No stream pause, no chunk buffer, no high
@@ -49,12 +49,12 @@ pub enum ChunkOutcome {
     Drained { rows: u64, final_lsn: Lsn },
 }
 
-/// How a whole [`ChunkExporter::run`] ended (PR 6.8).
+/// How a whole [`ChunkExporter::run`] ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunOutcome {
     /// The table drained at this attempt's frozen schema — the export is done. `final_lsn` is `H`:
     /// the drain probe's watermark, `>=` every chunk's `L_i` and `>= first_lsn` (LSNs are monotonic
-    /// in the stream). The controller flips `export_complete(H)` (PR 6.9); the loader then flips
+    /// in the stream). The controller flips `export_complete(H)`; the loader then flips
     /// `complete` once `transformed_lsn >= H`.
     Drained { final_lsn: Lsn },
     /// DDL bumped the table's structural `schema_version` past the frozen one between chunks: this
@@ -64,7 +64,7 @@ pub enum RunOutcome {
 
 /// Has the table's structural `schema_version` moved past the reload's `frozen` version? Returns
 /// the new version if so, else `None`. Deliberately compares the REGISTRY's version — which bumps
-/// only on structural DDL (a decoded Relation message, PR 2.33), so metadata-only DDL (`COMMENT
+/// only on structural DDL (a decoded Relation message), so metadata-only DDL (`COMMENT
 /// ON`) never trips it — and never restarts backwards (`latest < frozen` is a stale read). Pure so
 /// the restart trigger unit-tests without a database.
 fn version_changed(
@@ -120,7 +120,7 @@ pub struct ChunkExporter {
 impl ChunkExporter {
     /// Dial the side connection and resolve the export's fixed shape: the relation from the source
     /// catalog and the schema version from the registry (frozen on the reload row when resuming —
-    /// every attempt is single-schema by construction; PR 6.8 enforces it across DDL).
+    /// every attempt is single-schema by construction and stays so across DDL).
     ///
     /// # Errors
     ///
@@ -216,10 +216,10 @@ impl ChunkExporter {
             pk_cols.iter().map(String::as_str).collect();
         if registry_keys != live_keys {
             // The live PK drifted from the registered shape (a between-attempts DDL): stop
-            // without failing the row — PR 6.8's restart-on-DDL is the mechanism that reissues
+            // without failing the row — the restart-on-DDL is the mechanism that reissues
             // the attempt at the new schema; until then the loud error is the breadcrumb.
             anyhow::bail!(
-                "reload {}: live PK {live_keys:?} != registered key set {registry_keys:?} at                  version {schema_version} — schema drifted; restart-on-DDL (PR 6.8) reissues",
+                "reload {}: live PK {live_keys:?} != registered key set {registry_keys:?} at version {schema_version} — schema drifted; restart-on-DDL will reissue",
                 req.reload_id
             );
         }
@@ -241,10 +241,10 @@ impl ChunkExporter {
     }
 
     /// Fresh start or cursor resume (H7): loop `export_next_chunk` until a short chunk says
-    /// drained. The row then simply stays `exporting`, fully drained, cursor at end — PR 6.9
-    /// gives it its `export_complete` ending and the final watermark `H`.
+    /// drained. The row then stays `exporting`, fully drained with its cursor at the end, until the
+    /// controller records `export_complete` and the final watermark `H`.
     ///
-    /// Before each chunk, re-check the table's structural version (PR 6.8 / H9): a DDL that bumped
+    /// Before each chunk, re-check the table's structural version (H9): a DDL that bumped
     /// it past this attempt's frozen version returns [`RunOutcome::SchemaChanged`] so the
     /// controller restarts the attempt at the new shape. Every attempt is single-schema by
     /// construction; the loader therefore never reconciles a version change *inside* a rebuild.
@@ -263,7 +263,7 @@ impl ChunkExporter {
     /// mid-[`Self::export_next_chunk`] is a normal shutdown/lost-lease outcome rather than a bug: the
     /// chunk's manifest row and its cursor advance share ONE control-pg transaction, so an
     /// uncommitted chunk simply never happened and the row stays `exporting` at its previous cursor
-    /// for PR 6.9's adoption to resume. A drop between that chunk's S3 PUT and the commit orphans the
+    /// for the adoption to resume. A drop between that chunk's S3 PUT and the commit orphans the
     /// object exactly as [`crate::consume::flush_batch_kind`] does, and the re-export regenerates it.
     /// What a drop can never recover is partial progress *inside* one chunk — those rows live in this
     /// future's batcher — which is why the cursor only ever moves at a committed chunk boundary.
@@ -308,7 +308,7 @@ impl ChunkExporter {
         }
     }
 
-    /// The per-chunk staleness check (PR 6.8): is the table still at this attempt's frozen
+    /// The per-chunk staleness check: is the table still at this attempt's frozen
     /// `schema_version`? Reads the REGISTRY's latest version (control-pg, a cheap indexed MAX) —
     /// the sink's own structural-version source of truth, bumped only when a Relation message
     /// decodes — never a per-chunk catalog query against the source. Returns the new version if a
@@ -339,12 +339,12 @@ impl ChunkExporter {
     /// persistent silence then fails loudly, naming both candidate causes. Each retry re-signals
     /// via DELETE + INSERT in one implicit transaction (one simple-query batch = one commit = one
     /// FRESH echo — an `ON CONFLICT DO NOTHING` would echo nothing); the same statement shape
-    /// serves a crash-redone chunk. The DELETE also rides the slot; PR 6.3's routing ignores
+    /// serves a crash-redone chunk. The DELETE also rides the slot; the routing ignores
     /// non-insert signal ops by design.
     async fn await_echo(&self, chunk_no: i64) -> anyhow::Result<crate::reload_signal::Echo> {
         const ECHO_ATTEMPTS: u32 = 3;
         for attempt in 1..=ECHO_ATTEMPTS {
-            // Subscribe-then-insert (PR 6.3): the waiter must exist before the echo can arrive.
+            // Subscribe-then-insert: the waiter must exist before the echo can arrive.
             let rx = self.waiters.subscribe(self.reload_id, chunk_no);
             let signalled_at = std::time::Instant::now();
             self.client
@@ -358,7 +358,7 @@ impl ChunkExporter {
                 .context("insert reload watermark signal")?;
             match tokio::time::timeout(self.cfg.echo_timeout, rx).await {
                 Ok(Ok(echo)) => {
-                    // The echo round-trip: signal INSERT → decoded-commit echo (PR 6.11). Its p99
+                    // The echo round-trip: signal INSERT → decoded-commit echo. Its p99
                     // bounds reload throughput and tracks end-to-end decode latency.
                     common::metrics::record_reload_echo_wait(signalled_at.elapsed().as_secs_f64());
                     return Ok(echo);
@@ -376,7 +376,7 @@ impl ChunkExporter {
             }
         }
         // H11's silent failure, made loud — after enough patience that plain decode lag has had
-        // its chance. The fail() purges this reload's staged chunks (6.1); a later re-request
+        // its chance. fail() purges this reload's staged chunks; a later re-request
         // re-exports them.
         let reason = format!(
             "no echo after {ECHO_ATTEMPTS} attempts × {:?} on chunk {chunk_no} — either \
@@ -411,7 +411,7 @@ impl ChunkExporter {
         let echo = self.await_echo(chunk_no).await?;
         // The probe's watermark — carried into every `ChunkOutcome`'s `final_lsn` below so even an
         // empty drain (no file, no cursor advance) reports a valid `H` (>= first_lsn and every
-        // chunk `L_i`, LSNs being monotonic). PR 6.9.
+        // chunk `L_i`, because LSNs are monotonic).
         let watermark = echo.commit_lsn;
 
         // The chunk read: one short autocommit statement, strictly after the echo was observed.
@@ -495,7 +495,7 @@ impl ChunkExporter {
         }
 
         let n = u64::try_from(rows.len()).unwrap_or(u64::MAX);
-        // One chunk file exported (PR 6.11): bump the per-table chunk + row counters.
+        // One chunk file exported: bump the per-table chunk + row counters.
         common::metrics::record_reload_chunk(&self.series, n);
         if n < self.cfg.chunk_rows.get() {
             Ok(ChunkOutcome::Drained {

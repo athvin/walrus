@@ -1,7 +1,7 @@
 //! `schema_registry` model: the versioned per-column type-mapping descriptors.
 //!
 //! **History, never a queue** — never pruned. The sink writes one row per structural
-//! `schema_version` (a `Vec` of [`TypeDescriptor`]s from `common`, PR 1.2, plus a snapshot of the
+//! `schema_version` (a `Vec` of [`TypeDescriptor`]s from `common`, plus a snapshot of the
 //! resulting column set); the loader reads it back to rebuild the exact source types for a given
 //! file's `schema_version`. A `DELETE` here would make old-version Parquet files un-reconstructable.
 
@@ -24,8 +24,8 @@ pub struct RegistryRow {
     pub schema_version: SchemaVersionNo,
     /// The per-column descriptors (stored as `jsonb`).
     pub descriptors: Vec<TypeDescriptor>,
-    /// The resulting column-set snapshot (name/type/attnum/nullability/comment) — a `serde_json`
-    /// value for now; PRs 3.8/3.9 give it a typed shape.
+    /// The resulting column-set snapshot (name/type/attnum/nullability/comment), preserved as JSON
+    /// so it matches the source event payload exactly.
     pub columns: serde_json::Value,
 }
 

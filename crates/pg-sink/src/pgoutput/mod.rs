@@ -1,8 +1,8 @@
 //! Hand-rolled pgoutput (`proto_version` 2) decoder. Sync + pure: no tokio, no I/O.
 //!
-//! The logic arrives family-by-family in PRs 2.2–2.8, TDD-style against the golden vectors in
-//! `tests/pgoutput_vectors.rs`. PR 2.2 lands the [`Reader`] primitives, stream framing, and the
-//! transaction-boundary messages — Begin / Commit / Origin.
+//! The decoder is tested family-by-family against the golden vectors in
+//! `tests/pgoutput_vectors.rs`, from [`Reader`] primitives and stream framing through all supported
+//! transaction and row-change messages.
 
 pub mod error;
 pub mod reader;
@@ -24,7 +24,7 @@ fn wire_usize(raw: u32) -> usize {
 }
 
 /// Whether we are inside a Stream Start..Stop block. The per-message xid prefix (proto §7) exists
-/// **only** while this is true; Stream Start/Stop toggle it (from PR 2.7). It is threaded through
+/// **only** while this is true; Stream Start/Stop toggle it. It is threaded through
 /// [`parse_stream`] so context carries across messages.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StreamCtx {
@@ -64,9 +64,8 @@ impl TryFrom<u8> for OldTupleKind {
     }
 }
 
-/// One decoded pgoutput message. Variants are added family-by-family in PRs 2.2–2.8:
-/// 2.3 Relation/Type; 2.4 Insert; 2.5 Update/Delete; 2.6 Truncate/Message; 2.7 Stream*;
-/// 2.8 the two-phase family.
+/// One decoded pgoutput message, covering relation/type metadata, row changes, truncate/logical
+/// messages, streamed transactions, and the two-phase family.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum Message {
@@ -212,15 +211,15 @@ pub enum Message {
 
 /// Move-cost budget for the one-message-per-decoded-WAL-record hot path (`own-move-large`).
 ///
-/// Measured with `size_of::<Message>()` on PR 9.7. If this trips, shrink the type, box the growing
-/// variant in Phase 11, or raise the measured budget deliberately in review.
+/// Measured with `size_of::<Message>()` on the supported 64-bit targets. If this trips, shrink the
+/// type, box the growing variant, or raise the measured budget deliberately in review.
 const MESSAGE_MAX_BYTES: usize = 88;
 const _: () = assert!(size_of::<Message>() <= MESSAGE_MAX_BYTES);
 
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(
     size_of::<Option<Vec<TupleValue>>>() == size_of::<Vec<TupleValue>>(),
-    "Option<Vec<TupleValue>> lost its niche; revisit docs/implementation/notes/rust-skills/mem-thinvec.md"
+    "Option<Vec<TupleValue>> lost its niche; revisit the message representation"
 );
 
 impl Message {
@@ -288,7 +287,8 @@ pub fn parse_tuple(reader: &mut Reader<'_>) -> Result<Vec<TupleValue>, DecodeErr
 }
 
 /// Parse one message off `reader` (advancing it), for use by [`parse_stream`]. Stream context is
-/// consulted from PR 2.3 onward (the xid prefix); Begin/Commit/Origin are never xid-prefixed —
+/// consulted for every message that can carry the streamed xid prefix; Begin/Commit/Origin are
+/// never xid-prefixed —
 /// they *are* the transaction frame.
 fn parse_one(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Message, DecodeError> {
     // Changing this count changes how the same streamed bytes are framed and decoded.

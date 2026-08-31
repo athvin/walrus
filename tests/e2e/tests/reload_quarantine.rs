@@ -12,7 +12,7 @@
 //! quarantine is fundamentally a DuckDB cast the source already accepted. The injection makes the
 //! mirror's `99999` meet the int2 narrowing → genuine `LoaderError::Quarantine` → the loader exits.
 //!
-//! Then: `reload` the table, restart the loader, and it recovers. Three PR 6.12 loader fixes make
+//! Then: `reload` the table, restart the loader, and it recovers. Three loader behaviors make
 //! recovery possible: (1) a worker error cancels the shutdown token so a multi-table quarantine
 //! *exits* the loader instead of deadlocking (`app.rs`); (2) bootstrap SKIPS the forward reconcile
 //! when a rebuild reload is pending, so the restart doesn't re-quarantine before Phase A runs
@@ -28,7 +28,7 @@ use common::{Lsn, PgColumn, PgRelation, ReplicaIdentity};
 use e2e::Harness;
 use std::time::Duration;
 
-// Harness-owned fixtures (created before bootstrap so the loader owns them, PR 6.12).
+// Harness-owned fixtures created before bootstrap so the loader owns them.
 const OTHERS: [&str; 2] = ["rl1", "rl2"];
 
 fn col(name: &str, oid: u32, key: bool) -> PgColumn {

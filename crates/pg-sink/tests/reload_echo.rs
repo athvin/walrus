@@ -102,7 +102,7 @@ async fn signal_insert_resolves_waiter_and_never_reaches_parquet() {
             .await
             .unwrap();
 
-    // The real consume-loop pieces this PR wires together.
+    // The real consume-loop pieces exercised by this test.
     let waiters = Arc::new(WatermarkWaiters::default());
     let mut pending = PendingSignals::default();
     let mut internal = InternalTables::default();

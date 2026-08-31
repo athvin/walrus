@@ -9,8 +9,9 @@
 //!
 //! It runs inside this table's worker **task** on the shared `LocalSet` driver thread, serialized after
 //! an apply cycle (no separate connection, no quiescing dance), holds the exclusive writer, and needs
-//! ~2× transient space for the rewrite. The cross-table stall is an open finding recorded in
-//! `docs/implementation/notes/rust-skills/async-spawn-blocking.md`.
+//! ~2× transient space for the rewrite. Because every table task shares the LocalSet driver,
+//! a long rebuild can delay sibling tables; isolate owned connections only if that stall becomes
+//! measurable.
 
 use crate::duck::TableDb;
 use crate::duck_ext::{DuckResultExt, duck_err};
@@ -24,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 /// to the intact old mirror (readers on another connection see the old table until COMMIT). Reuses the
 /// transform's dedup/collapse (TRUNCATE tuple boundary, TOAST resolution, `(commit_lsn, lsn)` ranking).
 ///
-/// The `cancel` token is the PR 3.12 abort hook: checked before the rewrite starts, and — via
+/// The `cancel` token is the abort hook: checked before the rewrite starts, and — via
 /// [`full_rebuild_abortable`], which interrupts the running DuckDB query — an in-flight rewrite that is
 /// interrupted rolls back and returns `Ok(())` (an intentional drain abort; the idempotent rebuild
 /// re-runs next cycle). Only a genuine (non-cancel) failure is an error.
@@ -40,7 +41,7 @@ pub fn full_rebuild(
     cancel: &CancellationToken,
 ) -> Result<(), LoaderError> {
     if cancel.is_cancelled() {
-        return Ok(()); // shutting down — don't even start the heavy rewrite (PR 3.12)
+        return Ok(()); // shutting down — don't even start the heavy rewrite
     }
     // Rebuild over ALL retained raw (from LSN 0) plus the mirror baseline; the truncate boundary comes
     // from the retained tail exactly as the incremental path resolves it.
@@ -67,10 +68,11 @@ pub fn full_rebuild(
     }
 }
 
-/// [`full_rebuild`] wrapped so an in-flight rewrite is **aborted** the instant `cancel` fires (PR 3.12).
+/// [`full_rebuild`] wrapped so an in-flight rewrite is **aborted** the instant `cancel` fires.
 /// The blocking `CREATE OR REPLACE` runs inside this worker task on the shared `LocalSet` driver
-/// thread; a watcher task on the runtime pool holds the connection's [`InterruptHandle`](duckdb) (`Send + Sync`, asserted in [`crate::duck`] by PR
-/// 12.5) and calls `interrupt()` on cancellation, which makes the running query error →
+/// thread; a watcher task on the runtime pool holds the connection's [`InterruptHandle`](duckdb)
+/// (`Send + Sync`, asserted in [`crate::duck`]) and calls `interrupt()` on cancellation, which makes
+/// the running query error →
 /// `full_rebuild` rolls back and returns `Ok`. The watcher is aborted once the rewrite returns
 /// (whether it completed or was interrupted).
 ///

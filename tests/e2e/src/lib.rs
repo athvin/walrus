@@ -27,7 +27,7 @@ const S3_ENDPOINT: &str = "http://localhost:9000";
 const BUCKET: &str = "walrus";
 const SLOT: &str = "walrus_e2e_slot";
 /// The MinIO container name (`<compose project>-<service>-1`) — `docker pause`d to stall the sink's S3
-/// durability in the WAL-runaway / keepalive chaos tests (PR 4.5).
+/// durability in the WAL-runaway / keepalive chaos tests.
 const MINIO: &str = "walrus-minio-1";
 
 /// A running walrus stack: the compose services (assumed up) plus a live `pg-sink` and `loader` spawned
@@ -40,9 +40,9 @@ pub struct Harness {
     source: sqlx::PgPool,
     control: sqlx::PgPool,
     duckdb_dir: PathBuf,
-    /// The sink's captured stdout+stderr (its `tracing` log) — scraped for spill events (PR 4.3).
+    /// The sink's captured stdout+stderr (its `tracing` log) — scraped for spill events.
     sink_log: PathBuf,
-    /// The `target/<profile>/` dir the binaries live in — kept so a crashed child can be respawned (PR 4.4).
+    /// The `target/<profile>/` dir the binaries live in — kept so a crashed child can be respawned.
     bins: PathBuf,
     /// The epoch the sink established (always 1 after the clean reset).
     pub epoch: i64,
@@ -90,7 +90,7 @@ impl Harness {
         .execute(&source)
         .await
         .context("source 0003")?;
-        // The wide fidelity table (PR 4.2) — one column per mapped type family + a TOAST-able `big`. It
+        // The wide fidelity table — one column per mapped type family + a TOAST-able `big`. It
         // must exist BEFORE the sink bootstraps so the sink registers it and the loader owns it.
         sqlx::raw_sql(
             "CREATE TABLE IF NOT EXISTS public.types_matrix ( \
@@ -101,7 +101,7 @@ impl Harness {
         .execute(&source)
         .await
         .context("create types_matrix")?;
-        // The single-table-reload fixtures (PR 6.12). Like `types_matrix`, they must exist BEFORE
+        // The single-table-reload fixtures. Like `types_matrix`, they must exist BEFORE
         // the sink bootstraps so the sink registers them and the loader OWNS them (the loader only
         // picks up tables at bootstrap — a table created after start is never owned). `q_target.n`
         // is the column the quarantine e2e narrows to int2; `rl1..3` are the scale/others tables.
@@ -158,14 +158,13 @@ impl Harness {
         &self.source
     }
 
-    /// The control Postgres pool — for tests that read checkpoints / the manifest directly (PR 4.4).
+    /// The control Postgres pool — for tests that read checkpoints / the manifest directly.
     pub const fn control_pool(&self) -> &sqlx::PgPool {
         &self.control
     }
 
-    /// How many speculative spills the sink has logged so far (PR 4.3) — the observable proof that the
-    /// `max_inflight_bytes` ceiling fired and open-txn memory stayed bounded (a real `in_flight_bytes`
-    /// metric endpoint lands in PR 4.10).
+    /// How many speculative spills the sink has logged so far — an observable test probe showing
+    /// that the `max_inflight_bytes` ceiling fired and open-txn memory stayed bounded.
     pub fn sink_spill_count(&self) -> usize {
         std::fs::read_to_string(&self.sink_log)
             .map(|s| s.matches("spilled open-txn buffer").count())
@@ -294,8 +293,8 @@ impl Harness {
         Ok(())
     }
 
-    /// **SIGKILL** the sink (PR 4.4) — the *ungraceful* crash path, NOT the SIGTERM graceful drain of PR
-    /// 2.28. `tokio::process::Child::start_kill` sends `SIGKILL` (signal 9); `wait` reaps the zombie so the
+    /// **SIGKILL** the sink — the *ungraceful* crash path, not the SIGTERM graceful drain.
+    /// `tokio::process::Child::start_kill` sends `SIGKILL` (signal 9); `wait` reaps the zombie so the
     /// process is gone (and its walsender connection torn down) before we respawn.
     pub async fn kill_sink(&mut self) -> Result<()> {
         self.sink.start_kill().context("SIGKILL sink")?;
@@ -315,7 +314,7 @@ impl Harness {
             .context("sink /ready after restart")
     }
 
-    /// **SIGKILL** the loader (PR 4.4) — ungraceful, distinct from the SIGTERM drain of PR 3.12. Process
+    /// **SIGKILL** the loader — ungraceful and distinct from the SIGTERM drain. Process
     /// death releases the DuckDB file lock (the OS closes the fd) and leaves the lease row in place.
     pub async fn kill_loader(&mut self) -> Result<()> {
         self.loader.start_kill().context("SIGKILL loader")?;
@@ -335,13 +334,12 @@ impl Harness {
 
     /// Whether the loader child is still running (`try_wait() == Ok(None)`). A lossy-cast QUARANTINE
     /// makes a table worker return `Err`, which cancels the token and drains the whole loader — so
-    /// this flips to `false`. PR 6.12 waits on it to observe the quarantine before requesting the
-    /// recovery reload.
+    /// this flips to `false`. The recovery test waits on it before requesting a reload.
     pub fn is_loader_running(&mut self) -> bool {
         matches!(self.loader.try_wait(), Ok(None))
     }
 
-    /// Await the loader child's FULL exit (a quarantine self-exit, PR 6.12) — `wait()` reaps the
+    /// Await the loader child's FULL exit after quarantine — `wait()` reaps the
     /// process, so by the time this returns the loader has released every table's lease and DuckDB
     /// lock. A plain `try_wait()` poll can report "exited" while the OS is still tearing the process
     /// down, which would let a `restart_loader` race the old loader for the quarantined table's lock.
@@ -375,7 +373,7 @@ impl Harness {
 
     /// Poll `loader_checkpoint.raw_appended_lsn` for `table` until it passes `target` — i.e. Phase A has
     /// appended the batch to `<table>_raw`, even if Phase B has not yet MERGEd it (the mid-MERGE window,
-    /// where `transformed_lsn < raw_appended_lsn`). PR 4.4 uses this to crash the loader *after append,
+    /// where `transformed_lsn < raw_appended_lsn`).  uses this to crash the loader *after append,
     /// before/ during merge*.
     pub async fn await_raw_appended_past(
         &self,
@@ -466,13 +464,13 @@ impl Harness {
         Ok(conn.query_row(sql, [], |r| r.get(0))?)
     }
 
-    // ---- PR 4.5: slot-liveness chaos (S3 stall, slot status, heartbeat, health) ----------------
+    // ---- slot-liveness chaos (S3 stall, slot status, heartbeat, health) ----------------
 
     /// Stall the sink's durability by pausing MinIO (`docker pause`) — every S3 PUT then hangs, so the
     /// sink cannot finish a durable flush: `confirmed_flush_lsn` freezes and the slot's `restart_lsn`
     /// is pinned, so retained WAL grows (the WAL-runaway). Pausing the **loader** would NOT do this —
     /// it doesn't own the slot; the sink advances `confirmed_flush` on its OWN S3 durability (§1.5/§1.9),
-    /// so stalling S3 is the only thing that retains source WAL. The keepalive fix (PR #71) keeps the
+    /// so stalling S3 is the only thing that retains source WAL. The keepalive fix keeps the
     /// walsender connected throughout.
     pub async fn stall_s3(&self) -> Result<()> {
         docker(&["pause", MINIO]).await
@@ -616,7 +614,7 @@ impl Harness {
         matches!(self.sink.try_wait(), Ok(None))
     }
 
-    // ---- PR 4.6: total-restart (epoch bump on slot loss) ----------------------------------------
+    // ---- total-restart (epoch bump on slot loss) ----------------------------------------
 
     /// The current (highest) epoch in `replication_state`, or 1 if none yet — bumps on a total-restart.
     pub async fn current_epoch(&self) -> Result<i64> {
@@ -750,7 +748,7 @@ fn spawn_sink(bins: &std::path::Path, log: &std::path::Path) -> Result<Child> {
         .env("WALRUS_MANAGE_PUBLICATION", "false")
         .env("WALRUS_MAX_FILL", "1s")
         .env("WALRUS_MAX_ROWS", "100000")
-        // A LOW aggregate ceiling (64 KiB) so a few thousand rows in one open txn spill (PR 4.3) —
+        // A LOW aggregate ceiling (64 KiB) so a few thousand rows in one open txn spill —
         // bounding memory — instead of buffering the whole txn. `max_bytes` (per-batch) must stay ≤ the
         // ceiling (the sink validates `max_inflight_bytes >= max_bytes`).
         .env("WALRUS_MAX_BYTES", "32768")

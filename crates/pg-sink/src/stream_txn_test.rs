@@ -372,7 +372,7 @@ async fn low_ceiling_spills_yet_still_excludes_the_aborted_subxid() {
         400,
         "even with spilling, the aborted sub-xid (200 rows) is excluded → 400 survivors"
     );
-    // PR 4.3 fix: promoted spills are tagged `Spill` (their per-row commit_lsn is a placeholder, so the
+    // Promoted spills are tagged `Spill` (their per-row commit_lsn is a placeholder, so the
     // loader must stamp `lsn_end`), and EVERY returned file — spill or survivor — carries the real
     // commit LSN as `lsn_end`.
     assert!(
@@ -467,6 +467,6 @@ fn take_stream_drains_in_place_and_keeps_both_relative_orders() {
     assert!(!txn.keys.contains(&(TableId(42), 857)));
 }
 
-// Regression note (PR 26.2): the existing HashSet/BTreeSet membership indexes in loader/ddl.rs,
+// Regression note: the existing HashSet/BTreeSet membership indexes in loader/ddl.rs,
 // pg-sink/preflight.rs, and pg-sink/reload_export.rs stay sets. XID_PREFIXED stays a 7-byte slice
 // scan, and reload_signal/heartbeat/ddl column lookups stay Vec::position because they need indices.

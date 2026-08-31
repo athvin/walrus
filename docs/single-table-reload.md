@@ -1,16 +1,14 @@
 # Single-table reload — critique of the in-band signal proposal, and a revised shape
 
-> **Status: BUILT (Phase 6).** This design shipped across 12 PRs — see the
-> [Phase 6 curriculum](./implementation/phase-6-single-table-reload/) (task files 6.1–6.12). The
-> holes below (H1–H11) each map to a task; the anchor use case is proven end to end in
-> [PR 6.12](./implementation/phase-6-single-table-reload/pr-6.12-e2e-quarantine-recovery.md).
+> **Status: BUILT.** The holes below (H1–H11) map to the implemented invariants. The anchor use case
+> is covered end to end by `tests/e2e/tests/reload_quarantine.rs`.
 
 This note poke-holes a concrete proposal for
 [deferred goal §1](./deferred-goals.md#1-single-table-reload--re-sync-while-streaming):
 reload **N individual tables** through the one lifelong replication slot
 ([architecture §1.8](./architecture.md#18-single-slot-for-life--total-restart)), while the
-walrus-pg-sink keeps draining the WAL for every other table. It is a design document only — no code
-changes accompany it. Grounding: the walrus v1 codebase, Debezium's incremental-snapshot design
+walrus-pg-sink keeps draining the WAL for every other table. It now serves as the implementation and
+operations rationale. Grounding: the walrus codebase, Debezium's incremental-snapshot design
 (signals + chunking, [DDD-3]), and the Netflix DBLog watermark paper ([arXiv 2010.12597]).
 
 **The verdict up front.** The proposal's two big instincts are right and industry-validated: signal
@@ -182,13 +180,13 @@ for the quarantine case, where the mirror's shape itself is broken. The proposal
 Name both in the state machine; they share all machinery except the clear. Note the pause is needed
 **only** for rebuild — and "pause" costs nothing (H0 above: unclaimed manifest rows just wait).
 
-> **Which flavor? (the operator decision guide — PR 6.10)**
+> **Which flavor? (operator decision guide)**
 > - **`resync`** — cheap drift repair. Merges chunks over the *live* mirror, so the table stays
 >   queryable throughout; no pause, no rebuild, raw history preserved. Repairs stale and missing
 >   rows but **tolerates phantoms** (a row that drifted into the mirror and no longer exists upstream
 >   is in no chunk and survives). Reach for it when you suspect the mirror has *fallen behind*.
 > - **`reload`** — the truth reset. Clears and rebuilds the mirror at the current schema, so it also
->   removes phantoms and is the quarantine-recovery path (a failed lossy `ALTER … TYPE`, PR 3.9). It
+>   removes phantoms and is the quarantine-recovery path after a failed lossy `ALTER … TYPE`. It
 >   pauses the table's claims while exporting (queries see the pre-rebuild mirror until it swaps).
 >   Reach for it when the mirror's *shape or content* is wrong, not merely stale.
 >
@@ -392,19 +390,18 @@ fan-out can later compose with the CTID-range machinery of
   DBLog) to primary sources; whether any production tool ships the *full-export-plus-overlap*
   design (Airbyte resync, PeerDB, Fivetran, AWS DMS reload-table) went unverified. If precedent
   exists it would argue the simpler shape is shippable; absence of evidence isn't absence.
-- **Raw history semantics after rebuild.** ✅ **Resolved (PR 6.7 + PR 6.10).** A `reload`'s
+- **Raw history semantics after rebuild.** ✅ **Resolved.** A `reload`'s
   `CREATE OR REPLACE` of `<table>_raw` discards the table's CDC history in DuckDB (S3 Parquet
   persists subject to GC) — acceptable for quarantine recovery. A `resync` takes the **uniform Phase
   A path**: its chunk rows append into `<table>_raw` like any file, so raw history is preserved. One
-  path, no special-casing; see [PR 6.7](./implementation/phase-6-single-table-reload/pr-6.7-loader-rebuild-trigger.md)
-  and [PR 6.10](./implementation/phase-6-single-table-reload/pr-6.10-resync-flavor.md).
+  path, no special-casing; `loader::phase_a` routes both flavors.
 - **Interaction with loader sharding** ([deferred goal §2](./deferred-goals.md#2-multi-pod-loader-table-sharding-horizontal-scale-out)):
   the rebuild trigger runs under the table's ownership lease, so it inherits the fencing story —
   confirm the reload lease and the ownership lease can't deadlock or interleave badly.
 
-## Operating a reload (runbook — PR 6.11)
+## Operating a reload (runbook)
 
-The `walrus.table_reload` row **is** the operator interface. Metrics/dashboards (PR 6.11) show
+The `walrus.table_reload` row **is** the operator interface. Metrics and dashboards show
 aggregate health; this runbook turns a row into a decision.
 
 **Request.** Pick the flavor with the [decision guide](#h3--refresh-and-rebuild-are-different-operations-the-proposal-conflates-them)
@@ -436,7 +433,7 @@ means its exporter died and nothing adopted it (the `WalrusReloadLeaseStuck` pag
 `walrus_reload_lease_stale` gauge). Two options:
 
 - **Preferred — restart the sink.** On startup the controller's adoption scan re-acquires its own /
-  expired `exporting` leases and resumes from the chunk cursor (PR 6.9). No data is re-exported at
+  expired `exporting` leases and resumes from the chunk cursor. No data is re-exported at
   or before the cursor.
 - **Give up on the attempt.** Mark it failed (this also purges its staged `kind='reload'` chunk
   files, so the loader claims nothing stale — the coupling is in `reload::fail`):

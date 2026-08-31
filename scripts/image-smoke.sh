@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# image-smoke.sh — PR 4.8 PID-1 SIGTERM smoke for the two container images.
+# image-smoke.sh — PID-1 SIGTERM smoke for the two container images.
 #
 # Proves the load-bearing property of the Dockerfiles: because the entrypoint is exec-form under
 # `tini`, a SIGTERM (as Kubernetes sends on pod stop) reaches the Rust process, whose handler runs a

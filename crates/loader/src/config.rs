@@ -101,7 +101,7 @@ pub struct LoaderConfig {
     /// The apply-loop poll cadence (incremental Phase A + Phase B).
     #[serde(with = "humantime_serde")]
     pub poll_interval: Duration,
-    /// The compaction cadence (PR 3.11) — the per-table full-rebuild + retention prune. **Distinct** from
+    /// The compaction cadence — the per-table full-rebuild + retention prune. **Distinct** from
     /// `poll_interval`, slower, and run on the SAME worker thread serialized after an apply cycle (it
     /// holds the exclusive writer and needs ~2× transient space, so size it for low-traffic windows).
     #[serde(with = "humantime_serde")]

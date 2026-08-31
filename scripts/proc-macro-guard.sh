@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# proc-macro-guard.sh — PR 24.7/24.8 workspace-shape gate. walrus authors no procedural macros:
-# every codegen need is met by `macro_rules!` or a small hand-written implementation. Rationale +
-# the one condition that reopens the decision:
-# docs/implementation/notes/rust-skills/macro-proc-syn-quote.md.
+# proc-macro-guard.sh — workspace-shape gate. walrus authors no procedural macros: every current
+# code-generation need is met by `macro_rules!` or a small hand-written implementation. Revisit the
+# policy only when one of those approaches cannot provide the required diagnostics or hygiene.
 #
 #   bash scripts/proc-macro-guard.sh --check
 #   bash scripts/proc-macro-guard.sh --self-test
@@ -23,7 +22,7 @@ check_direct() {
     "$@" || true)
 
   if [ -n "$direct" ]; then
-    echo "::error::direct syn/quote/proc-macro2 dependency declared in a workspace manifest — walrus authors no proc-macros (docs/implementation/notes/rust-skills/macro-proc-syn-quote.md)"
+    echo "::error::direct syn/quote/proc-macro2 dependency declared in a workspace manifest — walrus authors no proc-macros"
     echo "$direct"
     return 1
   fi
@@ -48,7 +47,7 @@ check_proc_macro_setting() {
     "$@" || true)
 
   if [ -n "$declared" ]; then
-    echo "::error::a workspace manifest declares a proc-macro library setting — read docs/implementation/notes/rust-skills/macro-proc-syn-quote.md (§ The two-crate split) before adding one"
+    echo "::error::a workspace manifest declares a proc-macro library setting — update this guard and the six-member workspace invariant before adding one"
     echo "$declared"
     return 1
   fi

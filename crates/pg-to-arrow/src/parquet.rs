@@ -4,7 +4,7 @@
 //! must **not** coerce temporals. arrow-rs already emits `TIMESTAMP(MICROS, isAdjustedToUTC=…)`
 //! straight from `Timestamp(Microsecond, tz)` — coercing to NANOS/MILLIS is exactly the bug §2.1
 //! warns about. So [`default_writer_properties`] only sets compression and leaves the temporal
-//! encoding to arrow-rs. PR 2.11's conformance tests prove the round-trip through in-process DuckDB.
+//! encoding to arrow-rs. The conformance tests prove the round-trip through in-process DuckDB.
 
 use crate::error::Error;
 use arrow::array::RecordBatch;

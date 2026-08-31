@@ -1,14 +1,14 @@
 //! The durability checkpoint — **the heart of the whole sink** (§1.5).
 //!
-//! Only *after* a batch's Parquet is durable in S3 (PR 2.24) **and** its `file_manifest` row is
-//! committed (PR 2.25) does [`DurabilityCheckpoint::on_batch_durable`] advance `confirmed_flush_lsn`
+//! Only *after* a batch's Parquet is durable in S3 **and** its `file_manifest` row is
+//! committed does [`DurabilityCheckpoint::on_batch_durable`] advance `confirmed_flush_lsn`
 //! to the batch's `lsn_end`; the next standby status update carries it as `flush`/`apply`. That is the
 //! WAL-bounding invariant: slot lag is bounded to at most one in-flight batch, and a crash before the
 //! checkpoint just re-streams from the last confirmed LSN (at-least-once, no loss).
 //!
 //! **Two LSNs, two rules (§1.9):** `confirmed_flush` (durable) moves only here; the *received*
 //! keepalive LSN — `write` — is owned by [`ReplicationStream`] and moves **unconditionally** on every
-//! frame (that liveness path is PR 2.20). Conflating them causes disconnects (if you gate keepalives on
+//! frame. Conflating them causes disconnects (if you gate keepalives on
 //! durability) or data loss (if you advance `confirmed_flush` as your keepalive). We keep them apart:
 //! this struct owns `confirmed_flush`; the stream owns `received`.
 
@@ -24,7 +24,7 @@ use common::Lsn;
 pub struct DurabilityCheckpoint {
     confirmed_flush: Lsn,
     /// `confirmed_flush` is never advanced past this floor — the begin LSN of the oldest still-open
-    /// streamed txn (§1.6). `None` while only small/whole txns flow (a no-op ceiling); PR 2.30 fills it.
+    /// streamed txn (§1.6). `None` while only small/whole txns flow; the stream demux supplies it.
     open_txn_floor: Option<Lsn>,
 }
 
@@ -46,7 +46,7 @@ impl DurabilityCheckpoint {
         self.confirmed_flush
     }
 
-    /// Set the open-txn floor (PR 2.30). `None` = no open streamed txn; small/whole txns leave it unset.
+    /// Set the open-txn floor. `None` = no open streamed txn; small/whole txns leave it unset.
     pub const fn set_open_txn_floor(&mut self, floor: Option<Lsn>) {
         self.open_txn_floor = floor;
     }

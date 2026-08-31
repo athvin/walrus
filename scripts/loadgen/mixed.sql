@@ -1,4 +1,4 @@
--- PR 5.6 loadgen — a weighted insert/update/delete mix on `orders` (single-PK).
+-- Load generator — a weighted insert/update/delete mix on `orders` (single-PK).
 -- pgbench runs this once per transaction. ~60% insert / 30% update / 10% delete over a bounded key
 -- space, so keys collide and all three MERGE branches (insert/update/delete) get exercised downstream.
 \set id random(1, 50000)

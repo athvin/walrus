@@ -67,7 +67,7 @@ pub async fn read_current_epoch(
     Ok(Some(state))
 }
 
-/// Insert a new generation row (a new slot). Epoch bump / total-restart lands in PR 4.6.
+/// Insert a new generation row for a newly created slot during bootstrap or total restart.
 ///
 /// # Errors
 ///

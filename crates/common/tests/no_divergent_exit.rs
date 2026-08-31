@@ -8,10 +8,10 @@
     reason = "the synchronous integration-test scan is a repository-policy check, not runtime I/O"
 )]
 
-//! Guard (PR 18.13): walrus crate source must not declare never-returning functions or terminate
+//! Guard: walrus crate source must not declare never-returning functions or terminate
 //! the process directly. Errors reach `main` as values and map onto `common::ExitCode`; shutdown
 //! must unwind so Parquet flushes, watermarks commit, the ownership lease is released, and DuckDB
-//! checkpoints. See `docs/implementation/notes/rust-skills/type-never-diverge.md`.
+//! checkpoints.
 
 use std::fs;
 use std::path::{Path, PathBuf};

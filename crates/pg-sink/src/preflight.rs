@@ -11,7 +11,7 @@
 //! (and its config parser rejects the param), so the preflight runs its catalog checks over an
 //! ordinary connection and asserts the `REPLICATION` privilege from `pg_roles` — a *more* reliable
 //! capability check than "a superuser connect happened to succeed". The streaming replication
-//! connection itself is established in PR 2.20. Catalog reads use the **simple query protocol**
+//! connection itself is established by [`crate::replication`]. Catalog reads use the **simple query protocol**
 //! (`simple_query`); read the version from the integer `server_version_num`, never the text
 //! `version()`.
 
@@ -203,7 +203,7 @@ impl<'a> SourcePreflight<'a> {
         SourcePreflight { client, cfg }
     }
 
-    /// The DDL-capture tap is installed (PR 2.33): the `walrus.ddl_audit` table has the sink's columns
+    /// The DDL-capture tap is installed: the `walrus.ddl_audit` table has the sink's columns
     /// and **both** event triggers exist. Missing → terminal (schema changes would silently drift).
     ///
     /// # Errors
@@ -290,7 +290,7 @@ impl<'a> SourcePreflight<'a> {
         })
     }
 
-    /// The reload signal table (PR 6.2) is installed with its PK. Missing → terminal, because an
+    /// The reload signal table is installed with its PK. Missing → terminal, because an
     /// absent/unpublished signal table doesn't error at reload time — the echo just silently never
     /// arrives (reload H11). Publication membership is asserted (and auto-added under
     /// `manage_publication`) by [`Self::assert_publication_covers`], which treats `reload_signal`

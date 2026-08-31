@@ -120,16 +120,16 @@ pub struct SinkConfig {
     pub slot_name: String,
     /// The publication the slot streams.
     pub publication_name: String,
-    /// Batch cadence — flush a file at least this often (see PR 2.23 / §1.3).
+    /// Batch cadence — flush a file at least this often (§1.3).
     #[serde(with = "humantime_serde")]
     pub max_fill: Duration,
-    /// Fire an idle heartbeat only after the published tables have been idle this long (PR 2.27 / §1.9).
+    /// Fire an idle heartbeat only after the published tables have been idle this long (§1.9).
     #[serde(with = "humantime_serde")]
     pub heartbeat_idle_after: Duration,
     /// A beat un-returned after this long marks the sink `degraded` (observability, never a kill).
     #[serde(with = "humantime_serde")]
     pub heartbeat_roundtrip_deadline: Duration,
-    /// `statement_timeout` for each initial-backfill copy session (PR 2.29). `0` = disabled — a huge
+    /// `statement_timeout` for each initial-backfill copy session. `0` = disabled — a huge
     /// table's snapshot copy must not be killed mid-flight (the whole backfill is bounded by the slot's
     /// WAL retention, not a per-statement clock).
     #[serde(with = "humantime_serde")]
@@ -151,30 +151,30 @@ pub struct SinkConfig {
     pub startup_deadline: Duration,
     /// Where the K8s health endpoints bind.
     pub health_addr: SocketAddr,
-    /// Concurrent single-table reload exports (PR 6.4 / reload H6). "Reload N tables" drains a
+    /// Concurrent single-table reload exports (reload H6). "Reload N tables" drains a
     /// queue this wide — a polite cap, never N simultaneous load spikes on the source. ≥ 1.
     pub max_concurrent_reloads: NonZeroU64,
-    /// Reload lease TTL (PR 6.4 / reload H7): a live exporter renews at TTL/3, so a died-mid-export
+    /// Reload lease TTL (reload H7): a live exporter renews at TTL/3, so a failed exporter
     /// sink is detectable within one TTL. Bounds-checked so the renewal cadence fits inside it.
     #[serde(with = "humantime_serde")]
     pub reload_lease_ttl: Duration,
-    /// Rows per reload chunk (PR 6.5 / reload H2): each chunk is one short PK-ordered SELECT — no
+    /// Rows per reload chunk (reload H2): each chunk is one short PK-ordered SELECT — no
     /// hours-long transaction pinning xmin. Bounds each statement; `max_concurrent_reloads` bounds
     /// tables. ≥ 1.
     pub reload_chunk_rows: NonZeroU64,
-    /// How long a chunk waits for its watermark echo before the reload fails loudly (PR 6.5 /
-    /// reload H11): an unpublished signal table never echoes — this timeout turns that silent
+    /// How long a chunk waits for its watermark echo before the reload fails loudly (reload H11):
+    /// an unpublished signal table never echoes, so this timeout turns that silent
     /// failure into a `failed` row naming the fix.
     #[serde(with = "humantime_serde")]
     pub reload_echo_timeout: Duration,
     /// How many times a reload may restart because DDL bumped its `schema_version` mid-export
-    /// (PR 6.8 / reload H9). Every attempt is single-schema by construction; a schema change past
+    /// (reload H9). Every attempt is single-schema by construction; a schema change past
     /// chunk 1 invalidates the attempt and re-exports from zero at the new shape. This caps that
     /// churn so a migration-heavy window can't livelock a huge table's reload. `0` fails the first
     /// mid-export DDL; must be ≥ 0.
     pub reload_max_restarts: i32,
     /// If true, the sink creates/alters `publication_name` to cover the required tables; else a gap
-    /// is terminal (the operator owns the source setup — PR 2.19 `migrations/source`).
+    /// is terminal (the operator owns the source setup in `migrations/source`).
     pub manage_publication: bool,
     /// `true` (default) = **strict** keys: a published user table with no usable replica identity is
     /// terminal. `false` = **lenient**: quarantine + alert + continue (surfaced in the
@@ -298,7 +298,7 @@ impl SinkConfig {
         })
     }
 
-    /// The validated backpressure hysteresis gate (PR 2.32).
+    /// The validated backpressure hysteresis gate.
     ///
     /// # Errors
     ///
@@ -307,7 +307,7 @@ impl SinkConfig {
         Ok(crate::memory::Backpressure::new(self.hysteresis_band()?))
     }
 
-    /// The parsed replication slot name — `CREATE_REPLICATION_SLOT`'s precondition (PR 2.29).
+    /// The parsed replication slot name — `CREATE_REPLICATION_SLOT`'s precondition.
     /// [`Self::validate`] runs the same gate at load, so a config that booted cannot fail here.
     ///
     /// # Errors
@@ -318,7 +318,7 @@ impl SinkConfig {
         SlotName::new(&self.slot_name)
     }
 
-    /// The validated idle-heartbeat settings (PR 2.27).
+    /// The validated idle-heartbeat settings.
     #[must_use]
     pub const fn heartbeat_config(&self) -> crate::heartbeat::HeartbeatConfig {
         crate::heartbeat::HeartbeatConfig {
@@ -327,7 +327,7 @@ impl SinkConfig {
         }
     }
 
-    /// The keyless-table policy for the source preflight (§1.1, PR 2.19).
+    /// The keyless-table policy for the source preflight (§1.1).
     #[must_use]
     pub const fn pk_mode(&self) -> crate::preflight::PkMode {
         if self.strict_keys {

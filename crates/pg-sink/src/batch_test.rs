@@ -9,9 +9,8 @@ use pg_to_arrow::oids;
 ///
 /// [`Clock`] is `Send + Sync` and every owner holds its clock behind an `Arc`, so the mutable
 /// offset needs a *lock* — a `Cell`/`RefCell` would make `FakeClock` `!Sync` and stop satisfying
-/// the bound. `parking_lot::Mutex` is the workspace's lock for the reason
-/// `docs/implementation/notes/rust-skills/own-mutex-interior.md` records: it is non-poisoning, so
-/// `lock()` hands back the guard directly instead of a `Result` that invites `unwrap()`.
+/// the bound. `parking_lot::Mutex` is the workspace's non-poisoning lock, so `lock()` hands back
+/// the guard directly instead of a `Result` that invites `unwrap()`.
 #[derive(Debug)]
 struct FakeClock {
     base: Instant,
@@ -57,10 +56,10 @@ fn clock_bound_accepts_owned_shared_and_borrowed_clocks() {
 }
 
 /// A harness that wants to run the same assertion over several clocks needs one collection of
-/// them — the legitimate `dyn` case from PR 19.5's decision table.
+/// them — the legitimate `dyn` case from the decision table.
 ///
 /// NOTE: `Box::new(FakeClock::new())` is a `Box<Arc<FakeClock>>`; it coerces to `Box<dyn Clock>`
-/// only because of PR 19.4's `impl<T: Clock + ?Sized> Clock for Arc<T>`. If this line ever stops
+/// only because of the `impl<T: Clock + ?Sized> Clock for Arc<T>`. If this line ever stops
 /// compiling, that impl is what went missing.
 #[test]
 fn clock_is_dyn_compatible_and_usable_in_a_heterogeneous_collection() {

@@ -635,15 +635,14 @@ Per the "snapshot → then stream" choice:
 > [§1.9](#19-slot-liveness--heartbeat--keepalive) exists to keep this one slot healthy forever so
 > we never have to open a second one.
 >
-> **Single-table reloads / re-syncs — BUILT in Phase 6** (this section describes the v1 baseline it
+> **Single-table reloads / re-syncs — BUILT** (this section describes the original baseline they
 > replaced). v1 had **no per-table recovery path**: a table that quarantined on a lossy
 > `ALTER COLUMN TYPE` cast was left as-is and alerted, *not* individually reloaded, and the only full
-> re-sync was the whole-system total-restart that rebuilds *every* table together. Phase 6 adds the
+> re-sync was the whole-system total-restart that rebuilds *every* table together. The current system adds the
 > per-table exit — `just reload` recovers a quarantined table (or refreshes drift via `resync`)
 > **while the WAL stream keeps running for every other table**, through the one lifelong slot. See
-> [single-table-reload.md](./single-table-reload.md) and the
-> [Phase 6 curriculum](./implementation/phase-6-single-table-reload/); the recovery is proven end to
-> end in [PR 6.12](./implementation/phase-6-single-table-reload/pr-6.12-e2e-quarantine-recovery.md).
+> [single-table-reload.md](./single-table-reload.md); the recovery is covered end to end by
+> `tests/e2e/tests/reload_quarantine.rs`.
 
 The system consumes **exactly one** logical replication slot for its **entire life** — there
 is no multi-slot sharding. That makes `walrus-pg-sink` inherently a **single active consumer of
@@ -1622,7 +1621,7 @@ support or **`pgwire-replication`** [2]) — the pgoutput decoder is **ours**
 
 ---
 
-## Verification (how we'll prove it works end-to-end, later)
+## Verification (end-to-end coverage strategy)
 
 - **Local harness:** docker-compose with Postgres (`wal_level=logical`) + MinIO (S3). Run
   both services; `INSERT/UPDATE/DELETE`, assert Parquet lands in MinIO, the CDC row lands

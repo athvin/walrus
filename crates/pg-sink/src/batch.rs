@@ -4,10 +4,10 @@
 //! flushes when **any** threshold trips — `max_fill` (cadence), `max_rows`, or `max_bytes` — but
 //! **never in the middle of a committed transaction's tail**: rows buffer against the open txn and
 //! become flush-eligible only at `Commit`, so a batch may span many small txns but never a fraction of
-//! one (§1.6). This PR seals an in-memory [`RecordBatch`]; the Parquet/S3 write is PR 2.24.
+//! one (§1.6). The sealed in-memory [`RecordBatch`] is then written to Parquet and S3.
 //!
 //! `lsn_end` is the **commit LSN** of the batch's last transaction — the load-bearing key for the
-//! manifest (PR 2.25) and checkpoint (PR 2.26), and deliberately *not* the max per-row LSN.
+//! manifest and checkpoint, and deliberately *not* the max per-row LSN.
 //!
 //! ## Dynamic dispatch in `pg-sink` — the deliberate list
 //!
@@ -36,11 +36,11 @@ mod private {
 }
 
 /// Injectable clock so `max_fill` is testable without sleeping. Production has exactly one impl
-/// ([`SystemClock`]); the trait exists **for that test seam**, not as dead generality (audited
-/// PR 8.5, kept by design). Since PR 19.5 the seam is **statically dispatched**: every owner is
+/// ([`SystemClock`]); the trait exists **for that test seam**, not as dead generality. The seam is
+/// **statically dispatched**: every owner is
 /// generic over `C: Clock`, so the one production instantiation inlines and no vtable rides the
 /// per-commit path. `Arc<SystemClock>` / `Arc<FakeClock>` satisfy the bound via the delegating impls
-/// below (PR 19.4).
+/// below.
 ///
 /// This trait is sealed: it can be called and stored from anywhere, but only `pg-sink` can implement
 /// it.
@@ -227,8 +227,8 @@ pub struct TableBatcher<C> {
     pending_bytes: u64,
     /// The flush-eligible half — count, bytes, and LSN bounds as one state (see [`CommittedRows`]).
     committed: CommittedRows,
-    /// The file id shared by every row of this batch (assigned when it opens; the manifest, PR 2.25,
-    /// keys on it). `None` until the first row is pushed.
+    /// The file id shared by every row of this batch (assigned when it opens and used as the
+    /// manifest key). `None` until the first row is pushed.
     batch_id: Option<String>,
 }
 
@@ -277,7 +277,7 @@ impl<C: Clock> TableBatcher<C> {
 
     /// Promote the open txn's rows to the committed builder at `(commit_lsn, commit_ts)`; they are now
     /// flush-eligible. `commit_lsn` and `commit_ts` are known only at Commit, so per-row metas were
-    /// pushed with placeholders and get the real transaction values stamped here (PR 5.9). A commit
+    /// pushed with placeholders and get the real transaction values stamped here. A commit
     /// with no rows for this table is a no-op.
     ///
     /// # Errors
@@ -384,7 +384,7 @@ impl<C: Clock> TableBatcher<C> {
     }
 
     /// The commit LSN of the earliest committed-but-unsealed row, or `None` if nothing is buffered.
-    /// The durability floor an idle heartbeat must not advance `confirmed_flush` past (PR 2.27): those
+    /// The durability floor an idle heartbeat must not advance `confirmed_flush` past: those
     /// rows are not yet in S3, so a slot advance beyond them would lose them on crash. Open-txn
     /// (uncommitted) rows do **not** count — their future commit LSN re-streams regardless.
     #[must_use]
@@ -397,7 +397,7 @@ impl<C: Clock> TableBatcher<C> {
         }
     }
 
-    /// **Drop** the open (uncommitted) transaction's speculative buffer — on a graceful drain (PR 2.28)
+    /// **Drop** the open (uncommitted) transaction's speculative buffer — on a graceful drain
     /// these have no `Commit` yet, so forcing them out would orphan an S3 object with no way to resolve
     /// it; they simply re-stream on resume (at-least-once). Committed rows are untouched.
     pub fn drop_open_txn(&mut self) {

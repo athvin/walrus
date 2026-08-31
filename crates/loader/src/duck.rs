@@ -51,16 +51,15 @@ const MIGRATE_RAW_REPLAY_FENCE: &str =
 #[derive(Debug)]
 pub struct TableDb {
     conn: duckdb::Connection,
-    /// Parquet column lists by `schema_version` (PR 5.8). A version's file shape is immutable — the
+    /// Parquet column lists by `schema_version`. A version's file shape is immutable — the
     /// sink's homogeneous-file rule (walrus-pg-sink §3.5) cuts a fresh file at every DDL bump, so all
     /// files at one version share their columns and a DDL bump is a *new* key. So this cache never
     /// invalidates, and a Phase-A cycle claiming N same-version files runs one `DESCRIBE`, not N.
     /// `RefCell` provides interior mutability behind `&self`. `TableDb` is `Send + !Sync`:
     /// duckdb-rs declares `Connection: Send`, but the connection's `RefCell<InnerConnection>` and
     /// this cache's `RefCell` prevent shared access. That `!Sync` makes a future holding `&TableCtx`
-    /// non-`Send`, hence one apply worker per `.duckdb` file on a `LocalSet`. See the bound analysis
-    /// and shared-thread open finding in
-    /// `docs/implementation/notes/rust-skills/async-spawn-blocking.md`.
+    /// non-`Send`, hence one apply worker per `.duckdb` file on a `LocalSet`. Those tasks share one
+    /// driver thread, so a long DuckDB call can delay sibling tables.
     /// `Arc<[String]>` keeps reads to one indirection while preserving `TableDb: Send`. The `Rc`
     /// this `LocalSet`-confined cache would otherwise invite is declined: `Rc` is `!Send`, so it
     /// would break `assert_send::<TableDb>()` below and foreclose the owned-move redesign that
@@ -93,7 +92,7 @@ impl TableDb {
     /// `CREATE TABLE IF NOT EXISTS` for BOTH the mirror `<table>` and the CDC log `<table>_raw`
     /// (a heap; file-level replay is fenced by `_walrus_ingested_files`), the user-facing
     /// `<table>_current` view, and a `_walrus_meta` row seeding this table's `schema_version`
-    /// (PR 3.8's DDL-reconcile watermark).
+    /// (the DDL-reconcile watermark).
     /// The seed is `ON CONFLICT DO NOTHING`, so an EXISTING `.duckdb` keeps its persisted, already-
     /// reconciled version across restarts — the additive DDL applier ([`crate::ddl`]) advances it.
     ///
@@ -109,7 +108,7 @@ impl TableDb {
     }
 
     /// As [`TableDb::ensure_tables`], but from a full [`TablePlan`] — the mirror carries the recombined
-    /// target types and `<table>_raw` the verbatim emit columns (Tier-2 decomposition, PR 4.2). The
+    /// target types and `<table>_raw` the verbatim emit columns (Tier-2 decomposition). The
     /// Tier-1 plan produces exactly the scalar shape `ensure_tables` always built.
     ///
     /// # Errors
@@ -152,13 +151,13 @@ impl TableDb {
             .replace("{table}", table)
             .replace("{cols}", &cols.join(", "))
             .replace("{primary_key}", &primary_key);
-        // Idempotent back-fill for a mirror created before PR 3.7 (compose resume).
+        // Idempotent back-fill for a mirror created before the applied-LSN guard (compose resume).
         let applied_cols = ALTER_ADD_APPLIED.replace("{table}", table);
         // The user-facing projection: the mirror WITHOUT the internal guard columns (DoD §7 "hidden from
         // user projections"). Users read `<table>_current`; `_applied_*` never leak. Recreated by the DDL
         // applier after any structural change (a `SELECT *` view binds its columns at creation time).
         let user_view = user_view_sql(table);
-        // The per-table DDL-reconcile watermark (PR 3.8). Seeded once; the applier advances it.
+        // The per-table DDL-reconcile watermark. Seeded once; the applier advances it.
         let meta = CREATE_META.replace("{schema_version}", &schema_version.to_string());
 
         // The CDC log: every change verbatim (the emit columns), with the intact
@@ -201,12 +200,12 @@ impl TableDb {
         self.conn.execute_batch(&sql).duck("configure S3")
     }
 
-    /// Phase A (PR 3.2): append one Parquet file **verbatim** into `<table>_raw`, promoting
+    /// Phase A: append one Parquet file **verbatim** into `<table>_raw`, promoting
     /// `op`/`commit_lsn`/`lsn`/`sink_processed_at` out of `walrus_pg_sink_meta`. The append and a
     /// marker in `_walrus_ingested_files` commit in one DuckDB transaction; a replay of the same
     /// immutable object URI returns zero without reopening the Parquet. **Never touches the mirror.**
     ///
-    /// `commit_lsn_override` (PR 4.3 fix): for a **speculative-spill** file (manifest `kind = 'spill'`)
+    /// `commit_lsn_override`: for a **speculative-spill** file (manifest `kind = 'spill'`)
     /// the per-row `commit_lsn` in the Parquet is a *placeholder* — the file was written before its txn's
     /// commit LSN was known. A spill file is one whole transaction, so its authoritative `commit_lsn` is
     /// the file's `lsn_end` (stamped on the manifest at `Stream Commit`); passing `Some(lsn_end)` here
@@ -244,8 +243,8 @@ impl TableDb {
                 return Ok(0);
             }
 
-            // Map the file's columns into `<table>_raw` **by name**, not by position (PR 3.8).
-            // The list is cached per `schema_version` (PR 5.8). This happens after the marker check,
+            // Map the file's columns into `<table>_raw` **by name**, not by position.
+            // The list is cached per `schema_version`. This happens after the marker check,
             // so a crash-window replay does not require the staged object to remain readable.
             let file_cols = self.columns_for(&uri, schema_version)?;
             let quoted = file_cols
@@ -320,7 +319,7 @@ impl TableDb {
     }
 
     /// The Parquet column list for `schema_version`, introspecting `uri` **once** per version and
-    /// caching it (PR 5.8; sound by the homogeneous-file rule — see [`TableDb::parquet_cols`]).
+    /// caching it (sound by the homogeneous-file rule — see [`TableDb::parquet_cols`]).
     fn columns_for(
         &self,
         uri: &str,
@@ -339,7 +338,7 @@ impl TableDb {
         Ok(cols)
     }
 
-    /// Number of distinct `schema_version`s whose column list is cached — test probe for PR 5.8.
+    /// Number of distinct `schema_version`s whose column list is cached; exposed only to tests.
     #[cfg(test)]
     pub fn cached_schema_versions(&self) -> usize {
         self.parquet_cols.borrow().len()
@@ -359,7 +358,7 @@ impl TableDb {
         Ok(cols)
     }
 
-    /// The `.duckdb` connection (later PRs run the transform SQL through it).
+    /// The `.duckdb` connection used by transform, compaction, and schema-reconciliation callers.
     ///
     /// Handing out the borrow does nothing on its own — the caller still has to run something
     /// through it — so a discarded call is a no-op. `clippy::must_use_candidate` cannot say so: the
@@ -529,7 +528,7 @@ impl TableDb {
         Ok(())
     }
 
-    /// The highest `reload_id` this `.duckdb` has rebuilt for — the H8 idempotency latch (PR 6.7).
+    /// The highest `reload_id` this `.duckdb` has rebuilt for — the H8 idempotency latch.
     /// `None` when the latch was never set, so the first attempt of any kind triggers a rebuild; a
     /// caller can no longer confuse "never rebuilt" with a real id. `max(v)` yields NULL (→ `None`)
     /// when the key is missing, mirroring [`TableDb::built_epoch`]'s probe-free read.
@@ -566,7 +565,7 @@ impl TableDb {
         Ok(())
     }
 
-    /// The reload rebuild (PR 6.7 / reload H8, §5 step 4): atomically replace BOTH tables at the
+    /// The reload rebuild (reload H8, §5 step 4): atomically replace BOTH tables at the
     /// triggering file's `schema_version` — empty, at exactly the shape the attempt's chunks carry
     /// — then let ordinary Phase A/B replay chunks + post-`W` stream files in `(lsn_end, id)`
     /// order.

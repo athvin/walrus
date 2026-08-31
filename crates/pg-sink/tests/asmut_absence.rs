@@ -1,6 +1,5 @@
-//! Guard for the mutable-conversion decision note: walrus deliberately has no generic mutable
-//! write target because it has no fixed-length byte sink. If that changes, update the ADR in the
-//! same PR instead of deleting this test.
+//! Guard for the mutable-conversion policy: walrus deliberately has no generic mutable write target
+//! because it has no fixed-length byte sink. If that changes, update this test with the new invariant.
 
 use std::{
     io::Read,
@@ -57,7 +56,6 @@ fn no_asmut_bounds_anywhere_in_crates() {
     assert!(
         hits.is_empty(),
         "generic mutable bound(s) appeared: {hits:?}\n\
-         walrus has no fixed-length byte sink — see \
-         docs/implementation/notes/rust-skills/conv-asmut-mutable.md before adding one",
+         walrus has no fixed-length byte sink; document the new invariant before adding one",
     );
 }

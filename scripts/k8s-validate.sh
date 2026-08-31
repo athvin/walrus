@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# k8s-validate.sh — PR 4.9 manifest gate. Renders the kustomize base and schema-validates every
+# k8s-validate.sh — manifest gate. Renders the kustomize base and schema-validates every
 # resource with kubeconform, plus the standalone secrets.example.yaml template. Same command CI runs,
 # so "green locally" predicts "green in CI".
 #

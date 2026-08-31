@@ -31,7 +31,7 @@ pub enum ControlError {
     },
 
     /// A reload was requested for a table that already has a live (non-terminal) one — the
-    /// `table_reload_one_live` partial unique index fired (PR 6.1). Terminal for THIS request:
+    /// `table_reload_one_live` partial unique index fired. Terminal for THIS request:
     /// retrying is pointless until the live reload reaches `complete`/`failed`.
     #[error("a reload is already in progress for {schema}.{table}")]
     ReloadInProgress { schema: String, table: String },
@@ -97,8 +97,8 @@ impl From<sqlx::Error> for ControlError {
     }
 }
 
-/// The default control-pool ceiling. Bounds-checked, config-driven sizing arrives with the bin
-/// bootstraps (PR 3.1); a small pool is right for the low-volume control traffic until then.
+/// The control-pool ceiling. A small fixed pool matches the low-volume coordination workload;
+/// expose it as configuration only if pool contention becomes measurable.
 const DEFAULT_MAX_CONNECTIONS: u32 = 5;
 
 /// Connect to the control Postgres, returning a ready connection pool.

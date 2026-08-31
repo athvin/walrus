@@ -3,13 +3,13 @@
     clippy::expect_used,
     reason = "bench (harness=false, not test-cfg)"
 )]
-//! PR 5.5 — criterion micro-benches for the loader's raw→mirror transform.
+//! Criterion micro-benches for the loader's raw→mirror transform.
 //!
 //! Runs the **production** SQL (`loader::transform::apply_transform` over `TransformSql`) against an
-//! in-memory DuckDB seeded exactly the way the PR 3.3 crown-jewel tests seed it — same harness, clock
+//! in-memory DuckDB seeded exactly like the transform integration tests — same harness, clock
 //! on. Three views: transform scaling over an N×K grid, the unchanged-TOAST back-scan cost isolated
 //! as a delta, and mirror-size sensitivity (the MERGE join + PK-index side). No production code is
-//! touched — baselines PR 5.8 must beat.
+//! touched; these benches establish the baselines for future measured changes.
 //!
 //! Seeding uses one `INSERT … SELECT range(N)` per iteration (individual inserts would dwarf the
 //! measured transform at 1M rows). `SET threads = 4` is pinned so numbers don't drift with core count.
@@ -91,7 +91,7 @@ fn wide_rel() -> PgRelation {
 }
 
 /// A fresh in-memory DB with the mirror (+ hidden `_applied_*` guard cols) and `<table>_raw`, matching
-/// the PR 3.3 test schema. `threads` pinned for reproducibility.
+/// the production test schema. `threads` is pinned for reproducibility.
 fn db(mirror_cols: &str, raw_cols: &str) -> Connection {
     let c = Connection::open_in_memory().unwrap();
     c.execute_batch(&format!(

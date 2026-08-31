@@ -24,7 +24,7 @@ async fn insert_update_delete_reaches_mirror() {
     let before = h.source_wal_lsn().await.unwrap();
 
     // Bracket the three commits by the SOURCE clock (Unix-epoch seconds): every txn's real commit time
-    // lands in [ts_lo, ts_hi], so the `commit_ts` stamped into each row's meta must too (PR 5.9).
+    // lands in [ts_lo, ts_hi], so the `commit_ts` stamped into each row's meta must too.
     let ts_lo: f64 = sqlx::query_scalar("SELECT extract(epoch FROM clock_timestamp())::float8")
         .fetch_one(h.source_pool())
         .await
@@ -98,7 +98,7 @@ async fn insert_update_delete_reaches_mirror() {
 
     // The provenance `commit_ts` is the real transaction commit time (proto §4 µs-since-Y2K, converted
     // by `UtcTimestamp::from_pg_micros`), not a decode-time placeholder: every row's parsed `commit_ts`
-    // falls inside the source-clock bracket, ±1 s for sub-second rounding / minor skew (PR 5.9).
+    // falls inside the source-clock bracket, ±1 s for sub-second rounding / minor skew.
     let commit_ts_in_window = h
         .duckdb_scalar(
             "orders",

@@ -2,11 +2,11 @@
 //!
 //! Consumes the neutral shape types ([`common::PgRelation`] / [`common::PgColumn`] /
 //! [`common::TupleValue`]) the decoder produces and turns them into Arrow schemas, RecordBatches,
-//! and (later) Parquet. It depends on `common` **only** — never on `pg-sink` — which is what lets it
+//! and Parquet. It depends on `common` **only** — never on `pg-sink` — which is what lets it
 //! be unit-tested against hand-built [`PgRelation`](common::PgRelation)s with no decoder in sight.
 //!
-//! PR 2.9 builds the Tier-1 (native 1:1) Arrow schema; values (2.10), Parquet + DuckDB conformance
-//! (2.11), and the Tier-2/3 types (2.12+) follow.
+//! The crate supports native one-to-one mappings, Tier-2 column expansion, Tier-3 canonical-text
+//! carriers, batch construction, and Parquet output verified against DuckDB.
 
 // `batch` and `parquet` declare nothing the `pub use` block below does not already publish —
 // `BatchBuilder`, and the three writer entry points — so `pub` on either module would only add a
@@ -26,7 +26,7 @@ pub mod tier2;
 pub mod tier3;
 pub mod uuid_enum;
 
-/// Tolerance-based float assertions shared by sibling unit tests (PR 17.5).
+/// Tolerance-based float assertions shared by sibling unit tests.
 #[cfg(test)]
 mod approx;
 

@@ -7,8 +7,8 @@
 //!
 //! **Snapshot note:** SQL creation does not export a consistent snapshot (that needs the
 //! `CREATE_REPLICATION_SLOT … SNAPSHOT 'export'` *replication* command). The exported snapshot is only
-//! needed for the initial backfill (PR 2.29), so the spike creates via SQL and leaves `snapshot_name`
-//! `None`; PR 2.29 will create via the replication command and keep the snapshot.
+//! needed for the initial backfill. The production bootstrap creates that slot through the
+//! replication command; [`verify_or_create_slot`] is the SQL-created, snapshot-free test helper.
 
 use anyhow::Context as _;
 use common::Lsn;
@@ -33,7 +33,7 @@ pub enum SlotResume {
     Created {
         /// The LSN at which the new slot became consistent; where streaming starts.
         consistent_point: Lsn,
-        /// `None` for a SQL-created slot; the exported snapshot is PR 2.29 (backfill).
+        /// `None` for a SQL-created slot; production backfill creates an exported snapshot instead.
         snapshot_name: Option<String>,
     },
 }
@@ -63,7 +63,7 @@ fn parse_lsn(s: &str, field: &'static str) -> anyhow::Result<Lsn> {
 }
 
 /// Read a slot's resume position **without** creating it — `None` if it does not exist. The bootstrap
-/// (PR 2.29) uses this to decide between resuming (`Some`) and a first-time snapshot+backfill (`None`).
+/// uses this to decide between resuming (`Some`) and a first-time snapshot+backfill (`None`).
 ///
 /// # Errors
 ///

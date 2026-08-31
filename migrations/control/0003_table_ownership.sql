@@ -1,9 +1,10 @@
--- 0003_table_ownership.sql — the loader's cooperative single-writer lease (loader §8.1, PR 3.1).
+-- 0003_table_ownership.sql — the loader's cooperative single-writer lease (loader §8.1).
 --
 -- The sink gets single-writer for free (Postgres' active-slot rule). The loader must ASSEMBLE it: this
 -- control-plane ownership lease is the FIRST fence (a monotonic `fencing_token` per owned table),
 -- acquired BEFORE the DuckDB read-write file lock (the second fence). One row per owned
--- (epoch, schema, table). The token is inert while `replicas=1` (persist it now; sharded in PR 4.11).
+-- (epoch, schema, table). The token is inert while `replicas=1`, but preserves the fencing seam
+-- needed by the deferred table-sharding design.
 CREATE TABLE walrus.table_ownership (
   epoch          bigint      NOT NULL,
   source_schema  text        NOT NULL,

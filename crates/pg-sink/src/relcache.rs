@@ -4,7 +4,7 @@
 //! `Insert`/`Update`/`Delete` references it by OID. This cache turns a `Relation` into a Tier-1 Arrow
 //! schema (+ per-column [`TypeDescriptor`]s) via `pg-to-arrow` and stores it keyed by
 //! **`(relation_oid, schema_version)`** — the version in the key is what makes a schema change
-//! (PR 2.33) a *new* entry rather than a mutation, so in-flight batches at the old version still
+//! a *new* entry rather than a mutation, so in-flight batches at the old version still
 //! resolve. At bootstrap the cache is **hydrated** from `schema_registry` so a restart is a resume.
 
 use arrow::datatypes::SchemaRef;
@@ -12,7 +12,7 @@ use common::{PgRelation, SchemaVersionNo, TypeDescriptor};
 use std::collections::{BTreeMap, btree_map};
 use std::sync::Arc;
 
-/// Everything the batching path (PR 2.23) needs for one relation at one `schema_version`, shared by
+/// Everything the batching path needs for one relation at one `schema_version`, shared by
 /// `Arc` so it is read without cloning per row.
 #[derive(Debug)]
 pub struct CachedRelation {
@@ -28,7 +28,7 @@ pub struct CachedRelation {
 }
 
 /// The three walrus-internal source tables: control-plane, never registered or schematised as user
-/// data. `reload_signal` (PR 6.3) is consumed for its echo — the chunk watermark — exactly as
+/// data. `reload_signal` is consumed for its echo — the chunk watermark — exactly as
 /// `ddl_audit` is consumed for DDL events: never batched, never a Parquet file, never a manifest row.
 #[must_use]
 pub fn is_internal_table(schema: &str, table: &str) -> bool {
@@ -58,7 +58,7 @@ impl RelationCache {
     }
 
     /// The cached shape for `oid` at its **highest** `schema_version` — used to stamp streamed changes
-    /// after a DDL bump (PR 2.33), so a change always lands in the latest-shape file.
+    /// after a DDL bump, so a change always lands in the latest-shape file.
     #[must_use]
     pub fn latest_for(&self, oid: u32) -> Option<Arc<CachedRelation>> {
         self.by_key
@@ -67,7 +67,7 @@ impl RelationCache {
             .map(|(_, cached)| Arc::clone(cached))
     }
 
-    /// The OID of a cached `schema.table` (any version) — the DDL-capture cut (PR 2.33) needs it to find
+    /// The OID of a cached `schema.table` (any version) — the DDL-capture cut needs it to find
     /// the affected table's batcher.
     #[must_use]
     pub fn oid_for(&self, schema: &str, table: &str) -> Option<u32> {

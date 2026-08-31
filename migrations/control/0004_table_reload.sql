@@ -1,21 +1,21 @@
--- 0004_table_reload.sql — the single-table-reload state machine (reload H4/H5/H10, PR 6.1).
+-- 0004_table_reload.sql — the single-table-reload state machine (reload H4/H5/H10).
 --
 -- The reload's brain lives HERE, in control-pg — never in the source database. The loader has no
 -- source-DB credentials and never will (reload H4); the source-side `walrus.reload_signal` table
--- (PR 6.2) carries only in-band chunk-start watermarks, no state. One row per reload attempt:
+-- carries only in-band chunk-start watermarks, no state. One row per reload attempt:
 --
 --   requested → exporting → export_complete → complete        (`failed` terminal from the middle)
 --
 -- Who flips what (reload H10): an operator/`just reload` INSERTs `requested`; the sink's reload
--- controller claims it to `exporting` (PR 6.4), advances the chunk cursor (PR 6.5), and flips
--- `export_complete`; the LOADER flips `complete` once `transformed_lsn >= final_lsn` (PR 6.9).
+-- controller claims it to `exporting`, advances the chunk cursor, and flips
+-- `export_complete`; the LOADER flips `complete` once `transformed_lsn >= final_lsn`.
 --
 -- `reload_id` is a bigserial, DELIBERATELY not the design doc's UUID: "honor only the latest
 -- reload_id" (H9 restart hygiene) becomes a numeric comparison, and the id fits the loader's
 -- `_walrus_meta` k/v store (`v BIGINT`) verbatim. What a UUID key bought — duplicate-request
 -- idempotency — moves to the partial unique index below, which is the stronger guarantee anyway.
 --
--- There is NO 'superseded' status: a DDL-restarted attempt (PR 6.8) is `failed` with an
+-- There is NO 'superseded' status: a DDL-restarted attempt is `failed` with an
 -- explanatory `error`, and its successor is a fresh row with `restart_count + 1`. Five statuses,
 -- ever.
 CREATE TABLE walrus.table_reload (
@@ -31,7 +31,7 @@ CREATE TABLE walrus.table_reload (
   first_lsn      pg_lsn,                  -- L₁, the reload's first chunk watermark; frozen on chunk 1
   final_lsn      pg_lsn,                  -- H, set at export_complete; completion = transformed_lsn >= H
   schema_version bigint,                  -- the ONE version this attempt exports at; frozen on chunk 1
-  restart_count  int         NOT NULL DEFAULT 0,  -- DDL restarts consumed (PR 6.8 caps this)
+  restart_count  int         NOT NULL DEFAULT 0,  -- DDL restarts consumed; reload_max_restarts caps this
   lease_holder   text,                    -- which sink instance is exporting (H7)
   lease_expiry   timestamptz,             -- a live exporter keeps this in the future via renew
   error          text,                    -- why `failed` (preflight reason, DDL restart, echo timeout…)

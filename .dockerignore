@@ -1,4 +1,4 @@
-# .dockerignore — trim the build context for deploy/docker/Dockerfile.* (PR 4.8).
+# .dockerignore — trim the build context for deploy/docker/Dockerfile.*.
 #
 # The release build needs Cargo.toml, Cargo.lock, crates/, tests/ (workspace members),
 # migrations/ (sqlx::migrate! embeds migrations/control at compile time) and .sqlx/ (the offline

@@ -48,6 +48,6 @@ fn pause_logs_once_per_pause_and_relatches_on_a_new_reload() {
     assert_eq!(
         pause_began(&latch, Some(common::ReloadId(9))),
         Some(common::ReloadId(9)),
-        "a superseding reload (a PR 6.8 restart) logs without an intervening lift"
+        "a superseding reload logs without an intervening lift"
     );
 }

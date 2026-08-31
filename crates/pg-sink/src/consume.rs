@@ -1,5 +1,5 @@
-//! The decode loop: join the live [`ReplicationStream`] (PR 2.20) to the sync, pure [`pgoutput`]
-//! decoder (PRs 2.2–2.8). The Rust analogue of the proof harness's `run-tests.sh` — an `INSERT` now
+//! The decode loop: join the live [`ReplicationStream`] to the sync, pure [`pgoutput`]
+//! decoder. The Rust analogue of the proof harness's `run-tests.sh` — an `INSERT` now
 //! decodes to `Begin → Relation → Insert → Commit` against a real Postgres. No Arrow / batching / S3.
 //!
 //! **The seam that kept the decoder testable:** [`pgoutput::parse_message`] stays **sync + pure**;
@@ -148,7 +148,7 @@ impl<C: Clock + Clone> DecodeLoop<'_, C> {
         let schema_version = common::SchemaVersionNo(0);
         let mut ctx = StreamCtx::default();
         let mut internal = InternalTables::default();
-        // reload_signal echoes buffered between their Insert and their transaction's fate (PR 6.3):
+        // reload_signal echoes buffered between their Insert and their transaction's fate:
         // the watermark is the COMMIT LSN, which only the Commit message carries.
         let mut pending_signals = crate::reload_signal::PendingSignals::default();
         // Idle windows are monotonic (`tokio::time::Instant`); `last_activity` moves on every user change,
@@ -223,7 +223,7 @@ impl<C: Clock + Clone> DecodeLoop<'_, C> {
                                         // arrives (Relation always precedes the change in the same txn).
                                         internal.note_relation(relation);
                                         // Register user tables at their CURRENT structural version (bumped by
-                                        // DDL capture, PR 2.33) so the new-shape file carries the new version.
+                                        // DDL capture) so the new-shape file carries the new version.
                                         let version =
                                             ddl.version_of(&relation.schema, &relation.name);
                                         on_relation(cache, pool, epoch, relation.clone(), version)
@@ -265,7 +265,7 @@ impl<C: Clock + Clone> DecodeLoop<'_, C> {
                                             }
                                         }
                                     }
-                                    // The reload echo (PR 6.3): the sink's own signal INSERT returning
+                                    // The reload echo: the sink's own signal INSERT returning
                                     // through the stream. Buffered here; the waiter resolves at the
                                     // transaction's Commit with its commit LSN (= the chunk watermark
                                     // L_i). NEVER batched, never a Parquet file or manifest row.
@@ -308,8 +308,8 @@ impl<C: Clock + Clone> DecodeLoop<'_, C> {
                                             txn_has_heartbeat = true;
                                         }
                                     }
-                                    // Non-insert ops on internal tables — e.g. the future reload_signal
-                                    // pruning DELETEs (PR 6.11's runbook) — are consumed-and-ignored:
+                                    // Non-insert ops on internal tables — e.g. operator-run
+                                    // reload_signal pruning DELETEs — are consumed-and-ignored:
                                     // acked like any record, never routed toward a batcher.
                                     Message::Delete { relation_oid, .. }
                                         if internal.is_internal(*relation_oid) => {}
@@ -325,7 +325,7 @@ impl<C: Clock + Clone> DecodeLoop<'_, C> {
                                         )
                                         .await?;
                                         // Resolve any signal echoes this transaction carried: its commit
-                                        // LSN IS the chunk watermark L_i (PR 6.3). The signal txn needs no
+                                        // LSN IS the chunk watermark L_i. The signal txn needs no
                                         // special ack — confirmed_flush passes it like any consumed record.
                                         pending_signals.on_commit(*commit_lsn, waiters);
                                         // Then, for an idle heartbeat-only txn, advance to its commit LSN —
@@ -353,7 +353,7 @@ impl<C: Clock + Clone> DecodeLoop<'_, C> {
                                             );
                                         }
                                     }
-                                    // --- Large-transaction streaming (§1.6, PR 2.30). A txn over
+                                    // --- Large-transaction streaming (§1.6). A txn over
                                     // logical_decoding_work_mem arrives BEFORE its commit as interleaved
                                     // Stream blocks; the demux stages speculatively and commit-gates.
                                     Message::StreamStart { xid, first_segment } => {
@@ -415,7 +415,7 @@ impl<C: Clock + Clone> DecodeLoop<'_, C> {
                                             .send(stream, false)
                                             .await
                                             .context("send streamed-commit standby status")?;
-                                        // Can't-happen defense (PR 6.3): a single-row signal txn never
+                                        // Can't-happen defense: a single-row signal txn never
                                         // streams, but if one somehow did, its surviving echo resolves here.
                                         pending_signals.on_stream_commit(*commit_lsn, waiters);
                                         tracing::info!(
@@ -432,7 +432,7 @@ impl<C: Clock + Clone> DecodeLoop<'_, C> {
                                         demux.on_stream_abort(*top_xid, *sub_xid, sink).await;
                                         checkpoint.set_open_txn_floor(demux.open_floor());
                                         // An aborted (sub)transaction's signal echo must never resolve a
-                                        // waiter — the commit never carried it (PR 6.3).
+                                        // waiter — the commit never carried it.
                                         pending_signals.on_stream_abort(*top_xid, *sub_xid);
                                     }
                                     other => {
@@ -660,7 +660,8 @@ async fn flush_batch_keepalive(
 
 /// Flush a sealed batch durably: **(a)** PUT the Parquet object to S3, **then (b)** commit the
 /// `file_manifest` `ready` row — never the other way round (§1.5). Step (c) — advancing the slot to
-/// `obj.lsn_end` — is PR 2.26. A crash between (a) and (b) is safe: the batch re-streams (no `ready`
+/// `obj.lsn_end` — happens in the checkpoint caller. A crash between (a) and (b) is safe: the batch
+/// re-streams (no `ready`
 /// row was committed), at-least-once.
 ///
 /// ## Cancel safety
@@ -683,7 +684,7 @@ pub async fn flush_batch(
     flush_batch_kind(sink, ex, epoch, batch, crate::sink::FileKind::Stream).await
 }
 
-/// As [`flush_batch`], stamping the object + manifest `kind` — the backfill (PR 2.29) flushes with
+/// As [`flush_batch`], stamping the object + manifest `kind` — the backfill flushes with
 /// [`crate::sink::FileKind::Snapshot`].
 ///
 /// ## Cancel safety
@@ -719,7 +720,9 @@ pub async fn flush_batch_kind(
 /// per-table batchers + the sink context stamped into each row's `walrus_pg_sink_meta`.
 #[derive(Debug)]
 pub struct BatchRouter<C> {
-    // HASHER-CHOICE: std's default. This is the tree's densest map — one `entry` per decoded row — and a faster hasher was still declined: no profile implicates hashing and the keys are source-derived. See docs/implementation/notes/rust-skills/perf-ahash.md.
+    // HASHER-CHOICE: std's default. This is the tree's densest map — one `entry` per decoded row —
+    // but no profile implicates hashing, and the keys are source-derived, so collision resistance
+    // remains preferable to a speculative faster hasher.
     batchers: HashMap<u32, TableBatcher<C>>,
     triggers: BatchTriggers,
     clock: C,
@@ -764,8 +767,9 @@ impl<C: Clock + Clone> BatchRouter<C> {
     }
 
     /// Route one decoded message. `Begin` sets the txn context; `I/U/D` buffer against the open txn;
-    /// `Commit` promotes them and returns any batches that a trigger sealed. Streamed large txns
-    /// (`Stream*`) and `Truncate`/`Message` are deferred (PR 2.30 / 2.27 / 2.33).
+    /// `Commit` promotes them and returns any batches that a trigger sealed. The outer decode loop
+    /// sends streamed transactions through `StreamDemux`; `Truncate` and logical `Message` frames do
+    /// not create row batches here.
     ///
     /// # Errors
     ///
@@ -872,7 +876,7 @@ impl<C: Clock + Clone> BatchRouter<C> {
             op: row.op,
             lsn: row.frame_lsn,
             commit_lsn: Lsn::ZERO, // patched at the batcher's on_commit
-            commit_ts: UtcTimestamp::now(), // placeholder — patched at on_commit from Commit's ts (PR 5.9)
+            commit_ts: UtcTimestamp::now(), // placeholder — patched at on_commit from Commit's ts
             xid: row.xid,
             epoch: self.epoch,
             batch_id: String::new(), // assigned by the batcher when the batch opens
@@ -888,7 +892,7 @@ impl<C: Clock + Clone> BatchRouter<C> {
         Ok(())
     }
 
-    /// Cut the current file for `schema.table` (PR 2.33): force-seal its batcher so the pre-DDL rows
+    /// Cut the current file for `schema.table`: force-seal its batcher so the pre-DDL rows
     /// flush at the old `schema_version`, and drop the batcher so the next change rebuilds it from the
     /// new-version shape. Returns the sealed old-version batch, if any.
     ///
@@ -932,7 +936,7 @@ impl<C: Clock + Clone> BatchRouter<C> {
     }
 
     /// The earliest commit LSN of any committed-but-unsealed row across all tables, or `None` if
-    /// nothing is buffered. An idle heartbeat must not advance `confirmed_flush` past this (PR 2.27).
+    /// nothing is buffered. An idle heartbeat must not advance `confirmed_flush` past this.
     pub fn undurable_floor(&self) -> Option<Lsn> {
         self.batchers
             .values()
@@ -940,7 +944,7 @@ impl<C: Clock + Clone> BatchRouter<C> {
             .min()
     }
 
-    /// Graceful-drain seal (PR 2.28): seal every table's in-flight **committed** batch, dropping any
+    /// Graceful-drain seal: seal every table's in-flight **committed** batch, dropping any
     /// open speculative buffers. The returned batches are flushed with the usual PUT → manifest → slot
     /// ordering before the final standby update.
     ///

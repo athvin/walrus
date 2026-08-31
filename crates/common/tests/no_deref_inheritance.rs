@@ -12,15 +12,13 @@
 //! `DuckTable::as_str`), never `Deref`. `Deref` is for smart pointers and owned→borrowed containers
 //! (API guideline C-DEREF); using it on a domain newtype re-exposes every inner method through
 //! method resolution and quietly undoes the type distinction the newtype was created to enforce.
-//!
-//! See `docs/implementation/notes/rust-skills/type-deref-coercion.md`.
 
 use std::{
     fs,
     path::{Path, PathBuf},
 };
 
-const DECISION_NOTE: &str = "docs/implementation/notes/rust-skills/type-deref-coercion.md";
+const DECISION_CONTEXT: &str = "domain newtypes expose explicit accessors, never Deref";
 
 /// Types that legitimately implement `Deref`/`DerefMut`, with the reason.
 ///
@@ -64,7 +62,7 @@ fn no_walrus_type_implements_deref() {
     );
     assert!(
         offences.is_empty(),
-        "walrus newtypes must expose explicit accessors, not Deref (see {DECISION_NOTE}):\n{}",
+        "{DECISION_CONTEXT}:\n{}",
         offences.join("\n")
     );
 }
@@ -82,7 +80,7 @@ impl std::ops::Deref for ManifestId {
     let offences = deref_offences("crates/common/src/fabricated.rs", source);
     let rejection = rejection_message(&offences).expect("the fabricated Deref must be rejected");
 
-    assert!(rejection.contains(DECISION_NOTE));
+    assert!(rejection.contains(DECISION_CONTEXT));
     assert!(rejection.contains("crates/common/src/fabricated.rs:4"));
     assert!(!rejection.contains(":2"));
     assert!(!rejection.contains(":3"));
@@ -202,8 +200,5 @@ fn rejection_message(offences: &[String]) -> Option<String> {
         return None;
     }
 
-    Some(format!(
-        "walrus newtypes must expose explicit accessors, not Deref (see {DECISION_NOTE}):\n{}",
-        offences.join("\n")
-    ))
+    Some(format!("{DECISION_CONTEXT}:\n{}", offences.join("\n")))
 }

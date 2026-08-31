@@ -3,7 +3,7 @@
 //! - `/startup` — 200 once bootstrap completes (gates the slow lease+DuckDB open).
 //! - `/ready`   — 200 iff bootstrap done (leases held + files open) **and not quarantined**. Never
 //!   gated on "backlog drained": a legitimately-behind loader is still *ready*; gating on lag flaps a
-//!   busy pod out. A **quarantined** table (a failed lossy DDL cast, PR 3.9) degrades `/ready` — a loud,
+//!   busy pod out. A **quarantined** table (a failed lossy DDL cast) degrades `/ready` — a loud,
 //!   terminal signal, not a silent continue.
 //! - `/healthz` — liveness = *progress*, read from an in-memory `last_poll_completed_at` stamped every
 //!   cycle (even a no-op). It reflects **no** lag metric — an idle-but-healthy loader must stay live.
@@ -121,7 +121,7 @@ impl AtomicPhase {
 pub struct LoaderState {
     phase: AtomicPhase,
     /// The end of the last poll cycle — liveness proof, NOT a lag metric. `None` until bootstrap ends.
-    // LOCK-CHOICE: parking_lot::Mutex — poll-cycle writes dominate the one-expression kubelet read; see docs/implementation/notes/rust-skills/own-rwlock-readers.md.
+    // LOCK-CHOICE: parking_lot::Mutex — poll-cycle writes dominate the one-expression kubelet read.
     last_poll_completed_at: Mutex<Option<Instant>>,
 }
 
@@ -162,15 +162,15 @@ impl LoaderState {
         matches!(self.phase.load(), LoaderPhase::Ready)
     }
 
-    /// Latch the quarantine flag — a failed lossy DDL cast (PR 3.9). `/ready` degrades and stays
-    /// degraded; the caller also logs an error-level alert and exits. Since PR 6.7 the latch has
-    /// exactly one exit: a single-table-reload rebuild, which REPLACES the data instead of
+    /// Latch the quarantine flag — a failed lossy DDL cast. `/ready` degrades and stays
+    /// degraded; the caller also logs an error-level alert and exits. The latch has exactly one
+    /// exit: a single-table-reload rebuild, which REPLACES the data instead of
     /// retrying the cast on it ([`LoaderState::clear_quarantine`]).
     pub fn quarantine(&self) {
         self.phase.store(LoaderPhase::Quarantined);
     }
 
-    /// The one legitimate quarantine exit (PR 6.7): a reload rebuild just recreated the table at
+    /// The one legitimate quarantine exit: a reload rebuild just recreated the table at
     /// the attempt's schema_version, so the lossy cast the latch recorded no longer applies to
     /// anything — `/ready` recovers.
     pub fn clear_quarantine(&self) {
@@ -217,7 +217,7 @@ const fn ok_or_unavailable(ok: bool) -> StatusCode {
     }
 }
 
-/// The Prometheus text exposition (PR 4.10) — stateless; reads the process-wide recorder.
+/// The Prometheus text exposition — stateless; reads the process-wide recorder.
 async fn metrics() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],

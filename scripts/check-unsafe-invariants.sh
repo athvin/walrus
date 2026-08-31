@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# check-unsafe-invariants.sh — PR 12.6 repo-invariant guard. walrus never constructs a value from
+# check-unsafe-invariants.sh — repository guard. walrus never constructs a value from
 # uninitialized memory: its replication buffer gets spare capacity safely through BytesMut +
 # AsyncReadExt::read_buf. This script fails the build if a fake-initialization form comes back.
-# Rationale: docs/implementation/notes/rust-skills/unsafe-maybeuninit.md
 #
 #   bash scripts/check-unsafe-invariants.sh
 #   bash scripts/check-unsafe-invariants.sh --self-test
@@ -17,7 +16,7 @@ UNINIT_PATTERN='MaybeUninit|mem::uninitialized|mem::zeroed|assume_init|\.set_len
 # are scanned alongside library sources. Dependency and generated-code unsafe internals are outside
 # this policy; legitimate reserve-only calls such as `with_capacity` are not in the pattern.
 SCOPE_PATTERNS=('crates/*/src' 'crates/*/tests' 'crates/*/benches' 'tests/*/src' 'tests/*/tests')
-ADR="docs/implementation/notes/rust-skills/unsafe-miri-ci.md"
+POLICY_HINT="workspace unsafe policy requires unsafe_code = forbid and per-member lint inheritance"
 WALRUS_SELF_TEST_DIR=""
 
 cleanup_self_test() {
@@ -36,7 +35,7 @@ scan_uninit() {
     printf '%s\n' "$hits" >&2
     echo "FAIL: uninitialized-memory construction found in first-party sources." >&2
     echo "      walrus gets uninitialized spare capacity safely via BytesMut + read_buf." >&2
-    echo "      See docs/implementation/notes/rust-skills/unsafe-maybeuninit.md" >&2
+    echo "      Use safe spare-capacity APIs such as BytesMut + AsyncReadExt::read_buf." >&2
     return 1
   fi
   echo "   0 sites"
@@ -62,7 +61,7 @@ resolve_scope() {
     done
   done
   if [[ ${#roots[@]} -eq 0 ]]; then
-    fail "no first-party Rust root under $root matched ${SCOPE_PATTERNS[*]}; the scan would pass on an empty file set. See $ADR."
+    fail "no first-party Rust root under $root matched ${SCOPE_PATTERNS[*]}; the scan would pass on an empty file set. $POLICY_HINT."
     return 1
   fi
   printf '%s\n' "${roots[@]}"
@@ -99,17 +98,17 @@ workspace_members() {
 check_unsafe_policy() {
   local root="${1%/}"
   local workspace_manifest="$root/Cargo.toml"
-  echo "== unsafe policy still in force (PR 12.1 forbid + per-member inheritance) =="
+  echo "== unsafe policy still in force (workspace forbid + per-member inheritance) =="
 
   if ! has_workspace_unsafe_forbid "$workspace_manifest"; then
-    fail "$workspace_manifest lost \`unsafe_code = \"forbid\"\` (PR 12.1). Read $ADR before removing it."
+    fail "$workspace_manifest lost \`unsafe_code = \"forbid\"\`. $POLICY_HINT."
     return 1
   fi
 
   local members
   members="$(workspace_members "$workspace_manifest")"
   if [[ -z "$members" ]]; then
-    fail "$workspace_manifest has no parseable one-line workspace members list. See $ADR."
+    fail "$workspace_manifest has no parseable one-line workspace members list. $POLICY_HINT."
     return 1
   fi
 
@@ -118,7 +117,7 @@ check_unsafe_policy() {
     [[ -n "$member" ]] || continue
     local member_manifest="$root/$member/Cargo.toml"
     if ! member_inherits_workspace_lints "$member_manifest"; then
-      fail "$member_manifest no longer inherits \`[lints] workspace = true\`; the workspace forbid does not reach it. See $ADR."
+      fail "$member_manifest no longer inherits \`[lints] workspace = true\`; the workspace forbid does not reach it. $POLICY_HINT."
       return 1
     fi
     echo "   ok: $member inherits [lints] workspace = true"
@@ -229,8 +228,8 @@ self_test() {
     echo "not ok: a tree with no first-party Rust root unexpectedly resolved" >&2
     return 1
   fi
-  if ! grep -F "$ADR" "$empty_log" >/dev/null; then
-    echo "not ok: empty-scope diagnostic did not point to $ADR" >&2
+  if ! grep -F "$POLICY_HINT" "$empty_log" >/dev/null; then
+    echo "not ok: empty-scope diagnostic omitted the unsafe-policy context" >&2
     return 1
   fi
   grep -F 'FAIL:' "$empty_log"
@@ -255,8 +254,8 @@ self_test() {
     echo "not ok: temporary root without unsafe_code = \"forbid\" unexpectedly passed" >&2
     return 1
   fi
-  if ! grep -F "$ADR" "$missing_root_log" >/dev/null; then
-    echo "not ok: missing-root diagnostic did not point to $ADR" >&2
+  if ! grep -F "$POLICY_HINT" "$missing_root_log" >/dev/null; then
+    echo "not ok: missing-root diagnostic omitted the unsafe-policy context" >&2
     return 1
   fi
   grep -F 'FAIL:' "$missing_root_log"
@@ -266,8 +265,8 @@ self_test() {
     echo "not ok: temporary member without workspace = true unexpectedly passed" >&2
     return 1
   fi
-  if ! grep -F "$ADR" "$missing_member_log" >/dev/null; then
-    echo "not ok: missing-member diagnostic did not point to $ADR" >&2
+  if ! grep -F "$POLICY_HINT" "$missing_member_log" >/dev/null; then
+    echo "not ok: missing-member diagnostic omitted the unsafe-policy context" >&2
     return 1
   fi
   grep -F 'FAIL:' "$missing_member_log"

@@ -3,14 +3,14 @@
     clippy::expect_used,
     reason = "integration test — unwrap/expect fine in setup + helpers"
 )]
-//! DuckDB read-back conformance harness (Tier-1).
+//! DuckDB read-back conformance harness.
 //!
-//! The keystone of Phase 2b: write a `RecordBatch` to Parquet, then read it back through in-process
+//! The harness writes a `RecordBatch` to Parquet, then reads it back through in-process
 //! DuckDB and assert **both** the inferred DuckDB `typeof(col)` *and* the value — the only proof
 //! that the byte we wrote is the DuckDB type we intended (DuckDB ignores arrow-rs's `ARROW:schema`
 //! metadata and reads native Parquet logical types; §2.1). Gated behind `--features conformance`
-//! so the bundled DuckDB compile stays out of the default build. Every Tier-2/3 PR (2.12–2.16)
-//! appends one `#[test]` here.
+//! so the bundled DuckDB compile stays out of the default build. Each supported Tier-2/3 mapping
+//! has a focused test here.
 #![cfg(feature = "conformance")]
 
 use common::{Kind, Op, PgColumn, PgRelation, ReplicaIdentity, SinkMeta, TupleValue, UtcTimestamp};
@@ -165,7 +165,7 @@ fn json_is_verbatim() {
     assert_eq!(v, "{\"a\": 1}");
 }
 
-// ---- Tier-2 fan-out (PR 2.12) -------------------------------------------------------------------
+// ---- Tier-2 fan-out -----------------------------------------------------------------------------
 // One source column becomes several: interval → c_months/c_days/c_micros, timetz → c_micros/
 // c_offset_seconds. We assert the sibling column *types* and that DuckDB rebuilds them back into the
 // intended `INTERVAL` (via `to_months + to_days + to_microseconds`, §2.4) / pinned timetz offset.
@@ -260,7 +260,7 @@ fn timetz_offset_sign_roundtrips() {
     assert_eq!(w[0].1, "-28800");
 }
 
-// ---- Tier-2 range / multirange (PR 2.13) --------------------------------------------------------
+// ---- Tier-2 range / multirange ------------------------------------------------------------------
 // range → 5 flat columns (c_lower/c_upper/c_lower_inc/c_upper_inc/c_empty); multirange → LIST<STRUCT>.
 // NULL, `empty`, and `unbounded` must read back as three distinct states.
 
@@ -364,7 +364,7 @@ fn multirange_empty_list_is_distinct_from_null() {
     assert_eq!(n[0].0, "true", "NULL column = NULL list");
 }
 
-// ---- Tier-2 geometric (PR 2.14) -----------------------------------------------------------------
+// ---- Tier-2 geometric ---------------------------------------------------------------------------
 // Every native geometric type → a nested STRUCT / LIST<STRUCT> of doubles. We read the nested fields
 // back through DuckDB (`c.x`, `c.p1.x`, `c.points`, `unnest(c)`) and compare numerically (avoiding
 // DOUBLE text formatting). `path.is_closed` is proven to distinguish an open from a closed path.
@@ -444,7 +444,7 @@ fn geometric_path_open_vs_closed_reads_back_is_closed() {
     assert_eq!(c[0], ("true".to_string(), "true".to_string()));
 }
 
-// ---- Tier-3 canonical-text carriers (PR 2.15) ---------------------------------------------------
+// ---- Tier-3 canonical-text carriers -------------------------------------------------------------
 // No lossless structural target → one VARCHAR column carrying the canonical text verbatim.
 
 #[test]
@@ -487,7 +487,7 @@ fn system_types_carry_canonical_varchar() {
     }
 }
 
-// ---- uuid (native) + enum (PR 2.16) -------------------------------------------------------------
+// ---- uuid (native) + enum -----------------------------------------------------------------------
 
 #[test]
 fn uuid_reads_back_as_native_uuid() {
@@ -526,7 +526,7 @@ fn uuid_varchar_fallback_casts_to_uuid() {
 
 #[test]
 fn enum_reads_back_as_varchar_verbatim() {
-    // Enum OID is dynamic (≥16384); the interim rule maps non-builtin OIDs to enum→VARCHAR (PR 2.22).
+    // Enum OIDs are dynamic (≥16384); the conservative rule maps non-builtin OIDs to enum→VARCHAR.
     let (t, v) = typeof_and_value(16400, -1, "shipped");
     assert_eq!(t, "VARCHAR");
     assert_eq!(v, "shipped");

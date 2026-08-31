@@ -18,9 +18,9 @@ string_enum! {
     /// The kind of a `file_manifest` row — the canonical enum for the `kind` text column, shared by the
     /// sink (which writes it; pg-sink re-exports this as `FileKind`) and the loader (which routes on it).
     ///
-    /// `Spill` is a *single* streamed transaction written before its commit LSN was known (PR 4.3); the
+    /// `Spill` is a *single* streamed transaction written before its commit LSN was known; the
     /// loader treats the file's `lsn_end` — not the per-row placeholder — as the authoritative
-    /// `commit_lsn` for its rows. `Reload` chunk files (PR 6.1+) enter the same `(lsn_end, id)` claim
+    /// `commit_lsn` for its rows. `Reload` chunk files enter the same `(lsn_end, id)` claim
     /// order carrying a `reload_id`; `Snapshot`/`Stream` rows never set it.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ManifestKind {
@@ -48,9 +48,9 @@ string_enum! {
 
 /// A `ready` file the loader can claim. The column set is exactly what the claim query reads.
 ///
-/// `kind` is `Snapshot | Stream | Spill | Reload` — reload chunk files (PR 6.1+) enter this same
+/// `kind` is `Snapshot | Stream | Spill | Reload` — reload chunk files enter this same
 /// queue and sort into the same `(lsn_end, id)` order, carrying the `reload_id` the loader's
-/// rebuild trigger routes on (PR 6.7). Stream/snapshot/spill rows never set `reload_id`.
+/// rebuild trigger routes on. Stream/snapshot/spill rows never set `reload_id`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestRow {
     /// The row's primary key, and the *tiebreaker* half of the `(lsn_end, id)` claim order — so it
@@ -82,7 +82,7 @@ pub struct ManifestRow {
     pub reload_id: Option<ReloadId>,
 }
 
-/// What the sink inserts after its Parquet is durable in S3 (PR 2.25).
+/// What the sink inserts after its Parquet is durable in S3.
 ///
 /// Comparable like the [`ManifestRow`] it becomes, so a mapper that builds one can be asserted as a
 /// whole record instead of field by field (which silently skips whatever the assertion forgot).
@@ -106,7 +106,7 @@ pub struct NewManifestFile {
     pub lsn_end: Lsn,
     /// The relation shape these rows were encoded at.
     pub schema_version: SchemaVersionNo,
-    /// Set (with `kind=Reload`) only by the chunk export engine (PR 6.5); `None` otherwise.
+    /// Set (with `kind=Reload`) only by the chunk export engine; `None` otherwise.
     pub reload_id: Option<ReloadId>,
 }
 
@@ -144,13 +144,13 @@ pub async fn insert_ready(
 /// `ORDER BY lsn_end, id` — `id` breaks equal-`lsn_end` ties. There is deliberately **no**
 /// `lsn_end > raw_appended_lsn` predicate: that would skip the equal-`lsn_end` snapshot files.
 ///
-/// **The pause predicate (PR 6.6, reload §2/H8):** while a `flavor='reload'` reload is
+/// **The pause predicate (reload §2/H8):** while a `flavor='reload'` reload is
 /// `requested|exporting`, claiming would apply-and-RETIRE post-`W` stream files into the old
 /// mirror — and the rebuild would then clear that mirror with those events gone from the queue
 /// forever. Not claiming is a complete pause: rows accumulate `ready`, the frontier freezes at
 /// `W`, and the rebuild later replays the world in `(lsn_end, id)` order. The pause lives in the
 /// QUERY (one statement, no check-then-claim TOCTOU) and lifts at `export_complete` — the loader
-/// must claim again to reach the chunk files and trigger the rebuild (PR 6.7); pausing through
+/// must claim again to reach the chunk files and trigger the rebuild; pausing through
 /// `export_complete` would deadlock the reload. `resync` never pauses (H3). The `NOT EXISTS`
 /// probe is served by the `table_reload_one_live` partial index (its predicate
 /// `status NOT IN ('complete','failed')` covers `requested|exporting`).
@@ -200,7 +200,7 @@ pub async fn claim_ready(
 }
 
 /// The newest `ready` file's commit LSN for a table — the head of the Phase-A backlog — or `None`
-/// when the queue is empty. Powers the `walrus_loader_raw_append_lag_bytes` gauge (PR 5.6): the lag
+/// when the queue is empty. Powers the `walrus_loader_raw_append_lag_bytes` gauge: the lag
 /// is this minus `raw_appended_lsn`. `MAX` over an empty set is SQL `NULL` → `None`.
 ///
 /// # Errors
@@ -240,7 +240,7 @@ pub async fn delete_claimed(
     Ok(result.rows_affected())
 }
 
-/// Purge a rebuilding table's SUPERSEDED pending rows at trigger time (PR 6.7 / reload H8): every
+/// Purge a rebuilding table's SUPERSEDED pending rows at trigger time (reload H8): every
 /// non-reload row with `lsn_end <= first_lsn` describes a commit the chunks re-cover (`C <= L_1`
 /// ⇒ visible to chunk 1's SELECT), so applying it after the rebuild would only re-apply history
 /// the clear just replaced. Chunk 1 itself has `lsn_end = first_lsn` — the `kind` filter is what

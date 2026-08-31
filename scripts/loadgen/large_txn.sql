@@ -1,4 +1,4 @@
--- PR 5.6 loadgen — one large transaction: a single 200k-row upsert into `items`. With the compose
+-- Load generator — one large transaction: a single 200k-row upsert into `items`. With the compose
 -- `logical_decoding_work_mem=64kB`, the reorder buffer spills early, so the sink decodes this as a
 -- **streamed** transaction (Stream Start/Stop frames; `walrus_sink_spill_total` moves under a low
 -- inflight ceiling). Run once (`pgbench -t 1 -c 1`).

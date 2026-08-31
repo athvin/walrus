@@ -25,12 +25,12 @@ clippy:
 test:
     cargo test --workspace
 
-# Feature-gated integration tests (the `it` feature lands in later PRs).
+# Feature-gated integration tests.
 it:
     cargo test --workspace --features it
 
-# Criterion micro-benches: sink decode + Arrow batch building (PR 5.4) and the loader's transform +
-# Phase-A append (PR 5.5). Run on a quiet machine; results print to stdout. Never a CI gate (shared
+# Criterion micro-benches: sink decode, Arrow batch building, loader transform, and Phase-A append.
+# Run on a quiet machine; results print to stdout. Never a CI gate (shared
 # runners are too noisy) — CI only compile-checks the bench targets via `clippy --all-targets`.
 # Baselines *and* the profiling workflow — how to get from "this bench is slow" to a flamegraph —
 # live in docs/benchmarks.md. The loader targets build DuckDB (`bundled`), so a cold first run
@@ -54,7 +54,7 @@ bench-compare name="main":
 perf-e2e scenario="mixed":
     PERF_MODE=measure bash scripts/bench-e2e.sh {{scenario}}
 
-# Compatibility name for the original PR 5.6 entry point; it now delegates to the structured run.
+# Compatibility name for the original benchmark entry point; it delegates to the structured run.
 bench-e2e scenario="mixed":
     @just perf-e2e {{scenario}}
 
@@ -81,7 +81,7 @@ profile-async target="loader" scenario="mixed":
 
 # Request a single-table reload (flavor: reload | resync) — the operator entry point (reload §5.1).
 # INSERTs the request into control-pg's walrus.table_reload at the current epoch; the sink's reload
-# controller (PR 6.4) picks it up within one heartbeat cadence. Runs psql inside the compose
+# controller picks it up within one heartbeat cadence. Runs psql inside the compose
 # control-pg (the host needs no postgres-client), like `smoke`. Just args are positional, so both
 # `just reload public.orders` and the self-documenting `just reload table='public.orders'` work —
 # the optional key= prefixes are stripped.

@@ -44,7 +44,7 @@ pub enum Op {
 }
 
 /// Where the row originated: an exported-snapshot backfill row, a live WAL-stream row, or a
-/// single-table-reload chunk row (PR 6.5 — stamped `commit_lsn = lsn = L_i`, snapshot-op
+/// single-table-reload chunk row (stamped `commit_lsn = lsn = L_i`, with snapshot-op
 /// semantics so any overlapping stream event wins the loader's dedup).
 /// Wire form locked by `crates/common/tests/enum_wire_form.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,8 +118,7 @@ impl UtcTimestamp {
 
     /// Build from a pgoutput wire timestamp: **microseconds since 2000-01-01T00:00:00Z** (proto §4) —
     /// the Postgres epoch, not the Unix epoch. Offsets by [`PG_EPOCH_UNIX_SECS`] and defers to
-    /// jiff's range check, so a corrupt or overflowing frame is a decode error — **never a panic**
-    /// (PR 5.9; retires the `commit_ts` TODO).
+    /// jiff's range check, so a corrupt or overflowing frame is a decode error — **never a panic**.
     ///
     /// This deliberately remains a named constructor rather than `TryFrom<i64>`: a bare `i64` is
     /// ambiguous between microseconds from the Postgres epoch and microseconds from the Unix epoch.
@@ -268,14 +267,14 @@ pub struct SinkMeta {
 
 /// Move-cost budget for the per-row provenance hot path (`own-move-large`).
 ///
-/// Measured with `size_of::<SinkMeta>()` on PR 9.7. If this trips, shrink the type, box the
-/// offending field in the Phase 11 layout work, or raise the measured budget deliberately.
+/// The compile-time budget reflects a measured 192-byte value. If it trips, shrink or box the
+/// offending field, or raise the budget deliberately with a new measurement.
 const SINK_META_MAX_BYTES: usize = 192;
 const _: () = assert!(size_of::<SinkMeta>() <= SINK_META_MAX_BYTES);
 
-// --- amortized serialization (PR 5.7) -------------------------------------------------------------
+// --- amortized serialization -------------------------------------------------------------
 //
-// The meta column dominates `append_row` (PR 5.4: `serde_json::to_string(SinkMeta)` ≈ 576 ns/row,
+// The meta column dominates `append_row` (`serde_json::to_string(SinkMeta)` ≈ 576 ns/row,
 // ~91 % of the narrow-row cost). Within one sealed Parquet file the *batch-constant* fields never
 // change, so the batcher serializes them ONCE and, per row, serializes only the varying fields —
 // splicing the two into `{const,row}`. Byte-equivalence with `to_string(SinkMeta)` is guaranteed by

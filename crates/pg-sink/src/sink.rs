@@ -3,8 +3,8 @@
 //! Encode a [`SealedBatch`] to Parquet with arrow-rs's [`AsyncArrowWriter`] and stream it straight
 //! into an S3 object via `object_store`'s multipart [`BufWriter`] — never materialising the file on
 //! local disk. `close()` (which completes the multipart) is the **durability point**: `put` returns a
-//! [`WrittenObject`] only after it, because the manifest INSERT (PR 2.25) and the slot advance
-//! (PR 2.26) must never get ahead of a batch that isn't durably in S3 (the WAL-bounding invariant).
+//! [`WrittenObject`] only after it, because the manifest INSERT and the slot advance
+//! must never get ahead of a batch that isn't durably in S3 (the WAL-bounding invariant).
 //!
 //! The object key is the epoch-namespaced layout `<epoch>/<schema>/<table>/<lsn_end>-<uuid>.parquet`,
 //! with `lsn_end` as zero-padded 16-hex ([`common::Lsn`]'s `Display`) so keys sort in commit order.
@@ -17,18 +17,18 @@ use object_store::path::Path;
 use parquet::arrow::AsyncArrowWriter;
 use std::sync::Arc;
 
-/// Whether the object holds streamed WAL rows, backfill snapshot rows (PR 2.29), or a **speculative
-/// open-txn spill** (PR 4.3 fix). A `Spill` file is a *single* streamed transaction's rows written
+/// Whether the object holds streamed WAL rows, backfill snapshot rows, or a **speculative
+/// open-txn spill**. A `Spill` file is a *single* streamed transaction's rows written
 /// before its commit LSN is known, so its rows carry a placeholder `commit_lsn`; the real commit LSN is
 /// the file's `lsn_end`, stamped onto the manifest at `Stream Commit`. The loader therefore treats
 /// `lsn_end` — not the per-row placeholder — as the authoritative `commit_lsn` for a `Spill` file, which
 /// keeps commit-order correct (architecture.md §1.6). A multi-txn `Stream` batch keeps its per-row LSNs.
 ///
 /// This is `control::ManifestKind`, the canonical enum for the `file_manifest.kind` column;
-/// re-exported here under the sink-local name the writer path already uses (PR 8.2).
+/// re-exported here under the sink-local name the writer path already uses.
 pub use control::ManifestKind as FileKind;
 
-/// The result of a durable S3 PUT — everything PR 2.25 needs for the manifest row.
+/// The result of a durable S3 PUT — everything the manifest writer needs for its row.
 #[derive(Debug, Clone)]
 pub struct WrittenObject {
     /// The full `s3://…` URI, as it will be written to the manifest row.
@@ -53,7 +53,7 @@ pub struct WrittenObject {
 }
 
 /// Encodes sealed batches to Parquet and PUTs them to S3, epoch-namespaced. Cheap to clone (the
-/// store is an `Arc`) — reload exporters (PR 6.5) each carry their own handle.
+/// store is an `Arc`) — reload exporters each carry their own handle.
 #[derive(Clone, Debug)]
 pub struct ParquetSink {
     store: Arc<dyn ObjectStore>,
@@ -80,7 +80,7 @@ impl ParquetSink {
     }
 
     /// Best-effort delete of a staged object — used to clean up an aborted streamed txn's speculative
-    /// files (PR 2.30), which have no manifest row pointing at them.
+    /// files, which have no manifest row pointing at them.
     ///
     /// # Errors
     ///
@@ -102,7 +102,7 @@ impl ParquetSink {
 
     /// Encode `batch` to Parquet (MICROS temporals + Snappy, inherited from the Arrow schema and the
     /// walrus writer properties) and stream it to S3 via multipart. Returns **only once durable**.
-    /// Streamed WAL rows; the backfill (PR 2.29) uses [`Self::put_with_kind`].
+    /// Streamed WAL rows; the backfill uses [`Self::put_with_kind`].
     ///
     /// # Errors
     ///
@@ -113,7 +113,7 @@ impl ParquetSink {
     }
 
     /// As [`Self::put`], stamping the object's provenance (`stream` vs `snapshot`) — the manifest row's
-    /// `kind` (PR 2.25). Snapshot files all share `lsn_end = consistent_point`, `id`-disambiguated.
+    /// `kind`. Snapshot files all share `lsn_end = consistent_point`, `id`-disambiguated.
     ///
     /// # Errors
     ///
@@ -126,7 +126,7 @@ impl ParquetSink {
     ) -> Result<WrittenObject, SinkError> {
         let uuid = uuid::Uuid::new_v4().to_string();
         let key = self.object_key(&batch.schema, &batch.table, batch.lsn_end, &uuid);
-        // Flush-latency + throughput instrumentation (PR 4.10); no-op until a recorder is installed.
+        // Flush-latency + throughput instrumentation; no-op until a recorder is installed.
         let flush_start = std::time::Instant::now();
         let rows = u64::try_from(batch.record_batch.num_rows()).unwrap_or(u64::MAX);
 
@@ -135,9 +135,8 @@ impl ParquetSink {
         let props = pg_to_arrow::default_writer_properties();
         // The ENCODE stays on this task: `AsyncArrowWriter` wraps a synchronous `ArrowWriter`, so
         // `write` and `close` compress the whole batch before they await — the `async` in that name is
-        // the upload, not the compression. Why the blocking pool is declined here, and the shape the
-        // conversion would take if a profile ever demands it, is §5 of
-        // docs/implementation/notes/rust-skills/async-spawn-blocking.md.
+        // the upload, not the compression. This remains on the task because no profile identifies
+        // compression as a scheduler bottleneck; move it to the blocking pool if measurements do.
         let mut writer =
             AsyncArrowWriter::try_new(buf_writer, batch.record_batch.schema(), Some(props))?;
         writer.write(&batch.record_batch).await?;

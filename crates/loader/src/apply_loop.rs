@@ -2,7 +2,7 @@
 //! connection across tables). Each poll interval: Phase A (append) then Phase B (transform), then stamp
 //! `last_poll_completed_at` — **every** cycle, even a no-op poll, so an idle-but-healthy loader stays
 //! `/healthz` green. On a **slower, distinct** cadence, and on THIS same worker thread (serialized right
-//! after an apply cycle — no quiescing dance), it runs the full-rebuild + retention prune (PR 3.11).
+//! after an apply cycle — no quiescing dance), it runs the full-rebuild + retention prune.
 //! Exits cleanly on the shutdown token.
 
 use crate::error::LoaderError;
@@ -81,7 +81,7 @@ pub async fn apply_loop(ctx: TableCtx, shutdown: CancellationToken) -> Result<()
         // BETWEEN the two phases is absorbed by the next cycle's plain re-run (both idempotent).
         run_phase_a(&ctx).await?;
         run_phase_b(&ctx).await?;
-        // Reload completion (PR 6.9 / H10): AFTER Phase B advanced `transformed_lsn`, flip any
+        // Reload completion (H10): AFTER Phase B advanced `transformed_lsn`, flip any
         // `export_complete` reload for this table to `complete` once the mirror has reached its `H`
         // (`transformed_lsn >= final_lsn`). One guarded UPDATE joining the checkpoint we just wrote;
         // a no-op on cycles with no such reload. The loader owns this flip, never the sink (H10).
@@ -110,7 +110,7 @@ pub async fn apply_loop(ctx: TableCtx, shutdown: CancellationToken) -> Result<()
 /// Drain one worker on SIGTERM: the in-flight cycle already finished (both watermarks committed), so just
 /// `CHECKPOINT` the WAL into the main file and return — dropping `ctx` closes the file, releasing the
 /// lock cleanly (no stale lock for the next bootstrap). The lease is released by `app::pipeline` after
-/// all workers drain (after their watermarks commit). PR 3.12.
+/// all workers drain (after their watermarks commit).
 fn drain(ctx: &TableCtx) -> Result<(), LoaderError> {
     if let Err(e) = ctx.db.conn().execute_batch("CHECKPOINT;") {
         tracing::warn!(table = %format_args!("{}.{}", ctx.schema, ctx.table), error = %e, "drain CHECKPOINT failed");
@@ -125,7 +125,7 @@ async fn compact(ctx: &TableCtx, shutdown: &CancellationToken) -> Result<(), Loa
     let transformed = cp.map(|c| c.transformed_lsn).unwrap_or(Lsn::ZERO);
     let t = crate::phase_b::current_transform(ctx).await?;
 
-    // The rebuild is abortable: a SIGTERM mid-rewrite interrupts it, rolls back, and returns Ok (PR 3.12).
+    // The rebuild is abortable: a SIGTERM mid-rewrite interrupts it, rolls back, and returns Ok.
     crate::compaction::full_rebuild_abortable(&ctx.db, &t, shutdown).await?;
     if shutdown.is_cancelled() {
         return Ok(()); // draining — skip the prune, the rebuild was aborted; both re-run next start

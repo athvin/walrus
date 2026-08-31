@@ -6,10 +6,10 @@
 //! Arrow/Parquet/DuckDB scalar can hold, so the sink emits *several* sibling columns the loader
 //! recombines (walrus-pg-sink.md §2.4).
 //!
-//! This PR (2.12) lands the first two: `interval` → 3 signed ints, `timetz` → micros + offset.
-//! The canonical-text parsers here turn Postgres' output form (IntervalStyle `postgres`) into those
+//! `interval` expands to three signed integers; `timetz` expands to micros plus an offset. The
+//! canonical-text parsers turn Postgres' output form (`IntervalStyle postgres`) into those
 //! integer fields; the *reverse* (loader-side `to_months + to_days + …` / TIMETZ rebuild) is the
-//! loader's job (PR 3.x), not the sink's.
+//! loader's job, not the sink's.
 
 use crate::error::Error;
 use crate::range::RangeFamily;

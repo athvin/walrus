@@ -93,7 +93,7 @@ impl AtomicPhase {
     }
 }
 
-/// The snapshot every probe handler reads. All fields are atomics so the (future) replication loop
+/// The snapshot every probe handler reads. All fields are atomics so the replication loop
 /// can update them without locking the probe path.
 #[derive(Debug)]
 pub struct HealthState {
@@ -226,7 +226,7 @@ async fn healthz(State(state): State<Arc<HealthState>>) -> StatusCode {
     }
 }
 
-/// The Prometheus text exposition (PR 4.10). No state — it reads the process-wide recorder, so it
+/// The Prometheus text exposition. No state — it reads the process-wide recorder, so it
 /// lives happily on the same router as the state-backed probes.
 async fn metrics() -> impl IntoResponse {
     (

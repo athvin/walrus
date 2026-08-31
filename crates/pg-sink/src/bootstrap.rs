@@ -23,9 +23,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 
-/// What the shared bootstrap hands the (future) replication loop: the control-plane pool, a live
-/// canary-verified object store, and the preflighted source connection (PR 2.20 opens the actual
-/// streaming replication connection).
+/// What the shared bootstrap hands the replication loop: the control-plane pool, a live
+/// canary-verified object store, and the preflighted source connection. The application opens the
+/// actual streaming replication connection after classifying the slot.
 #[derive(Debug)]
 pub struct BootstrapCtx {
     /// Control-Postgres pool, already migrated to the current schema.
@@ -88,7 +88,7 @@ pub async fn run_shared(cfg: &SinkConfig, deadline: Instant) -> Result<Bootstrap
     let pf = SourcePreflight::new(&source_client, cfg);
     let server = pf.assert_server_prereqs().await?;
     // Signal-table existence BEFORE publication coverage: a missing table must yield the
-    // migration-naming error, not a failed ALTER PUBLICATION under manage_publication (PR 6.2).
+    // migration-naming error, not a failed ALTER PUBLICATION under manage_publication.
     pf.assert_reload_signal().await?;
     pf.assert_publication_covers().await?;
     pf.assert_ddl_capture().await?;

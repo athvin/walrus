@@ -39,13 +39,13 @@ pub const TIMESTAMP: u32 = 1114;
 /// `timestamp with time zone` — Tier 1, Arrow `Timestamp` in microseconds tagged `UTC`, which is
 /// the marker DuckDB reads as `isAdjustedToUTC=true`.
 pub const TIMESTAMPTZ: u32 = 1184;
-// Tier-2 decompositions (PR 2.12): each fans out to several sibling columns (§2.4).
+// Tier-2 decompositions: each fans out to several sibling columns (§2.4).
 /// `interval` — decomposed into the `months` / `days` / `micros` sibling columns Postgres itself
 /// stores, because no single Arrow type carries all three without loss.
 pub const INTERVAL: u32 = 1186;
 /// `time with time zone` — decomposed into a microsecond time-of-day plus its UTC offset.
 pub const TIMETZ: u32 = 1266;
-// Range families → 5 flat sibling columns (PR 2.13). OIDs are stable pg_catalog built-ins.
+// Range families → 5 flat sibling columns. OIDs are stable pg_catalog built-ins.
 /// `int4range` — Tier 2, over `integer`. `pg-to-arrow`'s `RangeFamily` groups the six families.
 pub const INT4RANGE: u32 = 3904;
 /// `numrange` — Tier 2; its element type is `numeric`, so it carries the same typmod.
@@ -58,7 +58,7 @@ pub const TSTZRANGE: u32 = 3910;
 pub const DATERANGE: u32 = 3912;
 /// `int8range` — Tier 2, over `bigint`.
 pub const INT8RANGE: u32 = 3926;
-// Multirange families (PG14+) → LIST<STRUCT> (PR 2.13).
+// Multirange families (PG14+) → LIST<STRUCT>.
 /// `int4multirange` (PG14+) — a list of `int4range` members.
 pub const INT4MULTIRANGE: u32 = 4451;
 /// `nummultirange` (PG14+) — a list of `numrange` members.
@@ -71,7 +71,7 @@ pub const TSTZMULTIRANGE: u32 = 4534;
 pub const DATEMULTIRANGE: u32 = 4535;
 /// `int8multirange` (PG14+) — a list of `int8range` members.
 pub const INT8MULTIRANGE: u32 = 4536;
-// Native geometric types → STRUCT/LIST of doubles (PR 2.14).
+// Native geometric types → STRUCT/LIST of doubles.
 /// `point` — one `(x, y)` pair.
 pub const POINT: u32 = 600;
 /// `lseg` — a line segment: its two endpoints.
@@ -86,7 +86,7 @@ pub const POLYGON: u32 = 604;
 pub const LINE: u32 = 628;
 /// `circle` — a center point plus a radius.
 pub const CIRCLE: u32 = 718;
-// Tier-3 canonical-text carriers → VARCHAR (PR 2.15): no lossless structural target.
+// Tier-3 canonical-text carriers → VARCHAR: no lossless structural target.
 /// `xml` — Tier 3; carried as its canonical text.
 pub const XML: u32 = 142;
 /// `xid` — a 32-bit transaction id. Tier 3: it is not an `integer`, and wraps around.
@@ -114,12 +114,12 @@ pub const TSVECTOR: u32 = 3614;
 pub const TSQUERY: u32 = 3615;
 /// `xid8` — a 64-bit, non-wrapping transaction id (PG13+). Tier 3.
 pub const XID8: u32 = 5069;
-// uuid → native DuckDB UUID via the arrow.uuid extension (PR 2.16).
+// uuid → native DuckDB UUID via the arrow.uuid extension.
 /// `uuid` — the one type that reaches DuckDB as a native `UUID`, via arrow-rs's `arrow.uuid`
 /// canonical extension on a `FixedSizeBinary(16)`.
 pub const UUID: u32 = 2950;
-/// Postgres `FirstNormalObjectId`: user-defined types (incl. enums) get OIDs at/above this. The sink
-/// treats a non-builtin OID as `enum → VARCHAR` for now; PR 2.22 resolves enum-ness from the catalog.
+/// Postgres `FirstNormalObjectId`: user-defined types (including enums) get OIDs at or above this.
+/// It is a conservative fallback boundary when catalog-derived type metadata is unavailable.
 ///
 /// This is a *boundary*, not a type OID — the only constant here that names no type.
 pub const FIRST_NORMAL_OID: u32 = 16384;

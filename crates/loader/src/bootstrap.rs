@@ -3,7 +3,7 @@
 //! and take its lock (the second fence) + ensure both `<table>` and `<table>_raw` → **(3)** load both
 //! checkpoints and assert `transformed_lsn <= raw_appended_lsn`. Then verify the S3 read path once. The
 //! **lease precedes the lock precedes any watermark read** — the fence is fully in place before the
-//! read-then-write cycle a later PR runs.
+//! read-then-write apply cycle starts.
 
 use crate::config::LoaderConfig;
 use crate::duck::TableDb;
@@ -104,7 +104,7 @@ pub async fn bootstrap(
 
         // (2) SECOND FENCE: open the .duckdb read-write (takes the file lock) + ensure both tables, then
         // (4) reconcile a RESUMED .duckdb (its persisted `_walrus_meta` version < the registered latest)
-        // UP TO that version — applying any additive DDL it missed before it processes more data (PR 3.8).
+        // UP TO that version — applying any additive DDL it missed before it processes more data.
         // For a FRESH file this is a no-op (created at the latest shape, watermark already there); the
         // steady-state per-file forward reconcile lives in Phase A.
         let path = Path::new(&cfg.duckdb_dir).join(format!("{}.duckdb", rel.name));
@@ -114,8 +114,8 @@ pub async fn bootstrap(
         // snapshot rebuilds it. A no-op for a fresh file or a same-epoch resume. Both watermarks reset for
         // free — the new epoch's `loader_checkpoint` (loaded below) is a fresh `0/0`.
         crate::epoch::rebuild_for_new_epoch(&db, &rel.name, epoch)?;
-        // Quarantine-recovery (PR 6.12): a pending **rebuild-flavor** reload will CREATE OR REPLACE
-        // this table's mirror at the reload's version (Phase A, PR 6.7). Reconciling the resumed
+        // Quarantine-recovery: a pending **rebuild-flavor** reload will CREATE OR REPLACE
+        // this table's mirror at the reload's version in Phase A. Reconciling the resumed
         // `.duckdb` to the registry's LATEST version here would re-run the very lossy cast that
         // quarantined it (the mirror still holds the un-castable data) and RE-QUARANTINE during
         // bootstrap — before Phase A can ever reach the reload chunk that recovers it. So when a
@@ -158,9 +158,9 @@ pub async fn bootstrap(
                 "bootstrap: a rebuild reload is pending — skipping the forward reconcile (Phase A rebuilds this table)"
             );
         } else {
-            // Build the DuckDB shape from the registry descriptors (Tier-2 emit/recombine, PR 4.2);
+            // Build the DuckDB shape from the registry descriptors (Tier-2 emit/recombine);
             // with no descriptors this is the plain scalar shape. Stamp the built generation, then
-            // reconcile a RESUMED file forward to the registered latest version (PR 3.8).
+            // reconcile a RESUMED file forward to the registered latest version.
             db.ensure_tables_planned(
                 &crate::plan::TablePlan::from_registry(&rel, &row.descriptors),
                 version,

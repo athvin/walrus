@@ -5,7 +5,7 @@
     reason = "integration test — unwrap/expect are setup assertions; synchronous source scans are \
               themselves repository-policy checks, not runtime I/O"
 )]
-//! Conformance gate for `err-lowercase-msg` (PR 10.7): every production `#[error("…")]` literal
+//! Conformance gate for `err-lowercase-msg`: every production `#[error("…")]` literal
 //! starts lowercase (or with an allow-listed acronym) and carries no trailing sentence punctuation,
 //! so `{:#}` chains read as one sentence. Pure source scanning — no Docker, no new dependency.
 

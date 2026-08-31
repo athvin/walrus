@@ -13,7 +13,7 @@
 -- each row; every mutating MERGE branch is gated on `(s.commit_lsn, s.lsn) > (t._applied_*)`, so a stale
 -- winner is a no-op regardless of watermark timing. The `>=` bound and the guard work TOGETHER: `>=`
 -- alone would re-apply already-applied rows every cycle; the guard makes those re-applications no-ops.
--- The periodic full-rebuild (PR 3.11) remains the safety net regardless — this only makes the
+-- The periodic full-rebuild remains the safety net regardless — this only makes the
 -- *incremental* path correct on its own.
 --
 -- Step 0 — TRUNCATE pre-step (§5.5). A `t` row carries no tuple/PK, so it can't be a MERGE branch:

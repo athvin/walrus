@@ -28,9 +28,9 @@ pub struct ValueParseDetail {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// The column's type is real but not handled at this tier yet — Tier-2 (interval/timetz/range/
-    /// geometric) and Tier-3 (VARCHAR carriers) land in later PRs. We fail loudly rather than emit a
-    /// wrong-but-compiling field, which is exactly the bug the PR 2.11 conformance tests exist to catch.
+    /// A caller requested the Tier-1 mapping for a type handled by another tier or not supported at
+    /// all. We fail loudly rather than emit a wrong-but-compiling field; the conformance tests guard
+    /// that boundary.
     #[error("type oid {oid} (typmod {typmod}) is not a Tier-1 type")]
     NotTier1 { oid: u32, typmod: i32 },
     /// A relation arrived with no columns at all. Arrow tolerates an empty schema; walrus does not,

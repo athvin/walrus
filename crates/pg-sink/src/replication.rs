@@ -1,18 +1,19 @@
 //! The hand-rolled logical-replication consumer (§1.2 — "we own the connection … don't adopt a
 //! framework") and its standby-status keepalive feedback (§1.9).
 //!
-//! **Spike outcome (the pivot point):** `tokio-postgres` 0.7 has **no** replication surface — no way
+//! **Implementation choice:** `tokio-postgres` 0.7 has **no** replication surface — no way
 //! to open a `replication=database` connection, no CopyBoth duplex. Rather than adopt
 //! `pgwire-replication`, we hand-roll the wire protocol over a raw `TcpStream`, exactly as §1.2
 //! prescribes: a Startup handshake, `START_REPLICATION`, then the CopyBoth byte stream (`'w'`
 //! XLogData / `'k'` primary keepalive), replying with `'r'` standby-status updates. The dev harness
 //! uses `trust` auth so the handshake carries no SCRAM (SCRAM would be added here if a
 //! password-authed source were required). The [`ReplicationStream`] / [`ReplicationMessage`] /
-//! [`StandbyStatus`] seam is unchanged for callers, so PR 2.21's decoder plugs in regardless.
+//! [`StandbyStatus`] seam is unchanged for callers, so the decoder plugs in regardless.
 //!
 //! **Two LSNs, kept apart (§1.9):** the *received* LSN (sent as `write` to stay connected) advances
 //! here on every frame; `flush`/`apply` (= `confirmed_flush_lsn`, which releases source WAL) only
-//! advance on durability — PR 2.26 — so we hold them at the durable baseline. Keepalive feedback is
+//! advance through [`crate::checkpoint`] after durability, so we hold them at the durable baseline.
+//! Keepalive feedback is
 //! **unconditional**: it goes out well under `wal_sender_timeout`, never gated on S3 durability, or
 //! the walsender severs us with a reconnect storm.
 //!
@@ -38,7 +39,7 @@ use tokio::time::Instant;
 /// Default feedback cadence: well under any sane `wal_sender_timeout` (the dev harness uses 5s).
 const DEFAULT_FEEDBACK_INTERVAL: Duration = Duration::from_secs(1);
 
-/// One CopyBoth frame off the wire. The XLogData payload stays opaque `Bytes` — PR 2.21's pgoutput
+/// One CopyBoth frame off the wire. The XLogData payload stays opaque `Bytes` — the pgoutput
 /// decoder consumes it directly (zero-copy).
 #[derive(Debug)]
 pub enum ReplicationMessage {
@@ -58,7 +59,7 @@ pub enum ReplicationMessage {
 }
 
 /// A `'r'` standby status update. **`write ≥ flush ≥ apply`.** The keepalive path moves only `write`
-/// (the received LSN); durability (PR 2.26) is the only thing that advances `flush`/`apply`.
+/// (the received LSN); durability is the only thing that advances `flush`/`apply`.
 #[derive(Clone, Copy, Debug)]
 pub struct StandbyStatus {
     /// Highest LSN received. Moved by the keepalive path, and it does **not** free WAL.
@@ -85,7 +86,7 @@ pub struct Streaming;
 /// A hand-rolled replication connection, typed by which protocol state it is in. [`Streaming`] is the
 /// default because every consumer of this module ([`crate::consume`], [`crate::shutdown`],
 /// [`crate::checkpoint`]) only ever holds a live CopyBoth stream; the [`Idle`] form exists for the
-/// snapshot-export handoff (PR 2.29) and exposes nothing that would tear the wire.
+/// snapshot-export handoff and exposes nothing that would tear the wire.
 ///
 /// Frames cannot be read before `START_REPLICATION`:
 ///
@@ -103,7 +104,7 @@ pub struct ReplicationStream<S = Streaming> {
     rbuf: BytesMut,
     /// The highest LSN we've received (sent as `write` in feedback).
     last_received: Lsn,
-    /// The durable baseline (`flush`/`apply`); constant until PR 2.26 advances it.
+    /// The durable baseline (`flush`/`apply`); updated only after the checkpoint advances it.
     durable: Lsn,
     /// Unconditional-feedback cadence (< `wal_sender_timeout`).
     feedback_interval: Duration,
@@ -116,7 +117,7 @@ pub struct ReplicationStream<S = Streaming> {
 
 impl ReplicationStream<Idle> {
     /// Open a `replication=database` connection and complete the startup handshake **without** yet
-    /// issuing `START_REPLICATION` — the idle state a snapshot export needs (PR 2.29). The caller then
+    /// issuing `START_REPLICATION` — the idle state a snapshot export needs. The caller then
     /// either [`create_replication_slot_export`](Self::create_replication_slot_export) or
     /// [`into_streaming`](Self::into_streaming).
     ///
@@ -176,7 +177,7 @@ impl ReplicationStream<Idle> {
         })
     }
 
-    /// `CREATE_REPLICATION_SLOT <slot> LOGICAL pgoutput (SNAPSHOT 'export')` (PR 2.29). Returns
+    /// `CREATE_REPLICATION_SLOT <slot> LOGICAL pgoutput (SNAPSHOT 'export')`. Returns
     /// `(consistent_point, snapshot_name)`. **This connection now holds the exported snapshot** — keep
     /// it strictly idle until every backfill session has run `SET TRANSACTION SNAPSHOT`; the next
     /// command on it (e.g. `START_REPLICATION`) ends the snapshot. Unlike
@@ -261,7 +262,7 @@ impl ReplicationStream<Streaming> {
         self.feedback_deadline = Instant::now() + interval;
     }
 
-    /// Time remaining until the next unconditional feedback is due. The flush path (PR 2.26) races this
+    /// Time remaining until the next unconditional feedback is due. The flush path races this
     /// against a slow S3 PUT so keepalive keeps flowing while the read loop is busy — a stalled flush
     /// must never starve the walsender past `wal_sender_timeout` (§1.9). Saturates to zero when overdue.
     ///
@@ -325,7 +326,7 @@ impl ReplicationStream<Streaming> {
         }
     }
 
-    /// Send an `'r'` standby status update. Callers (PR 2.26) use this to advance `flush`/`apply` on
+    /// Send an `'r'` standby status update. Callers use this to advance `flush`/`apply` on
     /// durability; the keepalive path uses [`Self::send_received_feedback`].
     ///
     /// ## Cancel safety
@@ -347,7 +348,7 @@ impl ReplicationStream<Streaming> {
         Ok(())
     }
 
-    /// Send `CopyDone` and flush — end our side of the CopyBoth stream on a graceful drain (PR 2.28).
+    /// Send `CopyDone` and flush — end our side of the CopyBoth stream on a graceful drain.
     /// The replication **slot is untouched** (never `DROP_REPLICATION_SLOT`); a replacement pod
     /// resumes from `confirmed_flush_lsn`. `CopyDone` is a bare frame: tag `'c'`, Int32 length `4`.
     ///
@@ -370,7 +371,7 @@ impl ReplicationStream<Streaming> {
     }
 
     /// Advance the durable (`flush`/`apply`) baseline the periodic keepalive reports — set by the
-    /// durability checkpoint (PR 2.26) only after S3 + manifest are durable. Never regresses.
+    /// durability checkpoint only after S3 + manifest are durable. Never regresses.
     pub fn set_durable(&mut self, lsn: Lsn) {
         self.durable = self.durable.max(lsn);
     }
@@ -496,7 +497,7 @@ impl<S: Send> ReplicationStream<S> {
                     if sub != 0 {
                         bail!(
                             "source demands auth type {sub}; the dev harness must use trust auth \
-                             (SCRAM is not implemented in this spike)"
+                             (this replication client does not implement SCRAM)"
                         );
                     }
                 }

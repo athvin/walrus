@@ -1,5 +1,5 @@
 //! Phase B — transform the un-transformed tail of `<table>_raw` into the mirror `<table>` (loader §4).
-//! Read only `commit_lsn > transformed_lsn`, run the PR 3.3 dedup + `MERGE` **inside one DuckDB
+//! Read only `commit_lsn > transformed_lsn`, run the dedup + `MERGE` **inside one DuckDB
 //! transaction**, commit, then advance `transformed_lsn = max(commit_lsn)` applied in a **separate**
 //! control-DB transaction (the two databases can't share one).
 //!
@@ -15,8 +15,8 @@ use crate::table_name::{DuckTable, Mirror};
 use crate::transform::{TransformSql, apply_transform};
 use common::{Lsn, PgRelation};
 
-/// Build the transform for a table at its CURRENT reconciled `schema_version` (PR 3.8): read the registry
-/// (columns + type descriptors) into a [`TablePlan`] (Tier-2 emit/recombine, PR 4.2); fall back to the
+/// Build the transform for a table at its CURRENT reconciled `schema_version`: read the registry
+/// (columns + type descriptors) into a [`TablePlan`] (Tier-2 emit/recombine); fall back to the
 /// bootstrap relation's scalar shape when there is no registry row (single-version / hermetic setups).
 ///
 /// # Errors
@@ -60,13 +60,13 @@ pub async fn run_phase_b(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
             LoaderError::Internal(format!("no checkpoint for {}.{}", ctx.schema, ctx.table))
         })?;
     let after = cp.transformed_lsn;
-    // Phase-B transform lag = raw_appended_lsn − transformed_lsn (PR 4.10); pure math from the checkpoint
+    // Phase-B transform lag = raw_appended_lsn − transformed_lsn; pure math from the checkpoint
     // just read, no extra query. Labelled per table (bounded cardinality).
     common::metrics::set_transform_lag(&ctx.series, cp.raw_appended_lsn - cp.transformed_lsn);
 
-    // The max commit LSN in the tail we (re)transform, bounded `>= transformed_lsn` (16-hex text sorts as
-    // the LSN, so `max` = latest). The `>=` is load-bearing for the snapshot/stream boundary (PR 3.10,
-    // closing PR 3.7 break-face A end-to-end): equal-`lsn_end` snapshot files carry `commit_lsn =
+    // The max commit LSN in the tail we (re)transform, bounded `>= transformed_lsn` (16-hex text
+    // sorts as the LSN, so `max` = latest). The `>=` is load-bearing for the snapshot/stream
+    // boundary: equal-`lsn_end` snapshot files carry `commit_lsn =
     // consistent_point`, and if a later loader batch appends one *after* `transformed_lsn` already reached
     // that point, a strict `>` scan would skip it forever. Re-including the boundary re-applies rows the
     // mirror already has — the per-PK `_applied_*` guard makes those a no-op, so the mirror stays exact
@@ -93,8 +93,8 @@ pub async fn run_phase_b(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     })?;
 
     // The transform must reference exactly the columns the reconciled tables now have — i.e. the shape at
-    // the DuckDB tables' CURRENT reconciled `schema_version` (Phase A advanced it, PR 3.8), NOT the stale
-    // bootstrap shape (and, PR 4.2, with the Tier-2 emit/recombine from the descriptors).
+    // the DuckDB tables' CURRENT reconciled `schema_version` (Phase A advanced it), NOT the stale
+    // bootstrap shape, including Tier-2 recombination from the descriptors.
     let t = current_transform(ctx).await?;
     ctx.db
         .in_txn("transform", |conn| apply_transform(conn, &t, after))?;
@@ -102,7 +102,7 @@ pub async fn run_phase_b(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     // Advance the watermark AFTER the DuckDB commit. The CHECK (transformed_lsn <= raw_appended_lsn)
     // holds because Phase A ran first this cycle. `max_lsn` can equal the prior `transformed_lsn` (a
     // boundary re-transform advances it to the same value — a no-op) — that is the snapshot/stream
-    // boundary being held closed (PR 3.10). The full-rebuild (PR 3.11) is the safety net regardless.
+    // boundary being held closed. The full-rebuild is the safety net regardless.
     control::advance_transformed(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table, max_lsn).await?;
     // Only a watermark that MOVED is a lifecycle event. The boundary re-transform described above
     // re-applies the same commit on every poll while the source sits idle (`max_lsn == after`, a

@@ -5,7 +5,7 @@
 )]
 //! Hermetic raw→mirror transform tests (loader §6) — `Connection::open_in_memory()`, **no docker
 //! compose, no Postgres, no S3**. They replay every worked case from `walrus-loader.md §6` against the
-//! *production* template (`loader::transform`), so test and Phase B (PR 3.4) share one source of truth.
+//! *production* template (`loader::transform`), so test and Phase B share one source of truth.
 
 use common::{PgColumn, PgRelation, ReplicaIdentity};
 use duckdb::Connection;
@@ -32,7 +32,7 @@ fn lsn(n: u64) -> String {
     format!("{n:016X}")
 }
 
-/// Fresh in-memory DB with `orders` (mirror, incl. the hidden `_applied_*` guard columns — PR 3.7) +
+/// Fresh in-memory DB with `orders` (mirror, including the hidden `_applied_*` guard columns) +
 /// `orders_raw` (CDC log, minimal columns the transform reads).
 fn db() -> Connection {
     let c = Connection::open_in_memory().unwrap();
@@ -295,7 +295,7 @@ fn composite_pk_partition_and_join_expand_to_all_key_columns() {
     assert_eq!(v12, "other", "(1,2) is independent of (1,1)");
 }
 
-// ---- PR 3.5: TRUNCATE — a mirror wipe keyed on the (commit_lsn, lsn) TUPLE, not the scalar. ----
+// ---- TRUNCATE — a mirror wipe keyed on the (commit_lsn, lsn) TUPLE, not the scalar. ----
 
 /// A truncate + re-inserts: the mirror is emptied as of the truncate (incl. pre-existing rows from
 /// earlier cycles) and holds ONLY the post-truncate rows.
@@ -329,7 +329,8 @@ fn truncate_then_reinsert_keeps_only_post_truncate_rows() {
     assert_eq!(mirror_count(&c), 1);
 }
 
-/// The subtlety this PR exists to nail: a SAME-transaction `TRUNCATE; INSERT` shares one commit_lsn;
+/// A same-transaction `TRUNCATE; INSERT` shares one commit LSN; the row LSN is therefore the
+/// load-bearing tiebreaker:
 /// the tuple boundary `(commit_lsn, lsn) > (Ct, Lt)` keeps the inserts (the truncate's lsn is lower).
 #[test]
 fn same_commit_truncate_then_insert_survives_tuple_boundary() {
@@ -418,7 +419,7 @@ fn raw_retains_the_truncate_op_row() {
     );
 }
 
-// ---- PR 3.6: unchanged-TOAST resolution — the raw back-scan (§5.6). ----
+// ---- unchanged-TOAST resolution — the raw back-scan (§5.6). ----
 
 fn docs_rel() -> PgRelation {
     let col = |n: &str, oid: u32, k: bool| PgColumn {
@@ -562,7 +563,7 @@ fn non_toast_columns_pass_through_untouched() {
     );
 }
 
-// ---- PR 3.7: the per-PK max-applied `(commit_lsn, lsn)` guard (§7, ⚠ extends architecture.md). The
+// ---- the per-PK max-applied `(commit_lsn, lsn)` guard (§7, ⚠ extends architecture.md). The
 // guarded MERGE + the relaxed `>=` window close the two straddle faces without losing idempotency. ----
 
 /// Break face B — a stale delete + re-insert straddling the watermark (older than what last shaped the
@@ -706,7 +707,7 @@ fn columns_of(conn: &Connection, name: &str) -> Vec<String> {
     rows.map(|r| r.unwrap()).collect()
 }
 
-// ---- PR 3.10: the snapshot/stream boundary through the transform. Snapshot rows are just more raw
+// ---- the snapshot/stream boundary through the transform. Snapshot rows are just more raw
 // rows the window ranks by `(commit_lsn, lsn)` — no bespoke backfill mode. ----
 
 /// A snapshot row (`commit_lsn = consistent_point`) plus a LATER overlapping stream change on the same
@@ -731,7 +732,7 @@ fn overlapping_stream_change_outranks_the_snapshot_row() {
 }
 
 /// A snapshot-ONLY key whose `commit_lsn` equals `transformed_lsn` (the consistent_point boundary) is
-/// still applied — the `>=` window + PR 3.7 guard (break face A) never let the watermark skip it.
+/// still applied — the `>=` window + per-PK guard (break face A) never let the watermark skip it.
 #[test]
 fn no_stream_key_snapshot_row_at_boundary_is_applied() {
     let c = db();

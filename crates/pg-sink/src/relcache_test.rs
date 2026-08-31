@@ -37,7 +37,7 @@ fn caches_arrow_schema_and_descriptors_by_versioned_key() {
     let entry = cache
         .upsert_from_relation(orders(), SchemaVersionNo(1))
         .unwrap();
-    // Tier-1 schema (PR 2.9): 4 data cols + the trailing meta col.
+    // Tier-1 schema: 4 data cols + the trailing meta col.
     assert_eq!(entry.arrow_schema.fields().len(), 5);
     assert_eq!(entry.arrow_schema.field(0).data_type(), &DataType::Int32);
     assert_eq!(

@@ -3,14 +3,14 @@
     clippy::expect_used,
     reason = "bench (harness=false, not test-cfg)"
 )]
-//! PR 5.4 — criterion micro-benches for the Arrow batch-building hot path.
+//! Criterion micro-benches for the Arrow batch-building hot path.
 //!
 //! Measures `BatchBuilder::append_row` across Tier-1 shapes (narrow/wide/text-heavy) and a Tier-2
 //! fan-out shape (interval + range + timetz), plus a whole-batch `into_record_batch()`. It also
 //! isolates the per-row `serde_json::to_string(meta)` cost that the design flags as a suspect: two
 //! identical micro-benches append the meta column, one serialising the `SinkMeta` per row and one
 //! appending a pre-serialised constant, so the JSON cost reads as a direct subtraction. No
-//! production code is touched — this is the baseline PR 5.7 optimises against.
+//! production code is touched, so this is a stable baseline for future optimizations.
 //!
 //! Run: `cargo bench -p pg-to-arrow --bench batch` (or `just bench`).
 
@@ -186,7 +186,7 @@ fn bench_finish(c: &mut Criterion) {
 
 /// Isolate the per-row meta serialisation. Both benches build an identical `StringBuilder` of `ROWS`
 /// entries; only `serialize` pays `serde_json::to_string(meta)` per row, `const` appends a pre-canned
-/// string. `serialize − const` is the meta-JSON cost that PR 5.7 amortises.
+/// string. `serialize − const` is the meta-JSON cost that the production implementation amortizes.
 fn bench_meta_json(c: &mut Criterion) {
     let m = meta();
     let precanned = serde_json::to_string(&m).unwrap();

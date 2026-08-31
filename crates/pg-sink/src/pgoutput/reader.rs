@@ -1,4 +1,4 @@
-#![deny(clippy::indexing_slicing)] // PR 16.2: every hot-path access must carry a bounds proof.
+#![deny(clippy::indexing_slicing)] // every hot-path access must carry a bounds proof.
 
 //! The [`Reader`] cursor: big-endian primitives over a bounds-checked byte slice. Every read is a
 //! `Result` — running off the end is a modelled [`DecodeError::UnexpectedEof`], never a panic.
@@ -65,7 +65,7 @@ impl<'a> Reader<'a> {
     fn fixed<const N: usize>(&mut self) -> Result<&'a [u8; N], DecodeError> {
         let head = self.need(N)?;
         // `need(N)` returned exactly N bytes, so this branch is unreachable. Keep it modelled
-        // rather than unwrapping, and retain PR 16.5's cold error construction.
+        // rather than unwrapping, and retain the cold error construction.
         let Some(chunk) = head.first_chunk::<N>() else {
             return Err(eof(N, self.pos, self.remaining()));
         };

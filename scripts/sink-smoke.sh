@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Compose smoke for the walrus-pg-sink pod lifecycle shell (PR 2.18).
+# Compose smoke for the walrus-pg-sink pod lifecycle shell.
 #
 # Requires the dev stack up (`docker compose up --wait`). Asserts:
 #   1. happy path — the process boots, /startup and /ready flip to 200, /healthz is 200,

@@ -160,7 +160,7 @@ async fn cap_of_two_schedules_third_request_only_after_a_permit_frees() {
             // Relaxed: an independent per-task latch. Nothing rides behind the flag, and the
             // permits — not this store — are what the test's ordering claim rests on.
             flag.store(1, Ordering::Relaxed);
-            let _ = rx.await; // park like the PR 6.5 stub, holding the permit
+            let _ = rx.await; // park while holding the permit
         });
     }
 

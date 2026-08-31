@@ -1,11 +1,11 @@
-//! `table_reload` models: the single-table-reload state machine (reload H4/H5/H10, PR 6.1).
+//! `table_reload` models: the single-table-reload state machine (reload H4/H5/H10).
 //!
 //! Control-pg owns the reload's brain; every transition below is a **guarded UPDATE** —
 //! `UPDATE … WHERE status = <expected>` — so a lost race or an illegal jump changes zero rows and
 //! surfaces as the typed [`ControlError::ReloadTransition`], never a silent double-claim. The
 //! status walk is `requested → exporting → export_complete → complete`, with `failed` terminal
 //! from the two middle states. There is deliberately **no** `superseded` status: a DDL restart
-//! (PR 6.8) is [`fail()`](fail) with an explanatory reason plus a fresh successor row.
+//! is [`fail()`](fail) with an explanatory reason plus a fresh successor row.
 //!
 //! `reload_id` is a **bigserial, not a UUID** (a recorded deviation from the design doc): "honor
 //! only the latest reload_id" (H9) becomes a numeric max, and the id fits the loader's
@@ -77,7 +77,7 @@ pub struct ReloadRow {
     pub final_lsn: Option<Lsn>,
     /// The single schema version this attempt exports at; frozen alongside `first_lsn`.
     pub schema_version: Option<SchemaVersionNo>,
-    /// DDL restarts consumed so far (PR 6.8 caps it at `reload_max_restarts`).
+    /// DDL restarts consumed so far; `reload_max_restarts` caps it.
     pub restart_count: i32,
     /// The instance currently holding the exporter lease; `None` when unclaimed. Compared only in
     /// SQL against `now()`, so this side never decides whether the lease is live.
@@ -198,7 +198,7 @@ pub async fn claim_requested(
 
 /// Return a claimed-but-never-started row to the queue: `exporting → requested`, lease cleared.
 ///
-/// The controller's un-claim for infra failures BETWEEN claim and exporter spawn (PR 6.4) — a
+/// The controller's un-claim for infra failures BETWEEN claim and exporter spawn — a
 /// dead preflight connection, a control-pg blip while recording a rejection. An infra error must
 /// neither terminally `fail` a valid request nor leave it `exporting` unowned; back in
 /// `requested`, the next tick re-claims and retries. Holder-guarded (only the claimant un-claims)
@@ -251,10 +251,10 @@ pub async fn renew_lease(
 /// carry a new `L_i` each call, so their values are simply not the first and never overwrite it)
 /// and `schema_version` — which, unlike the LSN, is also **asserted**: every reload attempt is
 /// single-schema *by construction* (H9), so a later chunk arriving with a different version means
-/// the export engine missed a DDL restart (PR 6.8) — the WHERE rejects it and the mismatch is the
+/// the export engine missed a DDL restart — the WHERE rejects it and the mismatch is the
 /// same loud zero-rows error as any illegal transition, never a silent swallow. The
 /// `chunk_no = $new - 1` guard makes the cursor strictly in-order: a duplicate or out-of-order
-/// advance changes zero rows and errors. (PR 6.8 restarts with a *fresh* row rather than ever
+/// advance changes zero rows and errors. A restart uses a *fresh* row rather than ever
 /// mutating the frozen fields.)
 ///
 /// # Errors
@@ -290,7 +290,7 @@ pub async fn advance_cursor(
 }
 
 /// `exporting → export_complete`, recording the final watermark `H`. The sink's last act; from
-/// here the LOADER finishes the walk (PR 6.9: `complete` once `transformed_lsn >= H`).
+/// here the LOADER finishes the walk (`complete` once `transformed_lsn >= H`).
 ///
 /// # Errors
 ///
@@ -317,8 +317,8 @@ pub async fn complete_export(
     Ok(())
 }
 
-/// `export_complete → complete` — the loader calls this once `transformed_lsn >= final_lsn`
-/// (PR 6.9). Terminal: the row leaves the `table_reload_one_live` index and the table can be
+/// `export_complete → complete` — the loader calls this once `transformed_lsn >= final_lsn`.
+/// Terminal: the row leaves the `table_reload_one_live` index and the table can be
 /// reloaded again.
 ///
 /// # Errors
@@ -343,8 +343,8 @@ pub async fn complete(ex: impl PgExecutor<'_>, reload_id: ReloadId) -> Result<()
 /// coupling the purge to the flip means no crash window can separate them.
 ///
 /// Takes a connection (not an executor) because this is two statements under one transaction;
-/// inside an outer transaction it nests as a savepoint, so callers like PR 6.8's
-/// fail-and-reissue can wrap it with the successor INSERT atomically. The purge needs no `kind`
+/// inside an outer transaction it nests as a savepoint, so fail-and-reissue callers can wrap it
+/// with the successor INSERT atomically. The purge needs no `kind`
 /// filter — only reload files carry a `reload_id` (that is the point of the nullable column).
 ///
 /// # Errors
@@ -375,7 +375,7 @@ pub async fn fail(
     Ok(())
 }
 
-/// Would restarting an attempt with `restart_count` push it past `max_restarts` (PR 6.8)? The next
+/// Would restarting an attempt with `restart_count` push it past `max_restarts`? The next
 /// attempt would carry `restart_count + 1`, so the cap is exceeded when that exceeds the max — a
 /// `max_restarts` of 0 fails the very first mid-export DDL. Pure so it unit-tests without a DB.
 ///
@@ -391,7 +391,7 @@ pub const fn restart_would_exceed_cap(restart_count: i32, max_restarts: i32) -> 
     }
 }
 
-/// H9 restart-on-DDL (PR 6.8): in ONE transaction, fail the old attempt — [`fail`]'s coupling
+/// H9 restart-on-DDL: in ONE transaction, fail the old attempt — [`fail`]'s coupling
 /// purges its `kind='reload'` manifest rows, so no observer ever sees a terminal attempt with
 /// claimable chunk files — and, unless the restart cap is spent, INSERT its successor.
 ///
@@ -455,7 +455,7 @@ pub async fn restart_for_ddl(
     Ok(Some(rec.reload_id.into()))
 }
 
-/// The loader's completion flip (PR 6.9 / H10): every `export_complete` reload for this table whose
+/// The loader's completion flip (H10): every `export_complete` reload for this table whose
 /// `final_lsn` (H) the mirror has now reached (`transformed_lsn >= H`) becomes `complete`. One
 /// guarded batch UPDATE that JOINs `loader_checkpoint` for the live `transformed_lsn` — no extra
 /// read, and a natural no-op (0 rows) on the vast majority of cycles that have no `export_complete`
@@ -485,7 +485,7 @@ pub async fn complete_reached(
 }
 
 /// The floor `first_lsn` (`L₁`) below which a pending **rebuild** supersedes this table's pending
-/// manifest files (PR 6.12). A live `reload`-flavor reload's rebuild trigger will `CREATE OR
+/// manifest files. A live `reload`-flavor reload's rebuild trigger will `CREATE OR
 /// REPLACE` the mirror at the new schema and `delete_superseded` every non-reload file with
 /// `lsn_end <= first_lsn` — so the loader must NOT reconcile (and possibly quarantine on) such a
 /// file: it skips it and lets the rebuild replace the mirror. Returns `first_lsn` for a
@@ -516,7 +516,7 @@ pub async fn reload_supersede_floor(
     Ok(rec.and_then(|r| r.first_lsn))
 }
 
-/// Startup crash-recovery (PR 6.9 / H7): the `exporting` reloads this sink may resume — its OWN
+/// Startup crash-recovery (H7): the `exporting` reloads this sink may resume — its OWN
 /// lease (a restart of the same instance) or an EXPIRED one (a dead instance). Re-acquires the
 /// lease in the SAME guarded `UPDATE … RETURNING` (with `FOR UPDATE SKIP LOCKED`) so two racing
 /// pods can never both adopt one row. A live FOREIGN lease (`lease_holder <> me AND lease_expiry >
@@ -550,9 +550,9 @@ pub async fn adopt_resumable(
     Ok(rows.into_iter().map(|row| typed_reload_row!(row)).collect())
 }
 
-/// Genuinely stuck exports (PR 6.9): `exporting` rows whose lease has expired and which nobody is
-/// renewing — a dead exporter no startup scan adopted. Surfaced as a per-tick warn (the alert rule
-/// is PR 6.11's). `export_complete` rows with an expired lease are NOT stuck — they are waiting on
+/// Genuinely stuck exports: `exporting` rows whose lease has expired and which nobody is
+/// renewing — a dead exporter no startup scan adopted. Surfaced as a per-tick warning and alert.
+/// `export_complete` rows with an expired lease are NOT stuck — they are waiting on
 /// the loader, by design — so the filter is `exporting` only.
 ///
 /// # Errors
@@ -571,12 +571,12 @@ pub async fn stuck_exporting(
         .collect())
 }
 
-/// Tables mid-rebuild — the loader-pause predicate's input (PR 6.6).
+/// Tables mid-rebuild — the loader-pause predicate's input.
 ///
 /// Deliberately `flavor = 'reload'` only (a `resync` never pauses anything — H3) and deliberately
 /// `requested | exporting` only: the pause MUST lift at `export_complete`, because the rebuild is
 /// *triggered by the loader claiming the chunk files* — pausing through `export_complete` would
-/// deadlock the reload forever (PR 6.6's gotcha, baked in here so no caller re-derives it).
+/// deadlock the reload forever; keep the boundary here so no caller re-derives it.
 ///
 /// # Errors
 ///

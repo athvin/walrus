@@ -13,9 +13,9 @@
 //!    **sub-transaction** abort `Stream Abort {sub != top}` (the dangerous savepoint case, proto §9b)
 //!    drops **exactly** that sub-xid's rows while the top-level continues to commit.
 //! 5. **Bound memory** — when the aggregate [`InflightMeter`] crosses `max_inflight_bytes`, the largest
-//!    open `(table, sub-xid)` buffer is **spilled speculatively** to S3 (PR 2.30 staging) — **no
+//!    open `(table, sub-xid)` buffer is **spilled speculatively** to S3 staging — **no
 //!    manifest row, slot NOT advanced** (§1.5). Spilling is **per sub-xid** so an aborted sub-xid's
-//!    already-spilled file can be dropped without contaminating survivors (the PR 2.31 interaction).
+//!    already-spilled file can be dropped without contaminating survivors.
 //!
 //! **top vs sub xid (proto §7).** `Stream Start` carries the **top-level** xid; every streamed change
 //! carries its **sub**-xid. The abort names the sub-xid — each buffered/spilled row is tagged with its
@@ -100,7 +100,7 @@ impl StreamedTxn {
 
     /// Move one stream out without cloning and preserve the relative order of rows and survivors.
     ///
-    /// PR 11.7 made this linear with `mem::take` + `partition`; `extract_if` keeps that complexity
+    /// `extract_if` keeps the linear complexity of `mem::take` + `partition`
     /// and ordering while avoiding a fresh survivor buffer. The txn is still open and still
     /// buffering when the ceiling sheds one of its streams, so the survivors stay in `changes`'s
     /// own allocation — the very one the next `push_change` refills. Taking first handed that
@@ -181,7 +181,7 @@ impl<C: Clock + Clone> StreamDemux<C> {
         }
     }
 
-    /// Total speculative spills so far (metric; PR 4.10 exports it).
+    /// Total speculative spills so far; the value is exported as a metric.
     #[must_use]
     pub const fn spill_count(&self) -> u64 {
         self.spill_count
@@ -338,7 +338,7 @@ impl<C: Clock + Clone> StreamDemux<C> {
                     // Best-effort: the real commit_ts arrives only at Stream Commit, but this spill file
                     // is already durable in S3 by then (like commit_lsn, which the loader overrides via
                     // the manifest lsn_end; commit_ts has no such override) — so spilled rows carry the
-                    // spill-time instant, always within the transaction's lifetime (PR 5.9).
+                    // spill-time instant, always within the transaction's lifetime.
                     commit_ts: UtcTimestamp::now(),
                     xid: c.sub_xid,
                     epoch,
@@ -371,7 +371,7 @@ impl<C: Clock + Clone> StreamDemux<C> {
                 .await
                 .context("speculative spill PUT")?;
             self.spill_count += 1;
-            common::metrics::inc_spill(); // memory-ceiling speculative spill (PR 4.10)
+            common::metrics::inc_spill(); // memory-ceiling speculative spill
             tracing::info!(
                 top_xid = top,
                 sub_xid,
@@ -395,7 +395,7 @@ impl<C: Clock + Clone> StreamDemux<C> {
     /// speculative files; the top-level txn stays open and commits its survivors.
     pub async fn on_stream_abort(&mut self, top_xid: u32, sub_xid: u32, sink: &ParquetSink) {
         if top_xid == sub_xid {
-            common::metrics::inc_aborted_txn(); // whole-txn abort (PR 4.10)
+            common::metrics::inc_aborted_txn(); // whole-txn abort
             if self.current_top == Some(top_xid) {
                 self.current_top = None;
             }

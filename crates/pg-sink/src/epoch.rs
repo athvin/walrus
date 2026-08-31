@@ -129,7 +129,7 @@ pub async fn classify_slot(client: &tokio_postgres::Client, slot: &str) -> SlotS
     };
     let reported: Option<String> = row.get(0);
     let wal_status = reported.as_deref().and_then(WalStatus::from_catalog);
-    // Expose the categorical slot health as a gauge (PR 4.10) from this existing read — no extra query.
+    // Expose the categorical slot health as a gauge from this existing read — no extra query.
     // NULL and any word this walrus does not know fall to 0, the reserved/extended code, exactly as
     // they fail the `Lost` test below: neither is evidence the slot was invalidated.
     common::metrics::set_wal_status(wal_status.map_or(0, WalStatus::gauge_code));

@@ -4,10 +4,10 @@
 //! SIGTERM (Kubernetes' graceful-stop signal) and SIGINT both trip a single [`CancellationToken`];
 //! `clone()` it into each task, which selects on `token.cancelled()`. The process must be able to be
 //! PID 1 with an exec-form entrypoint so the signal is delivered to *us*, not swallowed by a shell
-//! (the Dockerfile is PR 4.8, but we design for it now: direct signal handling, no wrapper).
+//! (the Dockerfile uses an exec-form entrypoint: direct signal handling, no wrapper).
 //!
 //! **The K8s termination sequence** is preStop-*then*-SIGTERM, sharing one `terminationGracePeriod`
-//! budget (wiring is PR 4.9). walrus skips preStop: the process handles SIGTERM directly as PID 1, so
+//! budget. walrus skips preStop: the process handles SIGTERM directly as PID 1, so
 //! there is nothing a preStop hook would add. On SIGTERM the decode loop's cancellation branch fires
 //! and calls [`drain`] — which runs **after** the `select!` loop exits, so a slow S3 PUT is never
 //! aborted mid-flight; the grace period bounds it externally, not cancellation.
@@ -56,7 +56,7 @@ pub enum DrainOutcome {
 /// the K8s grace period. Steps: **(1)** stop consuming (the `select!` loop already exited) → **(2)**
 /// flush + COMMIT the in-flight **committed** batch (PUT → manifest → advance checkpoint), dropping any
 /// open uncommitted speculative buffers → **(3)** send a **final** standby update advancing
-/// `confirmed_flush_lsn` (the checkpoint clamps it to the open-txn floor; `None` until PR 2.30) →
+/// `confirmed_flush_lsn` (the checkpoint clamps it to any open-txn floor) →
 /// **(4)** `CopyDone` + clean close → **(5)** return, leaving the slot in place. **Never** issues
 /// `DROP_REPLICATION_SLOT`.
 ///

@@ -4,12 +4,12 @@
     clippy::let_underscore_must_use,
     reason = "integration test — unwrap/expect fine in setup + helpers"
 )]
-//! Compose tests for the reload signal table (PR 6.2, `#[ignore]` — needs the compose source PG).
+//! Compose tests for the reload signal table (`#[ignore]` — needs the compose source PG).
 //!
 //!   cargo test -p pg-sink --test reload_signal -- --ignored
 //!
 //! Three properties, one per test: a signal INSERT is decode-visible through the slot (the echo
-//! PR 6.3 will wait on), the backfill's table source never contains the signal table (so no
+//! waiter depends on this), the backfill's table source never contains the signal table (so no
 //! snapshot file can ever exist for it), and preflight refuses a missing/unpublished signal table
 //! loudly (reload H11) — or heals it under `manage_publication=true`.
 
@@ -84,8 +84,8 @@ async fn signal_insert_is_visible_in_decoded_stream() {
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
-    // Cleanup BEFORE the slot exists so the DELETE's WAL is never streamed (and: future pruning
-    // DELETEs on this table flow through the slot too — PR 6.3's routing must ignore them).
+    // Cleanup BEFORE the slot exists so the DELETE's WAL is never streamed. Operator-run pruning
+    // DELETEs on this table do flow through the slot, and the routing must ignore them.
     admin
         .execute(
             "DELETE FROM walrus.reload_signal WHERE reload_id = 990001",

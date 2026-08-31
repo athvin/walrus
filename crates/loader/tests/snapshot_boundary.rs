@@ -10,7 +10,7 @@
 //! here: (1) an overlapping stream change out-ranks the snapshot row, and (2) equal-`lsn_end` snapshot
 //! files **split across loader batches** are all applied — none skipped by the watermark. A `lsn_end`-only
 //! watermark filter (`lsn_end > raw_appended_lsn`) would drop the equal-`lsn_end` snapshot files; the
-//! claim is `ORDER BY lsn_end, id` + queue-delete, and Phase B's `>=` bound + the PR 3.7 guard close the
+//! claim is `ORDER BY lsn_end, id` + queue-delete, and Phase B's `>=` bound + the per-PK guard close the
 //! boundary key.
 //!
 //!   cargo test -p loader --test snapshot_boundary -- --ignored
@@ -213,7 +213,7 @@ async fn snapshot_then_overlapping_stream_yields_stream_value() {
 
 /// Two equal-`lsn_end` snapshot files, one per loader batch (`max_files=1`), must BOTH land — none
 /// skipped by the watermark. The second file's `commit_lsn == transformed_lsn` after the first cycle;
-/// only Phase B's `>=` bound + the PR 3.7 guard apply it.
+/// only Phase B's `>=` bound + the per-PK guard apply it.
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn equal_lsn_end_snapshot_files_split_across_batches_all_applied() {

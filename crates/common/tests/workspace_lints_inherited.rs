@@ -5,7 +5,7 @@
     reason = "integration test — unwrap/expect are setup assertions; synchronous manifest and \
               clippy-config reads are themselves repository-policy checks, not runtime I/O"
 )]
-//! Guard for `err-no-unwrap-prod` (PR 10.11). `[workspace.lints]` is a default a member must
+//! Guard for `err-no-unwrap-prod`. `[workspace.lints]` is a default a member must
 //! *request*: without `[lints] workspace = true` in its own manifest, a crate silently opts out of
 //! `deny(warnings)`, `clippy::all`, `unwrap_used` and `expect_used` — and CI stays green. This test
 //! is the thing that goes red instead.
@@ -558,7 +558,7 @@ fn the_perf_group_carries_exactly_four_scoped_allows() {
 /// the manifest moved. walrus states exactly one of the four keys and it *lowers* a limit —
 /// `enum-variant-size-threshold = 64`, under a third of clippy's 200-byte default — so the
 /// assertion is on the value, not on the key's presence. The other three stay unstated, on the
-/// strength of PR 9.7's recorded decision that a threshold move is a separate, noisier call.
+/// strength of the recorded decision that a threshold move is a separate, noisier call.
 #[test]
 fn the_clippy_config_does_not_raise_a_perf_threshold() {
     let synthetic = "enum-variant-size-threshold = 64\nlarge-error-threshold=256\n";
@@ -650,7 +650,7 @@ fn the_workspace_lint_table_still_denies_the_cargo_group() {
 /// dismissal. `cargo deny check` asks the same question in a compile-free CI job, over the whole
 /// lock file rather than one package's dependency graph, and its `skip` list takes a reason per
 /// crate — so what this asserts is that the key is still there to receive it. The level is
-/// deliberately not asserted: PR 4.7 set `multiple-versions` to "warn" until the tree is
+/// deliberately not asserted: `multiple-versions` stays at "warn" until the tree is
 /// de-duplicated and anticipates the tightening to "deny", which must not fail this guard.
 #[test]
 fn duplicate_crate_versions_are_still_owned_by_the_supply_chain_gate() {
@@ -679,7 +679,7 @@ fn duplicate_crate_versions_are_still_owned_by_the_supply_chain_gate() {
 /// than all of it: it covers every member whose only reason for being denied is the pick itself,
 /// plus the two the usual pedantic advice turns *off* — `must_use_candidate` and
 /// `missing_errors_doc`, denied here on their own recorded merits. The cast and float lints are
-/// pedantic too, and stay out of this list because PR 17.3 and PR 17.5 own them.
+/// pedantic too, and stay out because they are asserted by their dedicated policy checks.
 #[test]
 fn the_workspace_lint_table_selects_pedantic_lints_by_name_never_as_a_group() {
     let synthetic = "pedantic = { level = \"deny\", priority = -1 }\n";
@@ -741,8 +741,8 @@ fn the_workspace_lint_table_selects_pedantic_lints_by_name_never_as_a_group() {
 ///
 /// So the two halves are asserted together, exactly as for pedantic: the group entry must stay
 /// absent while the named members stay present. Every name below is denied on its own recorded
-/// merit — lock scope (PR 9.11), the mutable-borrow gate, `const fn` reachability (PR 21.1),
-/// Send-ness of a spawned future (PR 14.8), clone-vs-move, an elidable lifetime and singular
+/// merit — lock scope, the mutable-borrow gate, `const fn` reachability,
+/// Send-ness of a spawned future, clone-vs-move, an elidable lifetime and singular
 /// generic bounds — and `or_fun_call` joins them as the eager-fallback gate the pick was missing.
 /// Its reach is zero today, for the reason the manifest gives, so nothing in the source goes red if
 /// that entry is dropped and this is the thing that does.
@@ -1090,7 +1090,7 @@ fn the_workspace_lint_table_still_pins_one_module_layout() {
 }
 
 /// `push_str(&format!(..))` allocates a whole `String` to copy it into a buffer that already
-/// exists — the "build the parts with `format!`" shape PRs 11.4-11.6 replaced tree-wide with
+/// exists — the tree uses `write!`, `push_str`, and caller-owned scratch buffers instead of
 /// `write!`, `push_str` and scratch a caller owns and reuses. `format_push_string` is what keeps it
 /// out, and it is `clippy::restriction`: outside `all`, `perf`, `complexity` and every other group
 /// this table denies, so none of those entries reaches it and only the named one does. The tree has

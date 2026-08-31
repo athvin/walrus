@@ -5,7 +5,7 @@
     reason = "integration test — unwrap/expect are setup assertions; synchronous source scans are \
               themselves repository-policy checks, not runtime I/O"
 )]
-//! Conformance guard for `closure-move-capture` (PR 25.4): every production `move` closure and
+//! Conformance guard for `closure-move-capture`: every production `move` closure and
 //! `async move` block captures explicitly pre-bound locals, never `self`. Pure source scanning —
 //! no Docker, no new dependency. Two clone-shaped guards ride along, because they answer the other
 //! half of the same question — what a capture is allowed to duplicate, and what it never may.

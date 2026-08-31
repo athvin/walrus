@@ -51,17 +51,17 @@ pub struct TableCtx {
     pub max_files: NonZeroI64,
     /// The apply-loop poll cadence.
     pub poll_interval: Duration,
-    /// The compaction cadence — full-rebuild + prune, on this worker thread after an apply cycle (PR 3.11).
+    /// The compaction cadence — full-rebuild + prune, on this worker thread after an apply cycle.
     pub compaction_interval: Duration,
     /// Raw retention as an LSN-byte lag behind `transformed_lsn` (the prune floor).
     pub retention_lsn_lag: u64,
-    /// The reload_id whose claim pause was already logged (PR 6.6) — a paused table says *why* it
+    /// The reload_id whose claim pause was already logged — a paused table says *why* it
     /// is idle once per pause, not once per poll. Per-table by construction (one [`TableCtx`] per
     /// worker, with `!Sync` interior state), so this needs interior mutability behind
     /// `run_phase_a(&ctx)`, not synchronisation. `Option<ReloadId>` is `Copy`, so `Cell` has no borrow
     /// flag or runtime panic path.
     pub pause_logged: Cell<Option<ReloadId>>,
-    /// reload_ids already identified as `resync` (PR 6.10). A resync never sets the meta latch, so
+    /// reload_ids already identified as `resync`. A resync never sets the meta latch, so
     /// every one of its chunk files would otherwise re-enter `route_reload_file`'s "greater" arm and
     /// re-fetch the reload row; caching the flavor here makes chunks 2…n a plain append with no
     /// per-file lookup. `HashSet` is not `Copy`, so this uses `RefCell`; it remains confined to the
@@ -119,7 +119,7 @@ async fn read_lag_inputs(ctx: &TableCtx) -> Result<(Option<Lsn>, Lsn), LoaderErr
 /// [`LoaderError::RegistryDecode`] for an invalid stored shape, [`LoaderError::Quarantine`] for an
 /// unsafe DDL cast, or [`LoaderError::Internal`] for an inconsistent reload manifest.
 pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
-    // Observability (PR 5.6): set the Phase-A backlog gauge every poll (0 when caught up) —
+    // Observability: set the Phase-A backlog gauge every poll (0 when caught up) —
     // `max(lsn_end over ready files) − raw_appended_lsn`. Both operands are cheap indexed control-DB
     // reads; doing this before the claim means idle polls report a truthful 0.
     let (max_ready, raw_appended) = read_lag_inputs(ctx).await?;
@@ -136,7 +136,7 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     )
     .await?;
     if claimed.is_empty() {
-        // Distinguish IDLE from PAUSED (PR 6.6): a live rebuild-flavor reload withholds this
+        // Distinguish IDLE from PAUSED: a live rebuild-flavor reload withholds this
         // table's claims (reload §2 — claiming would retire post-`W` files the rebuild must
         // replay). Only probe when a backlog exists, and log the reason once per pause.
         if max_ready.is_some() {
@@ -172,10 +172,10 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     // 2. Append each file verbatim to <table>_raw (DuckDB auto-commits each statement). Idempotent.
     //    Files are claimed in (lsn_end, id) = commit order, and the sink cuts a fresh homogeneous file at
     //    every structural change, so schema_version is monotonic across `claimed`. Before appending a
-    //    file at a NEWER version, reconcile both tables UP TO it (PR 3.8) — so `<table>_raw` always has
+    //    file at a NEWER version, reconcile both tables UP TO it — so `<table>_raw` always has
     //    exactly the file's columns and the verbatim `SELECT *` append lines up; already-appended older
     //    rows read NULL for the freshly-added column (additive superset).
-    // A pending rebuild-flavor reload (PR 6.12) will CREATE OR REPLACE the mirror at the new schema
+    // A pending rebuild-flavor reload will CREATE OR REPLACE the mirror at the new schema
     // and `delete_superseded` every non-reload file at `lsn_end <= first_lsn`. Such a file must NOT
     // reconcile here: a lossy cast would re-quarantine the loader on every restart BEFORE it ever
     // reaches the reload chunk file that clears the quarantine (the claim order puts the low-`lsn_end`
@@ -188,7 +188,7 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     let mut ids = Vec::with_capacity(claimed.len());
     let mut appended = 0u64;
     for f in &claimed {
-        // kind='reload' routing (PR 6.7, H8/H9): greater ⇒ rebuild-then-append; equal ⇒ plain
+        // kind='reload' routing (H8/H9): greater ⇒ rebuild-then-append; equal ⇒ plain
         // append (chunks 2…n); less ⇒ a stale attempt's file — retire it unapplied (its id joins
         // the end-of-batch delete, its lsn_end never advances the frontier, DuckDB is untouched).
         if f.kind == control::ManifestKind::Reload && !route_reload_file(ctx, f).await? {
@@ -201,11 +201,11 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
             ids.push(f.id);
             continue;
         }
-        // Skip a version-crossing non-reload file a pending rebuild will supersede (PR 6.12): leave
+        // Skip a version-crossing non-reload file a pending rebuild will supersede: leave
         // it `ready` (do NOT append, advance the frontier, or delete it) so the rebuild's
         // `delete_superseded` purges it, and so the loop reaches the reload chunk file that clears
         // the quarantine. Same-version files still apply normally and drop through the rebuild's
-        // clear as PR 6.7's "wasted but harmless" pre-`W` backlog.
+        // clear as the "wasted but harmless" pre-`W` backlog.
         if f.kind != control::ManifestKind::Reload
             && f.schema_version > ctx.db.schema_version()?
             && supersede_floor.is_some_and(|floor| f.lsn_end <= floor)
@@ -230,7 +230,7 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
             )
             .await
         {
-            // A lossy DDL cast that fails is a QUARANTINE (PR 3.9): latch the state so `/ready`
+            // A lossy DDL cast that fails is a QUARANTINE: latch the state so `/ready`
             // degrades, fire a loud error-level alert, and stop — never a silent continue. The alert
             // names the table and the latch, not the error: this worker's `Err` drains the loader, so
             // `main` logs the failure itself (reason included) exactly once on the way out.
@@ -304,7 +304,7 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     Ok(Some(max_lsn))
 }
 
-/// Route one claimed `kind='reload'` file (PR 6.7). Returns `true` to append it, `false` when it
+/// Route one claimed `kind='reload'` file. Returns `true` to append it, `false` when it
 /// is a STALE attempt's file to retire unapplied.
 ///
 /// The trigger's order of operations — rebuild DuckDB → clear quarantine → purge superseded
@@ -321,7 +321,7 @@ async fn route_reload_file(ctx: &TableCtx, f: &control::ManifestRow) -> Result<b
             f.id
         ))
     })?;
-    // Fast path (PR 6.10): a resync we've already classified — plain append, no `recorded` read and
+    // Fast path: a resync we've already classified — plain append, no `recorded` read and
     // no per-file reload-row fetch. A resync never latches, so without this cache every chunk would
     // re-enter the "greater" arm below and re-fetch.
     if ctx.resync_ids.borrow().contains(&file_reload_id) {
@@ -340,7 +340,7 @@ async fn route_reload_file(ctx: &TableCtx, f: &control::ManifestRow) -> Result<b
 
     // Greater (or unlatched): the first file of a NEW attempt. The reload row carries the flavor: a
     // `resync` merges over the LIVE mirror (H3) — no clear, no purge, no latch, and raw history
-    // preserved (chunks flow through Phase A like any file, PR 6.10); only a `reload` rebuilds.
+    // preserved (chunks flow through Phase A like any file); only a `reload` rebuilds.
     let row = control::reload::get(&ctx.pool, file_reload_id)
         .await?
         .ok_or_else(|| {
@@ -359,10 +359,10 @@ async fn route_reload_file(ctx: &TableCtx, f: &control::ManifestRow) -> Result<b
     })?;
 
     // 1. Rebuild both tables, empty, at the FILE's schema_version (all of an attempt's chunks
-    //    share it by construction — PR 6.8 enforces that across DDL).
+    //    share it by construction; restart-on-DDL preserves that invariant).
     let plan = plan_at_version(ctx, f.schema_version).await?;
     ctx.db.rebuild_for_reload(&plan, f.schema_version)?;
-    // 2. The quarantine latch (PR 3.9) clears: the rebuild replaced the data the lossy cast
+    // 2. The quarantine latch clears: the rebuild replaced the data the lossy cast
     //    could not be applied to — this is the per-table recovery path v1 never had.
     ctx.state.clear_quarantine();
     // 3. Purge superseded pending rows: every non-reload file at lsn_end <= first_lsn describes a
@@ -387,7 +387,7 @@ async fn route_reload_file(ctx: &TableCtx, f: &control::ManifestRow) -> Result<b
 }
 
 /// The registry shape at `version` as a [`crate::plan::TablePlan`] (the Tier-2 emit/recombine
-/// path, PR 4.2), falling back to the bootstrap relation's scalar shape for hermetic
+/// path), falling back to the bootstrap relation's scalar shape for hermetic
 /// single-version setups — `phase_b::current_transform`'s exact precedent.
 async fn plan_at_version(
     ctx: &TableCtx,
@@ -412,7 +412,7 @@ async fn plan_at_version(
 
 /// The raw-append backlog in LSN-bytes: how far the newest ready file's commit LSN leads the Phase-A
 /// frontier. An empty queue (`None`) is 0; a frontier already at/after the head is 0. This is the
-/// value of `walrus_loader_raw_append_lag_bytes` (PR 5.6).
+/// value of `walrus_loader_raw_append_lag_bytes`.
 ///
 /// `max` bounds the head **up to** the frontier rather than branching on the same comparison twice:
 /// the lower bound is what makes `-` reachable only inside its defined ordered domain, and the

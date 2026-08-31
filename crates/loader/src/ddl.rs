@@ -10,9 +10,9 @@
 //! source shape; `<table>_raw` is an **additive superset** (columns only ever added / widened / renamed —
 //! never dropped here), so old verbatim rows stay valid (a new column reads NULL for them).
 //!
-//! **Additive / lossless** (PR 3.8): `ADD COLUMN`, `RENAME COLUMN` / `RENAME TABLE`, a lossless/widening
+//! **Additive / lossless**: `ADD COLUMN`, `RENAME COLUMN` / `RENAME TABLE`, a lossless/widening
 //! `ALTER COLUMN TYPE`, and `COMMENT` (metadata — mirror only, does **not** cut a `schema_version`
-//! boundary). **Destructive** (PR 3.9), where mirror and raw diverge most: `DROP COLUMN` (physical on
+//! boundary). **Destructive**, where mirror and raw diverge most: `DROP COLUMN` (physical on
 //! the mirror, retained-nullable on raw), a **lossy** `ALTER COLUMN TYPE` (attempt the in-place mirror
 //! cast → on failure **quarantine + alert + stop**, an accepted terminal v1 outcome; raw is widened to
 //! `VARCHAR`, never re-cast), and `DROP TABLE` (retire both tables + file). Raw is an additive superset:
@@ -75,7 +75,7 @@ pub enum AdditiveChange {
     },
 }
 
-/// One destructive change (PR 3.9) — where mirror and raw **diverge**: the mirror follows the exact
+/// One destructive change — where mirror and raw **diverge**: the mirror follows the exact
 /// current shape (physical drop / in-place cast), the raw log preserves history (retain / widen-only).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DestructiveChange {
@@ -95,7 +95,7 @@ fn is_same_duck_type(a: &PgColumn, b: &PgColumn) -> bool {
 }
 
 /// A widening DuckDB *can* do in place without loss — the additive subset. Anything else whose DuckDB
-/// type changes is **lossy/narrowing** and belongs to PR 3.9's quarantine path.
+/// type changes is **lossy/narrowing** and belongs to the quarantine path.
 const fn is_lossless_widen(old: &PgColumn, new: &PgColumn) -> bool {
     // int2→int4→int8 and float4→float8 are the only in-place widenings, grouped by source type.
     matches!(
@@ -104,8 +104,8 @@ const fn is_lossless_widen(old: &PgColumn, new: &PgColumn) -> bool {
     )
 }
 
-/// The full classification of one version step: additive/lossless changes plus destructive ones
-/// (PR 3.9). The sink cuts one file per structural change, so a step usually yields a single change.
+/// The full classification of one version step: additive/lossless changes plus destructive ones.
+/// The sink cuts one file per structural change, so a step usually yields a single change.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SchemaDiff {
     /// Changes that can be applied in place to both tables without losing anything.
@@ -115,8 +115,8 @@ pub struct SchemaDiff {
     pub destructive: Vec<DestructiveChange>,
 }
 
-/// Diff `old → new` by POSITION (attnum), classifying each change as additive or **destructive**
-/// (PR 3.9). The homogeneous-file rule means one DDL per version, so a length change is unambiguous:
+/// Diff `old → new` by POSITION (attnum), classifying each change as additive or **destructive**.
+/// The homogeneous-file rule means one DDL per version, so a length change is unambiguous:
 /// a drop shrinks the column count (never a rename, which keeps it), and an empty new column set is a
 /// `DROP TABLE`. A type change is a lossless widen (additive) or a lossy/narrowing one (destructive).
 ///
@@ -186,7 +186,7 @@ pub fn diff(old: &SchemaVersion, new: &SchemaVersion) -> Result<SchemaDiff, Load
 }
 
 /// The additive-only view of [`diff`] — errors if the step is destructive (use [`diff`] +
-/// [`apply_destructive`] for those, PR 3.9). Kept so the additive path stays a total function.
+/// [`apply_destructive`] for those). Kept so the additive path stays a total function.
 ///
 /// # Errors
 ///
@@ -198,7 +198,7 @@ pub fn diff_additive(
     let d = diff(old, new)?;
     if !d.destructive.is_empty() {
         return Err(LoaderError::Internal(format!(
-            "destructive change on {} — not an additive diff (PR 3.9)",
+            "destructive change on {} — not an additive diff",
             new.relation.name
         )));
     }
@@ -292,7 +292,7 @@ pub fn apply_additive(
         .duck_with(|| format!("apply additive DDL to {table}"))
 }
 
-/// Apply destructive changes (PR 3.9) — the mirror-vs-raw asymmetry is the whole point: the mirror
+/// Apply destructive changes — the mirror-vs-raw asymmetry is the whole point: the mirror
 /// takes the exact current shape (physical drop / in-place cast), the raw log preserves history
 /// (retain / widen-to-VARCHAR, **never** a re-cast that could fail on stored values). A lossy cast that
 /// fails on the mirror returns [`LoaderError::Quarantine`] — a terminal, alerting v1 outcome (single-
@@ -411,7 +411,7 @@ pub async fn reconcile_to_version(
         if let (Some(old), Some(new)) = (old, new) {
             let d = diff(&old, &new)?;
             apply_additive(db.conn(), table, &d.additive)?;
-            // Destructive changes (PR 3.9) apply after additive ones; a lossy cast failure short-circuits
+            // Destructive changes apply after additive ones; a lossy cast failure short-circuits
             // with `Quarantine` and the watermark is NOT advanced (re-run re-quarantines idempotently).
             apply_destructive(db.conn(), table, &d.destructive)?;
         }

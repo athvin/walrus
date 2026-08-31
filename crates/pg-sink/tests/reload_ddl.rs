@@ -325,7 +325,7 @@ async fn chunk_columns(uri: &str) -> Vec<String> {
 
 /// A counter's total from the Prometheus exposition (0 if absent) — summed across all label sets,
 /// so it works for both unlabelled (`walrus_reload_restart_cap_exhausted_total`) and per-table
-/// (`walrus_reload_restarts_total{table="…"}`) counters (PR 6.11 relabelled restarts).
+/// (`walrus_reload_restarts_total{table="…"}`) counters.
 fn counter_value(name: &str) -> f64 {
     let mut total = 0.0;
     for line in common::metrics::render().lines() {

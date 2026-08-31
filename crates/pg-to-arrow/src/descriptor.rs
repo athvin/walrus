@@ -1,7 +1,7 @@
 //! Build the per-column [`TypeDescriptor`] (walrus-pg-sink.md §2.6).
 //!
-//! This closes the loop on Phase 2b: every tier decision from PRs 2.9–2.16 becomes one serializable
-//! record — tier, emitted columns, recombine expression, and the metadata (`enum_labels`,
+//! Every type-mapping decision becomes one serializable record: tier, emitted columns, recombine
+//! expression, and the metadata (`enum_labels`,
 //! `bit_length`, `char_length`) the loader must re-apply. It is what turns "reconcile to the exact
 //! source shape" from a guess into a mechanical operation.
 //!
@@ -16,8 +16,8 @@ use common::{PgColumn, PgRelation, Tier, TypeDescriptor, TypeMeta};
 use std::borrow::Cow;
 use std::num::NonZeroU32;
 
-/// Derive the per-column mapping descriptor (§2.6). Enum `enum_labels` are caller-supplied (the sink
-/// hydrates them from the catalog in PR 2.22); use [`describe_column_with_labels`] to pass them.
+/// Derive the per-column mapping descriptor (§2.6). Enum `enum_labels` are caller-supplied; use
+/// [`describe_column_with_labels`] when catalog metadata is available.
 ///
 /// # Errors
 ///

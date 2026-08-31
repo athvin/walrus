@@ -81,7 +81,7 @@ fn numeric_10_2_is_decimal128_10_2() {
 #[test]
 fn numeric_typmod_minus_one_is_unconstrained() {
     assert_eq!(numeric_precision_scale(-1), None);
-    // unconstrained numeric is a Tier-3 VARCHAR carrier (PR 2.15), not Tier-1.
+    // unconstrained numeric is a Tier-3 VARCHAR carrier, not Tier-1.
     assert_eq!(tier1_data_type(oids::NUMERIC, -1), None);
 }
 
@@ -133,7 +133,7 @@ fn numeric_precision_38_is_the_tier1_boundary_at_both_call_sites() {
 
 #[test]
 fn unconstrained_and_over_38_numeric_emit_one_utf8_field() {
-    // The Tier-3 numeric branch (PR 2.15): a single Utf8 carrier, not Decimal128.
+    // The Tier-3 numeric branch: a single Utf8 carrier, not Decimal128.
     for typmod in [-1, ((40 << 16) | 10) + 4] {
         let fields = emit_fields(&col("amount", oids::NUMERIC, typmod)).unwrap();
         assert_eq!(fields.len(), 1);
@@ -157,7 +157,7 @@ fn meta_column_is_last_and_non_null_utf8() {
 
 #[test]
 fn tier1_column_still_emits_exactly_one_field() {
-    // No regression from PR 2.9: a native type expands to a single field named after the column.
+    // A native type expands to a single field named after the column.
     let fields = emit_fields(&col("note", oids::TEXT, -1)).unwrap();
     assert_eq!(fields.len(), 1);
     assert_eq!(fields[0].name(), "note");
@@ -241,7 +241,7 @@ fn uuid_emits_fixed_size_binary_with_extension_and_enum_is_utf8() {
             .map(String::as_str),
         Some("arrow.uuid")
     );
-    // A non-builtin OID is treated as enum → Utf8 (interim, PR 2.22 resolves via catalog).
+    // Without explicit type-kind metadata, a non-builtin OID conservatively uses the enum carrier.
     let e = emit_fields(&col("status", 16400, -1)).unwrap();
     assert_eq!(e[0].data_type(), &DataType::Utf8);
 }

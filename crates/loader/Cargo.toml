@@ -38,7 +38,7 @@ tokio-util = { workspace = true }
 axum = { workspace = true }
 object_store = { workspace = true, features = ["aws"] }
 tracing = { workspace = true }
-# Non-poisoning mutex for the health / Phase-A shared state (PR 7.6).
+# Non-poisoning mutex for the health / Phase-A shared state.
 parking_lot = { workspace = true }
 dhat = { workspace = true, optional = true }
 
@@ -47,7 +47,7 @@ dhat = { workspace = true, optional = true }
 figment = { workspace = true, features = ["test"] }
 # Raw-HTTP scrape test (metrics_scrape.rs) reads the /metrics body via AsyncReadExt/AsyncWriteExt.
 tokio = { workspace = true, features = ["io-util"] }
-# Micro-benches (PR 5.5): transform scaling / TOAST back-scan / Phase-A append against in-memory DuckDB.
+# Micro-benches: transform scaling / TOAST back-scan / Phase-A append against in-memory DuckDB.
 criterion = { workspace = true }
 # The append bench generates a local Parquet fixture with the sink's own writer (Arrow → Parquet).
 pg-to-arrow = { workspace = true }

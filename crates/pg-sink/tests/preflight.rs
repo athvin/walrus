@@ -60,7 +60,7 @@ async fn good_source_passes_all_assertions() {
     let _guard = SOURCE_LOCK.lock().await;
     let setup = plain(&source_url()).await;
     setup.batch_execute(SOURCE_MIGRATION).await.unwrap(); // idempotent: ensure walrus tables
-    setup.batch_execute(SOURCE_MIGRATION_0003).await.unwrap(); // …incl. the reload signal (PR 6.2)
+    setup.batch_execute(SOURCE_MIGRATION_0003).await.unwrap(); // …incl. the reload signal
     setup
         .batch_execute("DROP TABLE IF EXISTS public._walrus_pf_keyless") // defensive cleanup
         .await

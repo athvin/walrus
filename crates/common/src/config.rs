@@ -16,8 +16,8 @@ use std::time::Duration;
 /// an hour is almost certainly a misconfiguration, not an intent.
 const MAX_STARTUP_DEADLINE: Duration = Duration::from_secs(60 * 60);
 
-/// Configuration shared by both walrus services. Service-specific knobs embed this.
-/// Flattening is deferred; see `docs/implementation/notes/rust-skills/serde-flatten.md`.
+/// Configuration shared by both walrus services. Service-specific knobs embed this rather than
+/// flattening it, so `deny_unknown_fields` continues to reject misspelled keys at each level.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct CommonConfig {
@@ -27,7 +27,7 @@ pub struct CommonConfig {
     pub control_db_url: Redacted<String>,
     /// S3/MinIO staging bucket + endpoint.
     pub object_store: ObjectStoreConfig,
-    /// Logging setup (PR 0.4).
+    /// Logging setup.
     pub telemetry: TelemetryConfig,
     /// Bootstrap retry budget: transient deps are retried until this elapses, then terminal.
     #[serde(with = "humantime_serde")]

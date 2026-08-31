@@ -1,5 +1,5 @@
 //! Aggregate, process-wide in-memory accounting + backpressure (§1.3). The per-batch `max_bytes`/
-//! `max_rows` caps (PR 2.23) bound **one** batch; they do nothing to stop the *sum* of all in-flight
+//! `max_rows` caps bound **one** batch; they do nothing to stop the *sum* of all in-flight
 //! `(table, xid)` Arrow builders from OOM-killing the pod when a giant open transaction streams faster
 //! than S3 drains. This module adds the aggregate `max_inflight_bytes` ceiling and the shed order.
 //!

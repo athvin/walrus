@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# Multi-stage image for the `walrus-pg-sink` binary (PR 4.8; cargo-chef caching added in PR 5.3).
+# Multi-stage image for the `walrus-pg-sink` binary, with cargo-chef dependency-layer caching.
 # cargo-chef splits the dependency build into a `cook` layer keyed only on the workspace's Cargo
 # manifests, so a source-only change reuses it from the GHA layer cache (`type=gha,mode=max`) and
 # recompiles just the workspace crates.

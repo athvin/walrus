@@ -29,7 +29,7 @@ fn maps_written_object_to_a_stream_ready_row() {
             lsn_start: "0/100".parse().unwrap(),
             lsn_end: "0/A100".parse().unwrap(),
             schema_version: common::SchemaVersionNo(3),
-            // Stream objects never carry a reload_id — only the PR 6.5 chunk exporter sets one.
+            // Stream objects never carry a reload_id — only the chunk exporter sets one.
             reload_id: None,
         }
     );

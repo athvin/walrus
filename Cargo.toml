@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/common", "crates/control", "crates/loader", "crates/pg-sink", "crates/pg-to-arrow", "tests/e2e"] # grows one crate at a time, following the DAG in docs/implementation/README.md
+members = ["crates/common", "crates/control", "crates/loader", "crates/pg-sink", "crates/pg-to-arrow", "tests/e2e"]
 
 [workspace.package]
 edition = "2024" # if-let chains require edition 2024 + Rust 1.88; walrus pins 1.95.0.
 license = "MIT"
-rust-version = "1.95" # MSRV — keep in sync with rust-toolchain.toml; CI `msrv` job fails on drift (PR 4.7)
+rust-version = "1.95" # MSRV — keep in sync with rust-toolchain.toml; CI `msrv` job fails on drift
 # That job reads this line alone, so per-member inheritance is a separate guard: every member takes
 # its floor from here with `rust-version.workspace = true`; one that states its own — or omits the
 # key, leaving Cargo no MSRV to check — fails crates/common/tests/msrv_inherited.rs.
@@ -22,7 +22,7 @@ publish = false
 [workspace.lints.rust]
 warnings = "deny"
 # Every public type must format under `{:?}` for diagnostics and tracing. This rustc lint is
-# allow-by-default, so the warnings group does not enable it (PR 13.1).
+# allow-by-default, so the warnings group does not enable it.
 missing_debug_implementations = "deny"
 # The rustc `unsafe-code` lint is allow-by-default, so `warnings = "deny"` never reaches it.
 # `forbid` prevents a member from reopening the door with an allow attribute; walrus has no sites.
@@ -117,8 +117,8 @@ complexity = { level = "deny", priority = -1 }
 # rather than walrus. Four of its lints read their limits from `clippy.toml` instead of from here,
 # so *raising* one silences the lint with this deny still in place: walrus lowers
 # `enum-variant-size-threshold` to 64 — under a third of clippy's default — and leaves
-# `large-error-threshold`, `too-large-for-stack` and `array-size-threshold` unstated, PR 9.7 having
-# recorded that a threshold move is a separate, noisier decision. No lint named below belongs to
+# `large-error-threshold`, `too-large-for-stack` and `array-size-threshold` unstated because a
+# threshold move is a separate, noisier decision. No lint named below belongs to
 # this group: its nearest neighbours here are pedantic or nursery (`large_types_passed_by_value`,
 # `large_stack_arrays`, `large_futures`, `large_stack_frames`, `redundant_clone`), and
 # `format_push_string` / `rc_buffer` are restriction. So `priority = -1` is required here for
@@ -148,7 +148,7 @@ perf = { level = "deny", priority = -1 }
 #     table: duplicated crate names fill the lock file (ahash, bitflags, getrandom, hashbrown, rand,
 #     rustix, syn, thiserror, windows-sys, …), every pair created by a transitive resolution rather
 #     than by a walrus pin. deny.toml's `[bans] multiple-versions` already owns that question and
-#     deliberately holds it at "warn" until the tree is de-duplicated (PR 4.7); the allow below keeps
+#     deliberately holds it at "warn" until the tree is de-duplicated; the allow below keeps
 #     the decision in the one file that can act on it — with a `skip` list and a per-crate reason —
 #     rather than restating it here, where the two spellings could only drift apart.
 # `priority = -1` is required for the reason the five groups above give, and for one more: the allow
@@ -157,8 +157,8 @@ perf = { level = "deny", priority = -1 }
 # crates/common/tests/workspace_lints_inherited.rs notices if either line drifts.
 cargo = { level = "deny", priority = -1 }
 multiple_crate_versions = "allow"
-# Phase 26 keeps ordered sequences contiguous. `linkedlist` is pedantic (outside `clippy::all`),
-# so this named deny needs no group-priority adjustment.
+# Ordered sequences stay contiguous. `linkedlist` is pedantic (outside `clippy::all`), so this
+# named deny needs no group-priority adjustment.
 linkedlist = "deny"
 # `redundant_closure_for_method_calls` is pedantic (outside `clippy::all`), so no `priority`
 # juggling is needed. Prefer the direct method item over a non-capturing forwarding adapter.
@@ -180,7 +180,7 @@ match_wildcard_for_single_variants = "deny"
 # are pedantic, outside `clippy::all`, so none needs a `priority`. The two members of the same
 # recommended set that stay out — `doc_markdown`, which is really a curated `doc-valid-idents`
 # allow-list, and `unused_self`, which `avoid-breaking-exported-api` narrows to the two binary
-# crates — are argued in docs/implementation/notes/rust-skills/lint-pedantic-selective.md.
+# crates — are intentionally left at their defaults.
 #
 # `unnested_or_patterns` had four sites: three copies of `Some("yaml") | Some("yml")` in the config
 # loaders, where repeating the constructor hid that the choice is between two extensions and not two
@@ -214,12 +214,12 @@ manual_let_else = "deny"
 # This lint is pedantic (outside `clippy::all`), so no priority juggling is needed.
 match_bool = "deny"
 # Pure public computations must warn when their returned value is discarded. This pedantic lint is
-# outside `clippy::all`, so it needs no group priority adjustment (PR 13.2).
+# outside `clippy::all`, so it needs no group priority adjustment.
 must_use_candidate = "deny"
 # A consuming builder's `-> Self` is worthless if dropped. This pedantic lint is outside
-# `clippy::all`, so it needs no group priority adjustment (PR 13.9).
+# `clippy::all`, so it needs no group priority adjustment.
 return_self_not_must_use = "deny"
-# Named explicitly (PR 13.4) so the rule survives a future regrouping of `clippy::all`.
+# Named explicitly so the rule survives a future regrouping of `clippy::all`.
 from_over_into = "deny"
 # `ptr_arg` already arrives via `all = "deny"`; pin it explicitly so the borrowed-argument family is
 # documented together. `ref_option` is pedantic (outside `all`), so no priority juggling is needed.
@@ -232,7 +232,7 @@ assigning_clones = "deny"
 format_push_string = "deny"
 # Pedantic: keep small `Copy` values passed by value once the rustc lint above finds them.
 trivially_copy_pass_by_ref = "deny"
-# No `unwrap`/`expect` in production (PR 7.6 cleaned the tree). Both are `clippy::restriction` lints
+# No `unwrap`/`expect` in production. Both are `clippy::restriction` lints
 # (not in `all`), so no `priority` juggling is needed. `clippy.toml` re-allows them under `#[cfg(test)]`
 # and integration `tests/`; benches (`harness = false`) and the e2e harness lib carry a file-level allow.
 unwrap_used = "deny"
@@ -255,30 +255,30 @@ print_stderr = "deny"
 # it does for the key that would hollow it out from the other side: `clippy.toml`'s
 # `allow-dbg-in-tests`, left unstated there for the reason the perf thresholds are.
 dbg_macro = "deny"
-# This nursery lint is outside `clippy::all`, so no `priority` juggling is needed. It is the
-# mutable-borrow gate walrus lacked; see docs/implementation/notes/rust-skills/conv-asmut-mutable.md.
+# This nursery lint is outside `clippy::all`, so no `priority` juggling is needed. It rejects
+# mutable references that are only read, keeping mutability contracts honest.
 needless_pass_by_ref_mut = "deny"
-# Pure stable-const functions are compile-time callable by policy (PR 21.1). This nursery lint is
+# Pure stable-const functions are compile-time callable by policy. This nursery lint is
 # outside `clippy::all`, so no group-vs-lint `priority` adjustment is needed.
 missing_const_for_fn = "deny"
-# Globals use std: `OnceLock`/`LazyLock`/atomics, never hand-rolled lazy statics (PR 21.2). This
-# pedantic lint is outside `clippy::all`, so it needs no `priority` today. If Phase 33 enables the
-# whole `pedantic` group at this level, revisit this named entry.
+# Globals use std: `OnceLock`/`LazyLock`/atomics, never hand-rolled lazy statics. This pedantic lint
+# is outside `clippy::all`, so it needs no `priority` today. Revisit the named entry if the whole
+# `pedantic` group is enabled at this level.
 non_std_lazy_statics = "deny"
 # A discarded `Result`/`#[must_use]` value must be an explicit, argued decision. Test targets
 # re-allow this through their existing unwrap/expect carve-outs.
 let_underscore_must_use = "deny"
-# Lossy integer casts are explicit policy (PR 17.3). These pedantic lints are outside `all`; a
+# Lossy integer casts are explicit policy. These pedantic lints are outside `all`; a
 # surviving bit-pattern reinterpretation needs a scoped allow with a reason. `cast_precision_loss`
 # deliberately stays allowed: metrics gauges/ratios and sqlx float8 binds require f64.
 cast_possible_truncation = "deny"
 cast_sign_loss = "deny"
 cast_possible_wrap = "deny"
 cast_lossless = "deny"
-# Float equality is never exact by accident (PR 17.5). Test comparisons use documented tolerance
+# Float equality is never exact by accident. Test comparisons use documented tolerance
 # helpers; special values use `is_nan`/`is_infinite` predicates instead of lint suppression.
 float_cmp = "deny"
-# Forced inlining must cite a measured win (PR 16.4). This pedantic lint is outside `clippy::all`,
+# Forced inlining must cite a measured win. This pedantic lint is outside `clippy::all`,
 # so it needs no priority. The escape hatch is a site-local Clippy allow with a reason citing its
 # `docs/benchmarks.md` delta.
 inline_always = "deny"
@@ -316,12 +316,12 @@ todo = "deny"               # unfinished code must not reach main
 unimplemented = "deny"      # the one deferred stub carries a scoped, fulfilled expectation
 unreachable = "deny"        # exhaustive matches turn impossible states into compile-time checks
 panic_in_result_fn = "deny" # a function that can return failure must not panic instead
-# Lock scope is a correctness property on the decode hot path (PR 9.11, `own-mutex-interior`):
+# Lock scope is a correctness property on the decode hot path (`own-mutex-interior`):
 # matching directly on `self.x.lock().remove(..)` holds the guard for the whole body. These nursery
 # lints are outside `clippy::all`, so no priority is needed.
 significant_drop_in_scrutinee = "deny"
 significant_drop_tightening = "deny"
-# Async guards and RefCell borrows must never remain live across a suspension point (PR 14.3).
+# Async guards and RefCell borrows must never remain live across a suspension point.
 # The first two know their guard types; `await_holding_invalid_type` reads its list from
 # `clippy.toml`'s `await-holding-invalid-types`, which names the lock-shaped guards the other two
 # miss (today: `tokio::sync::watch::Ref`).
@@ -329,17 +329,17 @@ await_holding_lock = "deny"
 await_holding_refcell_ref = "deny"
 await_holding_invalid_type = "deny"
 # Non-Send futures cannot be spawned onto Tokio's multi-thread scheduler. The loader is the
-# documented exception: DuckDB-backed workers are intentionally driven on a LocalSet (PR 14.8).
+# documented exception: DuckDB-backed workers are intentionally driven on a LocalSet.
 future_not_send = "deny"
-# Shared-ownership bumps must say they are bumps (PR 9.8, `own-arc-shared`). Like `unwrap_used` /
+# Shared-ownership bumps must say they are bumps (`own-arc-shared`). Like `unwrap_used` /
 # `expect_used`, this is one `clippy::restriction` lint rather than the whole group; it is outside
 # `clippy::all`, so no `priority` is needed.
 clone_on_ref_ptr = "deny"
-# No refcounted pointer to a growable buffer (PR 9.9, `own-rc-single-thread`): `Rc<Vec<T>>` /
+# No refcounted pointer to a growable buffer (`own-rc-single-thread`): `Rc<Vec<T>>` /
 # `Arc<String>` add an indirection where `Rc<[T]>` / `Arc<str>` are one. Like `unwrap_used` and
 # `expect_used`, this is one `clippy::restriction` lint outside `clippy::all`, so no priority.
 rc_buffer = "deny"
-# Large-value gates (PR 9.7, `own-move-large`). All four measured 0 sites across the 51-lint
+# Large-value gates (`own-move-large`). All four measured 0 sites across the 51-lint
 # pedantic+nursery sweep, so they only stop regressions on the per-WAL-message move path. They are
 # outside `clippy::all`, so no `priority` field is needed.
 large_types_passed_by_value = "deny"
@@ -372,9 +372,9 @@ self_named_module_files = "deny"
 # nursery lint is unfinished by definition, so the column of re-allows underneath it would have to be
 # re-argued on every toolchain bump, as heuristics tighten and names graduate out into `style`,
 # `pedantic` or `perf`. Ten members are already denied above, each argued where it sits rather than
-# swept in by a group: `significant_drop_in_scrutinee` and `significant_drop_tightening` (lock scope,
-# PR 9.11), `needless_pass_by_ref_mut`, `missing_const_for_fn` (PR 21.1), `future_not_send`
-# (PR 14.8), `redundant_clone`, `elidable_lifetime_names`, `large_stack_frames` (PR 9.7),
+# swept in by a group: `significant_drop_in_scrutinee` and `significant_drop_tightening` (lock
+# scope), `needless_pass_by_ref_mut`, `missing_const_for_fn`, `future_not_send`, `redundant_clone`,
+# `elidable_lifetime_names`, `large_stack_frames`,
 # `type_repetition_in_bounds` and `trait_duplication_in_bounds`.
 #
 # The two entries below finish that pick against the recommended starter set, and the fifth member
@@ -412,7 +412,7 @@ common = { path = "crates/common" }
 control = { path = "crates/control" }
 pg-to-arrow = { path = "crates/pg-to-arrow" }
 
-# Shared version pins land here as later PRs add deps (tracing, sqlx, arrow, …).
+# Shared version pins live here so every workspace member resolves the same dependency versions.
 thiserror = "2"
 serde = "1"
 serde_json = "1"
@@ -432,35 +432,35 @@ tokio = "1"
 sqlx = "0.8"
 anyhow = "1"
 hex = "0.4"
-# Non-poisoning mutex (PR 7.6): `.lock()` returns the guard directly, so there is no `unwrap`/`expect`
-# on the lock — the clean fit for the `clippy::unwrap_used`/`expect_used` deny (PR 7.7). Already in the
+# Non-poisoning mutex: `.lock()` returns the guard directly, so there is no `unwrap`/`expect`
+# on the lock — the clean fit for the `clippy::unwrap_used`/`expect_used` deny. Already in the
 # lock file (transitive), MIT/Apache: a zero-cost direct-dep promotion.
 parking_lot = "0.12"
-# Pinned to EXACT versions (PR 2.16): DuckDB reads a native `UUID` only when arrow-rs annotates the
+# Pinned to EXACT versions: DuckDB reads a native `UUID` only when arrow-rs annotates the
 # FixedSizeBinary(16) with the `arrow.uuid` canonical extension → Parquet UUID logical type. That
 # annotation is behaviour a minor bump could change, so the (CI-guarded) uuid mapping pins arrow +
 # parquet, and duckdb is pinned alongside for a stable read-back. §2.4 uuid.
 arrow = "=54.3.1"
 parquet = "=54.3.1"
 # `1.10504.0` encodes DuckDB engine v1.5.4 (duckdb-rs scheme since v1.5.0: minor=(N/100)%100,
-# patch=N%100). Latest published duckdb-rs, already past the 1.4.x LTS — see the LTS evaluation in
-# docs/implementation/notes/duckdb-lts-bump.md (PR 5.9).
+# patch=N%100). Keep this exact pin aligned with the Arrow/Parquet conformance suite before
+# upgrading because DuckDB's inferred logical types are part of the wire contract.
 duckdb = "=1.10504.0"
 uuid = "1"
 tempfile = "3"
-# Sink binary (PR 2.18): health endpoints, cancellation, object-store canary.
+# Sink binary: health endpoints, cancellation, object-store canary.
 axum = "0.7"
 tokio-util = "0.7"
 object_store = "0.11"
-# Replication-capable source connection + catalog preflight (PR 2.19); START_REPLICATION (PR 2.20).
+# Replication-capable source connection + catalog preflight; START_REPLICATION.
 tokio-postgres = "0.7"
-# Hand-rolled replication wire protocol (PR 2.20): big-endian LSNs / clocks in CopyBoth frames.
+# Hand-rolled replication wire protocol: big-endian LSNs / clocks in CopyBoth frames.
 byteorder = "1"
-# Observability (PR 4.10): a metrics facade + a Prometheus recorder. default-features off — we render
+# Observability: a metrics facade + a Prometheus recorder. default-features off — we render
 # the text exposition through the existing axum health server, not the crate's own hyper listener.
 metrics = "0.23"
 metrics-exporter-prometheus = { version = "0.15", default-features = false }
-# Micro-benchmark harness (PR 5.4). default-features off drops plotters/rayon/html_reports — we want
+# Micro-benchmark harness. default-features off drops plotters/rayon/html_reports — we want
 # the stdout stats, not the HTML plots, and a lean dev-dep tree (this phase is about *cutting* build
 # cost). `cargo_bench_support` is what makes `harness = false` + `criterion_main!` run under `cargo bench`.
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
@@ -471,20 +471,17 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 # the `bit-set` shrinker, keeping the dev-dep tree lean exactly as the criterion pin above does.
 proptest = { version = "1", default-features = false, features = ["std"] }
 
-# Release-artifact tuning (PR 5.7). Thin LTO inlines across crate boundaries — a real win on the
+# Release-artifact tuning. Thin LTO inlines across crate boundaries — a real win on the
 # dispatch-heavy hot paths (Arrow `append_value` downcasts, the decoder match arms) for ~10-20 % extra
-# link time, measured on the PR 5.4 suite. `codegen-units` is left at the default: cgu=1 buys only a
-# few percent more for ~2× the release build — a bad trade for a project whose Phase-5 north star is
-# *cutting* CI/Docker build time (PRs 5.1-5.3), and the bench inherits `release` so the numbers count.
-# Rejection recorded in full (with the re-open trigger) in
-# docs/implementation/notes/rust-skills/opt-codegen-units.md — guarded by crates/common/tests/build_profile.rs.
+# link time, measured on the benchmark suite. `codegen-units` is left at the default: cgu=1 buys
+# only a few percent more for ~2× the release build, a poor trade while CI and container build time
+# remain significant. `crates/common/tests/build_profile.rs` guards that choice.
 # `panic` and `strip` are the two remaining knobs of that family, and both keep their defaults for
 # behavioural rather than build-cost reasons: unwinding is what lets crates/pg-sink/src/reload.rs
 # classify a panicking reload exporter instead of taking the whole sink down with it, and the symbol
 # table is what names the frames in a profile of the release — and, by inheritance, `bench` — binary.
-# Recorded, with the dedicated symbolized-profiling exception and dev-override rejections, in
-# docs/implementation/notes/rust-skills/perf-release-profile.md and docs/benchmarks.md — the same
-# guard requires that exception to inherit release without changing code generation.
+# `docs/benchmarks.md` records the profiling method; the same build-profile guard requires the
+# symbolized profiling exception to inherit release without changing code generation.
 [profile.release]
 lto = "thin"
 

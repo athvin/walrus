@@ -64,7 +64,7 @@ fn a_parquet_failure_converts_into_the_encode_class() {
 /// the store only ever tries (and fails) to remove it.
 ///
 /// What this pins is the classification, not the transport. `ParquetSink::delete` is the best-effort
-/// cleanup for an aborted streamed txn's speculative files (PR 2.30), and "best-effort" must mean
+/// cleanup for an aborted streamed txn's speculative files, and "best-effort" must mean
 /// *reported*, never *swallowed*: a store refusal stays `SinkError::Store` →
 /// `common::Error::ObjectStore` — the transient class — and is never folded into the terminal
 /// `Encode` side asserted above.

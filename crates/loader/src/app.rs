@@ -30,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 pub async fn run(cfg: LoaderConfig) -> Result<(), LoaderError> {
     let token = crate::shutdown::install_signal_handlers();
     let state = LoaderState::new();
-    // Install the Prometheus recorder before anything can serve /metrics or emit a series (PR 4.10).
+    // Install the Prometheus recorder before anything can serve /metrics or emit a series.
     common::metrics::init();
 
     // Bind health *before* bootstrap so `/startup` answers 503 while the lease + DuckDB open proceed.
@@ -77,7 +77,7 @@ async fn pipeline(
     state.mark_ready();
     let keys: Vec<(String, String)> = owned.iter().map(bootstrap::OwnedTable::to_key).collect();
     // Zero-init every per-table loader series so /metrics lists the owned tables from the first scrape,
-    // before any apply cycle has moved a needle (PR 4.10).
+    // before any apply cycle has moved a needle.
     for (schema, table) in &keys {
         common::metrics::init_table_series(&format!("{schema}.{table}"));
     }
@@ -114,8 +114,7 @@ async fn pipeline(
     // an interior `RefCell`, so a future holding `&TableCtx` is not `Send` and cannot go to
     // `tokio::spawn`. The loops run on a `LocalSet` (this thread), the whole parallelism model being
     // one worker task per `.duckdb` file. Those tasks all share this one driver thread, so a long
-    // compaction stalls its siblings; see
-    // docs/implementation/notes/rust-skills/async-spawn-blocking.md.
+    // compaction stalls its siblings; isolate owned connections only if profiling justifies it.
     let local = tokio::task::LocalSet::new();
     let (failures_tx, failures_rx) = crate::supervisor::failure_channel(keys.len());
     // A `JoinSet` rather than a `Vec<JoinHandle>`: the worker count is whatever bootstrap owns, so

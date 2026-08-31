@@ -6,7 +6,7 @@
 //! Compose-gated integration tests for `schema_registry` and `ddl_manifest`.
 //!
 //! Each test runs inside a rolled-back transaction under a unique `epoch`. Gated behind the
-//! `integration` feature (needs the PR 0.6 control PG).
+//! `integration` feature (needs the compose control PG).
 #![cfg(feature = "integration")]
 
 use common::{DdlId, EpochNo, Lsn, SchemaVersionNo, Tier, TypeDescriptor, TypeMeta};

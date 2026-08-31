@@ -155,7 +155,7 @@ fn op_and_lsn_keys_serialize_as_documented() {
     let v: serde_json::Value =
         serde_json::from_str(&serde_json::to_string(&meta).unwrap()).unwrap();
     assert_eq!(v["op"], "u");
-    // Lsn fields render as zero-padded 16-hex (reusing the PR 0.3 newtype).
+    // Lsn fields render through the shared zero-padded 16-hex newtype.
     assert_eq!(v["lsn"], "00000000019A2B3C");
     assert_eq!(v["commit_lsn"], "0000000001B4C000");
 }
@@ -231,7 +231,7 @@ fn deserializes_the_docs_example_block() {
 
 #[test]
 fn amortized_meta_matches_full() {
-    // The amortized `{const,row}` splice (PR 5.7) must be byte-equivalent (key order aside) to
+    // The amortized `{const,row}` splice must be byte-equivalent (key order aside) to
     // `serde_json::to_string(SinkMeta)` — with AND without unchanged-TOAST columns.
     let base: SinkMeta = serde_json::from_str(DOCS_EXAMPLE).unwrap();
     for toast in [vec!["blob_col".to_string()], Vec::new()] {

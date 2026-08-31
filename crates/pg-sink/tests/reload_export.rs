@@ -11,7 +11,7 @@
 //! with the publication hint. The SQL/stamp shapes are unit-tested in `src/reload_export.rs`.
 //!
 //! Each test spins a mini echo-resolver: a real slot + `on_frame` + `PendingSignals` resolving
-//! the shared `WatermarkWaiters` — the decode-loop half of echo-wait (PR 6.3), which the engine
+//! the shared `WatermarkWaiters` — the decode-loop half of echo-wait, which the engine
 //! blocks on.
 //!
 //!   cargo test -p pg-sink --test reload_export -- --ignored --test-threads=1
@@ -428,7 +428,7 @@ async fn chunks_cover_the_table_exactly_with_per_chunk_stamps() {
     assert_eq!(
         row.status,
         control::reload::ReloadStatus::Exporting,
-        "export_complete is PR 6.9's"
+        "the controller records export_complete after the exporter drains"
     );
 
     // Read the 3 files back: the union is the table exactly, and EVERY row's meta carries

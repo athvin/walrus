@@ -1,7 +1,7 @@
 //! The pgoutput decoder's structured error taxonomy.
 
 /// Everything that can go wrong decoding a pgoutput message. Variants are *structured* (not
-/// stringly-typed) so callers can branch on them; several are used from later PRs (2.3/2.4).
+/// stringly-typed) so callers can branch on them throughout the decoder and consume loop.
 /// This taxonomy is still growing; new variants must remain additive for downstream crates.
 ///
 /// Comparable like the [`Message`](super::Message) it is the alternative to, so a decode result can

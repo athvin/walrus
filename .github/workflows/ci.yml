@@ -1,13 +1,11 @@
 name: CI
 
-# Every PR and main push runs the baseline gates plus the phase-specific jobs. This is the
-# machine-checked definition of "green" that every later PR in the roadmap inherits
-# (docs/implementation/README.md → "CI grows with the phases"). New gates (compose, sqlx offline,
-# conformance, cargo-deny, kubeconform) switch on in later phases as the code that needs them lands.
-# A cheap roadmap-contract job validates every implementation task on every run. A separate
+# Every pull request and main push runs the repository's baseline gates. The retained roadmap job is
+# a stable branch-protection interface; it exits successfully now that the completed roadmap has
+# been removed, and will reactivate its validator if the roadmap is restored. A separate
 # `changes` job classifies the diff so a docs-only commit skips the compile-heavy jobs
 # (static / clippy / unit / integration / conformance / images / compose); the ungated jobs
-# (supply-chain, msrv, manifests) are seconds each and always run (PR 5.1).
+# (supply-chain, msrv, manifests) are seconds each and always run.
 on:
   push:
     branches: [main]
@@ -311,124 +309,124 @@ jobs:
 
       # The type-descriptor round-trip is #[ignore]-gated (it dev-deps pg-to-arrow); run it explicitly
       # against the live control PG. Reuses the --features integration build from the step above.
-      - name: schema_registry TypeDescriptor round-trip (PR 2.17)
+      - name: schema_registry TypeDescriptor round-trip
         run: cargo test -p control --features integration -- --ignored schema_registry_roundtrips_a_type_descriptor
 
       - name: sqlx offline cache is up to date (cargo sqlx prepare --check)
         run: cargo sqlx prepare --check --workspace
 
-      # PR 2.19: source-side preflight over the live source PG (good source passes; control-pg's
+      # source-side preflight over the live source PG (good source passes; control-pg's
       # wal_level=replica is terminal; keyless table; publication gap).
       - name: Source preflight (compose)
         run: cargo test -p pg-sink --test preflight -- --ignored
 
-      # PR 2.20: the START_REPLICATION transport spike — a source write yields an XLogData frame, and
+      # the START_REPLICATION transport spike — a source write yields an XLogData frame, and
       # standby-status keepalive feedback keeps the connection alive past wal_sender_timeout (5s).
       - name: Replication spike (compose)
         run: cargo test -p pg-sink --test replication_spike -- --ignored
 
-      # PR 2.21: live pgoutput decode — an INSERT decodes to Begin/Relation/Insert/Commit.
+      # live pgoutput decode — an INSERT decodes to Begin/Relation/Insert/Commit.
       - name: Live decode (compose)
         run: cargo test -p pg-sink --test live_decode -- --ignored
 
-      # PR 2.22: relation cache → schema_registry round-trip (first Relation writes a row; hydrate).
+      # relation cache → schema_registry round-trip (first Relation writes a row; hydrate).
       - name: Relation cache (compose)
         run: cargo test -p pg-sink --test relation_cache -- --ignored
 
-      # PR 2.23: micro-batching — a stream of inserts forms and seals a batch.
+      # micro-batching — a stream of inserts forms and seals a batch.
       - name: Batching (compose)
         run: cargo test -p pg-sink --test batching -- --ignored
 
-      # PR 2.24: Arrow → Parquet → S3 PUT — object lands at the epoch key and reads back (MinIO).
+      # Arrow → Parquet → S3 PUT — object lands at the epoch key and reads back (MinIO).
       - name: Parquet S3 PUT (compose)
         run: cargo test -p pg-sink --test parquet_put -- --ignored
 
-      # PR 2.25: manifest INSERT — object + ready row both exist; lsn_end == commit LSN.
+      # manifest INSERT — object + ready row both exist; lsn_end == commit LSN.
       - name: Manifest insert (compose)
         run: cargo test -p pg-sink --test manifest_insert -- --ignored
 
-      # PR 2.26: durability checkpoint — confirmed_flush_lsn advances to a batch's lsn_end only after
+      # durability checkpoint — confirmed_flush_lsn advances to a batch's lsn_end only after
       # the S3 PUT + manifest commit; a crash before the standby update re-streams (at-least-once).
       - name: Durability checkpoint (compose)
         run: cargo test -p pg-sink --test durability -- --ignored --test-threads=1
 
-      # PR 2.27: idle heartbeat — an idle publication beats after idle_after, the beat_seq returns
+      # idle heartbeat — an idle publication beats after idle_after, the beat_seq returns
       # through the stream, confirmed_flush_lsn advances, and the beat is never staged to a manifest.
       - name: Heartbeat liveness (compose)
         run: cargo test -p pg-sink --test heartbeat_liveness -- --ignored --test-threads=1
 
-      # PR 2.28: graceful drain — SIGTERM flushes the in-flight committed batch + manifest, advances
+      # graceful drain — SIGTERM flushes the in-flight committed batch + manifest, advances
       # confirmed_flush via a final standby update, sends CopyDone, never drops the slot, and resumes.
       - name: Graceful shutdown drain (compose)
         run: cargo test -p pg-sink --test graceful_shutdown -- --ignored --test-threads=1
 
-      # PR 2.29: snapshot backfill — preloaded rows produce kind='snapshot' files sharing one
+      # snapshot backfill — preloaded rows produce kind='snapshot' files sharing one
       # lsn_end=consistent_point; a row written after the export streams once (no double count).
       - name: Snapshot backfill (compose)
         run: cargo test -p pg-sink --test snapshot_backfill -- --ignored --test-threads=1
 
-      # PR 2.30: large-txn streaming — an 8000-row txn (logical_decoding_work_mem=64kB) writes ready
+      # large-txn streaming — an 8000-row txn (logical_decoding_work_mem=64kB) writes ready
       # rows only after Stream Commit; a whole-txn abort writes none.
       - name: Streaming large txn (compose)
         run: cargo test -p pg-sink --test streaming_large_txn -- --ignored --test-threads=1
 
-      # PR 2.31: the flagship — a rolled-back savepoint inside a committing streamed txn (proto §9b)
+      # the flagship — a rolled-back savepoint inside a committing streamed txn (proto §9b)
       # yields a ready file with EXACTLY 6000 rows; the rolled-back sub-xid's rows are never present.
       - name: Sub-transaction exclusion (compose)
         run: cargo test -p pg-sink --test subtransaction_exclusion -- --ignored --test-threads=1
 
-      # PR 2.32: aggregate max_inflight_bytes — a large open txn under a low ceiling spills
+      # aggregate max_inflight_bytes — a large open txn under a low ceiling spills
       # speculatively (spill_count increments), memory stays bounded, and the slot is never advanced.
       - name: Max inflight bytes (compose)
         run: cargo test -p pg-sink --test max_inflight_bytes -- --ignored --test-threads=1
 
-      # PR 2.33: DDL capture — an ALTER ADD COLUMN writes a ddl_manifest row (c_lsn), bumps the
+      # DDL capture — an ALTER ADD COLUMN writes a ddl_manifest row (c_lsn), bumps the
       # structural schema_version + cuts a fresh file; a COMMENT is metadata-only; internal never staged.
       - name: DDL capture (compose)
         run: cargo test -p pg-sink --test ddl_capture -- --ignored --test-threads=1
 
-      # PR 6.2: the reload signal table — a signal INSERT is decode-visible through the slot
+      # the reload signal table — a signal INSERT is decode-visible through the slot
       # (wal_insert_lsn stamped by the DEFAULT), backfill never copies it, and preflight is terminal
       # on a missing/unpublished table (or heals the gap under manage_publication).
       - name: Reload signal (compose)
         run: cargo test -p pg-sink --test reload_signal -- --ignored --test-threads=1
 
-      # PR 6.3: echo routing — a manual reload_signal INSERT resolves a subscribed watermark waiter
+      # echo routing — a manual reload_signal INSERT resolves a subscribed watermark waiter
       # with the txn's COMMIT LSN (embedded < commit cross-check holds) and never reaches a
       # batcher / Parquet file / manifest row.
       - name: Reload echo (compose)
         run: cargo test -p pg-sink --test reload_echo -- --ignored --test-threads=1
 
-      # PR 6.4: the reload controller — pickup flips requested → exporting with a live, advancing
+      # the reload controller — pickup flips requested → exporting with a live, advancing
       # lease; unpublished/keyless/resync requests fail fast with reasons; cap=2 holds under three
       # requests while the stream keeps flowing.
       - name: Reload pickup (compose)
         run: cargo test -p pg-sink --test reload_pickup -- --ignored --test-threads=1
 
-      # PR 6.5: the chunk export engine — 2,500 rows at chunk_rows=1000 ⇒ exactly 3 kind='reload'
+      # the chunk export engine — 2,500 rows at chunk_rows=1000 ⇒ exactly 3 kind='reload'
       # files whose union is the table, every row stamped commit_lsn = lsn = L_i; cursor resume
       # never re-exports; a never-arriving echo fails loudly with the publication hint.
       - name: Reload export (compose)
         run: cargo test -p pg-sink --test reload_export -- --ignored --test-threads=1
 
-      # PR 6.8: restart-on-DDL — an ALTER between chunks trips the staleness check ⇒ old attempt
+      # restart-on-DDL — an ALTER between chunks trips the staleness check ⇒ old attempt
       # failed + chunk files purged + a successor exporting at restart_count=1 re-exporting at the
       # new schema; a cap of 0 fails the reload outright, no successor, both metrics move.
       - name: Reload DDL restart (compose)
         run: cargo test -p pg-sink --test reload_ddl -- --ignored --test-threads=1
 
-      # PR 6.9: completion & crash recovery — a dropped export is adopted from control-pg and
+      # completion & crash recovery — a dropped export is adopted from control-pg and
       # resumes from the cursor (no re-export), flips export_complete(H); the loader flips complete
       # only once transformed_lsn ≥ H; a live foreign lease is never stolen, an expired one is.
       - name: Reload recovery (compose)
         run: cargo test -p pg-sink --test reload_recovery -- --ignored --test-threads=1
 
-      # PR 6.11: reload observability — the chunk/row/echo metrics MOVE during an export, the failed
+      # reload observability — the chunk/row/echo metrics MOVE during an export, the failed
       # counter ticks on an echo timeout, and the active gauge rises to 1 then returns to 0.
       - name: Reload metrics (compose)
         run: cargo test -p pg-sink --test reload_metrics -- --ignored --test-threads=1
 
-      # PR 2.18/2.19: the sink pod-lifecycle shell against the live stack — full bootstrap (control +
+      # the sink pod-lifecycle shell against the live stack — full bootstrap (control +
       # S3 + source preflight) → /startup→/ready flip, SIGTERM exit 0, missing control DB → exit 11.
       - name: Sink pod-lifecycle smoke (health · SIGTERM · fail-fast exit code)
         run: bash scripts/sink-smoke.sh
@@ -532,7 +530,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    # A DEDICATED job (PR 6.12): the e2e harness spawns the real sink+loader binaries — its
+    # A DEDICATED job: the e2e harness spawns the real sink+loader binaries — its
     # `build_bins` compiles the bundled DuckDB in the DEV profile ON TOP of the test-profile builds,
     # which overflowed the integration runner's disk ("No space left on device"). A fresh runner with
     # only the e2e crate's builds stays under the ceiling.
@@ -593,7 +591,7 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     env:
-      # sccache: cache rustc + the DuckDB C++ objects across jobs/profiles/Cargo.lock (PR 5.2).
+      # sccache: cache rustc + the DuckDB C++ objects across jobs/profiles/Cargo.lock.
       RUSTC_WRAPPER: sccache
       CC: sccache cc
       CXX: sccache c++
@@ -627,7 +625,7 @@ jobs:
         if: always()
         run: bash .github/scripts/sccache-summary.sh conformance
 
-  # PR 4.7: supply-chain gate. `cargo deny check` runs all four families (advisories / licenses /
+  # supply-chain gate. `cargo deny check` runs all four families (advisories / licenses /
   # bans / sources) against Cargo.lock — no crate compilation, so this job is fast and needs no
   # DuckDB build. cargo-deny is pinned to an exact version (matching the one deny.toml was authored
   # against) so a new release can't silently change the gate; new RUSTSEC advisories still surface,
@@ -646,20 +644,18 @@ jobs:
       - name: cargo deny check
         run: cargo deny check
 
-      # PR 24.7/24.8: walrus authors no proc-macros. Three workspace-shape invariants: no direct
+      # walrus authors no proc-macros. Three workspace-shape invariants: no direct
       # syn/quote/proc-macro2 dependency, no proc-macro member, and exactly six workspace packages.
       - name: No proc-macro toolchain (direct deps · proc-macro crate · member count)
         run: bash scripts/proc-macro-guard.sh --check
 
-      # PR 11.17: Phase 11 declined five allocator/container crates, the `perf-ahash` audit declined
-      # the three faster-hasher crates, and the `anti-premature-optimize` audit the four
-      # global-allocator swaps — each with an ADR under docs/implementation/notes/. This keeps them
-      # out of member manifests; transitive presence in Cargo.lock is fine and expected (ahash
-      # already arrives through arrow).
-      - name: No speculative allocator/container/hasher deps (declined-crate ADRs)
+      # Keep unmeasured container, hasher, and global-allocator substitutions out of member
+      # manifests. Their transitive presence in Cargo.lock is fine and expected (ahash already
+      # arrives through arrow).
+      - name: No speculative allocator/container/hasher deps
         run: bash scripts/no-speculative-deps.sh
 
-  # PR 4.7: MSRV drift guard. walrus pins one exact stable in rust-toolchain.toml and every job above
+  # MSRV drift guard. walrus pins one exact stable in rust-toolchain.toml and every job above
   # builds + tests on it, so CI already builds on the MSRV — this job's role is to fail fast if the
   # declared MSRV (Cargo.toml [workspace.package].rust-version) and the pinned toolchain channel ever
   # diverge, turning a toolchain drift into an explicit CI failure instead of a mystery build break.
@@ -686,7 +682,7 @@ jobs:
           fi
           echo "ok: the gates/integration/conformance jobs build on this exact toolchain, i.e. on the MSRV ($declared)."
 
-  # PR 4.8: container images. Build both multi-stage Dockerfiles, then run the PID-1 SIGTERM smoke
+  # container images. Build both multi-stage Dockerfiles, then run the PID-1 SIGTERM smoke
   # (scripts/image-smoke.sh): boot compose, drive the sink to `streaming` and the loader to its apply
   # loops, SIGTERM each, and assert a graceful exit 0 (not 137/SIGKILL). The loader image cold-builds
   # the bundled DuckDB C++, so this job is slow like the other DuckDB jobs.
@@ -735,7 +731,7 @@ jobs:
         if: always()
         run: docker compose -f deploy/docker/docker-compose.yml down -v || true
 
-  # PR 4.9: Kubernetes manifests. Render the kustomize base (LoadRestrictionsNone — the slot-init
+  # Kubernetes manifests. Render the kustomize base (LoadRestrictionsNone — the slot-init
   # ConfigMap is generated from the real migrations/source/*.sql outside base/) and schema-validate every
   # resource with kubeconform in strict mode against a pinned API version. Fast, no cluster required.
   manifests:

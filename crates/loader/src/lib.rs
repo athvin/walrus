@@ -11,9 +11,9 @@
 )]
 
 //! `walrus-loader` — reads the sink's staged Parquet from S3 and materialises it into per-table DuckDB
-//! files (`<table>` mirror + `<table>_raw` CDC log). This PR is the first vertical slice: the ordered
-//! fail-fast [`bootstrap`] that proves exclusive ownership (control-plane [`lease`] + DuckDB file lock)
-//! and stands up [`health`] — no manifest file is claimed yet (that is PR 3.2).
+//! files (`<table>` mirror + `<table>_raw` CDC log). The ordered fail-fast [`bootstrap`] proves
+//! exclusive ownership (control-plane [`lease`] + DuckDB file lock) before manifest claiming and
+//! apply work begin, while [`health`] exposes the service state.
 //!
 //! [`app`] is the entry point: [`app::run`] is the whole service lifecycle, so the `walrus-loader`
 //! binary (`src/main.rs`) is only config, tracing, a runtime and an exit code.

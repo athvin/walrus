@@ -12,8 +12,7 @@
 //! Golden-vector fixtures for the pgoutput decoder — a faithful, byte-for-byte port of
 //! `docs/examples/proto-version/test_decode_pgoutput.py::VECTORS`.
 //!
-//! PRs 2.2–2.8 turn the vectors on family-by-family, TDD-style. PR 2.2 lights up `begin`, `commit`,
-//! and the `parse_stream` framing.
+//! The tests exercise every supported message family plus `parse_stream` framing.
 
 use common::{ReplicaIdentity, TupleValue};
 use pg_sink::pgoutput::{
@@ -316,7 +315,7 @@ fn fmt_lsn(v: u64) -> String {
 
 /// µs-since-2000 → Python `datetime.isoformat()` (`YYYY-MM-DDThh:mm:ss[.ffffff]+00:00`). The test
 /// crate reproduces Python's rendering to diff against the golden line; production uses `SinkMeta`'s
-/// RFC-3339 `Z` stamp (PR 1.1). Formatted by hand (not jiff's `Display`, which trims trailing
+/// RFC-3339 `Z` stamp. Formatted by hand (not jiff's `Display`, which trims trailing
 /// fractional zeros — `.914880` would render `.91488`).
 fn fmt_ts(micros_since_2000: i64) -> String {
     let ts = jiff::Timestamp::from_microsecond(micros_since_2000 + common::PG_EPOCH_UNIX_MICROS)

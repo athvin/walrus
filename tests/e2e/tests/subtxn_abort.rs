@@ -3,8 +3,8 @@
     clippy::expect_used,
     reason = "integration test — unwrap/expect fine in setup + helpers"
 )]
-//! End-to-end streamed sub-transaction abort (`architecture.md` "Streamed sub-transaction abort", PR
-//! 2.31): a committed top-level txn with a rolled-back savepoint materialises ONLY the surviving rows in
+//! End-to-end streamed sub-transaction abort (`architecture.md` "Streamed sub-transaction abort"):
+//! a committed top-level txn with a rolled-back savepoint materialises ONLY the surviving rows in
 //! `<table>_raw` — the exact 6000 count is unforgiving so an off-by-one in subxact tracking shows up.
 //!
 //!   cargo test -p e2e --features it -- --ignored

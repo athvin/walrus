@@ -300,22 +300,22 @@ fn comment_mirrored_onto_mirror_only_not_raw() {
     assert_eq!(raw_comment, None, "COMMENT never touches <table>_raw");
 }
 
-// ---- Destructive / lossy changes are deferred to PR 3.9 — an explicit error, never a silent cast. ----
+// ---- Additive-only entry point: destructive/lossy changes return an explicit error. ----
 #[test]
-fn destructive_and_lossy_changes_are_errors_deferred_to_3_9() {
+fn destructive_and_lossy_changes_are_errors_in_additive_path() {
     // A dropped column (fewer columns) → error.
     let drop = diff_additive(
         &sv(1, rel("t", vec![col("id", 23, true), col("x", 25, false)])),
         &sv(2, rel("t", vec![col("id", 23, true)])),
     );
-    assert!(drop.is_err(), "a DROP COLUMN is destructive → PR 3.9");
+    assert!(drop.is_err(), "a DROP COLUMN is destructive");
 
     // A narrowing cast (int8→int4) → error.
     let narrow = diff_additive(
         &sv(1, rel("t", vec![col("id", 23, true), col("n", 20, false)])),
         &sv(2, rel("t", vec![col("id", 23, true), col("n", 23, false)])),
     );
-    assert!(narrow.is_err(), "a narrowing type change is lossy → PR 3.9");
+    assert!(narrow.is_err(), "a narrowing type change is lossy");
 }
 
 // ---- Compose: both tables evolve at the correct LSN relative to data (the homogeneous-file rule). ----

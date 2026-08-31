@@ -3,7 +3,7 @@
     clippy::expect_used,
     reason = "bench (harness=false, not test-cfg)"
 )]
-//! PR 5.5 — criterion micro-benches for the loader's Phase-A append (`TableDb::append_parquet`).
+//! Criterion micro-benches for the loader's Phase-A append (`TableDb::append_parquet`).
 //!
 //! Generates a local Parquet fixture with the sink's own Arrow→Parquet writer, then benches
 //! `append_parquet` from a `file` path (no MinIO/httpfs — this isolates DuckDB ingest + the

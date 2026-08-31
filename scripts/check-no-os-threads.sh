@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# check-no-os-threads.sh — PR 15.4 production topology guard. Runtime sizing may query
+# check-no-os-threads.sh — production topology guard. Runtime sizing may query
 # std::thread::available_parallelism; only OS-thread creation/import paths are forbidden.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"

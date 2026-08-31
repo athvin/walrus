@@ -5,8 +5,8 @@
 //! exists. Every log line is a [`tracing`] event with **structured fields** so a Grafana/Loki query
 //! can follow one transaction through both services. [`init_tracing`] installs the
 //! process-wide subscriber once at the top of `main`; the [`fields`] module fixes the canonical
-//! field-key spellings (`xid`, `commit_lsn`, `lsn`, `batch_uuid`, …) that every later PR must use
-//! at its call sites — e.g. `info!({XID} = xid, {COMMIT_LSN} = %commit_lsn, "flushed batch")`.
+//! field-key spellings (`xid`, `commit_lsn`, `lsn`, `batch_uuid`, …) that every call site must use —
+//! e.g. `info!({XID} = xid, {COMMIT_LSN} = %commit_lsn, "flushed batch")`.
 
 use serde::Deserialize;
 use tracing_subscriber::EnvFilter;

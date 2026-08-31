@@ -1,4 +1,4 @@
-//! DDL capture — the sink's consume side of the source's event-trigger tap (§3, PR 2.33).
+//! DDL capture — the sink's consume side of the source's event-trigger tap (§3).
 //!
 //! Postgres logical decoding never emits DDL, so the source's `ddl_command_end`/`sql_drop` triggers
 //! (`migrations/source/0002`) INSERT into the **published** `walrus.ddl_audit` table, which rides the
@@ -14,7 +14,7 @@
 //! `walrus.ddl_audit`/`walrus.heartbeat` are internal ([`crate::heartbeat::InternalTables`]) — consumed
 //! for control, **never** materialised as `<table>`/`<table>_raw`. Event triggers are not exhaustive
 //! (globals fire nothing; `TRUNCATE` is a native pgoutput message) — the Relation-message drift backstop
-//! (TODO: full handling is the loader's, PR 3.8/3.9) covers the rest.
+//! (with full reconciliation handled by the loader) covers the rest.
 
 use common::{DdlId, EpochNo, Lsn, PgRelation, SchemaVersionNo, TupleValue};
 use std::collections::HashMap;

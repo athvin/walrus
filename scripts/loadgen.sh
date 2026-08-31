@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PR 5.6 load generator — drives pgbench against the compose source-pg with the scenario scripts under
+# Load generator — drives pgbench against the compose source-pg with the scenario scripts under
 # scripts/loadgen/. pgbench ships in the postgres:16 image, so we run it *inside* the source-pg
 # container (the script is piped in via stdin) — no pgbench needed on the host.
 #

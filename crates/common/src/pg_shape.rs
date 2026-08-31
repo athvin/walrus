@@ -108,7 +108,7 @@ impl PgColumn {
     /// Decode `numeric(p, s)` from `type_modifier` when this column is a `numeric`; `None` for a
     /// non-numeric column or an unconstrained `numeric` (`type_modifier == -1`).
     ///
-    /// The packing (the exact math PR 2.3 relies on): `precision = ((mod - 4) >> 16) & 0xFFFF`,
+    /// The exact Postgres packing is `precision = ((mod - 4) >> 16) & 0xFFFF`,
     /// `scale = (mod - 4) & 0xFFFF`.
     ///
     /// # Examples
@@ -205,12 +205,12 @@ impl PgRelation {
 /// One column value inside a TupleData (proto §5).
 ///
 /// **[`Null`](TupleValue::Null) (`'n'`) and [`UnchangedToast`](TupleValue::UnchangedToast) (`'u'`)
-/// are DISTINCT** — a whole loader-correctness story (PR 3.6) depends on the difference surviving
+/// are DISTINCT** — a whole loader-correctness story depends on the difference surviving
 /// from wire to `<table>_raw`, where the loader resolves an unchanged-TOAST placeholder by
 /// back-scanning. It must never be collapsed to [`Null`](TupleValue::Null).
 ///
 /// Not `Serialize`: this is an in-memory wire value, not a persisted document with a stable JSON
-/// contract. serde is added only if a later PR needs it.
+/// contract. Add serde only if the type gains a supported persistence boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TupleValue {
     /// `'n'` — a real SQL NULL.
@@ -225,8 +225,8 @@ pub enum TupleValue {
 
 /// Move-cost budget for the per-column decode hot path (`own-move-large`).
 ///
-/// Measured with `size_of::<TupleValue>()` on PR 9.7. If this trips, shrink the type, box the
-/// offending variant in Phase 11, or raise the measured budget deliberately in review.
+/// The compile-time budget reflects a measured 40-byte value. If it trips, shrink or box the
+/// offending variant, or raise the budget deliberately with a new measurement.
 const TUPLE_VALUE_MAX_BYTES: usize = 40;
 const _: () = assert!(size_of::<TupleValue>() <= TUPLE_VALUE_MAX_BYTES);
 

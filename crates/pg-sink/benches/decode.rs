@@ -3,12 +3,12 @@
     clippy::expect_used,
     reason = "bench (harness=false, not test-cfg)"
 )]
-//! PR 5.4 — criterion micro-benches for the pgoutput decoder hot path.
+//! Criterion micro-benches for the pgoutput decoder hot path.
 //!
 //! We synthesize *valid* pgoutput byte streams programmatically (the same message layouts the golden
 //! vectors in `tests/pgoutput_vectors.rs` prove — `docs/proto-version.md` §4–§8) and measure
 //! `parse_stream` end-to-end and `parse_tuple` alone across three table shapes plus a streamed
-//! variant. No production code is touched: this is the baseline PR 5.7 optimises against. The first
+//! variant. No production code is touched, so this remains a stable optimization baseline. The first
 //! suspect the design flags is the per-cell `String` allocation in the `'t'` branch — the text-heavy
 //! shape is built to expose it.
 //!

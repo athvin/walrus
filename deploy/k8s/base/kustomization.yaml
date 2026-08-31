@@ -1,10 +1,10 @@
-# deploy/k8s/base — kustomize base for the walrus data plane (PR 4.9).
+# deploy/k8s/base — kustomize base for the walrus data plane.
 #
 # Topology the design mandates (architecture.md#kubernetes-deployment):
 #   * walrus-pg-sink   — StatefulSet replicas=1  (exactly one consumer of the single lifelong slot)
 #   * walrus-loader    — StatefulSet replicas=1  + RWO PVC (one owner of every .duckdb file)
 # Both are Guaranteed QoS (requests == limits), drained on SIGTERM (grace 90s, NO preStop), and never
-# scaled horizontally (file/slot ownership is exclusive; sharding is the deferred goal in PR 4.11).
+# scaled horizontally (file/slot ownership is exclusive; sharding remains a deferred design goal).
 #
 # secrets.example.yaml is deliberately NOT a resource here — it is a template the operator copies to a
 # real `walrus-secrets` Secret (or lets IRSA/Workload Identity provide). CI validates it standalone.

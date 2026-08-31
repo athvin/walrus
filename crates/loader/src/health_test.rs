@@ -58,7 +58,7 @@ fn quarantine_degrades_ready_but_not_startup() {
         "/startup stays satisfied — bootstrap did complete"
     );
 
-    // The one exit (PR 6.7): a reload rebuild replaced the data — /ready recovers.
+    // The one exit: a reload rebuild replaced the data — /ready recovers.
     s.clear_quarantine();
     assert!(!s.is_quarantined(), "the rebuild clears the latch");
     assert!(s.is_ready(), "/ready recovers after the rebuild");

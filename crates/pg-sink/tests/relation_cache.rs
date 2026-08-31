@@ -41,7 +41,7 @@ fn col(name: &str, oid: u32, typmod: i32, is_key: bool) -> PgColumn {
     }
 }
 
-/// The `orders` shape from PR 2.9's unit test (id, amount, created_at, note).
+/// The `orders` shape from the unit test (id, amount, created_at, note).
 fn orders_relation(oid: u32) -> PgRelation {
     PgRelation {
         oid,
@@ -110,7 +110,7 @@ async fn first_relation_writes_a_schema_registry_row() {
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (grouped with the compose tests)"]
 async fn cached_arrow_schema_matches_expected_orders_shape() {
-    // Pure (no DB): the cached Arrow schema exactly matches PR 2.9's unit test.
+    // Pure (no DB): the cached Arrow schema exactly matches the unit test.
     let mut cache = RelationCache::default();
     let entry = cache
         .upsert_from_relation(orders_relation(50002), SchemaVersionNo(1))

@@ -1,6 +1,6 @@
 # walrus-loader: ONE owner of every .duckdb file. Single-writer is assembled from replicas=1 + the RWO
 # PVC + an ownership lease + DuckDB's file lock. Like the sink it scales VERTICALLY only — bumping
-# replicas would contend for the same exclusive files (per-replica-PVC sharding is deferred to PR 4.11).
+# replicas would contend for the same exclusive files (per-replica-PVC sharding remains deferred).
 ---
 apiVersion: v1
 kind: Service

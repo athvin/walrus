@@ -25,11 +25,11 @@
 //! avoids a stale lock. There is **no `wal_sender_timeout` analogue** — the drain is bounded only by the
 //! grace period and DuckDB commit latency (a genuine simplification vs the sink).
 //!
-//! **Grace-period sizing (PR 4.9):** the measured *incremental* worst case (append + transform + commit)
+//! **Grace-period sizing:** the measured *incremental* worst case (append + transform + commit)
 //! — the full-rebuild is **excluded** because it is aborted, not awaited. **Skip `preStop`**: a
 //! non-serving consumer gains nothing from it, and any preStop time is subtracted from the same budget
 //! the drain needs — let `SIGTERM` arrive at T=0. **PID-1 / exec-form** (so `SIGTERM` reaches the Rust
-//! process, not a shell) is a Dockerfile concern wired in **PR 4.8**; note it here.
+//! process, not a shell) is enforced by both runtime Dockerfiles; note it here.
 
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_util::sync::CancellationToken;

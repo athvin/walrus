@@ -3,7 +3,7 @@
     clippy::expect_used,
     reason = "integration test — unwrap/expect fine in setup + helpers"
 )]
-//! Compose-gated integration tests for the `table_reload` state machine (PR 6.1).
+//! Compose-gated integration tests for the `table_reload` state machine.
 //!
 //! Same discipline as the manifest tests: every test runs inside a rolled-back transaction and
 //! namespaces its rows by a unique `epoch`, so runs are isolated and idempotent. Statements that
@@ -115,7 +115,7 @@ async fn full_status_walk_and_duplicate_request_rejected() {
     assert!(other > id, "bigserial: monotonic ids");
 
     // The pause engages at REQUEST time, not claim time: `orders` is an active rebuild while
-    // still `requested` (PR 6.6 pauses that table's claims from this moment); the resync never
+    // still `requested` (that state pauses the table's claims immediately); the resync never
     // shows up here.
     let rebuilds = reload::active_rebuilds(&mut *tx, epoch).await.unwrap();
     assert_eq!(
@@ -256,7 +256,7 @@ async fn full_status_walk_and_duplicate_request_rejected() {
             .await
             .unwrap()
             .is_empty(),
-        "the pause lifts at export_complete — holding it would deadlock the rebuild (PR 6.6)"
+        "the pause lifts at export_complete — holding it would deadlock the rebuild"
     );
 
     // …but the one_live index still guards `export_complete` (non-terminal): no new request yet.
@@ -373,7 +373,7 @@ async fn release_claim_returns_the_row_to_the_queue() {
     );
 
     // The claimant releases: back to `requested`, lease cleared, immediately re-claimable — the
-    // controller's un-claim path for infra failures between claim and exporter spawn (PR 6.4).
+    // controller's un-claim path for infra failures between claim and exporter spawn.
     assert!(reload::release_claim(&mut *tx, id, "sink-a").await.unwrap());
     let row = reload::get(&mut *tx, id).await.unwrap().unwrap();
     assert_eq!(row.status, ReloadStatus::Requested);
@@ -450,9 +450,9 @@ async fn fail_purges_this_reloads_manifest_rows_only() {
         "stream rows never carry a reload_id"
     );
 
-    // …and the OTHER reload's chunk file is untouched. (Its reload is still `exporting`, which
-    // since PR 6.6 pauses claim_ready for that table — flip it to export_complete first, which
-    // doubles as a pause-lift assertion.)
+    // …and the OTHER reload's chunk file is untouched. Its reload is still `exporting`, which
+    // pauses `claim_ready` for that table; flip it to `export_complete` first, which doubles as a
+    // pause-lift assertion.
     let h: Lsn = "0/500".parse().unwrap();
     reload::complete_export(&mut *tx, r2, h).await.unwrap();
     let customers_left = claim_ready(&mut *tx, epoch, "public", "customers", 100)

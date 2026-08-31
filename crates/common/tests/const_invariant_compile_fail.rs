@@ -4,7 +4,7 @@
     clippy::disallowed_methods,
     reason = "integration test - filesystem and process calls build isolated rustc fixtures"
 )]
-//! Compile-fail coverage for walrus's inline const invariants (PR 21.3).
+//! Compile-fail coverage for walrus's inline const invariants.
 
 use std::ffi::OsString;
 use std::path::PathBuf;

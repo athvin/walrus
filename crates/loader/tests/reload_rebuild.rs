@@ -113,7 +113,7 @@ async fn seed_file(
 }
 
 /// Like [`seed_file`] but at an explicit `schema_version` — a file at a version NEWER than the
-/// loader's would trigger a reconcile (PR 6.12's skip path).
+/// loader's would trigger a reconcile (the skip path).
 async fn seed_file_v(
     pool: &sqlx::PgPool,
     epoch: EpochNo,
@@ -463,7 +463,7 @@ async fn stale_reload_file_is_skipped_and_retired() {
     let epoch = EpochNo(670_003);
     let (ctx, _dir) = setup(epoch).await;
 
-    // The .duckdb already rebuilt for a NEWER attempt (PR 6.8's restart hygiene, simulated).
+    // The .duckdb already rebuilt for a NEWER attempt (the restart hygiene, simulated).
     ctx.db
         .set_recorded_reload_id(common::ReloadId(999_999))
         .unwrap();
@@ -510,7 +510,7 @@ async fn rebuild_clears_the_lossy_cast_quarantine() {
     let epoch = EpochNo(670_004);
     let (ctx, _dir) = setup(epoch).await;
 
-    // The PR 3.9 terminal state: a lossy ALTER COLUMN TYPE cast failed; /ready is degraded. (The
+    // The quarantine state: a lossy ALTER COLUMN TYPE cast failed; /ready is degraded. (The
     // entry path is ddl_destructive.rs's covered ground; the EXIT is under test here.)
     ctx.state.quarantine();
     assert!(!ctx.state.is_ready() || !ctx.state.is_started());
@@ -642,7 +642,7 @@ async fn superseded_version_crossing_file_is_skipped_not_reconciled() {
 
     // A BLOCKER stream file at a NEWER schema_version (2) — reconciling it would run the DDL path
     // (and on a lossy cast, quarantine). It sits BELOW the reload's first_lsn, so a pending rebuild
-    // supersedes it. This is the quarantine-recovery blocker (PR 6.12), simulated without the ddl
+    // supersedes it. This is the quarantine-recovery blocker, simulated without the ddl
     // machinery: the skip happens BEFORE reconcile, so no v2 registry row is needed.
     let blocker = write_rows(
         epoch,

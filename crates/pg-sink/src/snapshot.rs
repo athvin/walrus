@@ -265,7 +265,7 @@ impl<C: Clock + Clone> Backfill<C> {
             // Snapshot rows have no per-row commit boundary: promote them all at the shared
             // consistent_point so the loader's (commit_lsn, lsn) dedup lets any later stream change win.
             // They also have no real commit *time* (pre-existing data), so commit_ts is the
-            // snapshot-capture instant — provenance only, never an ordering key (PR 5.9).
+            // snapshot-capture instant — provenance only, never an ordering key.
             batcher
                 .on_commit(snap.consistent_point, UtcTimestamp::now())
                 .context("promote snapshot rows")?;

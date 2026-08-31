@@ -8,10 +8,9 @@
 //! with a `VARCHAR + CAST(x AS UUID)` fallback if a bump ever drops the annotation.
 //!
 //! **enum.** Values are lossless as `VARCHAR`; the **ordered label set** is lost on the wire and is
-//! carried by the descriptor (PR 2.17), from which the loader recreates the DuckDB `ENUM`. Enum OIDs
-//! are dynamic (≥ [`oids::FIRST_NORMAL_OID`]), so we treat a non-builtin OID as `enum → VARCHAR` for
-//! now ([`is_enum_oid`]); PR 2.22 resolves enum-ness from the source catalog / the decoder's `Type`
-//! message.
+//! carried by the descriptor, from which the loader recreates the DuckDB `ENUM`. Enum OIDs
+//! are dynamic (≥ [`oids::FIRST_NORMAL_OID`]). Because [`PgColumn`](common::PgColumn) has no
+//! type-kind marker, [`is_enum_oid`] conservatively treats every non-builtin OID as an enum carrier.
 
 use crate::error::Error;
 use crate::oids;
@@ -38,14 +37,15 @@ pub fn uuid_as_varchar(name: &str) -> Field {
     Field::new(name, DataType::Utf8, true)
 }
 
-/// `enum` → nullable `Utf8`; the ordered label set is carried by the descriptor (PR 2.17), not here.
+/// `enum` → nullable `Utf8`; the ordered label set is carried by the descriptor, not here.
 #[must_use]
 pub fn enum_field(name: &str) -> Field {
     Field::new(name, DataType::Utf8, true)
 }
 
-/// Interim enum detection: a non-builtin OID (≥ [`oids::FIRST_NORMAL_OID`]) is treated as an enum
-/// carrier. PR 2.22 replaces this with a catalog-derived marker (the decoder's `Type` message).
+/// Conservative enum detection: a non-builtin OID (≥ [`oids::FIRST_NORMAL_OID`]) is treated as an
+/// enum carrier because [`PgColumn`](common::PgColumn) does not expose a type-kind marker. Callers
+/// can attach catalog-derived labels through the descriptor API.
 #[must_use]
 pub const fn is_enum_oid(type_oid: u32) -> bool {
     type_oid >= oids::FIRST_NORMAL_OID

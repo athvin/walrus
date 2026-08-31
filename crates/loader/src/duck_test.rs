@@ -175,7 +175,7 @@ fn ingest_markers(db: &TableDb) -> i64 {
         .unwrap()
 }
 
-/// PR 12.5: `TableDb` is `Send`. The apply worker moves one into `TableCtx` and then into a
+/// `TableDb` is `Send`. The apply worker moves one into `TableCtx` and then into a
 /// `spawn_local` future; this test exercises the bound by moving the database across an OS thread.
 #[test]
 fn table_db_moves_across_a_thread() {
@@ -221,7 +221,7 @@ fn owned_duckdb_handles_meet_the_blocking_pool_send_bound() {
     requires_spawn_blocking_bounds(|| 1_i64);
 }
 
-/// PR 4.3 fix: a `spill` file's per-row `commit_lsn` placeholder is overridden by the file's `lsn_end`
+/// A `spill` file's per-row `commit_lsn` placeholder is overridden by the file's `lsn_end`
 /// (the real commit LSN), while a non-spill file appends the per-row value verbatim.
 #[test]
 fn spill_override_stamps_lsn_end_but_verbatim_otherwise() {
@@ -270,7 +270,7 @@ fn spill_override_stamps_lsn_end_but_verbatim_otherwise() {
         "a non-spill file keeps its verbatim per-row commit_lsn"
     );
 
-    // PR 5.8: both files are schema_version 1 → the column list is DESCRIBEd once, cached, reused.
+    // both files are schema_version 1 → the column list is DESCRIBEd once, cached, reused.
     assert_eq!(
         db.cached_schema_versions(),
         1,

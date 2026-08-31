@@ -1,6 +1,6 @@
-//! Echo-wait watermark capture (reload H1, PR 6.3).
+//! Echo-wait watermark capture (reload H1).
 //!
-//! The exporter (PR 6.5) INSERTs a `walrus.reload_signal` row and blocks on a waiter; when the
+//! The exporter INSERTs a `walrus.reload_signal` row and blocks on a waiter; when the
 //! sink decodes its *own* insert coming back through the replication stream, the transaction's
 //! **commit LSN** is the chunk's low watermark `L_i` — the value chunk rows are stamped with. Two
 //! rules make the handoff race-free and are worth stating where the code can't show them:
@@ -12,10 +12,10 @@
 //!   a property of the `Commit` message, which arrives *after* the `Insert` — so the decoded
 //!   insert is held as a [`PendingSignal`] until its transaction's fate is known.
 //!
-//! The row's embedded `wal_insert_lsn` (PR 6.2) is never the stamp — it is the free cross-check:
+//! The row's embedded `wal_insert_lsn` is never the stamp — it is the free cross-check:
 //! an insert's WAL position strictly precedes its commit record, so `embedded < commit` on every
-//! echo, or the watermark model itself is broken (metric + error log, never a panic — see
-//! `docs/implementation/notes/commit-visibility-race.md` for the race this bounds).
+//! echo, or the watermark model itself is broken (metric + error log, never a panic). This check
+//! bounds the race between row visibility and commit-record visibility.
 
 use common::{Lsn, ReloadId};
 use parking_lot::Mutex;
@@ -40,13 +40,14 @@ type WaiterEntry = (u64, oneshot::Sender<Echo>);
 /// Registry of in-flight watermark waits, keyed by `(reload_id, chunk_no)`.
 ///
 /// Shared (`Arc`) between the decode loop (which resolves) and the exporter tasks (which
-/// subscribe, PR 6.5). [`Self::subscribe`] returns a [`SubscribeGuard`] whose [`Drop`] removes its
+/// subscribe). [`Self::subscribe`] returns a [`SubscribeGuard`] whose [`Drop`] removes its
 /// entry, including when the exporter returns before sending the signal. [`Self::resolve`] also
 /// removes the entry before delivering its echo. Each entry has a generation so dropping a stale
 /// guard after a re-subscribe cannot evict the replacement waiter.
 #[derive(Debug, Default)]
 pub struct WatermarkWaiters {
-    // LOCK-CHOICE: parking_lot::Mutex — every production access is a one-operation write; the lone reader is a test-facing `len()`. See docs/implementation/notes/rust-skills/own-rwlock-readers.md.
+    // Every production access writes once; the only reader is the test-facing `len()`.
+    // LOCK-CHOICE: a Mutex fits exclusive one-operation access; an RwLock adds no useful concurrency.
     waiters: Mutex<HashMap<WaiterKey, WaiterEntry>>,
     next_generation: AtomicU64,
     /// Cross-check violations observed (mirrors the Prometheus counter so unit tests — which run
@@ -366,7 +367,7 @@ impl PendingSignals {
 /// Drain every element matching `pred` out of `v`, preserving both halves' relative order and
 /// retaining `v`'s allocation for the next reload-signal transaction.
 ///
-/// PR 11.7 made this linear with `mem::take` + `partition`; `extract_if` keeps that complexity and
+/// `extract_if` keeps the linear complexity of `mem::take` + `partition` and
 /// ordering while avoiding a fresh survivor buffer. `Vec` remains correct because callers drain by
 /// predicate, never from the front of a queue.
 fn extract<T>(v: &mut Vec<T>, mut pred: impl FnMut(&T) -> bool) -> Vec<T> {

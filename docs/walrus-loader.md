@@ -907,7 +907,7 @@ A DuckDB truth the loader must design around: **`DELETE` only tombstones** — `
 heavily-deleted row groups, and **`VACUUM FULL` is unimplemented** [7]. So the single `.duckdb` file **does not
 shrink** on ordinary raw-retention deletes.
 
-> **Raw history under a single-table reload (PR 6.7).** A reload **rebuild** (the `reload` flavor,
+> **Raw history under a single-table reload.** A reload **rebuild** (the `reload` flavor,
 > [single-table-reload.md](./single-table-reload.md) H8) `CREATE OR REPLACE`s both `<table>` *and*
 > `<table>_raw` at the attempt's schema_version — **discarding that table's raw CDC history in
 > DuckDB by design**: the pre-reload raw rows describe the world the clear replaces (replaying

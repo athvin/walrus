@@ -263,7 +263,7 @@ async fn pause_withholds_claims_and_lifts_on_failed() {
         .await
         .unwrap();
 
-    // A live rebuild-flavor reload: Phase A must treat the table as PAUSED, not idle (PR 6.6).
+    // A live rebuild-flavor reload: Phase A must treat the table as PAUSED, not idle.
     let reload_id = control::reload::request(
         &ctx.pool,
         epoch,
@@ -284,7 +284,7 @@ async fn pause_withholds_claims_and_lifts_on_failed() {
             .await
             .unwrap()
             .is_some(),
-        "the ready backlog accumulates (the lag gauge SHOULD grow — PR 6.11)"
+        "the ready backlog accumulates (the lag gauge SHOULD grow by design)"
     );
     let cp = control::read_checkpoint(&ctx.pool, epoch, "public", "orders")
         .await

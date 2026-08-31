@@ -52,8 +52,8 @@ CREATE TABLE walrus.loader_checkpoint (
   CHECK (transformed_lsn <= raw_appended_lsn)  -- the mirror can never be ahead of the raw log
 );
 
--- Versioned per-column type-mapping descriptors (common::TypeDescriptor, PR 1.2). One row per
--- structural schema version of a table; NEVER pruned. Column detail is refined in PR 1.6.
+-- Versioned per-column type-mapping descriptors (common::TypeDescriptor). One row per structural
+-- schema version of a table; NEVER pruned. Migration 0002 adds the column snapshot.
 CREATE TABLE walrus.schema_registry (
   epoch          bigint NOT NULL,
   source_schema  text NOT NULL,
@@ -66,7 +66,7 @@ CREATE TABLE walrus.schema_registry (
 
 -- Schema-change events captured from the source's ddl_audit stream, stamped with the DDL's commit
 -- LSN so the loader applies each change at the right point in the data stream. NEVER pruned.
--- Column detail is refined in PR 1.6.
+-- Migration 0002 reshapes this initial event record into the decoded ddl_audit payload.
 CREATE TABLE walrus.ddl_manifest (
   id             bigserial PRIMARY KEY,
   epoch          bigint NOT NULL,

@@ -11,7 +11,7 @@
 //! Reload controller pickup against compose (`#[ignore]` — needs source + control PG). A
 //! `requested` row flips to `exporting` within one poll cadence with a live, observably-advancing
 //! lease; doomed requests (unpublished / keyless) fail fast with operator-readable reasons while a
-//! `resync` of a keyed table is accepted (PR 6.10); the `max_concurrent_reloads` cap holds under
+//! `resync` of a keyed table is accepted; the `max_concurrent_reloads` cap holds under
 //! three requests while the replication
 //! stream keeps flowing. The scheduling/lease-cancel semantics are unit-tested in
 //! `src/reload.rs`; each test runs its own controller against its own epoch, so tests never
@@ -78,7 +78,7 @@ fn controller_cfg(epoch: EpochNo, cap: NonZeroUsize) -> ReloadControllerConfig {
         epoch,
         chunk_rows: std::num::NonZeroU64::new(1000).unwrap(),
         // No decode loop resolves echoes in these tests, so exporters PARK on the echo await —
-        // exactly the observable-scheduling role PR 6.4's stub used to play. The echo/export
+        // exactly the observable-scheduling role the stub used to play. The echo/export
         // behaviour itself is reload_export.rs's suite.
         echo_timeout: Duration::from_secs(3600),
         reload_max_restarts: 3,
@@ -312,7 +312,7 @@ async fn preflight_failures_land_in_failed_with_reasons() {
     )
     .await
     .unwrap();
-    // (c) Resync of a published, keyed table: NO LONGER rejected (PR 6.10 lifted the guard) — it
+    // (c) Resync of a published, keyed table is accepted: it
     // passes preflight like a `reload` and reaches `exporting` (here it parks on the echo await,
     // no resolver runs, exactly like the accepted-request case above).
     let resync = reload::request(&pool, epoch, "public", "orders", ReloadFlavor::Resync)

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# check-lock-choice.sh — PR 9.12 guard (`own-rwlock-readers`). Every Mutex/RwLock field in
+# check-lock-choice.sh — lock-choice guard (`own-rwlock-readers`). Every Mutex/RwLock field in
 # production code must justify its access pattern on the line immediately above the declaration.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"

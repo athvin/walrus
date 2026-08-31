@@ -1,4 +1,4 @@
-//! Guards PR 5.7's workspace release-profile decision against silent drift.
+//! Guards the workspace release-profile decision against silent drift.
 
 use std::path::Path;
 
@@ -12,10 +12,6 @@ const PROFILE_BENCH: &str = include_str!("../../../scripts/profile-bench.sh");
 const SINK_SMOKE: &str = include_str!("../../../scripts/sink-smoke.sh");
 const PG_SINK_MAIN: &str = include_str!("../../pg-sink/src/main.rs");
 const LOADER_MAIN: &str = include_str!("../../loader/src/main.rs");
-const CODEGEN_UNITS_ADR: &str = "docs/implementation/notes/rust-skills/opt-codegen-units.md";
-const TARGET_CPU_ADR: &str = "docs/implementation/notes/rust-skills/opt-target-cpu.md";
-const PGO_ADR: &str = "docs/implementation/notes/rust-skills/opt-pgo-profile.md";
-const RELEASE_PROFILE_ADR: &str = "docs/implementation/notes/rust-skills/perf-release-profile.md";
 // Every surface that can hand a target-CPU or ISA flag to a cargo invocation: the manifest, the
 // sole workflow, both shipped Dockerfiles, and the three developer entry points that build a
 // walrus binary. The rule's own Cargo-config example is titled "native builds for development", so
@@ -151,8 +147,6 @@ fn profile_key_declaration<'a>(manifest: &'a str, key: &str) -> Option<&'a str> 
 fn codegen_units_policy(manifest: &str) -> Result<(), &'static str> {
     if profile_key_declaration(manifest, "codegen-units").is_some() {
         Err("codegen-units declared")
-    } else if !manifest.contains(CODEGEN_UNITS_ADR) {
-        Err("missing codegen-units ADR link")
     } else {
         Ok(())
     }
@@ -189,11 +183,7 @@ fn release_profile_policy(manifest: &str) -> Result<(), &'static str> {
         }
     }
 
-    if manifest.contains(RELEASE_PROFILE_ADR) {
-        Ok(())
-    } else {
-        Err("missing release-profile ADR link")
-    }
+    Ok(())
 }
 
 /// The out-of-manifest half, one environment needle and one build-flag needle per key, exactly as
@@ -392,7 +382,7 @@ fn no_profile_table_declares_codegen_units() {
     assert_eq!(
         profile_key_declaration(WORKSPACE_MANIFEST, "codegen-units"),
         None,
-        "walrus keeps the default codegen-unit count; see {CODEGEN_UNITS_ADR}"
+        "walrus keeps the default codegen-unit count; see the Cargo.toml release-profile rationale"
     );
 }
 
@@ -402,7 +392,7 @@ fn no_build_surface_overrides_codegen_units() {
         assert_eq!(
             codegen_units_override_policy(body),
             Ok(()),
-            "{name} must leave codegen-units at the default; see {CODEGEN_UNITS_ADR}"
+            "{name} must leave codegen-units at the default"
         );
     }
 }
@@ -414,25 +404,18 @@ fn workspace_rejects_codegen_units() {
 
 #[test]
 fn codegen_units_policy_rejects_fabricated_input() {
-    let linked_default = concat!(
-        "# docs/implementation/notes/rust-skills/opt-codegen-units.md\n",
-        "[profile.release]\n",
-        "lto = \"thin\"\n",
-    );
-    let linked_override = concat!(
-        "# docs/implementation/notes/rust-skills/opt-codegen-units.md\n",
+    let default = "[profile.release]\nlto = \"thin\"\n";
+    let override_value = concat!(
         "[profile.release]\n",
         "lto = \"thin\"\n",
         "codegen-units = 1\n",
     );
-    let linked_comment = concat!(
-        "# docs/implementation/notes/rust-skills/opt-codegen-units.md\n",
+    let commented_value = concat!(
         "[profile.release]\n",
         "lto = \"thin\"\n",
         "# codegen-units = 1\n",
     );
     let bench_override = concat!(
-        "# docs/implementation/notes/rust-skills/opt-codegen-units.md\n",
         "[profile.release]\n",
         "lto = \"thin\"\n",
         "\n",
@@ -441,22 +424,18 @@ fn codegen_units_policy_rejects_fabricated_input() {
         "codegen-units = 1\n",
     );
     let package_override = concat!(
-        "# docs/implementation/notes/rust-skills/opt-codegen-units.md\n",
         "[profile.release]\n",
         "lto = \"thin\"\n",
         "\n",
         "[profile.release.package.duckdb]\n",
         "codegen-units = 1\n",
     );
-    let missing_link = "[profile.release]\nlto = \"thin\"\n";
-
     let cases = [
-        (linked_default, Ok(())),
-        (linked_comment, Ok(())),
-        (linked_override, Err("codegen-units declared")),
+        (default, Ok(())),
+        (commented_value, Ok(())),
+        (override_value, Err("codegen-units declared")),
         (bench_override, Err("codegen-units declared")),
         (package_override, Err("codegen-units declared")),
-        (missing_link, Err("missing codegen-units ADR link")),
     ];
 
     for (manifest, expected) in cases {
@@ -500,20 +479,15 @@ fn no_profile_table_declares_panic_or_strip() {
     assert_eq!(
         release_profile_policy(WORKSPACE_MANIFEST),
         Ok(()),
-        "walrus keeps unwinding and its symbol table; see {RELEASE_PROFILE_ADR}"
+        "walrus keeps unwinding and its symbol table; see the Cargo.toml release-profile rationale"
     );
 }
 
 #[test]
 fn release_profile_policy_rejects_fabricated_input() {
-    let linked_default = concat!(
-        "# docs/implementation/notes/rust-skills/perf-release-profile.md\n",
-        "[profile.release]\n",
-        "lto = \"thin\"\n",
-    );
+    let default = "[profile.release]\nlto = \"thin\"\n";
     // The workspace's own `panic = "deny"` clippy entry is not a profile key.
     let lint_table_panic = concat!(
-        "# docs/implementation/notes/rust-skills/perf-release-profile.md\n",
         "[workspace.lints.clippy]\n",
         "panic = \"deny\"\n",
         "\n",
@@ -521,14 +495,12 @@ fn release_profile_policy_rejects_fabricated_input() {
         "lto = \"thin\"\n",
     );
     let abort_panic = concat!(
-        "# docs/implementation/notes/rust-skills/perf-release-profile.md\n",
         "[profile.release]\n",
         "lto = \"thin\"\n",
         "panic = \"abort\"\n",
     );
     // `bench` inherits `release`, so stripping it alone still costs the benchmark its frames.
     let stripped_bench = concat!(
-        "# docs/implementation/notes/rust-skills/perf-release-profile.md\n",
         "[profile.release]\n",
         "lto = \"thin\"\n",
         "\n",
@@ -536,14 +508,11 @@ fn release_profile_policy_rejects_fabricated_input() {
         "inherits = \"release\"\n",
         "strip = true\n",
     );
-    let missing_link = "[profile.release]\nlto = \"thin\"\n";
-
     let cases = [
-        (linked_default, Ok(())),
+        (default, Ok(())),
         (lint_table_panic, Ok(())),
         (abort_panic, Err("a panic strategy is declared")),
         (stripped_bench, Err("symbol stripping is declared")),
-        (missing_link, Err("missing release-profile ADR link")),
     ];
 
     for (manifest, expected) in cases {
@@ -561,7 +530,7 @@ fn no_build_surface_overrides_panic_or_strip() {
         assert_eq!(
             profile_key_override_policy(body),
             Ok(()),
-            "{name} must build the profile the manifest declares; see {RELEASE_PROFILE_ADR}"
+            "{name} must build the profile the manifest declares"
         );
     }
 }
@@ -610,7 +579,7 @@ fn no_build_surface_sets_a_target_cpu() {
         assert_eq!(
             target_cpu_policy(body),
             Ok(()),
-            "{name} must remain portable; see {TARGET_CPU_ADR}"
+            "{name} must remain portable"
         );
     }
 }
@@ -632,7 +601,7 @@ fn no_cargo_config_exists() {
                 path.join(".cargo/config").exists(),
             ),
             Ok(()),
-            "{dir}/.cargo must remain absent; see {TARGET_CPU_ADR}"
+            "{dir}/.cargo must remain absent so builds stay portable"
         );
     }
 }
@@ -710,7 +679,7 @@ fn no_build_surface_enables_pgo() {
         assert_eq!(
             pgo_policy(body),
             Ok(()),
-            "{name} must remain free of PGO instrumentation; see {PGO_ADR}"
+            "{name} must remain free of PGO instrumentation"
         );
     }
 }

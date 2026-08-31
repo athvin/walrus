@@ -7,7 +7,7 @@
 )]
 
 //! Shared primitives for walrus: errors + exit codes, [`Lsn`], telemetry, config,
-//! [`SinkMeta`], [`Redacted`], and the neutral Postgres shape types. Populated PR by PR (0.2 →).
+//! [`SinkMeta`], [`Redacted`], and the neutral Postgres shape types shared across the workspace.
 //!
 //! # Features
 //!
@@ -20,9 +20,8 @@
 //! Serde is deliberately *not* a feature. [`SinkMeta`], [`TypeDescriptor`], [`Lsn`] and
 //! [`CommonConfig`] **are** the wire and bootstrap contracts, and `figment`, `serde_json`,
 //! `humantime-serde`, and `tracing-subscriber`'s `json` layer each depend on serde
-//! unconditionally — so gating the derives would remove serde from no build at all. The decision,
-//! and what would reverse it, is recorded in
-//! `docs/implementation/notes/rust-skills/api-serde-optional.md`.
+//! unconditionally — so gating the derives would remove serde from no build at all. Reconsider a
+//! feature only if a supported consumer can compile `common` without those contracts.
 //!
 //! # Stability
 //!

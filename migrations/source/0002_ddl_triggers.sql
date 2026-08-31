@@ -1,4 +1,4 @@
--- 0002_ddl_triggers.sql — the sink's DDL tap on the source (§3, PR 2.33). Idempotent, re-runnable.
+-- 0002_ddl_triggers.sql — the sink's DDL tap on the source (§3). Idempotent, re-runnable.
 --
 -- Postgres logical decoding NEVER emits DDL. So the source carries an event-trigger tap: an INSERT
 -- into the PUBLISHED walrus.ddl_audit table rides the *same* replication slot as DML, in commit order
@@ -54,7 +54,7 @@ BEGIN
 END;
 $$;
 
--- `sql_drop`: capture dropped tables/columns (the loader applies destructive changes — PR 3.9). Only
+-- `sql_drop`: capture dropped tables/columns for the loader's destructive-change path. Only
 -- the dropped identity is needed; the ALTER itself is visible via ddl_command_end.
 CREATE OR REPLACE FUNCTION walrus.intercept_drop() RETURNS event_trigger
 LANGUAGE plpgsql SECURITY DEFINER AS $$

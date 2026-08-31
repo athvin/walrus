@@ -5,7 +5,7 @@
     reason = "integration test — unwrap/expect fine in setup + helpers"
 )]
 //! Reload observability against compose (`#[ignore]` — source + control PG + MinIO). Proves the
-//! PR 6.11 metrics MOVE during a reload: chunk/row counters and the echo-wait histogram tick as an
+//! reload metrics move during a reload: chunk/row counters and the echo-wait histogram tick as an
 //! export runs; the failed counter ticks on an echo timeout; the active gauge rises to 1 while an
 //! exporter is in flight and returns to 0 when it ends; and the cross-check violation counter stays
 //! 0 on a healthy run (its whole point is to be 0). The named-metric registration is covered by

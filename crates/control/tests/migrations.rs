@@ -5,7 +5,7 @@
 )]
 //! Compose-gated integration tests for the control-plane migrations.
 //!
-//! Requires the control Postgres from the PR 0.6 dev harness (`just up`). Gated behind the
+//! Requires the control Postgres from the dev harness (`just up`). Gated behind the
 //! `integration` feature so the DB-free baseline `cargo test --workspace` skips it; the CI
 //! integration job runs `cargo test -p control --features integration --test migrations`.
 #![cfg(feature = "integration")]

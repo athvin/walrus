@@ -9,7 +9,7 @@
 //! flush is durable — the two distinct LSNs (received/keepalive vs confirmed_flush). A catching-up sink
 //! with a stale round-trip must stay in readiness (`degraded` is a field, never a hard gate — §4.3).
 //!
-//! This is the end-to-end proof of the keepalive fix (PR #71): the sink's S3 PUT runs inline in the
+//! This is the end-to-end proof of the keepalive fix: the sink's S3 PUT runs inline in the
 //! decode loop, so without a concurrent keepalive pump a stalled flush would starve the walsender and
 //! sever the connection after `wal_sender_timeout` (5s in the harness). The stall is `docker pause`d MinIO
 //! (every PUT hangs) while the process keeps running and pumping feedback.
