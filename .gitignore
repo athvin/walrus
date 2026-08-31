@@ -1,0 +1,9 @@
+# Rust build artifacts
+/target
+
+# Local environment / secrets
+.env
+
+# Python bytecode from the docs/examples/proto-version harness
+**/__pycache__/
+*.pyc

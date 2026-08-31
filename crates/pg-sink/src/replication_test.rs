@@ -1,0 +1,83 @@
+use super::*;
+
+#[test]
+fn lsn_formats_as_x_slash_y() {
+    assert_eq!(lsn_xy(Lsn::ZERO), "0/0");
+    assert_eq!(lsn_xy(Lsn::new(0x1_9A2B_3C4D)), "1/9A2B3C4D");
+    assert_eq!(lsn_xy(Lsn::new(0x0199_BAC8)), "0/199BAC8");
+}
+
+#[test]
+fn standby_status_frame_layout() {
+    let s = StandbyStatus {
+        write: Lsn::new(0x100),
+        flush: Lsn::new(0x80),
+        apply: Lsn::new(0x40),
+        reply_requested: true,
+    };
+    let msg = build_standby_status(s);
+    assert_eq!(msg[0], b'd'); // CopyData
+    let len = u32::from_be_bytes([msg[1], msg[2], msg[3], msg[4]]) as usize;
+    assert_eq!(len, msg.len() - 1); // length is self-inclusive, excludes the tag
+    assert_eq!(msg[5], b'r'); // standby status update
+    assert_eq!(read_lsn(&msg[6..14]).unwrap().as_u64(), 0x100); // write
+    assert_eq!(read_lsn(&msg[14..22]).unwrap().as_u64(), 0x80); // flush
+    assert_eq!(read_lsn(&msg[22..30]).unwrap().as_u64(), 0x40); // apply
+    assert_eq!(*msg.last().unwrap(), 1); // reply_requested
+}
+
+#[test]
+fn take_message_needs_a_full_frame() {
+    let mut buf = BytesMut::new();
+    buf.extend_from_slice(b"Z"); // tag only
+    buf.extend_from_slice(&5u32.to_be_bytes()); // length = 5 (4 + 1 body byte)
+    assert!(
+        take_message(&mut buf).is_none(),
+        "body byte not yet present"
+    );
+    buf.extend_from_slice(b"I"); // the 1 body byte (idle)
+    let (tag, body) = take_message(&mut buf).unwrap();
+    assert_eq!(tag, b'Z');
+    assert_eq!(&body[..], b"I");
+    assert!(buf.is_empty());
+}
+
+#[test]
+fn error_message_extracts_the_message_field() {
+    // Fields: S<severity>\0 C<code>\0 M<message>\0 \0
+    let body = b"SERROR\0C42704\0Mno such slot\0\0";
+    assert_eq!(error_message(body), "no such slot");
+    // The bare NUL closes the field list, so trailing bytes are padding and never a field.
+    assert_eq!(error_message(b"SERROR\0\0Mhidden\0"), "(no message)");
+    // A frame truncated mid-field still yields the bytes that did arrive.
+    assert_eq!(error_message(b"C42704\0Mno such"), "no such");
+    // A present but empty message, and a body carrying no fields at all.
+    assert_eq!(error_message(b"M\0\0"), "");
+    assert_eq!(error_message(b""), "(no message)");
+}
+
+#[test]
+fn fixed_width_window_preserves_bytes_and_context() {
+    assert_eq!(fixed::<4>(&[0, 0, 0, 7], "word").unwrap(), [0, 0, 0, 7]);
+    assert_eq!(
+        fixed::<4>(&[0, 0, 0], "word").unwrap_err().to_string(),
+        "word: expected 4 bytes, got 3"
+    );
+}
+
+#[test]
+fn auth_sub_type_reports_a_truncated_body_instead_of_panicking() {
+    assert_eq!(auth_sub_type(&[0, 0, 0, 0]).unwrap(), 0); // AuthenticationOk
+    assert_eq!(auth_sub_type(&[0, 0, 0, 10, b'S']).unwrap(), 10); // SASL, mechanisms trail the Int32
+    assert_eq!(
+        auth_sub_type(&[0, 0, 0]).unwrap_err().to_string(),
+        "short Authentication message (3 bytes)"
+    );
+    assert!(auth_sub_type(&[]).is_err());
+}
+
+#[test]
+fn parse_dsn_rejects_a_dsn_without_a_tcp_host() {
+    let err = parse_dsn("user=walrus dbname=walrus").unwrap_err();
+    assert!(err.to_string().contains("needs a TCP host"));
+}

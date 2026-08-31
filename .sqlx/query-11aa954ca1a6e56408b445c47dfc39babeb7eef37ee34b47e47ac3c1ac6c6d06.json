@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE walrus.file_manifest SET status = 'failed' WHERE id = $1\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "11aa954ca1a6e56408b445c47dfc39babeb7eef37ee34b47e47ac3c1ac6c6d06"
+}

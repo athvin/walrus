@@ -1,0 +1,617 @@
+//! Large-transaction streaming + sub-transaction exclusion + memory-ceiling spill (§1.6, §1.3, proto
+//! §8/§9). With `streaming='on'`, a transaction larger than `logical_decoding_work_mem` arrives
+//! **before its commit**, chopped into interleaved `Stream Start … Stream Stop` blocks that finish with
+//! `Stream Commit` or `Stream Abort`. This module makes the sink correct under that:
+//!
+//! 1. **Demultiplex per top-level `xid`** — a [`StreamDemux`] of per-xid `StreamedTxn` buffers,
+//!    reassembling non-contiguous segments via the `Stream Start` first-segment flag.
+//! 2. **Commit-gate visibility** — a txn's rows become a `ready` manifest file **only on `Stream
+//!    Commit`**; nothing is visible before it.
+//! 3. **Hold the slot** — [`StreamDemux::open_floor`] is the oldest open txn's begin LSN; the checkpoint
+//!    clamps `confirmed_flush_lsn` to it, so a crash always re-streams an incomplete txn.
+//! 4. **Discard aborts** — a whole-txn `Stream Abort {sub == top}` drops the buffer entirely; a
+//!    **sub-transaction** abort `Stream Abort {sub != top}` (the dangerous savepoint case, proto §9b)
+//!    drops **exactly** that sub-xid's rows while the top-level continues to commit.
+//! 5. **Bound memory** — when the aggregate [`InflightMeter`] crosses `max_inflight_bytes`, the largest
+//!    open `(table, sub-xid)` buffer is **spilled speculatively** to S3 staging — **no
+//!    manifest row, slot NOT advanced** (§1.5). Spilling is **per sub-xid** so an aborted sub-xid's
+//!    already-spilled file can be dropped without contaminating survivors.
+//!
+//! **top vs sub xid (proto §7).** `Stream Start` carries the **top-level** xid; every streamed change
+//! carries its **sub**-xid. The abort names the sub-xid — each buffered/spilled row is tagged with its
+//! sub-xid so `iter_survivors` excludes exactly the aborted ones. *Freeing memory (the spill) is NOT
+//! advancing the slot or making data visible (the `ready` row).*
+
+use crate::batch::{BatchTriggers, Clock, SystemClock, TableBatcher};
+use crate::memory::{InflightMeter, TableId};
+use crate::pgoutput::Message;
+use crate::relcache::RelationCache;
+use crate::sink::{FileKind, ParquetSink, WrittenObject};
+use anyhow::Context;
+use common::{EpochNo, Kind, Lsn, Op, SinkMeta, TupleValue, UtcTimestamp};
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU64;
+use std::sync::Arc;
+
+/// One streamed change, tagged with **its** sub-transaction xid (proto §7).
+///
+/// `values` is the decoded tuple, fixed at its source relation's width the moment the row is
+/// buffered — nothing ever appends to it — so it is frozen into a `Box<[_]>`: the capacity word a
+/// `Vec` would carry is dead weight repeated once per buffered row.
+///
+/// Deliberately **not** `Clone`. A buffered row is only ever moved (`push_change`, then
+/// `take_stream`'s `extract_if`) or borrowed (`iter_survivors`), and [`InflightMeter`] charges its
+/// bytes exactly once against the ceiling that decides when to spill. Deriving `Clone` would let a
+/// second, unmetered deep copy of an open transaction's buffer — one `Box<[TupleValue]>` per row —
+/// compile silently, so duplication here has to be a deliberate `impl`, not a derive nobody uses.
+#[derive(Debug)]
+struct StreamedChange {
+    sub_xid: u32,
+    oid: TableId,
+    op: Op,
+    values: Box<[TupleValue]>,
+    lsn: Lsn,
+}
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+    std::mem::size_of::<StreamedChange>() == 40,
+    "StreamedChange buffers every row of an open streamed transaction"
+);
+
+/// A speculatively-spilled S3 object for one `(sub_xid)` of an open txn — no manifest row until commit.
+#[derive(Debug)]
+struct StagedSpill {
+    sub_xid: u32,
+    written: WrittenObject,
+}
+
+/// Per top-level xid buffer for an in-progress streamed transaction.
+#[derive(Debug)]
+struct StreamedTxn {
+    /// The floor `confirmed_flush` must not pass while this txn is open (its first-segment LSN).
+    begin_lsn: Lsn,
+    /// Buffered (not-yet-spilled) changes in commit order, each tagged with its sub-xid.
+    changes: Vec<StreamedChange>,
+    /// Exactly the distinct `(oid, sub_xid)` streams currently represented in `changes`.
+    keys: HashSet<(TableId, u32)>,
+    /// Speculatively-spilled files, each homogeneous in one sub-xid (droppable on that sub-xid's abort).
+    staged: Vec<StagedSpill>,
+    /// Sub-xids that rolled back (`Stream Abort {sub != top}`) — excluded from `iter_survivors`.
+    aborted: HashSet<u32>,
+}
+
+impl StreamedTxn {
+    fn new(begin_lsn: Lsn) -> Self {
+        StreamedTxn {
+            begin_lsn,
+            changes: Vec::new(),
+            keys: HashSet::new(),
+            staged: Vec::new(),
+            aborted: HashSet::new(),
+        }
+    }
+
+    fn push_change(&mut self, change: StreamedChange) {
+        self.keys.insert((change.oid, change.sub_xid));
+        self.changes.push(change);
+    }
+
+    /// Move one stream out without cloning and preserve the relative order of rows and survivors.
+    ///
+    /// `extract_if` keeps the linear complexity of `mem::take` + `partition`
+    /// and ordering while avoiding a fresh survivor buffer. The txn is still open and still
+    /// buffering when the ceiling sheds one of its streams, so the survivors stay in `changes`'s
+    /// own allocation — the very one the next `push_change` refills. Taking first handed that
+    /// allocation to `IntoIter`, grew a second vector for the survivors, and freed the original on
+    /// every spill. Only the returned rows allocate.
+    fn take_stream(&mut self, oid: TableId, sub_xid: u32) -> Vec<StreamedChange> {
+        let rows: Vec<StreamedChange> = self
+            .changes
+            .extract_if(.., |c| c.oid == oid && c.sub_xid == sub_xid)
+            .collect();
+        self.keys.remove(&(oid, sub_xid));
+        rows
+    }
+
+    fn abort_subtxn(&mut self, sub_xid: u32) {
+        self.aborted.insert(sub_xid);
+    }
+
+    /// The buffered (in-memory) rows that survive to commit: every change **except** aborted sub-xids.
+    /// The single definition of survivorship — `on_stream_commit` materialises exactly this iterator,
+    /// and `survivor_count` counts it.
+    ///
+    /// `aborted` is bound to a local first: a `move` closure reading `self.aborted` would truncate
+    /// the capture path at the `*self` deref and capture the whole `&StreamedTxn` (RFC 2229).
+    ///
+    /// No `#[must_use]` here: the `Iterator` trait carries one, so an `impl Iterator` return is
+    /// already covered — unlike [`crate::relcache::Iter`], a named struct that needs its own.
+    fn iter_survivors(&self) -> impl Iterator<Item = &StreamedChange> {
+        let aborted = &self.aborted;
+        self.changes
+            .iter()
+            .filter(move |c| !aborted.contains(&c.sub_xid))
+    }
+}
+
+/// Demultiplexes interleaved streamed transactions, commit-gates visibility, and spills under memory
+/// pressure. **DB-free** — `on_stream_commit` returns the objects to `record_ready`.
+#[derive(Debug)]
+pub struct StreamDemux<C = std::sync::Arc<SystemClock>> {
+    open: HashMap<u32, StreamedTxn>,
+    /// `(relation_oid, sub_xid)` maps to the one top-level xid buffering that stream.
+    ///
+    /// Postgres xids are process-global, so one stream key has one owner. Invariant:
+    /// `owner[key] == top` iff `open[top].keys` contains `key`; every owner key is metered.
+    owner: HashMap<(TableId, u32), u32>,
+    /// The top-level xid of the currently-open `Stream Start … Stream Stop` block; changes route here.
+    current_top: Option<u32>,
+    triggers: BatchTriggers,
+    clock: C,
+    epoch: EpochNo,
+    sink_instance: String,
+    meter: InflightMeter,
+    spill_count: u64,
+}
+
+impl<C: Clock + Clone> StreamDemux<C> {
+    /// A fresh demux with no open streams. Pure, and invisible to `clippy::must_use_candidate` for
+    /// the reason [`BatchRouter::new`](crate::consume::BatchRouter::new) is.
+    #[must_use]
+    pub fn new(
+        triggers: BatchTriggers,
+        clock: C,
+        epoch: EpochNo,
+        sink_instance: impl Into<String>,
+        max_inflight_bytes: NonZeroU64,
+    ) -> Self {
+        let sink_instance = sink_instance.into();
+        StreamDemux {
+            open: HashMap::new(),
+            owner: HashMap::new(),
+            current_top: None,
+            triggers,
+            clock,
+            epoch,
+            sink_instance,
+            meter: InflightMeter::new(max_inflight_bytes),
+            spill_count: 0,
+        }
+    }
+
+    /// Total speculative spills so far; the value is exported as a metric.
+    #[must_use]
+    pub const fn spill_count(&self) -> u64 {
+        self.spill_count
+    }
+
+    /// `Stream Start`: open (first segment) or resume (later segment) the top-level xid's buffer.
+    pub fn on_stream_start(&mut self, top_xid: u32, _first_segment: bool, lsn: Lsn) {
+        self.open
+            .entry(top_xid)
+            .or_insert_with(|| StreamedTxn::new(lsn));
+        self.current_top = Some(top_xid);
+    }
+
+    /// `Stream Stop`: the block ended (the txn may resume with a later segment).
+    pub const fn on_stream_stop(&mut self) {
+        self.current_top = None;
+    }
+
+    /// Claim one buffered row's bytes and record or confirm the stream's unique owner.
+    fn claim_stream(&mut self, key: (TableId, u32), top: u32, bytes: u64) {
+        self.meter.add(key, bytes);
+        let prior = self.owner.insert(key, top);
+        debug_assert!(prior.is_none() || prior == Some(top));
+    }
+
+    /// Forget a stream in the owner index and meter as one operation.
+    fn forget_stream(&mut self, key: (TableId, u32)) {
+        self.owner.remove(&key);
+        self.meter.release(key);
+    }
+
+    /// A streamed change: buffer it against the current top-level xid, tagged with its sub-xid, and
+    /// meter its bytes. If the aggregate ceiling is crossed, spill the largest open `(table, sub-xid)`
+    /// buffer speculatively (no manifest row, slot not advanced).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if no stream block is active, the relation is unknown, batching fails,
+    /// or a speculative Parquet spill cannot be written.
+    pub async fn on_change(
+        &mut self,
+        cache: &RelationCache,
+        msg: &Message,
+        sink: &ParquetSink,
+        lsn: Lsn,
+    ) -> anyhow::Result<()> {
+        let top = self
+            .current_top
+            .context("streamed change arrived outside a Stream Start block")?;
+        // `clone().into_boxed_slice()` freezes the tuple at its decoded width; the clone already
+        // allocates exactly `len`, so the conversion is a header change, not a second allocation.
+        let (oid, op, values, sub_xid) = match msg {
+            Message::Insert {
+                relation_oid,
+                new,
+                xid,
+            } => (
+                TableId(*relation_oid),
+                Op::Insert,
+                new.clone().into_boxed_slice(),
+                xid.unwrap_or(top),
+            ),
+            Message::Update {
+                relation_oid,
+                new,
+                xid,
+                ..
+            } => (
+                TableId(*relation_oid),
+                Op::Update,
+                new.clone().into_boxed_slice(),
+                xid.unwrap_or(top),
+            ),
+            Message::Delete {
+                relation_oid,
+                old,
+                xid,
+                ..
+            } => (
+                TableId(*relation_oid),
+                Op::Delete,
+                old.clone().into_boxed_slice(),
+                xid.unwrap_or(top),
+            ),
+            // Wildcard is deliberate: Message is #[non_exhaustive], and this dispatcher ignores other families.
+            _ => return Ok(()),
+        };
+        let bytes = estimate_change_bytes(&values);
+        let txn = self
+            .open
+            .get_mut(&top)
+            .context("no open buffer for the current stream block")?;
+        txn.push_change(StreamedChange {
+            sub_xid,
+            oid,
+            op,
+            values,
+            lsn,
+        });
+        self.claim_stream((oid, sub_xid), top, bytes);
+        self.spill_if_over_ceiling(cache, sink).await
+    }
+
+    /// While over the aggregate ceiling, spill the largest open `(table, sub-xid)` buffer to a
+    /// speculative S3 object (frees memory; **not** a manifest row, **not** a slot advance).
+    async fn spill_if_over_ceiling(
+        &mut self,
+        cache: &RelationCache,
+        sink: &ParquetSink,
+    ) -> anyhow::Result<()> {
+        if !self.meter.is_over_ceiling() {
+            return Ok(());
+        }
+
+        // Build one snapshot per shed episode. Inside this loop priorities only ever fall: it calls
+        // `meter.release` through `forget_stream`, never `meter.add`. Each popped tuple is only a
+        // hint and its snapshot byte count is never treated as live accounting.
+        let mut candidates = self.meter.to_spill_order();
+        while self.meter.is_over_ceiling() {
+            let Some((_bytes, oid, sub_xid)) = candidates.pop() else {
+                break;
+            };
+            let key = (oid, sub_xid);
+            let Some(top) = self.owner.get(&key).copied() else {
+                self.forget_stream(key); // stale accounting; nothing buffered
+                continue;
+            };
+            let (triggers, clock, epoch, instance) = (
+                self.triggers,
+                self.clock.clone(),
+                self.epoch,
+                self.sink_instance.clone(),
+            );
+            let (begin, rows) = {
+                let Some(txn) = self.open.get_mut(&top) else {
+                    // A stale owner must be forgotten so the over-ceiling loop cannot spin.
+                    self.forget_stream(key);
+                    continue;
+                };
+                (txn.begin_lsn, txn.take_stream(oid, sub_xid))
+            };
+            self.forget_stream(key);
+            // `RelationCache` is keyed by the decoder's raw wire OID, so unwrap at that boundary.
+            let Some(cached) = cache.latest_for(oid.0) else {
+                continue; // shape not cached (shouldn't happen mid-stream) — nothing to spill
+            };
+            let mut batcher = TableBatcher::new(Arc::clone(&cached), triggers, clock)
+                .context("open spill batcher")?;
+            for c in &rows {
+                let meta = SinkMeta {
+                    op: c.op,
+                    lsn: c.lsn,
+                    commit_lsn: begin, // placeholder until commit stamps the real one on the manifest
+                    // Best-effort: the real commit_ts arrives only at Stream Commit, but this spill file
+                    // is already durable in S3 by then (like commit_lsn, which the loader overrides via
+                    // the manifest lsn_end; commit_ts has no such override) — so spilled rows carry the
+                    // spill-time instant, always within the transaction's lifetime.
+                    commit_ts: UtcTimestamp::now(),
+                    xid: c.sub_xid,
+                    epoch,
+                    batch_id: String::new(),
+                    schema_version: cached.schema_version,
+                    source_schema: cached.relation.schema.clone(),
+                    source_table: cached.relation.name.clone(),
+                    kind: Kind::Stream,
+                    unchanged_toast: Box::default(),
+                    sink_instance: instance.clone(),
+                    sink_processed_at: UtcTimestamp::now(),
+                };
+                batcher.push(meta, &c.values);
+            }
+            // The spill-time instant stands in for commit_ts here (see the meta comment above).
+            batcher
+                .on_commit(begin, UtcTimestamp::now())
+                .context("promote spill rows")?;
+            if batcher.committed_rows() == 0 {
+                continue;
+            }
+            // Tag as `Spill`: these rows carry a placeholder `commit_lsn` (`begin`) because the real commit
+            // LSN is not yet known. `on_stream_commit` corrects the manifest `lsn_end` to the commit LSN;
+            // the loader then reads `lsn_end` as the authoritative per-row `commit_lsn` for a `spill` file.
+            let written = sink
+                .put_with_kind(
+                    batcher.seal().context("seal speculative spill batch")?,
+                    FileKind::Spill,
+                )
+                .await
+                .context("speculative spill PUT")?;
+            self.spill_count += 1;
+            common::metrics::inc_spill(); // memory-ceiling speculative spill
+            tracing::info!(
+                top_xid = top,
+                sub_xid,
+                oid = oid.0,
+                spill_count = self.spill_count,
+                uri = %written.s3_uri,
+                "spilled open-txn buffer speculatively (no manifest, slot held)"
+            );
+            let Some(txn) = self.open.get_mut(&top) else {
+                // `top` came from `self.open`'s own keys and the txn is not removed within this
+                // loop body, so this is unreachable; skip recording the staged spill rather than panic.
+                continue;
+            };
+            txn.staged.push(StagedSpill { sub_xid, written });
+        }
+        Ok(())
+    }
+
+    /// `Stream Abort {top, sub}`. **sub == top** (whole-txn): drop the buffer AND delete its speculative
+    /// files. **sub != top** (rolled-back savepoint): mark the sub-xid dead and delete only ITS
+    /// speculative files; the top-level txn stays open and commits its survivors.
+    pub async fn on_stream_abort(&mut self, top_xid: u32, sub_xid: u32, sink: &ParquetSink) {
+        if top_xid == sub_xid {
+            common::metrics::inc_aborted_txn(); // whole-txn abort
+            if self.current_top == Some(top_xid) {
+                self.current_top = None;
+            }
+            let Some(txn) = self.open.remove(&top_xid) else {
+                return; // never opened (or already aborted) — no buffer and no spills to delete
+            };
+            self.release_txn_meter(&txn);
+            for s in &txn.staged {
+                if let Err(error) = sink.delete(&s.written.key).await {
+                    tracing::warn!(
+                        key = %s.written.key,
+                        error = %error,
+                        "failed to delete aborted speculative spill; object orphaned in staging"
+                    );
+                }
+            }
+            tracing::info!(
+                top_xid,
+                rows = txn.changes.len(),
+                staged = txn.staged.len(),
+                "whole-txn abort"
+            );
+            return;
+        }
+        let Some(txn) = self.open.get_mut(&top_xid) else {
+            return; // the top-level txn is not open here — nothing of its savepoint to drop
+        };
+        txn.abort_subtxn(sub_xid);
+        // One predicate pass both removes the rolled-back spills and hands them over: the
+        // survivors compact inside `staged`'s allocation (the txn stays open and keeps
+        // spilling), and the doomed entries move out instead of their keys being cloned
+        // to outlive the borrow the awaited deletes cannot hold.
+        let doomed = txn
+            .staged
+            .extract_if(.., |s| s.sub_xid == sub_xid)
+            .collect::<Vec<_>>();
+        for spill in &doomed {
+            if let Err(error) = sink.delete(&spill.written.key).await {
+                tracing::warn!(
+                    key = %spill.written.key,
+                    error = %error,
+                    "failed to delete rolled-back speculative spill; object orphaned in staging"
+                );
+            }
+        }
+        tracing::info!(
+            top_xid,
+            sub_xid,
+            dropped_spills = doomed.len(),
+            "sub-txn abort: savepoint rows excluded"
+        );
+    }
+
+    /// `Stream Commit`: publish the (non-aborted) speculative spills stamped with the real `commit_lsn`,
+    /// and materialise the in-memory survivors, returning every object for the caller to `record_ready`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if survivor batching, commit timestamp propagation, or durable
+    /// Parquet publication of an in-memory group fails.
+    pub async fn on_stream_commit(
+        &mut self,
+        top_xid: u32,
+        commit_lsn: Lsn,
+        commit_ts: UtcTimestamp,
+        cache: &RelationCache,
+        sink: &ParquetSink,
+    ) -> anyhow::Result<Vec<WrittenObject>> {
+        if self.current_top == Some(top_xid) {
+            self.current_top = None;
+        }
+        let Some(mut txn) = self.open.remove(&top_xid) else {
+            tracing::warn!(
+                top_xid,
+                "Stream Commit for an unknown xid; nothing to materialise"
+            );
+            return Ok(Vec::new());
+        };
+        self.release_txn_meter(&txn);
+        let mut out = Vec::new();
+        // Publish speculative spills whose sub-xid did NOT abort, stamped with the real commit LSN.
+        // `take` moves the spill vector out without moving `txn`, so `txn.iter_survivors()` remains usable.
+        for spill in std::mem::take(&mut txn.staged) {
+            if txn.aborted.contains(&spill.sub_xid) {
+                if let Err(error) = sink.delete(&spill.written.key).await {
+                    tracing::warn!(
+                        key = %spill.written.key,
+                        error = %error,
+                        "failed to delete aborted speculative spill; object orphaned in staging"
+                    );
+                }
+                continue;
+            }
+            let mut w = spill.written;
+            w.lsn_end = commit_lsn;
+            out.push(w);
+        }
+        // Materialise the still-in-memory survivors — the same predicate the accessor defines.
+        let (triggers, clock, epoch, instance) = (
+            self.triggers,
+            self.clock.clone(),
+            self.epoch,
+            self.sink_instance.clone(),
+        );
+        let mut batchers: HashMap<TableId, TableBatcher<C>> = HashMap::new();
+        for c in txn.iter_survivors() {
+            let Some(cached) = cache.latest_for(c.oid.0) else {
+                continue;
+            };
+            let meta = SinkMeta {
+                op: c.op,
+                lsn: c.lsn,
+                commit_lsn,
+                commit_ts, // the real Stream-Commit timestamp (also re-stamped by on_commit below)
+                xid: c.sub_xid,
+                epoch,
+                batch_id: String::new(),
+                schema_version: cached.schema_version,
+                source_schema: cached.relation.schema.clone(),
+                source_table: cached.relation.name.clone(),
+                kind: Kind::Stream,
+                unchanged_toast: Box::default(),
+                sink_instance: instance.clone(),
+                sink_processed_at: UtcTimestamp::now(),
+            };
+            let batcher = match batchers.entry(c.oid) {
+                Entry::Occupied(e) => e.into_mut(),
+                Entry::Vacant(e) => e.insert(
+                    TableBatcher::new(Arc::clone(&cached), triggers, clock.clone())
+                        .context("open streamed materialise batcher")?,
+                ),
+            };
+            batcher.push(meta, &c.values);
+            batcher
+                .on_commit(commit_lsn, commit_ts)
+                .context("promote streamed survivors")?;
+            if batcher.should_flush() {
+                out.push(
+                    sink.put(batcher.seal().context("seal streamed sub-batch")?)
+                        .await
+                        .context("materialise streamed sub-batch")?,
+                );
+            }
+        }
+        for batcher in batchers.values_mut() {
+            if batcher.committed_rows() > 0 {
+                out.push(
+                    sink.put(batcher.seal().context("seal final streamed batch")?)
+                        .await
+                        .context("materialise final streamed batch")?,
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    /// The oldest open txn's begin LSN — `confirmed_flush` must never pass this (§1.6). `None` when no
+    /// streamed txn is open.
+    #[must_use]
+    pub fn open_floor(&self) -> Option<Lsn> {
+        self.open.values().map(|t| t.begin_lsn).min()
+    }
+
+    fn release_txn_meter(&mut self, txn: &StreamedTxn) {
+        for &key in &txn.keys {
+            self.forget_stream(key);
+        }
+    }
+
+    #[cfg(test)]
+    fn owner_len(&self) -> usize {
+        self.owner.len()
+    }
+
+    #[cfg(test)]
+    fn survivor_count(&self, top_xid: u32) -> usize {
+        self.open
+            .get(&top_xid)
+            .map(|t| t.iter_survivors().count())
+            .unwrap_or(0)
+    }
+}
+
+/// A rough per-change byte estimate (Arrow-buffered size, not serialized Parquet) for the meter.
+///
+/// Saturating to match the [`InflightMeter`] it feeds, whose own `add` clamps: a wrapped sum here
+/// would hand the meter a *small* number in release and silently lift the memory ceiling, which is
+/// the backstop against an OOM-kill.
+fn estimate_change_bytes(values: &[TupleValue]) -> u64 {
+    const META_OVERHEAD: u64 = 96;
+    values
+        .iter()
+        .map(|v| match v {
+            TupleValue::Text(s) => u64::try_from(s.len()).unwrap_or(u64::MAX),
+            TupleValue::Binary(b) => u64::try_from(b.len()).unwrap_or(u64::MAX),
+            TupleValue::Null | TupleValue::UnchangedToast => 1,
+        })
+        .fold(META_OVERHEAD, u64::saturating_add)
+}
+
+/// A streamed change carries its sub-xid; a non-streamed change never enters the demux.
+///
+/// A pure classification of `msg`, so calling it for effect is meaningless. It escapes
+/// `clippy::must_use_candidate` through the argument: a [`Message`] can hold a `TupleValue::Binary`,
+/// whose `bytes::Bytes` is not `Freeze`, and that lint reads any non-`Freeze` reference as a
+/// mutable — therefore side-effecting — argument.
+#[must_use]
+pub const fn is_streamed_change(msg: &Message) -> bool {
+    matches!(
+        msg,
+        Message::Insert { xid: Some(_), .. }
+            | Message::Update { xid: Some(_), .. }
+            | Message::Delete { xid: Some(_), .. }
+    )
+}
+
+#[cfg(test)]
+#[path = "stream_txn_test.rs"]
+mod tests;

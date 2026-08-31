@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE walrus.table_reload\nSET chunk_no = $2,\n    cursor_pk = $3,\n    first_lsn = COALESCE(first_lsn, $4),\n    schema_version = COALESCE(schema_version, $5),\n    updated_at = now()\nWHERE reload_id = $1 AND status = 'exporting' AND chunk_no = $2::bigint - 1\n  AND (schema_version IS NULL OR schema_version = $5)\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Jsonb",
+        {
+          "Custom": {
+            "name": "pg_lsn",
+            "kind": "Simple"
+          }
+        },
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ed50e153f0c92b2094d1df293bec406b628ac5c536425bfce37718a6eb1066f6"
+}

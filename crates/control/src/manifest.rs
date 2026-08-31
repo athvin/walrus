@@ -1,0 +1,292 @@
+//! `file_manifest` models: the sink's insert-ready, the loader's claim-in-commit-order, and the
+//! queue's retire-by-delete.
+//!
+//! The manifest is a **work queue, not a history**. The single load-bearing line is the claim
+//! ordering: `ORDER BY lsn_end, id` — commit LSN, then `id` as the tiebreaker. It is *not*
+//! `lsn_end > raw_appended_lsn`: the many snapshot files that share `consistent_point` all have the
+//! same `lsn_end`, and a `>` filter would skip them forever. And it keys on the **commit** LSN, not
+//! a max-row LSN, or a late-committing large transaction would be silently dropped. Retiring a file
+//! is a `DELETE`, not a status flip — the queue's frontier advances by removal.
+
+use crate::{ControlError, parse::ParseEnumError};
+use common::string_enum;
+use common::{EpochNo, Lsn, ManifestId, ReloadId, SchemaVersionNo};
+use sqlx::PgExecutor;
+
+// Each table below is the exact persisted string contract for its `file_manifest` text column.
+string_enum! {
+    /// The kind of a `file_manifest` row — the canonical enum for the `kind` text column, shared by the
+    /// sink (which writes it; pg-sink re-exports this as `FileKind`) and the loader (which routes on it).
+    ///
+    /// `Spill` is a *single* streamed transaction written before its commit LSN was known; the
+    /// loader treats the file's `lsn_end` — not the per-row placeholder — as the authoritative
+    /// `commit_lsn` for its rows. `Reload` chunk files enter the same `(lsn_end, id)` claim
+    /// order carrying a `reload_id`; `Snapshot`/`Stream` rows never set it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ManifestKind {
+        error = ParseEnumError;
+        column = "file_manifest.kind";
+        Snapshot => "snapshot",
+        Stream => "stream",
+        Spill => "spill",
+        Reload => "reload",
+    }
+}
+
+string_enum! {
+    /// The lifecycle state of a `file_manifest` row: `Ready` to claim, or dead-lettered `Failed` (a
+    /// poison file that can't block the queue — see [`mark_failed`]). Applied rows are DELETED, never
+    /// kept (see [`delete_claimed`]), so those are the only two persisted states.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ManifestStatus {
+        error = ParseEnumError;
+        column = "file_manifest.status";
+        Ready => "ready",
+        Failed => "failed",
+    }
+}
+
+/// A `ready` file the loader can claim. The column set is exactly what the claim query reads.
+///
+/// `kind` is `Snapshot | Stream | Spill | Reload` — reload chunk files enter this same
+/// queue and sort into the same `(lsn_end, id)` order, carrying the `reload_id` the loader's
+/// rebuild trigger routes on. Stream/snapshot/spill rows never set `reload_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestRow {
+    /// The row's primary key, and the *tiebreaker* half of the `(lsn_end, id)` claim order — so it
+    /// is load-bearing for ordering, not just a handle.
+    pub id: ManifestId,
+    /// Generation this file belongs to; a retired generation's rows are never claimed.
+    pub epoch: EpochNo,
+    /// Source schema the file's rows came from.
+    pub source_schema: String,
+    /// Source table the file's rows came from.
+    pub source_table: String,
+    /// Where the Parquet lives. Durable in object storage *before* this row exists.
+    pub s3_uri: String,
+    /// Which producer wrote it, which is what the loader routes on; see [`ManifestKind`].
+    pub kind: ManifestKind,
+    /// Rows in the file, for backlog accounting. Not a correctness input.
+    pub row_count: i64,
+    /// Lowest commit LSN in the file — diagnostic only; the queue never orders on it.
+    pub lsn_start: Lsn,
+    /// Highest **commit** LSN in the file: the frontier this file advances, and the primary claim
+    /// sort key. Snapshot files all share one `lsn_end`, which is why the claim uses `>=`-free
+    /// ordering rather than a `>` filter.
+    pub lsn_end: Lsn,
+    /// The relation shape these rows were encoded at, so the loader can reconstruct the types.
+    pub schema_version: SchemaVersionNo,
+    /// `Ready` to claim, or dead-lettered `Failed`; see [`ManifestStatus`].
+    pub status: ManifestStatus,
+    /// `Some` only for `kind='reload'` chunk files; the purge/routing key.
+    pub reload_id: Option<ReloadId>,
+}
+
+/// What the sink inserts after its Parquet is durable in S3.
+///
+/// Comparable like the [`ManifestRow`] it becomes, so a mapper that builds one can be asserted as a
+/// whole record instead of field by field (which silently skips whatever the assertion forgot).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewManifestFile {
+    /// Generation this file belongs to.
+    pub epoch: EpochNo,
+    /// Source schema the file's rows came from.
+    pub source_schema: String,
+    /// Source table the file's rows came from.
+    pub source_table: String,
+    /// Where the Parquet already lives — the insert happens only after the PUT is durable.
+    pub s3_uri: String,
+    /// Which producer wrote it; see [`ManifestKind`].
+    pub kind: ManifestKind,
+    /// Rows in the file, for backlog accounting.
+    pub row_count: i64,
+    /// Lowest commit LSN in the file — diagnostic only.
+    pub lsn_start: Lsn,
+    /// Highest **commit** LSN in the file — the value the claim order sorts on.
+    pub lsn_end: Lsn,
+    /// The relation shape these rows were encoded at.
+    pub schema_version: SchemaVersionNo,
+    /// Set (with `kind=Reload`) only by the chunk export engine; `None` otherwise.
+    pub reload_id: Option<ReloadId>,
+}
+
+/// Insert a `status='ready'` row with `lsn_end` set to the commit LSN; returns the new `id`.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] when the insert fails, or [`ControlError::CheckViolation`] if
+/// the manifest values violate a database invariant.
+pub async fn insert_ready(
+    executor: impl PgExecutor<'_>,
+    f: &NewManifestFile,
+) -> Result<ManifestId, ControlError> {
+    let reload_id = f.reload_id.map(|id| id.0);
+    let rec = sqlx::query_file!(
+        "sql/postgres/queries/insert_ready.sql",
+        f.epoch.0,
+        f.source_schema,
+        f.source_table,
+        f.s3_uri,
+        f.kind.as_str(),
+        f.row_count,
+        f.lsn_start as Lsn,
+        f.lsn_end as Lsn,
+        f.schema_version.0,
+        reload_id,
+    )
+    .fetch_one(executor)
+    .await?;
+    Ok(ManifestId(rec.id))
+}
+
+/// Claim the next `ready` files for a table **in commit order**.
+///
+/// `ORDER BY lsn_end, id` — `id` breaks equal-`lsn_end` ties. There is deliberately **no**
+/// `lsn_end > raw_appended_lsn` predicate: that would skip the equal-`lsn_end` snapshot files.
+///
+/// **The pause predicate (reload §2/H8):** while a `flavor='reload'` reload is
+/// `requested|exporting`, claiming would apply-and-RETIRE post-`W` stream files into the old
+/// mirror — and the rebuild would then clear that mirror with those events gone from the queue
+/// forever. Not claiming is a complete pause: rows accumulate `ready`, the frontier freezes at
+/// `W`, and the rebuild later replays the world in `(lsn_end, id)` order. The pause lives in the
+/// QUERY (one statement, no check-then-claim TOCTOU) and lifts at `export_complete` — the loader
+/// must claim again to reach the chunk files and trigger the rebuild; pausing through
+/// `export_complete` would deadlock the reload. `resync` never pauses (H3). The `NOT EXISTS`
+/// probe is served by the `table_reload_one_live` partial index (its predicate
+/// `status NOT IN ('complete','failed')` covers `requested|exporting`).
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the atomic claim query fails, or [`ControlError::Decode`] if
+/// a stored manifest kind or status is outside its checked enum set.
+pub async fn claim_ready(
+    executor: impl PgExecutor<'_>,
+    epoch: EpochNo,
+    source_schema: &str,
+    source_table: &str,
+    limit: i64,
+) -> Result<Vec<ManifestRow>, ControlError> {
+    // The `kind`/`status` text columns decode to `String` here, then parse into the typed enums.
+    // A value outside the known set is a data-integrity bug (the sink only ever writes `as_str()`),
+    // so it maps to the terminal `Decode`. The SQL text is unchanged, so the committed `.sqlx`
+    // offline cache stays valid without a regenerate.
+    let rows = sqlx::query_file!(
+        "sql/postgres/queries/claim_ready.sql",
+        epoch.0,
+        source_schema,
+        source_table,
+        limit,
+    )
+    .fetch_all(executor)
+    .await?;
+    rows.into_iter()
+        .map(|r| {
+            Ok(ManifestRow {
+                id: ManifestId(r.id),
+                epoch: r.epoch.into(),
+                source_schema: r.source_schema,
+                source_table: r.source_table,
+                s3_uri: r.s3_uri,
+                kind: r.kind.parse()?,
+                row_count: r.row_count,
+                lsn_start: r.lsn_start,
+                lsn_end: r.lsn_end,
+                schema_version: r.schema_version.into(),
+                status: r.status.parse()?,
+                reload_id: r.reload_id.map(Into::into),
+            })
+        })
+        .collect()
+}
+
+/// The newest `ready` file's commit LSN for a table — the head of the Phase-A backlog — or `None`
+/// when the queue is empty. Powers the `walrus_loader_raw_append_lag_bytes` gauge: the lag
+/// is this minus `raw_appended_lsn`. `MAX` over an empty set is SQL `NULL` → `None`.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the backlog query cannot reach or read control Postgres.
+pub async fn max_ready_lsn_end(
+    executor: impl PgExecutor<'_>,
+    epoch: EpochNo,
+    source_schema: &str,
+    source_table: &str,
+) -> Result<Option<Lsn>, ControlError> {
+    let row = sqlx::query_file!(
+        "sql/postgres/queries/max_ready_lsn_end.sql",
+        epoch.0,
+        source_schema,
+        source_table,
+    )
+    .fetch_one(executor)
+    .await?;
+    Ok(row.max_lsn_end)
+}
+
+/// Retire claimed rows — the queue's "done" is a `DELETE`, not a status flip. Returns the count.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the claimed-row delete cannot be executed.
+pub async fn delete_claimed(
+    executor: impl PgExecutor<'_>,
+    ids: &[ManifestId],
+) -> Result<u64, ControlError> {
+    // The transparent `Type` impl carries no `PgHasArrayType`, so unwrap to `&[i64]` for the array bind.
+    let raw: Vec<i64> = ids.iter().map(|id| id.0).collect();
+    let result = sqlx::query_file!("sql/postgres/queries/delete_claimed.sql", raw.as_slice())
+        .execute(executor)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// Purge a rebuilding table's SUPERSEDED pending rows at trigger time (reload H8): every
+/// non-reload row with `lsn_end <= first_lsn` describes a commit the chunks re-cover (`C <= L_1`
+/// ⇒ visible to chunk 1's SELECT), so applying it after the rebuild would only re-apply history
+/// the clear just replaced. Chunk 1 itself has `lsn_end = first_lsn` — the `kind` filter is what
+/// lets it survive its own purge. No status filter: a dead-lettered (`failed`) pre-`W` file is
+/// equally superseded. Idempotent (a re-run deletes nothing). Returns rows purged.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the superseded-row delete cannot be executed.
+pub async fn delete_superseded(
+    executor: impl PgExecutor<'_>,
+    epoch: EpochNo,
+    source_schema: &str,
+    source_table: &str,
+    first_lsn: Lsn,
+) -> Result<u64, ControlError> {
+    let done = sqlx::query_file!(
+        "sql/postgres/queries/delete_superseded.sql",
+        epoch.0,
+        source_schema,
+        source_table,
+        first_lsn as Lsn,
+    )
+    .execute(executor)
+    .await?;
+    Ok(done.rows_affected())
+}
+
+/// Dead-letter a repeatedly-failing file (`status='failed'`) so a poison file can't block the queue.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the status update fails, or
+/// [`ControlError::CheckViolation`] if it would violate a manifest invariant.
+pub async fn mark_failed(
+    executor: impl PgExecutor<'_>,
+    id: ManifestId,
+) -> Result<(), ControlError> {
+    // Unwrap to `i64` for the bind: `query_file!` (unlike `query_file_as!`) offline-checks the arg
+    // against the column's concrete `i64`, so a scalar bind passes the inner value.
+    sqlx::query_file!("sql/postgres/queries/mark_failed.sql", id.0)
+        .execute(executor)
+        .await?;
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "manifest_test.rs"]
+mod tests;

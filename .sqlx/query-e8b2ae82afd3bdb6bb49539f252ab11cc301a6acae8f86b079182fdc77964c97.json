@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM walrus.file_manifest WHERE reload_id = $1\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e8b2ae82afd3bdb6bb49539f252ab11cc301a6acae8f86b079182fdc77964c97"
+}

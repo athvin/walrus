@@ -1,0 +1,454 @@
+//! The raw→mirror transform (loader §5–§6) — **the correctness heart of the loader**. One parameterized
+//! SQL template ([`transform.sql`](TRANSFORM_SQL)) rendered per table: a dedup window that keeps the
+//! latest change per PK (deletes stay *in* the window; the winner's `op` decides — the resurrection
+//! guard §5.3), then a three-branch `MERGE INTO` that collapses intra-batch PK churn (`i→d→i`, `i→u→d`,
+//! `d→i`, phantom `d`). The same template is used by the hermetic tests here and by Phase B.
+//!
+//! **⚠ Extends architecture.md (§7, Open Q8/Q13):** the per-PK max-applied-`(commit_lsn, lsn)` guard.
+//! Each mutating MERGE branch is gated on `(s.commit_lsn, s.lsn) > (t._applied_commit_lsn, t._applied_lsn)`
+//! and the window low bound is relaxed to `>=`, together closing two straddle faces — (A) the
+//! equal-`commit_lsn` snapshot row and (B) a stale delete/re-insert across the watermark — while keeping
+//! the mirror idempotent (the guard makes a re-applied boundary row a no-op). The full-rebuild
+//! remains the safety net regardless; this makes the *incremental* path self-correcting.
+
+use crate::duck_ext::DuckResultExt;
+use crate::error::LoaderError;
+use crate::table_name::{DuckTable, Mirror, Raw};
+use common::{Lsn, PgRelation};
+use duckdb::OptionalExt;
+
+/// The transform template (single source of truth). Rendered by [`TransformSql::render`].
+pub const TRANSFORM_SQL: &str = include_str!("../sql/duckdb/templates/transform.sql");
+
+/// Substitute every transform placeholder in one pass. `str::replace` allocates and copies the
+/// whole (increasingly large) SQL string once per placeholder; the transform has eleven of them.
+/// Counting against the static template first gives the final string an exact capacity, then this
+/// traversal copies each literal and replacement only once.
+fn render_transform_template(replacements: &[(&str, &str)]) -> String {
+    let capacity = replacements
+        .iter()
+        .fold(TRANSFORM_SQL.len(), |length, (placeholder, value)| {
+            let occurrences = TRANSFORM_SQL.matches(placeholder).count();
+            length - occurrences * placeholder.len() + occurrences * value.len()
+        });
+    let mut rendered = String::with_capacity(capacity);
+    let mut remaining = TRANSFORM_SQL;
+
+    while let Some(open) = remaining.find('{') {
+        rendered.push_str(&remaining[..open]);
+        let token_start = &remaining[open..];
+        let Some(close) = token_start.find('}') else {
+            rendered.push_str(token_start);
+            return rendered;
+        };
+        let token_end = open + close + 1;
+        let token = &remaining[open..token_end];
+        let replacement = replacements
+            .iter()
+            .find_map(|(placeholder, value)| (*placeholder == token).then_some(*value))
+            .unwrap_or(token);
+        rendered.push_str(replacement);
+        remaining = &remaining[token_end..];
+    }
+    rendered.push_str(remaining);
+    rendered
+}
+
+/// The latest `TRUNCATE` tuple `(Ct, Lt)` in the un-transformed tail. The wipe boundary is the
+/// **tuple**, never the scalar `commit_lsn`.
+///
+/// "The tail holds no truncate" is the *absence* of this value — producers and consumers carry it
+/// as `Option<TruncateBoundary>` — so a half-resolved boundary (one LSN of the pair without the
+/// other) cannot be constructed, and no call site has to re-check the second field.
+#[derive(Debug, Clone, Copy)]
+pub struct TruncateBoundary {
+    /// The TRUNCATE's commit LSN — which transaction wiped the table.
+    pub ct: Lsn,
+    /// The TRUNCATE's per-row LSN — the intra-transaction tiebreaker that, with `ct`, orders the
+    /// wipe against rows committed by the same transaction.
+    pub lt: Lsn,
+}
+
+/// One mirror column and the SQL producing its value from the winning raw row `s` (and, for a
+/// TOAST-resolvable scalar, the current mirror `t`). A Tier-2 column recombines/flattens from
+/// its emit columns; a Tier-1 scalar is the same TOAST-resolved passthrough the transform always used.
+#[derive(Debug)]
+struct MirrorCol {
+    name: String,
+    is_key: bool,
+    /// Whether `value_expr` recombines from raw emit columns (Tier-2) — in the full-rebuild the recombine
+    /// happens in the raw arm of the union (the mirror baseline can't be decomposed back), then the
+    /// column passes through; the incremental path just uses `value_expr` directly over the raw winner.
+    is_recombine: bool,
+    value_expr: String,
+}
+
+/// A table's mirror-column layout for rendering the transform (order preserved). Built from the
+/// crate-internal `plan::TablePlan` — the Tier-1 plan reproduces the pre-descriptor scalar SQL
+/// exactly. The public constructor ([`Self::from_relation`]) takes the shape callers already hold,
+/// so the plan type stays free to change with the type system it bridges.
+#[derive(Debug)]
+pub struct TransformSql {
+    table: DuckTable<Mirror>,
+    /// Frozen like the `plan::TablePlan::mirror_cols` it is derived from: the layout is
+    /// settled once per Phase-B poll and only ever read back to render SQL.
+    mirror: Box<[MirrorCol]>,
+}
+
+impl TransformSql {
+    /// Tier-1 (scalar) transform from a bare relation — unchanged from the pre-descriptor path.
+    #[must_use]
+    pub fn from_relation(rel: &PgRelation) -> Self {
+        Self::from_plan(&crate::plan::TablePlan::tier1(rel))
+    }
+
+    /// The full transform from a schema [`crate::plan::TablePlan`]: each mirror column's value is precomputed as SQL
+    /// over the winner `s` — a recombine expression (Tier-2), an unchanged-TOAST-resolved back-scan
+    /// (Tier-1 non-key, §5.6), or a plain `s."col"` (keys / flat siblings).
+    #[must_use]
+    pub(crate) fn from_plan(plan: &crate::plan::TablePlan) -> Self {
+        use crate::plan::MirrorValue;
+        let q = |c: &str| format!("\"{c}\"");
+        let table = DuckTable::<Mirror>::new(plan.table.as_ref());
+        let raw_table = table.to_raw();
+        // The TOAST back-scan's key predicate is the only thing the key names feed here, so the
+        // filter streams straight into the rendered equalities — the join needs a slice, nothing
+        // upstream of it does.
+        let r_pk_eq_s = plan
+            .mirror_cols
+            .iter()
+            .filter(|c| c.is_key)
+            .map(|c| format!("r.{} = s.{}", q(&c.name), q(&c.name)))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let mirror = plan
+            .mirror_cols
+            .iter()
+            .map(|c| {
+                let is_recombine = matches!(c.value, MirrorValue::Recombine(_));
+                let value_expr = match &c.value {
+                    MirrorValue::Recombine(expr) => expr.clone(),
+                    MirrorValue::Passthrough {
+                        toast_resolvable: false,
+                    } => format!("s.{}", q(&c.name)),
+                    MirrorValue::Passthrough {
+                        toast_resolvable: true,
+                    } => {
+                        let qc = q(&c.name);
+                        // Membership test on the JSON array text (`["big"]`) — the quotes disambiguate.
+                        let listed = |alias: &str| {
+                            format!(
+                                "COALESCE(json_extract_string({alias}.\"walrus_pg_sink_meta\", '$.unchanged_toast'), '[]') LIKE '%\"{}\"%'",
+                                c.name
+                            )
+                        };
+                        format!(
+                            "CASE WHEN {winner} THEN COALESCE(( \
+                               SELECT r.{qc} FROM \"{raw_table}\" r \
+                               WHERE {r_pk_eq_s} AND NOT ({raw}) \
+                                 AND (r.\"_walrus_commit_lsn\", r.\"_walrus_lsn\") <= (s.\"_walrus_commit_lsn\", s.\"_walrus_lsn\") \
+                               ORDER BY r.\"_walrus_commit_lsn\" DESC, r.\"_walrus_lsn\" DESC LIMIT 1), t.{qc}) \
+                             ELSE s.{qc} END",
+                            winner = listed("s"),
+                            raw_table = raw_table.as_str(),
+                            raw = listed("r"),
+                        )
+                    }
+                };
+                MirrorCol {
+                    name: c.name.clone(),
+                    is_key: c.is_key,
+                    is_recombine,
+                    value_expr,
+                }
+            })
+            .collect();
+        TransformSql { table, mirror }
+    }
+
+    /// The mirror's key columns in relation order. Allocates a `Vec` per call — hence `to_`; the
+    /// borrowed `&str` elements still refer to `self`.
+    fn to_pk_names(&self) -> Vec<&str> {
+        self.mirror
+            .iter()
+            .filter(|c| c.is_key)
+            .map(|c| c.name.as_str())
+            .collect()
+    }
+    /// The mirror's non-key columns in relation order. Allocates a `Vec` per call — hence `to_`;
+    /// the borrowed `&str` elements still refer to `self`.
+    fn to_non_key_names(&self) -> Vec<&str> {
+        self.mirror
+            .iter()
+            .filter(|c| !c.is_key)
+            .map(|c| c.name.as_str())
+            .collect()
+    }
+
+    /// The latest `TRUNCATE` `(Ct, Lt)` in the tail (`op='t'`, `commit_lsn > after_lsn`), ordered by the
+    /// tuple. `None` if the tail holds no truncate — every downstream predicate is then simply omitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::LsnParse`] if a stored truncate commit or row LSN is malformed, or
+    /// [`LoaderError::Duck`] if DuckDB rejects the boundary query. Only a genuinely missing row is
+    /// treated as no truncate boundary.
+    pub fn latest_truncate(
+        &self,
+        conn: &duckdb::Connection,
+        after_lsn: Lsn,
+    ) -> Result<Option<TruncateBoundary>, LoaderError> {
+        let raw = self.table.to_raw();
+        let sql = format!(
+            "SELECT \"_walrus_commit_lsn\", \"_walrus_lsn\" FROM \"{}\" \
+             WHERE \"_walrus_op\" = 't' AND \"_walrus_commit_lsn\" > '{}' \
+             ORDER BY \"_walrus_commit_lsn\" DESC, \"_walrus_lsn\" DESC LIMIT 1",
+            raw.as_str(),
+            after_lsn
+        );
+        let row: Option<(String, String)> = conn
+            .query_row(&sql, [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()
+            .duck_with(|| format!("scan truncate boundary on {}", raw.as_str()))?;
+        match row {
+            None => Ok(None),
+            Some((ct, lt)) => Ok(Some(TruncateBoundary {
+                ct: ct.parse().map_err(|source| LoaderError::LsnParse {
+                    field: "Ct",
+                    source,
+                })?,
+                lt: lt.parse().map_err(|source| LoaderError::LsnParse {
+                    field: "Lt",
+                    source,
+                })?,
+            })),
+        }
+    }
+
+    /// Render the full rendered SQL (truncate wipe + dedup `CREATE TEMP TABLE _batch` + guarded `MERGE
+    /// INTO`), reading the un-transformed tail (`commit_lsn >= after_lsn` — the `>=` re-examines the
+    /// equal-`commit_lsn` snapshot straddle, §7 break face A; and — if the tail has a truncate — only
+    /// rows STRICTLY after the `(Ct, Lt)` tuple). Composite-PK-aware.
+    #[must_use]
+    pub fn render(&self, after_lsn: Lsn, boundary: Option<TruncateBoundary>) -> String {
+        let q = |c: &str| format!("\"{c}\"");
+        let table = self.table.as_str();
+        let pk = self.to_pk_names();
+        let non_key = self.to_non_key_names();
+        let all: Vec<&str> = self.mirror.iter().map(|c| c.name.as_str()).collect();
+        let pk_list = pk.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
+        let pk_join = pk
+            .iter()
+            .map(|c| format!("t.{} = s.{}", q(c), q(c)))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        // MATCHED UPDATE assigns the non-key mirror columns; if a table is all-PK, a self-assignment keeps
+        // the UPDATE valid (a no-op) so `d→i` still lands via the MATCHED branch. Every UPDATE also stamps
+        // the hidden `_applied_*` guard columns with the winner's tuple (§7).
+        let mut set_parts: Vec<String> = if non_key.is_empty() {
+            // A column-less relation has no key to self-assign either. Render the guard stamps alone
+            // rather than indexing: DuckDB then rejects the degenerate statement as a classified
+            // `LoaderError::Duck` instead of the apply loop panicking mid-transaction.
+            pk.first()
+                .map(|k| format!("{} = s.{}", q(k), q(k)))
+                .into_iter()
+                .collect()
+        } else {
+            non_key
+                .iter()
+                .map(|c| format!("{} = s.{}", q(c), q(c)))
+                .collect()
+        };
+        set_parts.push("\"_applied_commit_lsn\" = s.\"_walrus_commit_lsn\"".into());
+        set_parts.push("\"_applied_lsn\" = s.\"_walrus_lsn\"".into());
+        let set_cols = set_parts.join(", ");
+        // INSERT carries the mirror columns PLUS the hidden guard columns seeded from the winner's tuple.
+        let mut insert_col_parts: Vec<String> = all.iter().map(|c| q(c)).collect();
+        insert_col_parts.push("\"_applied_commit_lsn\"".into());
+        insert_col_parts.push("\"_applied_lsn\"".into());
+        let insert_cols = insert_col_parts.join(", ");
+        let mut insert_val_parts: Vec<String> = all.iter().map(|c| format!("s.{}", q(c))).collect();
+        insert_val_parts.push("s.\"_walrus_commit_lsn\"".into());
+        insert_val_parts.push("s.\"_walrus_lsn\"".into());
+        let insert_vals = insert_val_parts.join(", ");
+        // The per-PK max-applied guard (§7, ⚠ extends architecture.md): a MUTATING branch fires only when
+        // the winner's tuple is STRICTLY newer than what last shaped the mirror row. Row-value `>` is
+        // lexicographic in DuckDB — exactly the `(commit_lsn, lsn)` order; do NOT hand-decompose it.
+        let guard = "(s.\"_walrus_commit_lsn\", s.\"_walrus_lsn\") > \
+                     (t.\"_applied_commit_lsn\", t.\"_applied_lsn\")";
+
+        // `_batch`'s SELECT list: each mirror column's precomputed value expression over the raw winner
+        // `s` (a Tier-2 recombine or a Tier-1 TOAST-resolved passthrough), then `_walrus_op` for the MERGE
+        // branches and `_walrus_commit_lsn`/`_walrus_lsn` for the guard comparison and `_applied_*` stamps.
+        let mut select_parts: Vec<String> = self
+            .mirror
+            .iter()
+            .map(|c| format!("{} AS {}", c.value_expr, q(&c.name)))
+            .collect();
+        select_parts.push("s.\"_walrus_op\"".to_string());
+        select_parts.push("s.\"_walrus_commit_lsn\"".to_string());
+        select_parts.push("s.\"_walrus_lsn\"".to_string());
+        let resolved_select = select_parts.join(", ");
+        // The truncate wipe (whole mirror) + the tuple-boundary window filter — empty when no truncate.
+        let (truncate_wipe, truncate_bound) = match boundary {
+            Some(TruncateBoundary { ct, lt }) => (
+                format!("DELETE FROM \"{table}\";"),
+                format!(" AND (\"_walrus_commit_lsn\", \"_walrus_lsn\") > ('{ct}', '{lt}')"),
+            ),
+            None => (String::new(), String::new()),
+        };
+        let after_lsn = after_lsn.to_string();
+        render_transform_template(&[
+            ("{table}", table),
+            ("{pk_list}", &pk_list),
+            ("{pk_join}", &pk_join),
+            ("{set_cols}", &set_cols),
+            ("{insert_cols}", &insert_cols),
+            ("{insert_vals}", &insert_vals),
+            ("{after_lsn}", &after_lsn),
+            ("{truncate_wipe}", &truncate_wipe),
+            ("{truncate_bound}", &truncate_bound),
+            ("{resolved_select}", &resolved_select),
+            ("{guard}", guard),
+        ])
+    }
+
+    /// The table name (for compaction / prune SQL that lives outside the template).
+    #[must_use]
+    pub fn table(&self) -> &str {
+        self.table.as_str()
+    }
+
+    /// This table's CDC log `<table>_raw`, tagged [`Raw`] so it cannot land where a mirror name
+    /// belongs. [`crate::compaction::prune_raw`] `DELETE`s from it — the same statement aimed at the
+    /// mirror would erase every current row — so it takes the name from the typed layer rather than
+    /// re-deriving the suffix beside its own SQL.
+    ///
+    /// Formats a fresh name per call — hence `to_`, next to the free [`Self::table`].
+    #[must_use]
+    pub fn to_raw(&self) -> DuckTable<Raw> {
+        self.table.to_raw()
+    }
+
+    /// Render the atomic full-rebuild: `CREATE OR REPLACE TABLE <table>` over **retained raw ∪
+    /// the current mirror injected as an LSN-floor baseline**, reusing the same dedup/collapse (TRUNCATE
+    /// tuple boundary, TOAST resolution, `(commit_lsn, lsn)` ranking) as the incremental path — dropping
+    /// `op='d'` winners. The mirror baseline (each row tagged at its own `_applied_*` tuple, so real newer
+    /// raw out-ranks it) guarantees a PK whose raw evidence was already pruned still contributes its
+    /// current value. Staged through a TEMP table so the statement never reads and replaces `<table>` at
+    /// once; the swap + view recreate run inside one transaction ([`crate::compaction::full_rebuild`]).
+    ///
+    /// The union is over the MIRROR columns (not the raw emit columns), so a Tier-2 value's
+    /// recombine happens in the raw arm (the mirror baseline can't be decomposed back into emit columns);
+    /// the final resolve then only TOAST-resolves the Tier-1 columns and passes the recombined Tier-2 ones
+    /// through.
+    #[must_use]
+    pub fn render_rebuild(&self, boundary: Option<TruncateBoundary>) -> String {
+        let q = |c: &str| format!("\"{c}\"");
+        let t = self.table.as_str();
+        let raw_table = self.table.to_raw();
+        let pk = self.to_pk_names();
+        let pk_list = pk.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
+        let pk_join = pk
+            .iter()
+            .map(|c| format!("t.{} = s.{}", q(c), q(c)))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        // The raw arm collapses each mirror column FROM the raw emit columns (aliased `s`): a Tier-2
+        // recombine, or a plain `s."col"` for Tier-1 (its TOAST resolution happens in the final SELECT).
+        let raw_exprs: Vec<String> = self
+            .mirror
+            .iter()
+            .map(|c| {
+                let qc = q(&c.name);
+                if c.is_recombine {
+                    format!("{} AS {qc}", c.value_expr)
+                } else {
+                    format!("s.{qc} AS {qc}")
+                }
+            })
+            .collect();
+        let mirror_names = self
+            .mirror
+            .iter()
+            .map(|c| q(&c.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // The union feeding the dedup: every retained raw change (op<>'t'), collapsed to mirror columns,
+        // plus the current mirror as a baseline row per PK, tagged at that PK's `_applied_*` tuple with an
+        // empty unchanged_toast meta. Both arms carry the same mirror-column names → `UNION ALL BY NAME`.
+        let src = format!(
+            "SELECT {raw}, s.\"walrus_pg_sink_meta\" AS \"walrus_pg_sink_meta\", \
+                 s.\"_walrus_op\" AS \"_walrus_op\", s.\"_walrus_commit_lsn\" AS \"_walrus_commit_lsn\", \
+                 s.\"_walrus_lsn\" AS \"_walrus_lsn\" FROM \"{raw_table}\" s WHERE s.\"_walrus_op\" <> 't' \
+             UNION ALL BY NAME \
+             SELECT {mirror_names}, '{{}}' AS \"walrus_pg_sink_meta\", 'i' AS \"_walrus_op\", \
+                 \"_applied_commit_lsn\" AS \"_walrus_commit_lsn\", \
+                 \"_applied_lsn\" AS \"_walrus_lsn\" FROM \"{t}\"",
+            raw = raw_exprs.join(", "),
+            raw_table = raw_table.as_str(),
+        );
+        // The truncate tuple boundary applies to the union (the mirror baseline is post-truncate by
+        // construction, so it survives); empty when the retained tail holds no truncate.
+        let truncate_bound = match boundary {
+            Some(TruncateBoundary { ct, lt }) => {
+                format!(" WHERE (\"_walrus_commit_lsn\", \"_walrus_lsn\") > ('{ct}', '{lt}')")
+            }
+            None => String::new(),
+        };
+        // The rebuilt row list: Tier-1 columns TOAST-resolve (over `s` = the collapsed winner + the raw
+        // back-scan + the mirror `t` fallback); Tier-2 (recombined) columns pass through `s`. Then the
+        // `_applied_*` stamps re-seeded from the winner's tuple so the incremental guard keeps working.
+        let mut cols: Vec<String> = self
+            .mirror
+            .iter()
+            .map(|c| {
+                let qc = q(&c.name);
+                if c.is_recombine {
+                    format!("s.{qc} AS {qc}")
+                } else {
+                    format!("{} AS {qc}", c.value_expr)
+                }
+            })
+            .collect();
+        cols.push("s.\"_walrus_commit_lsn\" AS \"_applied_commit_lsn\"".to_string());
+        cols.push("s.\"_walrus_lsn\" AS \"_applied_lsn\"".to_string());
+        let resolved = cols.join(", ");
+        format!(
+            "CREATE OR REPLACE TEMP TABLE \"_walrus_rebuild_{t}\" AS \
+             WITH src AS ({src}), \
+             winners AS (SELECT * FROM src{truncate_bound} \
+                 QUALIFY row_number() OVER (PARTITION BY {pk_list} \
+                     ORDER BY \"_walrus_commit_lsn\" DESC, \"_walrus_lsn\" DESC) = 1) \
+             SELECT {resolved} FROM winners s LEFT JOIN \"{t}\" t ON {pk_join} \
+             WHERE s.\"_walrus_op\" <> 'd'; \
+             DROP VIEW IF EXISTS \"{t}_current\"; \
+             CREATE OR REPLACE TABLE \"{t}\" AS SELECT * FROM \"_walrus_rebuild_{t}\"; \
+             DROP TABLE \"_walrus_rebuild_{t}\"; \
+             {view}",
+            view = crate::duck::user_view_sql(t),
+        )
+    }
+}
+
+/// Run the transform against `<table>_raw`, reading only `commit_lsn > after_lsn`: resolve the latest
+/// truncate `(Ct, Lt)`, wipe the mirror if present, then dedup + MERGE the post-boundary tail. Phase B
+/// calls this inside a DuckDB transaction so the wipe + repopulation are atomic.
+///
+/// # Errors
+///
+/// Returns [`LoaderError::LsnParse`] for a malformed truncate boundary, or [`LoaderError::Duck`] if
+/// DuckDB rejects the rendered transform batch.
+pub fn apply_transform(
+    conn: &duckdb::Connection,
+    t: &TransformSql,
+    after_lsn: Lsn,
+) -> Result<(), LoaderError> {
+    let boundary = t.latest_truncate(conn, after_lsn)?;
+    conn.execute_batch(&t.render(after_lsn, boundary))
+        .duck_with(|| format!("transform {}", t.table()))
+}
+
+#[cfg(test)]
+#[path = "transform_test.rs"]
+mod tests;
