@@ -304,10 +304,11 @@ pub fn apply_additive(
 /// Returns [`LoaderError::Duck`] for a failed drop or raw-table widening, and
 /// [`LoaderError::Quarantine`] when a lossy mirror cast cannot be applied without data loss.
 pub fn apply_destructive(
-    conn: &duckdb::Connection,
+    db: &TableDb,
     table: &str,
     changes: &[DestructiveChange],
 ) -> Result<(), LoaderError> {
+    let conn = db.conn();
     for ch in changes {
         match ch {
             DestructiveChange::DropColumn { name } => {
@@ -323,11 +324,11 @@ pub fn apply_destructive(
             DestructiveChange::LossyType { name, new } => {
                 let ty = duck_type(new.type_oid);
                 // Raw FIRST: widen to VARCHAR so rows of BOTH schema_versions coexist in one column;
-                // never issue a CAST that could fail on historical values. Idempotent (already VARCHAR).
-                conn.execute_batch(&format!(
-                    "ALTER TABLE \"{table}_raw\" ALTER COLUMN \"{name}\" TYPE VARCHAR;"
-                ))
-                .duck_with(|| format!("widen raw {name} on {table}"))?;
+                // never narrow historical values. Native DuckDB can do that in-place. DuckLake only
+                // permits lossless type promotions, so replace the raw table transactionally from a
+                // VARCHAR projection instead. The all-or-nothing rewrite preserves every historical
+                // row and leaves no half-renamed table if any statement fails.
+                widen_raw_to_varchar(db, table, name)?;
                 // Mirror: attempt the in-place cast. DuckDB validates before applying, so a failure
                 // leaves the mirror unchanged → QUARANTINE (loud, terminal). Never silent data loss.
                 if let Err(e) = conn.execute_batch(&format!(
@@ -349,6 +350,36 @@ pub fn apply_destructive(
         }
     }
     Ok(())
+}
+
+/// Preserve one raw column's complete history while changing its common storage type to `VARCHAR`.
+///
+/// DuckLake deliberately rejects incompatible `ALTER COLUMN TYPE` operations (including
+/// `INTEGER -> VARCHAR`), even though native DuckDB can perform that cast. Rebuilding from a
+/// `SELECT * REPLACE` projection gives the replacement column a fresh type without asking DuckLake
+/// to reinterpret an existing field id. The transaction makes the create/drop/rename atomic.
+fn widen_raw_to_varchar(db: &TableDb, table: &str, name: &str) -> Result<(), LoaderError> {
+    let conn = db.conn();
+    if !db.is_ducklake() {
+        return conn
+            .execute_batch(&format!(
+                "ALTER TABLE \"{table}_raw\" ALTER COLUMN \"{name}\" TYPE VARCHAR;"
+            ))
+            .duck_with(|| format!("widen raw {name} on {table}"));
+    }
+
+    let replacement = format!("{table}_raw__walrus_retype");
+    db.in_txn("rewrite raw column as VARCHAR", |conn| {
+        conn.execute_batch(&format!(
+            "DROP TABLE IF EXISTS \"{replacement}\"; \
+             CREATE TABLE \"{replacement}\" AS \
+             SELECT * REPLACE (CAST(\"{name}\" AS VARCHAR) AS \"{name}\") \
+             FROM \"{table}_raw\"; \
+             DROP TABLE \"{table}_raw\"; \
+             ALTER TABLE \"{replacement}\" RENAME TO \"{table}_raw\";"
+        ))
+        .duck_with(|| format!("rewrite raw {name} as VARCHAR on {table}"))
+    })
 }
 
 /// Retire a dropped table's `.duckdb` file (call after its owning connection is closed). Idempotent —
@@ -420,7 +451,7 @@ pub async fn reconcile_to_version(
             if drops_table {
                 db.unpublish_current_view()?;
             }
-            apply_destructive(db.conn(), table, &d.destructive)?;
+            apply_destructive(db, table, &d.destructive)?;
             if !drops_table {
                 db.publish_current_view()?;
             }

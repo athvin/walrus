@@ -92,7 +92,7 @@ fn drop_column_physical_on_mirror_retained_nullable_on_raw() {
         vec![col("id", 23, true), col("x", 25, false)],
     ));
     apply_destructive(
-        db.conn(),
+        &db,
         "orders",
         &[DestructiveChange::DropColumn { name: "x".into() }],
     )
@@ -150,7 +150,7 @@ fn lossy_type_change_widens_raw_to_varchar_without_recasting() {
         .unwrap();
 
     apply_destructive(
-        db.conn(),
+        &db,
         "orders",
         &[DestructiveChange::LossyType {
             name: "n".into(),
@@ -192,7 +192,7 @@ async fn drop_table_retires_both_tables_and_the_file() {
         )
         .unwrap();
         apply_destructive(
-            db.conn(),
+            &db,
             "orders",
             &[DestructiveChange::DropTable {
                 name: "orders".into(),
