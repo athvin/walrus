@@ -371,12 +371,14 @@ impl Harness {
     /// process, so by the time this returns the loader has released every table's lease and catalog
     /// lock. A plain `try_wait()` poll can report "exited" while the OS is still tearing the process
     /// down, which would let a `restart_loader` race the old loader's catalog session.
-    pub async fn await_loader_exited(&mut self, deadline: Duration) -> Result<()> {
+    pub async fn await_loader_exited(
+        &mut self,
+        deadline: Duration,
+    ) -> Result<std::process::ExitStatus> {
         tokio::time::timeout(deadline, self.loader.wait())
             .await
             .context("loader did not exit (quarantine) in time")?
-            .context("waiting on loader exit")?;
-        Ok(())
+            .context("waiting on loader exit")
     }
 
     /// Poll the source until the replication slot is `active = false` (the dead walsender cleaned up), so a

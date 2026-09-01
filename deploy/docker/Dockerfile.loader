@@ -2,8 +2,9 @@
 #
 # Multi-stage image for the `walrus-loader` binary, with cargo-chef dependency-layer caching.
 # cargo-chef splits the dependency build — including the bundled DuckDB C++ compile — into a `cook`
-# layer keyed only on the workspace's Cargo manifests, so a source-only change reuses it from the GHA
-# layer cache (`type=gha,mode=max`) and recompiles just the workspace crates. BuildKit cache MOUNTS
+# layer keyed on dependency metadata and deployable target topology, so a production source-only
+# change reuses it from the GHA layer cache (`type=gha,mode=max`) and recompiles just the workspace
+# crates. `.dockerignore` keeps test-only target discovery out of that topology. BuildKit cache MOUNTS
 # can't achieve this: cargo's mtime-based fingerprinting re-runs the DuckDB build script after a
 # cache tar-restore, so the ~15-20 min C++ build repeats regardless.
 #
@@ -19,7 +20,9 @@ RUN cargo install cargo-chef --locked
 WORKDIR /src
 
 # --- planner ---------------------------------------------------------------
-# Distil the whole workspace into recipe.json — a dependency-only skeleton that is the cook cache key.
+# Distil the release-relevant workspace into recipe.json — a dependency-only skeleton that is the
+# cook cache key. Test directories are omitted from the context, while their package manifests and
+# library targets remain available for valid workspace metadata.
 FROM chef AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json

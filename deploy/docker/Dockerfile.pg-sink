@@ -2,8 +2,9 @@
 #
 # Multi-stage image for the `walrus-pg-sink` binary, with cargo-chef dependency-layer caching.
 # cargo-chef splits the dependency build into a `cook` layer keyed only on the workspace's Cargo
-# manifests, so a source-only change reuses it from the GHA layer cache (`type=gha,mode=max`) and
-# recompiles just the workspace crates.
+# metadata and deployable target topology, so a production source-only change reuses it from the GHA
+# layer cache (`type=gha,mode=max`) and recompiles just the workspace crates. `.dockerignore` keeps
+# test-only target discovery out of that topology.
 #
 # builder  — compile the release binary against the pinned MSRV toolchain (1.95.0, matching
 #            rust-toolchain.toml so rustup never re-downloads). sqlx runs OFFLINE against the
@@ -20,6 +21,7 @@ RUN cargo install cargo-chef --locked
 WORKDIR /src
 
 # --- planner ---------------------------------------------------------------
+# Test directories are omitted from this context; workspace manifests and library targets remain.
 FROM chef AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json

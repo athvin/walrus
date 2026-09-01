@@ -180,9 +180,27 @@ async fn quarantined_table_recovers_via_reload_without_stalling_others() {
     .await
     .unwrap();
 
-    h.await_loader_exited(Duration::from_secs(60))
+    let loader_status = h
+        .await_loader_exited(Duration::from_secs(60))
         .await
         .unwrap();
+    assert_eq!(
+        loader_status.code(),
+        Some(common::ExitCode::Quarantine as i32),
+        "the injected lossy cast must stop the loader via quarantine, not an unrelated failure: \
+         {loader_status}"
+    );
+    let raw_history = h
+        .duckdb_rows(
+            "q_target",
+            "SELECT DISTINCT concat(typeof(n), ':', n) FROM q_target_raw WHERE id = 1",
+        )
+        .unwrap();
+    assert_eq!(
+        raw_history,
+        vec!["VARCHAR:99999".to_string()],
+        "the DuckLake rewrite must retain the pre-narrowing raw value as VARCHAR"
+    );
     // Sample the other tables at the quarantine freeze — the pre-reload baseline.
     let pre_others: Vec<Lsn> = {
         let mut v = Vec::new();

@@ -544,11 +544,18 @@ jobs:
         if: always()
         run: docker compose -f deploy/docker/docker-compose.yml down -v
 
-  e2e:
-    name: e2e (full pipeline — reload + transactional DDL)
+  e2e_matrix:
+    name: e2e (${{ matrix.test }})
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - reload_quarantine
+          - reload_scale
+          - ddl_transactions
     # A DEDICATED job: the e2e harness spawns the real sink+loader binaries — its
     # `build_bins` compiles the bundled DuckDB in the DEV profile ON TOP of the test-profile builds,
     # which overflowed the integration runner's disk ("No space left on device"). A fresh runner with
@@ -579,7 +586,7 @@ jobs:
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: e2e-reload
+          shared-key: e2e-${{ matrix.test }}
           cache-on-failure: true
 
       - name: Boot the dev stack (up --wait)
@@ -588,21 +595,38 @@ jobs:
       - name: Start workload timer
         run: echo "CI_TIMED_WORK_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
 
-      # Build the selected test executables in one Cargo invocation before any harness starts
-      # its nested production-binary build. This avoids alternating feature graphs and relinking.
-      - name: Reload recovery + scale + transactional DDL (e2e)
+      # Every matrix runner has its own Compose stack, ports, databases, bucket, target directory,
+      # and child processes, so the stateful harnesses can execute concurrently without collisions.
+      - name: ${{ matrix.test }} (e2e)
         run: |
           cargo test -p e2e --features it \
-            --test reload_quarantine --test reload_scale --test ddl_transactions \
+            --test "${{ matrix.test }}" \
             -- --ignored --test-threads=1
 
       - name: sccache and timing summary
         if: always()
-        run: bash .github/scripts/sccache-summary.sh e2e-reload
+        run: bash .github/scripts/sccache-summary.sh "e2e-${{ matrix.test }}"
 
       - name: Tear down (remove volumes)
         if: always()
         run: docker compose -f deploy/docker/docker-compose.yml down -v
+
+  # Preserve the pre-matrix check name as a stable branch-protection interface. `result` is the
+  # aggregate result of every expanded matrix child, so this succeeds only when all three pass.
+  e2e:
+    name: e2e (full pipeline — reload + transactional DDL)
+    needs: [changes, e2e_matrix]
+    if: always() && needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every e2e matrix target
+        env:
+          E2E_MATRIX_RESULT: ${{ needs.e2e_matrix.result }}
+        run: |
+          if [ "$E2E_MATRIX_RESULT" != success ]; then
+            echo "::error::one or more e2e matrix jobs ended with: $E2E_MATRIX_RESULT"
+            exit 1
+          fi
 
   conformance:
     name: conformance (DuckDB read-back)
@@ -717,9 +741,10 @@ jobs:
       - uses: ./.github/actions/free-disk-space
 
       # Build via Buildx Bake with the GHA layer cache. The Dockerfiles use cargo-chef, whose `cook`
-      # layer (all deps incl. the bundled-DuckDB C++ build) is keyed on the workspace Cargo manifests,
-      # so a source-only change is a layer-cache hit and DuckDB is not recompiled. `mode=max` is
-      # essential — it caches the intermediate builder/cook layers, not just the final runtime stage.
+      # layer (all deps incl. the bundled-DuckDB C++ build) is keyed on dependency metadata and
+      # deployable target topology. `.dockerignore` removes integration/e2e target directories, so
+      # adding a test cannot invalidate that layer and recompile DuckDB. `mode=max` is essential — it
+      # caches the intermediate builder/cook layers, not just the final runtime stage.
       # (Cache MOUNTS were tried first and dropped: cargo's mtime fingerprinting re-runs the DuckDB
       # build script after a cache tar-restore, so the C++ build repeated regardless — chef sidesteps
       # that by using the content-hashed Docker layer cache.)
