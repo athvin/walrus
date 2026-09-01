@@ -26,6 +26,39 @@ fn main() -> ExitCode {
         .file_name(std::env::var_os("DHAT_OUTPUT").unwrap_or_else(|| "dhat-heap.json".into()))
         .build();
 
+    let mut args = std::env::args_os();
+    let _program = args.next();
+    let command = args.next();
+    if matches!(command.as_deref(), Some(flag) if flag == "--install-duckdb-extensions") {
+        let Some(directory) = args.next() else {
+            eprintln!(
+                "walrus-loader: --install-duckdb-extensions requires a destination directory"
+            );
+            return common::ExitCode::Config.into();
+        };
+        if args.next().is_some() {
+            eprintln!("walrus-loader: unexpected extra installer argument");
+            return common::ExitCode::Config.into();
+        }
+        return match loader::duck::install_extensions(std::path::Path::new(&directory)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("walrus-loader: extension installation failed: {error:?}");
+                common::ExitCode::Internal.into()
+            }
+        };
+    }
+    let migrate_catalog =
+        matches!(command.as_deref(), Some(flag) if flag == "--migrate-ducklake-catalog");
+    if command.is_some() && !migrate_catalog {
+        eprintln!("walrus-loader: unknown argument");
+        return common::ExitCode::Config.into();
+    }
+    if args.next().is_some() {
+        eprintln!("walrus-loader: unexpected extra argument");
+        return common::ExitCode::Config.into();
+    }
+
     let cfg = match LoaderConfig::load() {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -40,6 +73,16 @@ fn main() -> ExitCode {
     if let Err(e) = tracing_result {
         eprintln!("walrus-loader: tracing init failed: {e}");
         return common::ExitCode::Internal.into();
+    }
+    if migrate_catalog {
+        let s3 = loader::app::duck_s3_access(&cfg);
+        return match loader::duck::migrate_catalog(&cfg.ducklake, &s3) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                tracing::error!(error = ?error, "DuckLake catalog migration failed");
+                error.exit_code().into()
+            }
+        };
     }
     // The multi-thread FLAVOR is load-bearing; the worker count is not. `block_on` drives the
     // pipeline — and with it the `LocalSet`'s apply loops — on THIS thread, which a full rebuild's

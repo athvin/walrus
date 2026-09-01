@@ -413,7 +413,17 @@ pub async fn reconcile_to_version(
             apply_additive(db.conn(), table, &d.additive)?;
             // Destructive changes apply after additive ones; a lossy cast failure short-circuits
             // with `Quarantine` and the watermark is NOT advanced (re-run re-quarantines idempotently).
+            let drops_table = d
+                .destructive
+                .iter()
+                .any(|change| matches!(change, DestructiveChange::DropTable { .. }));
+            if drops_table {
+                db.unpublish_current_view()?;
+            }
             apply_destructive(db.conn(), table, &d.destructive)?;
+            if !drops_table {
+                db.publish_current_view()?;
+            }
         }
         db.set_schema_version(next)?;
         cur = next;

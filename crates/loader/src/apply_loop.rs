@@ -1,5 +1,5 @@
-//! The per-table apply loop (loader §8.4) — **one worker per `.duckdb` file** (never share a DuckDB
-//! connection across tables). Each poll interval: Phase A (append) then Phase B (transform), then stamp
+//! The per-table apply loop (loader §8.4) — **one worker and transient DuckDB connection per source
+//! table**. Each poll interval: Phase A (append) then Phase B (transform), then stamp
 //! `last_poll_completed_at` — **every** cycle, even a no-op poll, so an idle-but-healthy loader stays
 //! `/healthz` green. On a **slower, distinct** cadence, and on THIS same worker thread (serialized right
 //! after an apply cycle — no quiescing dance), it runs the full-rebuild + retention prune.
@@ -71,7 +71,7 @@ pub async fn apply_loop(ctx: TableCtx, shutdown: CancellationToken) -> Result<()
         }
         // Total-restart guard (§1.8): if the control plane opened a newer generation than the one we
         // started on, this loader is now running a RETIRED epoch. Exit loudly (→ `app::pipeline`
-        // cancels the token and the process restarts) so bootstrap wipes + rebuilds every `.duckdb`
+        // cancels the token and the process restarts) so bootstrap wipes + rebuilds every table namespace
         // under the new epoch — never rebuild in place mid-run.
         let observed = *ctx.epoch_rx.borrow();
         epoch_guard(observed, baseline_epoch, ctx.epoch)?;
@@ -107,15 +107,18 @@ pub async fn apply_loop(ctx: TableCtx, shutdown: CancellationToken) -> Result<()
     }
 }
 
-/// Drain one worker on SIGTERM: the in-flight cycle already finished (both watermarks committed), so just
-/// `CHECKPOINT` the WAL into the main file and return — dropping `ctx` closes the file, releasing the
-/// lock cleanly (no stale lock for the next bootstrap). The lease is released by `app::pipeline` after
-/// all workers drain (after their watermarks commit).
+/// Drain one worker on SIGTERM: the in-flight cycle already finished (both watermarks committed).
+/// Native test databases checkpoint their local WAL; a DuckLake `CHECKPOINT` means catalog-wide file
+/// maintenance and must not run independently in every worker, so production simply closes the
+/// already-committed connection. The catalog advisory-lock session and control leases are released by
+/// `app::pipeline` only after all workers have drained.
 fn drain(ctx: &TableCtx) -> Result<(), LoaderError> {
-    if let Err(e) = ctx.db.conn().execute_batch("CHECKPOINT;") {
+    if !ctx.db.is_ducklake()
+        && let Err(e) = ctx.db.conn().execute_batch("CHECKPOINT;")
+    {
         tracing::warn!(table = %format_args!("{}.{}", ctx.schema, ctx.table), error = %e, "drain CHECKPOINT failed");
     }
-    tracing::info!(table = %format_args!("{}.{}", ctx.schema, ctx.table), "apply loop drained (watermarks committed, file checkpointed)");
+    tracing::info!(table = %format_args!("{}.{}", ctx.schema, ctx.table), "apply loop drained (watermarks committed)");
     Ok(())
 }
 
@@ -133,7 +136,12 @@ async fn compact(ctx: &TableCtx, shutdown: &CancellationToken) -> Result<(), Loa
     // Prune only below `transformed_lsn - retention_lsn_lag` (always behind transformed_lsn) — the rebuild
     // just captured every current value into the mirror baseline, so pruned raw can lose nothing.
     let floor = crate::compaction::retention_floor(transformed, ctx.retention_lsn_lag);
-    let pruned = crate::compaction::prune_raw(ctx.db.conn(), &t, floor)?;
+    let pruned = if ctx.db.is_ducklake() {
+        crate::compaction::prune_raw_ducklake(ctx.db.conn(), &t, floor)?
+    } else {
+        crate::compaction::prune_raw(ctx.db.conn(), &t, floor)?
+    };
+    ctx.db.maintain_files(&ctx.table)?;
     tracing::info!(
         table = %format_args!("{}.{}", ctx.schema, ctx.table),
         floor = %floor,

@@ -23,9 +23,14 @@ use tokio::process::{Child, Command};
 
 const SOURCE_URL: &str = "postgres://postgres:postgres@localhost:5432/walrus";
 const CONTROL_URL: &str = "postgres://postgres:postgres@localhost:5433/walrus_control";
+const CATALOG_URL: &str = "postgres://postgres:postgres@localhost:5433/walrus_ducklake";
+const DUCKLAKE_SCHEMA: &str = "walrus_e2e";
+const DUCKLAKE_DATA: &str = "s3://walrus/ducklake/e2e/";
 const S3_ENDPOINT: &str = "http://localhost:9000";
 const BUCKET: &str = "walrus";
 const SLOT: &str = "walrus_e2e_slot";
+const TABLE_NAMESPACE: uuid::Uuid =
+    uuid::Uuid::from_u128(0x4f02_efc2_39b3_4d9d_a860_22af_7291_8cc8);
 /// The MinIO container name (`<compose project>-<service>-1`) — `docker pause`d to stall the sink's S3
 /// durability in the WAL-runaway / keepalive chaos tests.
 const MINIO: &str = "walrus-minio-1";
@@ -39,7 +44,7 @@ pub struct Harness {
     loader: Child,
     source: sqlx::PgPool,
     control: sqlx::PgPool,
-    duckdb_dir: PathBuf,
+    runtime_dir: PathBuf,
     /// The sink's captured stdout+stderr (its `tracing` log) — scraped for spill events.
     sink_log: PathBuf,
     /// The `target/<profile>/` dir the binaries live in — kept so a crashed child can be respawned.
@@ -127,16 +132,25 @@ impl Harness {
 
         let bins = target_dir()?;
         build_bins(&bins).await?;
-        let duckdb_dir = std::env::temp_dir().join(format!("walrus-e2e-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&duckdb_dir);
-        std::fs::create_dir_all(&duckdb_dir)?;
-        let sink_log = duckdb_dir.join("sink.log");
+        let catalog = control::connect(CATALOG_URL)
+            .await
+            .context("connect DuckLake catalog PG")?;
+        sqlx::raw_sql("DROP SCHEMA IF EXISTS walrus_e2e CASCADE")
+            .execute(&catalog)
+            .await
+            .context("reset DuckLake e2e metadata schema")?;
+        migrate_ducklake(&bins).await?;
+
+        let runtime_dir = std::env::temp_dir().join(format!("walrus-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&runtime_dir);
+        std::fs::create_dir_all(&runtime_dir)?;
+        let sink_log = runtime_dir.join("sink.log");
 
         let sink = spawn_sink(&bins, &sink_log)?;
         wait_ready("http://127.0.0.1:8130", Duration::from_secs(45))
             .await
             .context("sink /ready")?;
-        let loader = spawn_loader(&bins, &duckdb_dir)?;
+        let loader = spawn_loader(&bins)?;
         wait_ready("http://127.0.0.1:8131", Duration::from_secs(90))
             .await
             .context("loader /ready")?;
@@ -146,7 +160,7 @@ impl Harness {
             loader,
             source,
             control,
-            duckdb_dir,
+            runtime_dir,
             sink_log,
             bins,
             epoch: 1,
@@ -315,7 +329,7 @@ impl Harness {
     }
 
     /// **SIGKILL** the loader — ungraceful and distinct from the SIGTERM drain. Process
-    /// death releases the DuckDB file lock (the OS closes the fd) and leaves the lease row in place.
+    /// death closes its DuckLake connections/catalog session and leaves the control lease row in place.
     pub async fn kill_loader(&mut self) -> Result<()> {
         self.loader.start_kill().context("SIGKILL loader")?;
         let _ = self.loader.wait().await;
@@ -324,9 +338,10 @@ impl Harness {
 
     /// Respawn the loader fresh and block until `/ready`. It reuses `WALRUS_INSTANCE=e2e-loader`, so
     /// `acquire_lease` sees the lease as **already ours** and reclaims it immediately (no TTL wait); the
-    /// DuckDB lock was freed on `SIGKILL`. Resume is from the two persisted watermarks.
+    /// PostgreSQL drops the old session's advisory locks on `SIGKILL`. Resume is from the two
+    /// persisted watermarks.
     pub async fn restart_loader(&mut self) -> Result<()> {
-        self.loader = spawn_loader(&self.bins, &self.duckdb_dir)?;
+        self.loader = spawn_loader(&self.bins)?;
         wait_ready("http://127.0.0.1:8131", Duration::from_secs(90))
             .await
             .context("loader /ready after restart")
@@ -340,9 +355,9 @@ impl Harness {
     }
 
     /// Await the loader child's FULL exit after quarantine — `wait()` reaps the
-    /// process, so by the time this returns the loader has released every table's lease and DuckDB
+    /// process, so by the time this returns the loader has released every table's lease and catalog
     /// lock. A plain `try_wait()` poll can report "exited" while the OS is still tearing the process
-    /// down, which would let a `restart_loader` race the old loader for the quarantined table's lock.
+    /// down, which would let a `restart_loader` race the old loader's catalog session.
     pub async fn await_loader_exited(&mut self, deadline: Duration) -> Result<()> {
         tokio::time::timeout(deadline, self.loader.wait())
             .await
@@ -398,10 +413,8 @@ impl Harness {
         }
     }
 
-    /// Assert the loader's DuckDB mirror `<table>_current` equals the current source `public.<table>`
-    /// **row-by-row** (id + status), the effectively-once convergence check. Call after
-    /// [`Self::stop_loader`]
-    /// (DuckDB is single-writer, so the mirror is read only once the loader has exited).
+    /// Assert the loader's DuckLake mirror `<table>_current` equals the current source
+    /// `public.<table>` **row-by-row** (id + status), the effectively-once convergence check.
     pub async fn assert_mirror_equals_source(&self, table: &str) -> Result<()> {
         let src: Vec<(i32, Option<String>)> = sqlx::query_as(&format!(
             "SELECT id, status FROM public.{table} ORDER BY id"
@@ -425,14 +438,9 @@ impl Harness {
         Ok(())
     }
 
-    /// Read `(id, status)` pairs from the loader's read-only `.duckdb` file. Call after [`stop_loader`].
+    /// Read `(id, status)` pairs through a direct read-only DuckLake attachment.
     fn duckdb_pairs(&self, table: &str, sql: &str) -> Result<Vec<(i32, Option<String>)>> {
-        let path = self.duckdb_dir.join(format!("{table}.duckdb"));
-        let conn = duckdb::Connection::open_with_flags(
-            &path,
-            duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?,
-        )
-        .with_context(|| format!("open {}", path.display()))?;
+        let conn = ducklake_reader(table)?;
         let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map([], |r| {
             Ok((r.get::<_, i32>(0)?, r.get::<_, Option<String>>(1)?))
@@ -440,27 +448,17 @@ impl Harness {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    /// Open the loader's per-table `.duckdb` file read-only and collect the first column of each row as a
-    /// string. Call after [`Harness::stop_loader`].
+    /// Attach DuckLake read-only and collect the first column of each row as a string.
     pub fn duckdb_rows(&self, table: &str, sql: &str) -> Result<Vec<String>> {
-        let path = self.duckdb_dir.join(format!("{table}.duckdb"));
-        let conn = duckdb::Connection::open_with_flags(
-            &path,
-            duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?,
-        )
-        .with_context(|| format!("open {}", path.display()))?;
+        let conn = ducklake_reader(table)?;
         let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    /// A single integer scalar from the loader's `.duckdb` file (read-only).
+    /// A single integer scalar from a direct read-only DuckLake attachment.
     pub fn duckdb_scalar(&self, table: &str, sql: &str) -> Result<i64> {
-        let path = self.duckdb_dir.join(format!("{table}.duckdb"));
-        let conn = duckdb::Connection::open_with_flags(
-            &path,
-            duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?,
-        )?;
+        let conn = ducklake_reader(table)?;
         Ok(conn.query_row(sql, [], |r| r.get(0))?)
     }
 
@@ -693,7 +691,7 @@ impl Drop for Harness {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
-        let _ = std::fs::remove_dir_all(&self.duckdb_dir);
+        let _ = std::fs::remove_dir_all(&self.runtime_dir);
     }
 }
 
@@ -727,6 +725,58 @@ async fn build_bins(_target: &std::path::Path) -> Result<()> {
         .context("cargo build bins")?;
     anyhow::ensure!(status.success(), "cargo build of the bins failed");
     Ok(())
+}
+
+async fn migrate_ducklake(bins: &std::path::Path) -> Result<()> {
+    let status = Command::new(bins.join("walrus-loader"))
+        .arg("--migrate-ducklake-catalog")
+        .env("WALRUS_CONTROL_DB_URL", CONTROL_URL)
+        .env("WALRUS_OBJECT_STORE__BUCKET", BUCKET)
+        .env("WALRUS_OBJECT_STORE__ENDPOINT", S3_ENDPOINT)
+        .env("WALRUS_OBJECT_STORE__REGION", "us-east-1")
+        .env("WALRUS_INSTANCE", "e2e-loader-0")
+        .env("WALRUS_DUCKLAKE__CATALOG_URL", CATALOG_URL)
+        .env("WALRUS_DUCKLAKE__METADATA_SCHEMA", DUCKLAKE_SCHEMA)
+        .env("WALRUS_DUCKLAKE__DATA_PATH", DUCKLAKE_DATA)
+        .env("WALRUS_DUCKLAKE__INSTALL_EXTENSIONS", "true")
+        .env("AWS_ACCESS_KEY_ID", "minioadmin")
+        .env("AWS_SECRET_ACCESS_KEY", "minioadmin")
+        .status()
+        .await
+        .context("run DuckLake catalog migration")?;
+    anyhow::ensure!(status.success(), "DuckLake catalog migration failed");
+    Ok(())
+}
+
+fn ducklake_reader(table: &str) -> Result<duckdb::Connection> {
+    let conn = duckdb::Connection::open_in_memory().context("open DuckLake reader")?;
+    conn.execute_batch(
+        r#"
+        INSTALL json; INSTALL httpfs; INSTALL aws; INSTALL postgres; INSTALL ducklake;
+        LOAD json; LOAD httpfs; LOAD aws; LOAD postgres; LOAD ducklake;
+        CREATE OR REPLACE SECRET e2e_s3 (
+            TYPE s3, PROVIDER config, KEY_ID 'minioadmin', SECRET 'minioadmin',
+            REGION 'us-east-1', ENDPOINT 'localhost:9000', URL_STYLE 'path', USE_SSL false
+        );
+        CREATE OR REPLACE SECRET e2e_catalog (
+            TYPE postgres,
+            URI 'postgres://postgres:postgres@localhost:5433/walrus_ducklake'
+        );
+        ATTACH 'ducklake:postgres:' AS walrus (
+            META_SECRET 'e2e_catalog', METADATA_SCHEMA 'walrus_e2e',
+            META_SCHEMA 'walrus_e2e', CREATE_IF_NOT_EXISTS false, READ_ONLY
+        );
+        "#,
+    )
+    .context("attach DuckLake reader")?;
+    let key = format!("public\0{table}");
+    let schema = format!(
+        "_walrus_{}",
+        uuid::Uuid::new_v5(&TABLE_NAMESPACE, key.as_bytes()).simple()
+    );
+    conn.execute_batch(&format!("USE walrus.{schema};"))
+        .with_context(|| format!("select DuckLake namespace for public.{table}"))?;
+    Ok(conn)
 }
 
 fn spawn_sink(bins: &std::path::Path, log: &std::path::Path) -> Result<Child> {
@@ -764,7 +814,7 @@ fn spawn_sink(bins: &std::path::Path, log: &std::path::Path) -> Result<Child> {
         .context("spawn walrus-pg-sink")
 }
 
-fn spawn_loader(bins: &std::path::Path, duckdb_dir: &std::path::Path) -> Result<Child> {
+fn spawn_loader(bins: &std::path::Path) -> Result<Child> {
     // Inherit the test's stdout/stderr (the loader's `tracing` log) so a bootstrap failure is
     // visible — cargo test surfaces a failed test's captured output, which is how a CI failure is
     // diagnosed. (An earlier `loader.log` file-redirect hid the reason from the CI job log.)
@@ -773,8 +823,11 @@ fn spawn_loader(bins: &std::path::Path, duckdb_dir: &std::path::Path) -> Result<
         .env("WALRUS_OBJECT_STORE__BUCKET", BUCKET)
         .env("WALRUS_OBJECT_STORE__ENDPOINT", S3_ENDPOINT)
         .env("WALRUS_OBJECT_STORE__REGION", "us-east-1")
-        .env("WALRUS_INSTANCE", "e2e-loader")
-        .env("WALRUS_DUCKDB_DIR", duckdb_dir.to_string_lossy().as_ref())
+        .env("WALRUS_INSTANCE", "e2e-loader-0")
+        .env("WALRUS_DUCKLAKE__CATALOG_URL", CATALOG_URL)
+        .env("WALRUS_DUCKLAKE__METADATA_SCHEMA", DUCKLAKE_SCHEMA)
+        .env("WALRUS_DUCKLAKE__DATA_PATH", DUCKLAKE_DATA)
+        .env("WALRUS_DUCKLAKE__INSTALL_EXTENSIONS", "true")
         .env("WALRUS_POLL_INTERVAL", "1s")
         // Generous for a cold CI runner (a dev-profile binary bootstrapping 6 tables).
         .env("WALRUS_STARTUP_DEADLINE", "90s")

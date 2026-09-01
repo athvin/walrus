@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # k8s-validate.sh — manifest gate. Renders the kustomize base and schema-validates every
-# resource with kubeconform, plus the standalone secrets.example.yaml template. Same command CI runs,
+# resource with kubeconform, plus the standalone Secret template and explicit DuckLake migration Job.
+# Same command CI runs,
 # so "green locally" predicts "green in CI".
 #
 #   bash scripts/k8s-validate.sh
@@ -31,5 +32,9 @@ render | kubeconform -strict -summary -kubernetes-version "$K8S_VERSION" -
 
 echo "== kubeconform on secrets.example.yaml (not part of the base) =="
 kubeconform -strict -summary -kubernetes-version "$K8S_VERSION" "$BASE/secrets.example.yaml"
+
+echo "== kubeconform on DuckLake catalog migration Job (explicit release step) =="
+kubeconform -strict -summary -kubernetes-version "$K8S_VERSION" \
+  deploy/k8s/ducklake-catalog-migrate-job.yaml
 
 echo "k8s-validate: PASS"

@@ -1,6 +1,6 @@
 # Deferred design goals — shapes and seams
 
-These are **intended capabilities, deliberately deferred**, plus one completed capability retained
+These are **intended capabilities, deliberately deferred**, plus completed capabilities retained
 for context — not permanent
 [non-goals](./architecture.md#goals--non-goals) and not open
 [unknowns/risks](./architecture.md#open-questions--risks). They are features walrus plans to own,
@@ -35,20 +35,22 @@ lineage) that needs no extra slots and no stream pause.
 The anchor use case — a lossy-`ALTER` quarantine recovering via `just reload` while every other
 table streams on — is covered by `tests/e2e/tests/reload_quarantine.rs`.
 
-## 2. Multi-pod loader table-sharding (horizontal scale-out)
+## 2. Multi-pod loader table-sharding (completed with DuckLake)
 
 **What.** Spread tables across **multiple loader replicas**, each owning a disjoint set — consistent
-hashing, one PVC per replica, exclusive file ownership. Today one active loader owns all `.duckdb`
-files and scales **up** (CPU/memory, more per-table worker threads within the one pod).
+hashing and exclusive per-table writer ownership, while all replicas share one DuckLake catalog and
+object-data root.
 
-**Likely shape.** A consistent-hash assignment of tables → replicas, with the **fencing token** guarding
-against a stale owner's writes after a reshard (never a naive HPA — file ownership is exclusive).
+**Implemented shape.** Rendezvous hashing maps `(epoch, schema, table)` to a stable StatefulSet
+ordinal. The existing control-plane lease is the first fence. A dedicated PostgreSQL catalog session
+holds one table-keyed advisory lock per assigned table as the second fence; losing that session
+cancels every worker before a successor can write. Scale changes are deliberate StatefulSet rollouts,
+not a naive HPA.
 
-**Seam.** [`crates/loader/src/ownership.rs`](../crates/loader/src/ownership.rs) — the inert
-`TableAssignment` placeholder. The forward-compat hook already exists: the `fencing_token` in
-`control::table_ownership` (bumped only when ownership changes hands) is acquired at bootstrap
-and carried on every `crate::bootstrap::OwnedTable`, but is **unused for routing** today (dormant at
-`replicas=1`). Sharding turns it into the fence; nothing else needs re-plumbing.
+**Implementation.** Routing and the DuckLake namespace live in `loader::duck`; ordered lease +
+catalog-lock acquisition lives in `loader::bootstrap`; catalog-session failure is wired into
+`loader::supervisor`. The safe rollout and reshard sequence is documented in
+[ducklake-migration.md](./ducklake-migration.md#horizontal-writer-rollout).
 
 ## 3. Faster initial export / backfill — parallel CTID-range snapshot (nearest-term)
 
@@ -71,5 +73,5 @@ epoch, or ownership machinery — only concurrent `COPY` under the snapshot alre
 
 ---
 
-*Single-table reload (§1) is implemented. The sharding and parallel-backfill seams (§2–§3) remain
-deliberately inert and change no current runtime behavior.*
+*Single-table reload (§1) and DuckLake writer sharding (§2) are implemented. Parallel backfill (§3)
+remains deliberately inert and changes no current runtime behavior.*

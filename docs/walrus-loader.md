@@ -1,5 +1,12 @@
 # `walrus-loader` — the raw→mirror reconciler, in depth (work-handoff contract · commit-gating · transform correctness · pod lifecycle · performance)
 
+> **Storage amendment (implemented):** the loader now writes to a shared PostgreSQL-catalogued
+> DuckLake with Parquet data in S3. Its embedded DuckDB connections are transient; there are no
+> loader PVCs or durable `.duckdb` files. The queue, commit-gating, two-phase transform, checkpoints,
+> DDL, and reload semantics in this document still apply. The topology, second-writer fence,
+> read-only client contract, retention, and horizontal-sharding procedures are superseded by
+> [ducklake-migration.md](./ducklake-migration.md).
+
 > **Status: design deep-dive, companion to [architecture.md](./architecture.md).** Where
 > [`walrus-pg-sink.md`](./walrus-pg-sink.md) is the authoritative spec for the **producer** side (type
 > conversion, DDL capture, pod lifecycle of the WAL consumer), this doc is the authoritative spec for the

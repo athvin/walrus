@@ -38,6 +38,9 @@ tokio-util = { workspace = true }
 axum = { workspace = true }
 object_store = { workspace = true, features = ["aws"] }
 tracing = { workspace = true }
+# Stable UUID-v5 names isolate each source table's internal DuckLake objects without leaking or
+# truncating PostgreSQL identifiers into the shared catalog namespace.
+uuid = { workspace = true, features = ["v5"] }
 # Non-poisoning mutex for the health / Phase-A shared state.
 parking_lot = { workspace = true }
 dhat = { workspace = true, optional = true }

@@ -33,7 +33,8 @@ pub async fn run(cfg: LoaderConfig) -> Result<(), LoaderError> {
     // Install the Prometheus recorder before anything can serve /metrics or emit a series.
     common::metrics::init();
 
-    // Bind health *before* bootstrap so `/startup` answers 503 while the lease + DuckDB open proceed.
+    // Bind health *before* bootstrap so `/startup` answers 503 while leases, catalog fences, and
+    // DuckLake attachments are established.
     let listener = tokio::net::TcpListener::bind(cfg.health_addr)
         .await
         .map_err(|source| LoaderError::Health {
@@ -70,10 +71,15 @@ async fn pipeline(
 ) -> Result<(), LoaderError> {
     let pool = control::connect(cfg.control_db_url.expose()).await?;
     let store = build_store(cfg)?;
+    let s3 = duck_s3_access(cfg);
 
     // `&store` unsize-coerces to the `&dyn ObjectStore` bootstrap takes, so the concrete client is
     // erased at that one boundary and nowhere else.
-    let owned = bootstrap::bootstrap(cfg, &pool, &store, state).await?;
+    let bootstrapped = bootstrap::bootstrap(cfg, &pool, &store, &s3, state).await?;
+    let bootstrap::BootstrapResult {
+        tables: owned,
+        catalog_fence,
+    } = bootstrapped;
     state.mark_ready();
     let keys: Vec<(String, String)> = owned.iter().map(bootstrap::OwnedTable::to_key).collect();
     // Zero-init every per-table loader series so /metrics lists the owned tables from the first scrape,
@@ -102,21 +108,34 @@ async fn pipeline(
     );
     let (epoch_rx, epoch_watch) =
         crate::epoch::spawn_epoch_watch(pool.clone(), epoch, cfg.poll_interval, token.clone());
-
-    // Configure DuckDB's httpfs on every owned file so `read_parquet('s3://…')` (Phase A) has the
-    // staging-bucket credentials — the binary's equivalent of what the compose tests set up by hand.
-    let s3 = duck_s3_access(cfg);
-    for o in &owned {
-        o.db.configure_s3(&s3)?;
-    }
+    let maintenance = (cfg.effective_shard_index()? == 0)
+        .then(|| spawn_catalog_maintenance(cfg.ducklake.clone(), s3.clone(), token.clone()));
 
     // One apply loop per owned table. DuckDB's `Connection` is `Send + !Sync` because it holds
     // an interior `RefCell`, so a future holding `&TableCtx` is not `Send` and cannot go to
     // `tokio::spawn`. The loops run on a `LocalSet` (this thread), the whole parallelism model being
-    // one worker task per `.duckdb` file. Those tasks all share this one driver thread, so a long
+    // one worker task per attached source table. Those tasks all share this one driver thread, so a long
     // compaction stalls its siblings; isolate owned connections only if profiling justifies it.
     let local = tokio::task::LocalSet::new();
     let (failures_tx, failures_rx) = crate::supervisor::failure_channel(keys.len());
+    let fence_stop = CancellationToken::new();
+    let fence_failures = failures_tx.clone();
+    let fence_watch = tokio::spawn({
+        let fence_stop = fence_stop.clone();
+        let period = cfg.lease_ttl / 3;
+        async move {
+            if let Err(error) = catalog_fence.watch(period, fence_stop).await {
+                crate::supervisor::report(
+                    &fence_failures,
+                    crate::supervisor::WorkerFailure {
+                        schema: "_walrus".to_string(),
+                        table: "catalog_fence".to_string(),
+                        error,
+                    },
+                );
+            }
+        }
+    });
     // A `JoinSet` rather than a `Vec<JoinHandle>`: the worker count is whatever bootstrap owns, so
     // this is a dynamic collection, and the set owns the whole fleet as one value. The drain below
     // then reaps each worker in COMPLETION order instead of index order (a panic is logged when it
@@ -168,6 +187,8 @@ async fn pipeline(
             &local,
         );
     }
+    let no_workers = workers.is_empty();
+    let idle_token = token.clone();
     // Only workers own receivers now; with zero workers, this also stops the poller immediately.
     drop(epoch_rx);
     // The receiver closes when the final worker exits; nothing above may keep an extra sender alive.
@@ -177,6 +198,12 @@ async fn pipeline(
             failures_rx,
             token,
             async move {
+                // A legitimate shard can be empty (especially while scaling out). Keep that pod
+                // ready and its catalog-fence watcher alive instead of returning success into a
+                // StatefulSet restart loop. A signal or fence failure cancels this token.
+                if no_workers {
+                    idle_token.cancelled().await;
+                }
                 // Once the supervisor sees a failure it cancels `token`, so healthy workers leave
                 // their loops and this drain always makes progress. It must run to completion:
                 // `supervise` only returns when this future does, and the lease release below depends
@@ -191,14 +218,23 @@ async fn pipeline(
         .await;
 
     // DROP ORDER, load-bearing (see `loader::shutdown` steps 4-5): each `join_next` above joined a
-    // worker task, which dropped its `TableCtx` — and with it the `TableDb` whose drop closes the
-    // `.duckdb` and releases DuckDB's writer lock. Only then is the lease released, so the two fences
-    // come off in the reverse of their bootstrap order (lease → file lock, so file lock → lease).
-    // Handing a replacement the lease first would only cost it a failed open and a retry, but this
-    // order leaves no such window — so keep `release_all` after the joins, never beside them.
-    tracing::info!("workers drained (files closed); releasing leases");
+    // worker task, which dropped its `TableCtx` and transient DuckDB connection. Then stop the
+    // dedicated catalog session, releasing all table advisory locks, and only then release the
+    // control leases. The two fences come off in reverse bootstrap order; keep `release_all` after
+    // both joins, never beside them.
+    tracing::info!("workers drained (DuckLake connections closed); releasing catalog fence");
+    fence_stop.cancel();
+    if let Err(error) = fence_watch.await {
+        tracing::error!(%error, "DuckLake catalog-fence task panicked");
+    }
+    tracing::info!("catalog advisory locks released; releasing ownership leases");
     if let Err(error) = epoch_watch.await {
         tracing::error!(%error, "epoch watch task panicked");
+    }
+    if let Some(maintenance) = maintenance
+        && let Err(error) = maintenance.await
+    {
+        tracing::error!(%error, "DuckLake maintenance task panicked");
     }
     // Cancel-then-join, never `abort()`: the renewer already observes this token, and `abort()` only
     // *requests* a stop — it returns while an in-flight renewal may still be on the wire. That matters
@@ -217,6 +253,36 @@ async fn pipeline(
         return Err(failure.error);
     }
     Ok(())
+}
+
+fn spawn_catalog_maintenance(
+    ducklake: crate::config::DuckLakeConfig,
+    s3: crate::duck::S3Access,
+    token: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(ducklake.maintenance_interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        tick.tick().await;
+        loop {
+            tokio::select! {
+                biased;
+                () = token.cancelled() => return,
+                _ = tick.tick() => {}
+            }
+            match crate::duck::maintain_catalog(&ducklake, &s3) {
+                Ok(()) => tracing::info!(
+                    retention_seconds = ducklake.snapshot_retention.as_secs(),
+                    cleanup_grace_seconds = ducklake.cleanup_grace.as_secs(),
+                    "DuckLake catalog maintenance complete"
+                ),
+                Err(error) => tracing::error!(
+                    error = ?error,
+                    "DuckLake catalog maintenance failed; retrying next interval"
+                ),
+            }
+        }
+    })
 }
 
 /// The loader's one object-store client.
@@ -244,7 +310,8 @@ fn build_store(cfg: &LoaderConfig) -> Result<AmazonS3, LoaderError> {
 /// DuckDB httpfs credentials for `read_parquet('s3://…')`, from the object-store config + the AWS env
 /// (the same `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` the `object_store` client reads). DuckDB wants a
 /// scheme-less `host:port` endpoint; the scheme selects TLS.
-fn duck_s3_access(cfg: &LoaderConfig) -> crate::duck::S3Access {
+#[must_use]
+pub fn duck_s3_access(cfg: &LoaderConfig) -> crate::duck::S3Access {
     let raw = cfg.object_store.endpoint.as_deref().unwrap_or_default();
     let (use_ssl, endpoint) = match raw.strip_prefix("https://") {
         Some(host) => (true, host),

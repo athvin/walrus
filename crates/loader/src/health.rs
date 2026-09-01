@@ -1,7 +1,7 @@
 //! The loader's K8s health endpoints (loader §8.3) — **the catch-up-lag trap avoided**.
 //!
-//! - `/startup` — 200 once bootstrap completes (gates the slow lease+DuckDB open).
-//! - `/ready`   — 200 iff bootstrap done (leases held + files open) **and not quarantined**. Never
+//! - `/startup` — 200 once bootstrap completes (gates lease/fence acquisition + DuckLake attach).
+//! - `/ready`   — 200 iff bootstrap done (leases/fences held + connections open) **and not quarantined**. Never
 //!   gated on "backlog drained": a legitimately-behind loader is still *ready*; gating on lag flaps a
 //!   busy pod out. A **quarantined** table (a failed lossy DDL cast) degrades `/ready` — a loud,
 //!   terminal signal, not a silent continue.
@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum LoaderPhase {
-    /// Leases are not yet held and the DuckDB files are not yet open. Both `/startup` and `/ready`
+    /// Leases/fences are not yet held and DuckLake connections are not yet open. Both `/startup` and `/ready`
     /// answer 503. The default, and byte `0` — which `AtomicPhase`'s zero default depends on.
     #[default]
     Bootstrapping = 0,

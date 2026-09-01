@@ -55,11 +55,21 @@ data:
   WALRUS_RETENTION_LSN_LAG: "16777216" # keep 16 MiB of <table>_raw history behind transformed_lsn
   WALRUS_MAX_FILES_PER_CYCLE: "32"     # manifest files claimed per Phase-A cycle
   WALRUS_LEASE_TTL: "30s"              # table-ownership lease TTL (renewed well under it)
-  # --- storage: the RWO PVC is mounted here; one .duckdb file per source table ---
-  WALRUS_DUCKDB_DIR: "/var/lib/walrus"
+  # --- shared DuckLake: PostgreSQL catalog URL comes from walrus-secrets ---
+  WALRUS_DUCKLAKE__ATTACH_NAME: "walrus"
+  WALRUS_DUCKLAKE__METADATA_SCHEMA: "walrus_ducklake"
+  WALRUS_DUCKLAKE__DATA_PATH: "s3://walrus/ducklake/prod/"
+  WALRUS_DUCKLAKE__EXTENSION_DIRECTORY: "/opt/walrus/duckdb_extensions"
+  WALRUS_DUCKLAKE__INSTALL_EXTENSIONS: "false"
+  WALRUS_DUCKLAKE__SNAPSHOT_RETENTION: "7d"
+  WALRUS_DUCKLAKE__CLEANUP_GRACE: "7d"
+  WALRUS_DUCKLAKE__MAINTENANCE_INTERVAL: "24h"
+  # Table ownership uses rendezvous hashing over StatefulSet ordinals. Raise this together with
+  # `spec.replicas`; WALRUS_INSTANCE already supplies each pod's trailing ordinal.
+  WALRUS_SHARD_COUNT: "1"
   # --- bootstrap ---
   WALRUS_STARTUP_DEADLINE: "60s"
-  # --- object store (same bucket the sink writes; loader reads via DuckDB httpfs) ---
+  # --- object store (sink staging bucket; the same workload identity also accesses DuckLake DATA_PATH) ---
   WALRUS_OBJECT_STORE__BUCKET: "walrus"
   WALRUS_OBJECT_STORE__REGION: "us-east-1"
   # WALRUS_OBJECT_STORE__ENDPOINT: "http://minio:9000"

@@ -57,8 +57,8 @@ esac
 COMPOSE=(docker compose -f deploy/docker/docker-compose.yml)
 SINK_ADDR="127.0.0.1:8188"
 LOADER_ADDR="127.0.0.1:8190"
-DUCKDB_ROOT=""
-DUCKDB_DIR=""
+RUNTIME_ROOT=""
+EXTENSION_DIR=""
 SINK_PID=""
 LOADER_PID=""
 RESOURCE_SAMPLER_PID=""
@@ -85,8 +85,8 @@ python3 scripts/perf_report.py start \
   --max-inflight "$MAX_INFLIGHT" \
   --poll-interval "$POLL_INTERVAL" \
   --sample-interval "$SAMPLE_INTERVAL"
-DUCKDB_ROOT="$(mktemp -d)"
-DUCKDB_DIR="$DUCKDB_ROOT/duckdb"
+RUNTIME_ROOT="$(mktemp -d)"
+EXTENSION_DIR="$RUNTIME_ROOT/duckdb-extensions"
 
 stop_resource_sampler() {
   if [ -n "$RESOURCE_SAMPLER_PID" ]; then
@@ -128,8 +128,8 @@ cleanup() {
   if [ "$STACK_STARTED" = true ]; then
     "${COMPOSE[@]}" down -v >/dev/null 2>&1 || true
   fi
-  if [ -n "$DUCKDB_ROOT" ]; then
-    rm -rf "$DUCKDB_ROOT" 2>/dev/null || true
+  if [ -n "$RUNTIME_ROOT" ]; then
+    rm -rf "$RUNTIME_ROOT" 2>/dev/null || true
   fi
 }
 
@@ -213,6 +213,14 @@ export WALRUS_OBJECT_STORE__BUCKET=walrus
 export WALRUS_OBJECT_STORE__ENDPOINT=http://localhost:9000
 export WALRUS_OBJECT_STORE__REGION=us-east-1
 export WALRUS_CONTROL_DB_URL=postgres://postgres:postgres@localhost:5433/walrus_control
+export WALRUS_DUCKLAKE__CATALOG_URL=postgres://postgres:postgres@localhost:5433/walrus_ducklake
+export WALRUS_DUCKLAKE__METADATA_SCHEMA=walrus_bench
+export WALRUS_DUCKLAKE__DATA_PATH=s3://walrus/ducklake/bench/
+export WALRUS_DUCKLAKE__EXTENSION_DIRECTORY="$EXTENSION_DIR"
+export WALRUS_DUCKLAKE__INSTALL_EXTENSIONS=false
+"target/$PROFILE_DIR/walrus-loader" --install-duckdb-extensions "$EXTENSION_DIR"
+WALRUS_INSTANCE=bench-loader-0 \
+  "target/$PROFILE_DIR/walrus-loader" --migrate-ducklake-catalog
 if [ "$PERF_MODE" = heap ]; then
   export DHAT_OUTPUT="$RUN_DIR/${PERF_TARGET}-dhat-heap.json"
 fi
@@ -233,8 +241,7 @@ wait_ready "$SINK_ADDR" 60
 echo "  sink ready (pid=$SINK_PID)"
 
 echo "--- starting walrus-loader ($PROFILE) on $LOADER_ADDR ---"
-mkdir -p "$DUCKDB_DIR"
-WALRUS_INSTANCE=bench-loader WALRUS_DUCKDB_DIR="$DUCKDB_DIR" \
+WALRUS_INSTANCE=bench-loader-0 \
 WALRUS_HEALTH_ADDR="$LOADER_ADDR" WALRUS_POLL_INTERVAL="$POLL_INTERVAL" \
   "target/$PROFILE_DIR/walrus-loader" >"$RUN_DIR/loader.log" 2>&1 &
 LOADER_PID=$!

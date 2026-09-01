@@ -128,6 +128,31 @@ pub fn prune_raw(
     Ok(u64::try_from(n).unwrap_or(u64::MAX))
 }
 
+/// DuckLake raw pruning. Unlike [`prune_raw`], this does not issue the global `CHECKPOINT`
+/// statement: per-table merge/rewrite maintenance follows through [`TableDb::maintain_files`], and
+/// catalog-wide snapshot expiration is serialized by shard zero.
+///
+/// # Errors
+///
+/// Returns [`LoaderError::Duck`] if DuckLake cannot delete rows below `floor`.
+pub fn prune_raw_ducklake(
+    conn: &duckdb::Connection,
+    t: &TransformSql,
+    floor: Lsn,
+) -> Result<u64, LoaderError> {
+    let raw = t.to_raw();
+    let n = conn
+        .execute(
+            &format!(
+                "DELETE FROM \"{}\" WHERE \"_walrus_commit_lsn\" < ?",
+                raw.as_str()
+            ),
+            duckdb::params![floor.to_string()],
+        )
+        .duck_with(|| format!("prune DuckLake {}", raw.as_str()))?;
+    Ok(u64::try_from(n).unwrap_or(u64::MAX))
+}
+
 /// The retention floor for a table: `transformed_lsn - retention_lsn_lag`, saturating at 0. Always `<=
 /// transformed_lsn`, so pruning below it can never drop a row the incremental transform still reads.
 #[must_use = "returns the computed floor; it does not prune anything by itself"]

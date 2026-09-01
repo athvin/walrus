@@ -25,3 +25,4 @@ duckdb = { workspace = true, features = ["bundled"] }
 object_store = { workspace = true, features = ["aws"] }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
+uuid = { workspace = true, features = ["v5"] }

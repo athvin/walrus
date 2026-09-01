@@ -12,7 +12,7 @@ use crate::error::LoaderError;
 use crate::phase_a::TableCtx;
 use crate::plan::TablePlan;
 use crate::table_name::{DuckTable, Mirror};
-use crate::transform::{TransformSql, apply_transform};
+use crate::transform::{TransformSql, apply_transform, apply_transform_ducklake};
 use common::{Lsn, PgRelation};
 
 /// Build the transform for a table at its CURRENT reconciled `schema_version`: read the registry
@@ -96,8 +96,14 @@ pub async fn run_phase_b(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     // the DuckDB tables' CURRENT reconciled `schema_version` (Phase A advanced it), NOT the stale
     // bootstrap shape, including Tier-2 recombination from the descriptors.
     let t = current_transform(ctx).await?;
-    ctx.db
-        .in_txn("transform", |conn| apply_transform(conn, &t, after))?;
+    let ducklake = ctx.db.is_ducklake();
+    ctx.db.in_txn("transform", |conn| {
+        if ducklake {
+            apply_transform_ducklake(conn, &t, after)
+        } else {
+            apply_transform(conn, &t, after)
+        }
+    })?;
 
     // Advance the watermark AFTER the DuckDB commit. The CHECK (transformed_lsn <= raw_appended_lsn)
     // holds because Phase A ran first this cycle. `max_lsn` can equal the prior `transformed_lsn` (a

@@ -451,3 +451,30 @@ fn parquet_column_cache_hit_then_mutation_capable_miss() {
         "the miss can mutably insert after the hit borrow ends"
     );
 }
+
+#[test]
+fn table_sharding_is_deterministic_balanced_and_minimally_disruptive() {
+    let epoch = common::EpochNo(42);
+    let shards3 = std::num::NonZeroU32::new(3).unwrap();
+    let shards4 = std::num::NonZeroU32::new(4).unwrap();
+    let first = super::table_shard(epoch, "public", "orders", shards4);
+    assert_eq!(
+        first,
+        super::table_shard(epoch, "public", "orders", shards4)
+    );
+
+    let mut counts = [0_u32; 4];
+    for i in 0..2_000 {
+        let table = format!("table_{i}");
+        let old = super::table_shard(epoch, "public", &table, shards3);
+        let new = super::table_shard(epoch, "public", &table, shards4);
+        if new != old {
+            assert_eq!(new, 3, "adding one rendezvous node only moves rows to it");
+        }
+        counts[usize::try_from(new).unwrap()] += 1;
+    }
+    assert!(
+        counts.iter().all(|count| *count > 350),
+        "every shard receives a useful share: {counts:?}"
+    );
+}

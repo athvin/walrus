@@ -10,17 +10,18 @@
     reason = "futures borrowing Send + !Sync TableDb values are intentionally driven on a LocalSet"
 )]
 
-//! `walrus-loader` — reads the sink's staged Parquet from S3 and materialises it into per-table DuckDB
-//! files (`<table>` mirror + `<table>_raw` CDC log). The ordered fail-fast [`bootstrap`] proves
-//! exclusive ownership (control-plane [`lease`] + DuckDB file lock) before manifest claiming and
-//! apply work begin, while [`health`] exposes the service state.
+//! `walrus-loader` — reads the sink's staged Parquet from S3 and materialises it into a shared
+//! PostgreSQL-catalogued DuckLake (`<table>` mirror + `<table>_raw` CDC log per source table). The
+//! ordered fail-fast [`bootstrap`] proves exclusive ownership (control-plane [`lease`] + a table-keyed
+//! catalog advisory lock) before manifest claiming and apply work begin, while [`health`] exposes the
+//! service state.
 //!
 //! [`app`] is the entry point: [`app::run`] is the whole service lifecycle, so the `walrus-loader`
 //! binary (`src/main.rs`) is only config, tracing, a runtime and an exit code.
 //!
 //! # Concurrency
 //!
-//! One apply worker per `.duckdb` file, all on a single `LocalSet`. [`duck`]'s
+//! One apply worker and transient DuckDB connection per table, all on a single `LocalSet`. [`duck`]'s
 //! [`TableDb`](duck::TableDb) is `Send + !Sync`, so a future holding a `&` borrow of
 //! [`TableCtx`](phase_a::TableCtx) or that [`TableDb`](duck::TableDb) across an await is
 //! intentionally `!Send` and cannot be handed to `tokio::spawn` — which is what the crate-level

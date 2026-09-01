@@ -19,20 +19,23 @@ use duckdb::OptionalExt;
 
 /// The transform template (single source of truth). Rendered by [`TransformSql::render`].
 pub const TRANSFORM_SQL: &str = include_str!("../sql/duckdb/templates/transform.sql");
+/// DuckLake-compatible split-MERGE form of the same transform.
+pub const TRANSFORM_DUCKLAKE_SQL: &str =
+    include_str!("../sql/duckdb/templates/transform_ducklake.sql");
 
 /// Substitute every transform placeholder in one pass. `str::replace` allocates and copies the
 /// whole (increasingly large) SQL string once per placeholder; the transform has eleven of them.
 /// Counting against the static template first gives the final string an exact capacity, then this
 /// traversal copies each literal and replacement only once.
-fn render_transform_template(replacements: &[(&str, &str)]) -> String {
+fn render_transform_template(template: &str, replacements: &[(&str, &str)]) -> String {
     let capacity = replacements
         .iter()
-        .fold(TRANSFORM_SQL.len(), |length, (placeholder, value)| {
-            let occurrences = TRANSFORM_SQL.matches(placeholder).count();
+        .fold(template.len(), |length, (placeholder, value)| {
+            let occurrences = template.matches(placeholder).count();
             length - occurrences * placeholder.len() + occurrences * value.len()
         });
     let mut rendered = String::with_capacity(capacity);
-    let mut remaining = TRANSFORM_SQL;
+    let mut remaining = template;
 
     while let Some(open) = remaining.find('{') {
         rendered.push_str(&remaining[..open]);
@@ -231,6 +234,21 @@ impl TransformSql {
     /// rows STRICTLY after the `(Ct, Lt)` tuple). Composite-PK-aware.
     #[must_use]
     pub fn render(&self, after_lsn: Lsn, boundary: Option<TruncateBoundary>) -> String {
+        self.render_with(TRANSFORM_SQL, after_lsn, boundary)
+    }
+
+    /// Render the semantically identical DuckLake transform using two single-action MERGEs.
+    #[must_use]
+    pub fn render_ducklake(&self, after_lsn: Lsn, boundary: Option<TruncateBoundary>) -> String {
+        self.render_with(TRANSFORM_DUCKLAKE_SQL, after_lsn, boundary)
+    }
+
+    fn render_with(
+        &self,
+        template: &str,
+        after_lsn: Lsn,
+        boundary: Option<TruncateBoundary>,
+    ) -> String {
         let q = |c: &str| format!("\"{c}\"");
         let table = self.table.as_str();
         let pk = self.to_pk_names();
@@ -298,19 +316,22 @@ impl TransformSql {
             None => (String::new(), String::new()),
         };
         let after_lsn = after_lsn.to_string();
-        render_transform_template(&[
-            ("{table}", table),
-            ("{pk_list}", &pk_list),
-            ("{pk_join}", &pk_join),
-            ("{set_cols}", &set_cols),
-            ("{insert_cols}", &insert_cols),
-            ("{insert_vals}", &insert_vals),
-            ("{after_lsn}", &after_lsn),
-            ("{truncate_wipe}", &truncate_wipe),
-            ("{truncate_bound}", &truncate_bound),
-            ("{resolved_select}", &resolved_select),
-            ("{guard}", guard),
-        ])
+        render_transform_template(
+            template,
+            &[
+                ("{table}", table),
+                ("{pk_list}", &pk_list),
+                ("{pk_join}", &pk_join),
+                ("{set_cols}", &set_cols),
+                ("{insert_cols}", &insert_cols),
+                ("{insert_vals}", &insert_vals),
+                ("{after_lsn}", &after_lsn),
+                ("{truncate_wipe}", &truncate_wipe),
+                ("{truncate_bound}", &truncate_bound),
+                ("{resolved_select}", &resolved_select),
+                ("{guard}", guard),
+            ],
+        )
     }
 
     /// The table name (for compaction / prune SQL that lives outside the template).
@@ -447,6 +468,23 @@ pub fn apply_transform(
     let boundary = t.latest_truncate(conn, after_lsn)?;
     conn.execute_batch(&t.render(after_lsn, boundary))
         .duck_with(|| format!("transform {}", t.table()))
+}
+
+/// DuckLake form of [`apply_transform`], split to respect DuckLake's one matched mutation per
+/// `MERGE` restriction while retaining one outer transaction.
+///
+/// # Errors
+///
+/// Returns [`LoaderError::LsnParse`] for a malformed truncate boundary, or [`LoaderError::Duck`] if
+/// DuckLake rejects either rendered `MERGE`.
+pub fn apply_transform_ducklake(
+    conn: &duckdb::Connection,
+    t: &TransformSql,
+    after_lsn: Lsn,
+) -> Result<(), LoaderError> {
+    let boundary = t.latest_truncate(conn, after_lsn)?;
+    conn.execute_batch(&t.render_ducklake(after_lsn, boundary))
+        .duck_with(|| format!("transform {} in DuckLake", t.table()))
 }
 
 #[cfg(test)]
