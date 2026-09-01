@@ -170,8 +170,8 @@ async fn bootstrap_creates_duckdb_with_both_tables_and_takes_the_lease() {
     let owned = bootstrap(&cfg, &pool, &store(), &s3(), &state)
         .await
         .unwrap();
-    assert_eq!(owned.len(), 1, "owns the one registered table");
-    let orders = &owned[0];
+    assert_eq!(owned.tables.len(), 1, "owns the one registered table");
+    let orders = &owned.tables[0];
     assert!(table_exists(&orders.db, "orders"), "mirror table exists");
     assert!(
         table_exists(&orders.db, "orders_raw"),
@@ -310,7 +310,7 @@ async fn expired_lease_and_dropped_catalog_fence_are_reclaimed() {
         )
         .await
         .unwrap();
-        assert_eq!(owned_a[0].fencing_token, 1);
+        assert_eq!(owned_a.tables[0].fencing_token, 1);
     } // owned_a dropped → catalog fence released; the control lease row remains but will expire.
 
     tokio::time::sleep(Duration::from_millis(900)).await; // lease expires
@@ -326,8 +326,8 @@ async fn expired_lease_and_dropped_catalog_fence_are_reclaimed() {
     .await
     .unwrap();
     assert_eq!(
-        owned_b[0].fencing_token, 2,
+        owned_b.tables[0].fencing_token, 2,
         "reclaim by a new owner bumps the fencing token"
     );
-    assert!(table_exists(&owned_b[0].db, "orders"));
+    assert!(table_exists(&owned_b.tables[0].db, "orders"));
 }

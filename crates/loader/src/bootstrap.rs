@@ -14,7 +14,6 @@ use crate::lease;
 use common::{Lsn, PgRelation};
 use object_store::ObjectStore;
 use sqlx::Connection as _;
-use std::ops::Deref;
 
 /// The two commit-LSN watermarks for one table.
 #[derive(Debug, Clone, Copy)]
@@ -43,22 +42,13 @@ pub struct OwnedTable {
     pub checkpoints: Checkpoints,
 }
 
-/// Tables plus the session that holds their PostgreSQL advisory locks. Deref keeps the former
-/// `Vec<OwnedTable>` inspection API for integration tests while production extracts both parts.
+/// Tables plus the session that holds their PostgreSQL advisory locks.
 #[derive(Debug)]
 pub struct BootstrapResult {
     /// Tables assigned to this shard.
     pub tables: Vec<OwnedTable>,
     /// Catalog-session second fence, held until every table worker has drained.
     pub catalog_fence: CatalogFence,
-}
-
-impl Deref for BootstrapResult {
-    type Target = [OwnedTable];
-
-    fn deref(&self) -> &Self::Target {
-        &self.tables
-    }
 }
 
 /// One PostgreSQL session holding all table-keyed advisory locks assigned to this loader shard.
