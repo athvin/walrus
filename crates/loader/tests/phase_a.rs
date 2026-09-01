@@ -12,6 +12,7 @@
 //!   cargo test -p loader --test phase_a -- --ignored
 
 use common::{EpochNo, Lsn, PgColumn, PgRelation, ReplicaIdentity};
+use loader::config::DuckLakeConfig;
 use loader::duck::{S3Access, TableDb};
 use loader::health::LoaderState;
 use loader::phase_a::{TableCtx, run_phase_a};
@@ -23,6 +24,21 @@ fn control_url() -> String {
     std::env::var("WALRUS_CONTROL_DB_URL").unwrap_or_else(|_| {
         "postgres://postgres:postgres@localhost:5433/walrus_control".to_string()
     })
+}
+
+fn catalog_url() -> String {
+    std::env::var("WALRUS_DUCKLAKE_CATALOG_URL").unwrap_or_else(|_| {
+        "postgres://postgres:postgres@localhost:5433/walrus_ducklake".to_string()
+    })
+}
+
+fn ducklake() -> DuckLakeConfig {
+    DuckLakeConfig {
+        catalog_url: catalog_url().into(),
+        data_path: "s3://walrus/ducklake/tests/".to_string(),
+        install_extensions: true,
+        ..DuckLakeConfig::default()
+    }
 }
 
 fn s3() -> S3Access {
@@ -129,7 +145,8 @@ async fn setup(epoch: EpochNo) -> (TableCtx, tempfile::TempDir) {
         .await
         .unwrap();
     let dir = tmpdir(&epoch.to_string());
-    let db = TableDb::open(dir.path().join("orders.duckdb")).unwrap();
+    let db = TableDb::open_ducklake(&ducklake(), epoch, "public", "orders", &s3()).unwrap();
+    db.wipe_generation("orders").unwrap();
     db.ensure_tables(&orders(), common::SchemaVersionNo(1))
         .unwrap();
     db.configure_s3(&s3()).unwrap();

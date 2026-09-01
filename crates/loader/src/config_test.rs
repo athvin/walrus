@@ -10,7 +10,11 @@ fn valid() -> LoaderConfig {
             ..ObjectStoreConfig::default()
         },
         instance: "walrus-loader-0".to_string(),
-        duckdb_dir: "/var/lib/walrus".to_string(),
+        ducklake: DuckLakeConfig {
+            catalog_url: "postgres://localhost/walrus_ducklake".into(),
+            data_path: "s3://walrus/ducklake/test/".to_string(),
+            ..DuckLakeConfig::default()
+        },
         ..LoaderConfig::default()
     }
 }
@@ -33,18 +37,34 @@ fn humantime_durations_parse_for_every_field() {
     in_jail(|jail| {
         jail.set_env("WALRUS_CONTROL_DB_URL", "postgres://x/y");
         jail.set_env("WALRUS_INSTANCE", "walrus-loader-0");
-        jail.set_env("WALRUS_DUCKDB_DIR", "/var/lib/walrus");
+        jail.set_env("WALRUS_DUCKLAKE__CATALOG_URL", "postgres://x/ducklake");
+        jail.set_env("WALRUS_DUCKLAKE__DATA_PATH", "s3://b/ducklake/test/");
         jail.set_env("WALRUS_OBJECT_STORE__BUCKET", "b");
         jail.set_env("WALRUS_LEASE_TTL", "45s");
         jail.set_env("WALRUS_POLL_INTERVAL", "250ms");
         jail.set_env("WALRUS_COMPACTION_INTERVAL", "30m");
         jail.set_env("WALRUS_STARTUP_DEADLINE", "1m 30s");
+        jail.set_env("WALRUS_DUCKLAKE__SNAPSHOT_RETENTION", "8d");
+        jail.set_env("WALRUS_DUCKLAKE__CLEANUP_GRACE", "2d");
+        jail.set_env("WALRUS_DUCKLAKE__MAINTENANCE_INTERVAL", "12h");
 
         let cfg = LoaderConfig::load().expect("valid humantime config should load");
         assert_eq!(cfg.lease_ttl, Duration::from_secs(45));
         assert_eq!(cfg.poll_interval, Duration::from_millis(250));
         assert_eq!(cfg.compaction_interval, Duration::from_secs(30 * 60));
         assert_eq!(cfg.startup_deadline, Duration::from_secs(90));
+        assert_eq!(
+            cfg.ducklake.snapshot_retention,
+            Duration::from_secs(8 * 24 * 60 * 60)
+        );
+        assert_eq!(
+            cfg.ducklake.cleanup_grace,
+            Duration::from_secs(2 * 24 * 60 * 60)
+        );
+        assert_eq!(
+            cfg.ducklake.maintenance_interval,
+            Duration::from_secs(12 * 60 * 60)
+        );
     });
 }
 
@@ -93,6 +113,13 @@ fn every_duration_field_carries_humantime() {
     let body = loader_config_struct_body(include_str!("config.rs"));
     let mismatch = duration_attribute_mismatch(body, 4);
     assert!(mismatch.is_none(), "{mismatch:?}");
+
+    let source = include_str!("config.rs");
+    let start = source.find("pub struct DuckLakeConfig {").unwrap();
+    let body = &source[start..];
+    let end = body.find("\n}").unwrap();
+    let mismatch = duration_attribute_mismatch(&body[..end], 3);
+    assert!(mismatch.is_none(), "{mismatch:?}");
 }
 
 /// The slice really is the struct: it stops before `ConfigError`'s duration-carrying variant.
@@ -135,7 +162,27 @@ fn defaults_are_the_shipped_contract() {
     assert!(!cfg.telemetry.json);
     assert_eq!(cfg.telemetry.filter, "info");
     assert_eq!(cfg.instance, "");
-    assert_eq!(cfg.duckdb_dir, "");
+    assert_eq!(cfg.ducklake.catalog_url.expose(), "");
+    assert_eq!(cfg.ducklake.attach_name, "walrus");
+    assert_eq!(cfg.ducklake.metadata_schema, "walrus_ducklake");
+    assert_eq!(cfg.ducklake.data_path, "");
+    assert_eq!(cfg.ducklake.extension_directory, None);
+    assert!(!cfg.ducklake.install_extensions);
+    assert_eq!(
+        cfg.ducklake.snapshot_retention,
+        Duration::from_secs(7 * 24 * 60 * 60)
+    );
+    assert_eq!(
+        cfg.ducklake.cleanup_grace,
+        Duration::from_secs(7 * 24 * 60 * 60)
+    );
+    assert_eq!(
+        cfg.ducklake.maintenance_interval,
+        Duration::from_secs(24 * 60 * 60)
+    );
+    assert_eq!(cfg.shard_count.get(), 1);
+    assert_eq!(cfg.shard_index, None);
+    assert_eq!(cfg.effective_shard_index().unwrap(), 0);
     assert_eq!(cfg.lease_ttl, Duration::from_secs(30));
     assert_eq!(cfg.poll_interval, Duration::from_secs(5));
     assert_eq!(cfg.compaction_interval, Duration::from_secs(3600));
@@ -211,8 +258,12 @@ fn every_missing_required_field_is_named_by_the_variant() {
     expect_missing(&cfg, "instance");
 
     let mut cfg = valid();
-    cfg.duckdb_dir = String::new();
-    expect_missing(&cfg, "duckdb_dir");
+    cfg.ducklake.catalog_url = "".into();
+    expect_missing(&cfg, "ducklake.catalog_url");
+
+    let mut cfg = valid();
+    cfg.ducklake.data_path = String::new();
+    expect_missing(&cfg, "ducklake.data_path");
 
     let mut cfg = valid();
     cfg.object_store.bucket = String::new();
@@ -223,14 +274,20 @@ fn every_missing_required_field_is_named_by_the_variant() {
 /// anywhere would put the control-plane credential in the log aggregator.
 #[test]
 fn debug_does_not_render_the_control_dsn() {
-    let cfg = LoaderConfig {
+    let mut cfg = LoaderConfig {
         control_db_url: "postgres://walrus:hunter2@control-pg/walrus".into(),
         ..valid()
     };
+    cfg.ducklake.catalog_url =
+        "postgres://catalog:correct-horse-battery-staple@catalog-pg/ducklake".into();
 
     let rendered = format!("{cfg:?}");
 
     assert!(!rendered.contains("hunter2"), "{rendered}");
+    assert!(
+        !rendered.contains("correct-horse-battery-staple"),
+        "{rendered}"
+    );
     assert!(rendered.contains(common::REDACTED), "{rendered}");
 }
 
@@ -326,6 +383,27 @@ fn zero_poll_and_compaction_intervals_are_rejected() {
     assert!(err.to_string().contains("compaction_interval"), "{err}");
 }
 
+#[test]
+fn shard_index_must_be_inside_the_ring() {
+    let mut cfg = valid();
+    cfg.shard_count = NonZeroU32::new(2).unwrap();
+    cfg.shard_index = Some(2);
+    assert!(matches!(
+        cfg.validate(),
+        Err(ConfigError::ShardIndex { index: 2, count: 2 })
+    ));
+}
+
+#[test]
+fn ducklake_data_path_must_be_remote() {
+    let mut cfg = valid();
+    cfg.ducklake.data_path = "/var/lib/walrus".to_string();
+    assert!(matches!(
+        cfg.validate(),
+        Err(ConfigError::DuckLakeDataPath(path)) if path == "/var/lib/walrus"
+    ));
+}
+
 /// Structuring the type must not move the operator-facing text: `main` prints
 /// `walrus-loader: invalid loader configuration: {e}` and `LoaderError::Config` re-adds the same
 /// framing, while the `common::Error` classifier keeps carrying the bare detail.
@@ -350,7 +428,8 @@ fn an_unknown_key_is_a_load_failure_carrying_figments_detail() {
     in_jail(|jail| {
         jail.set_env("WALRUS_CONTROL_DB_URL", "postgres://x/y");
         jail.set_env("WALRUS_INSTANCE", "walrus-loader-0");
-        jail.set_env("WALRUS_DUCKDB_DIR", "/var/lib/walrus");
+        jail.set_env("WALRUS_DUCKLAKE__CATALOG_URL", "postgres://x/ducklake");
+        jail.set_env("WALRUS_DUCKLAKE__DATA_PATH", "s3://b/ducklake/test/");
         jail.set_env("WALRUS_OBJECT_STORE__BUCKET", "b");
         jail.set_env("WALRUS_NONSENSE", "boom"); // typo'd ConfigMap key
 

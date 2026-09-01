@@ -2,9 +2,10 @@
 #
 # Topology the design mandates (architecture.md#kubernetes-deployment):
 #   * walrus-pg-sink   — StatefulSet replicas=1  (exactly one consumer of the single lifelong slot)
-#   * walrus-loader    — StatefulSet replicas=1  + RWO PVC (one owner of every .duckdb file)
-# Both are Guaranteed QoS (requests == limits), drained on SIGTERM (grace 90s, NO preStop), and never
-# scaled horizontally (file/slot ownership is exclusive; sharding remains a deferred design goal).
+#   * walrus-loader    — StatefulSet replicas=N, disjoint table shards over shared DuckLake
+# Both are Guaranteed QoS (requests == limits) and drain on SIGTERM (grace 90s, no preStop).
+# The sink remains single-replica because slot ownership is exclusive; the loader scales by changing
+# its replica and shard counts together.
 #
 # secrets.example.yaml is deliberately NOT a resource here — it is a template the operator copies to a
 # real `walrus-secrets` Secret (or lets IRSA/Workload Identity provide). CI validates it standalone.

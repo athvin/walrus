@@ -5,15 +5,17 @@
     reason = "integration test — unwrap/expect fine in setup + helpers"
 )]
 //! Loader bootstrap against compose (`#[ignore]` — needs control PG + MinIO). Bootstrap acquires the
-//! ownership lease, opens `<table>.duckdb` with both `<table>` and `<table>_raw`, loads the watermarks,
-//! and verifies S3 read. A second live-lease instance exits terminal; a stale lock behind an expired
-//! lease is reclaimed. The lease/DuckDB logic is unit-tested in the library.
+//! ownership lease and catalog advisory-lock fence, attaches DuckLake with both `<table>` and
+//! `<table>_raw`, loads the watermarks, and verifies S3 read. A second live-lease instance exits
+//! terminal; an expired lease plus dropped catalog session is reclaimed.
 //!
 //!   cargo test -p loader --test bootstrap -- --ignored
 
 use common::{EpochNo, FailureClass, PgColumn, PgRelation, ReplicaIdentity};
 use loader::bootstrap::bootstrap;
+use loader::config::DuckLakeConfig;
 use loader::config::LoaderConfig;
+use loader::duck::S3Access;
 use loader::error::LoaderError;
 use loader::health::LoaderState;
 use object_store::aws::{AmazonS3, AmazonS3Builder};
@@ -24,6 +26,12 @@ static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 fn control_url() -> String {
     std::env::var("WALRUS_CONTROL_DB_URL").unwrap_or_else(|_| {
         "postgres://postgres:postgres@localhost:5433/walrus_control".to_string()
+    })
+}
+
+fn catalog_url() -> String {
+    std::env::var("WALRUS_DUCKLAKE_CATALOG_URL").unwrap_or_else(|_| {
+        "postgres://postgres:postgres@localhost:5433/walrus_ducklake".to_string()
     })
 }
 
@@ -57,7 +65,7 @@ fn orders() -> PgRelation {
     }
 }
 
-fn cfg(pod: &str, dir: &std::path::Path, ttl: Duration) -> LoaderConfig {
+fn cfg(pod: &str, ttl: Duration) -> LoaderConfig {
     LoaderConfig {
         control_db_url: control_url().into(),
         object_store: common::ObjectStoreConfig {
@@ -66,9 +74,24 @@ fn cfg(pod: &str, dir: &std::path::Path, ttl: Duration) -> LoaderConfig {
             region: "us-east-1".into(),
         },
         instance: pod.into(),
-        duckdb_dir: dir.to_string_lossy().into_owned(),
+        ducklake: DuckLakeConfig {
+            catalog_url: catalog_url().into(),
+            data_path: "s3://walrus/ducklake/tests/".to_string(),
+            install_extensions: true,
+            ..DuckLakeConfig::default()
+        },
         lease_ttl: ttl,
         ..LoaderConfig::default()
+    }
+}
+
+fn s3() -> S3Access {
+    S3Access {
+        endpoint: "localhost:9000".to_string(),
+        region: "us-east-1".to_string(),
+        access_key_id: "minioadmin".to_string(),
+        secret_access_key: "minioadmin".into(),
+        use_ssl: false,
     }
 }
 
@@ -112,11 +135,13 @@ async fn seed(pool: &sqlx::PgPool, epoch: EpochNo) {
     .unwrap();
 }
 
-/// A scratch directory for one test's `.duckdb` file. The returned guard deletes it on drop — even
-/// when an assertion panics, which a trailing `remove_dir_all` would skip.
-fn tmpdir(name: &str) -> tempfile::TempDir {
-    let prefix = format!("walrus-loader-{name}-");
-    tempfile::Builder::new().prefix(&prefix).tempdir().unwrap()
+async fn next_epoch(pool: &sqlx::PgPool) -> EpochNo {
+    let epoch: i64 =
+        sqlx::query_scalar("SELECT COALESCE(MAX(epoch), 0) + 1 FROM walrus.replication_state")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    EpochNo(epoch)
 }
 
 fn table_exists(db: &loader::duck::TableDb, name: &str) -> bool {
@@ -135,15 +160,16 @@ fn table_exists(db: &loader::duck::TableDb, name: &str) -> bool {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn bootstrap_creates_duckdb_with_both_tables_and_takes_the_lease() {
     let _g = LOCK.lock().await;
-    let epoch = EpochNo(3_100_101);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
+    let epoch = next_epoch(&pool).await;
     seed(&pool, epoch).await;
-    let dir = tmpdir("bootstrap");
-    let cfg = cfg("loader-a", dir.path(), Duration::from_secs(30));
+    let cfg = cfg("loader-a", Duration::from_secs(30));
     let state = LoaderState::new();
 
-    let owned = bootstrap(&cfg, &pool, &store(), &state).await.unwrap();
+    let owned = bootstrap(&cfg, &pool, &store(), &s3(), &state)
+        .await
+        .unwrap();
     assert_eq!(owned.len(), 1, "owns the one registered table");
     let orders = &owned[0];
     assert!(table_exists(&orders.db, "orders"), "mirror table exists");
@@ -171,7 +197,7 @@ async fn bootstrap_creates_duckdb_with_both_tables_and_takes_the_lease() {
     assert_eq!(owner, "loader-a");
     assert!(
         orders.db.conn().execute_batch("SELECT 1").is_ok(),
-        ".duckdb file lock is held (open RW)"
+        "DuckLake connection is attached read-write"
     );
 }
 
@@ -179,29 +205,29 @@ async fn bootstrap_creates_duckdb_with_both_tables_and_takes_the_lease() {
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
 async fn second_instance_with_live_lease_exits_terminal() {
     let _g = LOCK.lock().await;
-    let epoch = EpochNo(3_100_102);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
+    let epoch = next_epoch(&pool).await;
     seed(&pool, epoch).await;
-    let dir_a = tmpdir("live-a");
     let state = LoaderState::new();
 
-    // Instance A takes the lease (live, 30s) and keeps its DuckDB connection open.
+    // Instance A takes the lease (live, 30s), catalog fence, and DuckLake connection.
     let _owned_a = bootstrap(
-        &cfg("loader-a", dir_a.path(), Duration::from_secs(30)),
+        &cfg("loader-a", Duration::from_secs(30)),
         &pool,
         &store(),
+        &s3(),
         &state,
     )
     .await
     .unwrap();
 
     // Instance B, while A's lease is live, must fail terminal with LeaseContended.
-    let dir_b = tmpdir("live-b");
     let res = bootstrap(
-        &cfg("loader-b", dir_b.path(), Duration::from_secs(30)),
+        &cfg("loader-b", Duration::from_secs(30)),
         &pool,
         &store(),
+        &s3(),
         &LoaderState::new(),
     )
     .await;
@@ -215,35 +241,86 @@ async fn second_instance_with_live_lease_exits_terminal() {
 
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
-async fn stale_lock_expired_lease_is_reclaimed_and_opened() {
+async fn catalog_fence_blocks_a_successor_even_if_the_control_lease_is_released() {
     let _g = LOCK.lock().await;
-    let epoch = EpochNo(3_100_103);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
+    let epoch = next_epoch(&pool).await;
     seed(&pool, epoch).await;
-    let dir = tmpdir("stale");
+
+    let owned_a = bootstrap(
+        &cfg("loader-a", Duration::from_secs(30)),
+        &pool,
+        &store(),
+        &s3(),
+        &LoaderState::new(),
+    )
+    .await
+    .unwrap();
+    control::release_lease(&pool, epoch, "public", "orders", "loader-a")
+        .await
+        .unwrap();
+
+    let error = bootstrap(
+        &cfg("loader-b", Duration::from_secs(30)),
+        &pool,
+        &store(),
+        &s3(),
+        &LoaderState::new(),
+    )
+    .await
+    .expect_err("the independent catalog fence must still reject loader-b");
+    assert!(matches!(error, LoaderError::LeaseContended { .. }));
+
+    let owner: Option<String> = sqlx::query_scalar(
+        "SELECT owner_pod FROM walrus.table_ownership \
+         WHERE epoch=$1 AND source_schema='public' AND source_table='orders' \
+           AND lease_expiry > now()",
+    )
+    .bind(epoch.0)
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        owner, None,
+        "failed second-fence acquisition releases loader-b's lease"
+    );
+    drop(owned_a);
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose up --wait (control PG + MinIO)"]
+async fn expired_lease_and_dropped_catalog_fence_are_reclaimed() {
+    let _g = LOCK.lock().await;
+    let pool = control::connect(&control_url()).await.unwrap();
+    control::run_migrations(&pool).await.unwrap();
+    let epoch = next_epoch(&pool).await;
+    seed(&pool, epoch).await;
     let state = LoaderState::new();
 
-    // Instance A takes a SHORT-TTL lease then "dies": dropping its TableDb releases the DuckDB lock.
+    // Instance A takes a SHORT-TTL lease then "dies": dropping the BootstrapResult closes the
+    // DuckDB connection and its dedicated catalog session, releasing every advisory lock.
     {
         let owned_a = bootstrap(
-            &cfg("loader-dead", dir.path(), Duration::from_millis(500)),
+            &cfg("loader-dead", Duration::from_millis(500)),
             &pool,
             &store(),
+            &s3(),
             &state,
         )
         .await
         .unwrap();
         assert_eq!(owned_a[0].fencing_token, 1);
-    } // owned_a dropped → file lock released; the lease row remains but will expire.
+    } // owned_a dropped → catalog fence released; the control lease row remains but will expire.
 
     tokio::time::sleep(Duration::from_millis(900)).await; // lease expires
 
-    // Instance B reclaims the expired lease and opens the (now-unlocked) file. Token bumps to 2.
+    // Instance B reclaims the expired lease and catalog fence. Token bumps to 2.
     let owned_b = bootstrap(
-        &cfg("loader-b", dir.path(), Duration::from_secs(30)),
+        &cfg("loader-b", Duration::from_secs(30)),
         &pool,
         &store(),
+        &s3(),
         &LoaderState::new(),
     )
     .await

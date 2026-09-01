@@ -8,21 +8,17 @@
 //! 3. **finish the in-flight Phase B** transform + commit `transformed_lsn`; and **abort** any in-flight
 //!    periodic **full-rebuild** (idempotent self-heal; re-runs next cycle) so it can't blow the grace
 //!    budget — see [`crate::compaction::full_rebuild_abortable`];
-//! 4. **`CHECKPOINT` and close** the `.duckdb` file so no stale lock is left for the next bootstrap.
-//!    [`crate::apply_loop`]'s drain runs the `CHECKPOINT`; the *close* is a **drop** — the worker task
-//!    owns its [`TableCtx`](crate::phase_a::TableCtx), so DuckDB's writer lock comes off when that
-//!    task's future ends, which is why `app::pipeline` joins every worker before step 5;
-//! 5. **release the ownership lease** — last, and only *after* the watermarks commit, so a fast
-//!    replacement can't double-apply the tail. The two fences therefore come off in the REVERSE of
-//!    their bootstrap order (lease → file lock, so file lock → lease). Design §8.5 lists these two the
-//!    other way round and is not wrong — the file lock is the second fence, so a successor handed the
-//!    lease early merely fails its [`TableDb::open`](crate::duck::TableDb::open) and retries — but
-//!    this order leaves no such window;
-//! 6. **never touch the replication slot** — the loader doesn't own it.
+//! 4. **close each transient DuckDB connection** by joining its worker. Transactions are already
+//!    committed; production does not issue DuckLake's catalog-wide `CHECKPOINT` from every worker;
+//! 5. **release the PostgreSQL advisory-lock session**, dropping the second writer fence only after
+//!    all table connections are closed;
+//! 6. **release the ownership lease** — last, and only after the watermarks commit. The fences come
+//!    off in reverse bootstrap order (lease → advisory lock, then advisory lock → lease);
+//! 7. **never touch the replication slot** — the loader doesn't own it.
 //!
 //! Every restart is a resume from the two watermarks, so an ungraceful `SIGKILL` is still absorbed (the
 //! `<table>_raw` PK + `ON CONFLICT` + the queue re-claim); graceful drain just minimises replay and
-//! avoids a stale lock. There is **no `wal_sender_timeout` analogue** — the drain is bounded only by the
+//! avoids a contested handoff. There is **no `wal_sender_timeout` analogue** — the drain is bounded only by the
 //! grace period and DuckDB commit latency (a genuine simplification vs the sink).
 //!
 //! **Grace-period sizing:** the measured *incremental* worst case (append + transform + commit)

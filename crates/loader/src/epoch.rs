@@ -1,7 +1,7 @@
 //! Total-restart on the loader side (§1.8). When the control plane opens a new generation (the sink
 //! bumped `replication_state.epoch` after the single lifelong slot was lost/invalidated), every
-//! `.duckdb` built for the retired generation holds stale `<table>`/`<table>_raw` data. The fix is a
-//! whole-file **rebuild**: wipe the mirror + CDC log so the fresh new-epoch snapshot re-appends from
+//! DuckLake namespace built for the retired generation holds stale `<table>`/`<table>_raw` data. The
+//! fix is a whole-table **rebuild**: wipe the mirror + CDC log so the fresh new-epoch snapshot re-appends from
 //! scratch and the transform re-derives the mirror. **Both watermarks reset for free** — the new epoch's
 //! `loader_checkpoint` row is a fresh `(0/0, 0/0)`, since checkpoints are epoch-keyed.
 //!
@@ -38,7 +38,7 @@ pub fn rebuild_for_new_epoch(
                 table,
                 old_epoch = %built,
                 new_epoch = %control_epoch,
-                "TOTAL-RESTART: .duckdb was built for a retired generation — wiping mirror + raw to \
+                "TOTAL-RESTART: table was built for a retired generation — wiping mirror + raw to \
                  rebuild under the new epoch (both watermarks reset from the fresh checkpoint)"
             );
             db.wipe_generation(table)?;

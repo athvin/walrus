@@ -1,5 +1,12 @@
 # Walrus — Postgres WAL → DuckDB Replication Service (Architecture Sketch)
 
+> **Storage amendment (implemented):** the per-table `.duckdb` file/PVC model in this original
+> design has been replaced by a PostgreSQL-catalogued DuckLake whose Parquet data lives in S3.
+> The sink, manifest queue, two-phase raw→mirror semantics, watermarks, DDL handling, and reload
+> protocol remain the same. For the authoritative current topology and rollout, see
+> [ducklake-migration.md](./ducklake-migration.md). File-lock, PVC, and vertical-only-loader
+> passages below are retained as historical rationale and are superseded by that amendment.
+
 > **Status: design sketch for review.** This is a thorough, cited design intended to be read
 > and critiqued before any code is written. Findings are grounded in successive deep-research
 > passes — dozens of sources fetched and claims adversarially verified with 3-vote review.

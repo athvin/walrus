@@ -6,7 +6,7 @@
 use common::{ObjectStoreConfig, Redacted, TelemetryConfig};
 use serde::Deserialize;
 use std::net::SocketAddr;
-use std::num::NonZeroI64;
+use std::num::{NonZeroI64, NonZeroU32};
 use std::time::Duration;
 
 /// Floor for `lease_ttl`: renewal runs at TTL/3, so anything shorter cannot land inside the TTL.
@@ -70,6 +70,62 @@ const fn nonzero_i64(value: i64) -> NonZeroI64 {
     }
 }
 
+const fn nonzero_u32(value: u32) -> NonZeroU32 {
+    match NonZeroU32::new(value) {
+        Some(value) => value,
+        None => NonZeroU32::MIN,
+    }
+}
+
+/// The shared DuckLake catalog and object-data location.
+///
+/// The catalog URL is independent from `control_db_url`: DuckLake owns and migrates its metadata
+/// tables, while control Postgres remains Walrus's manifest/checkpoint authority. Keeping the two
+/// databases separate also lets operators scale and back them up independently.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DuckLakeConfig {
+    /// PostgreSQL URI for the dedicated DuckLake metadata database.
+    pub catalog_url: Redacted<String>,
+    /// DuckDB attachment/catalog name exposed to SQL rendered by the loader and read clients.
+    pub attach_name: String,
+    /// PostgreSQL schema in the catalog database that DuckLake owns.
+    pub metadata_schema: String,
+    /// Root object-store path for DuckLake-managed Parquet, e.g. `s3://walrus/ducklake/prod/`.
+    pub data_path: String,
+    /// Optional pre-populated DuckDB extension directory. Production images set this and never
+    /// download executable extensions at startup.
+    pub extension_directory: Option<String>,
+    /// Development escape hatch. When true, missing extensions may be installed before they load.
+    /// Shipping manifests leave this false; the image build installs the pinned artifacts.
+    pub install_extensions: bool,
+    /// Time-travel history retained before snapshots become eligible for expiration.
+    #[serde(with = "humantime_serde")]
+    pub snapshot_retention: Duration,
+    /// Additional age before unreferenced/orphaned files may be physically deleted.
+    #[serde(with = "humantime_serde")]
+    pub cleanup_grace: Duration,
+    /// Cadence for the singleton catalog-level expiration/cleanup pass.
+    #[serde(with = "humantime_serde")]
+    pub maintenance_interval: Duration,
+}
+
+impl Default for DuckLakeConfig {
+    fn default() -> Self {
+        Self {
+            catalog_url: Redacted::default(),
+            attach_name: "walrus".to_string(),
+            metadata_schema: "walrus_ducklake".to_string(),
+            data_path: String::new(),
+            extension_directory: None,
+            install_extensions: false,
+            snapshot_retention: Duration::from_secs(7 * 24 * 60 * 60),
+            cleanup_grace: Duration::from_secs(7 * 24 * 60 * 60),
+            maintenance_interval: Duration::from_secs(24 * 60 * 60),
+        }
+    }
+}
+
 /// The loader's fully-resolved configuration.
 ///
 /// Every field has a default, so an omitted key is not an error; `deny_unknown_fields` makes a
@@ -93,8 +149,13 @@ pub struct LoaderConfig {
     pub worker_threads: Option<usize>,
     /// This pod's identity — the lease `owner_pod`.
     pub instance: String,
-    /// Local directory holding the `<table>.duckdb` files (an RWO PVC in production).
-    pub duckdb_dir: String,
+    /// Shared DuckLake catalog and object-data settings.
+    pub ducklake: DuckLakeConfig,
+    /// Number of deterministic table shards in the loader StatefulSet.
+    pub shard_count: NonZeroU32,
+    /// This instance's zero-based shard ordinal. When omitted, parse the trailing StatefulSet
+    /// ordinal from `instance` (e.g. `walrus-loader-2` → `2`).
+    pub shard_index: Option<u32>,
     /// The ownership-lease TTL; renewed well under it.
     #[serde(with = "humantime_serde")]
     pub lease_ttl: Duration,
@@ -128,7 +189,9 @@ impl Default for LoaderConfig {
             telemetry: TelemetryConfig::default(),
             worker_threads: None,
             instance: String::new(),
-            duckdb_dir: String::new(),
+            ducklake: DuckLakeConfig::default(),
+            shard_count: nonzero_u32(1),
+            shard_index: None,
             lease_ttl: Duration::from_secs(30),
             poll_interval: Duration::from_secs(5),
             compaction_interval: Duration::from_secs(3600),
@@ -190,7 +253,10 @@ impl LoaderConfig {
         for (field, v) in [
             ("control_db_url", self.control_db_url.expose()),
             ("instance", &self.instance),
-            ("duckdb_dir", &self.duckdb_dir),
+            ("ducklake.catalog_url", self.ducklake.catalog_url.expose()),
+            ("ducklake.attach_name", &self.ducklake.attach_name),
+            ("ducklake.metadata_schema", &self.ducklake.metadata_schema),
+            ("ducklake.data_path", &self.ducklake.data_path),
             ("object_store.bucket", &self.object_store.bucket),
         ] {
             if v.trim().is_empty() {
@@ -203,13 +269,67 @@ impl LoaderConfig {
         for (field, value) in [
             ("poll_interval", self.poll_interval),
             ("compaction_interval", self.compaction_interval),
+            (
+                "ducklake.snapshot_retention",
+                self.ducklake.snapshot_retention,
+            ),
+            ("ducklake.cleanup_grace", self.ducklake.cleanup_grace),
+            (
+                "ducklake.maintenance_interval",
+                self.ducklake.maintenance_interval,
+            ),
         ] {
             if value.is_zero() {
                 return Err(ConfigError::ZeroInterval(field));
             }
         }
+        let shard_index = self.effective_shard_index()?;
+        if shard_index >= self.shard_count.get() {
+            return Err(ConfigError::ShardIndex {
+                index: shard_index,
+                count: self.shard_count.get(),
+            });
+        }
+        for (field, value) in [
+            ("ducklake.attach_name", self.ducklake.attach_name.as_str()),
+            (
+                "ducklake.metadata_schema",
+                self.ducklake.metadata_schema.as_str(),
+            ),
+        ] {
+            common::sql::SqlIdent::new(value)
+                .map_err(|source| ConfigError::Identifier { field, source })?;
+        }
+        if !self.ducklake.data_path.starts_with("s3://") {
+            return Err(ConfigError::DuckLakeDataPath(
+                self.ducklake.data_path.clone(),
+            ));
+        }
         common::runtime::validate_worker_threads(self.worker_threads)?;
         Ok(())
+    }
+
+    /// Configured shard index, or the trailing StatefulSet ordinal from `instance`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::ShardIdentity`] when sharding is enabled but `instance` does not end
+    /// in a numeric ordinal.
+    pub fn effective_shard_index(&self) -> Result<u32, ConfigError> {
+        if let Some(index) = self.shard_index {
+            return Ok(index);
+        }
+        if self.shard_count.get() == 1 {
+            return Ok(0);
+        }
+        match self.instance.rsplit_once('-') {
+            Some((_, ordinal)) => ordinal.parse().map_err(|_| ConfigError::ShardIdentity {
+                instance: self.instance.clone(),
+            }),
+            None => Err(ConfigError::ShardIdentity {
+                instance: self.instance.clone(),
+            }),
+        }
     }
 }
 
@@ -245,6 +365,22 @@ pub enum ConfigError {
     /// A cadence that drives a loop was zero, which would make that loop spin instead of poll.
     #[error("{0} must be greater than zero")]
     ZeroInterval(&'static str),
+    /// A StatefulSet ordinal outside the configured shard ring can never own a table.
+    #[error("shard_index {index} must be less than shard_count {count}")]
+    ShardIndex { index: u32, count: u32 },
+    /// Deterministic sharding needs the StatefulSet ordinal when no explicit index is provided.
+    #[error("cannot derive shard_index from instance {instance:?}; set shard_index explicitly")]
+    ShardIdentity { instance: String },
+    /// DuckDB catalog/schema names are quoted, but still pass through the shared identifier policy.
+    #[error("{field}: {source}")]
+    Identifier {
+        field: &'static str,
+        #[source]
+        source: common::sql::IdentError,
+    },
+    /// DuckLake writes object data; local/file paths would reintroduce node-local state.
+    #[error("ducklake.data_path must be an s3:// URI, got {0}")]
+    DuckLakeDataPath(String),
     /// The configured Tokio worker count is outside its documented `1..=64` bound. Keeps the typed
     /// [`common::runtime::WorkerThreadsError`] so callers can recover the offending count.
     #[error("worker_threads: {0}")]

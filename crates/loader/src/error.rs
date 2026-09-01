@@ -25,6 +25,13 @@ pub enum LoaderError {
         #[source]
         source: duckdb::Error,
     },
+    /// The dedicated DuckLake PostgreSQL catalog failed or its advisory-lock session was lost.
+    #[error("DuckLake catalog: {op}")]
+    Catalog {
+        op: &'static str,
+        #[source]
+        source: sqlx::Error,
+    },
     /// An object-store call failed. `op` names the call while `source` keeps the store's own typed
     /// failure — its path, its status, its nested transport cause — reachable by
     /// [`source()`](std::error::Error::source)/`downcast_ref` instead of collapsed into a sentence.
@@ -128,6 +135,9 @@ impl From<&LoaderError> for common::Error {
             LoaderError::Duck { op, source } => {
                 common::Error::Internal(format!("duckdb: {op}: {source}"))
             }
+            LoaderError::Catalog { op, source } => {
+                common::Error::ControlDb(format!("DuckLake catalog {op}: {source}"))
+            }
             LoaderError::ObjectStore { op, source } => {
                 common::Error::ObjectStore(format!("{op}: {source}"))
             }
@@ -179,6 +189,7 @@ impl FailureClass for LoaderError {
             LoaderError::Control(e) => e.is_terminal(),
             LoaderError::Config(_)
             | LoaderError::Duck { .. }
+            | LoaderError::Catalog { .. }
             | LoaderError::ObjectStore { .. }
             | LoaderError::LeaseContended { .. }
             | LoaderError::CorruptCheckpoint { .. }

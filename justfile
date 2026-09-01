@@ -29,6 +29,25 @@ test:
 it:
     cargo test --workspace --features it
 
+# Create or migrate the local PostgreSQL-backed DuckLake catalog. Normal loader startup refuses
+# automatic catalog migrations; production runs the same binary command as an explicit release step.
+ducklake-migrate:
+    WALRUS_CONTROL_DB_URL=postgres://postgres:postgres@localhost:5433/walrus_control \
+    WALRUS_INSTANCE=walrus-loader-0 \
+    WALRUS_OBJECT_STORE__BUCKET=walrus \
+    WALRUS_OBJECT_STORE__ENDPOINT=http://localhost:9000 \
+    WALRUS_DUCKLAKE__CATALOG_URL=postgres://postgres:postgres@localhost:5433/walrus_ducklake \
+    WALRUS_DUCKLAKE__DATA_PATH=s3://walrus/ducklake/tests/ \
+    WALRUS_DUCKLAKE__INSTALL_EXTENSIONS=true \
+    AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
+    cargo run -p loader --bin walrus-loader -- --migrate-ducklake-catalog
+
+# Real DuckLake contract: PostgreSQL catalog + MinIO-backed Parquet, including transform, rebuild,
+# pruning, per-table file maintenance, catalog retention procedures, and the public read view.
+ducklake-it:
+    WALRUS_DUCKLAKE_CATALOG_URL=postgres://postgres:postgres@localhost:5433/walrus_ducklake \
+    cargo test -p loader --test ducklake -- --ignored --test-threads=1
+
 # Criterion micro-benches: sink decode, Arrow batch building, loader transform, and Phase-A append.
 # Run on a quiet machine; results print to stdout. Never a CI gate (shared
 # runners are too noisy) — CI only compile-checks the bench targets via `clippy --all-targets`.
@@ -96,11 +115,26 @@ reload table flavor='reload':
           FROM walrus.replication_state \
           RETURNING reload_id, source_schema, source_table, flavor, status"
 
+# Queue a rebuilding reload for every table in the current epoch. This is the data migration from
+# frozen `.duckdb` files: the sink exports fresh source snapshots and the DuckLake loader rebuilds
+# each mirror. Already-live requests are left alone by the partial unique-index conflict target.
+reload-all:
+    {{compose}} exec -T control-pg psql -U postgres -d walrus_control -v ON_ERROR_STOP=1 \
+      -c "WITH e AS (SELECT MAX(epoch) AS epoch FROM walrus.replication_state), \
+           tables AS (SELECT DISTINCT r.epoch, r.source_schema, r.source_table \
+                      FROM walrus.schema_registry r JOIN e USING (epoch)) \
+          INSERT INTO walrus.table_reload (epoch, source_schema, source_table, flavor) \
+          SELECT epoch, source_schema, source_table, 'reload' FROM tables \
+          ON CONFLICT (epoch, source_schema, source_table) \
+            WHERE status NOT IN ('complete', 'failed') DO NOTHING \
+          RETURNING reload_id, source_schema, source_table, status"
+
 # Connectivity smoke: both Postgres instances ready + MinIO health + the walrus bucket exists.
 # Postgres checks run inside the containers (the host needs no postgres-client); MinIO health is
 # hit on the published port.
 smoke:
     {{compose}} exec -T source-pg pg_isready -U postgres -d walrus
     {{compose}} exec -T control-pg pg_isready -U postgres -d walrus_control
+    {{compose}} exec -T control-pg pg_isready -U postgres -d walrus_ducklake
     curl -sf http://localhost:9000/minio/health/live
     {{compose}} exec -T createbucket mc ls local/walrus

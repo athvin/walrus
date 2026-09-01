@@ -1,8 +1,8 @@
-//! One `.duckdb` file's read-write connection (loader §8.1) — holding DuckDB's single-writer file lock,
-//! the **second** fence (the lease is the first). Opening read-write takes an exclusive OS lock on the
-//! file: if a still-live owner held it we'd fail opaquely here, which is why the ordered bootstrap
-//! proves the lease is reclaimable *before* calling [`TableDb::open`].
+//! One source table's DuckDB execution connection. Production connections are transient, in-memory
+//! DuckDB instances attached to the shared PostgreSQL-catalogued DuckLake; [`TableDb::open`] remains
+//! the native-file backend used by hermetic tests and migration verification.
 
+use crate::config::DuckLakeConfig;
 use crate::duck_ext::DuckResultExt;
 use crate::error::LoaderError;
 use crate::plan::TablePlan;
@@ -14,8 +14,15 @@ use common::sql::SqlStrExt;
 use common::{EpochNo, ManifestId, PgRelation, Redacted, ReloadId, SchemaVersionNo};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::Arc;
+
+const EXTENSIONS: [&str; 5] = ["json", "httpfs", "aws", "postgres", "ducklake"];
+
+/// Stable namespace for the per-source-table UUID-v5 DuckLake schema names.
+const TABLE_NAMESPACE: uuid::Uuid =
+    uuid::Uuid::from_u128(0x4f02_efc2_39b3_4d9d_a860_22af_7291_8cc8);
 
 // DuckDB DDL templates (see `sql/duckdb/templates/`). Fixed structure with `{placeholder}` holes,
 // rendered by `.replace(...)`; per-table column lists stay interpolated in Rust (they can't be
@@ -33,7 +40,21 @@ const WIPE_GENERATION: &str = include_str!("../sql/duckdb/templates/wipe_generat
 const MIGRATE_RAW_REPLAY_FENCE: &str =
     include_str!("../sql/duckdb/templates/migrate_raw_replay_fence.sql");
 
-/// Owns one table's `.duckdb` connection (mirror `<table>` + CDC log `<table>_raw`).
+const CREATE_DUCKLAKE_META: &str = r#"
+CREATE TABLE IF NOT EXISTS "_walrus_meta" (k VARCHAR, v BIGINT);
+INSERT INTO "_walrus_meta"
+SELECT 'schema_version', {schema_version}
+WHERE NOT EXISTS (SELECT 1 FROM "_walrus_meta" WHERE k = 'schema_version');
+"#;
+
+const CREATE_DUCKLAKE_LEDGER: &str = r#"
+CREATE TABLE IF NOT EXISTS "_walrus_ingested_files" (
+    "s3_uri" VARCHAR NOT NULL,
+    "manifest_id" BIGINT NOT NULL
+);
+"#;
+
+/// Owns one table's DuckDB execution connection (mirror `<table>` + CDC log `<table>_raw`).
 ///
 /// The owned handles are `Send`, but their shared references are not: `&T: Send` requires `T: Sync`,
 /// while both types contain a `RefCell`. These compile-fail guards pin the boundary that prevents the
@@ -51,6 +72,7 @@ const MIGRATE_RAW_REPLAY_FENCE: &str =
 #[derive(Debug)]
 pub struct TableDb {
     conn: duckdb::Connection,
+    backend: Backend,
     /// Parquet column lists by `schema_version`. A version's file shape is immutable — the
     /// sink's homogeneous-file rule (walrus-pg-sink §3.5) cuts a fresh file at every DDL bump, so all
     /// files at one version share their columns and a DDL bump is a *new* key. So this cache never
@@ -71,6 +93,25 @@ pub struct TableDb {
     legacy_raw_replay_pk: Cell<bool>,
 }
 
+#[derive(Debug, Clone)]
+enum Backend {
+    Native,
+    DuckLake(Box<DuckLakeTable>),
+}
+
+/// Names required to bridge the existing per-table SQL into one shared DuckLake catalog.
+///
+/// Every connection sets its default schema to `internal_schema`, so the transform can continue to
+/// use the short `<table>`, `<table>_raw`, `_walrus_meta`, and `_walrus_ingested_files` names. Only
+/// the compatibility view is published outside this schema.
+#[derive(Debug, Clone)]
+struct DuckLakeTable {
+    attach_name: String,
+    internal_schema: String,
+    source_schema: String,
+    source_table: String,
+}
+
 impl TableDb {
     /// Open (or create) the file read-write, taking DuckDB's file lock. A stale lock behind an expired
     /// lease has already been reclaimed by the caller; a *live* owner would make this fail.
@@ -84,9 +125,59 @@ impl TableDb {
             duckdb::Connection::open(path).duck_with(|| format!("open {}", path.display()))?;
         Ok(TableDb {
             conn,
+            backend: Backend::Native,
             parquet_cols: RefCell::new(HashMap::new()),
             legacy_raw_replay_pk: Cell::new(false),
         })
+    }
+
+    /// Open a transient DuckDB connection, load the pinned extensions, attach the shared DuckLake,
+    /// and select this source table's isolated internal schema.
+    ///
+    /// The PostgreSQL URI is first stored in a temporary DuckDB secret and is never interpolated into
+    /// the `ATTACH` path or an operation label, preventing driver errors from echoing credentials.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] if extensions, credentials, the DuckLake attachment, or the
+    /// table's namespace cannot be configured.
+    pub fn open_ducklake(
+        cfg: &DuckLakeConfig,
+        _epoch: EpochNo,
+        source_schema: &str,
+        source_table: &str,
+        s3: &S3Access,
+    ) -> Result<Self, LoaderError> {
+        let conn = attach_ducklake(cfg, s3, false)?;
+        let attach = ident(&cfg.attach_name)?;
+
+        let internal_schema = internal_schema(source_schema, source_table);
+        let internal = ident(&internal_schema)?;
+        let public = ident(source_schema)?;
+        conn.execute_batch(&format!(
+            "CREATE SCHEMA IF NOT EXISTS {attach}.{internal};\n\
+             CREATE SCHEMA IF NOT EXISTS {attach}.{public};\n\
+             USE {attach}.{internal};"
+        ))
+        .duck_with(|| format!("select DuckLake namespace for {source_schema}.{source_table}"))?;
+
+        Ok(Self {
+            conn,
+            backend: Backend::DuckLake(Box::new(DuckLakeTable {
+                attach_name: cfg.attach_name.clone(),
+                internal_schema,
+                source_schema: source_schema.to_string(),
+                source_table: source_table.to_string(),
+            })),
+            parquet_cols: RefCell::new(HashMap::new()),
+            legacy_raw_replay_pk: Cell::new(false),
+        })
+    }
+
+    /// Whether this connection writes to the shared DuckLake rather than a native test database.
+    #[must_use]
+    pub const fn is_ducklake(&self) -> bool {
+        matches!(self.backend, Backend::DuckLake(_))
     }
 
     /// `CREATE TABLE IF NOT EXISTS` for BOTH the mirror `<table>` and the CDC log `<table>_raw`
@@ -142,7 +233,7 @@ impl TableDb {
         // that makes a stale straddle winner a no-op. Seeded from the low sentinel `0/0`; a pre-3.7 mirror
         // gains them via `ALTER … IF NOT EXISTS`, which back-fills existing rows with that sentinel (a
         // too-low seed just means the first real event wins — which is correct).
-        let primary_key = if keys.is_empty() {
+        let primary_key = if self.is_ducklake() || keys.is_empty() {
             String::new()
         } else {
             format!(", PRIMARY KEY ({})", keys.join(", "))
@@ -158,7 +249,16 @@ impl TableDb {
         // applier after any structural change (a `SELECT *` view binds its columns at creation time).
         let user_view = user_view_sql(table);
         // The per-table DDL-reconcile watermark. Seeded once; the applier advances it.
-        let meta = CREATE_META.replace("{schema_version}", &schema_version.to_string());
+        let meta = if self.is_ducklake() {
+            CREATE_DUCKLAKE_META.replace("{schema_version}", &schema_version.to_string())
+        } else {
+            CREATE_META.replace("{schema_version}", &schema_version.to_string())
+        };
+        let ledger = if self.is_ducklake() {
+            CREATE_DUCKLAKE_LEDGER
+        } else {
+            CREATE_INGEST_LEDGER
+        };
 
         // The CDC log: every change verbatim (the emit columns), with the intact
         // `walrus_pg_sink_meta` JSON plus four promoted columns. It is deliberately a HEAP: a
@@ -170,14 +270,15 @@ impl TableDb {
 
         self.conn
             .execute_batch(&format!(
-                "{mirror} {applied_cols} {raw} {user_view} {meta} {CREATE_INGEST_LEDGER}"
+                "{mirror} {applied_cols} {raw} {user_view} {meta} {ledger}"
             ))
             .duck_with(|| format!("ensure tables for {table}"))?;
         // `CREATE TABLE IF NOT EXISTS` intentionally leaves an upgraded raw table's old primary
         // key intact. Phase A uses it as a compatibility fence until all potentially pre-appended
         // manifests have drained, then calls `migrate_legacy_replay_fence` exactly once.
         self.legacy_raw_replay_pk
-            .set(self.raw_has_primary_key(table)?);
+            .set(!self.is_ducklake() && self.raw_has_primary_key(table)?);
+        self.publish_current_view()?;
         Ok(())
     }
 
@@ -189,6 +290,11 @@ impl TableDb {
     ///
     /// Returns [`LoaderError::Duck`] when DuckDB rejects the httpfs/S3 configuration statements.
     pub fn configure_s3(&self, s3: &S3Access) -> Result<(), LoaderError> {
+        if self.is_ducklake() {
+            // `open_ducklake` creates a modern secret before ATTACH so both staging reads and
+            // DuckLake-owned writes use the same refreshable credential source.
+            return Ok(());
+        }
         let esc = common::sql::sql_literal;
         let use_ssl = if s3.use_ssl { "true" } else { "false" };
         let sql = CONFIGURE_S3
@@ -440,15 +546,7 @@ impl TableDb {
     /// real DuckDB fault, kept distinct from the absent watermark `Ok(None)` reports.
     pub fn stored_schema_version(&self) -> Result<Option<SchemaVersionNo>, LoaderError> {
         // A brand-new file has no `_walrus_meta` yet — probe first, exactly as `built_epoch` does.
-        let has_meta: i64 = self
-            .conn
-            .query_row(
-                "SELECT count(*) FROM information_schema.tables WHERE table_name = '_walrus_meta'",
-                [],
-                |r| r.get(0),
-            )
-            .duck("probe _walrus_meta")?;
-        if has_meta == 0 {
+        if !self.has_metadata_table()? {
             return Ok(None);
         }
         // `max(v)` yields one row with NULL (→ `None`) when the key is absent, as in `built_epoch`.
@@ -488,15 +586,7 @@ impl TableDb {
     /// Returns [`LoaderError::Duck`] if the metadata table probe or epoch read fails.
     pub fn built_epoch(&self) -> Result<Option<EpochNo>, LoaderError> {
         // A brand-new file has no `_walrus_meta` yet — probe first so this never errors on it.
-        let has_meta: i64 = self
-            .conn
-            .query_row(
-                "SELECT count(*) FROM information_schema.tables WHERE table_name = '_walrus_meta'",
-                [],
-                |r| r.get(0),
-            )
-            .duck("probe _walrus_meta")?;
-        if has_meta == 0 {
+        if !self.has_metadata_table()? {
             return Ok(None);
         }
         // `max(v)` yields one row with NULL (→ `None`) when the 'epoch' key is absent (pre-4.6 file).
@@ -518,6 +608,9 @@ impl TableDb {
     ///
     /// Returns [`LoaderError::Duck`] if the epoch upsert fails.
     pub fn set_built_epoch(&self, epoch: EpochNo) -> Result<(), LoaderError> {
+        if self.is_ducklake() {
+            return self.replace_meta("epoch", epoch.0);
+        }
         self.conn
             .execute(
                 "INSERT INTO \"_walrus_meta\" (k, v) VALUES ('epoch', ?) \
@@ -555,6 +648,9 @@ impl TableDb {
     ///
     /// Returns [`LoaderError::Duck`] if the reload-id upsert fails.
     pub fn set_recorded_reload_id(&self, reload_id: ReloadId) -> Result<(), LoaderError> {
+        if self.is_ducklake() {
+            return self.replace_meta("reload_id", reload_id.0);
+        }
         self.conn
             .execute(
                 "INSERT INTO \"_walrus_meta\" (k, v) VALUES ('reload_id', ?) \
@@ -563,6 +659,31 @@ impl TableDb {
             )
             .duck("set recorded reload_id")?;
         Ok(())
+    }
+
+    fn has_metadata_table(&self) -> Result<bool, LoaderError> {
+        let count: i64 = match &self.backend {
+            Backend::Native => self
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM information_schema.tables \
+                     WHERE table_name = '_walrus_meta'",
+                    [],
+                    |row| row.get(0),
+                )
+                .duck("probe _walrus_meta")?,
+            Backend::DuckLake(names) => self
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM information_schema.tables \
+                     WHERE table_catalog = ? AND table_schema = ? \
+                       AND table_name = '_walrus_meta'",
+                    duckdb::params![names.attach_name, names.internal_schema],
+                    |row| row.get(0),
+                )
+                .duck("probe DuckLake _walrus_meta")?,
+        };
+        Ok(count > 0)
     }
 
     /// The reload rebuild (reload H8, §5 step 4): atomically replace BOTH tables at the
@@ -589,6 +710,7 @@ impl TableDb {
         schema_version: SchemaVersionNo,
     ) -> Result<(), LoaderError> {
         let table = &plan.table;
+        self.unpublish_current_view()?;
         self.conn
             .execute_batch(&RELOAD_REBUILD_DROP.replace("{table}", table))
             .duck_with(|| format!("reload rebuild drop for {table}"))?;
@@ -606,12 +728,270 @@ impl TableDb {
     ///
     /// Returns [`LoaderError::Duck`] if DuckDB cannot drop the retired generation's objects.
     pub fn wipe_generation(&self, table: &str) -> Result<(), LoaderError> {
+        self.unpublish_current_view()?;
         self.conn
             .execute_batch(&WIPE_GENERATION.replace("{table}", table))
             .duck_with(|| format!("wipe generation for {table}"))?;
         self.legacy_raw_replay_pk.set(false);
         Ok(())
     }
+
+    /// Re-publish the stable source-schema read contract after creating or evolving the internal
+    /// mirror view. Native test databases have no shared catalog and therefore need no second view.
+    pub(crate) fn publish_current_view(&self) -> Result<(), LoaderError> {
+        let Backend::DuckLake(names) = &self.backend else {
+            return Ok(());
+        };
+        let catalog = ident(&names.attach_name)?;
+        let source_schema = ident(&names.source_schema)?;
+        let internal_schema = ident(&names.internal_schema)?;
+        let public_view = ident(&format!("{}_current", names.source_table))?;
+        let internal_view = ident(&format!("{}_current", names.source_table))?;
+        self.conn
+            .execute_batch(&format!(
+                "CREATE OR REPLACE VIEW {catalog}.{source_schema}.{public_view} AS \
+                 SELECT * FROM {catalog}.{internal_schema}.{internal_view};"
+            ))
+            .duck_with(|| {
+                format!(
+                    "publish DuckLake view {}.{}_current",
+                    names.source_schema, names.source_table
+                )
+            })
+    }
+
+    pub(crate) fn unpublish_current_view(&self) -> Result<(), LoaderError> {
+        let Backend::DuckLake(names) = &self.backend else {
+            return Ok(());
+        };
+        self.conn
+            .execute_batch(&format!(
+                "DROP VIEW IF EXISTS {}.{}.{};",
+                ident(&names.attach_name)?,
+                ident(&names.source_schema)?,
+                ident(&format!("{}_current", names.source_table))?
+            ))
+            .duck_with(|| {
+                format!(
+                    "unpublish DuckLake view {}.{}_current",
+                    names.source_schema, names.source_table
+                )
+            })
+    }
+
+    fn replace_meta(&self, key: &str, value: i64) -> Result<(), LoaderError> {
+        self.in_txn("replace DuckLake table metadata", |conn| {
+            conn.execute("DELETE FROM \"_walrus_meta\" WHERE k = ?", [key])
+                .duck_with(|| format!("delete old {key} metadata"))?;
+            conn.execute(
+                "INSERT INTO \"_walrus_meta\" (k, v) VALUES (?, ?)",
+                duckdb::params![key, value],
+            )
+            .duck_with(|| format!("insert {key} metadata"))?;
+            Ok(())
+        })
+    }
+
+    /// Compact this table's newly written files and rewrite delete-heavy files. Snapshot expiration
+    /// is deliberately catalog-level and runs in the singleton maintenance loop instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] if any DuckLake maintenance procedure fails.
+    pub fn maintain_files(&self, table: &str) -> Result<(), LoaderError> {
+        let Backend::DuckLake(names) = &self.backend else {
+            return Ok(());
+        };
+        let catalog = names.attach_name.to_quoted_literal();
+        let schema = names.internal_schema.to_quoted_literal();
+        let mirror = table.to_quoted_literal();
+        let raw = format!("{table}_raw").to_quoted_literal();
+        self.conn
+            .execute_batch(&format!(
+                "CALL ducklake_merge_adjacent_files({catalog}, {mirror}, schema => {schema});\n\
+                 CALL ducklake_merge_adjacent_files({catalog}, {raw}, schema => {schema});\n\
+                 CALL ducklake_rewrite_data_files({catalog}, {mirror}, schema => {schema});\n\
+                 CALL ducklake_rewrite_data_files({catalog}, {raw}, schema => {schema});"
+            ))
+            .duck_with(|| format!("maintain DuckLake files for {table}"))
+    }
+}
+
+/// Install the exact set of dynamic extensions required by the production loader into `directory`.
+/// This is invoked by the image build (`walrus-loader --install-duckdb-extensions …`), not by the
+/// normal service lifecycle.
+///
+/// # Errors
+///
+/// Returns [`LoaderError::File`] if `directory` cannot be created, or [`LoaderError::Duck`] if an
+/// extension cannot be installed there.
+pub fn install_extensions(directory: &Path) -> Result<(), LoaderError> {
+    std::fs::create_dir_all(directory).map_err(|source| LoaderError::File {
+        op: "create extension directory",
+        path: directory.display().to_string(),
+        source,
+    })?;
+    let conn = duckdb::Connection::open_in_memory().duck("open extension installer")?;
+    let directory = directory.to_string_lossy().to_quoted_literal();
+    conn.execute_batch(&format!("SET extension_directory = {directory};"))
+        .duck("set extension install directory")?;
+    for extension in EXTENSIONS {
+        conn.execute_batch(&format!("INSTALL {extension};"))
+            .duck_with(|| format!("install DuckDB extension {extension}"))?;
+    }
+    Ok(())
+}
+
+fn configure_extensions(
+    conn: &duckdb::Connection,
+    cfg: &DuckLakeConfig,
+) -> Result<(), LoaderError> {
+    if let Some(directory) = &cfg.extension_directory {
+        conn.execute_batch(&format!(
+            "SET extension_directory = {};",
+            directory.to_quoted_literal()
+        ))
+        .duck("set extension directory")?;
+    }
+    if cfg.install_extensions {
+        for extension in EXTENSIONS {
+            conn.execute_batch(&format!("INSTALL {extension};"))
+                .duck_with(|| format!("install DuckDB extension {extension}"))?;
+        }
+    }
+    for extension in EXTENSIONS {
+        conn.execute_batch(&format!("LOAD {extension};"))
+            .duck_with(|| format!("load DuckDB extension {extension}"))?;
+    }
+    // Once every required artifact is resident, prohibit a typo or optional code path from fetching
+    // and executing a new extension at runtime.
+    conn.execute_batch(
+        "SET autoinstall_known_extensions = false; SET autoload_known_extensions = false;",
+    )
+    .duck("disable runtime extension downloads")
+}
+
+fn attach_ducklake(
+    cfg: &DuckLakeConfig,
+    s3: &S3Access,
+    automatic_migration: bool,
+) -> Result<duckdb::Connection, LoaderError> {
+    let conn = duckdb::Connection::open_in_memory().duck("open transient DuckDB")?;
+    configure_extensions(&conn, cfg)?;
+    configure_s3_secret(&conn, s3)?;
+
+    let attach = ident(&cfg.attach_name)?;
+    let metadata_schema = cfg.metadata_schema.to_quoted_literal();
+    let data_path = cfg.data_path.to_quoted_literal();
+    let catalog_uri = cfg.catalog_url.expose().to_quoted_literal();
+    let migration = if automatic_migration {
+        ", AUTOMATIC_MIGRATION true"
+    } else {
+        ""
+    };
+    let create_if_not_exists = if automatic_migration { "true" } else { "false" };
+    conn.execute_batch(&format!(
+        "CREATE OR REPLACE SECRET walrus_catalog (TYPE postgres, URI {catalog_uri});\n\
+         ATTACH 'ducklake:postgres:' AS {attach} (META_SECRET 'walrus_catalog', \
+             METADATA_SCHEMA {metadata_schema}, META_SCHEMA {metadata_schema}, DATA_PATH {data_path}, \
+             DATA_INLINING_ROW_LIMIT 0, CREATE_IF_NOT_EXISTS {create_if_not_exists}, \
+             OVERRIDE_DATA_PATH false{migration});"
+    ))
+    .duck("attach DuckLake catalog")?;
+    Ok(conn)
+}
+
+/// Run catalog-wide retention and physical cleanup. Callers serialize this to shard zero; all
+/// thresholds are explicit so upgrading DuckLake cannot silently change the storage policy.
+///
+/// # Errors
+///
+/// Returns [`LoaderError::Duck`] if attachment, snapshot expiration, or file cleanup fails.
+pub fn maintain_catalog(cfg: &DuckLakeConfig, s3: &S3Access) -> Result<(), LoaderError> {
+    let conn = attach_ducklake(cfg, s3, false)?;
+    let catalog = cfg.attach_name.to_quoted_literal();
+    let snapshot_seconds = cfg.snapshot_retention.as_secs();
+    let cleanup_seconds = cfg.cleanup_grace.as_secs();
+    conn.execute_batch(&format!(
+        "CALL ducklake_expire_snapshots({catalog}, \
+             older_than => CAST(now() AS TIMESTAMP) - INTERVAL '{snapshot_seconds} seconds');\n\
+         CALL ducklake_cleanup_old_files({catalog}, \
+             older_than => CAST(now() AS TIMESTAMP) - INTERVAL '{cleanup_seconds} seconds');\n\
+         CALL ducklake_delete_orphaned_files({catalog}, \
+             older_than => CAST(now() AS TIMESTAMP) - INTERVAL '{cleanup_seconds} seconds');"
+    ))
+    .duck("run DuckLake catalog maintenance")
+}
+
+/// Explicitly create or migrate the DuckLake catalog with the pinned extension version. Normal
+/// service startup never enables automatic migration.
+///
+/// # Errors
+///
+/// Returns [`LoaderError::Duck`] if the catalog cannot be attached, created, migrated, or verified.
+pub fn migrate_catalog(cfg: &DuckLakeConfig, s3: &S3Access) -> Result<(), LoaderError> {
+    let conn = attach_ducklake(cfg, s3, true)?;
+    conn.execute_batch("SELECT 1;")
+        .duck("verify migrated DuckLake catalog")
+}
+
+fn configure_s3_secret(conn: &duckdb::Connection, s3: &S3Access) -> Result<(), LoaderError> {
+    let region = s3.region.to_quoted_literal();
+    let sql = if s3.endpoint.is_empty() && s3.access_key_id.is_empty() {
+        format!(
+            "CREATE OR REPLACE SECRET walrus_s3 (TYPE s3, PROVIDER credential_chain, \
+             REGION {region}, REFRESH auto);"
+        )
+    } else {
+        let endpoint = s3.endpoint.to_quoted_literal();
+        let key = s3.access_key_id.to_quoted_literal();
+        let secret = s3.secret_access_key.expose().to_quoted_literal();
+        let ssl = if s3.use_ssl { "true" } else { "false" };
+        format!(
+            "CREATE OR REPLACE SECRET walrus_s3 (TYPE s3, PROVIDER config, KEY_ID {key}, \
+             SECRET {secret}, REGION {region}, ENDPOINT {endpoint}, URL_STYLE 'path', \
+             USE_SSL {ssl});"
+        )
+    };
+    conn.execute_batch(&sql).duck("configure S3 secret")
+}
+
+fn internal_schema(source_schema: &str, source_table: &str) -> String {
+    let id = table_uuid(source_schema, source_table);
+    format!("_walrus_{}", id.simple())
+}
+
+fn table_uuid(source_schema: &str, source_table: &str) -> uuid::Uuid {
+    let key = format!("{source_schema}\0{source_table}");
+    uuid::Uuid::new_v5(&TABLE_NAMESPACE, key.as_bytes())
+}
+
+/// Stable deterministic shard for a registered source table.
+#[must_use]
+pub fn table_shard(
+    epoch: EpochNo,
+    source_schema: &str,
+    source_table: &str,
+    shard_count: NonZeroU32,
+) -> u32 {
+    let table = format!("{}\0{source_schema}\0{source_table}", epoch.0);
+    let score = |shard| {
+        let candidate = format!("{table}\0{shard}");
+        u128::from_be_bytes(uuid::Uuid::new_v5(&TABLE_NAMESPACE, candidate.as_bytes()).into_bytes())
+    };
+    let mut best = (0, score(0));
+    for shard in 1..shard_count.get() {
+        let candidate = score(shard);
+        if candidate > best.1 {
+            best = (shard, candidate);
+        }
+    }
+    best.0
+}
+
+fn ident(raw: &str) -> Result<common::sql::SqlIdent, LoaderError> {
+    common::sql::SqlIdent::new(raw)
+        .map_err(|source| LoaderError::Internal(format!("DuckLake identifier {raw:?}: {source}")))
 }
 
 /// The user-facing `<table>_current` view: the mirror minus the hidden `_applied_*` guard columns

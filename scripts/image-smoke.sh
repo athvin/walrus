@@ -89,6 +89,22 @@ COMMON_ENV=(
   -e WALRUS_OBJECT_STORE__ENDPOINT=http://minio:9000
   -e WALRUS_OBJECT_STORE__REGION=us-east-1
 )
+DUCKLAKE_ENV=(
+  -e WALRUS_DUCKLAKE__CATALOG_URL=postgres://postgres:postgres@control-pg:5432/walrus_ducklake
+  -e WALRUS_DUCKLAKE__METADATA_SCHEMA=walrus_imgsmoke
+  -e WALRUS_DUCKLAKE__DATA_PATH=s3://walrus/ducklake/imgsmoke/
+  -e WALRUS_DUCKLAKE__EXTENSION_DIRECTORY=/opt/walrus/duckdb_extensions
+  -e WALRUS_DUCKLAKE__INSTALL_EXTENSIONS=false
+)
+
+# Catalog changes are an explicit release step; the normal loader below attaches with automatic
+# migration disabled. This also proves the runtime image contains all pinned extension artifacts.
+echo "=== migrating DuckLake catalog ==="
+docker run --rm --network "$NET" "${COMMON_ENV[@]}" "${DUCKLAKE_ENV[@]}" \
+  -e WALRUS_CONTROL_DB_URL=postgres://postgres:postgres@control-pg:5432/walrus_control \
+  -e WALRUS_INSTANCE=walrus-loader-imgsmoke-0 \
+  "$LOADER_IMG" --migrate-ducklake-catalog \
+  || fail "DuckLake catalog migration failed"
 
 # 4. Sink: creates the slot + establishes the epoch, registers orders/customers/items, then streams.
 echo "=== starting $SINK_C ==="
@@ -108,10 +124,9 @@ wait_log "$SINK_C" "streaming logical replication" 90 || fail "$SINK_C never rea
 #    shutdown token. Reaching "starting apply loops" also proves the bundled-DuckDB binary runs and
 #    the httpfs extension loaded in the image.
 echo "=== starting $LOADER_C ==="
-docker run -d --name "$LOADER_C" --network "$NET" "${COMMON_ENV[@]}" \
+docker run -d --name "$LOADER_C" --network "$NET" "${COMMON_ENV[@]}" "${DUCKLAKE_ENV[@]}" \
   -e WALRUS_CONTROL_DB_URL=postgres://postgres:postgres@control-pg:5432/walrus_control \
-  -e WALRUS_INSTANCE=walrus-loader-imgsmoke \
-  -e WALRUS_DUCKDB_DIR=/var/lib/walrus \
+  -e WALRUS_INSTANCE=walrus-loader-imgsmoke-0 \
   -e WALRUS_HEALTH_ADDR=0.0.0.0:8090 \
   -e WALRUS_POLL_INTERVAL=1s \
   "$LOADER_IMG" >/dev/null

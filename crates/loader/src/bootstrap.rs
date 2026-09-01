@@ -1,18 +1,20 @@
 //! The loader's ordered, fail-fast bootstrap (loader §8.2). For each owned table: **(1)** acquire the
-//! ownership lease (the first fence; a live owner → terminal) → **(2)** open/create the `.duckdb` file
-//! and take its lock (the second fence) + ensure both `<table>` and `<table>_raw` → **(3)** load both
+//! ownership lease (the first fence) → **(2)** take a table-keyed advisory lock on a dedicated
+//! DuckLake-catalog PostgreSQL session (the second fence), attach a transient DuckDB connection, and
+//! ensure both `<table>` and `<table>_raw` → **(3)** load both
 //! checkpoints and assert `transformed_lsn <= raw_appended_lsn`. Then verify the S3 read path once. The
 //! **lease precedes the lock precedes any watermark read** — the fence is fully in place before the
 //! read-then-write apply cycle starts.
 
 use crate::config::LoaderConfig;
-use crate::duck::TableDb;
+use crate::duck::{S3Access, TableDb};
 use crate::error::LoaderError;
 use crate::health::LoaderState;
 use crate::lease;
 use common::{Lsn, PgRelation};
 use object_store::ObjectStore;
-use std::path::Path;
+use sqlx::Connection as _;
+use std::ops::Deref;
 
 /// The two commit-LSN watermarks for one table.
 #[derive(Debug, Clone, Copy)]
@@ -32,12 +34,119 @@ pub struct OwnedTable {
     pub table: String,
     /// The table's shape at the version bootstrap resolved, used to render the transform SQL.
     pub relation: PgRelation,
-    /// The lease token held for this table — the first of the two fences, taken before the file.
+    /// The lease token held for this table — the first of the two fences.
     pub fencing_token: i64,
-    /// The open DuckDB handle. Holding it *is* the second fence: DuckDB's read-write file lock.
+    /// The open transient DuckDB handle attached to this table's DuckLake namespace. The catalog
+    /// session owned by [`BootstrapResult`] holds the second fence.
     pub db: TableDb,
     /// Where the two phases had reached when bootstrap read them.
     pub checkpoints: Checkpoints,
+}
+
+/// Tables plus the session that holds their PostgreSQL advisory locks. Deref keeps the former
+/// `Vec<OwnedTable>` inspection API for integration tests while production extracts both parts.
+#[derive(Debug)]
+pub struct BootstrapResult {
+    /// Tables assigned to this shard.
+    pub tables: Vec<OwnedTable>,
+    /// Catalog-session second fence, held until every table worker has drained.
+    pub catalog_fence: CatalogFence,
+}
+
+impl Deref for BootstrapResult {
+    type Target = [OwnedTable];
+
+    fn deref(&self) -> &Self::Target {
+        &self.tables
+    }
+}
+
+/// One PostgreSQL session holding all table-keyed advisory locks assigned to this loader shard.
+pub struct CatalogFence {
+    connection: sqlx::PgConnection,
+    held: usize,
+}
+
+impl std::fmt::Debug for CatalogFence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CatalogFence")
+            .field("held", &self.held)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CatalogFence {
+    async fn connect(cfg: &LoaderConfig) -> Result<Self, LoaderError> {
+        let connection = sqlx::PgConnection::connect(cfg.ducklake.catalog_url.expose())
+            .await
+            .map_err(|source| LoaderError::Catalog {
+                op: "connect advisory-lock session",
+                source,
+            })?;
+        Ok(Self {
+            connection,
+            held: 0,
+        })
+    }
+
+    async fn acquire(
+        &mut self,
+        _epoch: common::EpochNo,
+        schema: &str,
+        table: &str,
+        instance: &str,
+    ) -> Result<(), LoaderError> {
+        // Deliberately epoch-independent: all generations reuse one physical DuckLake namespace,
+        // so an old worker and its total-restart successor must contend on the same hard fence.
+        let key = format!("walrus:{schema}:{table}");
+        let acquired: bool =
+            sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtextextended($1, 0))")
+                .bind(key)
+                .fetch_one(&mut self.connection)
+                .await
+                .map_err(|source| LoaderError::Catalog {
+                    op: "acquire table advisory lock",
+                    source,
+                })?;
+        if !acquired {
+            return Err(LoaderError::LeaseContended {
+                table: format!("{schema}.{table}"),
+                owner: format!("another DuckLake writer (requester {instance})"),
+            });
+        }
+        self.held += 1;
+        Ok(())
+    }
+
+    /// Keep the lock session observable. A broken session drops every server-side lock and returns
+    /// an error so the app supervisor cancels all writers before a successor is admitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Catalog`] when the dedicated PostgreSQL session cannot be pinged.
+    pub async fn watch(
+        mut self,
+        period: std::time::Duration,
+        stop: tokio_util::sync::CancellationToken,
+    ) -> Result<(), LoaderError> {
+        let mut tick = tokio::time::interval(period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        tick.tick().await;
+        loop {
+            tokio::select! {
+                biased;
+                () = stop.cancelled() => return Ok(()),
+                _ = tick.tick() => {}
+            }
+            sqlx::query("SELECT 1")
+                .execute(&mut self.connection)
+                .await
+                .map_err(|source| LoaderError::Catalog {
+                    op: "advisory-lock session health check",
+                    source,
+                })?;
+        }
+    }
 }
 
 impl OwnedTable {
@@ -69,8 +178,9 @@ pub async fn bootstrap(
     cfg: &LoaderConfig,
     pool: &sqlx::PgPool,
     store: &dyn ObjectStore,
+    s3: &S3Access,
     state: &LoaderState,
-) -> Result<Vec<OwnedTable>, LoaderError> {
+) -> Result<BootstrapResult, LoaderError> {
     // The generation to load. The sink establishes it; until it does, there is nothing to own.
     let epoch = control::read_current_epoch(pool)
         .await?
@@ -81,7 +191,17 @@ pub async fn bootstrap(
 
     let registry = control::read_all_latest_registry(pool, epoch).await?;
     let mut owned = Vec::with_capacity(registry.len());
+    let mut catalog_fence = CatalogFence::connect(cfg).await?;
     for row in registry {
+        let shard = crate::duck::table_shard(
+            epoch,
+            &row.source_schema,
+            &row.source_table,
+            cfg.shard_count,
+        );
+        if shard != cfg.effective_shard_index()? {
+            continue;
+        }
         let version = row.schema_version;
         let table = format!("{}.{}", row.source_schema, row.source_table);
         let rel: PgRelation =
@@ -92,23 +212,29 @@ pub async fn bootstrap(
             })?;
 
         // (1) FIRST FENCE: the ownership lease — before we ever touch the file.
-        let lease = lease::acquire(
-            pool,
-            epoch,
-            &rel.schema,
-            &rel.name,
-            &cfg.instance,
-            cfg.lease_ttl,
-        )
-        .await?;
+        let lease = acquire_for_shard(cfg, pool, epoch, &rel.schema, &rel.name).await?;
+        if let Err(error) =
+            acquire_catalog_for_shard(cfg, &mut catalog_fence, epoch, &rel.schema, &rel.name).await
+        {
+            // Do not leave a full-TTL availability delay when the hard catalog fence says another
+            // writer is still live. The compare-by-owner release cannot disturb that writer's lease.
+            lease::release_all(
+                pool,
+                epoch,
+                &[(rel.schema.clone(), rel.name.clone())],
+                &cfg.instance,
+            )
+            .await;
+            return Err(error);
+        }
 
-        // (2) SECOND FENCE: open the .duckdb read-write (takes the file lock) + ensure both tables, then
-        // (4) reconcile a RESUMED .duckdb (its persisted `_walrus_meta` version < the registered latest)
+        // (2) Attach a transient DuckDB connection to this table's isolated schema in the shared
+        // DuckLake + ensure both tables, then (4) reconcile a resumed table whose persisted
+        // `_walrus_meta` version is below the registered latest
         // UP TO that version — applying any additive DDL it missed before it processes more data.
         // For a FRESH file this is a no-op (created at the latest shape, watermark already there); the
         // steady-state per-file forward reconcile lives in Phase A.
-        let path = Path::new(&cfg.duckdb_dir).join(format!("{}.duckdb", rel.name));
-        let db = TableDb::open(&path)?;
+        let db = TableDb::open_ducklake(&cfg.ducklake, epoch, &rel.schema, &rel.name, s3)?;
         // Total-restart rebuild (§1.8): if this `.duckdb` was built for a retired generation (its
         // `_walrus_meta['epoch']` < the control epoch), wipe its mirror + raw so the fresh new-epoch
         // snapshot rebuilds it. A no-op for a fresh file or a same-epoch resume. Both watermarks reset for
@@ -191,7 +317,8 @@ pub async fn bootstrap(
             fencing_token = lease.fencing_token,
             raw_appended = %cp.raw_appended_lsn,
             transformed = %cp.transformed_lsn,
-            "owned: lease held, .duckdb open, watermarks loaded"
+            shard,
+            "owned: lease held, DuckLake attached, watermarks loaded"
         );
         owned.push(OwnedTable {
             schema: rel.schema.clone(),
@@ -211,7 +338,56 @@ pub async fn bootstrap(
 
     // Liveness: stamp one poll so an idle-but-healthy loader is `/healthz` green (no poll loop yet).
     state.stamp_poll();
-    Ok(owned)
+    Ok(BootstrapResult {
+        tables: owned,
+        catalog_fence,
+    })
+}
+
+async fn acquire_for_shard(
+    cfg: &LoaderConfig,
+    pool: &sqlx::PgPool,
+    epoch: common::EpochNo,
+    schema: &str,
+    table: &str,
+) -> Result<control::Lease, LoaderError> {
+    let deadline = tokio::time::Instant::now() + cfg.startup_deadline;
+    loop {
+        match lease::acquire(pool, epoch, schema, table, &cfg.instance, cfg.lease_ttl).await {
+            Ok(lease) => return Ok(lease),
+            Err(LoaderError::LeaseContended { .. })
+                if cfg.shard_count.get() > 1 && tokio::time::Instant::now() < deadline =>
+            {
+                tracing::info!(schema, table, "waiting for shard ownership handoff");
+                tokio::time::sleep((cfg.lease_ttl / 3).min(std::time::Duration::from_secs(5)))
+                    .await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn acquire_catalog_for_shard(
+    cfg: &LoaderConfig,
+    fence: &mut CatalogFence,
+    epoch: common::EpochNo,
+    schema: &str,
+    table: &str,
+) -> Result<(), LoaderError> {
+    let deadline = tokio::time::Instant::now() + cfg.startup_deadline;
+    loop {
+        match fence.acquire(epoch, schema, table, &cfg.instance).await {
+            Ok(()) => return Ok(()),
+            Err(LoaderError::LeaseContended { .. })
+                if cfg.shard_count.get() > 1 && tokio::time::Instant::now() < deadline =>
+            {
+                tracing::info!(schema, table, "waiting for DuckLake advisory-lock handoff");
+                tokio::time::sleep((cfg.lease_ttl / 3).min(std::time::Duration::from_secs(5)))
+                    .await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// Prove the staging bucket is readable. A `NotFound` on a probe key means "reachable, key absent" —

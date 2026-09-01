@@ -49,13 +49,15 @@ services:
       POSTGRES_DB: walrus_control
     ports:
       - "5433:5432"
+    volumes:
+      - ./initdb/control:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d walrus_control"]
       interval: 2s
       timeout: 3s
       retries: 15
 
-  minio: # S3-compatible staging bucket
+  minio: # S3-compatible staging + DuckLake object-data bucket
     image: minio/minio
     command: server /data --console-address ":9001"
     environment:
