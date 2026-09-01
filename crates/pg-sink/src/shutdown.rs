@@ -83,15 +83,22 @@ pub async fn drain<C: Clock + Clone>(
         .drain_committed()
         .context("seal committed batches on drain")?;
     let mut drained_any = false;
+    let mut max_durable = None;
     for batch in sealed {
         let written = flush_batch(sink, pool, epoch, batch).await?; // (a) PUT then (b) manifest
-        checkpoint.on_batch_durable(written.lsn_end); // (c) advance confirmed_flush
+        max_durable =
+            Some(max_durable.map_or(written.lsn_end, |lsn: Lsn| lsn.max(written.lsn_end)));
         drained_any = true;
         tracing::info!(
             uri = %written.s3_uri,
             lsn_end = %written.lsn_end,
             "drain: flushed in-flight committed batch"
         );
+    }
+    if let Some(frontier) = max_durable {
+        // (c) only after every sibling batch has a durable object + manifest. A crash during the
+        // loop therefore replays the whole unacknowledged tail instead of losing later siblings.
+        checkpoint.on_batch_durable(frontier);
     }
     // (3) The final standby update carries the durable confirmed_flush (clamped to the open-txn floor).
     checkpoint

@@ -214,9 +214,9 @@ impl<'a> SourcePreflight<'a> {
     pub async fn assert_ddl_capture(&self) -> Result<(), PreflightError> {
         if self
             .first_text(
-                "SELECT EXISTS (SELECT 1 FROM information_schema.columns
-                                WHERE table_schema='walrus' AND table_name='ddl_audit'
-                                  AND column_name='c_columns')::text",
+                "SELECT (count(*) = 4)::text FROM information_schema.columns
+                 WHERE table_schema='walrus' AND table_name='ddl_audit'
+                   AND column_name IN ('c_columns', 'c_rel_oid', 'c_replica_identity', 'c_ddl_text')",
             )
             .await?
             != "true"

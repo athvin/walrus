@@ -120,6 +120,19 @@ impl Harness {
         .execute(&source)
         .await
         .context("create reload fixtures")?;
+        // DDL transaction tests add these columns to `orders`. Normalize the persistent compose
+        // source before dropping the old slot, so every test bootstraps from the same v1 shape and
+        // none of this cleanup WAL belongs to the fresh epoch.
+        sqlx::raw_sql(
+            "ALTER TABLE public.orders \
+                 DROP COLUMN IF EXISTS ddl_txn_extra, \
+                 DROP COLUMN IF EXISTS ddl_stream_extra, \
+                 DROP COLUMN IF EXISTS ddl_abort_extra, \
+                 DROP COLUMN IF EXISTS ddl_savepoint_extra;",
+        )
+        .execute(&source)
+        .await
+        .context("normalize orders DDL test columns")?;
         sqlx::raw_sql(&format!(
             "TRUNCATE public.orders; TRUNCATE public.types_matrix; \
              TRUNCATE public.q_target; TRUNCATE public.rl1; TRUNCATE public.rl2; TRUNCATE public.rl3; \

@@ -8,7 +8,8 @@
 
 use crate::ControlError;
 use common::{DdlId, EpochNo, Lsn, SchemaVersionNo};
-use sqlx::PgExecutor;
+use sqlx::postgres::PgRow;
+use sqlx::{PgExecutor, Row};
 
 /// A decoded schema-change event. `c_columns` and `c_dropped` remain JSON because they preserve the
 /// source event payload; loader-side parsing gives the fields their operational shape.
@@ -18,6 +19,8 @@ pub struct DdlRow {
     pub id: DdlId,
     /// Generation the event was recorded under.
     pub epoch: EpochNo,
+    /// Identity primary key of the source `walrus.ddl_audit` row. Stable across WAL replay.
+    pub source_audit_id: i64,
     /// Schema of the table the DDL changed.
     pub source_schema: String,
     /// Table the DDL changed.
@@ -30,6 +33,14 @@ pub struct DdlRow {
     pub c_tag: String,
     /// The `schema_version` this DDL produces.
     pub schema_version: SchemaVersionNo,
+    /// Affected source relation OID, when the event still has one.
+    pub c_rel_oid: Option<u32>,
+    /// Structured post-change columns snapshot.
+    pub c_columns: Option<serde_json::Value>,
+    /// Structured dropped-object payload.
+    pub c_dropped: Option<serde_json::Value>,
+    /// Best-effort source SQL text, retained for audit/debugging but never replayed for correctness.
+    pub c_ddl_text: Option<String>,
 }
 
 /// Record a decoded schema-change event from the sink. `c_rel_oid` + `c_columns` are the structured
@@ -40,30 +51,24 @@ pub struct DdlRow {
 ///
 /// Returns [`ControlError::Connect`] if the event cannot be inserted, or
 /// [`ControlError::CheckViolation`] if its values violate a control-plane invariant.
-pub async fn insert_ddl(
-    ex: impl PgExecutor<'_>,
-    row: &DdlRow,
-    c_rel_oid: Option<u32>,
-    c_columns: Option<&serde_json::Value>,
-) -> Result<DdlId, ControlError> {
-    let c_rel_oid = c_rel_oid.map(sqlx::postgres::types::Oid);
-    let rec = sqlx::query_file!(
-        "sql/postgres/queries/insert_ddl.sql",
-        row.epoch.0,
-        row.source_schema,
-        row.source_table,
-        row.c_lsn as Lsn,
-        row.c_event,
-        row.c_tag,
-        row.schema_version.0,
-        c_rel_oid,
-        c_columns,
-    )
-    .fetch_one(ex)
-    .await?;
-    // Wrap the decoded scalar rather than binding the newtype: the SQL text is untouched, so the
-    // committed `.sqlx` offline cache stays valid without a regenerate.
-    Ok(DdlId(rec.id))
+pub async fn insert_ddl(ex: impl PgExecutor<'_>, row: &DdlRow) -> Result<DdlId, ControlError> {
+    let c_rel_oid = row.c_rel_oid.map(sqlx::postgres::types::Oid);
+    let rec = sqlx::query(include_str!("../sql/postgres/queries/insert_ddl.sql"))
+        .bind(row.epoch.0)
+        .bind(row.source_audit_id)
+        .bind(&row.source_schema)
+        .bind(&row.source_table)
+        .bind(row.c_lsn)
+        .bind(&row.c_event)
+        .bind(&row.c_tag)
+        .bind(row.schema_version.0)
+        .bind(c_rel_oid)
+        .bind(&row.c_columns)
+        .bind(&row.c_dropped)
+        .bind(&row.c_ddl_text)
+        .fetch_one(ex)
+        .await?;
+    Ok(DdlId(rec.try_get("id")?))
 }
 
 /// DDL the loader must apply before transforming past `after_lsn`, in `c_lsn` order (`id` breaks
@@ -79,26 +84,49 @@ pub async fn read_pending_ddl(
     table: &str,
     after_lsn: Lsn,
 ) -> Result<Vec<DdlRow>, ControlError> {
-    let rows = sqlx::query_file!(
-        "sql/postgres/queries/read_pending_ddl.sql",
-        epoch.0,
-        schema,
-        table,
-        after_lsn as Lsn,
-    )
-    .fetch_all(ex)
-    .await?;
-    Ok(rows
-        .into_iter()
-        .map(|row| DdlRow {
-            id: DdlId(row.id),
-            epoch: row.epoch.into(),
-            source_schema: row.source_schema,
-            source_table: row.source_table,
-            c_lsn: row.c_lsn,
-            c_event: row.c_event,
-            c_tag: row.c_tag,
-            schema_version: row.schema_version.into(),
-        })
-        .collect())
+    let rows = sqlx::query(include_str!("../sql/postgres/queries/read_pending_ddl.sql"))
+        .bind(epoch.0)
+        .bind(schema)
+        .bind(table)
+        .bind(after_lsn)
+        .fetch_all(ex)
+        .await?;
+    rows.into_iter().map(decode_ddl_row).collect()
+}
+
+/// Read the epoch's complete DDL history. The sink hydrates source audit identities and committed
+/// schema versions from this on restart so replay is idempotent before the first repeated event arrives.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if control Postgres cannot execute or decode the query.
+pub async fn read_all_ddl(
+    ex: impl PgExecutor<'_>,
+    epoch: EpochNo,
+) -> Result<Vec<DdlRow>, ControlError> {
+    let rows = sqlx::query(include_str!("../sql/postgres/queries/read_all_ddl.sql"))
+        .bind(epoch.0)
+        .fetch_all(ex)
+        .await?;
+    rows.into_iter().map(decode_ddl_row).collect()
+}
+
+fn decode_ddl_row(row: PgRow) -> Result<DdlRow, ControlError> {
+    Ok(DdlRow {
+        id: DdlId(row.try_get("id")?),
+        epoch: EpochNo(row.try_get("epoch")?),
+        source_audit_id: row.try_get("source_audit_id")?,
+        source_schema: row.try_get("source_schema")?,
+        source_table: row.try_get("source_table")?,
+        c_lsn: row.try_get("c_lsn")?,
+        c_event: row.try_get("c_event")?,
+        c_tag: row.try_get("c_tag")?,
+        schema_version: SchemaVersionNo(row.try_get("schema_version")?),
+        c_rel_oid: row
+            .try_get::<Option<sqlx::postgres::types::Oid>, _>("c_rel_oid")?
+            .map(|oid| oid.0),
+        c_columns: row.try_get("c_columns")?,
+        c_dropped: row.try_get("c_dropped")?,
+        c_ddl_text: row.try_get("c_ddl_text")?,
+    })
 }

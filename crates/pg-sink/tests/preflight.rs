@@ -192,3 +192,234 @@ async fn publication_missing_heartbeat_is_terminal() {
     setup.batch_execute(SOURCE_MIGRATION).await.unwrap();
     setup.batch_execute(SOURCE_DDL_MIGRATION).await.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires docker compose up --wait (source PG)"]
+async fn ddl_event_bindings_share_one_function_and_capture_commit_safe_snapshots() {
+    let _guard = SOURCE_LOCK.lock().await;
+    let setup = plain(&source_url()).await;
+    setup.batch_execute(SOURCE_MIGRATION).await.unwrap();
+    setup.batch_execute(SOURCE_DDL_MIGRATION).await.unwrap();
+    setup
+        .batch_execute("DROP TABLE IF EXISTS public._walrus_ddl_trigger_test")
+        .await
+        .unwrap();
+
+    let bindings = setup
+        .query(
+            "SELECT evtname, evtevent, evtfoid::regprocedure::text \
+             FROM pg_event_trigger \
+             WHERE evtname IN ('walrus_intercept_ddl', 'walrus_intercept_drop') \
+             ORDER BY evtname",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(bindings.len(), 2);
+    assert_eq!(bindings[0].get::<_, &str>(1), "ddl_command_end");
+    assert_eq!(bindings[1].get::<_, &str>(1), "sql_drop");
+    assert_eq!(bindings[0].get::<_, &str>(2), "walrus.intercept_ddl()");
+    assert_eq!(bindings[1].get::<_, &str>(2), "walrus.intercept_ddl()");
+
+    let before: i64 = setup
+        .query_one("SELECT COALESCE(max(id), 0) FROM walrus.ddl_audit", &[])
+        .await
+        .unwrap()
+        .get(0);
+    setup
+        .execute(
+            "CREATE TABLE public._walrus_ddl_trigger_test (id int PRIMARY KEY, note text)",
+            &[],
+        )
+        .await
+        .unwrap();
+    let created = setup
+        .query_one(
+            "SELECT c_event, c_tag, c_rel_oid::text, c_replica_identity, c_columns::text, c_ddl_text \
+             FROM walrus.ddl_audit WHERE id > $1 AND c_table = '_walrus_ddl_trigger_test'",
+            &[&before],
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.get::<_, &str>(0), "ddl_command_end");
+    assert_eq!(created.get::<_, &str>(1), "CREATE TABLE");
+    assert!(!created.get::<_, &str>(2).is_empty());
+    assert_eq!(created.get::<_, &str>(3), "d");
+    let columns: serde_json::Value = serde_json::from_str(created.get::<_, &str>(4)).unwrap();
+    assert_eq!(columns.as_array().unwrap().len(), 2);
+    assert_eq!(columns[0]["name"], "id");
+    assert_eq!(columns[0]["is_key"], true);
+    assert!(
+        created
+            .get::<_, &str>(5)
+            .contains("CREATE TABLE public._walrus_ddl_trigger_test")
+    );
+
+    let before_drop_column: i64 = setup
+        .query_one("SELECT COALESCE(max(id), 0) FROM walrus.ddl_audit", &[])
+        .await
+        .unwrap()
+        .get(0);
+    setup
+        .execute(
+            "ALTER TABLE public._walrus_ddl_trigger_test DROP COLUMN note",
+            &[],
+        )
+        .await
+        .unwrap();
+    let drop_column_rows = setup
+        .query(
+            "SELECT c_event, c_tag, c_columns::text FROM walrus.ddl_audit \
+             WHERE id > $1 AND c_table = '_walrus_ddl_trigger_test' ORDER BY id",
+            &[&before_drop_column],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        drop_column_rows.len(),
+        1,
+        "DROP COLUMN must not be duplicated by sql_drop + ddl_command_end"
+    );
+    assert_eq!(drop_column_rows[0].get::<_, &str>(0), "ddl_command_end");
+    assert_eq!(drop_column_rows[0].get::<_, &str>(1), "ALTER TABLE");
+    let columns: serde_json::Value =
+        serde_json::from_str(drop_column_rows[0].get::<_, &str>(2)).unwrap();
+    assert_eq!(columns.as_array().unwrap().len(), 1);
+
+    let before_rollback: i64 = setup
+        .query_one("SELECT COALESCE(max(id), 0) FROM walrus.ddl_audit", &[])
+        .await
+        .unwrap()
+        .get(0);
+    setup
+        .batch_execute(
+            "BEGIN; \
+             ALTER TABLE public._walrus_ddl_trigger_test ADD COLUMN rolled_back text; \
+             ROLLBACK",
+        )
+        .await
+        .unwrap();
+    let after_rollback: i64 = setup
+        .query_one("SELECT COALESCE(max(id), 0) FROM walrus.ddl_audit", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        after_rollback, before_rollback,
+        "audit INSERT rolls back with DDL"
+    );
+    let rolled_back_column_exists: bool = setup
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = '_walrus_ddl_trigger_test' \
+               AND column_name = 'rolled_back')",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(!rolled_back_column_exists);
+
+    let before_drop_table: i64 = setup
+        .query_one("SELECT COALESCE(max(id), 0) FROM walrus.ddl_audit", &[])
+        .await
+        .unwrap()
+        .get(0);
+    setup
+        .execute("DROP TABLE public._walrus_ddl_trigger_test", &[])
+        .await
+        .unwrap();
+    let dropped = setup
+        .query_one(
+            "SELECT c_event, c_tag, c_columns::text, c_dropped::text, c_ddl_text \
+             FROM walrus.ddl_audit WHERE id > $1 AND c_table = '_walrus_ddl_trigger_test'",
+            &[&before_drop_table],
+        )
+        .await
+        .unwrap();
+    assert_eq!(dropped.get::<_, &str>(0), "sql_drop");
+    assert_eq!(dropped.get::<_, &str>(1), "DROP TABLE");
+    assert_eq!(dropped.get::<_, &str>(2), "[]");
+    assert!(dropped.get::<_, &str>(3).contains("table"));
+    assert!(
+        dropped
+            .get::<_, &str>(4)
+            .contains("DROP TABLE public._walrus_ddl_trigger_test")
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose up --wait (source PG)"]
+async fn concurrent_table_ddl_waits_for_an_inflight_writer_and_captures_only_after_success() {
+    let _guard = SOURCE_LOCK.lock().await;
+    let writer = plain(&source_url()).await;
+    let ddl = plain(&source_url()).await;
+    writer.batch_execute(SOURCE_MIGRATION).await.unwrap();
+    writer.batch_execute(SOURCE_DDL_MIGRATION).await.unwrap();
+    writer
+        .batch_execute(
+            "DROP TABLE IF EXISTS public._walrus_ddl_lock_test; \
+             CREATE TABLE public._walrus_ddl_lock_test (id int PRIMARY KEY)",
+        )
+        .await
+        .unwrap();
+    let audit_floor: i64 = writer
+        .query_one("SELECT COALESCE(max(id), 0) FROM walrus.ddl_audit", &[])
+        .await
+        .unwrap()
+        .get(0);
+
+    writer
+        .batch_execute("BEGIN; INSERT INTO public._walrus_ddl_lock_test (id) VALUES (1)")
+        .await
+        .unwrap();
+    ddl.batch_execute("SET lock_timeout = '250ms'")
+        .await
+        .unwrap();
+    let blocked = ddl
+        .execute(
+            "ALTER TABLE public._walrus_ddl_lock_test ADD COLUMN extra text",
+            &[],
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        blocked.code(),
+        Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE),
+        "ALTER must wait behind the writer's RowExclusive lock"
+    );
+    let premature_audits: i64 = writer
+        .query_one(
+            "SELECT count(*) FROM walrus.ddl_audit \
+             WHERE id > $1 AND c_table = '_walrus_ddl_lock_test' AND c_tag = 'ALTER TABLE'",
+            &[&audit_floor],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(premature_audits, 0, "a timed-out DDL has no audit event");
+
+    writer.batch_execute("COMMIT").await.unwrap();
+    ddl.batch_execute("SET lock_timeout = 0").await.unwrap();
+    ddl.execute(
+        "ALTER TABLE public._walrus_ddl_lock_test ADD COLUMN extra text",
+        &[],
+    )
+    .await
+    .unwrap();
+    let committed_audits: i64 = writer
+        .query_one(
+            "SELECT count(*) FROM walrus.ddl_audit \
+             WHERE id > $1 AND c_table = '_walrus_ddl_lock_test' AND c_tag = 'ALTER TABLE'",
+            &[&audit_floor],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(committed_audits, 1);
+
+    writer
+        .batch_execute("DROP TABLE public._walrus_ddl_lock_test")
+        .await
+        .unwrap();
+}

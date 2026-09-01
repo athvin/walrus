@@ -56,6 +56,43 @@ async fn migrations_create_all_tables() {
 }
 
 #[tokio::test]
+async fn transactional_ddl_migration_installs_replay_and_sql_audit_columns() {
+    let pool = migrated_pool().await;
+    for column in ["source_audit_id", "c_ddl_text"] {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+             WHERE table_schema = 'walrus' AND table_name = 'ddl_manifest' AND column_name = $1)",
+        )
+        .bind(column)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(exists, "walrus.ddl_manifest.{column} must exist");
+    }
+
+    let source_id_nullable: String = sqlx::query_scalar(
+        "SELECT is_nullable FROM information_schema.columns \
+         WHERE table_schema = 'walrus' AND table_name = 'ddl_manifest' \
+           AND column_name = 'source_audit_id'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(source_id_nullable, "NO");
+
+    let unique_index: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_indexes \
+         WHERE schemaname = 'walrus' AND tablename = 'ddl_manifest' \
+           AND indexname = 'ddl_manifest_source_audit_idx' \
+           AND indexdef LIKE 'CREATE UNIQUE INDEX%')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(unique_index);
+}
+
+#[tokio::test]
 async fn file_manifest_partial_index_is_ready_only() {
     let pool = migrated_pool().await;
     let indexdef: String = sqlx::query_scalar(

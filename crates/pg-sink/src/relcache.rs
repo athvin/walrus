@@ -76,6 +76,25 @@ impl RelationCache {
             .map(|cached| cached.relation.oid)
     }
 
+    /// Highest-version cached relation for a qualified table name.
+    #[must_use]
+    pub fn latest_for_name(&self, schema: &str, table: &str) -> Option<Arc<CachedRelation>> {
+        self.iter()
+            .filter(|cached| cached.relation.schema == schema && cached.relation.name == table)
+            .max_by_key(|cached| cached.schema_version)
+            .map(Arc::clone)
+    }
+
+    /// Remove one provisional version after its streamed source transaction or savepoint aborts.
+    /// Committed older versions remain available to in-flight files and replay.
+    pub fn remove_version(&mut self, schema: &str, table: &str, version: SchemaVersionNo) {
+        self.by_key.retain(|_, cached| {
+            cached.schema_version != version
+                || cached.relation.schema != schema
+                || cached.relation.name != table
+        });
+    }
+
     /// The cached relations in ascending `(relation_oid, schema_version)` key order. The map key is
     /// a projection of each value, so iteration yields values directly.
     #[must_use = "iterators are lazy and do nothing unless consumed"]

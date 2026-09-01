@@ -34,6 +34,19 @@ enum FrameEvent {
     Frame(anyhow::Result<Option<ReplicationMessage>>),
 }
 
+fn transaction_scope(
+    xid: Option<u32>,
+    current_top: Option<u32>,
+) -> anyhow::Result<crate::ddl::TransactionScope> {
+    match xid {
+        Some(sub_xid) => Ok(crate::ddl::TransactionScope::Streamed {
+            top_xid: current_top.context("xid-prefixed message arrived outside StreamStart")?,
+            sub_xid,
+        }),
+        None => Ok(crate::ddl::TransactionScope::Ordinary),
+    }
+}
+
 /// The fully wired decode loop. Construct it with [`DecodeLoop::builder`]; [`DecodeLoop::run`]
 /// consumes the wiring so its mutable borrows cannot escape or be reused concurrently.
 #[derive(Debug)]
@@ -218,50 +231,122 @@ impl<C: Clock + Clone> DecodeLoop<'_, C> {
                             if let Some(msg) = on_frame(&mut ctx, frame)? {
                                 trace_message(&msg);
                                 match &msg {
-                                    Message::Relation { relation, .. } => {
+                                    Message::Relation { relation, xid } => {
                                         // Learn walrus.heartbeat / walrus.ddl_audit OIDs BEFORE their change
                                         // arrives (Relation always precedes the change in the same txn).
                                         internal.note_relation(relation);
-                                        // Register user tables at their CURRENT structural version (bumped by
-                                        // DDL capture) so the new-shape file carries the new version.
-                                        let version =
-                                            ddl.version_of(&relation.schema, &relation.name);
-                                        on_relation(cache, pool, epoch, relation.clone(), version)
-                                            .await?;
+                                        if !is_internal_table(&relation.schema, &relation.name) {
+                                            let scope =
+                                                transaction_scope(*xid, demux.current_top())?;
+                                            let version = ddl.version_for(
+                                                scope,
+                                                &relation.schema,
+                                                &relation.name,
+                                            );
+                                            let row = cache_relation(
+                                                cache,
+                                                epoch,
+                                                relation.clone(),
+                                                version,
+                                            )?
+                                            .context(
+                                                "user Relation unexpectedly classified internal",
+                                            )?;
+                                            if let crate::ddl::TransactionScope::Streamed {
+                                                top_xid,
+                                                ..
+                                            } = scope
+                                            {
+                                                demux.bind_relation(top_xid, relation.oid, version);
+                                            } else {
+                                                router.bind_relation(relation.oid, version);
+                                            }
+                                            if ddl.is_provisional(
+                                                &relation.schema,
+                                                &relation.name,
+                                                version,
+                                            ) {
+                                                ddl.stage_registry(scope, row);
+                                            } else {
+                                                persist_registry(pool, &row).await?;
+                                            }
+                                        }
                                     }
-                                    // The DDL signal: a walrus.ddl_audit INSERT. Write a ddl_manifest row,
-                                    // bump the affected table's structural schema_version, and cut a fresh
-                                    // file. NEVER materialised as user data.
+                                    // The DDL signal is provisional until this source transaction commits.
+                                    // Its structured snapshot is usable immediately INSIDE the transaction,
+                                    // while manifest/registry publication waits for Commit/StreamCommit.
                                     Message::Insert {
-                                        relation_oid, new, ..
+                                        relation_oid,
+                                        new,
+                                        xid,
                                     } if internal.is_ddl_audit(*relation_oid) => {
                                         if let Some(rel) = internal.ddl_audit_rel() {
                                             let ev = crate::ddl::DdlEvent::from_tuple(rel, new)
                                                 .context("parse ddl_audit tuple")?;
-                                            let structural = ddl
-                                                .consume(pool, &ev)
-                                                .await
-                                                .context("consume ddl event")?;
-                                            if let Some(new_version) = structural {
-                                                // Cut the old-version file for that table, then flush it.
+                                            let scope =
+                                                transaction_scope(*xid, demux.current_top())?;
+                                            let previous = ev
+                                                .c_rel_oid
+                                                .and_then(|oid| cache.latest_for(oid))
+                                                .or_else(|| {
+                                                    cache.latest_for_name(
+                                                        &ev.source_schema,
+                                                        &ev.source_table,
+                                                    )
+                                                })
+                                                .map(|cached| cached.relation.clone());
+                                            let observation = ddl.observe(scope, ev.clone());
+                                            if let Some(new_version) =
+                                                observation.structural_version
+                                            {
+                                                // Cache the trigger's authoritative post-change catalog
+                                                // snapshot now, but commit-gate its registry row.
+                                                if let Some(after) =
+                                                    ev.relation_after(previous.as_ref())?
+                                                    && let Some(row) = cache_relation(
+                                                        cache,
+                                                        epoch,
+                                                        after,
+                                                        new_version,
+                                                    )?
+                                                {
+                                                    if observation.replay {
+                                                        persist_registry(pool, &row).await?;
+                                                    } else {
+                                                        ddl.stage_registry(scope, row);
+                                                    }
+                                                }
+                                                // Cut committed old-version rows now; preserve any open
+                                                // ordinary pre-DDL rows as a commit-gated segment.
                                                 let sealed = router.cut_table(
                                                     cache,
                                                     &ev.source_schema,
                                                     &ev.source_table,
                                                 )?;
                                                 flush_sealed(
-                                                    sealed, stream, sink, checkpoint, pool, epoch,
+                                                    sealed,
+                                                    router.undurable_floor(),
+                                                    stream,
+                                                    sink,
+                                                    checkpoint,
+                                                    pool,
+                                                    epoch,
                                                 )
                                                 .await?;
                                                 tracing::info!(
                                                     source_table = %format_args!("{}.{}", ev.source_schema, ev.source_table),
                                                     c_tag = %ev.c_tag,
                                                     schema_version = %new_version,
-                                                    c_lsn = %ev.c_lsn,
-                                                    "DDL: manifest + version bump + file cut"
+                                                    capture_lsn = %ev.capture_lsn,
+                                                    replay = observation.replay,
+                                                    "DDL staged: provisional version + file boundary"
                                                 );
                                             } else {
-                                                tracing::info!(c_tag = %ev.c_tag, "DDL: metadata-only (recorded, no bump)");
+                                                tracing::info!(
+                                                    c_tag = %ev.c_tag,
+                                                    replay = observation.replay,
+                                                    "DDL staged: metadata-only"
+                                                );
                                             }
                                         }
                                     }
@@ -315,8 +400,14 @@ impl<C: Clock + Clone> DecodeLoop<'_, C> {
                                         if internal.is_internal(*relation_oid) => {}
                                     m @ Message::Commit { commit_lsn, .. } => {
                                         // First seal/flush any user batch this commit made eligible.
+                                        let sealed =
+                                            router.route(cache, m, frame_lsn, schema_version)?;
+                                        ddl.on_commit(pool, *commit_lsn)
+                                            .await
+                                            .context("commit ordinary DDL state")?;
                                         flush_sealed(
-                                            router.route(cache, m, frame_lsn, schema_version)?,
+                                            sealed,
+                                            router.undurable_floor(),
                                             stream,
                                             sink,
                                             checkpoint,
@@ -385,6 +476,7 @@ impl<C: Clock + Clone> DecodeLoop<'_, C> {
                                         // `on_batch_durable` below, so draining early never advances past it.)
                                         flush_sealed(
                                             router.drain_committed()?,
+                                            router.undurable_floor(),
                                             stream,
                                             sink,
                                             checkpoint,
@@ -404,6 +496,9 @@ impl<C: Clock + Clone> DecodeLoop<'_, C> {
                                                 sink,
                                             )
                                             .await?;
+                                        ddl.on_stream_commit(pool, *xid, *commit_lsn)
+                                            .await
+                                            .context("commit streamed DDL state")?;
                                         for obj in &objs {
                                             crate::manifest::record_ready(pool, epoch, obj)
                                                 .await
@@ -430,6 +525,11 @@ impl<C: Clock + Clone> DecodeLoop<'_, C> {
                                         // sub == top → whole-txn drop; sub != top → exclude the rolled-back
                                         // savepoint's rows (proto §9b) while the top-level txn commits on.
                                         demux.on_stream_abort(*top_xid, *sub_xid, sink).await;
+                                        for (schema, table, version) in
+                                            ddl.on_stream_abort(*top_xid, *sub_xid)
+                                        {
+                                            cache.remove_version(&schema, &table, version);
+                                        }
                                         checkpoint.set_open_txn_floor(demux.open_floor());
                                         // An aborted (sub)transaction's signal echo must never resolve a
                                         // waiter — the commit never carried it.
@@ -452,6 +552,7 @@ impl<C: Clock + Clone> DecodeLoop<'_, C> {
                                                 frame_lsn,
                                                 schema_version,
                                             )?,
+                                            router.undurable_floor(),
                                             stream,
                                             sink,
                                             checkpoint,
@@ -597,35 +698,67 @@ impl<'a, C> DecodeLoopBuilder<'a, C> {
     }
 }
 
-/// PUT each sealed batch, commit its manifest row, then advance the durability checkpoint to its
-/// `lsn_end` and tell the server — the strict (a) PUT → (b) manifest → (c) slot ordering of §1.5.
+/// PUT every sealed batch and commit every manifest row before advancing the durability checkpoint.
+/// Several files can share one transaction's commit LSN (multiple tables, or the pre/post-DDL schema
+/// segments of one table); acknowledging after only the first sibling would make a crash lose the
+/// rest. An older committed-but-unsealed batch is an additional fence: its commit has not reached S3,
+/// so the slot cannot advance through its LSN yet.
 async fn flush_sealed(
     sealed: Vec<SealedBatch>,
+    undurable_floor: Option<Lsn>,
     stream: &mut ReplicationStream,
     sink: &crate::sink::ParquetSink,
     checkpoint: &mut crate::checkpoint::DurabilityCheckpoint,
     pool: &sqlx::PgPool,
     epoch: EpochNo,
 ) -> anyhow::Result<()> {
+    let mut max_durable = None;
     for batch in sealed {
         // Durability steps (a) PUT then (b) commit the manifest row — pumping unconditional keepalive
         // throughout so a slow or stalled S3 flush can't starve the walsender past `wal_sender_timeout`
         // (§1.9). The flush touches the object store + control DB, never the replication socket.
         let written = flush_batch_keepalive(stream, sink, pool, epoch, batch).await?;
-        // Step (c): ONLY now advance confirmed_flush and tell the server.
-        checkpoint.on_batch_durable(written.lsn_end);
-        checkpoint
-            .send(stream, false)
-            .await
-            .context("send durability standby status")?;
+        max_durable =
+            Some(max_durable.map_or(written.lsn_end, |lsn: Lsn| lsn.max(written.lsn_end)));
         tracing::info!(
             uri = %written.s3_uri,
             lsn_end = %written.lsn_end,
-            confirmed_flush = %checkpoint.confirmed_flush(),
-            "durable: object + manifest + slot advanced"
+            "durable: object + manifest committed"
         );
     }
+    let Some(frontier) = durable_frontier(max_durable, undurable_floor) else {
+        if let (Some(durable), Some(floor)) = (max_durable, undurable_floor)
+            && floor <= durable
+        {
+            tracing::info!(
+                durable_through = %durable,
+                undurable_floor = %floor,
+                confirmed_flush = %checkpoint.confirmed_flush(),
+                "slot held behind an older committed-but-unsealed batch"
+            );
+        }
+        return Ok(());
+    };
+    // Step (c): all files at/below this frontier are now represented by durable manifests.
+    checkpoint.on_batch_durable(frontier);
+    checkpoint
+        .send(stream, false)
+        .await
+        .context("send durability standby status")?;
+    tracing::info!(
+        durable_through = %frontier,
+        confirmed_flush = %checkpoint.confirmed_flush(),
+        "durable file group complete; slot advanced"
+    );
     Ok(())
+}
+
+/// Highest newly-durable LSN that is strictly before any committed-but-unsealed row.
+fn durable_frontier(max_durable: Option<Lsn>, undurable_floor: Option<Lsn>) -> Option<Lsn> {
+    match (max_durable, undurable_floor) {
+        (Some(durable), Some(floor)) if floor <= durable => None,
+        (durable, _) => durable,
+    }
 }
 
 /// Await the durable flush ([`flush_batch`]: S3 PUT + manifest commit) while pumping **unconditional**
@@ -724,6 +857,11 @@ pub struct BatchRouter<C> {
     // but no profile implicates hashing, and the keys are source-derived, so collision resistance
     // remains preferable to a speculative faster hasher.
     batchers: HashMap<u32, TableBatcher<C>>,
+    /// Relation version currently bound by pgoutput's latest ordinary `Relation` message for an OID.
+    bindings: HashMap<u32, common::SchemaVersionNo>,
+    /// Pre-DDL segments from the current ordinary transaction. They are promoted and force-sealed only
+    /// when that transaction's Commit arrives, so a boundary never discards speculative rows.
+    pending_cuts: Vec<TableBatcher<C>>,
     triggers: BatchTriggers,
     clock: C,
     epoch: EpochNo,
@@ -758,12 +896,19 @@ impl<C: Clock + Clone> BatchRouter<C> {
         let sink_instance = sink_instance.into();
         BatchRouter {
             batchers: HashMap::new(),
+            bindings: HashMap::new(),
+            pending_cuts: Vec::new(),
             triggers,
             clock,
             epoch,
             sink_instance,
             txn_xid: 0,
         }
+    }
+
+    /// Bind subsequent ordinary changes for `oid` to the exact relation version announced by pgoutput.
+    pub fn bind_relation(&mut self, oid: u32, version: common::SchemaVersionNo) {
+        self.bindings.insert(oid, version);
     }
 
     /// Route one decoded message. `Begin` sets the txn context; `I/U/D` buffer against the open txn;
@@ -852,9 +997,14 @@ impl<C: Clock + Clone> BatchRouter<C> {
     }
 
     fn push(&mut self, cache: &RelationCache, row: RowSource<'_>) -> anyhow::Result<()> {
-        // Always the LATEST cached shape for this OID — so a change after a DDL bump lands in a
-        // new-version file (the homogeneous-file rule; the batcher was cut on the bump).
-        let Some(cached) = cache.latest_for(row.oid) else {
+        // A transaction-local DDL can put a provisional newer shape in the shared cache. Route by the
+        // Relation message that actually preceded this ordinary change, never by a global `latest` read.
+        let cached = self
+            .bindings
+            .get(&row.oid)
+            .and_then(|version| cache.get(row.oid, *version))
+            .or_else(|| cache.latest_for(row.oid));
+        let Some(cached) = cached else {
             tracing::warn!(
                 relation_oid = row.oid,
                 "change for a relation with no cached shape yet; skipping"
@@ -892,9 +1042,11 @@ impl<C: Clock + Clone> BatchRouter<C> {
         Ok(())
     }
 
-    /// Cut the current file for `schema.table`: force-seal its batcher so the pre-DDL rows
-    /// flush at the old `schema_version`, and drop the batcher so the next change rebuilds it from the
-    /// new-version shape. Returns the sealed old-version batch, if any.
+    /// Cut the current file for `schema.table` without discarding an open ordinary transaction.
+    ///
+    /// A batcher with speculative pre-DDL rows moves to `pending_cuts`; Commit promotes and force-seals
+    /// that old-version segment. A batcher containing only earlier committed rows can be sealed now.
+    /// The next post-DDL change opens a fresh batcher at its Relation-bound version.
     ///
     /// # Errors
     ///
@@ -911,7 +1063,12 @@ impl<C: Clock + Clone> BatchRouter<C> {
         };
         let mut sealed = Vec::new();
         if let Some(mut batcher) = self.batchers.remove(&oid)
-            && let Some(batch) = batcher.drain_committed().context("cut table on DDL bump")?
+            && let Some(batch) = if batcher.has_open_txn() {
+                self.pending_cuts.push(batcher);
+                None
+            } else {
+                batcher.drain_committed().context("cut table on DDL bump")?
+            }
         {
             sealed.push(batch);
         }
@@ -924,6 +1081,14 @@ impl<C: Clock + Clone> BatchRouter<C> {
         commit_ts: UtcTimestamp,
     ) -> anyhow::Result<Vec<SealedBatch>> {
         let mut sealed = Vec::new();
+        for mut batcher in self.pending_cuts.drain(..) {
+            batcher
+                .on_commit(commit_lsn, commit_ts)
+                .context("promote pre-DDL transaction segment")?;
+            if batcher.committed_rows() > 0 {
+                sealed.push(batcher.seal().context("seal pre-DDL transaction segment")?);
+            }
+        }
         for batcher in self.batchers.values_mut() {
             batcher
                 .on_commit(commit_lsn, commit_ts)
@@ -940,6 +1105,7 @@ impl<C: Clock + Clone> BatchRouter<C> {
     pub fn undurable_floor(&self) -> Option<Lsn> {
         self.batchers
             .values()
+            .chain(self.pending_cuts.iter())
             .filter_map(TableBatcher::undurable_floor)
             .min()
     }
@@ -953,6 +1119,15 @@ impl<C: Clock + Clone> BatchRouter<C> {
     /// Returns [`anyhow::Error`] if any table's committed Arrow batch cannot be sealed.
     pub fn drain_committed(&mut self) -> anyhow::Result<Vec<SealedBatch>> {
         let mut sealed = Vec::new();
+        for batcher in &mut self.pending_cuts {
+            if let Some(batch) = batcher
+                .drain_committed()
+                .context("drain committed pre-DDL segment")?
+            {
+                sealed.push(batch);
+            }
+        }
+        self.pending_cuts.clear();
         for batcher in self.batchers.values_mut() {
             if let Some(batch) = batcher.drain_committed().context("drain committed batch")? {
                 sealed.push(batch);
@@ -978,8 +1153,26 @@ pub async fn on_relation(
     relation: common::PgRelation,
     schema_version: common::SchemaVersionNo,
 ) -> anyhow::Result<()> {
-    if is_internal_table(&relation.schema, &relation.name) {
+    let Some(row) = cache_relation(cache, epoch, relation, schema_version)? else {
         return Ok(());
+    };
+    persist_registry(ex, &row).await
+}
+
+/// Build/cache one user relation and return the control row that may be persisted now or commit-gated
+/// by [`crate::ddl::DdlConsumer`]. Internal walrus relations return `None`.
+///
+/// # Errors
+///
+/// Returns [`anyhow::Error`] if the relation cannot be mapped to Arrow or serialized.
+pub fn cache_relation(
+    cache: &mut RelationCache,
+    epoch: EpochNo,
+    relation: common::PgRelation,
+    schema_version: common::SchemaVersionNo,
+) -> anyhow::Result<Option<control::RegistryRow>> {
+    if is_internal_table(&relation.schema, &relation.name) {
+        return Ok(None);
     }
     let cached = cache
         .upsert_from_relation(relation, schema_version)
@@ -992,12 +1185,24 @@ pub async fn on_relation(
         descriptors: cached.descriptors.clone(),
         columns: serde_json::to_value(&cached.relation).context("serialize relation snapshot")?,
     };
-    control::upsert_registry(ex, &row)
+    Ok(Some(row))
+}
+
+/// Persist a previously cached registry row.
+///
+/// # Errors
+///
+/// Returns [`anyhow::Error`] if control Postgres rejects the idempotent registry upsert.
+pub async fn persist_registry(
+    ex: impl sqlx::PgExecutor<'_>,
+    row: &control::RegistryRow,
+) -> anyhow::Result<()> {
+    control::upsert_registry(ex, row)
         .await
         .context("upsert schema_registry")?;
     tracing::info!(
-        source_table = %format_args!("{}.{}", cached.relation.schema, cached.relation.name),
-        schema_version = %schema_version,
+        source_table = %format_args!("{}.{}", row.source_schema, row.source_table),
+        schema_version = %row.schema_version,
         "registered relation"
     );
     Ok(())

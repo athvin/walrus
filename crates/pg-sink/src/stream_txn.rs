@@ -30,7 +30,7 @@ use crate::sink::{FileKind, ParquetSink, WrittenObject};
 use anyhow::Context;
 use common::{EpochNo, Kind, Lsn, Op, SinkMeta, TupleValue, UtcTimestamp};
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
@@ -52,11 +52,13 @@ struct StreamedChange {
     op: Op,
     values: Box<[TupleValue]>,
     lsn: Lsn,
+    /// Exact relation version bound when this change was decoded. Never looked up as `latest` later.
+    schema_version: common::SchemaVersionNo,
 }
 
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(
-    std::mem::size_of::<StreamedChange>() == 40,
+    std::mem::size_of::<StreamedChange>() == 48,
     "StreamedChange buffers every row of an open streamed transaction"
 );
 
@@ -148,6 +150,8 @@ pub struct StreamDemux<C = std::sync::Arc<SystemClock>> {
     owner: HashMap<(TableId, u32), u32>,
     /// The top-level xid of the currently-open `Stream Start … Stream Stop` block; changes route here.
     current_top: Option<u32>,
+    /// Exact Relation-message binding per open top-level transaction and relation OID.
+    bindings: HashMap<(u32, TableId), common::SchemaVersionNo>,
     triggers: BatchTriggers,
     clock: C,
     epoch: EpochNo,
@@ -172,6 +176,7 @@ impl<C: Clock + Clone> StreamDemux<C> {
             open: HashMap::new(),
             owner: HashMap::new(),
             current_top: None,
+            bindings: HashMap::new(),
             triggers,
             clock,
             epoch,
@@ -198,6 +203,23 @@ impl<C: Clock + Clone> StreamDemux<C> {
     /// `Stream Stop`: the block ended (the txn may resume with a later segment).
     pub const fn on_stream_stop(&mut self) {
         self.current_top = None;
+    }
+
+    /// Top-level xid of the currently open StreamStart..Stop block.
+    #[must_use]
+    pub const fn current_top(&self) -> Option<u32> {
+        self.current_top
+    }
+
+    /// Bind subsequent changes in `top_xid` to the exact schema version from its Relation message.
+    pub fn bind_relation(
+        &mut self,
+        top_xid: u32,
+        relation_oid: u32,
+        version: common::SchemaVersionNo,
+    ) {
+        self.bindings
+            .insert((top_xid, TableId(relation_oid)), version);
     }
 
     /// Claim one buffered row's bytes and record or confirm the stream's unique owner.
@@ -269,6 +291,12 @@ impl<C: Clock + Clone> StreamDemux<C> {
             // Wildcard is deliberate: Message is #[non_exhaustive], and this dispatcher ignores other families.
             _ => return Ok(()),
         };
+        let cached = self
+            .bindings
+            .get(&(top, oid))
+            .and_then(|version| cache.get(oid.0, *version))
+            .or_else(|| cache.latest_for(oid.0))
+            .context("streamed change relation version is not cached")?;
         let bytes = estimate_change_bytes(&values);
         let txn = self
             .open
@@ -280,6 +308,7 @@ impl<C: Clock + Clone> StreamDemux<C> {
             op,
             values,
             lsn,
+            schema_version: cached.schema_version,
         });
         self.claim_stream((oid, sub_xid), top, bytes);
         self.spill_if_over_ceiling(cache, sink).await
@@ -324,13 +353,11 @@ impl<C: Clock + Clone> StreamDemux<C> {
                 (txn.begin_lsn, txn.take_stream(oid, sub_xid))
             };
             self.forget_stream(key);
-            // `RelationCache` is keyed by the decoder's raw wire OID, so unwrap at that boundary.
-            let Some(cached) = cache.latest_for(oid.0) else {
-                continue; // shape not cached (shouldn't happen mid-stream) — nothing to spill
-            };
-            let mut batcher = TableBatcher::new(Arc::clone(&cached), triggers, clock)
-                .context("open spill batcher")?;
+            let mut batchers = BTreeMap::new();
             for c in &rows {
+                let cached = cache
+                    .get(oid.0, c.schema_version)
+                    .context("spill relation version is not cached")?;
                 let meta = SinkMeta {
                     op: c.op,
                     lsn: c.lsn,
@@ -351,41 +378,47 @@ impl<C: Clock + Clone> StreamDemux<C> {
                     sink_instance: instance.clone(),
                     sink_processed_at: UtcTimestamp::now(),
                 };
+                let batcher = match batchers.entry(c.schema_version) {
+                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(entry) => entry.insert(
+                        TableBatcher::new(Arc::clone(&cached), triggers, clock.clone())
+                            .context("open spill batcher")?,
+                    ),
+                };
                 batcher.push(meta, &c.values);
             }
-            // The spill-time instant stands in for commit_ts here (see the meta comment above).
-            batcher
-                .on_commit(begin, UtcTimestamp::now())
-                .context("promote spill rows")?;
-            if batcher.committed_rows() == 0 {
-                continue;
+            for mut batcher in batchers.into_values() {
+                // The spill-time instant stands in for commit_ts here (see the meta comment above).
+                batcher
+                    .on_commit(begin, UtcTimestamp::now())
+                    .context("promote spill rows")?;
+                if batcher.committed_rows() == 0 {
+                    continue;
+                }
+                // Tag as `Spill`: `begin` is a placeholder until StreamCommit supplies the real LSN.
+                let written = sink
+                    .put_with_kind(
+                        batcher.seal().context("seal speculative spill batch")?,
+                        FileKind::Spill,
+                    )
+                    .await
+                    .context("speculative spill PUT")?;
+                self.spill_count += 1;
+                common::metrics::inc_spill();
+                tracing::info!(
+                    top_xid = top,
+                    sub_xid,
+                    oid = oid.0,
+                    schema_version = %written.schema_version,
+                    spill_count = self.spill_count,
+                    uri = %written.s3_uri,
+                    "spilled open-txn buffer speculatively (no manifest, slot held)"
+                );
+                let Some(txn) = self.open.get_mut(&top) else {
+                    continue;
+                };
+                txn.staged.push(StagedSpill { sub_xid, written });
             }
-            // Tag as `Spill`: these rows carry a placeholder `commit_lsn` (`begin`) because the real commit
-            // LSN is not yet known. `on_stream_commit` corrects the manifest `lsn_end` to the commit LSN;
-            // the loader then reads `lsn_end` as the authoritative per-row `commit_lsn` for a `spill` file.
-            let written = sink
-                .put_with_kind(
-                    batcher.seal().context("seal speculative spill batch")?,
-                    FileKind::Spill,
-                )
-                .await
-                .context("speculative spill PUT")?;
-            self.spill_count += 1;
-            common::metrics::inc_spill(); // memory-ceiling speculative spill
-            tracing::info!(
-                top_xid = top,
-                sub_xid,
-                oid = oid.0,
-                spill_count = self.spill_count,
-                uri = %written.s3_uri,
-                "spilled open-txn buffer speculatively (no manifest, slot held)"
-            );
-            let Some(txn) = self.open.get_mut(&top) else {
-                // `top` came from `self.open`'s own keys and the txn is not removed within this
-                // loop body, so this is unreachable; skip recording the staged spill rather than panic.
-                continue;
-            };
-            txn.staged.push(StagedSpill { sub_xid, written });
         }
         Ok(())
     }
@@ -399,6 +432,7 @@ impl<C: Clock + Clone> StreamDemux<C> {
             if self.current_top == Some(top_xid) {
                 self.current_top = None;
             }
+            self.bindings.retain(|(owner, _), _| *owner != top_xid);
             let Some(txn) = self.open.remove(&top_xid) else {
                 return; // never opened (or already aborted) — no buffer and no spills to delete
             };
@@ -424,6 +458,7 @@ impl<C: Clock + Clone> StreamDemux<C> {
             return; // the top-level txn is not open here — nothing of its savepoint to drop
         };
         txn.abort_subtxn(sub_xid);
+        self.bindings.retain(|(owner, _), _| *owner != top_xid);
         // One predicate pass both removes the rolled-back spills and hands them over: the
         // survivors compact inside `staged`'s allocation (the txn stays open and keeps
         // spilling), and the doomed entries move out instead of their keys being cloned
@@ -467,6 +502,7 @@ impl<C: Clock + Clone> StreamDemux<C> {
         if self.current_top == Some(top_xid) {
             self.current_top = None;
         }
+        self.bindings.retain(|(owner, _), _| *owner != top_xid);
         let Some(mut txn) = self.open.remove(&top_xid) else {
             tracing::warn!(
                 top_xid,
@@ -500,11 +536,15 @@ impl<C: Clock + Clone> StreamDemux<C> {
             self.epoch,
             self.sink_instance.clone(),
         );
-        let mut batchers: HashMap<TableId, TableBatcher<C>> = HashMap::new();
+        let mut batchers: HashMap<(TableId, common::SchemaVersionNo), TableBatcher<C>> =
+            HashMap::new();
         for c in txn.iter_survivors() {
-            let Some(cached) = cache.latest_for(c.oid.0) else {
-                continue;
-            };
+            let cached = cache.get(c.oid.0, c.schema_version).with_context(|| {
+                format!(
+                    "stream commit relation version is not cached: oid={} version={}",
+                    c.oid.0, c.schema_version
+                )
+            })?;
             let meta = SinkMeta {
                 op: c.op,
                 lsn: c.lsn,
@@ -521,7 +561,7 @@ impl<C: Clock + Clone> StreamDemux<C> {
                 sink_instance: instance.clone(),
                 sink_processed_at: UtcTimestamp::now(),
             };
-            let batcher = match batchers.entry(c.oid) {
+            let batcher = match batchers.entry((c.oid, c.schema_version)) {
                 Entry::Occupied(e) => e.into_mut(),
                 Entry::Vacant(e) => e.insert(
                     TableBatcher::new(Arc::clone(&cached), triggers, clock.clone())
@@ -549,6 +589,20 @@ impl<C: Clock + Clone> StreamDemux<C> {
                 );
             }
         }
+        out.sort_by(|left, right| {
+            (
+                &left.source_schema,
+                &left.source_table,
+                left.schema_version,
+                left.lsn_start,
+            )
+                .cmp(&(
+                    &right.source_schema,
+                    &right.source_table,
+                    right.schema_version,
+                    right.lsn_start,
+                ))
+        });
         Ok(out)
     }
 

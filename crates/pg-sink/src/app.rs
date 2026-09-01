@@ -83,6 +83,16 @@ async fn pipeline(
         start_lsn,
         sink,
     } = establish_stream(cfg, &ctx, &mut cache, triggers, SCHEMA_VERSION).await?;
+    // DDL state is restartable: hydrate both the latest registered shapes and every processed source
+    // audit identity before reading another WAL frame. A replayed audit row then reuses its committed
+    // version instead of manufacturing version N+1.
+    let mut ddl = crate::ddl::DdlConsumer::new(epoch);
+    ddl.hydrate_versions(&cache);
+    ddl.hydrate_history(
+        control::read_all_ddl(&ctx.control_pool, epoch)
+            .await
+            .context("hydrate DDL history")?,
+    );
     // The shared dependency checks are only the first half of bootstrap. Do not advertise ready
     // until slot classification plus fresh-slot epoch/backfill (or resume hydration) has completed:
     // the loader is allowed to start as soon as this endpoint flips, and it needs the epoch to exist.
@@ -114,9 +124,6 @@ async fn pipeline(
     )
     .await
     .context("connect heartbeat SQL connection")?;
-
-    // DDL capture (§3): consume walrus.ddl_audit INSERTs → ddl_manifest + per-table structural version.
-    let mut ddl = crate::ddl::DdlConsumer::new(epoch);
 
     // Reload echo waiters: Arc-shared so the reload controller's exporter tasks
     // can subscribe while the decode loop resolves.

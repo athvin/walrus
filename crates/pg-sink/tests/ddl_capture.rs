@@ -15,8 +15,8 @@
 
 use common::{EpochNo, Lsn};
 use pg_sink::batch::{BatchTriggers, SystemClock};
-use pg_sink::consume::{BatchRouter, flush_batch, on_frame, on_relation};
-use pg_sink::ddl::{DdlConsumer, DdlEvent};
+use pg_sink::consume::{BatchRouter, cache_relation, flush_batch, on_frame, persist_registry};
+use pg_sink::ddl::{DdlConsumer, DdlEvent, TransactionScope};
 use pg_sink::heartbeat::InternalTables;
 use pg_sink::pgoutput::{Message, StreamCtx};
 use pg_sink::relcache::RelationCache;
@@ -166,6 +166,7 @@ async fn alter_add_column_bumps_version_and_cuts_file() {
         .unwrap();
 
     let mut saw_end = false;
+    let mut end_pending = false;
     tokio::time::timeout(Duration::from_secs(30), async {
         while !saw_end {
             let frame = stream.next().await.unwrap().unwrap();
@@ -179,17 +180,44 @@ async fn alter_add_column_bumps_version_and_cuts_file() {
             match &msg {
                 Message::Relation { relation, .. } => {
                     internal.note_relation(relation);
-                    let v = ddl.version_of(&relation.schema, &relation.name);
-                    on_relation(&mut cache, &pool, epoch, relation.clone(), v)
-                        .await
-                        .unwrap();
+                    let v = ddl.version_for(
+                        TransactionScope::Ordinary,
+                        &relation.schema,
+                        &relation.name,
+                    );
+                    if let Some(row) =
+                        cache_relation(&mut cache, epoch, relation.clone(), v).unwrap()
+                    {
+                        router.bind_relation(relation.oid, v);
+                        if ddl.is_provisional(&relation.schema, &relation.name, v) {
+                            ddl.stage_registry(TransactionScope::Ordinary, row);
+                        } else {
+                            persist_registry(&pool, &row).await.unwrap();
+                        }
+                    }
                 }
                 Message::Insert {
                     relation_oid, new, ..
                 } if internal.is_ddl_audit(*relation_oid) => {
                     let rel = internal.ddl_audit_rel().unwrap();
                     let ev = DdlEvent::from_tuple(rel, new).unwrap();
-                    if ddl.consume(&pool, &ev).await.unwrap().is_some() {
+                    let previous = ev
+                        .c_rel_oid
+                        .and_then(|oid| cache.latest_for(oid))
+                        .or_else(|| cache.latest_for_name(&ev.source_schema, &ev.source_table))
+                        .map(|cached| cached.relation.clone());
+                    let observation = ddl.observe(TransactionScope::Ordinary, ev.clone());
+                    if let Some(version) = observation.structural_version {
+                        if let Some(after) = ev.relation_after(previous.as_ref()).unwrap()
+                            && let Some(row) =
+                                cache_relation(&mut cache, epoch, after, version).unwrap()
+                        {
+                            if observation.replay {
+                                persist_registry(&pool, &row).await.unwrap();
+                            } else {
+                                ddl.stage_registry(TransactionScope::Ordinary, row);
+                            }
+                        }
                         for sealed in router
                             .cut_table(&cache, &ev.source_schema, &ev.source_table)
                             .unwrap()
@@ -204,15 +232,19 @@ async fn alter_add_column_bumps_version_and_cuts_file() {
                         .unwrap();
                     // The last row (850003) is our stop marker.
                     if matches!(new.first(), Some(common::TupleValue::Text(s)) if s == "850003") {
-                        saw_end = true;
+                        end_pending = true;
                     }
                 }
-                Message::Commit { .. } => {
-                    for sealed in router
+                Message::Commit { commit_lsn, .. } => {
+                    let sealed = router
                         .route(&cache, &msg, frame_lsn, common::SchemaVersionNo(1))
-                        .unwrap()
-                    {
+                        .unwrap();
+                    ddl.on_commit(&pool, *commit_lsn).await.unwrap();
+                    for sealed in sealed {
                         flush_batch(&sink, &pool, epoch, sealed).await.unwrap();
+                    }
+                    if end_pending {
+                        saw_end = true;
                     }
                 }
                 _ => {}
