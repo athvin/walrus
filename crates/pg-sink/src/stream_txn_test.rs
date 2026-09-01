@@ -47,6 +47,35 @@ fn insert_id(id: i32, sub_xid: u32) -> Message {
     }
 }
 
+fn insert_id_v2(id: i32, sub_xid: u32) -> Message {
+    Message::Insert {
+        xid: Some(sub_xid),
+        relation_oid: 42,
+        new: vec![
+            TupleValue::Text(id.to_string()),
+            TupleValue::Text("n".into()),
+            TupleValue::Text("extra".into()),
+        ],
+    }
+}
+
+fn add_v2(cache: &mut RelationCache) {
+    let mut relation = cache
+        .get(42, common::SchemaVersionNo(1))
+        .unwrap()
+        .relation
+        .clone();
+    relation.columns.push(PgColumn {
+        name: "extra".into(),
+        type_oid: oids::TEXT,
+        type_modifier: -1,
+        is_key: false,
+    });
+    cache
+        .upsert_from_relation(relation, common::SchemaVersionNo(2))
+        .unwrap();
+}
+
 fn demux(ceiling: u64) -> StreamDemux {
     StreamDemux::new(
         BatchTriggers {
@@ -88,6 +117,7 @@ async fn spill_resolves_the_owning_txn_without_scanning_buffered_changes() {
                 op: Op::Insert,
                 values: values.into_boxed_slice(),
                 lsn: Lsn::new(u64::from(row)),
+                schema_version: common::SchemaVersionNo(1),
             });
         }
     }
@@ -227,6 +257,97 @@ async fn stream_commit_materialises_survivors_stamped_with_commit_lsn() {
 }
 
 #[tokio::test]
+async fn stream_commit_separates_rows_bound_to_pre_and_post_ddl_versions() {
+    let (mut cache, sink) = (cache(), mem_sink());
+    let mut d = demux(u64::MAX);
+    let top = 100;
+    d.on_stream_start(top, true, Lsn::new(100));
+    d.bind_relation(top, 42, common::SchemaVersionNo(1));
+    d.on_change(&cache, &insert_id(1, top), &sink, Lsn::new(101))
+        .await
+        .unwrap();
+
+    add_v2(&mut cache);
+    d.bind_relation(top, 42, common::SchemaVersionNo(2));
+    d.on_change(&cache, &insert_id_v2(2, top), &sink, Lsn::new(102))
+        .await
+        .unwrap();
+
+    let commit_lsn = Lsn::new(900);
+    let files = d
+        .on_stream_commit(top, commit_lsn, UtcTimestamp::now(), &cache, &sink)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        files
+            .iter()
+            .map(|file| (file.schema_version, file.row_count, file.lsn_end))
+            .collect::<Vec<_>>(),
+        vec![
+            (common::SchemaVersionNo(1), 1, commit_lsn),
+            (common::SchemaVersionNo(2), 1, commit_lsn),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn speculative_spill_partitions_one_subtransaction_by_schema_version() {
+    let (mut cache, sink) = (cache(), mem_sink());
+    // The v1 row stays below this ceiling; adding the v2 row crosses it, so one spill candidate
+    // contains both tuple widths and must be partitioned before Arrow conversion.
+    let mut d = demux(150);
+    let top = 100;
+    d.on_stream_start(top, true, Lsn::new(100));
+    d.bind_relation(top, 42, common::SchemaVersionNo(1));
+    d.on_change(&cache, &insert_id(1, top), &sink, Lsn::new(101))
+        .await
+        .unwrap();
+
+    add_v2(&mut cache);
+    d.bind_relation(top, 42, common::SchemaVersionNo(2));
+    d.on_change(&cache, &insert_id_v2(2, top), &sink, Lsn::new(102))
+        .await
+        .unwrap();
+
+    let files = d
+        .on_stream_commit(top, Lsn::new(900), UtcTimestamp::now(), &cache, &sink)
+        .await
+        .unwrap();
+    assert_eq!(files.iter().map(|file| file.row_count).sum::<u64>(), 2);
+    assert_eq!(
+        files
+            .iter()
+            .map(|file| file.schema_version)
+            .collect::<Vec<_>>(),
+        vec![common::SchemaVersionNo(1), common::SchemaVersionNo(2)]
+    );
+    assert!(files.iter().all(|file| file.kind == FileKind::Spill));
+}
+
+#[tokio::test]
+async fn stream_commit_fails_instead_of_dropping_a_row_if_its_version_was_evicted() {
+    let (cache, sink) = (cache(), mem_sink());
+    let mut d = demux(u64::MAX);
+    d.on_stream_start(100, true, Lsn::new(100));
+    d.bind_relation(100, 42, common::SchemaVersionNo(1));
+    d.on_change(&cache, &insert_id(1, 100), &sink, Lsn::new(101))
+        .await
+        .unwrap();
+
+    let empty_cache = RelationCache::default();
+    let error = d
+        .on_stream_commit(100, Lsn::new(900), UtcTimestamp::now(), &empty_cache, &sink)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("stream commit relation version is not cached: oid=42 version=1")
+    );
+}
+
+#[tokio::test]
 async fn commit_materialises_exactly_what_survivors_reports() {
     let (cache, sink) = (cache(), mem_sink());
     let mut d = demux(u64::MAX);
@@ -272,6 +393,7 @@ fn survivors_borrows_only_the_aborted_set() {
         op: Op::Insert,
         values: Box::default(),
         lsn: "0/101".parse().unwrap(),
+        schema_version: common::SchemaVersionNo(1),
     });
     let survivors = txn.iter_survivors();
     let begin_lsn = txn.begin_lsn;
@@ -416,6 +538,7 @@ async fn spill_preserves_commit_order_of_the_surviving_rows() {
             op: Op::Insert,
             values: values.into_boxed_slice(),
             lsn: lsn.parse().unwrap(),
+            schema_version: common::SchemaVersionNo(1),
         });
     }
 
@@ -449,6 +572,7 @@ fn take_stream_drains_in_place_and_keeps_both_relative_orders() {
             op: Op::Insert,
             values: Box::default(),
             lsn: lsn(at),
+            schema_version: common::SchemaVersionNo(1),
         });
     }
     let capacity = txn.changes.capacity();

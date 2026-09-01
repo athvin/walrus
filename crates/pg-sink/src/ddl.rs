@@ -1,189 +1,544 @@
-//! DDL capture — the sink's consume side of the source's event-trigger tap (§3).
+//! Transactional DDL capture — the sink side of the source event-trigger tap.
 //!
-//! Postgres logical decoding never emits DDL, so the source's `ddl_command_end`/`sql_drop` triggers
-//! (`migrations/source/0002`) INSERT into the **published** `walrus.ddl_audit` table, which rides the
-//! *same* replication slot as DML **in commit order**. The sink recognises that relation's INSERTs and,
-//! per event: writes a `ddl_manifest` row stamped with the DDL's `c_lsn`, bumps the affected table's
-//! **structural** `schema_version` (structural events only), and signals the batcher to **cut a fresh
-//! Parquet file** — so every file carries exactly one `schema_version` (the homogeneous-file rule).
+//! The source trigger writes a structured row to the published `walrus.ddl_audit` table in the SAME
+//! transaction as the DDL. Ordinary pgoutput transactions are known to have committed before they are
+//! emitted, but streamed transactions are visible while still open and can later abort. Consequently a
+//! decoded audit row is only a **provisional** schema boundary: the sink may use its post-change shape to
+//! decode later rows in that transaction, but it does not publish the DDL manifest/registry or make the
+//! version globally committed until `Commit`/`StreamCommit`. `StreamAbort` drops the complete provisional
+//! state, including a rolled-back savepoint's DDL.
 //!
-//! **Schema-DIFF, not DDL-text replay.** We act on the structured `c_columns` snapshot (the source read
-//! the *already-changed* catalog post-execution), never by re-executing `c_ddl_text`. A `COMMENT ON` is
-//! recorded but is **metadata-only** — it neither bumps the structural version nor cuts a file.
-//!
-//! `walrus.ddl_audit`/`walrus.heartbeat` are internal ([`crate::heartbeat::InternalTables`]) — consumed
-//! for control, **never** materialised as `<table>`/`<table>_raw`. Event triggers are not exhaustive
-//! (globals fire nothing; `TRUNCATE` is a native pgoutput message) — the Relation-message drift backstop
-//! (with full reconciliation handled by the loader) covers the rest.
+//! `c_columns` is the correctness input. `c_ddl_text` is retained as best-effort audit context only and is
+//! never replayed or parsed to determine the change.
 
-use common::{DdlId, EpochNo, Lsn, PgRelation, SchemaVersionNo, TupleValue};
+use crate::relcache::RelationCache;
+use common::{
+    DdlId, EpochNo, Lsn, PgColumn, PgRelation, ReplicaIdentity, SchemaVersionNo, TupleValue,
+};
 use std::collections::HashMap;
 
-/// A decoded `walrus.ddl_audit` INSERT — the sink's only signal that the schema changed.
-#[derive(Debug, Clone)]
+/// The source transaction that owns a decoded DDL audit row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionScope {
+    /// A normal `Begin … Commit` transaction. pgoutput carries no xid prefix on its changes.
+    Ordinary,
+    /// One streamed top-level transaction and the subtransaction that emitted this particular row.
+    Streamed {
+        /// Top-level xid named by `StreamStart`/`StreamCommit`.
+        top_xid: u32,
+        /// Per-message xid, used to discard a rolled-back savepoint precisely.
+        sub_xid: u32,
+    },
+}
+
+/// Result of observing one audit event before its transaction commits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DdlObservation {
+    /// New provisional version for a structural DDL; `None` for metadata-only events.
+    pub structural_version: Option<SchemaVersionNo>,
+    /// The source audit identity was already committed in control Postgres (WAL replay).
+    pub replay: bool,
+}
+
+/// A decoded `walrus.ddl_audit` insert.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DdlEvent {
-    /// `pg_current_wal_lsn()` at capture — orders the DDL against data.
-    pub c_lsn: Lsn,
-    /// `ddl_command_end` | `sql_drop`.
+    /// Stable source identity (`walrus.ddl_audit.id`), used to make WAL replay idempotent.
+    pub source_audit_id: i64,
+    /// `pg_current_wal_lsn()` captured by the source trigger. Audit context, not the commit LSN.
+    pub capture_lsn: Lsn,
+    /// `ddl_command_end` or `sql_drop`.
     pub c_event: String,
-    /// `ALTER TABLE` | `CREATE TABLE` | `DROP TABLE` | `COMMENT` | …
+    /// `ALTER TABLE`, `CREATE TABLE`, `DROP TABLE`, `COMMENT`, and so on.
     pub c_tag: String,
-    /// Schema of the table the DDL changed.
+    /// Schema of the affected table.
     pub source_schema: String,
-    /// Table the DDL changed. With `source_schema`, the key whose version this event bumps.
+    /// Name of the affected table.
     pub source_table: String,
-    /// The structured post-change column set (the schema-diff input); `None` for pure drops.
+    /// Source relation OID, including the last OID of a dropped table.
+    pub c_rel_oid: Option<u32>,
+    /// Post-change replica identity for a surviving table.
+    pub c_replica_identity: Option<ReplicaIdentity>,
+    /// Structured post-change column set; an empty array is the dropped-table sentinel.
     pub c_columns: Option<serde_json::Value>,
+    /// Structured dropped-object identity, when supplied by `sql_drop`.
+    pub c_dropped: Option<serde_json::Value>,
+    /// Best-effort SQL text from `current_query()`, retained for audit/debugging only.
+    pub c_ddl_text: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct AuditColumn {
+    name: String,
+    type_oid: u32,
+    type_modifier: i32,
+    #[serde(default)]
+    is_key: Option<bool>,
 }
 
 impl DdlEvent {
-    /// Extract from a decoded `ddl_audit` tuple by column name (text/pgoutput format).
+    /// Extract an event from a decoded `ddl_audit` tuple by column name.
     ///
     /// # Errors
     ///
-    /// Returns [`DdlError::MissingColumn`] when the required LSN is absent or invalid, and
-    /// [`DdlError::Json`] when the optional structured column snapshot is malformed.
+    /// Returns [`DdlError::MissingColumn`] for a missing/invalid required scalar,
+    /// [`DdlError::ReplicaIdentity`] for an invalid catalog identity code, or [`DdlError::Json`] for
+    /// malformed structured payloads.
     #[deny(clippy::wildcard_enum_match_arm)]
     pub fn from_tuple(rel: &PgRelation, values: &[TupleValue]) -> Result<Self, DdlError> {
         let text = |name: &str| -> Option<String> {
             let idx = rel.columns.iter().position(|c| c.name == name)?;
-            // Every `ddl_audit` column arrives as text; the other images are listed rather than
-            // absorbed by a wildcard, so a new TupleValue variant is decided here, not defaulted.
             match values.get(idx)? {
                 TupleValue::Text(s) => Some(s.clone()),
                 TupleValue::Null | TupleValue::UnchangedToast | TupleValue::Binary(_) => None,
             }
         };
-        let c_lsn = text("c_lsn")
-            .ok_or(DdlError::MissingColumn("c_lsn"))?
+        let required = |name: &'static str| -> Result<String, DdlError> {
+            text(name).ok_or(DdlError::MissingColumn(name))
+        };
+        let source_audit_id = required("id")?
+            .parse()
+            .map_err(|_| DdlError::MissingColumn("id"))?;
+        let capture_lsn = required("c_lsn")?
             .parse()
             .map_err(|_| DdlError::MissingColumn("c_lsn"))?;
-        let c_columns = text("c_columns")
-            .filter(|s| !s.is_empty())
-            .map(|s| serde_json::from_str(&s))
+        let json = |name: &str| -> Result<Option<serde_json::Value>, DdlError> {
+            text(name)
+                .filter(|s| !s.is_empty())
+                .map(|s| serde_json::from_str(&s))
+                .transpose()
+                .map_err(Into::into)
+        };
+        let c_rel_oid = text("c_rel_oid")
+            .map(|raw| raw.parse())
+            .transpose()
+            .map_err(|_| DdlError::MissingColumn("c_rel_oid"))?;
+        let c_replica_identity = text("c_replica_identity")
+            .map(|raw| {
+                raw.parse()
+                    .map_err(|_| DdlError::ReplicaIdentity(raw.clone()))
+            })
             .transpose()?;
         Ok(DdlEvent {
-            c_lsn,
+            source_audit_id,
+            capture_lsn,
             c_event: text("c_event").unwrap_or_default(),
             c_tag: text("c_tag").unwrap_or_default(),
             source_schema: text("c_schema").unwrap_or_default(),
             source_table: text("c_table").unwrap_or_default(),
-            c_columns,
+            c_rel_oid,
+            c_replica_identity,
+            c_columns: json("c_columns")?,
+            c_dropped: json("c_dropped")?,
+            c_ddl_text: text("c_ddl_text"),
         })
     }
 
-    /// Structural (gates data + cuts a file) vs metadata-only. A `COMMENT` mirrors documentation but
-    /// never changes the row shape, so it must NOT bump the structural version or cut a file.
+    /// Structural (schema version + file boundary) versus metadata-only.
     #[must_use]
     pub fn is_structural(&self) -> bool {
         !self.c_tag.eq_ignore_ascii_case("COMMENT")
     }
-}
 
-/// Consumes decoded `ddl_audit` events: writes the `ddl_manifest` history and tracks each table's
-/// current **structural** `schema_version` (starts at 1; every structural DDL bumps it by one).
-#[derive(Debug)]
-pub struct DdlConsumer {
-    epoch: EpochNo,
-    versions: HashMap<(String, String), SchemaVersionNo>,
-}
-
-impl DdlConsumer {
-    /// A consumer for one generation, with no versions known yet.
+    /// Build the authoritative post-change relation described by this event.
     ///
-    /// Versions start empty rather than being loaded from control Postgres: the first DDL event for
-    /// a table establishes its baseline, and until one arrives the table is at version 1.
-    #[must_use]
-    pub fn new(epoch: EpochNo) -> Self {
-        DdlConsumer {
-            epoch,
-            versions: HashMap::new(),
-        }
-    }
-
-    /// The current structural version for a table (1 until its first structural DDL).
-    #[must_use]
-    pub fn version_of(&self, schema: &str, table: &str) -> SchemaVersionNo {
-        // Compared borrowed, not looked up: `HashMap<(String, String), _>::get` can only be handed
-        // an OWNED key — `Borrow` has no `(&str, &str)` form to reach a `(String, String)` — so the
-        // keyed spelling has to allocate both halves of the name on every `Relation` message just
-        // to copy a version out. This map holds one entry per table that has taken a structural
-        // DDL, so scanning it borrowed is the cheaper read; [`crate::relcache::RelationCache`]
-        // resolves a name over the same table set the same way.
-        self.versions
-            .iter()
-            .find(|((s, t), _)| s.as_str() == schema && t.as_str() == table)
-            .map_or(SchemaVersionNo(1), |(_, version)| *version)
-    }
-
-    /// Record one structural DDL against a table: its version + 1, or 2 when this is the first
-    /// structural change it has seen.
-    fn bump(&mut self, schema: &str, table: &str) -> SchemaVersionNo {
-        // The bump edits its entry through the BORROWED name (see [`Self::version_of`]); only a
-        // table's first structural DDL owns copies of it, for the key it inserts.
-        let current = self
-            .versions
-            .iter_mut()
-            .find(|((s, t), _)| s.as_str() == schema && t.as_str() == table);
-        if let Some((_, version)) = current {
-            version.0 += 1;
-            return *version;
-        }
-        let version = SchemaVersionNo(2);
-        self.versions
-            .insert((schema.to_string(), table.to_string()), version);
-        version
-    }
-
-    /// **(1)** write a `ddl_manifest` row stamped with `c_lsn`; **(2)** for a *structural* event, bump the
-    /// table's `schema_version`. Returns `Some(new_version)` iff structural (the caller cuts a fresh
-    /// file), `None` for metadata-only.
+    /// The source snapshot deliberately contains a little more than [`PgColumn`] (`attnum`, nullability);
+    /// serde ignores those fields here. On an upgraded source whose older trigger omitted `is_key`, the
+    /// previous relation supplies it by column name. A dropped table uses the prior relation's identity
+    /// with an empty column set.
     ///
     /// # Errors
     ///
-    /// Returns [`DdlError::Control`] if the DDL history row cannot be persisted in control Postgres.
-    pub async fn consume(
-        &mut self,
-        ex: impl sqlx::PgExecutor<'_>,
-        ev: &DdlEvent,
-    ) -> Result<Option<SchemaVersionNo>, DdlError> {
-        let structural = ev.is_structural();
-        // Both arms read the version through the event's own borrowed names; the owned copies below
-        // are the ones the `ddl_manifest` row keeps, so the bookkeeping adds none of its own.
-        let version = if structural {
-            self.bump(&ev.source_schema, &ev.source_table)
-        } else {
-            self.version_of(&ev.source_schema, &ev.source_table)
+    /// Returns [`DdlError::Json`] when `c_columns` cannot decode to the expected column snapshot.
+    pub fn relation_after(
+        &self,
+        previous: Option<&PgRelation>,
+    ) -> Result<Option<PgRelation>, DdlError> {
+        if !self.is_structural() {
+            return Ok(None);
+        }
+        let Some(columns) = &self.c_columns else {
+            return Ok(None);
         };
-        let row = control::DdlRow {
-            id: DdlId(0), // ignored on insert; the DB assigns the bigserial
-            epoch: self.epoch,
-            source_schema: ev.source_schema.clone(),
-            source_table: ev.source_table.clone(),
-            c_lsn: ev.c_lsn,
-            c_event: ev.c_event.clone(),
-            c_tag: ev.c_tag.clone(),
-            schema_version: version,
+        let audit: Vec<AuditColumn> = serde_json::from_value(columns.clone())?;
+        let prior_key = |name: &str| {
+            previous
+                .and_then(|rel| rel.columns.iter().find(|col| col.name == name))
+                .is_some_and(|col| col.is_key)
         };
-        control::insert_ddl(ex, &row, None, ev.c_columns.as_ref()).await?;
-        Ok(structural.then_some(version))
+        let columns = audit
+            .into_iter()
+            .map(|col| PgColumn {
+                is_key: col.is_key.unwrap_or_else(|| prior_key(&col.name)),
+                name: col.name,
+                type_oid: col.type_oid,
+                type_modifier: col.type_modifier,
+            })
+            .collect();
+        let Some(oid) = self.c_rel_oid.or_else(|| previous.map(|rel| rel.oid)) else {
+            return Ok(None);
+        };
+        Ok(Some(PgRelation {
+            oid,
+            schema: self.source_schema.clone(),
+            name: self.source_table.clone(),
+            replica_identity: self
+                .c_replica_identity
+                .or_else(|| previous.map(|rel| rel.replica_identity))
+                .unwrap_or(ReplicaIdentity::Default),
+            columns,
+        }))
     }
 }
 
-/// This taxonomy is still growing; new variants must remain additive for downstream crates.
+#[derive(Debug, Clone)]
+struct PendingDdl {
+    scope: TransactionScope,
+    event: DdlEvent,
+    version: SchemaVersionNo,
+}
+
+#[derive(Debug, Clone)]
+struct PendingRegistry {
+    scope: TransactionScope,
+    row: control::RegistryRow,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CommitSelector {
+    Ordinary,
+    Streamed(u32),
+}
+
+impl CommitSelector {
+    const fn matches(self, scope: TransactionScope) -> bool {
+        match (self, scope) {
+            (Self::Ordinary, TransactionScope::Ordinary) => true,
+            (Self::Streamed(expected), TransactionScope::Streamed { top_xid, .. }) => {
+                expected == top_xid
+            }
+            (Self::Ordinary, TransactionScope::Streamed { .. })
+            | (Self::Streamed(_), TransactionScope::Ordinary) => false,
+        }
+    }
+}
+
+/// Tracks committed and transaction-local schema versions and atomically publishes DDL history plus
+/// provisional registry rows at the matching source commit.
+#[derive(Debug)]
+pub struct DdlConsumer {
+    epoch: EpochNo,
+    committed_versions: HashMap<(String, String), SchemaVersionNo>,
+    pending: Vec<PendingDdl>,
+    pending_registry: Vec<PendingRegistry>,
+    processed: HashMap<i64, control::DdlRow>,
+}
+
+impl DdlConsumer {
+    /// A consumer for one epoch. Tables default to schema version 1 until hydrated or changed.
+    #[must_use]
+    pub fn new(epoch: EpochNo) -> Self {
+        Self {
+            epoch,
+            committed_versions: HashMap::new(),
+            pending: Vec::new(),
+            pending_registry: Vec::new(),
+            processed: HashMap::new(),
+        }
+    }
+
+    /// Hydrate committed versions from the relation cache restored at sink startup.
+    pub fn hydrate_versions(&mut self, cache: &RelationCache) {
+        for cached in cache {
+            self.set_committed(
+                &cached.relation.schema,
+                &cached.relation.name,
+                cached.schema_version,
+            );
+        }
+    }
+
+    /// Hydrate processed source audit identities and their committed versions from DDL history.
+    pub fn hydrate_history(&mut self, history: Vec<control::DdlRow>) {
+        for row in history {
+            self.set_committed(&row.source_schema, &row.source_table, row.schema_version);
+            self.processed.insert(row.source_audit_id, row);
+        }
+    }
+
+    /// Highest globally committed version for a table, defaulting to 1.
+    #[must_use]
+    pub fn committed_version_of(&self, schema: &str, table: &str) -> SchemaVersionNo {
+        find_version(&self.committed_versions, schema, table).unwrap_or(SchemaVersionNo(1))
+    }
+
+    /// Highest projected version across all currently visible pending transactions.
+    ///
+    /// Primarily a diagnostics/test accessor. Decode routing should use [`Self::version_for`] so one
+    /// open streamed transaction never leaks its provisional version into another.
+    #[must_use]
+    pub fn version_of(&self, schema: &str, table: &str) -> SchemaVersionNo {
+        self.pending
+            .iter()
+            .filter(|pending| table_matches(&pending.event, schema, table))
+            .map(|pending| pending.version)
+            .max()
+            .unwrap_or_else(|| self.committed_version_of(schema, table))
+    }
+
+    /// Version visible inside one source transaction: committed state plus that transaction's own DDL.
+    #[must_use]
+    pub fn version_for(
+        &self,
+        scope: TransactionScope,
+        schema: &str,
+        table: &str,
+    ) -> SchemaVersionNo {
+        self.pending
+            .iter()
+            .filter(|pending| {
+                same_transaction(pending.scope, scope)
+                    && table_matches(&pending.event, schema, table)
+            })
+            .map(|pending| pending.version)
+            .max()
+            .unwrap_or_else(|| self.committed_version_of(schema, table))
+    }
+
+    /// Stage one decoded DDL event. No control-DB side effect occurs before commit.
+    pub fn observe(&mut self, scope: TransactionScope, event: DdlEvent) -> DdlObservation {
+        if let Some(existing) = self.processed.get(&event.source_audit_id).cloned() {
+            self.set_committed(
+                &existing.source_schema,
+                &existing.source_table,
+                existing.schema_version,
+            );
+            return DdlObservation {
+                structural_version: event.is_structural().then_some(existing.schema_version),
+                replay: true,
+            };
+        }
+        let current = self.version_for(scope, &event.source_schema, &event.source_table);
+        let version = if event.is_structural() {
+            SchemaVersionNo(current.0 + 1)
+        } else {
+            current
+        };
+        let structural_version = event.is_structural().then_some(version);
+        self.pending.push(PendingDdl {
+            scope,
+            event,
+            version,
+        });
+        DdlObservation {
+            structural_version,
+            replay: false,
+        }
+    }
+
+    /// Whether `version` is provisional rather than globally committed.
+    #[must_use]
+    pub fn is_provisional(&self, schema: &str, table: &str, version: SchemaVersionNo) -> bool {
+        self.pending.iter().any(|pending| {
+            pending.version == version && table_matches(&pending.event, schema, table)
+        })
+    }
+
+    /// Stage a registry row in the source transaction that owns it. A later Relation message for the
+    /// same version and transaction replaces the trigger snapshot idempotently before commit.
+    pub fn stage_registry(&mut self, scope: TransactionScope, row: control::RegistryRow) {
+        if let Some(existing) = self.pending_registry.iter_mut().find(|pending| {
+            same_transaction(pending.scope, scope)
+                && pending.row.epoch == row.epoch
+                && pending.row.source_schema == row.source_schema
+                && pending.row.source_table == row.source_table
+                && pending.row.schema_version == row.schema_version
+        }) {
+            existing.row = row;
+            return;
+        }
+        self.pending_registry.push(PendingRegistry { scope, row });
+    }
+
+    /// Commit the ordinary transaction's DDL and registry state with its actual commit LSN.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DdlError::Control`] if the atomic control-Postgres transaction fails.
+    pub async fn on_commit(
+        &mut self,
+        pool: &sqlx::PgPool,
+        commit_lsn: Lsn,
+    ) -> Result<(), DdlError> {
+        self.commit_selected(pool, commit_lsn, CommitSelector::Ordinary)
+            .await
+    }
+
+    /// Commit one streamed top-level transaction's DDL and registry state with its StreamCommit LSN.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DdlError::Control`] if the atomic control-Postgres transaction fails.
+    pub async fn on_stream_commit(
+        &mut self,
+        pool: &sqlx::PgPool,
+        top_xid: u32,
+        commit_lsn: Lsn,
+    ) -> Result<(), DdlError> {
+        self.commit_selected(pool, commit_lsn, CommitSelector::Streamed(top_xid))
+            .await
+    }
+
+    /// Discard DDL and provisional registry rows rolled back by `StreamAbort`.
+    ///
+    /// Returns the provisional `(schema, table, version)` cache entries the caller must remove.
+    pub fn on_stream_abort(
+        &mut self,
+        top_xid: u32,
+        sub_xid: u32,
+    ) -> Vec<(String, String, SchemaVersionNo)> {
+        let whole = top_xid == sub_xid;
+        let aborts = |scope: TransactionScope| match scope {
+            TransactionScope::Ordinary => false,
+            TransactionScope::Streamed {
+                top_xid: owner,
+                sub_xid: sub,
+            } => owner == top_xid && (whole || sub == sub_xid),
+        };
+        let removed = self
+            .pending
+            .extract_if(.., |pending| aborts(pending.scope))
+            .collect::<Vec<_>>();
+        self.pending_registry
+            .retain(|pending| !aborts(pending.scope));
+        removed
+            .into_iter()
+            .filter(|pending| pending.event.is_structural())
+            .map(|pending| {
+                (
+                    pending.event.source_schema,
+                    pending.event.source_table,
+                    pending.version,
+                )
+            })
+            .collect()
+    }
+
+    async fn commit_selected(
+        &mut self,
+        pool: &sqlx::PgPool,
+        commit_lsn: Lsn,
+        selector: CommitSelector,
+    ) -> Result<(), DdlError> {
+        let pending = self
+            .pending
+            .iter()
+            .filter(|row| selector.matches(row.scope))
+            .cloned()
+            .collect::<Vec<_>>();
+        let registry = self
+            .pending_registry
+            .iter()
+            .filter(|row| selector.matches(row.scope))
+            .cloned()
+            .collect::<Vec<_>>();
+        if pending.is_empty() && registry.is_empty() {
+            return Ok(());
+        }
+
+        let rows = pending
+            .iter()
+            .map(|pending| control::DdlRow {
+                id: DdlId(0),
+                epoch: self.epoch,
+                source_audit_id: pending.event.source_audit_id,
+                source_schema: pending.event.source_schema.clone(),
+                source_table: pending.event.source_table.clone(),
+                c_lsn: commit_lsn,
+                c_event: pending.event.c_event.clone(),
+                c_tag: pending.event.c_tag.clone(),
+                schema_version: pending.version,
+                c_rel_oid: pending.event.c_rel_oid,
+                c_columns: pending.event.c_columns.clone(),
+                c_dropped: pending.event.c_dropped.clone(),
+                c_ddl_text: pending.event.c_ddl_text.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        let mut tx = pool.begin().await.map_err(control::ControlError::from)?;
+        for row in &rows {
+            control::insert_ddl(&mut *tx, row).await?;
+        }
+        for pending in &registry {
+            control::upsert_registry(&mut *tx, &pending.row).await?;
+        }
+        tx.commit().await.map_err(control::ControlError::from)?;
+
+        for row in rows {
+            self.set_committed(&row.source_schema, &row.source_table, row.schema_version);
+            self.processed.insert(row.source_audit_id, row);
+        }
+        self.pending.retain(|row| !selector.matches(row.scope));
+        self.pending_registry
+            .retain(|row| !selector.matches(row.scope));
+        Ok(())
+    }
+
+    fn set_committed(&mut self, schema: &str, table: &str, version: SchemaVersionNo) {
+        let existing = self
+            .committed_versions
+            .iter_mut()
+            .find(|((s, t), _)| s == schema && t == table);
+        if let Some((_, current)) = existing {
+            *current = (*current).max(version);
+        } else {
+            self.committed_versions
+                .insert((schema.to_string(), table.to_string()), version);
+        }
+    }
+}
+
+fn find_version(
+    versions: &HashMap<(String, String), SchemaVersionNo>,
+    schema: &str,
+    table: &str,
+) -> Option<SchemaVersionNo> {
+    versions
+        .iter()
+        .find(|((s, t), _)| s == schema && t == table)
+        .map(|(_, version)| *version)
+}
+
+fn table_matches(event: &DdlEvent, schema: &str, table: &str) -> bool {
+    event.source_schema == schema && event.source_table == table
+}
+
+const fn same_transaction(left: TransactionScope, right: TransactionScope) -> bool {
+    match (left, right) {
+        (TransactionScope::Ordinary, TransactionScope::Ordinary) => true,
+        (
+            TransactionScope::Streamed { top_xid: left, .. },
+            TransactionScope::Streamed { top_xid: right, .. },
+        ) => left == right,
+        (TransactionScope::Ordinary, TransactionScope::Streamed { .. })
+        | (TransactionScope::Streamed { .. }, TransactionScope::Ordinary) => false,
+    }
+}
+
+/// DDL decode, structured-snapshot, and control-persistence failures.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum DdlError {
-    /// A `ddl_audit` tuple did not carry a column the decoder requires, or carried it with the
-    /// wrong shape. Names the column, since that identifies which migration is out of date.
+    /// A required audit tuple column was absent or invalid.
     #[error("ddl_audit tuple missing/invalid column: {0}")]
     MissingColumn(&'static str),
-    /// `#[from]` (which implies `#[source]`): a malformed column snapshot has exactly one meaning
-    /// here, so `?` may carry the decode failure straight out of `from_tuple`.
-    #[error("parse c_columns json: {0}")]
+    /// The source replica-identity catalog code was invalid.
+    #[error("ddl_audit tuple has invalid replica identity: {0}")]
+    ReplicaIdentity(String),
+    /// A structured JSON payload was malformed.
+    #[error("parse ddl_audit json: {0}")]
     Json(#[from] serde_json::Error),
-    /// Persisting the DDL history row failed. `transparent` because [`control::ControlError`]
-    /// already names the operation.
+    /// The atomic control-Postgres commit failed.
     #[error(transparent)]
     Control(#[from] control::ControlError),
 }

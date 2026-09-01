@@ -11,8 +11,8 @@
 
 use common::{DdlId, EpochNo, Lsn, SchemaVersionNo, Tier, TypeDescriptor, TypeMeta};
 use control::{
-    DdlRow, RegistryRow, connect, insert_ddl, read_latest_version, read_pending_ddl, read_registry,
-    run_migrations, upsert_registry,
+    DdlRow, RegistryRow, connect, insert_ddl, read_all_ddl, read_latest_version, read_pending_ddl,
+    read_registry, run_migrations, upsert_registry,
 };
 use sqlx::postgres::PgPool;
 
@@ -79,12 +79,17 @@ fn ddl(epoch: EpochNo, c_lsn: &str, version: SchemaVersionNo) -> DdlRow {
     DdlRow {
         id: DdlId(0), // ignored on insert
         epoch,
+        source_audit_id: version.0,
         source_schema: "public".to_string(),
         source_table: "orders".to_string(),
         c_lsn: c_lsn.parse().unwrap(),
         c_event: "ddl_command_end".to_string(),
         c_tag: "ALTER TABLE".to_string(),
         schema_version: version,
+        c_rel_oid: Some(42),
+        c_columns: Some(serde_json::json!([])),
+        c_dropped: None,
+        c_ddl_text: Some("ALTER TABLE public.orders ADD COLUMN duration interval".into()),
     }
 }
 
@@ -165,14 +170,9 @@ async fn ddl_row_round_trips_with_commit_lsn() {
     let mut tx = pool.begin().await.unwrap();
     let epoch = EpochNo(800_003);
 
-    let id = insert_ddl(
-        &mut *tx,
-        &ddl(epoch, "0/500", SchemaVersionNo(5)),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
+    let id = insert_ddl(&mut *tx, &ddl(epoch, "0/500", SchemaVersionNo(5)))
+        .await
+        .unwrap();
     assert!(id > DdlId(0));
 
     let pending = read_pending_ddl(
@@ -189,6 +189,44 @@ async fn ddl_row_round_trips_with_commit_lsn() {
     assert_eq!(pending[0].c_tag, "ALTER TABLE");
     assert_eq!(pending[0].c_event, "ddl_command_end");
     assert_eq!(pending[0].schema_version, SchemaVersionNo(5));
+    assert_eq!(pending[0].source_audit_id, 5);
+    assert_eq!(
+        pending[0].c_ddl_text.as_deref(),
+        Some("ALTER TABLE public.orders ADD COLUMN duration interval")
+    );
+
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn source_audit_identity_makes_ddl_replay_idempotent() {
+    let pool = pool().await;
+    let mut tx = pool.begin().await.unwrap();
+    let epoch = EpochNo(800_005);
+    let original = ddl(epoch, "0/500", SchemaVersionNo(2));
+
+    let first_id = insert_ddl(&mut *tx, &original).await.unwrap();
+    let second_id = insert_ddl(&mut *tx, &original).await.unwrap();
+    assert_eq!(second_id, first_id, "WAL replay must reuse the history row");
+
+    let history = read_all_ddl(&mut *tx, epoch).await.unwrap();
+    assert_eq!(
+        history,
+        vec![DdlRow {
+            id: first_id,
+            ..original
+        }]
+    );
+
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM walrus.ddl_manifest WHERE epoch = $1 AND source_audit_id = $2",
+    )
+    .bind(epoch)
+    .bind(2_i64)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(count, 1);
 
     tx.rollback().await.unwrap();
 }
@@ -200,30 +238,15 @@ async fn read_pending_ddl_orders_by_c_lsn() {
     let epoch = EpochNo(800_004);
 
     // Insert out of LSN order.
-    insert_ddl(
-        &mut *tx,
-        &ddl(epoch, "0/300", SchemaVersionNo(3)),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-    insert_ddl(
-        &mut *tx,
-        &ddl(epoch, "0/100", SchemaVersionNo(1)),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-    insert_ddl(
-        &mut *tx,
-        &ddl(epoch, "0/200", SchemaVersionNo(2)),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
+    insert_ddl(&mut *tx, &ddl(epoch, "0/300", SchemaVersionNo(3)))
+        .await
+        .unwrap();
+    insert_ddl(&mut *tx, &ddl(epoch, "0/100", SchemaVersionNo(1)))
+        .await
+        .unwrap();
+    insert_ddl(&mut *tx, &ddl(epoch, "0/200", SchemaVersionNo(2)))
+        .await
+        .unwrap();
 
     let all = read_pending_ddl(&mut *tx, epoch, "public", "orders", "0/0".parse().unwrap())
         .await
