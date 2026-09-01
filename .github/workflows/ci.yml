@@ -482,6 +482,22 @@ jobs:
       - name: Apply control migrations
         run: sqlx migrate run --source migrations/control
 
+      # Ordinary loader startup deliberately disables DuckLake's automatic metadata migrations.
+      # Exercise the same explicit pre-deploy command operators/Kubernetes run before any loader
+      # can attach to the shared catalog.
+      - name: Migrate DuckLake catalog
+        env:
+          WALRUS_INSTANCE: ci-ducklake-migrator
+          WALRUS_OBJECT_STORE__BUCKET: walrus
+          WALRUS_OBJECT_STORE__ENDPOINT: http://localhost:9000
+          WALRUS_OBJECT_STORE__REGION: us-east-1
+          WALRUS_DUCKLAKE__CATALOG_URL: postgres://postgres:postgres@localhost:5433/walrus_ducklake
+          WALRUS_DUCKLAKE__DATA_PATH: s3://walrus/ducklake/tests/
+          WALRUS_DUCKLAKE__INSTALL_EXTENSIONS: "true"
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+        run: cargo run -p loader --bin walrus-loader -- --migrate-ducklake-catalog
+
       - name: Start workload timer
         run: echo "CI_TIMED_WORK_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
 
@@ -495,6 +511,9 @@ jobs:
 
       - name: Loader bootstrap (compose)
         run: cargo test -p loader --test bootstrap -- --ignored --test-threads=1
+
+      - name: DuckLake catalog contract (compose)
+        run: cargo test -p loader --test ducklake -- --ignored --test-threads=1
 
       - name: Loader Phase A (compose)
         run: cargo test -p loader --test phase_a -- --ignored --test-threads=1

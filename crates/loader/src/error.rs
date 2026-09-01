@@ -26,7 +26,7 @@ pub enum LoaderError {
         source: duckdb::Error,
     },
     /// The dedicated DuckLake PostgreSQL catalog failed or its advisory-lock session was lost.
-    #[error("DuckLake catalog: {op}")]
+    #[error("ducklake catalog: {op}")]
     Catalog {
         op: &'static str,
         #[source]
@@ -136,7 +136,7 @@ impl From<&LoaderError> for common::Error {
                 common::Error::Internal(format!("duckdb: {op}: {source}"))
             }
             LoaderError::Catalog { op, source } => {
-                common::Error::ControlDb(format!("DuckLake catalog {op}: {source}"))
+                common::Error::ControlDb(format!("ducklake catalog {op}: {source}"))
             }
             LoaderError::ObjectStore { op, source } => {
                 common::Error::ObjectStore(format!("{op}: {source}"))
