@@ -1,7 +1,7 @@
 # CI performance plan
 
-Status: phases 1–4 implemented; e2e matrix awaiting the ten-run threshold  
-Last audited: 2026-08-30
+Status: phases 1–4 implemented; three-way e2e matrix enabled, measurements pending
+Last audited: 2026-09-01
 
 ## Objective
 
@@ -214,19 +214,24 @@ parallel instead of serially.
    and `loader` targets in one default group. Preserve the current Dockerfiles,
    tags, `load: true`, and independent GHA cache scopes. Replace the two serial
    build actions with one Bake invocation; BuildKit schedules both targets
-   concurrently. Run `scripts/image-smoke.sh` only after Bake succeeds.
+   concurrently. Run `scripts/image-smoke.sh` only after Bake succeeds. Exclude
+   integration and e2e test directories from the release build context so a
+   newly auto-discovered test target cannot invalidate cargo-chef's dependency
+   recipe and force a cold bundled-DuckDB rebuild.
 
-2. Measure the combined e2e job from Phase 1 for ten code PRs. If its p95
-   execution time remains over 12 minutes, convert it to a two-entry matrix
-   (`reload_quarantine`, `reload_scale`). Each matrix entry gets an isolated
-   runner and Compose stack, so the tests may execute concurrently without
-   sharing ports, databases, buckets, or target directories. Keep the combined
-   command locally; the matrix is a CI latency tradeoff only.
+2. The full-pipeline suite now uses a three-entry matrix (`reload_quarantine`,
+   `reload_scale`, and `ddl_transactions`). Each matrix entry gets an isolated
+   runner and Compose stack, so the tests execute concurrently without sharing
+   ports, databases, buckets, or target directories. Keep the combined command
+   locally; the matrix is a CI latency tradeoff only. A tiny aggregate job keeps
+   the pre-matrix check name as the stable branch-protection interface and goes
+   green only if every matrix child passes.
 
    The 12-minute rule is mechanical: at or below it, retain the lower-cost
-   combined job; above it, enable the matrix because fast feedback is the chosen
+   combined job; above it, retain the matrix because fast feedback is the chosen
    priority. Re-evaluate the 30% runner-minute guardrail after the matrix has
-   ten samples.
+   ten samples. The matrix was enabled explicitly on 2026-09-01; its first ten
+   runs supply that decision's post-change sample.
 
 Expected result: cold image latency approaches the slower image build rather
 than the sum, and e2e latency has a defined route to the slower test rather than
