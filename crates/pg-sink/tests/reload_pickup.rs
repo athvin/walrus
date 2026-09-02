@@ -438,10 +438,15 @@ async fn cap_of_two_holds_and_the_stream_keeps_flowing() {
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
     if status_of(&pool, c).await.0 == ReloadStatus::Requested {
-        // Free a permit through the shipped lost-lease path. If an earlier exporter already
-        // released a permit naturally, `c` is exporting and this branch is unnecessary.
+        // Free a permit through the shipped lost-lease path. Model a legitimate successor claim:
+        // changing the holder must also advance the fencing generation, exactly as adoption does.
+        // If an earlier exporter already released a permit naturally, `c` is exporting and this
+        // branch is unnecessary.
         sqlx::query(
-            "UPDATE walrus.table_reload SET lease_holder = 'lease-thief' WHERE reload_id = $1",
+            "UPDATE walrus.table_reload
+             SET lease_holder = 'lease-thief',
+                 exporter_generation = exporter_generation + 1
+             WHERE reload_id = $1",
         )
         .bind(a.0)
         .execute(&pool)
