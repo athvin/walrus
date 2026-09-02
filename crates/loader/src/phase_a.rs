@@ -323,7 +323,12 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
         let destination = match &route {
             FileRoute::Live => ctx.table.as_str(),
             FileRoute::Shadow(table) => table.as_str(),
-            FileRoute::Retire => unreachable!("retired files continued above"),
+            FileRoute::Retire => {
+                return Err(LoaderError::Internal(format!(
+                    "retired manifest {} reached the append path",
+                    f.id
+                )));
+            }
         };
         appended += ctx.db.append_parquet(
             destination,

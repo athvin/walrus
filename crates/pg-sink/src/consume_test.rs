@@ -714,65 +714,53 @@ async fn committed_end_fence_resolves_only_from_the_persisted_state() {
 fn only_failed_attempt_with_exact_target_is_a_stale_fence_noop() {
     let request_id = Uuid::new_v4();
     let version = SchemaVersionNo(3);
-    assert!(is_matching_failed_fence(
-        control::ReloadStatus::Failed,
-        "public",
-        "orders",
-        Some(request_id),
-        Some(version),
-        Some(("public", "orders")),
+    let attempt = FailedReloadAttempt {
+        status: control::ReloadStatus::Failed,
+        target: ("public", "orders"),
+        request_id: Some(request_id),
+        schema_version: Some(version),
+    };
+    let fence = DecodedFenceIdentity {
+        target: Some(("public", "orders")),
         request_id,
-        Some(version),
+        schema_version: Some(version),
+    };
+
+    assert!(is_matching_failed_fence(attempt, fence));
+    assert!(!is_matching_failed_fence(
+        FailedReloadAttempt {
+            status: control::ReloadStatus::Exporting,
+            ..attempt
+        },
+        fence,
     ));
     assert!(!is_matching_failed_fence(
-        control::ReloadStatus::Exporting,
-        "public",
-        "orders",
-        Some(request_id),
-        Some(version),
-        Some(("public", "orders")),
-        request_id,
-        Some(version),
+        attempt,
+        DecodedFenceIdentity {
+            target: Some(("public", "invoices")),
+            ..fence
+        },
     ));
     assert!(!is_matching_failed_fence(
-        control::ReloadStatus::Failed,
-        "public",
-        "orders",
-        Some(request_id),
-        Some(version),
-        Some(("public", "invoices")),
-        request_id,
-        Some(version),
+        attempt,
+        DecodedFenceIdentity {
+            target: None,
+            ..fence
+        },
     ));
     assert!(!is_matching_failed_fence(
-        control::ReloadStatus::Failed,
-        "public",
-        "orders",
-        Some(request_id),
-        Some(version),
-        None,
-        request_id,
-        Some(version),
+        attempt,
+        DecodedFenceIdentity {
+            request_id: Uuid::new_v4(),
+            ..fence
+        },
     ));
     assert!(!is_matching_failed_fence(
-        control::ReloadStatus::Failed,
-        "public",
-        "orders",
-        Some(request_id),
-        Some(version),
-        Some(("public", "orders")),
-        Uuid::new_v4(),
-        Some(version),
-    ));
-    assert!(!is_matching_failed_fence(
-        control::ReloadStatus::Failed,
-        "public",
-        "orders",
-        Some(request_id),
-        Some(version),
-        Some(("public", "orders")),
-        request_id,
-        Some(SchemaVersionNo(4)),
+        attempt,
+        DecodedFenceIdentity {
+            schema_version: Some(SchemaVersionNo(4)),
+            ..fence
+        },
     ));
 }
 

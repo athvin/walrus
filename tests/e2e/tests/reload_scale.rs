@@ -69,6 +69,8 @@ async fn n_table_reloads_respect_the_cap_on_one_slot() {
         .unwrap();
         reload_ids.push(id);
     }
+    let owned_reload_ids: Vec<i64> = reload_ids.iter().map(|id| id.0).collect();
+    let expected_complete = i64::try_from(owned_reload_ids.len()).unwrap();
 
     // (No concurrent source churn here — the reloads' own signal/echo traffic exercises the one
     // slot, and a static source keeps the final mirror==source comparison free of catch-up races.
@@ -99,19 +101,23 @@ async fn n_table_reloads_respect_the_cap_on_one_slot() {
             .unwrap();
         assert_eq!(slots, 1, "exactly one slot throughout (got {slots})");
 
+        // Bootstrap also creates terminal reload rows in this epoch. Count only the attempts this
+        // test requested; otherwise the global completed total can exceed three before these finish.
         let complete: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM walrus.table_reload WHERE epoch = $1 AND status = 'complete'",
+            "SELECT count(*) FROM walrus.table_reload \
+             WHERE epoch = $1 AND reload_id = ANY($2) AND status = 'complete'",
         )
         .bind(epoch)
+        .bind(&owned_reload_ids)
         .fetch_one(&pool)
         .await
         .unwrap();
-        if complete == i64::try_from(TABLES.len()).unwrap() {
+        if complete == expected_complete {
             break;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "reloads did not all complete in time ({complete}/3 complete)"
+            "reloads did not all complete in time ({complete}/{expected_complete} complete)"
         );
         tokio::time::sleep(Duration::from_millis(150)).await;
     }

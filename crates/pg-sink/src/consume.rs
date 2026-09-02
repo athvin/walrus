@@ -1176,14 +1176,17 @@ async fn accept_failed_attempt_fence(
     };
     let target = committed.event.target();
     if !is_matching_failed_fence(
-        row.status,
-        &row.source_schema,
-        &row.source_table,
-        row.source_request_id.or(row.parent_request_id),
-        row.schema_version,
-        target,
-        committed.event.request_id,
-        committed.event.schema_version,
+        FailedReloadAttempt {
+            status: row.status,
+            target: (&row.source_schema, &row.source_table),
+            request_id: row.source_request_id.or(row.parent_request_id),
+            schema_version: row.schema_version,
+        },
+        DecodedFenceIdentity {
+            target,
+            request_id: committed.event.request_id,
+            schema_version: committed.event.schema_version,
+        },
     ) {
         return Err(anyhow::Error::new(error).context(format!(
             "reload fence {phase:?} rejected for attempt {reload_id}: status={:?}, event_target={target:?}, row_target={}.{}",
@@ -1201,21 +1204,34 @@ async fn accept_failed_attempt_fence(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FailedReloadAttempt<'a> {
+    status: control::ReloadStatus,
+    target: (&'a str, &'a str),
+    request_id: Option<Uuid>,
+    schema_version: Option<common::SchemaVersionNo>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DecodedFenceIdentity<'a> {
+    target: Option<(&'a str, &'a str)>,
+    request_id: Uuid,
+    schema_version: Option<common::SchemaVersionNo>,
+}
+
 #[must_use]
 fn is_matching_failed_fence(
-    status: control::ReloadStatus,
-    row_schema: &str,
-    row_table: &str,
-    row_request_id: Option<Uuid>,
-    row_schema_version: Option<common::SchemaVersionNo>,
-    event_target: Option<(&str, &str)>,
-    event_request_id: Uuid,
-    event_schema_version: Option<common::SchemaVersionNo>,
+    attempt: FailedReloadAttempt<'_>,
+    fence: DecodedFenceIdentity<'_>,
 ) -> bool {
-    status == control::ReloadStatus::Failed
-        && event_target.is_some_and(|(schema, table)| schema == row_schema && table == row_table)
-        && row_request_id.is_none_or(|request_id| request_id == event_request_id)
-        && row_schema_version.is_none_or(|version| event_schema_version == Some(version))
+    attempt.status == control::ReloadStatus::Failed
+        && fence.target == Some(attempt.target)
+        && attempt
+            .request_id
+            .is_none_or(|request_id| request_id == fence.request_id)
+        && attempt
+            .schema_version
+            .is_none_or(|version| fence.schema_version == Some(version))
 }
 
 #[must_use]

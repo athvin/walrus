@@ -227,15 +227,56 @@ fn validate_targets(targets: &[ReloadTarget]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Complete immutable input for one source fence.
+///
+/// Keeping the source identity, frozen catalog shape, and timing policy together prevents callers
+/// from accidentally shifting one positional fence argument into another.
+#[derive(Debug, Clone, Copy)]
+pub struct FenceSpec<'a> {
+    /// Publication whose coverage must still include the complete target row.
+    pub publication: &'a str,
+    /// Stable source request namespace.
+    pub request_id: Uuid,
+    /// Control-plane attempt identity.
+    pub reload_id: ReloadId,
+    /// Boundary being emitted.
+    pub phase: FencePhase,
+    /// Exact source target and frozen structural shape.
+    pub target: FenceTarget<'a>,
+    /// Bounds for acquiring and observing the boundary.
+    pub timeouts: FenceTimeouts,
+}
+
+/// Exact source relation guarded by a fence.
+#[derive(Debug, Clone, Copy)]
+pub struct FenceTarget<'a> {
+    /// Source schema.
+    pub schema: &'a str,
+    /// Source table.
+    pub table: &'a str,
+    /// Full relation shape expected while the fence lock is held.
+    pub expected_relation: &'a common::PgRelation,
+    /// Frozen registry version represented by that shape.
+    pub schema_version: common::SchemaVersionNo,
+}
+
+/// Independent time bounds for one source fence.
+#[derive(Debug, Clone, Copy)]
+pub struct FenceTimeouts {
+    /// Maximum wait for the target-table schema fence.
+    pub lock: std::time::Duration,
+    /// Maximum wait for the committed fence to return through logical decoding.
+    pub echo: std::time::Duration,
+}
+
 /// Emit one deterministic source fence and wait for its decoded commit.
 ///
 /// Both fences acquire `SHARE UPDATE EXCLUSIVE` on the target before inserting the event. The table
 /// lock orders the boundary against structural/membership DDL while remaining compatible with
 /// ordinary DML's `ROW EXCLUSIVE` lock. The pipeline sessions' advisory guards order all publication
-/// DDL across the complete F..H interval. Under those locks the exact target is
-/// revalidated for membership, all four actions, and absence of row filters/column lists.
-/// A retry uses the same UUID and returns [`FenceEmission::AlreadyExists`] rather than manufacturing
-/// a different boundary.
+/// DDL across the complete F..H interval. Under those locks the exact target is revalidated for
+/// membership, all four actions, and absence of row filters/column lists. A retry uses the same UUID
+/// and returns [`FenceEmission::AlreadyExists`] rather than manufacturing a different boundary.
 ///
 /// # Errors
 ///
@@ -243,17 +284,26 @@ fn validate_targets(targets: &[ReloadTarget]) -> anyhow::Result<()> {
 pub async fn emit_fence(
     client: &mut tokio_postgres::Client,
     waiters: &FenceWaiters,
-    publication: &str,
-    request_id: Uuid,
-    reload_id: ReloadId,
-    phase: FencePhase,
-    source_schema: &str,
-    source_table: &str,
-    expected_relation: &common::PgRelation,
-    schema_version: common::SchemaVersionNo,
-    lock_timeout: std::time::Duration,
-    echo_timeout: std::time::Duration,
+    spec: FenceSpec<'_>,
 ) -> anyhow::Result<FenceEmission> {
+    let FenceSpec {
+        publication,
+        request_id,
+        reload_id,
+        phase,
+        target:
+            FenceTarget {
+                schema: source_schema,
+                table: source_table,
+                expected_relation,
+                schema_version,
+            },
+        timeouts:
+            FenceTimeouts {
+                lock: lock_timeout,
+                echo: echo_timeout,
+            },
+    } = spec;
     let schema = SqlIdent::new(source_schema).context("validate reload fence schema")?;
     let table = SqlIdent::new(source_table).context("validate reload fence table")?;
     let event_id = deterministic_fence_id(request_id, reload_id, phase);

@@ -87,9 +87,11 @@ impl TablePlan {
     /// (and, by derivation, raw-table) name changes.
     #[must_use]
     pub(crate) fn for_table(&self, table: impl Into<Box<str>>) -> Self {
-        let mut plan = self.clone();
-        plan.table = table.into();
-        plan
+        Self {
+            table: table.into(),
+            raw_cols: self.raw_cols.clone(),
+            mirror_cols: self.mirror_cols.clone(),
+        }
     }
 
     /// The Tier-1 (scalar-only) plan from a bare relation — one emit column == source column via

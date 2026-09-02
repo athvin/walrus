@@ -248,7 +248,7 @@ fn durable_end_recovery_requires_exact_f_h_schema_and_request_identity() {
         .contains("no source-fence request namespace")
     );
 
-    let mut wrong_baseline = markers.clone();
+    let mut wrong_baseline = markers;
     wrong_baseline[0].lsn = "0/101".parse().unwrap();
     assert!(
         validate_durable_end(

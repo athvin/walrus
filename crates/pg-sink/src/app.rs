@@ -554,9 +554,12 @@ async fn establish_stream(
     // No usable slot: establish WAL retention first. The full baseline is deliberately not copied
     // here; it is requested through the published event stream below, exactly like an operator's
     // later all-table reconciliation.
-    let created = match slot_loss_recovery(status)
-        .expect("fresh-slot action requires authoritative absent/invalidated status")
-    {
+    let recovery = slot_loss_recovery(status).with_context(|| {
+        format!(
+            "fresh-slot action requires authoritative absent/invalidated status, found {status:?}"
+        )
+    })?;
+    let created = match recovery {
         SlotLossRecovery::CreateIfAbsent => {
             crate::slot::verify_or_create_slot(&ctx.source_client, slot.as_str())
                 .await

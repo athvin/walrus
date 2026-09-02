@@ -87,7 +87,7 @@ const fn adopted_snapshot_ownership(req: &control::ReloadRow) -> SnapshotOwnersh
 #[derive(Debug)]
 pub enum PreflightOutcome {
     /// The request is genuinely invalid. Terminal: the reload row is failed with this reason.
-    Rejected(PreflightRejection),
+    Rejected(Box<PreflightRejection>),
     /// Preflight could not reach a verdict. The claim is released and retried next tick, so a
     /// transient fault never fails a valid request with a misleading reason.
     Infra(anyhow::Error),
@@ -1173,14 +1173,12 @@ impl ReloadController {
                     )
                 });
         if let Err(issue) = coverage {
-            return Err(PreflightOutcome::Rejected(classify_publication_issue(
-                issue,
-                &req.source_schema,
-                &req.source_table,
+            return Err(PreflightOutcome::Rejected(Box::new(
+                classify_publication_issue(issue, &req.source_schema, &req.source_table),
             )));
         }
         classify_target(true, has_pk, &req.source_schema, &req.source_table)
-            .map_err(PreflightOutcome::Rejected)
+            .map_err(|rejection| PreflightOutcome::Rejected(Box::new(rejection)))
     }
 }
 

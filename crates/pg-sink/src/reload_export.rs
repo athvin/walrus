@@ -21,7 +21,9 @@
 //! For very large tables, a future CTID-range fan-out (deferred goal §3) would parallelise
 //! *within* a chunk — the composition point is `export_next_chunk`'s SELECT; nothing else changes.
 
-use crate::reload_event::{FenceEmission, FencePhase, FenceWaiters};
+use crate::reload_event::{
+    FenceEmission, FencePhase, FenceSpec, FenceTarget, FenceTimeouts, FenceWaiters,
+};
 use crate::sink::{FileKind, ParquetSink};
 use anyhow::Context;
 use common::sql::{SqlIdent, SqlStrExt};
@@ -288,17 +290,16 @@ impl ChunkExporter {
         let start_lsn = match req.start_lsn {
             Some(lsn) => lsn,
             None => {
-                establish_start_fence(
-                    &mut client,
-                    &pool,
-                    &fence_waiters,
-                    &cfg.publication_name,
+                StartFenceContext {
+                    pool: &pool,
+                    waiters: &fence_waiters,
+                    cfg: &cfg,
                     request_id,
                     req,
-                    &rel,
+                    expected_relation: &rel,
                     schema_version,
-                    cfg.echo_timeout,
-                )
+                }
+                .establish(&mut client)
                 .await?
             }
         };
@@ -401,7 +402,7 @@ impl ChunkExporter {
         match snapshot_outcome {
             SnapshotExportOutcome::SchemaChanged { new_version } => {
                 self.rollback_dump_snapshot().await?;
-                return Ok(RunOutcome::SchemaChanged { new_version });
+                Ok(RunOutcome::SchemaChanged { new_version })
             }
             SnapshotExportOutcome::Drained { rows } => {
                 // H must follow the snapshot commit. Releasing the source transaction first also
@@ -434,7 +435,7 @@ impl ChunkExporter {
                     final_lsn = %final_lsn,
                     "reload export drained (controller flips export_complete)"
                 );
-                return Ok(RunOutcome::Drained { final_lsn });
+                Ok(RunOutcome::Drained { final_lsn })
             }
         }
     }
@@ -568,16 +569,22 @@ impl ChunkExporter {
         match crate::reload_event::emit_fence(
             &mut self.client,
             &self.fence_waiters,
-            &self.cfg.publication_name,
-            self.request_id,
-            self.reload_id,
-            FencePhase::End,
-            &self.rel.schema,
-            &self.rel.name,
-            &self.rel,
-            self.schema_version,
-            FENCE_LOCK_TIMEOUT,
-            self.cfg.echo_timeout,
+            FenceSpec {
+                publication: &self.cfg.publication_name,
+                request_id: self.request_id,
+                reload_id: self.reload_id,
+                phase: FencePhase::End,
+                target: FenceTarget {
+                    schema: &self.rel.schema,
+                    table: &self.rel.name,
+                    expected_relation: &self.rel,
+                    schema_version: self.schema_version,
+                },
+                timeouts: FenceTimeouts {
+                    lock: FENCE_LOCK_TIMEOUT,
+                    echo: self.cfg.echo_timeout,
+                },
+            },
         )
         .await?
         {
@@ -852,71 +859,79 @@ fn validate_durable_end(
     Ok(Some(end.lsn))
 }
 
-async fn establish_start_fence(
-    client: &mut tokio_postgres::Client,
-    pool: &sqlx::PgPool,
-    waiters: &FenceWaiters,
-    publication: &str,
+struct StartFenceContext<'a> {
+    pool: &'a sqlx::PgPool,
+    waiters: &'a FenceWaiters,
+    cfg: &'a ChunkExportConfig,
     request_id: Uuid,
-    req: &control::ReloadRow,
-    expected_relation: &PgRelation,
+    req: &'a control::ReloadRow,
+    expected_relation: &'a PgRelation,
     schema_version: SchemaVersionNo,
-    echo_timeout: Duration,
-) -> anyhow::Result<Lsn> {
-    match crate::reload_event::emit_fence(
-        client,
-        waiters,
-        publication,
-        request_id,
-        req.reload_id,
-        FencePhase::Start,
-        &req.source_schema,
-        &req.source_table,
-        expected_relation,
-        schema_version,
-        FENCE_LOCK_TIMEOUT,
-        echo_timeout,
-    )
-    .await?
-    {
-        FenceEmission::Observed(echo) => {
-            control::reload::record_start_fence(
-                pool,
-                req.reload_id,
-                echo.commit_lsn,
-                control::ReloadFenceIdentity {
-                    request_id: Some(request_id),
-                    source_schema: &req.source_schema,
-                    source_table: &req.source_table,
-                    schema_version,
+}
+
+impl StartFenceContext<'_> {
+    async fn establish(self, client: &mut tokio_postgres::Client) -> anyhow::Result<Lsn> {
+        match crate::reload_event::emit_fence(
+            client,
+            self.waiters,
+            FenceSpec {
+                publication: &self.cfg.publication_name,
+                request_id: self.request_id,
+                reload_id: self.req.reload_id,
+                phase: FencePhase::Start,
+                target: FenceTarget {
+                    schema: &self.req.source_schema,
+                    table: &self.req.source_table,
+                    expected_relation: self.expected_relation,
+                    schema_version: self.schema_version,
                 },
-            )
-            .await
-            .context("record safe reload start fence")?;
-            Ok(echo.commit_lsn)
+                timeouts: FenceTimeouts {
+                    lock: FENCE_LOCK_TIMEOUT,
+                    echo: self.cfg.echo_timeout,
+                },
+            },
+        )
+        .await?
+        {
+            FenceEmission::Observed(echo) => {
+                control::reload::record_start_fence(
+                    self.pool,
+                    self.req.reload_id,
+                    echo.commit_lsn,
+                    control::ReloadFenceIdentity {
+                        request_id: Some(self.request_id),
+                        source_schema: &self.req.source_schema,
+                        source_table: &self.req.source_table,
+                        schema_version: self.schema_version,
+                    },
+                )
+                .await
+                .context("record safe reload start fence")?;
+                Ok(echo.commit_lsn)
+            }
+            FenceEmission::AlreadyExists => {
+                wait_for_marker(
+                    self.pool,
+                    self.req.reload_id,
+                    control::ReloadMarkerKind::Baseline,
+                    self.cfg.echo_timeout,
+                )
+                .await
+            }
+            FenceEmission::SchemaChanged => Err(ConnectSchemaChanged {
+                new_version: await_schema_change(
+                    self.pool,
+                    self.req.epoch,
+                    &self.req.source_schema,
+                    &self.req.source_table,
+                    self.schema_version,
+                    self.req.reload_id,
+                    self.cfg.echo_timeout,
+                )
+                .await?,
+            }
+            .into()),
         }
-        FenceEmission::AlreadyExists => {
-            wait_for_marker(
-                pool,
-                req.reload_id,
-                control::ReloadMarkerKind::Baseline,
-                echo_timeout,
-            )
-            .await
-        }
-        FenceEmission::SchemaChanged => Err(ConnectSchemaChanged {
-            new_version: await_schema_change(
-                pool,
-                req.epoch,
-                &req.source_schema,
-                &req.source_table,
-                schema_version,
-                req.reload_id,
-                echo_timeout,
-            )
-            .await?,
-        }
-        .into()),
     }
 }
 

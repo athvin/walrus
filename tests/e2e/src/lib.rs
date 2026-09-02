@@ -139,6 +139,13 @@ impl Harness {
         .execute(&source)
         .await
         .context("normalize orders DDL test columns")?;
+        // The quarantine recovery test narrows this fixture after correcting its out-of-range row.
+        // Restore the persistent compose source before dropping the old slot so repeated local runs
+        // always bootstrap the intended v1 INTEGER shape.
+        sqlx::raw_sql("ALTER TABLE public.q_target ALTER COLUMN n TYPE INTEGER USING n::INTEGER;")
+            .execute(&source)
+            .await
+            .context("normalize q_target quarantine-test type")?;
         sqlx::raw_sql(&format!(
             "TRUNCATE public.orders; TRUNCATE public.types_matrix; \
              TRUNCATE public.q_target; TRUNCATE public.rl1; TRUNCATE public.rl2; TRUNCATE public.rl3; \
