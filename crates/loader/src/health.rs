@@ -124,6 +124,8 @@ pub struct LoaderState {
     /// Idempotent table identities currently requiring a replacement generation. A set (rather
     /// than a boolean/counter) prevents one table's successful reload from clearing another
     /// table's independent quarantine and makes repeated polls harmless.
+    // Mutations are brief, synchronous set operations.
+    // LOCK-CHOICE: parking_lot::Mutex — the guard is never held across an await.
     quarantined_tables: Mutex<HashSet<(String, String)>>,
     /// Fresh all-table reconciliation gates external readiness independently of local startup.
     /// Keeping this separate from quarantine means a repaired table cannot accidentally advertise
