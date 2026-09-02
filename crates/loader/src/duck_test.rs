@@ -29,6 +29,42 @@ fn orders() -> PgRelation {
     }
 }
 
+#[test]
+fn mirror_template_lists_every_wide_primary_key_column() {
+    let mut columns = (1..=32)
+        .map(|index| PgColumn {
+            name: format!("key_{index:02}"),
+            type_oid: 23,
+            type_modifier: -1,
+            is_key: true,
+        })
+        .collect::<Vec<_>>();
+    columns.push(PgColumn {
+        name: "payload".into(),
+        type_oid: 25,
+        type_modifier: -1,
+        is_key: false,
+    });
+    let relation = PgRelation {
+        oid: 43,
+        schema: "public".into(),
+        name: "wide_keys".into(),
+        replica_identity: ReplicaIdentity::Default,
+        columns,
+    };
+    let db = TableDb::open(":memory:").unwrap();
+    let sql = db.generation_sql(&crate::plan::TablePlan::tier1(&relation));
+    let expected = (1..=32)
+        .map(|index| format!("\"key_{index:02}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    assert!(
+        sql.contains(&format!("PRIMARY KEY ({expected})")),
+        "the mirror DDL must contain the complete composite key"
+    );
+}
+
 /// `S3Access` derives `Debug` and is carried by every worker, so a stray `?s3` in a diagnostic
 /// would ship the bucket credential to the log aggregator. The endpoint, region and key id stay
 /// legible — they are identifiers an operator needs; only the secret half is withheld.

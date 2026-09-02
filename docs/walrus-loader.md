@@ -444,7 +444,8 @@ The three branches encode the **collapse rule**: winner `op ∈ {i,u}` → the k
 
 **Composite PK generalization.** `<pk>` denotes the *full* primary-key column list, generated from
 `schema_registry` — never assuming a single column: `PARTITION BY k1, k2, …`; `ON t.k1=s.k1 AND t.k2=s.k2 …`; and
-the `ON CONFLICT (k1, k2, …)` fallback targets the composite constraint. **⚠ Guardrail:** never let a normalized
+the `ON CONFLICT (k1, k2, …)` fallback targets the composite constraint. There is no Walrus-specific
+cardinality cap below PostgreSQL's own index-column limit. **⚠ Guardrail:** never let a normalized
 type into the partition/join key — DuckDB normalizes `INTERVAL` for equality/ordering, so two byte-different
 intervals can compare equal ([`walrus-pg-sink.md` §2.4](./walrus-pg-sink.md#24-tier-2-decompositions-column-by-column)).
 This is a non-risk since the key is always the source PK, but state it.

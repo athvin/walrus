@@ -266,7 +266,9 @@ ALTER PUBLICATION walrus_pub ADD TABLE walrus.heartbeat;   -- MUST be published 
   audit stream), the sink **quarantines** that table and alerts rather than silently degrading.
   The PK may be **composite** (multiple columns) — every key column is captured from
   `schema_registry` and used *together* as the merge/dedup key throughout (partition, `MERGE … ON`,
-  delete predicate); nothing in the design assumes a single-column key.
+  delete predicate). Walrus imposes no lower key-column limit of its own: a composite key is supported
+  up to PostgreSQL's index-column limit, and the boundary-width regression fixture exercises all 32
+  key columns used by the standard PostgreSQL build.
   *(A `UNIQUE NOT NULL` column via `REPLICA IDENTITY USING INDEX` could relax this later; out of
   scope for v1 by design.)*
 

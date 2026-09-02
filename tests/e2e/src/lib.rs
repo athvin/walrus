@@ -29,6 +29,8 @@ const DUCKLAKE_DATA: &str = "s3://walrus/ducklake/e2e/";
 const S3_ENDPOINT: &str = "http://localhost:9000";
 const BUCKET: &str = "walrus";
 const SLOT: &str = "walrus_e2e_slot";
+/// The standard PostgreSQL build limit for columns participating in one index.
+pub const WIDE_PRIMARY_KEY_COLUMNS: usize = 32;
 /// Most E2Es intentionally keep this tiny so their large open transactions exercise WAL spilling.
 const DEFAULT_E2E_MAX_INFLIGHT_BYTES: u64 = 64 * 1024;
 /// Reload-scale E2Es need room for their explicitly configured parallel COPY routes. This is the
@@ -39,6 +41,21 @@ const TABLE_NAMESPACE: uuid::Uuid =
 /// The MinIO container name (`<compose project>-<service>-1`) — `docker pause`d to stall the sink's S3
 /// durability in the WAL-runaway / keepalive chaos tests.
 const MINIO: &str = "walrus-minio-1";
+
+fn wide_primary_key_table_ddl() -> String {
+    let columns = (1..=WIDE_PRIMARY_KEY_COLUMNS)
+        .map(|index| format!("key_{index:02} integer NOT NULL"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let keys = (1..=WIDE_PRIMARY_KEY_COLUMNS)
+        .map(|index| format!("key_{index:02}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "DROP TABLE IF EXISTS public.wide_keys; \
+         CREATE TABLE public.wide_keys ({columns}, payload text NOT NULL, PRIMARY KEY ({keys}));"
+    )
+}
 
 /// A running walrus stack: the compose services (assumed up) plus a live `pg-sink` and `loader` spawned
 /// as child processes. `Drop` kills both — a leaked sink holds the replication slot and blocks the next
@@ -189,6 +206,12 @@ impl Harness {
         .execute(&source)
         .await
         .context("create types_matrix")?;
+        // Boundary-width composite-key fixture. Recreate it so a prior interrupted run cannot leave
+        // behind a different shape; all setup WAL precedes the fresh replication slot below.
+        sqlx::raw_sql(&wide_primary_key_table_ddl())
+            .execute(&source)
+            .await
+            .context("create wide composite-key fixture")?;
         // The single-table-reload fixtures. Like `types_matrix`, they must exist BEFORE
         // the sink bootstraps so the sink registers them and the loader OWNS them (the loader only
         // picks up tables at bootstrap — a table created after start is never owned). `q_target.n`
@@ -225,6 +248,7 @@ impl Harness {
             .context("normalize q_target quarantine-test type")?;
         sqlx::raw_sql(&format!(
             "TRUNCATE public.orders; TRUNCATE public.types_matrix; \
+             TRUNCATE public.wide_keys; \
              TRUNCATE public.q_target; TRUNCATE public.rl1; TRUNCATE public.rl2; TRUNCATE public.rl3; \
              SELECT pg_drop_replication_slot('{SLOT}') \
                 FROM pg_replication_slots WHERE slot_name = '{SLOT}';"

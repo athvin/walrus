@@ -554,6 +554,7 @@ jobs:
           - ddl_transactions
           - source_reload_event
           - total_restart
+          - wide_primary_key
     # A DEDICATED job: the e2e harness spawns the real sink+loader binaries — its
     # `build_bins` compiles the bundled DuckDB in the DEV profile ON TOP of the test-profile builds,
     # which overflowed the integration runner's disk ("No space left on device"). A fresh runner with
@@ -610,7 +611,7 @@ jobs:
         run: docker compose -f deploy/docker/docker-compose.yml down -v
 
   # Preserve the pre-matrix check name as a stable branch-protection interface. `result` is the
-  # aggregate result of every expanded matrix child, so this succeeds only when all five pass.
+  # aggregate result of every expanded matrix child, so this succeeds only when all six pass.
   e2e:
     name: e2e (full pipeline — reload + transactional DDL)
     needs: [changes, e2e_matrix]

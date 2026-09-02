@@ -295,6 +295,105 @@ fn composite_pk_partition_and_join_expand_to_all_key_columns() {
     assert_eq!(v12, "other", "(1,2) is independent of (1,1)");
 }
 
+#[test]
+fn widest_postgres_primary_key_uses_every_component() {
+    const POSTGRES_MAX_INDEX_KEYS: usize = 32;
+    let key_names = (1..=POSTGRES_MAX_INDEX_KEYS)
+        .map(|index| format!("key_{index:02}"))
+        .collect::<Vec<_>>();
+    let key_defs = key_names
+        .iter()
+        .map(|name| format!("\"{name}\" INTEGER"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let quoted_keys = key_names
+        .iter()
+        .map(|name| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let c = Connection::open_in_memory().unwrap();
+    c.execute_batch(&format!(
+        "CREATE TABLE wide_keys ({key_defs}, payload VARCHAR,
+             \"_applied_commit_lsn\" VARCHAR DEFAULT '0000000000000000',
+             \"_applied_lsn\" VARCHAR DEFAULT '0000000000000000',
+             PRIMARY KEY ({quoted_keys}));
+         CREATE TABLE wide_keys_raw ({key_defs}, payload VARCHAR, walrus_pg_sink_meta VARCHAR,
+             \"_walrus_op\" VARCHAR, \"_walrus_commit_lsn\" VARCHAR, \"_walrus_lsn\" VARCHAR);"
+    ))
+    .unwrap();
+
+    let mut columns = key_names
+        .iter()
+        .map(|name| PgColumn {
+            name: name.clone(),
+            type_oid: 23,
+            type_modifier: -1,
+            is_key: true,
+        })
+        .collect::<Vec<_>>();
+    columns.push(PgColumn {
+        name: "payload".into(),
+        type_oid: 25,
+        type_modifier: -1,
+        is_key: false,
+    });
+    let relation = PgRelation {
+        oid: 44,
+        schema: "public".into(),
+        name: "wide_keys".into(),
+        replica_identity: ReplicaIdentity::Default,
+        columns,
+    };
+    let row = |last_key: i32, payload: &str, op: char, row_lsn: u64| {
+        let mut values = vec!["1".to_string(); POSTGRES_MAX_INDEX_KEYS];
+        *values.last_mut().unwrap() = last_key.to_string();
+        format!(
+            "({}, '{payload}', '{{}}', '{op}', '{}', '{}')",
+            values.join(", "),
+            lsn(1),
+            lsn(row_lsn)
+        )
+    };
+    let rows = [
+        row(1, "first", 'i', 1),
+        row(2, "other", 'i', 2),
+        row(1, "after", 'u', 3),
+        row(1, "after", 'd', 4),
+        row(3, "moved", 'u', 4),
+        row(2, "other", 'd', 5),
+    ];
+    c.execute_batch(&format!(
+        "INSERT INTO wide_keys_raw VALUES {};",
+        rows.join(", ")
+    ))
+    .unwrap();
+
+    let transform = TransformSql::from_relation(&relation);
+    let sql = transform.render(common::Lsn::ZERO, None);
+    let ducklake_sql = transform.render_ducklake(common::Lsn::ZERO, None);
+    let rebuild_sql = transform.render_rebuild(None);
+    for rendered in [&sql, &ducklake_sql, &rebuild_sql] {
+        assert!(
+            rendered.contains("t.\"key_32\" IS NOT DISTINCT FROM s.\"key_32\""),
+            "every transform template must match on the final key component"
+        );
+    }
+    apply_transform(&c, &transform, common::Lsn::ZERO).unwrap();
+
+    let result: (i64, i32, String) = c
+        .query_row(
+            "SELECT count(*), min(key_32), min(payload) FROM wide_keys",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        result,
+        (1, 3, "moved".to_string()),
+        "keys differing only at component 32 must deduplicate independently"
+    );
+}
+
 // ---- TRUNCATE — a mirror wipe keyed on the (commit_lsn, lsn) TUPLE, not the scalar. ----
 
 /// A truncate + re-inserts: the mirror is emptied as of the truncate (incl. pre-existing rows from
