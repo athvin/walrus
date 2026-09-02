@@ -158,8 +158,9 @@ impl AsyncFileWriter for AbortableObjectWriter {
         &mut self,
         mut bytes: Bytes,
     ) -> futures_util::future::BoxFuture<'_, parquet::errors::Result<()>> {
+        let state = Arc::clone(&self.state);
         async move {
-            let mut state = self.state.lock().await;
+            let mut state = state.lock().await;
             if state.completing {
                 return Err(parquet::errors::ParquetError::General(
                     "reload object upload is already completing".into(),
@@ -192,8 +193,9 @@ impl AsyncFileWriter for AbortableObjectWriter {
     }
 
     fn complete(&mut self) -> futures_util::future::BoxFuture<'_, parquet::errors::Result<()>> {
+        let state = Arc::clone(&self.state);
         async move {
-            let mut state = self.state.lock().await;
+            let mut state = state.lock().await;
             state.completing = true;
             let writer = state.writer.as_mut().ok_or_else(|| {
                 parquet::errors::ParquetError::General(
