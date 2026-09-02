@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "unit test assertions use unwrap/expect for impossible fixture failures"
+)]
+
 use super::*;
 use common::ObjectStoreConfig;
 
@@ -50,4 +56,59 @@ fn no_endpoint_yields_an_empty_host_and_the_configured_region() {
     assert!(access.endpoint.is_empty());
     assert!(!access.use_ssl);
     assert_eq!(access.region, "eu-west-2");
+}
+
+#[tokio::test]
+async fn zero_table_shard_reports_an_epoch_bump_through_the_supervisor() {
+    let baseline = common::EpochNo(7);
+    let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(baseline);
+    let token = tokio_util::sync::CancellationToken::new();
+    let (failure_tx, failure_rx) = crate::supervisor::failure_channel(0);
+    epoch_tx.send(common::EpochNo(8)).unwrap();
+
+    let failure = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        crate::supervisor::supervise(
+            failure_rx,
+            &token,
+            guard_idle_epoch(epoch_rx, baseline, token.clone(), failure_tx),
+        ),
+    )
+    .await
+    .expect("an idle shard must not hang after its epoch retires")
+    .expect("the forward epoch move is a supervised failure");
+
+    assert!(matches!(
+        failure.error,
+        LoaderError::EpochBumped { from, to }
+            if from == baseline && to == common::EpochNo(8)
+    ));
+    assert!(
+        token.is_cancelled(),
+        "the supervisor cancels every side task before pipeline joins them"
+    );
+}
+
+#[tokio::test]
+async fn zero_table_epoch_guard_joins_cleanly_on_shutdown() {
+    let baseline = common::EpochNo(11);
+    let (_epoch_tx, epoch_rx) = tokio::sync::watch::channel(baseline);
+    let token = tokio_util::sync::CancellationToken::new();
+    let (failure_tx, failure_rx) = crate::supervisor::failure_channel(0);
+    token.cancel();
+
+    let failure = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        crate::supervisor::supervise(
+            failure_rx,
+            &token,
+            guard_idle_epoch(epoch_rx, baseline, token.clone(), failure_tx),
+        ),
+    )
+    .await
+    .expect("shutdown must promptly join an idle shard's epoch guard");
+    assert!(
+        failure.is_none(),
+        "operator shutdown is not a worker failure"
+    );
 }

@@ -14,7 +14,7 @@
 //!   cargo test -p loader --test reload_rebuild -- --ignored --test-threads=1
 
 use common::{EpochNo, Lsn, PgColumn, PgRelation, ReplicaIdentity};
-use control::reload::{self, ReloadFlavor};
+use control::reload::{self, ReloadFenceIdentity, ReloadFlavor};
 use loader::duck::{S3Access, TableDb};
 use loader::health::LoaderState;
 use loader::phase_a::{TableCtx, run_phase_a};
@@ -192,14 +192,12 @@ async fn setup(epoch: EpochNo) -> (TableCtx, tempfile::TempDir) {
         compaction_interval: Duration::from_secs(3600),
         retention_lsn_lag: 16 << 20,
         pause_logged: Default::default(),
-        resync_ids: Default::default(),
     };
     (ctx, dir)
 }
 
-/// Walk a reload of `flavor` through the REAL transitions to `export_complete` at `first_lsn = l1`
-/// — the state the loader sees once the sink's export drains (for a rebuild-flavor reload the pause
-/// is lifted and chunks are claimable; a resync never paused anything).
+/// Walk a reload of either persisted flavor through the real transitions to `export_complete` at
+/// `first_lsn = l1` — the state where its claim pause lifts and reconciliation can start.
 async fn drained_reload(
     pool: &sqlx::PgPool,
     epoch: EpochNo,
@@ -213,19 +211,37 @@ async fn drained_reload(
     reload::claim_requested(pool, epoch, "sink-t", 60, 10)
         .await
         .unwrap();
+    let request_id = reload::get(pool, id)
+        .await
+        .unwrap()
+        .unwrap()
+        .parent_request_id
+        .expect("direct reload has a durable fence namespace");
+    let start_lsn = l1.parse::<Lsn>().unwrap();
+    let final_lsn = h.parse::<Lsn>().unwrap();
+    let fence = ReloadFenceIdentity {
+        request_id: Some(request_id),
+        source_schema: "public",
+        source_table: "orders",
+        schema_version: common::SchemaVersionNo(1),
+    };
+    reload::record_start_fence(pool, id, start_lsn, fence)
+        .await
+        .unwrap();
     reload::advance_cursor(
         pool,
         id,
         1,
         &serde_json::json!(["999"]),
-        l1.parse::<Lsn>().unwrap(),
+        start_lsn,
         common::SchemaVersionNo(1),
     )
     .await
     .unwrap();
-    reload::complete_export(pool, id, h.parse::<Lsn>().unwrap())
+    reload::record_end_marker(pool, id, final_lsn, fence)
         .await
         .unwrap();
+    reload::complete_export(pool, id, final_lsn).await.unwrap();
     id
 }
 
@@ -270,7 +286,7 @@ async fn rebuild_converges_mirror_to_source_and_kills_phantoms() {
 
     // The reload: chunks stamped L1 = 0/100 carry the source truth {1:'snap', 2:'b', 3:'c'};
     // a mid-export stream file at 0/200 updates 1 → 'newest' and deletes 2.
-    let reload_id = drained_reload(&ctx.pool, epoch, "0/100", "0/100", ReloadFlavor::Reload).await;
+    let reload_id = drained_reload(&ctx.pool, epoch, "0/100", "0/200", ReloadFlavor::Reload).await;
     let chunk = write_rows(
         epoch,
         "chunk1",
@@ -356,7 +372,7 @@ async fn superseded_rows_are_purged_and_their_content_discarded() {
     );
     let pre_w_id = seed_file(&ctx.pool, epoch, &pre_w, "stream", "0/60", None).await;
 
-    let reload_id = drained_reload(&ctx.pool, epoch, "0/100", "0/100", ReloadFlavor::Reload).await;
+    let reload_id = drained_reload(&ctx.pool, epoch, "0/100", "0/200", ReloadFlavor::Reload).await;
     let chunk = write_rows(
         epoch,
         "chunk1",
@@ -535,13 +551,14 @@ async fn rebuild_clears_the_lossy_cast_quarantine() {
 
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
-async fn resync_flavor_never_rebuilds_and_merges_over_the_live_mirror() {
+async fn resync_alias_uses_the_same_full_rebuild_path() {
     let _g = LOCK.lock().await;
     let epoch = EpochNo(670_006);
     let (ctx, _dir) = setup(epoch).await;
 
-    // A LIVE mirror the resync must NOT clear: ids 1,2 already streamed in. And — to prove the
-    // resync arm skips `clear_quarantine` (only a rebuild is that exit) — latch the quarantine.
+    // A live mirror contains ids 1,2. The full dump below contains ids 1,3, so identical rebuild
+    // semantics require id 2 to disappear. Latch quarantine too: either spelling is the recovery
+    // path and must clear it only after publishing the replacement generation.
     let live = write_rows(
         epoch,
         "live",
@@ -556,19 +573,17 @@ async fn resync_flavor_never_rebuilds_and_merges_over_the_live_mirror() {
     assert_eq!(mirror_count(&ctx), 2);
     ctx.state.quarantine();
 
-    // A RESYNC reload (H3), drained to export_complete at first_lsn = 0/100. `active_rebuilds`
-    // excludes resync, so the loader never paused — the chunk is claimable straight away.
+    // The legacy `resync` spelling is retained, but it now selects the same rebuild protocol.
     let reload_id = drained_reload(&ctx.pool, epoch, "0/100", "0/100", ReloadFlavor::Resync).await;
 
-    // A pre-`W` stream file (lsn_end <= first_lsn) that the REBUILD path would `delete_superseded`
-    // and discard with the old raw. Under resync it must survive and apply — proof the arm runs no
-    // purge. Claimed in the same batch, it sorts before the chunk in (lsn_end, id) order.
+    // This pre-fence stream file is covered by the full dump and must be purged, not replayed into
+    // the replacement generation.
     let pre_w = write_rows(
         epoch,
         "prew",
         &[(
             4,
-            "kept-no-purge",
+            "must-be-purged",
             "i",
             "0000000000000060",
             "0000000000000060",
@@ -576,7 +591,7 @@ async fn resync_flavor_never_rebuilds_and_merges_over_the_live_mirror() {
     );
     seed_file(&ctx.pool, epoch, &pre_w, "stream", "0/60", None).await;
 
-    // The resync chunk stamped L1 = 0/100: merges over the live mirror — updates id 1, adds id 3.
+    // The complete source image at the fence contains exactly ids 1 and 3.
     let chunk = write_rows(
         epoch,
         "chunk1",
@@ -590,36 +605,32 @@ async fn resync_flavor_never_rebuilds_and_merges_over_the_live_mirror() {
     run_phase_a(&ctx).await.unwrap();
     run_phase_b(&ctx).await.unwrap();
 
-    // Never rebuilt: the pre-existing live row survives (a rebuild would have dropped the whole
-    // mirror), the chunk merged over it, and the pre-`W` file's content was applied — not purged.
     assert_eq!(
-        mirror_status(&ctx, 2).as_deref(),
-        Some("keep"),
-        "no rebuild — the untouched live row survives"
+        mirror_status(&ctx, 2),
+        None,
+        "full rebuild removes stale rows"
     );
     assert_eq!(
         mirror_status(&ctx, 1).as_deref(),
         Some("resynced"),
-        "the chunk merges over the live mirror"
+        "the replacement generation carries the dump value"
     );
     assert_eq!(mirror_status(&ctx, 3).as_deref(), Some("new"));
     assert_eq!(
-        mirror_status(&ctx, 4).as_deref(),
-        Some("kept-no-purge"),
-        "resync runs no delete_superseded — the pre-`W` content is NOT discarded"
+        mirror_status(&ctx, 4),
+        None,
+        "the alias uses the same pre-fence purge"
     );
-    assert_eq!(mirror_count(&ctx), 4);
+    assert_eq!(mirror_count(&ctx), 2);
 
-    // No latch (a stale-vs-latest comparison must never fire off a resync chunk — H9) and no
-    // quarantine exit (only a rebuild clears it).
     assert_eq!(
         ctx.db.recorded_reload_id().unwrap(),
-        None,
-        "resync never sets the reload_id latch"
+        Some(reload_id),
+        "the alias records the published rebuild identity"
     );
     assert!(
-        ctx.state.is_quarantined(),
-        "resync is not a quarantine exit — the latch still holds"
+        !ctx.state.is_quarantined(),
+        "the alias is the same quarantine-recovery path"
     );
 }
 

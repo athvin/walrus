@@ -306,14 +306,12 @@ missing_errors_doc = "deny"
 # The no-panic policy: a recoverable failure — a bad config value, a short wire frame, a malformed
 # range literal — leaves as a typed `Err` that `main` maps onto a `common::ExitCode`, never as an
 # abort. All five are `restriction`/`pedantic` lints outside every group denied above, so only these
-# named entries reach them, and four of them have zero sites: dropping an entry reddens no source
-# file. `unimplemented` is the one that reports itself, because crates/pg-sink/src/backfill.rs's
-# `#[expect]` goes unfulfilled without it; for the other four what notices is
-# crates/common/tests/workspace_lints_inherited.rs, and what notices a scoped in-source allow past
+# named entries reach them. What notices if one is dropped is
+# crates/common/tests/workspace_lints_inherited.rs; what notices a scoped in-source suppression past
 # any of them is crates/common/tests/no_panic_suppression.rs.
 panic = "deny"              # a service returns a classified error instead of aborting the pod
 todo = "deny"               # unfinished code must not reach main
-unimplemented = "deny"      # the one deferred stub carries a scoped, fulfilled expectation
+unimplemented = "deny"      # incomplete production paths are compile failures
 unreachable = "deny"        # exhaustive matches turn impossible states into compile-time checks
 panic_in_result_fn = "deny" # a function that can return failure must not panic instead
 # Lock scope is a correctness property on the decode hot path (`own-mutex-interior`):
@@ -406,10 +404,12 @@ redundant_else = "deny"
 # out in five member manifests, in two different relative forms (`../common` from a `crates/*`
 # member, `../../crates/common` from `tests/e2e`), so moving a crate meant finding all of them. A
 # path here is resolved against the workspace root, so each internal crate has exactly one spelling
-# and each member states only the edge — plus any feature it needs on top. `loader`, `pg-sink` and
-# `e2e` are deliberately absent: nothing depends on them, so they have no edge to centralise.
+# and each member states only the edge — plus any feature it needs on top. `loader` and `e2e` are
+# deliberately absent: nothing depends on them, so they have no edge to centralise. The e2e source-
+# event test depends on `pg-sink` so it invokes the production request API rather than duplicating it.
 common = { path = "crates/common" }
 control = { path = "crates/control" }
+pg-sink = { path = "crates/pg-sink" }
 pg-to-arrow = { path = "crates/pg-to-arrow" }
 
 # Shared version pins live here so every workspace member resolves the same dependency versions.

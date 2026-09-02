@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "UPDATE walrus.table_reload\nSET status = 'exporting',\n    lease_holder = $2,\n    lease_expiry = now() + make_interval(secs => $3),\n    updated_at = now()\nWHERE reload_id IN (\n    SELECT reload_id FROM walrus.table_reload\n    WHERE epoch = $1 AND status = 'requested'\n    ORDER BY reload_id\n    LIMIT $4\n    FOR UPDATE SKIP LOCKED\n)\nRETURNING reload_id, epoch, source_schema, source_table,\n          flavor AS \"flavor: ReloadFlavor\", status AS \"status: ReloadStatus\",\n          chunk_no, cursor_pk,\n          first_lsn AS \"first_lsn: Lsn\", final_lsn AS \"final_lsn: Lsn\",\n          schema_version, restart_count, lease_holder, error\n",
+  "query": "SELECT reload_id, epoch, source_schema, source_table,\n       flavor AS \"flavor: ReloadFlavor\", status AS \"status: ReloadStatus\",\n       source_request_id, parent_request_id,\n       request_scope AS \"request_scope: ReloadScope\",\n       chunk_no, cursor_pk,\n       start_lsn AS \"start_lsn: Lsn\",\n       first_lsn AS \"first_lsn: Lsn\", final_lsn AS \"final_lsn: Lsn\",\n       schema_version, restart_count, lease_holder, error\nFROM walrus.table_reload\nWHERE reload_id = $1\n",
   "describe": {
     "columns": [
       {
@@ -35,16 +35,41 @@
       },
       {
         "ordinal": 6,
+        "name": "source_request_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 7,
+        "name": "parent_request_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 8,
+        "name": "request_scope: ReloadScope",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
         "name": "chunk_no",
         "type_info": "Int8"
       },
       {
-        "ordinal": 7,
+        "ordinal": 10,
         "name": "cursor_pk",
         "type_info": "Jsonb"
       },
       {
-        "ordinal": 8,
+        "ordinal": 11,
+        "name": "start_lsn: Lsn",
+        "type_info": {
+          "Custom": {
+            "name": "pg_lsn",
+            "kind": "Simple"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
         "name": "first_lsn: Lsn",
         "type_info": {
           "Custom": {
@@ -54,7 +79,7 @@
         }
       },
       {
-        "ordinal": 9,
+        "ordinal": 13,
         "name": "final_lsn: Lsn",
         "type_info": {
           "Custom": {
@@ -64,31 +89,28 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 14,
         "name": "schema_version",
         "type_info": "Int8"
       },
       {
-        "ordinal": 11,
+        "ordinal": 15,
         "name": "restart_count",
         "type_info": "Int4"
       },
       {
-        "ordinal": 12,
+        "ordinal": 16,
         "name": "lease_holder",
         "type_info": "Text"
       },
       {
-        "ordinal": 13,
+        "ordinal": 17,
         "name": "error",
         "type_info": "Text"
       }
     ],
     "parameters": {
       "Left": [
-        "Int8",
-        "Text",
-        "Float8",
         "Int8"
       ]
     },
@@ -99,7 +121,11 @@
       false,
       false,
       false,
+      true,
+      true,
       false,
+      false,
+      true,
       true,
       true,
       true,
@@ -109,5 +135,5 @@
       true
     ]
   },
-  "hash": "211f7b228ba4802c86f85b36283049ef2ff9256ffed7e23d9f9f5ab0c26803d4"
+  "hash": "c1a14ad8ee17377084be06c9a3a541e382c550d04e8335a941d3556fc4781bf7"
 }

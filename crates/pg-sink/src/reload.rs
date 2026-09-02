@@ -4,7 +4,7 @@
 //! stream stalled for one table's export, the single slot would lag for *every* table — the exact
 //! failure the reload design exists to avoid. So the controller lives entirely off the decode
 //! path: its own control-pg pool, its own source SQL connection for catalog preflight, and the
-//! only shared state is the `Arc<WatermarkWaiters>` the decode loop resolves.
+//! only shared state is the `Arc<FenceWaiters>` the decode loop resolves.
 //!
 //! Each tick (the heartbeat cadence): claim up to *free-permit-count* `requested` rows
 //! (`control::reload::claim_requested` — the DB guards double-claims), preflight each (fail fast
@@ -18,7 +18,7 @@
 //! `lease_holder` plus the `table_ownership` fencing-token pattern is how a stale sink would be
 //! kept from double-exporting. Noted, deliberately not built (`replicas=1`).
 
-use crate::reload_signal::WatermarkWaiters;
+use crate::reload_event::FenceWaiters;
 use anyhow::Context as _;
 use common::{EpochNo, Redacted};
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -49,6 +49,35 @@ fn count_i64(count: usize) -> i64 {
 /// Convert an in-memory count to the metrics API's unsigned domain without wrapping.
 fn count_u64(count: usize) -> u64 {
     u64::try_from(count).unwrap_or(u64::MAX)
+}
+
+/// How an exporter entered the current attempt. Every adopted connection must first recover a
+/// durable H and otherwise move to a fresh attempt identity: the abandoned connection may already
+/// have appended an as-yet-undecoded marker. Only an adoption with durable chunk progress spends the
+/// bounded lost-snapshot restart budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotOwnership {
+    Owned,
+    AdoptedPristine,
+    AdoptedWithProgress,
+}
+
+impl SnapshotOwnership {
+    const fn was_adopted(self) -> bool {
+        !matches!(self, Self::Owned)
+    }
+
+    const fn spends_restart_budget(self) -> bool {
+        matches!(self, Self::AdoptedWithProgress)
+    }
+}
+
+const fn adopted_snapshot_ownership(req: &control::ReloadRow) -> SnapshotOwnership {
+    if req.chunk_no > 0 || req.cursor_pk.is_some() {
+        SnapshotOwnership::AdoptedWithProgress
+    } else {
+        SnapshotOwnership::AdoptedPristine
+    }
 }
 
 /// A preflight either genuinely REJECTS the request (typed, terminal, operator-facing) or fails
@@ -85,6 +114,10 @@ pub enum PreflightRejection {
     /// The table has no primary key, so the chunk cursor has nothing to page on.
     #[error("table {0}.{1} has no primary key")]
     NoPrimaryKey(String, String),
+    /// The table is nominally present, but global actions or a per-table restriction make its WAL
+    /// incomplete for full-table reconciliation.
+    #[error(transparent)]
+    PublicationCoverage(#[from] crate::source_catalog::PublicationCoverageIssue),
 }
 
 /// Why a lease-guarded exporter ended (see [`lease_guarded_export`]).
@@ -210,10 +243,10 @@ where
     }
 }
 
-/// The outcome of a mid-export DDL restart (H9).
+/// The outcome of a bounded exporter-attempt restart.
 #[derive(Debug, Clone, Copy)]
 pub enum RestartDecision {
-    /// A fresh successor at the new schema; keep exporting under this `reload_id`.
+    /// A fresh successor with a fresh F; keep exporting under this `reload_id`.
     Restarted(common::ReloadId),
     /// `reload_max_restarts` is spent — the reload is now `failed`; stop.
     Capped,
@@ -267,6 +300,55 @@ pub async fn handle_ddl_restart(
     }
 }
 
+/// Supersede an adopted attempt whose connection-local source snapshot was lost, emitting the
+/// same bounded-restart metrics as DDL recovery. The control transaction fails and purges the
+/// predecessor before inserting its lease-carrying successor.
+///
+/// # Errors
+///
+/// Returns [`anyhow::Error`] if a control-pool connection cannot be acquired or the atomic
+/// fail/purge/successor transaction fails.
+pub async fn handle_lost_snapshot_restart(
+    pool: &sqlx::PgPool,
+    old: &control::ReloadRow,
+    max_restarts: i32,
+) -> anyhow::Result<RestartDecision> {
+    let table = format!("{}.{}", old.source_schema, old.source_table);
+    let mut conn = pool
+        .acquire()
+        .await
+        .context("acquire a control-pg connection for lost-snapshot restart")?;
+    match control::reload::restart_for_lost_snapshot(&mut conn, old, max_restarts)
+        .await
+        .with_context(|| {
+            format!(
+                "restart reload {} after source snapshot loss",
+                old.reload_id
+            )
+        })? {
+        Some(new_id) => {
+            common::metrics::record_reload_restart(&table);
+            tracing::info!(
+                old_reload_id = %old.reload_id,
+                new_reload_id = %new_id,
+                restart_count = old.restart_count.saturating_add(1),
+                "adopted reload restarted with a fresh source snapshot and F"
+            );
+            Ok(RestartDecision::Restarted(new_id))
+        }
+        None => {
+            common::metrics::record_reload_restart_cap_exhausted();
+            common::metrics::record_reload_failed(&table);
+            tracing::error!(
+                reload_id = %old.reload_id,
+                max_restarts,
+                "lost-snapshot restart cap exhausted — attempt failed"
+            );
+            Ok(RestartDecision::Capped)
+        }
+    }
+}
+
 /// Classify a preflighted target from its two independent catalog answers (H11): not being in the
 /// publication outranks having no primary key, so a table that is neither still reports the
 /// publication gap the operator must fix first.
@@ -295,33 +377,55 @@ fn classify_target(
     Ok(())
 }
 
+fn classify_publication_issue(
+    issue: crate::source_catalog::PublicationCoverageIssue,
+    schema: &str,
+    table: &str,
+) -> PreflightRejection {
+    if matches!(
+        issue,
+        crate::source_catalog::PublicationCoverageIssue::MissingTarget { .. }
+    ) {
+        PreflightRejection::NotPublished(schema.to_string(), table.to_string())
+    } else {
+        PreflightRejection::PublicationCoverage(issue)
+    }
+}
+
 /// The connections + config an exporter needs, bundled so the restart loop takes few args.
 struct ExportDeps {
     /// Wrapped for `ReloadController::source_db_url`'s reason — this is a clone of it.
     source_db_url: Redacted<String>,
     pool: sqlx::PgPool,
-    waiters: Arc<WatermarkWaiters>,
+    waiters: Arc<FenceWaiters>,
     sink: crate::sink::ParquetSink,
     export_cfg: crate::reload_export::ChunkExportConfig,
 }
 
-/// The exporter body under DDL-restart (H9): export until drained; on a mid-export
-/// structural bump, fail-and-reissue via [`handle_ddl_restart`] and resume from chunk zero at the
-/// new schema under the successor `reload_id` — or stop at the cap (the row is already `failed`).
+fn connect_schema_change(error: &anyhow::Error) -> Option<common::SchemaVersionNo> {
+    error
+        .downcast_ref::<crate::reload_export::ConnectSchemaChanged>()
+        .map(|changed| changed.new_version)
+}
+
+/// Export until drained under bounded fresh-attempt restarts. Structural changes and adopted
+/// connection-local snapshot loss both atomically fail/purge the predecessor and reissue from
+/// chunk zero with a fresh F — or stop at the cap (the row is already `failed`).
 /// `current_reload_id` is shared with the lease-renewal closure: repointing it to the successor
 /// BEFORE the next await keeps renewal following the lease onto the new row (which
 /// `restart_for_ddl` carried the lease onto), so a renewal tick never fails against the terminal
 /// predecessor.
-async fn export_with_ddl_restarts(
+async fn export_with_restarts(
     deps: ExportDeps,
     mut req: control::ReloadRow,
     max_restarts: i32,
     current_reload_id: Arc<AtomicI64>,
+    mut snapshot_ownership: SnapshotOwnership,
 ) -> anyhow::Result<()> {
     use crate::reload_export::{ChunkExporter, RunOutcome};
     let pool = deps.pool;
     loop {
-        let mut exporter = ChunkExporter::connect(
+        let mut exporter = match ChunkExporter::connect(
             deps.source_db_url.expose(),
             pool.clone(),
             Arc::clone(&deps.waiters),
@@ -330,9 +434,33 @@ async fn export_with_ddl_restarts(
             &req,
         )
         .await
-        .with_context(|| format!("connect chunk exporter for reload {}", req.reload_id))?;
+        {
+            Ok(exporter) => exporter,
+            Err(error) => {
+                let changed = connect_schema_change(&error);
+                let Some(new_version) = changed else {
+                    return Err(error).with_context(|| {
+                        format!("connect chunk exporter for reload {}", req.reload_id)
+                    });
+                };
+                let Some(successor) = restart_after_schema_change(
+                    &pool,
+                    &req,
+                    new_version,
+                    max_restarts,
+                    &current_reload_id,
+                )
+                .await?
+                else {
+                    return Ok(());
+                };
+                req = successor;
+                snapshot_ownership = SnapshotOwnership::Owned;
+                continue;
+            }
+        };
         match exporter
-            .run()
+            .run(snapshot_ownership.was_adopted())
             .await
             .with_context(|| format!("export chunks for reload {}", req.reload_id))?
         {
@@ -350,24 +478,117 @@ async fn export_with_ddl_restarts(
                 return Ok(());
             }
             RunOutcome::SchemaChanged { new_version } => {
-                match handle_ddl_restart(&pool, &req, new_version, max_restarts).await? {
-                    RestartDecision::Restarted(new_id) => {
-                        // Release publishes the lease-carrying successor before the next await. The
-                        // renewal currently shares this task; this documents the intended handoff if
-                        // it later moves to its own task and pairs with the Acquire loads below.
-                        current_reload_id.store(new_id.0, Ordering::Release);
-                        req = control::reload::get(&pool, new_id)
-                            .await
-                            .with_context(|| format!("read successor reload {new_id}"))?
-                            .ok_or_else(|| {
-                                anyhow::anyhow!("successor reload {new_id} vanished after restart")
-                            })?;
-                    }
-                    RestartDecision::Capped => return Ok(()),
-                }
+                let Some(successor) = restart_after_schema_change(
+                    &pool,
+                    &req,
+                    new_version,
+                    max_restarts,
+                    &current_reload_id,
+                )
+                .await?
+                else {
+                    return Ok(());
+                };
+                req = successor;
+                snapshot_ownership = SnapshotOwnership::Owned;
+            }
+            RunOutcome::SnapshotLost => {
+                let successor = if snapshot_ownership.spends_restart_budget() {
+                    let Some(successor) =
+                        restart_after_snapshot_loss(&pool, &req, max_restarts, &current_reload_id)
+                            .await?
+                    else {
+                        return Ok(());
+                    };
+                    successor
+                } else {
+                    restart_after_pristine_adoption(&pool, &req, &current_reload_id).await?
+                };
+                req = successor;
+                snapshot_ownership = SnapshotOwnership::Owned;
             }
         }
     }
+}
+
+async fn restart_after_schema_change(
+    pool: &sqlx::PgPool,
+    req: &control::ReloadRow,
+    new_version: common::SchemaVersionNo,
+    max_restarts: i32,
+    current_reload_id: &AtomicI64,
+) -> anyhow::Result<Option<control::ReloadRow>> {
+    match handle_ddl_restart(pool, req, new_version, max_restarts).await? {
+        RestartDecision::Restarted(new_id) => {
+            // Release publishes the lease-carrying successor before the next await. The renewal
+            // shares this task today; the ordering remains correct if it later moves independently.
+            current_reload_id.store(new_id.0, Ordering::Release);
+            let successor = control::reload::get(pool, new_id)
+                .await
+                .with_context(|| format!("read successor reload {new_id}"))?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("successor reload {new_id} vanished after restart")
+                })?;
+            Ok(Some(successor))
+        }
+        RestartDecision::Capped => Ok(None),
+    }
+}
+
+async fn restart_after_snapshot_loss(
+    pool: &sqlx::PgPool,
+    req: &control::ReloadRow,
+    max_restarts: i32,
+    current_reload_id: &AtomicI64,
+) -> anyhow::Result<Option<control::ReloadRow>> {
+    match handle_lost_snapshot_restart(pool, req, max_restarts).await? {
+        RestartDecision::Restarted(new_id) => {
+            current_reload_id.store(new_id.0, Ordering::Release);
+            let successor = control::reload::get(pool, new_id)
+                .await
+                .with_context(|| format!("read lost-snapshot successor reload {new_id}"))?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "lost-snapshot successor reload {new_id} vanished after restart"
+                    )
+                })?;
+            Ok(Some(successor))
+        }
+        RestartDecision::Capped => Ok(None),
+    }
+}
+
+async fn restart_after_pristine_adoption(
+    pool: &sqlx::PgPool,
+    req: &control::ReloadRow,
+    current_reload_id: &AtomicI64,
+) -> anyhow::Result<control::ReloadRow> {
+    let mut conn = pool
+        .acquire()
+        .await
+        .context("acquire a control-pg connection for pristine-adoption restart")?;
+    let new_id = control::reload::restart_pristine_adoption(&mut conn, req)
+        .await
+        .with_context(|| {
+            format!(
+                "restart pristine adopted reload {} with a fresh fence identity",
+                req.reload_id
+            )
+        })?;
+    current_reload_id.store(new_id.0, Ordering::Release);
+    let successor = control::reload::get(pool, new_id)
+        .await
+        .with_context(|| format!("read pristine-adoption successor reload {new_id}"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!("pristine-adoption successor reload {new_id} vanished after restart")
+        })?;
+    tracing::info!(
+        old_reload_id = %req.reload_id,
+        new_reload_id = %new_id,
+        restart_count = req.restart_count,
+        "adopted pristine reload moved to a fresh fence identity without spending restart budget"
+    );
+    Ok(successor)
 }
 
 /// Everything the controller needs, cut from [`SinkConfig`](crate::config::SinkConfig) + bootstrap
@@ -412,7 +633,7 @@ pub struct ReloadController {
     /// password inline.
     source_db_url: Redacted<String>,
     /// Exporters subscribe here before signalling; the decode loop resolves.
-    waiters: Arc<WatermarkWaiters>,
+    waiters: Arc<FenceWaiters>,
     /// Each exporter clones a handle: chunk Parquet lands in the same epoch-prefixed layout.
     sink: crate::sink::ParquetSink,
     cfg: ReloadControllerConfig,
@@ -448,7 +669,7 @@ impl ReloadController {
     pub fn spawn(
         pool: sqlx::PgPool,
         source_db_url: &str,
-        waiters: Arc<WatermarkWaiters>,
+        waiters: Arc<FenceWaiters>,
         sink: crate::sink::ParquetSink,
         cfg: ReloadControllerConfig,
         token: CancellationToken,
@@ -467,7 +688,7 @@ impl ReloadController {
             // Startup crash-recovery: adopt + resume our own / orphaned exporting reloads
             // ONCE, before the tick loop, unless we're already shutting down.
             if !token.is_cancelled() {
-                controller.adopt_and_resume(&mut exporters).await;
+                controller.adopt_and_resume(&mut exporters, true).await;
             }
             let mut tick = tokio::time::interval(controller.cfg.poll_interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -541,6 +762,8 @@ impl ReloadController {
         if let Err(e) = self.warn_stuck().await {
             tracing::debug!(error = %format_args!("{e:#}"), "stuck-reload scan failed this tick");
         }
+        self.maybe_complete_bootstrap().await?;
+        self.adopt_and_resume(exporters, false).await;
         let free = self.semaphore.available_permits();
         if free == 0 {
             return Ok(());
@@ -621,7 +844,7 @@ impl ReloadController {
                 flavor = req.flavor.as_str(),
                 "reload claimed → exporting; exporter scheduled"
             );
-            self.spawn_exporter(exporters, req, permit);
+            self.spawn_exporter(exporters, req, permit, SnapshotOwnership::Owned);
         }
         Ok(())
     }
@@ -634,6 +857,7 @@ impl ReloadController {
         exporters: &mut JoinSet<()>,
         req: control::ReloadRow,
         permit: tokio::sync::OwnedSemaphorePermit,
+        snapshot_ownership: SnapshotOwnership,
     ) {
         let pool = self.pool.clone();
         let holder = self.cfg.instance.clone();
@@ -645,6 +869,7 @@ impl ReloadController {
             echo_timeout: self.cfg.echo_timeout,
             instance: self.cfg.instance.clone(),
             epoch: self.cfg.epoch,
+            publication_name: self.cfg.publication_name.clone(),
         };
         let source_db_url = self.source_db_url.clone();
         let waiters = Arc::clone(&self.waiters);
@@ -670,12 +895,12 @@ impl ReloadController {
             let current_reload_id = Arc::new(AtomicI64::new(req.reload_id.0));
             let renew_pool = pool.clone();
             let renew_id = Arc::clone(&current_reload_id);
-            // The chunk engine under DDL-restart: dial the side connection,
-            // resume from the cursor, export until drained — restarting at the new schema if DDL
-            // bumps the version mid-export, then flipping export_complete. Echo timeout
+            // The chunk engine under bounded restart: dial the side connection and export one
+            // repeatable-read snapshot until drained. Adoption without durable H and DDL both
+            // create a fresh fenced successor before continuing, then flip export_complete. Echo timeout
             // fails the row inside; any other error leaves it `exporting` for lease-expiry and
             // startup adoption (infra errors are retried, never terminally mis-recorded).
-            let export = export_with_ddl_restarts(
+            let export = export_with_restarts(
                 ExportDeps {
                     source_db_url,
                     pool,
@@ -686,6 +911,7 @@ impl ReloadController {
                 req,
                 max_restarts,
                 Arc::clone(&current_reload_id),
+                snapshot_ownership,
             );
             let end = lease_guarded_export(
                 child,
@@ -728,12 +954,16 @@ impl ReloadController {
         exporters.spawn(exporter.instrument(span));
     }
 
-    /// Startup crash-recovery (H7): adopt this sink's own / orphaned `exporting` reloads
-    /// (re-acquiring each lease in a race-safe guarded UPDATE) and resume them from the chunk cursor
-    /// — NOT from WAL redelivery, which is long gone. Runs ONCE before the tick loop: `adopt_resumable`'s
-    /// `lease_holder = me` clause is only safe before any exporter of ours is live (afterwards a live
-    /// row would be re-adopted into a duplicate). Bounded by the free permits, so it never oversubscribes.
-    async fn adopt_and_resume(&self, exporters: &mut JoinSet<()>) {
+    /// Crash recovery (H7): adopt this sink's own live leases at startup, and expired orphaned
+    /// `exporting` reloads on every later tick (re-acquiring each lease in a race-safe guarded
+    /// UPDATE). Durable H finishes the same attempt; otherwise every adoption creates a fresh fenced
+    /// successor so an in-flight old marker cannot bind a new snapshot. A pristine pre-F or
+    /// pre-chunk attempt preserves its restart count; durable chunk progress spends the bounded
+    /// lost-snapshot budget. WAL redelivery is not the recovery mechanism.
+    /// `include_own_live_lease` is true only before the tick loop; later scans take expired leases
+    /// only, so a live task cannot be adopted twice.
+    /// Bounded by the free permits, so it never oversubscribes.
+    async fn adopt_and_resume(&self, exporters: &mut JoinSet<()>, include_own_live_lease: bool) {
         let free = self.semaphore.available_permits();
         if free == 0 {
             return;
@@ -744,14 +974,16 @@ impl ReloadController {
             &self.cfg.instance,
             ttl_secs(self.cfg.lease_ttl),
             count_i64(free),
+            include_own_live_lease,
         )
         .await;
         let Ok(adopted) = scan.inspect_err(|e| {
-            tracing::warn!(error = %e, "startup reload-adoption scan failed; requested reloads still pick up per tick");
+            tracing::warn!(error = %e, "reload-adoption scan failed; requested reloads still pick up per tick");
         }) else {
             return;
         };
         for req in adopted {
+            let snapshot_ownership = adopted_snapshot_ownership(&req);
             let Ok(permit) = Arc::clone(&self.semaphore).try_acquire_owned() else {
                 tracing::warn!(
                     reload_id = %req.reload_id,
@@ -764,9 +996,10 @@ impl ReloadController {
                 source_table = %format_args!("{}.{}", req.source_schema, req.source_table),
                 status = req.status.as_str(),
                 cursor_chunk = req.chunk_no,
-                "adopting reload (crash recovery); resuming from the cursor"
+                ?snapshot_ownership,
+                "adopting reload (crash recovery)"
             );
-            self.spawn_exporter(exporters, req, permit);
+            self.spawn_exporter(exporters, req, permit, snapshot_ownership);
         }
     }
 
@@ -785,6 +1018,53 @@ impl ReloadController {
                 reload_id = %reload_id,
                 lease_holder = ?holder,
                 "reload stuck: exporting with an expired, unadopted lease (no live exporter renewing it)"
+            );
+        }
+        Ok(())
+    }
+
+    /// Promote a new epoch only after every child in its durably bound all-table request has
+    /// published successfully. This runs on every controller tick, so it also repairs the crash
+    /// window where the final loader cutover committed immediately before the sink restarted.
+    async fn maybe_complete_bootstrap(&self) -> anyhow::Result<()> {
+        let Some(progress) = control::read_bootstrap_progress(&self.pool, self.cfg.epoch)
+            .await
+            .context("read bootstrap group progress")?
+        else {
+            return Ok(());
+        };
+        if progress.failed > 0 {
+            tracing::error!(
+                epoch = %self.cfg.epoch,
+                request_id = %progress.request_id,
+                expected = progress.expected_tables,
+                children = progress.children,
+                complete = progress.complete,
+                failed = progress.failed,
+                "bootstrap reconciliation has failed children; epoch remains bootstrapping"
+            );
+            return Ok(());
+        }
+        if !progress.is_ready() {
+            tracing::debug!(
+                epoch = %self.cfg.epoch,
+                request_id = %progress.request_id,
+                expected = progress.expected_tables,
+                children = progress.children,
+                complete = progress.complete,
+                "bootstrap reconciliation still in progress"
+            );
+            return Ok(());
+        }
+        if control::complete_bootstrap(&self.pool, self.cfg.epoch, progress.request_id)
+            .await
+            .context("promote completed bootstrap generation")?
+        {
+            tracing::info!(
+                epoch = %self.cfg.epoch,
+                request_id = %progress.request_id,
+                tables = progress.expected_tables,
+                "bootstrap reconciliation complete; epoch promoted to streaming"
             );
         }
         Ok(())
@@ -831,36 +1111,40 @@ impl ReloadController {
         source: &tokio_postgres::Client,
         req: &control::ReloadRow,
     ) -> Result<(), PreflightOutcome> {
-        // Both flavors preflight identically: in the publication + has a PK. `resync`
-        // needs no special guard — it merges chunks over the live mirror on the loader side, no
-        // pause and no rebuild; only the semantics differ, not the export.
+        // Both accepted flavor spellings preflight identically: in the publication + has a PK.
+        // `resync` is only a compatibility alias; it uses the same paused hidden-generation
+        // rebuild and fenced publication protocol as `reload`.
         //
-        // The two catalog reads are independent, and a tick preflights every claimed row in turn,
-        // so they ride this one connection concurrently (tokio-postgres pipelines futures polled
-        // together) — one round trip per row instead of two. The REJECTION precedence is unchanged:
-        // `classify_target` still tests the booleans in order, so a table that is neither published
-        // nor keyed still reports `NotPublished`. If both QUERIES fail, whichever error lands first
-        // wins; both classify as `Infra`, which releases the claim to retry either way.
-        let (published, has_pk) = tokio::try_join!(
+        // Publication actions, effective per-target options, and the PK read are independent, so
+        // tokio-postgres pipelines them on this one connection. Catalog failures remain Infra;
+        // only a successfully observed mismatch becomes a terminal rejection.
+        let ((actions, options), has_pk) = tokio::try_join!(
             async {
-                source
-                    .query_one(
-                        "SELECT EXISTS (SELECT 1 FROM pg_publication_tables
-                                        WHERE pubname = $1 AND schemaname = $2 AND tablename = $3)",
-                        &[
+                tokio::try_join!(
+                    async {
+                        crate::source_catalog::publication_actions(
+                            source,
+                            &self.cfg.publication_name,
+                        )
+                        .await
+                        .context("read reload publication action flags")
+                    },
+                    async {
+                        crate::source_catalog::publication_target_options(
+                            source,
                             &self.cfg.publication_name,
                             &req.source_schema,
                             &req.source_table,
-                        ],
-                    )
-                    .await
-                    .map(|row| row.get::<_, bool>(0))
-                    .with_context(|| {
-                        format!(
-                            "publication check for {}.{}",
-                            req.source_schema, req.source_table
                         )
-                    })
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "publication coverage check for {}.{}",
+                                req.source_schema, req.source_table
+                            )
+                        })
+                    },
+                )
             },
             async {
                 source
@@ -878,7 +1162,24 @@ impl ReloadController {
                     })
             },
         )?;
-        classify_target(published, has_pk, &req.source_schema, &req.source_table)
+        let coverage =
+            crate::source_catalog::require_publication_actions(&self.cfg.publication_name, actions)
+                .and_then(|()| {
+                    crate::source_catalog::require_full_target(
+                        &self.cfg.publication_name,
+                        &req.source_schema,
+                        &req.source_table,
+                        options,
+                    )
+                });
+        if let Err(issue) = coverage {
+            return Err(PreflightOutcome::Rejected(classify_publication_issue(
+                issue,
+                &req.source_schema,
+                &req.source_table,
+            )));
+        }
+        classify_target(true, has_pk, &req.source_schema, &req.source_table)
             .map_err(PreflightOutcome::Rejected)
     }
 }

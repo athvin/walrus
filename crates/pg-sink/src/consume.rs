@@ -17,11 +17,13 @@ use crate::relcache::{RelationCache, is_internal_table};
 use crate::replication::{ReplicationMessage, ReplicationStream};
 use anyhow::Context;
 use common::{EpochNo, Kind, Lsn, Op, SinkMeta, TupleValue, UtcTimestamp};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use tokio::time::{Instant, sleep};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 /// A missing required field at decode-loop build time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -47,6 +49,36 @@ fn transaction_scope(
     }
 }
 
+fn decode_reload_event(
+    rel: &common::PgRelation,
+    new: &[TupleValue],
+    xid: Option<u32>,
+    current_top: Option<u32>,
+) -> anyhow::Result<crate::reload_event::PendingReloadEvent> {
+    let top_xid = match transaction_scope(xid, current_top)? {
+        crate::ddl::TransactionScope::Ordinary => None,
+        crate::ddl::TransactionScope::Streamed { top_xid, .. } => Some(top_xid),
+    };
+    crate::reload_event::PendingReloadEvent::from_tuple(rel, new, xid, top_xid)
+        .context("parse walrus.reload_event tuple")
+}
+
+/// Resolve a DDL audit row only against the exact relation identity frozen into this epoch.
+///
+/// The source trigger sees every user table, not just publication members. Schema/name lookup is
+/// deliberately forbidden: a dropped and recreated table can reuse the same qualified name while
+/// having a different OID, and accepting that row would silently add an unpublished table to the
+/// registry and loader inventory.
+fn tracked_relation_for_ddl(
+    cache: &RelationCache,
+    event: &crate::ddl::DdlEvent,
+) -> Option<common::PgRelation> {
+    event
+        .c_rel_oid
+        .and_then(|oid| cache.latest_for(oid))
+        .map(|cached| cached.relation.clone())
+}
+
 /// The fully wired decode loop. Construct it with [`DecodeLoop::builder`]; [`DecodeLoop::run`]
 /// consumes the wiring so its mutable borrows cannot escape or be reused concurrently.
 #[derive(Debug)]
@@ -64,6 +96,7 @@ pub struct DecodeLoop<'a, C> {
     pool: &'a sqlx::PgPool,
     epoch: EpochNo,
     waiters: &'a crate::reload_signal::WatermarkWaiters,
+    fence_waiters: &'a crate::reload_event::FenceWaiters,
 }
 
 /// Wires a [`DecodeLoop`]. Every setter consumes and returns the builder, so the chain must be kept:
@@ -94,6 +127,7 @@ pub struct DecodeLoopBuilder<'a, C> {
     pool: Option<&'a sqlx::PgPool>,
     epoch: Option<EpochNo>,
     waiters: Option<&'a crate::reload_signal::WatermarkWaiters>,
+    fence_waiters: Option<&'a crate::reload_event::FenceWaiters>,
 }
 
 impl<C> Default for DecodeLoopBuilder<'_, C> {
@@ -112,6 +146,7 @@ impl<C> Default for DecodeLoopBuilder<'_, C> {
             pool: None,
             epoch: None,
             waiters: None,
+            fence_waiters: None,
         }
     }
 }
@@ -126,7 +161,8 @@ impl<'a, C> DecodeLoop<'a, C> {
 
 impl<C: Clock + Clone> DecodeLoop<'_, C> {
     /// Drive the stream: decode each `XLogData`, register each `Relation` (cache + schema_registry),
-    /// route I/U/D into per-table batchers (sealing at commit boundaries), PUT sealed batches to S3,
+    /// route I/U/D plus table-level TRUNCATE boundaries into per-table batchers (sealing at commit
+    /// boundaries), PUT sealed batches to S3,
     /// keep keepalives answered, and exit cleanly on cancel or stream end.
     ///
     /// # Errors
@@ -155,6 +191,7 @@ impl<C: Clock + Clone> DecodeLoop<'_, C> {
             pool,
             epoch,
             waiters,
+            fence_waiters,
         } = self;
         // `BatchRouter::route` retains its integration-test seam, but the cached relation owns the
         // structural version now; this compatibility argument is intentionally ignored there.
@@ -164,6 +201,10 @@ impl<C: Clock + Clone> DecodeLoop<'_, C> {
         // reload_signal echoes buffered between their Insert and their transaction's fate:
         // the watermark is the COMMIT LSN, which only the Commit message carries.
         let mut pending_signals = crate::reload_signal::PendingSignals::default();
+        // Source reload events are also provisional until their transaction commits.  End fences
+        // take the stronger path below: their waiter is not resolved until the target's committed
+        // rows have crossed object-store + manifest durability.
+        let mut pending_reload_events = crate::reload_event::PendingReloadEvents::default();
         // Idle windows are monotonic (`tokio::time::Instant`); `last_activity` moves on every user change,
         // never on keepalives or the heartbeat's own round-trip.
         let mut last_activity = Instant::now();
@@ -285,54 +326,71 @@ impl<C: Clock + Clone> DecodeLoop<'_, C> {
                                                 .context("parse ddl_audit tuple")?;
                                             let scope =
                                                 transaction_scope(*xid, demux.current_top())?;
-                                            let previous = ev
-                                                .c_rel_oid
-                                                .and_then(|oid| cache.latest_for(oid))
-                                                .or_else(|| {
-                                                    cache.latest_for_name(
-                                                        &ev.source_schema,
-                                                        &ev.source_table,
-                                                    )
-                                                })
-                                                .map(|cached| cached.relation.clone());
-                                            let observation = ddl.observe(scope, ev.clone());
+                                            let previous_for_oid =
+                                                tracked_relation_for_ddl(cache, &ev);
+                                            let Some(previous_for_oid) = previous_for_oid else {
+                                                // The source audit trigger observes every user table, while
+                                                // this epoch's cache is seeded from the exact frozen
+                                                // publication inventory. Publication additions are forbidden
+                                                // online, so an unknown OID is unrelated—not a dynamic table
+                                                // to register. A name fallback would be unsafe after drop +
+                                                // recreate because identity is the OID, not schema.table.
+                                                tracing::debug!(
+                                                    relation_oid = ?ev.c_rel_oid,
+                                                    source_table = %format_args!("{}.{}", ev.source_schema, ev.source_table),
+                                                    c_tag = %ev.c_tag,
+                                                    "ignoring DDL audit for an untracked relation"
+                                                );
+                                                continue;
+                                            };
+                                            let observation = ddl.observe(
+                                                scope,
+                                                ev.clone(),
+                                                Some(&previous_for_oid),
+                                            );
                                             if let Some(new_version) =
                                                 observation.structural_version
                                             {
-                                                // Cache the trigger's authoritative post-change catalog
-                                                // snapshot now, but commit-gate its registry row.
-                                                if let Some(after) =
-                                                    ev.relation_after(previous.as_ref())?
-                                                    && let Some(row) = cache_relation(
-                                                        cache,
-                                                        epoch,
-                                                        after,
-                                                        new_version,
-                                                    )?
-                                                {
-                                                    if observation.replay {
-                                                        persist_registry(pool, &row).await?;
-                                                    } else {
-                                                        ddl.stage_registry(scope, row);
+                                                // A sql_drop sentinel has no post-change relation. Do not
+                                                // try to build/cache its empty shape or cut files before
+                                                // transaction fate is known; a tracked drop fails at commit,
+                                                // while StreamAbort discards it without decode side effects.
+                                                if !ev.is_table_drop() {
+                                                    // Cache the trigger's authoritative post-change catalog
+                                                    // snapshot now, but commit-gate its registry row.
+                                                    if let Some(after) =
+                                                        ev.relation_after(Some(&previous_for_oid))?
+                                                        && let Some(row) = cache_relation(
+                                                            cache,
+                                                            epoch,
+                                                            after,
+                                                            new_version,
+                                                        )?
+                                                    {
+                                                        if observation.replay {
+                                                            persist_registry(pool, &row).await?;
+                                                        } else {
+                                                            ddl.stage_registry(scope, row);
+                                                        }
                                                     }
+                                                    // Cut committed old-version rows now; preserve any open
+                                                    // ordinary pre-DDL rows as a commit-gated segment.
+                                                    let sealed = router.cut_table(
+                                                        cache,
+                                                        &ev.source_schema,
+                                                        &ev.source_table,
+                                                    )?;
+                                                    flush_sealed(
+                                                        sealed,
+                                                        router.undurable_floor(),
+                                                        stream,
+                                                        sink,
+                                                        checkpoint,
+                                                        pool,
+                                                        epoch,
+                                                    )
+                                                    .await?;
                                                 }
-                                                // Cut committed old-version rows now; preserve any open
-                                                // ordinary pre-DDL rows as a commit-gated segment.
-                                                let sealed = router.cut_table(
-                                                    cache,
-                                                    &ev.source_schema,
-                                                    &ev.source_table,
-                                                )?;
-                                                flush_sealed(
-                                                    sealed,
-                                                    router.undurable_floor(),
-                                                    stream,
-                                                    sink,
-                                                    checkpoint,
-                                                    pool,
-                                                    epoch,
-                                                )
-                                                .await?;
                                                 tracing::info!(
                                                     source_table = %format_args!("{}.{}", ev.source_schema, ev.source_table),
                                                     c_tag = %ev.c_tag,
@@ -349,6 +407,25 @@ impl<C: Clock + Clone> DecodeLoop<'_, C> {
                                                 );
                                             }
                                         }
+                                    }
+                                    // Append-only reload request/fence events are control-plane rows,
+                                    // never user data.  Buffer until transaction fate is known; the
+                                    // Commit paths below enforce the stronger end-fence durability gate.
+                                    Message::Insert {
+                                        relation_oid,
+                                        new,
+                                        xid,
+                                    } if internal.is_reload_event(*relation_oid) => {
+                                        let rel = internal.reload_event_rel().context(
+                                            "reload_event OID known without its relation shape",
+                                        )?;
+                                        let event = decode_reload_event(
+                                            rel,
+                                            new,
+                                            *xid,
+                                            demux.current_top(),
+                                        )?;
+                                        pending_reload_events.push(event);
                                     }
                                     // The reload echo: the sink's own signal INSERT returning
                                     // through the stream. Buffered here; the waiter resolves at the
@@ -399,22 +476,38 @@ impl<C: Clock + Clone> DecodeLoop<'_, C> {
                                     Message::Delete { relation_oid, .. }
                                         if internal.is_internal(*relation_oid) => {}
                                     m @ Message::Commit { commit_lsn, .. } => {
-                                        // First seal/flush any user batch this commit made eligible.
+                                        // Promote this transaction, then strengthen an EndFence into a
+                                        // targeted cut even when ordinary cadence/size triggers stayed idle.
                                         let sealed =
                                             router.route(cache, m, frame_lsn, schema_version)?;
+                                        let committed_reload_events =
+                                            pending_reload_events.on_commit(*commit_lsn);
                                         ddl.on_commit(pool, *commit_lsn)
                                             .await
                                             .context("commit ordinary DDL state")?;
-                                        flush_sealed(
-                                            sealed,
-                                            router.undurable_floor(),
-                                            stream,
-                                            sink,
-                                            checkpoint,
-                                            pool,
-                                            epoch,
-                                        )
-                                        .await?;
+                                        let persisted_reload_events =
+                                            persist_committed_reload_events(
+                                                committed_reload_events,
+                                                sealed,
+                                                router,
+                                                stream,
+                                                sink,
+                                                checkpoint,
+                                                pool,
+                                            )
+                                            .await?;
+                                        // Start resolves after normal commit durability. End resolves only
+                                        // after the helper force-flushed its target AND recorded H.
+                                        let persisted_requests =
+                                            persisted_reload_events.resolve_fences(fence_waiters);
+                                        for request in persisted_requests {
+                                            tracing::info!(
+                                                event_id = %request.event.event_id,
+                                                request_id = %request.event.request_id,
+                                                commit_lsn = %request.commit_lsn,
+                                                "source reload request durably persisted in control"
+                                            );
+                                        }
                                         // Resolve any signal echoes this transaction carried: its commit
                                         // LSN IS the chunk watermark L_i. The signal txn needs no
                                         // special ack — confirmed_flush passes it like any consumed record.
@@ -454,7 +547,8 @@ impl<C: Clock + Clone> DecodeLoop<'_, C> {
                                     Message::StreamStop => demux.on_stream_stop(),
                                     m @ (Message::Insert { xid: Some(_), .. }
                                     | Message::Update { xid: Some(_), .. }
-                                    | Message::Delete { xid: Some(_), .. }) => {
+                                    | Message::Delete { xid: Some(_), .. }
+                                    | Message::Truncate { xid: Some(_), .. }) => {
                                         last_activity = Instant::now();
                                         demux.on_change(cache, m, sink, frame_lsn).await?;
                                     }
@@ -504,12 +598,39 @@ impl<C: Clock + Clone> DecodeLoop<'_, C> {
                                                 .await
                                                 .context("commit streamed manifest ready row")?;
                                         }
+                                        // Defensive path: a one-row internal event should not stream, but
+                                        // if it does, target objects from this transaction are now manifested.
+                                        // Persist its End marker before ACKing the StreamCommit; resolve only
+                                        // after the ordinary checkpoint send below succeeds.
+                                        let committed_reload_events = pending_reload_events
+                                            .on_stream_commit(*xid, *commit_lsn);
+                                        let persisted_reload_events =
+                                            persist_committed_reload_events(
+                                                committed_reload_events,
+                                                Vec::new(),
+                                                router,
+                                                stream,
+                                                sink,
+                                                checkpoint,
+                                                pool,
+                                            )
+                                            .await?;
                                         checkpoint.set_open_txn_floor(demux.open_floor());
                                         checkpoint.on_batch_durable(*commit_lsn);
                                         checkpoint
                                             .send(stream, false)
                                             .await
                                             .context("send streamed-commit standby status")?;
+                                        let persisted_requests =
+                                            persisted_reload_events.resolve_fences(fence_waiters);
+                                        for request in persisted_requests {
+                                            tracing::info!(
+                                                event_id = %request.event.event_id,
+                                                request_id = %request.event.request_id,
+                                                commit_lsn = %request.commit_lsn,
+                                                "streamed source reload request durably persisted in control"
+                                            );
+                                        }
                                         // Can't-happen defense: a single-row signal txn never
                                         // streams, but if one somehow did, its surviving echo resolves here.
                                         pending_signals.on_stream_commit(*commit_lsn, waiters);
@@ -534,6 +655,7 @@ impl<C: Clock + Clone> DecodeLoop<'_, C> {
                                         // An aborted (sub)transaction's signal echo must never resolve a
                                         // waiter — the commit never carried it.
                                         pending_signals.on_stream_abort(*top_xid, *sub_xid);
+                                        pending_reload_events.on_stream_abort(*top_xid, *sub_xid);
                                     }
                                     other => {
                                         // A user change is activity — it suppresses the idle beat.
@@ -542,6 +664,7 @@ impl<C: Clock + Clone> DecodeLoop<'_, C> {
                                             Message::Insert { .. }
                                                 | Message::Update { .. }
                                                 | Message::Delete { .. }
+                                                | Message::Truncate { .. }
                                         ) {
                                             last_activity = Instant::now();
                                         }
@@ -674,6 +797,17 @@ impl<'a, C> DecodeLoopBuilder<'a, C> {
         self
     }
 
+    /// The start/end-fence waiters resolved from committed `walrus.reload_event` rows.  End waiters
+    /// are resolved only after this loop has durably flushed their target table. Required.
+    #[must_use = "builder methods return the modified builder — chain or assign"]
+    pub const fn fence_waiters(
+        mut self,
+        fence_waiters: &'a crate::reload_event::FenceWaiters,
+    ) -> Self {
+        self.fence_waiters = Some(fence_waiters);
+        self
+    }
+
     /// Construct the fully wired loop, naming the first missing required field.
     ///
     /// # Errors
@@ -694,6 +828,7 @@ impl<'a, C> DecodeLoopBuilder<'a, C> {
             pool: self.pool.ok_or(DecodeLoopError("pool"))?,
             epoch: self.epoch.ok_or(DecodeLoopError("epoch"))?,
             waiters: self.waiters.ok_or(DecodeLoopError("waiters"))?,
+            fence_waiters: self.fence_waiters.ok_or(DecodeLoopError("fence_waiters"))?,
         })
     }
 }
@@ -712,6 +847,20 @@ async fn flush_sealed(
     pool: &sqlx::PgPool,
     epoch: EpochNo,
 ) -> anyhow::Result<()> {
+    let max_durable = persist_sealed(sealed, stream, sink, pool, epoch).await?;
+    advance_durable_frontier(max_durable, undurable_floor, stream, checkpoint).await
+}
+
+/// Complete durability steps (a) object PUT and (b) manifest commit, but deliberately do not ACK
+/// the source yet.  End-fence handling uses this seam to persist its data-free control marker after
+/// every target file is durable and before an ACK could make the source event non-replayable.
+async fn persist_sealed(
+    sealed: Vec<SealedBatch>,
+    stream: &mut ReplicationStream,
+    sink: &crate::sink::ParquetSink,
+    pool: &sqlx::PgPool,
+    epoch: EpochNo,
+) -> anyhow::Result<Option<Lsn>> {
     let mut max_durable = None;
     for batch in sealed {
         // Durability steps (a) PUT then (b) commit the manifest row — pumping unconditional keepalive
@@ -726,6 +875,18 @@ async fn flush_sealed(
             "durable: object + manifest committed"
         );
     }
+    Ok(max_durable)
+}
+
+/// Apply the existing committed-but-unsealed floor and send feedback for a newly durable file
+/// group.  Kept separate from [`persist_sealed`] so control markers can be crash-durable before an
+/// event commit becomes ACK-eligible without changing the normal floor calculation.
+async fn advance_durable_frontier(
+    max_durable: Option<Lsn>,
+    undurable_floor: Option<Lsn>,
+    stream: &mut ReplicationStream,
+    checkpoint: &mut crate::checkpoint::DurabilityCheckpoint,
+) -> anyhow::Result<()> {
     let Some(frontier) = durable_frontier(max_durable, undurable_floor) else {
         if let (Some(durable), Some(floor)) = (max_durable, undurable_floor)
             && floor <= durable
@@ -751,6 +912,320 @@ async fn flush_sealed(
         "durable file group complete; slot advanced"
     );
     Ok(())
+}
+
+/// Committed reload events whose end-fence target files and end markers are durable.  Keeping this
+/// as a distinct state prevents the decode loop from resolving a fence directly from tuple decode
+/// or transaction commit: the only constructor is [`persist_committed_reload_events`].
+#[derive(Debug)]
+struct PersistedReloadEvents {
+    events: Vec<crate::reload_event::CommittedReloadEvent>,
+}
+
+impl PersistedReloadEvents {
+    /// Resolve committed start/end waiters and return already-persisted request events for logging.
+    /// End events can reach this method only after their target flush and marker commit succeeded.
+    fn resolve_fences(
+        self,
+        waiters: &crate::reload_event::FenceWaiters,
+    ) -> Vec<crate::reload_event::CommittedReloadEvent> {
+        let mut requests = Vec::new();
+        for committed in self.events {
+            let Some(phase) = committed.event.fence_phase() else {
+                requests.push(committed);
+                continue;
+            };
+            let Some(reload_id) = committed.event.reload_id else {
+                tracing::error!(
+                    event_id = %committed.event.event_id,
+                    ?phase,
+                    "committed reload fence has no reload_id; not resolving"
+                );
+                continue;
+            };
+            waiters.resolve(
+                reload_id,
+                phase,
+                crate::reload_event::FenceEcho {
+                    commit_lsn: committed.commit_lsn,
+                    embedded_lsn: committed.event.embedded_lsn,
+                },
+            );
+        }
+        requests
+    }
+}
+
+/// Force-seal every end fence's target, persist all supplied batches, and commit every data-free
+/// end marker before allowing the ordinary durability checkpoint to advance.
+///
+/// Start fences use the same path without a force-seal or marker; callers resolve both phases only
+/// from the returned [`PersistedReloadEvents`].  The router's post-seal undurable floor is passed to
+/// the unchanged frontier calculation, so an unrelated table can still hold the slot behind its
+/// older committed rows even though this target's end fence is safe to publish.
+async fn persist_committed_reload_events<C: Clock + Clone>(
+    events: Vec<crate::reload_event::CommittedReloadEvent>,
+    mut sealed: Vec<SealedBatch>,
+    router: &mut BatchRouter<C>,
+    stream: &mut ReplicationStream,
+    sink: &crate::sink::ParquetSink,
+    checkpoint: &mut crate::checkpoint::DurabilityCheckpoint,
+    pool: &sqlx::PgPool,
+) -> anyhow::Result<PersistedReloadEvents> {
+    let epoch = router.epoch;
+    for committed in &events {
+        if committed.event.kind != crate::reload_event::ReloadEventKind::EndFence {
+            continue;
+        }
+        let (schema, table) = committed.event.target().with_context(|| {
+            format!(
+                "end-fence event {} has no concrete target",
+                committed.event.event_id
+            )
+        })?;
+        sealed.extend(
+            router
+                .force_flush_table(schema, table)
+                .with_context(|| format!("force-flush end fence for {schema}.{table}"))?,
+        );
+    }
+
+    let undurable_floor = router.undurable_floor();
+    let mut max_durable = persist_sealed(sealed, stream, sink, pool, epoch).await?;
+
+    // Persist every control-plane consequence before ACK. A crash can therefore replay the source
+    // event idempotently, while a successful ACK can never strand a request/fence only in memory.
+    for committed in &events {
+        match committed.event.kind {
+            crate::reload_event::ReloadEventKind::Request => {
+                let request_id = committed.event.request_id;
+                match committed.event.scope {
+                    crate::reload_event::ReloadScope::Table => {
+                        let (schema, table) = committed.event.target().with_context(|| {
+                            format!(
+                                "table reload request event {} has no target",
+                                committed.event.event_id
+                            )
+                        })?;
+                        control::reload::request_from_source(
+                            pool,
+                            &control::SourceReloadRequest {
+                                epoch,
+                                source_request_id: request_id,
+                                parent_request_id: None,
+                                scope: control::ReloadScope::Table,
+                                source_schema: schema,
+                                source_table: table,
+                                flavor: control::ReloadFlavor::Reload,
+                            },
+                        )
+                        .await
+                        .context("persist table reload request decoded from source WAL")?;
+                    }
+                    crate::reload_event::ReloadScope::AllPublished => {
+                        // This inventory was frozen into the source WAL row. A replay after a
+                        // publication/DDL change must fan out exactly the same children.
+                        let targets = dedupe_reload_targets(&committed.event.targets);
+                        for (schema, table) in targets {
+                            control::reload::request_from_source(
+                                pool,
+                                &control::SourceReloadRequest {
+                                    epoch,
+                                    source_request_id: request_id,
+                                    parent_request_id: Some(request_id),
+                                    scope: control::ReloadScope::AllPublished,
+                                    source_schema: schema,
+                                    source_table: table,
+                                    flavor: control::ReloadFlavor::Reload,
+                                },
+                            )
+                            .await
+                            .with_context(|| {
+                                format!("persist all-published reload child for {schema}.{table}")
+                            })?;
+                        }
+                    }
+                }
+            }
+            crate::reload_event::ReloadEventKind::StartFence => {
+                let reload_id = committed.event.reload_id.with_context(|| {
+                    format!(
+                        "start-fence event {} has no reload attempt",
+                        committed.event.event_id
+                    )
+                })?;
+                let schema_version = committed.event.schema_version.with_context(|| {
+                    format!(
+                        "start-fence event {} has no schema version",
+                        committed.event.event_id
+                    )
+                })?;
+                let (source_schema, source_table) =
+                    committed.event.target().with_context(|| {
+                        format!(
+                            "start-fence event {} has no concrete target",
+                            committed.event.event_id
+                        )
+                    })?;
+                let recorded = control::reload::record_start_fence(
+                    pool,
+                    reload_id,
+                    committed.commit_lsn,
+                    control::ReloadFenceIdentity {
+                        request_id: Some(committed.event.request_id),
+                        source_schema,
+                        source_table,
+                        schema_version,
+                    },
+                )
+                .await;
+                accept_failed_attempt_fence(
+                    pool,
+                    committed,
+                    reload_id,
+                    crate::reload_event::FencePhase::Start,
+                    recorded,
+                )
+                .await
+                .context("record durable reload start fence")?;
+            }
+            crate::reload_event::ReloadEventKind::EndFence => {
+                let reload_id = committed.event.reload_id.with_context(|| {
+                    format!(
+                        "end-fence event {} has no reload attempt",
+                        committed.event.event_id
+                    )
+                })?;
+                let schema_version = committed.event.schema_version.with_context(|| {
+                    format!(
+                        "end-fence event {} has no schema version",
+                        committed.event.event_id
+                    )
+                })?;
+                let (source_schema, source_table) =
+                    committed.event.target().with_context(|| {
+                        format!(
+                            "end-fence event {} has no concrete target",
+                            committed.event.event_id
+                        )
+                    })?;
+                let recorded = control::reload::record_end_marker(
+                    pool,
+                    reload_id,
+                    committed.commit_lsn,
+                    control::ReloadFenceIdentity {
+                        request_id: Some(committed.event.request_id),
+                        source_schema,
+                        source_table,
+                        schema_version,
+                    },
+                )
+                .await;
+                accept_failed_attempt_fence(
+                    pool,
+                    committed,
+                    reload_id,
+                    crate::reload_event::FencePhase::End,
+                    recorded,
+                )
+                .await
+                .context("record durable reload end marker")?;
+            }
+        }
+    }
+
+    // The event row itself carries no user-data batch. Once every consequence above is durable in
+    // control Postgres, its commit is nevertheless a durable point just like a manifested file.
+    // Including it lets an empty-table start/end request advance confirmed_flush without waiting
+    // for an unrelated future heartbeat; the ordinary undurable floor below still holds ACK behind
+    // any older committed user rows on another table.
+    for committed in &events {
+        max_durable = Some(max_durable.map_or(committed.commit_lsn, |durable| {
+            durable.max(committed.commit_lsn)
+        }));
+    }
+
+    advance_durable_frontier(max_durable, undurable_floor, stream, checkpoint).await?;
+    Ok(PersistedReloadEvents { events })
+}
+
+/// A fence can be irrevocably present in source WAL while DDL supersedes its attempt in control.
+/// Treat exactly that durable terminal race as a stale no-op; every other transition failure stays
+/// loud so a missing row, wrong target, or illegal live-state transition cannot be ACKed away.
+async fn accept_failed_attempt_fence(
+    pool: &sqlx::PgPool,
+    committed: &crate::reload_event::CommittedReloadEvent,
+    reload_id: common::ReloadId,
+    phase: crate::reload_event::FencePhase,
+    result: Result<(), control::ControlError>,
+) -> anyhow::Result<()> {
+    let Err(error) = result else {
+        return Ok(());
+    };
+    if !matches!(&error, control::ControlError::ReloadTransition { .. }) {
+        return Err(error.into());
+    }
+
+    let row = control::reload::get(pool, reload_id)
+        .await
+        .context("classify rejected reload fence transition")?;
+    let Some(row) = row else {
+        return Err(anyhow::Error::new(error).context(format!(
+            "reload fence {phase:?} references missing attempt {reload_id}"
+        )));
+    };
+    let target = committed.event.target();
+    if !is_matching_failed_fence(
+        row.status,
+        &row.source_schema,
+        &row.source_table,
+        row.source_request_id.or(row.parent_request_id),
+        row.schema_version,
+        target,
+        committed.event.request_id,
+        committed.event.schema_version,
+    ) {
+        return Err(anyhow::Error::new(error).context(format!(
+            "reload fence {phase:?} rejected for attempt {reload_id}: status={:?}, event_target={target:?}, row_target={}.{}",
+            row.status, row.source_schema, row.source_table
+        )));
+    }
+
+    tracing::info!(
+        %reload_id,
+        ?phase,
+        event_id = %committed.event.event_id,
+        source_table = %format_args!("{}.{}", row.source_schema, row.source_table),
+        "ignoring stale fence for DDL-superseded failed reload"
+    );
+    Ok(())
+}
+
+#[must_use]
+fn is_matching_failed_fence(
+    status: control::ReloadStatus,
+    row_schema: &str,
+    row_table: &str,
+    row_request_id: Option<Uuid>,
+    row_schema_version: Option<common::SchemaVersionNo>,
+    event_target: Option<(&str, &str)>,
+    event_request_id: Uuid,
+    event_schema_version: Option<common::SchemaVersionNo>,
+) -> bool {
+    status == control::ReloadStatus::Failed
+        && event_target.is_some_and(|(schema, table)| schema == row_schema && table == row_table)
+        && row_request_id.is_none_or(|request_id| request_id == event_request_id)
+        && row_schema_version.is_none_or(|version| event_schema_version == Some(version))
+}
+
+#[must_use]
+fn dedupe_reload_targets(
+    targets: &[crate::reload_event::ReloadTarget],
+) -> std::collections::BTreeSet<(&str, &str)> {
+    targets
+        .iter()
+        .map(|target| (target.schema.as_str(), target.table.as_str()))
+        .collect()
 }
 
 /// Highest newly-durable LSN that is strictly before any committed-but-unsealed row.
@@ -817,8 +1292,7 @@ pub async fn flush_batch(
     flush_batch_kind(sink, ex, epoch, batch, crate::sink::FileKind::Stream).await
 }
 
-/// As [`flush_batch`], stamping the object + manifest `kind` — the backfill flushes with
-/// [`crate::sink::FileKind::Snapshot`].
+/// As [`flush_batch`], stamping an explicit object + manifest `kind` for reload or spill writers.
 ///
 /// ## Cancel safety
 ///
@@ -880,6 +1354,148 @@ struct RowSource<'a> {
     xid: u32,
 }
 
+/// Whether an UPDATE's old and new images address different replication keys.
+///
+/// pgoutput supplies an old tuple for `REPLICA IDENTITY FULL` updates even when the key did not
+/// move, so the presence of `old` alone is not enough. Compare only the relation's key columns.
+/// The preflight requires a real primary key; an absent key or malformed tuple is therefore a
+/// protocol/catalog invariant violation and must stop acknowledgement rather than leak a ghost row.
+///
+/// # Errors
+///
+/// Returns an error if either tuple width differs from the relation, the relation has no key, or an
+/// old key arrives as an unresolved TOAST placeholder. A `new` unchanged-TOAST marker is explicitly
+/// equal to the old value: that is the marker's wire meaning.
+pub(crate) fn update_changes_key(
+    relation: &common::PgRelation,
+    old: &[TupleValue],
+    new: &[TupleValue],
+) -> anyhow::Result<bool> {
+    let expected = relation.columns.len();
+    anyhow::ensure!(
+        old.len() == expected && new.len() == expected,
+        "UPDATE tuple width mismatch for {}.{}: relation={expected}, old={}, new={}",
+        relation.schema,
+        relation.name,
+        old.len(),
+        new.len()
+    );
+
+    let mut saw_key = false;
+    let mut changed = false;
+    for (index, column) in relation.columns.iter().enumerate() {
+        if !column.is_key {
+            continue;
+        }
+        saw_key = true;
+        // Width was checked above, so zipped iteration would also be safe; checked access keeps
+        // this helper valid under the crate's no-indexing lint if it is enabled here later.
+        let old_value = old.get(index).context("checked UPDATE old tuple width")?;
+        let new_value = new.get(index).context("checked UPDATE new tuple width")?;
+        anyhow::ensure!(
+            !matches!(old_value, TupleValue::UnchangedToast),
+            "UPDATE old key column {}.{}.{} arrived as unchanged TOAST",
+            relation.schema,
+            relation.name,
+            column.name
+        );
+        if matches!(new_value, TupleValue::UnchangedToast) {
+            continue;
+        }
+        changed |= old_value != new_value;
+    }
+    anyhow::ensure!(
+        saw_key,
+        "UPDATE relation {}.{} has no replication key",
+        relation.schema,
+        relation.name
+    );
+    Ok(changed)
+}
+
+/// Replace an unchanged-TOAST marker in an UPDATE's replication-key columns with the actual old
+/// key value. Arrow represents the marker as NULL and the loader partitions by these columns, so
+/// allowing the sentinel to cross the sink boundary would address a NULL key instead of the source
+/// row. Non-key sentinels deliberately remain untouched for the loader's value back-scan.
+///
+/// The common case borrows `new` without allocating; an owned copy is made only when a key marker
+/// actually needs substitution.
+///
+/// # Errors
+///
+/// Returns an error if a tuple has the wrong width, the relation has no replication key, a key
+/// sentinel has no old image to resolve it from, or the old key is itself unresolved.
+pub(crate) fn normalize_update_keys<'a>(
+    relation: &common::PgRelation,
+    old: Option<&[TupleValue]>,
+    new: &'a [TupleValue],
+) -> anyhow::Result<Cow<'a, [TupleValue]>> {
+    let expected = relation.columns.len();
+    anyhow::ensure!(
+        new.len() == expected,
+        "UPDATE new tuple width mismatch for {}.{}: relation={expected}, new={}",
+        relation.schema,
+        relation.name,
+        new.len()
+    );
+    if let Some(old) = old {
+        anyhow::ensure!(
+            old.len() == expected,
+            "UPDATE old tuple width mismatch for {}.{}: relation={expected}, old={}",
+            relation.schema,
+            relation.name,
+            old.len()
+        );
+    }
+
+    let mut normalized = Cow::Borrowed(new);
+    let mut saw_key = false;
+    for (index, column) in relation.columns.iter().enumerate() {
+        if !column.is_key {
+            continue;
+        }
+        saw_key = true;
+        let new_value = normalized
+            .as_ref()
+            .get(index)
+            .context("checked UPDATE new tuple width")?;
+        if !matches!(new_value, TupleValue::UnchangedToast) {
+            continue;
+        }
+        let old_value = old
+            .context("UPDATE key arrived as unchanged TOAST without an old image")?
+            .get(index)
+            .context("checked UPDATE old tuple width")?;
+        anyhow::ensure!(
+            !matches!(old_value, TupleValue::UnchangedToast),
+            "UPDATE old key column {}.{}.{} arrived as unchanged TOAST",
+            relation.schema,
+            relation.name,
+            column.name
+        );
+        normalized
+            .to_mut()
+            .get_mut(index)
+            .context("checked normalized UPDATE tuple width")?
+            .clone_from(old_value);
+    }
+    anyhow::ensure!(
+        saw_key,
+        "UPDATE relation {}.{} has no replication key",
+        relation.schema,
+        relation.name
+    );
+    Ok(normalized)
+}
+
+/// A TRUNCATE has no tuple on the wire, but the raw Parquet schema is table-shaped. A full-width
+/// NULL tuple carries the table-level `op='t'` boundary through that schema; the loader filters its
+/// values and orders the boundary solely by `(commit_lsn, lsn)`.
+#[must_use]
+pub(crate) fn truncate_values(relation: &common::PgRelation) -> Vec<TupleValue> {
+    vec![TupleValue::Null; relation.columns.len()]
+}
+
 impl<C: Clock + Clone> BatchRouter<C> {
     /// A fresh router with no batchers. Pure — nothing is registered anywhere, so a discarded call
     /// builds and drops the routing table. `clippy::must_use_candidate` skips it (the `C` type
@@ -912,9 +1528,10 @@ impl<C: Clock + Clone> BatchRouter<C> {
     }
 
     /// Route one decoded message. `Begin` sets the txn context; `I/U/D` buffer against the open txn;
-    /// `Commit` promotes them and returns any batches that a trigger sealed. The outer decode loop
-    /// sends streamed transactions through `StreamDemux`; `Truncate` and logical `Message` frames do
-    /// not create row batches here.
+    /// `Commit` promotes them and returns any batches that a trigger sealed. A key-changing update
+    /// contributes two rows (delete the old key, then upsert the new image), and `Truncate`
+    /// contributes one data-free boundary row per affected table. The outer decode loop sends
+    /// streamed transactions through `StreamDemux`; logical `Message` frames do not create batches.
     ///
     /// # Errors
     ///
@@ -951,18 +1568,40 @@ impl<C: Clock + Clone> BatchRouter<C> {
             }
             Message::Update {
                 relation_oid,
+                old,
                 new,
                 xid,
                 ..
             } => {
+                let xid = xid.unwrap_or(self.txn_xid);
+                let cached = self.cached_relation(cache, *relation_oid)?;
+                let normalized =
+                    normalize_update_keys(&cached.relation, old.as_deref(), new.as_slice())?;
+                if let Some(old) = old
+                    && update_changes_key(&cached.relation, old, normalized.as_ref())?
+                {
+                    // pgoutput's UPDATE new image cannot remove the old mirror row after a key
+                    // change: it addresses the new key. Preserve the old identity as an ordered
+                    // delete in the same source transaction, then route the new image below.
+                    self.push(
+                        cache,
+                        RowSource {
+                            oid: *relation_oid,
+                            op: Op::Delete,
+                            values: old,
+                            frame_lsn,
+                            xid,
+                        },
+                    )?;
+                }
                 self.push(
                     cache,
                     RowSource {
                         oid: *relation_oid,
                         op: Op::Update,
-                        values: new,
+                        values: normalized.as_ref(),
                         frame_lsn,
-                        xid: xid.unwrap_or(self.txn_xid),
+                        xid,
                     },
                 )?;
                 Ok(Vec::new())
@@ -986,6 +1625,34 @@ impl<C: Clock + Clone> BatchRouter<C> {
                 )?;
                 Ok(Vec::new())
             }
+            Message::Truncate { xid, relations, .. } => {
+                let xid = xid.unwrap_or(self.txn_xid);
+                anyhow::ensure!(
+                    !relations.is_empty(),
+                    "pgoutput TRUNCATE names no relations"
+                );
+                // Resolve every shape before mutating any batcher. If one relation is unexpectedly
+                // absent, fail the whole frame loudly instead of retaining only a prefix of a
+                // multi-table TRUNCATE and acknowledging a partial wipe.
+                let targets = relations
+                    .iter()
+                    .map(|oid| self.cached_relation(cache, *oid))
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                for cached in targets {
+                    let values = truncate_values(&cached.relation);
+                    self.push(
+                        cache,
+                        RowSource {
+                            oid: cached.relation.oid,
+                            op: Op::Truncate,
+                            values: &values,
+                            frame_lsn,
+                            xid,
+                        },
+                    )?;
+                }
+                Ok(Vec::new())
+            }
             Message::Commit {
                 commit_lsn,
                 commit_ts,
@@ -996,21 +1663,22 @@ impl<C: Clock + Clone> BatchRouter<C> {
         }
     }
 
-    fn push(&mut self, cache: &RelationCache, row: RowSource<'_>) -> anyhow::Result<()> {
+    fn cached_relation(
+        &self,
+        cache: &RelationCache,
+        oid: u32,
+    ) -> anyhow::Result<Arc<crate::relcache::CachedRelation>> {
         // A transaction-local DDL can put a provisional newer shape in the shared cache. Route by the
         // Relation message that actually preceded this ordinary change, never by a global `latest` read.
-        let cached = self
-            .bindings
-            .get(&row.oid)
-            .and_then(|version| cache.get(row.oid, *version))
-            .or_else(|| cache.latest_for(row.oid));
-        let Some(cached) = cached else {
-            tracing::warn!(
-                relation_oid = row.oid,
-                "change for a relation with no cached shape yet; skipping"
-            );
-            return Ok(());
-        };
+        self.bindings
+            .get(&oid)
+            .and_then(|version| cache.get(oid, *version))
+            .or_else(|| cache.latest_for(oid))
+            .with_context(|| format!("ordinary change relation version is not cached: oid={oid}"))
+    }
+
+    fn push(&mut self, cache: &RelationCache, row: RowSource<'_>) -> anyhow::Result<()> {
+        let cached = self.cached_relation(cache, row.oid)?;
         let batcher = match self.batchers.entry(row.oid) {
             Entry::Occupied(e) => e.into_mut(),
             // The clock clone stays inside this arm. `C` is an `Arc` in production, so hoisting it
@@ -1108,6 +1776,53 @@ impl<C: Clock + Clone> BatchRouter<C> {
             .chain(self.pending_cuts.iter())
             .filter_map(TableBatcher::undurable_floor)
             .min()
+    }
+
+    /// Force every committed segment for one source table into sealed batches.
+    ///
+    /// This is the in-memory half of an end-fence durability barrier.  The caller invokes it at
+    /// the fence transaction's commit boundary, then durably writes every returned batch before
+    /// publishing or resolving that fence.  Other tables remain open and continue to contribute
+    /// to [`Self::undurable_floor`], so targeted fencing does not weaken normal slot-ACK ordering.
+    ///
+    /// Both the current batcher and any pre-DDL cut are considered, which makes "all committed
+    /// rows for this table" true across a schema boundary.  No open transaction is ever discarded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] if any matching segment still has an open transaction (the caller
+    /// is not at a commit boundary), or if its committed Arrow batch cannot be sealed.
+    pub fn force_flush_table(
+        &mut self,
+        schema: &str,
+        table: &str,
+    ) -> anyhow::Result<Vec<SealedBatch>> {
+        let has_open_target = self
+            .batchers
+            .values()
+            .chain(self.pending_cuts.iter())
+            .any(|batcher| batcher.is_for_table(schema, table) && batcher.has_open_txn());
+        if has_open_target {
+            anyhow::bail!(
+                "cannot force-flush durability fence for {schema}.{table} with an open transaction"
+            );
+        }
+
+        let mut sealed = Vec::new();
+        for batcher in self
+            .pending_cuts
+            .iter_mut()
+            .chain(self.batchers.values_mut())
+            .filter(|batcher| batcher.is_for_table(schema, table))
+        {
+            if let Some(batch) = batcher
+                .force_seal_committed()
+                .context("force-seal table durability fence")?
+            {
+                sealed.push(batch);
+            }
+        }
+        Ok(sealed)
     }
 
     /// Graceful-drain seal: seal every table's in-flight **committed** batch, dropping any

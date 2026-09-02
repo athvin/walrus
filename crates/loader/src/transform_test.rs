@@ -1,5 +1,5 @@
 use super::*;
-use common::{PgColumn, PgRelation, ReplicaIdentity};
+use common::{PgColumn, PgRelation, ReplicaIdentity, Tier, TypeDescriptor, TypeMeta, oids};
 
 fn relation() -> PgRelation {
     PgRelation {
@@ -82,4 +82,609 @@ fn a_broken_raw_table_is_an_error_not_an_absent_truncate_boundary() {
 
     let err = transform.latest_truncate(&conn, Lsn::ZERO).unwrap_err();
     assert!(matches!(err, LoaderError::Duck { .. }), "got {err:?}");
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TransformPath {
+    Incremental,
+    DuckLake,
+    Rebuild,
+}
+
+impl TransformPath {
+    fn apply(self, conn: &duckdb::Connection, transform: &TransformSql) {
+        let sql = match self {
+            Self::Incremental => transform.render(Lsn::ZERO, None),
+            Self::DuckLake => transform.render_ducklake(Lsn::ZERO, None),
+            Self::Rebuild => transform.render_rebuild(None),
+        };
+        conn.execute_batch(&sql).unwrap();
+    }
+}
+
+fn descriptor(column: &str, oid: u32, duckdb: &str, emit: &[&str]) -> TypeDescriptor {
+    TypeDescriptor {
+        column: column.into(),
+        pg_type_oid: oid,
+        pg_type: column.into(),
+        tier: Tier::Two,
+        arrow: "test".into(),
+        duckdb: duckdb.into(),
+        emit: emit.iter().map(ToString::to_string).collect(),
+        recombine: None,
+        meta: TypeMeta::default(),
+    }
+}
+
+fn relation_with(table: &str, value: &str, value_oid: u32) -> PgRelation {
+    PgRelation {
+        oid: 42,
+        schema: "public".into(),
+        name: table.into(),
+        replica_identity: ReplicaIdentity::Default,
+        columns: vec![
+            PgColumn {
+                name: "id".into(),
+                type_oid: oids::INT4,
+                type_modifier: -1,
+                is_key: true,
+            },
+            PgColumn {
+                name: value.into(),
+                type_oid: value_oid,
+                type_modifier: -1,
+                is_key: false,
+            },
+        ],
+    }
+}
+
+fn hex_lsn(value: u64) -> String {
+    Lsn::new(value).to_string()
+}
+
+#[test]
+fn tier2_recombine_resolves_the_source_sentinel_in_incremental_and_rebuild_paths() {
+    let rel = relation_with("events", "elapsed", oids::INTERVAL);
+    let elapsed = descriptor(
+        "elapsed",
+        oids::INTERVAL,
+        "INTERVAL",
+        &[
+            "elapsed_months:INT32",
+            "elapsed_days:INT32",
+            "elapsed_micros:INT64",
+        ],
+    );
+    let plan = crate::plan::TablePlan::from_registry(&rel, &[elapsed]);
+    let transform = TransformSql::from_plan(&plan);
+
+    for path in [TransformPath::Incremental, TransformPath::Rebuild] {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE events (
+                 id INTEGER PRIMARY KEY, elapsed INTERVAL,
+                 \"_applied_commit_lsn\" VARCHAR DEFAULT '0000000000000000',
+                 \"_applied_lsn\" VARCHAR DEFAULT '0000000000000000');
+             CREATE TABLE events_raw (
+                 id INTEGER, elapsed_months INTEGER, elapsed_days INTEGER, elapsed_micros BIGINT,
+                 walrus_pg_sink_meta VARCHAR, \"_walrus_op\" VARCHAR,
+                 \"_walrus_commit_lsn\" VARCHAR, \"_walrus_lsn\" VARCHAR);",
+        )
+        .unwrap();
+        // Deliberately wrong fallback: successful resolution must use the earlier raw setter.
+        conn.execute(
+            "INSERT INTO events (id, elapsed) VALUES (1, to_days(99))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO events_raw VALUES
+                 (1, 2, 3, 4, '{}', 'i', ?, ?),
+                 (1, NULL, NULL, NULL, '{\"unchanged_toast\":[\"elapsed\"]}', 'u', ?, ?)",
+            duckdb::params![hex_lsn(100), hex_lsn(1), hex_lsn(100), hex_lsn(2)],
+        )
+        .unwrap();
+
+        path.apply(&conn, &transform);
+
+        let resolved: bool = conn
+            .query_row(
+                "SELECT elapsed = to_months(2) + to_days(3) + to_microseconds(4)
+                 FROM events WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(resolved, "Tier-2 recombine failed on selected path");
+    }
+}
+
+#[test]
+fn timetz_recombine_backscan_uses_the_original_source_name_in_both_paths() {
+    let rel = relation_with("schedule", "at", oids::TIMETZ);
+    let at = descriptor(
+        "at",
+        oids::TIMETZ,
+        "TIME WITH TIME ZONE",
+        &["at_micros:INT64", "at_offset:INT32"],
+    );
+    let plan = crate::plan::TablePlan::from_registry(&rel, &[at]);
+    let transform = TransformSql::from_plan(&plan);
+    let prior = r#"list_value(make_timetz(r."at_micros", r."at_offset"))"#;
+
+    for sql in [
+        transform.render(Lsn::ZERO, None),
+        transform.render_rebuild(None),
+    ] {
+        assert!(sql.contains(prior), "got {sql}");
+        assert!(sql.contains(r#"LIKE '%"at"%'"#), "got {sql}");
+        assert!(!sql.contains(r#"LIKE '%"at_micros"%'"#), "got {sql}");
+    }
+}
+
+#[test]
+fn tier2_flat_siblings_resolve_the_source_sentinel_in_incremental_and_rebuild_paths() {
+    let rel = relation_with("ranges", "span", oids::INT4RANGE);
+    let span = descriptor(
+        "span",
+        oids::INT4RANGE,
+        "IGNORED",
+        &[
+            "span_lower:INT32",
+            "span_upper:INT32",
+            "span_lower_inc:BOOLEAN",
+            "span_upper_inc:BOOLEAN",
+            "span_empty:BOOLEAN",
+        ],
+    );
+    let plan = crate::plan::TablePlan::from_registry(&rel, &[span]);
+    let transform = TransformSql::from_plan(&plan);
+
+    for path in [TransformPath::Incremental, TransformPath::Rebuild] {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ranges (
+                 id INTEGER PRIMARY KEY, span_lower INTEGER, span_upper INTEGER,
+                 span_lower_inc BOOLEAN, span_upper_inc BOOLEAN, span_empty BOOLEAN,
+                 \"_applied_commit_lsn\" VARCHAR DEFAULT '0000000000000000',
+                 \"_applied_lsn\" VARCHAR DEFAULT '0000000000000000');
+             CREATE TABLE ranges_raw (
+                 id INTEGER, span_lower INTEGER, span_upper INTEGER,
+                 span_lower_inc BOOLEAN, span_upper_inc BOOLEAN, span_empty BOOLEAN,
+                 walrus_pg_sink_meta VARCHAR, \"_walrus_op\" VARCHAR,
+                 \"_walrus_commit_lsn\" VARCHAR, \"_walrus_lsn\" VARCHAR);
+             INSERT INTO ranges VALUES
+                 (1, 90, 99, FALSE, FALSE, TRUE, '0000000000000000', '0000000000000000');",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ranges_raw VALUES
+                 (1, 10, 20, TRUE, FALSE, FALSE, '{}', 'i', ?, ?),
+                 (1, NULL, NULL, NULL, NULL, NULL,
+                  '{\"unchanged_toast\":[\"span\"]}', 'u', ?, ?)",
+            duckdb::params![hex_lsn(100), hex_lsn(1), hex_lsn(100), hex_lsn(2)],
+        )
+        .unwrap();
+
+        path.apply(&conn, &transform);
+
+        let values: (i32, i32, bool, bool, bool) = conn
+            .query_row(
+                "SELECT span_lower, span_upper, span_lower_inc, span_upper_inc, span_empty
+                 FROM ranges WHERE id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(values, (10, 20, true, false, false));
+    }
+}
+
+#[test]
+fn a_found_real_null_wins_over_the_mirror_fallback_in_both_paths() {
+    let rel = relation_with("notes", "body", oids::TEXT);
+    let transform = TransformSql::from_relation(&rel);
+
+    for path in [TransformPath::Incremental, TransformPath::Rebuild] {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE notes (
+                 id INTEGER PRIMARY KEY, body VARCHAR,
+                 \"_applied_commit_lsn\" VARCHAR DEFAULT '0000000000000000',
+                 \"_applied_lsn\" VARCHAR DEFAULT '0000000000000000');
+             CREATE TABLE notes_raw (
+                 id INTEGER, body VARCHAR, walrus_pg_sink_meta VARCHAR, \"_walrus_op\" VARCHAR,
+                 \"_walrus_commit_lsn\" VARCHAR, \"_walrus_lsn\" VARCHAR);
+             INSERT INTO notes (id, body) VALUES (1, 'stale mirror value');",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO notes_raw VALUES
+                 (1, NULL, '{}', 'u', ?, ?),
+                 (1, NULL, '{\"unchanged_toast\":[\"body\"]}', 'u', ?, ?)",
+            duckdb::params![hex_lsn(100), hex_lsn(1), hex_lsn(100), hex_lsn(2)],
+        )
+        .unwrap();
+
+        path.apply(&conn, &transform);
+
+        let is_null: bool = conn
+            .query_row("SELECT body IS NULL FROM notes WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(is_null, "a found real NULL was replaced by the fallback");
+    }
+}
+
+#[test]
+fn key_change_unchanged_toast_resolves_through_the_paired_old_key_delete() {
+    let rel = relation_with("keyed_notes", "body", oids::TEXT);
+    let transform = TransformSql::from_relation(&rel);
+
+    for path in [TransformPath::Incremental, TransformPath::Rebuild] {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE keyed_notes (
+                 id INTEGER PRIMARY KEY, body VARCHAR,
+                 \"_applied_commit_lsn\" VARCHAR DEFAULT '0000000000000000',
+                 \"_applied_lsn\" VARCHAR DEFAULT '0000000000000000');
+             CREATE TABLE keyed_notes_raw (
+                 id INTEGER, body VARCHAR, walrus_pg_sink_meta VARCHAR, \"_walrus_op\" VARCHAR,
+                 \"_walrus_commit_lsn\" VARCHAR, \"_walrus_lsn\" VARCHAR);
+             INSERT INTO keyed_notes (id, body) VALUES (1, 'inherited');",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO keyed_notes_raw VALUES
+                 (1, 'inherited', '{}', 'i', ?, ?),
+                 (1, NULL, '{}', 'd', ?, ?),
+                 (2, NULL, '{\"unchanged_toast\":[\"body\"]}', 'u', ?, ?)",
+            duckdb::params![
+                hex_lsn(90),
+                hex_lsn(1),
+                hex_lsn(100),
+                hex_lsn(2),
+                hex_lsn(100),
+                hex_lsn(2),
+            ],
+        )
+        .unwrap();
+
+        path.apply(&conn, &transform);
+
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM keyed_notes", [], |row| row.get(0))
+            .unwrap();
+        let body: String = conn
+            .query_row("SELECT body FROM keyed_notes WHERE id = 2", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 1, "the synthetic delete must remove the old key");
+        assert_eq!(body, "inherited");
+    }
+}
+
+#[test]
+fn key_change_unchanged_toast_falls_back_to_the_old_key_mirror_after_raw_pruning() {
+    let rel = relation_with("pruned_notes", "body", oids::TEXT);
+    let transform = TransformSql::from_relation(&rel);
+
+    for path in [TransformPath::Incremental, TransformPath::Rebuild] {
+        for expected in [Some("mirror-only value"), None] {
+            let conn = duckdb::Connection::open_in_memory().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE pruned_notes (
+                     id INTEGER PRIMARY KEY, body VARCHAR,
+                     \"_applied_commit_lsn\" VARCHAR DEFAULT '0000000000000000',
+                     \"_applied_lsn\" VARCHAR DEFAULT '0000000000000000');
+                 CREATE TABLE pruned_notes_raw (
+                     id INTEGER, body VARCHAR, walrus_pg_sink_meta VARCHAR, \"_walrus_op\" VARCHAR,
+                     \"_walrus_commit_lsn\" VARCHAR, \"_walrus_lsn\" VARCHAR);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pruned_notes (id, body) VALUES (1, ?)",
+                [expected],
+            )
+            .unwrap();
+            // The historical setter for id=1 has been compacted away. Only the paired key move
+            // remains in raw, so resolution must address the current mirror by OLD key.
+            conn.execute(
+                "INSERT INTO pruned_notes_raw VALUES
+                     (1, NULL, '{}', 'd', ?, ?),
+                     (2, NULL, '{\"unchanged_toast\":[\"body\"]}', 'u', ?, ?)",
+                duckdb::params![hex_lsn(100), hex_lsn(1), hex_lsn(100), hex_lsn(1)],
+            )
+            .unwrap();
+
+            path.apply(&conn, &transform);
+
+            let body: Option<String> = conn
+                .query_row("SELECT body FROM pruned_notes WHERE id = 2", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(body.as_deref(), expected);
+        }
+    }
+}
+
+#[test]
+fn chained_pruned_key_moves_carry_the_value_across_transform_cycles() {
+    let rel = relation_with("moving_notes", "body", oids::TEXT);
+    let transform = TransformSql::from_relation(&rel);
+
+    for path in [TransformPath::Incremental, TransformPath::Rebuild] {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE moving_notes (
+                 id INTEGER PRIMARY KEY, body VARCHAR,
+                 \"_applied_commit_lsn\" VARCHAR DEFAULT '0000000000000000',
+                 \"_applied_lsn\" VARCHAR DEFAULT '0000000000000000');
+             CREATE TABLE moving_notes_raw (
+                 id INTEGER, body VARCHAR, walrus_pg_sink_meta VARCHAR, \"_walrus_op\" VARCHAR,
+                 \"_walrus_commit_lsn\" VARCHAR, \"_walrus_lsn\" VARCHAR);
+             INSERT INTO moving_notes (id, body) VALUES (1, 'crosses both moves');",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO moving_notes_raw VALUES
+                 (1, NULL, '{}', 'd', ?, ?),
+                 (2, NULL, '{\"unchanged_toast\":[\"body\"]}', 'u', ?, ?)",
+            duckdb::params![hex_lsn(100), hex_lsn(1), hex_lsn(100), hex_lsn(1)],
+        )
+        .unwrap();
+        path.apply(&conn, &transform);
+
+        // Compact all evidence of A→B, then move B→C with another unchanged marker. The only
+        // surviving setter is the current B mirror row produced by the previous cycle.
+        conn.execute("DELETE FROM moving_notes_raw", []).unwrap();
+        conn.execute(
+            "INSERT INTO moving_notes_raw VALUES
+                 (2, NULL, '{}', 'd', ?, ?),
+                 (3, NULL, '{\"unchanged_toast\":[\"body\"]}', 'u', ?, ?)",
+            duckdb::params![hex_lsn(200), hex_lsn(1), hex_lsn(200), hex_lsn(1)],
+        )
+        .unwrap();
+        path.apply(&conn, &transform);
+
+        let result: (i64, String) = conn
+            .query_row(
+                "SELECT count(*), any_value(body) FROM moving_notes WHERE id = 3",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(result, (1, "crosses both moves".to_string()));
+    }
+}
+
+#[test]
+fn chained_key_moves_in_one_tail_walk_back_to_the_mirror_value() {
+    let rel = relation_with("tail_moves", "body", oids::TEXT);
+    let transform = TransformSql::from_relation(&rel);
+
+    for path in [
+        TransformPath::Incremental,
+        TransformPath::DuckLake,
+        TransformPath::Rebuild,
+    ] {
+        for expected in [Some("crosses the whole tail"), None] {
+            let conn = duckdb::Connection::open_in_memory().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tail_moves (
+                     id INTEGER PRIMARY KEY, body VARCHAR,
+                     \"_applied_commit_lsn\" VARCHAR DEFAULT '0000000000000000',
+                     \"_applied_lsn\" VARCHAR DEFAULT '0000000000000000');
+                 CREATE TABLE tail_moves_raw (
+                     id INTEGER, body VARCHAR, walrus_pg_sink_meta VARCHAR, \"_walrus_op\" VARCHAR,
+                     \"_walrus_commit_lsn\" VARCHAR, \"_walrus_lsn\" VARCHAR);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO tail_moves (id, body) VALUES (1, ?)",
+                [expected],
+            )
+            .unwrap();
+            // Both key moves are in the same untransformed tail and all historical setters have
+            // already been pruned. C inherits from B, which itself inherited from the mirror's A;
+            // a one-hop old-key fallback cannot recover this value.
+            conn.execute(
+                "INSERT INTO tail_moves_raw VALUES
+                     (1, NULL, '{}', 'd', ?, ?),
+                     (2, NULL, '{\"unchanged_toast\":[\"body\"]}', 'u', ?, ?),
+                     (2, NULL, '{}', 'd', ?, ?),
+                     (3, NULL, '{\"unchanged_toast\":[\"body\"]}', 'u', ?, ?)",
+                duckdb::params![
+                    hex_lsn(100),
+                    hex_lsn(1),
+                    hex_lsn(100),
+                    hex_lsn(1),
+                    hex_lsn(200),
+                    hex_lsn(1),
+                    hex_lsn(200),
+                    hex_lsn(1),
+                ],
+            )
+            .unwrap();
+
+            path.apply(&conn, &transform);
+
+            let rows: i64 = conn
+                .query_row("SELECT count(*) FROM tail_moves", [], |row| row.get(0))
+                .unwrap();
+            let body: Option<String> = conn
+                .query_row("SELECT body FROM tail_moves WHERE id = 3", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(rows, 1, "old keys survived on {path:?}");
+            assert_eq!(body.as_deref(), expected, "wrong value on {path:?}");
+        }
+    }
+}
+
+#[test]
+fn a_recombined_identity_partitions_incremental_raw_rows_by_its_emit_expression() {
+    let rel = PgRelation {
+        oid: 42,
+        schema: "public".into(),
+        name: "interval_keys".into(),
+        replica_identity: ReplicaIdentity::Index,
+        columns: vec![
+            PgColumn {
+                name: "elapsed".into(),
+                type_oid: oids::INTERVAL,
+                type_modifier: -1,
+                is_key: true,
+            },
+            PgColumn {
+                name: "body".into(),
+                type_oid: oids::TEXT,
+                type_modifier: -1,
+                is_key: false,
+            },
+        ],
+    };
+    let elapsed = descriptor(
+        "elapsed",
+        oids::INTERVAL,
+        "INTERVAL",
+        &[
+            "elapsed_months:INT32",
+            "elapsed_days:INT32",
+            "elapsed_micros:INT64",
+        ],
+    );
+    let plan = crate::plan::TablePlan::from_registry(&rel, &[elapsed]);
+    let transform = TransformSql::from_plan(&plan);
+
+    for sql in [
+        transform.render(Lsn::ZERO, None),
+        transform.render_ducklake(Lsn::ZERO, None),
+    ] {
+        assert!(
+            sql.contains(
+                "PARTITION BY to_months(raw_winner.\"elapsed_months\") + \
+                 to_days(raw_winner.\"elapsed_days\") + \
+                 to_microseconds(raw_winner.\"elapsed_micros\")"
+            ),
+            "got {sql}"
+        );
+        assert!(!sql.contains("PARTITION BY \"elapsed\""), "got {sql}");
+    }
+}
+
+#[test]
+fn nullable_full_identity_components_match_without_leaving_a_ghost() {
+    let rel = PgRelation {
+        oid: 42,
+        schema: "public".into(),
+        name: "full_notes".into(),
+        replica_identity: ReplicaIdentity::Full,
+        columns: vec![
+            PgColumn {
+                name: "id".into(),
+                type_oid: oids::INT4,
+                type_modifier: -1,
+                is_key: true,
+            },
+            PgColumn {
+                name: "nullable_identity".into(),
+                type_oid: oids::TEXT,
+                type_modifier: -1,
+                is_key: true,
+            },
+            PgColumn {
+                name: "body".into(),
+                type_oid: oids::TEXT,
+                type_modifier: -1,
+                is_key: true,
+            },
+        ],
+    };
+    let transform = TransformSql::from_relation(&rel);
+
+    for path in [TransformPath::Incremental, TransformPath::Rebuild] {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        // No DuckDB PK here: PostgreSQL FULL identity components may be nullable even though the
+        // source table also has a separate real primary key.
+        conn.execute_batch(
+            "CREATE TABLE full_notes (
+                 id INTEGER, nullable_identity VARCHAR, body VARCHAR,
+                 \"_applied_commit_lsn\" VARCHAR DEFAULT '0000000000000000',
+                 \"_applied_lsn\" VARCHAR DEFAULT '0000000000000000');
+             CREATE TABLE full_notes_raw (
+                 id INTEGER, nullable_identity VARCHAR, body VARCHAR,
+                 walrus_pg_sink_meta VARCHAR, \"_walrus_op\" VARCHAR,
+                 \"_walrus_commit_lsn\" VARCHAR, \"_walrus_lsn\" VARCHAR);
+             INSERT INTO full_notes (id, nullable_identity, body) VALUES (1, NULL, 'keep me');",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO full_notes_raw VALUES
+                 (1, NULL, 'keep me', '{}', 'u', ?, ?)",
+            duckdb::params![hex_lsn(100), hex_lsn(1)],
+        )
+        .unwrap();
+
+        path.apply(&conn, &transform);
+
+        let result: (i64, Option<String>) = conn
+            .query_row(
+                "SELECT count(*), any_value(body) FROM full_notes",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(result, (1, Some("keep me".to_string())));
+    }
+}
+
+#[test]
+fn an_exact_tuple_tie_prefers_the_non_delete_winner() {
+    let rel = relation_with("tie_notes", "body", oids::TEXT);
+    let transform = TransformSql::from_relation(&rel);
+
+    for path in [TransformPath::Incremental, TransformPath::Rebuild] {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tie_notes (
+                 id INTEGER PRIMARY KEY, body VARCHAR,
+                 \"_applied_commit_lsn\" VARCHAR DEFAULT '0000000000000000',
+                 \"_applied_lsn\" VARCHAR DEFAULT '0000000000000000');
+             CREATE TABLE tie_notes_raw (
+                 id INTEGER, body VARCHAR, walrus_pg_sink_meta VARCHAR, \"_walrus_op\" VARCHAR,
+                 \"_walrus_commit_lsn\" VARCHAR, \"_walrus_lsn\" VARCHAR);",
+        )
+        .unwrap();
+        // Put the delete first so physical input order cannot accidentally provide the desired tie-break.
+        conn.execute(
+            "INSERT INTO tie_notes_raw VALUES
+                 (1, NULL, '{}', 'd', ?, ?),
+                 (1, 'survives', '{}', 'u', ?, ?)",
+            duckdb::params![hex_lsn(100), hex_lsn(1), hex_lsn(100), hex_lsn(1)],
+        )
+        .unwrap();
+
+        path.apply(&conn, &transform);
+
+        let body: String = conn
+            .query_row("SELECT body FROM tie_notes WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(body, "survives");
+    }
 }

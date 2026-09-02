@@ -21,6 +21,8 @@ const SOURCE_MIGRATION: &str = include_str!("../../../migrations/source/0001_pub
 const SOURCE_DDL_MIGRATION: &str = include_str!("../../../migrations/source/0002_ddl_triggers.sql");
 const SOURCE_MIGRATION_0003: &str =
     include_str!("../../../migrations/source/0003_reload_signal.sql");
+const SOURCE_MIGRATION_0004: &str =
+    include_str!("../../../migrations/source/0004_reload_event.sql");
 
 static SOURCE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -60,7 +62,9 @@ async fn good_source_passes_all_assertions() {
     let _guard = SOURCE_LOCK.lock().await;
     let setup = plain(&source_url()).await;
     setup.batch_execute(SOURCE_MIGRATION).await.unwrap(); // idempotent: ensure walrus tables
+    setup.batch_execute(SOURCE_DDL_MIGRATION).await.unwrap(); // …DDL tap + publication guard
     setup.batch_execute(SOURCE_MIGRATION_0003).await.unwrap(); // …incl. the reload signal
+    setup.batch_execute(SOURCE_MIGRATION_0004).await.unwrap(); // …and the reload event log
     setup
         .batch_execute("DROP TABLE IF EXISTS public._walrus_pf_keyless") // defensive cleanup
         .await
@@ -79,10 +83,16 @@ async fn good_source_passes_all_assertions() {
     pf.assert_reload_signal()
         .await
         .expect("reload signal table installed with its PK");
+    pf.assert_reload_event()
+        .await
+        .expect("reload event table installed with its PK");
+    pf.assert_ddl_capture()
+        .await
+        .expect("DDL tap and publication/schema guards installed with complete tag coverage");
 
     pf.assert_publication_covers()
         .await
-        .expect("publication covers ddl_audit + heartbeat + reload_signal");
+        .expect("publication covers ddl_audit + heartbeat + reload internals");
 
     let report = pf
         .assert_tables_have_pk(PkMode::Strict)
@@ -92,6 +102,66 @@ async fn good_source_passes_all_assertions() {
     assert!(
         !report.ok.is_empty(),
         "orders/customers/items are published"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose up --wait (source PG)"]
+async fn reload_events_are_request_namespaced_and_append_only() {
+    let _guard = SOURCE_LOCK.lock().await;
+    let setup = plain(&source_url()).await;
+    setup.batch_execute(SOURCE_MIGRATION).await.unwrap();
+    setup.batch_execute(SOURCE_MIGRATION_0004).await.unwrap();
+
+    let first_event = uuid::Uuid::new_v4();
+    let second_event = uuid::Uuid::new_v4();
+    let first_request = uuid::Uuid::new_v4();
+    let second_request = uuid::Uuid::new_v4();
+    let reused_reload_id = 8_880_004_i64;
+    for (event_id, request_id) in [(first_event, first_request), (second_event, second_request)] {
+        let event_id = event_id.to_string();
+        let request_id = request_id.to_string();
+        setup
+            .execute(
+                "INSERT INTO walrus.reload_event
+                   (event_id, request_id, reload_id, event_kind, scope,
+                    source_schema, source_table, schema_version)
+                 VALUES ($1::text::uuid, $2::text::uuid, $3, 'start_fence', 'table', 'public', 'orders', 1)",
+                &[&event_id, &request_id, &reused_reload_id],
+            )
+            .await
+            .unwrap();
+    }
+
+    let update = setup
+        .execute(
+            "UPDATE walrus.reload_event SET source_table = 'changed' WHERE event_id = $1::text::uuid",
+            &[&first_event.to_string()],
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        update.code(),
+        Some(&tokio_postgres::error::SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE)
+    );
+    let delete = setup
+        .execute(
+            "DELETE FROM walrus.reload_event WHERE event_id = $1::text::uuid",
+            &[&first_event.to_string()],
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        delete.code(),
+        Some(&tokio_postgres::error::SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE)
+    );
+    let truncate = setup
+        .batch_execute("TRUNCATE walrus.reload_event")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        truncate.code(),
+        Some(&tokio_postgres::error::SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE)
     );
 }
 
@@ -195,6 +265,263 @@ async fn publication_missing_heartbeat_is_terminal() {
 
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (source PG)"]
+async fn publication_must_emit_every_action_and_unrestricted_rows() {
+    let _guard = SOURCE_LOCK.lock().await;
+    let url = source_url();
+    let setup = plain(&url).await;
+    setup.batch_execute(SOURCE_MIGRATION).await.unwrap();
+    setup.batch_execute(SOURCE_DDL_MIGRATION).await.unwrap();
+    setup.batch_execute(SOURCE_MIGRATION_0003).await.unwrap();
+    setup.batch_execute(SOURCE_MIGRATION_0004).await.unwrap();
+    setup
+        .batch_execute(
+            "DROP PUBLICATION IF EXISTS walrus_pf_coverage;
+             DROP TABLE IF EXISTS public._walrus_pf_coverage;
+             CREATE TABLE public._walrus_pf_coverage (id int PRIMARY KEY, payload text);",
+        )
+        .await
+        .unwrap();
+
+    let required = "walrus.heartbeat, walrus.ddl_audit, walrus.reload_signal, walrus.reload_event";
+    setup
+        .batch_execute(&format!(
+            "CREATE PUBLICATION walrus_pf_coverage
+             FOR TABLE {required}, public._walrus_pf_coverage
+             WITH (publish = 'insert, update, truncate')"
+        ))
+        .await
+        .unwrap();
+    let mut cfg = cfg_for(&url);
+    cfg.publication_name = "walrus_pf_coverage".to_string();
+    let client = connect_source(cfg.source_db_url.expose()).await.unwrap();
+    let pf = SourcePreflight::new(&client, &cfg);
+    let err = pf.assert_publication_covers().await.unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            PreflightError::PublicationCoverage(
+                pg_sink::source_catalog::PublicationCoverageIssue::DisabledOperations { .. }
+            )
+        ),
+        "disabled DELETE must be terminal, got {err:?}"
+    );
+
+    setup
+        .batch_execute(&format!(
+            "DROP PUBLICATION walrus_pf_coverage;
+             CREATE PUBLICATION walrus_pf_coverage
+             FOR TABLE {required}, public._walrus_pf_coverage WHERE (id > 0)"
+        ))
+        .await
+        .unwrap();
+    let err = pf.assert_publication_covers().await.unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            PreflightError::PublicationCoverage(
+                pg_sink::source_catalog::PublicationCoverageIssue::RowFilter { .. }
+            )
+        ),
+        "a row filter must be terminal, got {err:?}"
+    );
+
+    setup
+        .batch_execute(&format!(
+            "DROP PUBLICATION walrus_pf_coverage;
+             CREATE PUBLICATION walrus_pf_coverage
+             FOR TABLE {required}, public._walrus_pf_coverage (id, payload)"
+        ))
+        .await
+        .unwrap();
+    let err = pf.assert_publication_covers().await.unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            PreflightError::PublicationCoverage(
+                pg_sink::source_catalog::PublicationCoverageIssue::ColumnList { .. }
+            )
+        ),
+        "even an explicit list of every current column must be terminal, got {err:?}"
+    );
+
+    setup
+        .batch_execute(
+            "DROP PUBLICATION walrus_pf_coverage;
+             DROP TABLE public._walrus_pf_coverage;
+             CREATE TABLE public._walrus_pf_coverage (id int PRIMARY KEY, payload text)
+               PARTITION BY RANGE (id);
+             CREATE TABLE public._walrus_pf_coverage_leaf
+               PARTITION OF public._walrus_pf_coverage FOR VALUES FROM (0) TO (100);",
+        )
+        .await
+        .unwrap();
+    setup
+        .batch_execute(&format!(
+            "CREATE PUBLICATION walrus_pf_coverage
+             FOR TABLE {required}, public._walrus_pf_coverage"
+        ))
+        .await
+        .unwrap();
+    let err = pf.assert_publication_covers().await.unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            PreflightError::PublicationCoverage(
+                pg_sink::source_catalog::PublicationCoverageIssue::TopologyDependent { .. }
+            )
+        ),
+        "partition-derived membership must be rejected, got {err:?}"
+    );
+
+    setup
+        .batch_execute(
+            "DROP PUBLICATION walrus_pf_coverage;
+             DROP TABLE public._walrus_pf_coverage CASCADE;",
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose up --wait (source PG)"]
+async fn publication_ddl_is_rejected_by_the_shared_pipeline_guard() {
+    let _guard = SOURCE_LOCK.lock().await;
+    let url = source_url();
+    let setup = plain(&url).await;
+    setup.batch_execute(SOURCE_DDL_MIGRATION).await.unwrap();
+    setup
+        .batch_execute(
+            "DROP TABLE IF EXISTS public._walrus_pf_guard_create;
+             DROP TABLE IF EXISTS public._walrus_pf_guard_root CASCADE;
+             DROP TABLE IF EXISTS public._walrus_pf_guard_leaf;
+             DROP SCHEMA IF EXISTS _walrus_pf_guard_schema CASCADE;
+             DROP SCHEMA IF EXISTS _walrus_pf_guard_schema_v2 CASCADE;
+             CREATE TABLE public._walrus_pf_guard_root (id int NOT NULL)
+               PARTITION BY RANGE (id);
+             CREATE TABLE public._walrus_pf_guard_leaf (id int NOT NULL);
+             CREATE SCHEMA _walrus_pf_guard_schema;
+             CREATE TABLE _walrus_pf_guard_schema.tracked (id int PRIMARY KEY);",
+        )
+        .await
+        .unwrap();
+
+    let holder = plain(&url).await;
+    assert!(
+        pg_sink::source_catalog::try_acquire_publication_ddl_guard(&holder)
+            .await
+            .unwrap(),
+        "shared guard should be immediately available"
+    );
+
+    let ddl = plain(&url).await;
+    ddl.batch_execute("SET statement_timeout = '2s'")
+        .await
+        .unwrap();
+    let err = ddl
+        .batch_execute(
+            "ALTER PUBLICATION walrus_pub
+             SET (publish = 'insert, update, delete, truncate')",
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.code(),
+        Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE),
+        "command-start trigger must reject rather than wait behind the shared advisory lock: {err}"
+    );
+    assert!(
+        err.as_db_error()
+            .is_some_and(|db| db.message().contains("publication DDL rejected")),
+        "guard rejection should explain the operational remedy: {err}"
+    );
+
+    let err = ddl
+        .batch_execute("CREATE TABLE public._walrus_pf_guard_create (id int PRIMARY KEY)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.code(),
+        Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE),
+        "CREATE TABLE must not add an un-baselined FOR ALL target while online: {err}"
+    );
+    let absent: bool = setup
+        .query_one(
+            "SELECT to_regclass('public._walrus_pf_guard_create') IS NULL",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        absent,
+        "rejected CREATE TABLE must leave no relation behind"
+    );
+
+    ddl.batch_execute("CREATE TEMP TABLE _walrus_pf_guard_temp (id int PRIMARY KEY)")
+        .await
+        .expect("an unpublished temporary table must not contend on the coverage guard");
+    let temp_exists: bool = ddl
+        .query_one(
+            "SELECT to_regclass('pg_temp._walrus_pf_guard_temp') IS NOT NULL",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(temp_exists, "the allowed temporary CREATE must commit");
+
+    let err = ddl
+        .batch_execute(
+            "ALTER TABLE public._walrus_pf_guard_root
+             ATTACH PARTITION public._walrus_pf_guard_leaf FOR VALUES FROM (0) TO (100)",
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.code(),
+        Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE),
+        "partition topology must remain fixed while the coverage guard is held: {err}"
+    );
+
+    ddl.batch_execute("ALTER SCHEMA _walrus_pf_guard_schema OWNER TO CURRENT_USER")
+        .await
+        .expect("a metadata-only schema owner change must remain allowed online");
+    let err = ddl
+        .batch_execute("ALTER SCHEMA _walrus_pf_guard_schema RENAME TO _walrus_pf_guard_schema_v2")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.code(),
+        Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE),
+        "renaming a schema with published tables must fail while the guard is held: {err}"
+    );
+    let schema_rename_rolled_back: bool = setup
+        .query_one(
+            "SELECT to_regnamespace('_walrus_pf_guard_schema') IS NOT NULL
+                    AND to_regnamespace('_walrus_pf_guard_schema_v2') IS NULL",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        schema_rename_rolled_back,
+        "the rejected schema rename must roll back atomically"
+    );
+
+    drop(holder);
+    setup
+        .batch_execute(
+            "DROP TABLE public._walrus_pf_guard_root CASCADE;
+             DROP TABLE public._walrus_pf_guard_leaf;
+             DROP SCHEMA _walrus_pf_guard_schema CASCADE;",
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose up --wait (source PG)"]
 async fn ddl_event_bindings_share_one_function_and_capture_commit_safe_snapshots() {
     let _guard = SOURCE_LOCK.lock().await;
     let setup = plain(&source_url()).await;
@@ -228,7 +555,13 @@ async fn ddl_event_bindings_share_one_function_and_capture_commit_safe_snapshots
         .get(0);
     setup
         .execute(
-            "CREATE TABLE public._walrus_ddl_trigger_test (id int PRIMARY KEY, note text)",
+            "CREATE TABLE public._walrus_ddl_trigger_test (
+               id int NOT NULL,
+               note text,
+               included text,
+               id_twice int GENERATED ALWAYS AS (id * 2) STORED,
+               PRIMARY KEY (id) INCLUDE (included)
+             )",
             &[],
         )
         .await
@@ -246,9 +579,77 @@ async fn ddl_event_bindings_share_one_function_and_capture_commit_safe_snapshots
     assert!(!created.get::<_, &str>(2).is_empty());
     assert_eq!(created.get::<_, &str>(3), "d");
     let columns: serde_json::Value = serde_json::from_str(created.get::<_, &str>(4)).unwrap();
-    assert_eq!(columns.as_array().unwrap().len(), 2);
+    assert_eq!(columns.as_array().unwrap().len(), 3);
     assert_eq!(columns[0]["name"], "id");
     assert_eq!(columns[0]["is_key"], true);
+    assert!(
+        columns
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|column| column["name"] != "id_twice"),
+        "the DDL snapshot must match pgoutput and omit generated columns"
+    );
+    assert_eq!(
+        columns[2]["is_key"], false,
+        "an INCLUDE attribute is payload, not part of the replica identity"
+    );
+    let described = pg_sink::source_catalog::describe_source_relation(
+        &setup,
+        "public",
+        "_walrus_ddl_trigger_test",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        described.columns.len(),
+        3,
+        "the live export shape must omit the physical generated attribute"
+    );
+    assert!(
+        described
+            .columns
+            .iter()
+            .all(|column| column.name != "id_twice"),
+        "a generated column cannot appear in the catalog-derived export shape"
+    );
+    assert!(
+        described
+            .columns
+            .iter()
+            .find(|c| c.name == "id")
+            .unwrap()
+            .is_key
+    );
+    assert!(
+        !described
+            .columns
+            .iter()
+            .find(|c| c.name == "included")
+            .unwrap()
+            .is_key,
+        "the live source-catalog shape must exclude INCLUDE attributes too"
+    );
+    let audit_shape = pg_sink::ddl::DdlEvent {
+        source_audit_id: 0,
+        capture_lsn: common::Lsn::ZERO,
+        c_event: "ddl_command_end".to_string(),
+        c_tag: "CREATE TABLE".to_string(),
+        source_schema: "public".to_string(),
+        source_table: "_walrus_ddl_trigger_test".to_string(),
+        c_rel_oid: Some(created.get::<_, &str>(2).parse().unwrap()),
+        c_replica_identity: Some(created.get::<_, &str>(3).parse().unwrap()),
+        c_columns: Some(columns),
+        c_dropped: None,
+        c_ddl_text: None,
+    }
+    .relation_after(None)
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        audit_shape, described,
+        "DDL registry and catalog export shapes must agree at one schema version"
+    );
     assert!(
         created
             .get::<_, &str>(5)
@@ -284,7 +685,7 @@ async fn ddl_event_bindings_share_one_function_and_capture_commit_safe_snapshots
     assert_eq!(drop_column_rows[0].get::<_, &str>(1), "ALTER TABLE");
     let columns: serde_json::Value =
         serde_json::from_str(drop_column_rows[0].get::<_, &str>(2)).unwrap();
-    assert_eq!(columns.as_array().unwrap().len(), 1);
+    assert_eq!(columns.as_array().unwrap().len(), 2);
 
     let before_rollback: i64 = setup
         .query_one("SELECT COALESCE(max(id), 0) FROM walrus.ddl_audit", &[])

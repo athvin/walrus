@@ -9,11 +9,11 @@
 //! `cargo_common_metadata`, skips a workspace that publishes nothing. This test is what goes red
 //! instead, across every dependency table of every member.
 //!
-//! The internal edges (`common`, `control`, `pg-to-arrow`) are covered by the same scan. They have
-//! no version to drift, but they did have a path: twelve declarations across five manifests, and
+//! The internal edges (`common`, `control`, `pg-sink`, `pg-to-arrow`) are covered by the same scan.
+//! They have no version to drift, but they did have a path: declarations across five manifests, and
 //! `common` alone was spelled two ways — `../common` from a `crates/*` member,
-//! `../../crates/common` from `tests/e2e` — so no crate could move without finding all of them.
-//! One root-relative pin per crate is what replaced that, and the third test keeps it that way.
+//! `../../crates/common` from `tests/e2e` — so no crate could move without finding all of them. One
+//! root-relative pin per crate is what replaced that, and the third test keeps it that way.
 
 const WORKSPACE_MANIFEST: &str = include_str!("../../../Cargo.toml");
 
@@ -40,9 +40,9 @@ const DEPENDENCY_TABLES: [&str; 3] = [
     "[build-dependencies]",
 ];
 
-/// The three internal edges, in the order the root table pins them. A seventh crate that another
+/// The four internal edges, in the order the root table pins them. A seventh crate that another
 /// member depends on has to be added here — which is the moment its path spelling is decided.
-const INTERNAL_CRATES: [&str; 3] = ["common", "control", "pg-to-arrow"];
+const INTERNAL_CRATES: [&str; 4] = ["common", "control", "pg-sink", "pg-to-arrow"];
 
 /// The body of `header` in `manifest`, up to the next line that opens a table. `None` if absent.
 fn table_body<'a>(manifest: &'a str, header: &str) -> Option<&'a str> {

@@ -1024,6 +1024,7 @@ dependencies = [
  "sqlx",
  "thiserror 2.0.18",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -1365,9 +1366,11 @@ dependencies = [
  "control",
  "duckdb",
  "object_store",
+ "pg-sink",
  "serde_json",
  "sqlx",
  "tokio",
+ "tokio-postgres",
  "uuid",
 ]
 
@@ -4008,6 +4011,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "url",
+ "uuid",
  "webpki-roots 0.26.11",
 ]
 
@@ -4088,6 +4092,7 @@ dependencies = [
  "stringprep",
  "thiserror 2.0.18",
  "tracing",
+ "uuid",
  "whoami 1.6.1",
 ]
 
@@ -4125,6 +4130,7 @@ dependencies = [
  "stringprep",
  "thiserror 2.0.18",
  "tracing",
+ "uuid",
  "whoami 1.6.1",
 ]
 
@@ -4150,6 +4156,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]

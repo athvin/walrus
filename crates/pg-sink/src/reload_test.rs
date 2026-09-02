@@ -6,6 +6,17 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[test]
+fn connect_time_schema_change_enters_the_restart_path() {
+    let expected = common::SchemaVersionNo(7);
+    let error = anyhow::Error::new(crate::reload_export::ConnectSchemaChanged {
+        new_version: expected,
+    })
+    .context("connect exporter");
+    assert_eq!(connect_schema_change(&error), Some(expected));
+    assert_eq!(connect_schema_change(&anyhow::anyhow!("network")), None);
+}
+
 #[tokio::test]
 async fn a_panicking_exporter_is_observed_not_swallowed() {
     let mut set = tokio::task::JoinSet::new();
@@ -65,6 +76,30 @@ fn an_unpublished_keyless_table_reports_the_publication_gap_first() {
 }
 
 #[test]
+fn reload_preflight_preserves_full_coverage_reasons() {
+    let disabled = crate::source_catalog::PublicationCoverageIssue::DisabledOperations {
+        publication: "walrus_pub".into(),
+        disabled: "DELETE".into(),
+    };
+    let rejection = classify_publication_issue(disabled, "public", "orders");
+    assert!(matches!(
+        rejection,
+        PreflightRejection::PublicationCoverage(_)
+    ));
+    assert!(rejection.to_string().contains("DELETE"));
+
+    let missing = crate::source_catalog::PublicationCoverageIssue::MissingTarget {
+        publication: "walrus_pub".into(),
+        schema: "public".into(),
+        table: "ghost".into(),
+    };
+    assert!(matches!(
+        classify_publication_issue(missing, "public", "ghost"),
+        PreflightRejection::NotPublished(..)
+    ));
+}
+
+#[test]
 fn an_ad_hoc_preflight_failure_is_infra_never_a_rejection() {
     // `preflight` propagates its catalog queries with `?`; the From impl is what keeps a dead
     // connection out of `table_reload.error` as a false "not in the publication" reason.
@@ -87,6 +122,61 @@ fn the_configured_reload_cap_narrows_without_losing_its_non_zero_proof() {
     let cap = NonZeroUsize::try_from(configured).expect("the shipped default fits a usize");
     assert_eq!(u64::try_from(cap.get()), Ok(configured.get()));
     assert_eq!(Semaphore::new(cap.get()).available_permits(), cap.get());
+}
+
+fn adopted_row(
+    start_lsn: Option<common::Lsn>,
+    chunk_no: i64,
+    cursor_pk: Option<serde_json::Value>,
+) -> control::ReloadRow {
+    control::ReloadRow {
+        reload_id: common::ReloadId(7),
+        epoch: common::EpochNo(3),
+        source_schema: "public".to_string(),
+        source_table: "orders".to_string(),
+        flavor: control::ReloadFlavor::Reload,
+        source_request_id: Some(uuid::Uuid::from_u128(7)),
+        parent_request_id: None,
+        scope: control::ReloadScope::Table,
+        status: control::ReloadStatus::Exporting,
+        chunk_no,
+        cursor_pk,
+        start_lsn,
+        first_lsn: None,
+        final_lsn: None,
+        schema_version: Some(common::SchemaVersionNo(1)),
+        restart_count: 0,
+        lease_holder: Some("sink-a".to_string()),
+        error: None,
+    }
+}
+
+#[test]
+fn adoption_progress_decides_whether_fresh_identity_spends_restart_budget() {
+    let pre_f = adopted_row(None, 0, None);
+    assert_eq!(
+        adopted_snapshot_ownership(&pre_f),
+        SnapshotOwnership::AdoptedPristine,
+        "a claimed row with no F gets a fresh identity without spending the restart budget"
+    );
+
+    let fenced_pre_chunk = adopted_row(Some(common::Lsn::new(0x100)), 0, None);
+    assert_eq!(
+        adopted_snapshot_ownership(&fenced_pre_chunk),
+        SnapshotOwnership::AdoptedPristine,
+        "F alone is not durable baseline material, but its marker identity still cannot be reused"
+    );
+
+    let durable_chunk = adopted_row(
+        Some(common::Lsn::new(0x100)),
+        1,
+        Some(serde_json::json!([42])),
+    );
+    assert_eq!(
+        adopted_snapshot_ownership(&durable_chunk),
+        SnapshotOwnership::AdoptedWithProgress,
+        "a committed chunk belongs to the lost connection-local snapshot and spends budget"
+    );
 }
 
 #[tokio::test(start_paused = true)]

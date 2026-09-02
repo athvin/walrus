@@ -253,65 +253,138 @@ impl<C: Clock + Clone> StreamDemux<C> {
         let top = self
             .current_top
             .context("streamed change arrived outside a Stream Start block")?;
-        // `clone().into_boxed_slice()` freezes the tuple at its decoded width; the clone already
+        // Build the complete frame before mutating the transaction. In particular, a multi-table
+        // TRUNCATE with one unknown relation must fail as a unit instead of buffering a partial wipe.
+        // `clone().into_boxed_slice()` freezes each tuple at its decoded width; the clone already
         // allocates exactly `len`, so the conversion is a header change, not a second allocation.
-        let (oid, op, values, sub_xid) = match msg {
+        let mut changes = Vec::new();
+        match msg {
             Message::Insert {
                 relation_oid,
                 new,
                 xid,
-            } => (
-                TableId(*relation_oid),
-                Op::Insert,
-                new.clone().into_boxed_slice(),
-                xid.unwrap_or(top),
-            ),
+            } => {
+                let oid = TableId(*relation_oid);
+                let cached = self.cached_relation(cache, top, oid)?;
+                changes.push(StreamedChange {
+                    sub_xid: xid.unwrap_or(top),
+                    oid,
+                    op: Op::Insert,
+                    values: new.clone().into_boxed_slice(),
+                    lsn,
+                    schema_version: cached.schema_version,
+                });
+            }
             Message::Update {
                 relation_oid,
+                old,
                 new,
                 xid,
                 ..
-            } => (
-                TableId(*relation_oid),
-                Op::Update,
-                new.clone().into_boxed_slice(),
-                xid.unwrap_or(top),
-            ),
+            } => {
+                let oid = TableId(*relation_oid);
+                let sub_xid = xid.unwrap_or(top);
+                let cached = self.cached_relation(cache, top, oid)?;
+                let normalized = crate::consume::normalize_update_keys(
+                    &cached.relation,
+                    old.as_deref(),
+                    new.as_slice(),
+                )?;
+                if let Some(old) = old
+                    && crate::consume::update_changes_key(
+                        &cached.relation,
+                        old,
+                        normalized.as_ref(),
+                    )?
+                {
+                    changes.push(StreamedChange {
+                        sub_xid,
+                        oid,
+                        op: Op::Delete,
+                        values: old.clone().into_boxed_slice(),
+                        lsn,
+                        schema_version: cached.schema_version,
+                    });
+                }
+                changes.push(StreamedChange {
+                    sub_xid,
+                    oid,
+                    op: Op::Update,
+                    values: normalized.into_owned().into_boxed_slice(),
+                    lsn,
+                    schema_version: cached.schema_version,
+                });
+            }
             Message::Delete {
                 relation_oid,
                 old,
                 xid,
                 ..
-            } => (
-                TableId(*relation_oid),
-                Op::Delete,
-                old.clone().into_boxed_slice(),
-                xid.unwrap_or(top),
-            ),
+            } => {
+                let oid = TableId(*relation_oid);
+                let cached = self.cached_relation(cache, top, oid)?;
+                changes.push(StreamedChange {
+                    sub_xid: xid.unwrap_or(top),
+                    oid,
+                    op: Op::Delete,
+                    values: old.clone().into_boxed_slice(),
+                    lsn,
+                    schema_version: cached.schema_version,
+                });
+            }
+            Message::Truncate { xid, relations, .. } => {
+                anyhow::ensure!(
+                    !relations.is_empty(),
+                    "streamed pgoutput TRUNCATE names no relations"
+                );
+                let sub_xid = xid.unwrap_or(top);
+                for relation_oid in relations {
+                    let oid = TableId(*relation_oid);
+                    let cached = self.cached_relation(cache, top, oid)?;
+                    changes.push(StreamedChange {
+                        sub_xid,
+                        oid,
+                        op: Op::Truncate,
+                        values: crate::consume::truncate_values(&cached.relation)
+                            .into_boxed_slice(),
+                        lsn,
+                        schema_version: cached.schema_version,
+                    });
+                }
+            }
             // Wildcard is deliberate: Message is #[non_exhaustive], and this dispatcher ignores other families.
             _ => return Ok(()),
-        };
-        let cached = self
-            .bindings
+        }
+
+        for change in changes {
+            let key = (change.oid, change.sub_xid);
+            let bytes = estimate_change_bytes(&change.values);
+            let txn = self
+                .open
+                .get_mut(&top)
+                .context("no open buffer for the current stream block")?;
+            txn.push_change(change);
+            self.claim_stream(key, top, bytes);
+        }
+        self.spill_if_over_ceiling(cache, sink).await
+    }
+
+    fn cached_relation(
+        &self,
+        cache: &RelationCache,
+        top: u32,
+        oid: TableId,
+    ) -> anyhow::Result<Arc<crate::relcache::CachedRelation>> {
+        self.bindings
             .get(&(top, oid))
             .and_then(|version| cache.get(oid.0, *version))
             .or_else(|| cache.latest_for(oid.0))
-            .context("streamed change relation version is not cached")?;
-        let bytes = estimate_change_bytes(&values);
-        let txn = self
-            .open
-            .get_mut(&top)
-            .context("no open buffer for the current stream block")?;
-        txn.push_change(StreamedChange {
-            sub_xid,
-            oid,
-            op,
-            values,
-            lsn,
-            schema_version: cached.schema_version,
-        });
-        self.claim_stream((oid, sub_xid), top, bytes);
-        self.spill_if_over_ceiling(cache, sink).await
+            .with_context(|| {
+                format!(
+                    "streamed change relation version is not cached: oid={} top_xid={top}",
+                    oid.0
+                )
+            })
     }
 
     /// While over the aggregate ceiling, spill the largest open `(table, sub-xid)` buffer to a
@@ -650,7 +723,8 @@ fn estimate_change_bytes(values: &[TupleValue]) -> u64 {
         .fold(META_OVERHEAD, u64::saturating_add)
 }
 
-/// A streamed change carries its sub-xid; a non-streamed change never enters the demux.
+/// A streamed row change or table-level truncate carries its sub-xid; a non-streamed change never
+/// enters the demux.
 ///
 /// A pure classification of `msg`, so calling it for effect is meaningless. It escapes
 /// `clippy::must_use_candidate` through the argument: a [`Message`] can hold a `TupleValue::Binary`,
@@ -663,6 +737,7 @@ pub const fn is_streamed_change(msg: &Message) -> bool {
         Message::Insert { xid: Some(_), .. }
             | Message::Update { xid: Some(_), .. }
             | Message::Delete { xid: Some(_), .. }
+            | Message::Truncate { xid: Some(_), .. }
     )
 }
 

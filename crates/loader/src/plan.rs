@@ -36,9 +36,9 @@ const _: () = assert!(
 /// scalar, the current mirror `t`).
 #[derive(Debug, Clone)]
 pub(crate) enum MirrorValue {
-    /// `s."<name>"` — a direct copy of the like-named raw column. `toast_resolvable` marks a Tier-1
-    /// non-key scalar that may carry the unchanged-TOAST sentinel (resolved by the raw back-scan, §5.6).
-    Passthrough { toast_resolvable: bool },
+    /// `s."<name>"` — a direct copy of the like-named raw column. Unchanged-TOAST eligibility lives
+    /// on [`MirrorCol::toast_source`] because flat Tier-2 siblings also pass through this way.
+    Passthrough,
     /// A recombine SQL expression over the raw emit columns (already `s.`-qualified), e.g. an INTERVAL.
     Recombine(String),
 }
@@ -49,6 +49,9 @@ pub(crate) struct MirrorCol {
     pub(crate) name: String,
     pub(crate) duckdb_type: String,
     pub(crate) is_key: bool,
+    /// Original PostgreSQL column named in `SinkMeta::unchanged_toast`. Tier-2 emit columns use
+    /// sibling names, so this cannot be reconstructed from `name` in the loader.
+    pub(crate) toast_source: Option<Box<str>>,
     pub(crate) value: MirrorValue,
 }
 
@@ -59,7 +62,7 @@ pub(crate) struct MirrorCol {
 /// A ceiling rather than an equality because whether [`MirrorValue`] borrows `String`'s niche for
 /// its discriminant is a compiler detail; either way a new owned field breaches this. If it trips,
 /// shrink the entry or raise the budget deliberately in review.
-const MIRROR_COL_MAX_BYTES: usize = 88;
+const MIRROR_COL_MAX_BYTES: usize = 104;
 const _: () = assert!(std::mem::size_of::<MirrorCol>() <= MIRROR_COL_MAX_BYTES);
 
 /// The full plan for one table: the raw emit columns and the mirror columns.
@@ -77,6 +80,18 @@ const _: () = assert!(
 );
 
 impl TablePlan {
+    /// Clone this shape for another physical DuckDB table name.
+    ///
+    /// Reload reconciliation builds into a hidden generation while the source table's canonical
+    /// name remains live. The columns and recombination expressions are identical; only the mirror
+    /// (and, by derivation, raw-table) name changes.
+    #[must_use]
+    pub(crate) fn for_table(&self, table: impl Into<Box<str>>) -> Self {
+        let mut plan = self.clone();
+        plan.table = table.into();
+        plan
+    }
+
     /// The Tier-1 (scalar-only) plan from a bare relation — one emit column == source column via
     /// `crate::duck::duck_type`, mirror = same. Reproduces the pre-descriptor behaviour exactly.
     #[must_use]
@@ -94,9 +109,8 @@ impl TablePlan {
                 name: c.name.clone(),
                 duckdb_type: ty,
                 is_key: c.is_key,
-                value: MirrorValue::Passthrough {
-                    toast_resolvable: !c.is_key,
-                },
+                toast_source: (!c.is_key).then(|| c.name.as_str().into()),
+                value: MirrorValue::Passthrough,
             });
         }
         TablePlan {
@@ -128,9 +142,8 @@ impl TablePlan {
                         name: c.name.clone(),
                         duckdb_type: ty,
                         is_key: c.is_key,
-                        value: MirrorValue::Passthrough {
-                            toast_resolvable: !c.is_key,
-                        },
+                        toast_source: (!c.is_key).then(|| c.name.as_str().into()),
+                        value: MirrorValue::Passthrough,
                     });
                 }
                 Some(d) => plan_column(
@@ -175,7 +188,11 @@ fn plan_column(
         mirror_cols.push(MirrorCol {
             name: name.to_string(),
             duckdb_type: d.duckdb.clone(),
-            is_key: false, // an interval/timetz is never a replica-identity key
+            is_key,
+            // FULL and INDEX identities may include a Tier-2 value. The sink normalizes any `u`
+            // marker in an identity field from the old tuple, so key components are never resolved
+            // by the loader.
+            toast_source: (!is_key).then(|| name.into()),
             value: MirrorValue::Recombine(expr),
         });
         return;
@@ -197,9 +214,8 @@ fn plan_column(
             name: name.to_string(),
             duckdb_type: ty,
             is_key,
-            value: MirrorValue::Passthrough {
-                toast_resolvable: !is_key,
-            },
+            toast_source: (!is_key).then(|| name.into()),
+            value: MirrorValue::Passthrough,
         });
         return;
     }
@@ -213,10 +229,10 @@ fn plan_column(
         mirror_cols.push(MirrorCol {
             name: n.to_string(),
             duckdb_type: t.to_string(),
-            is_key: false,
-            value: MirrorValue::Passthrough {
-                toast_resolvable: false,
-            },
+            // One logical identity column fans out into identity siblings in the mirror key.
+            is_key,
+            toast_source: (!is_key).then(|| name.into()),
+            value: MirrorValue::Passthrough,
         });
     }
 }

@@ -191,6 +191,32 @@ fn committed_rows_keep_byte_identical_batch_id_with_clone_from() {
 }
 
 #[test]
+fn push_records_unchanged_toast_column_names_in_row_metadata() {
+    let mut b = TableBatcher::new(
+        cached(),
+        triggers(u64::MAX, u64::MAX, Duration::from_secs(3600)),
+        Arc::new(SystemClock),
+    )
+    .unwrap();
+    b.push(
+        meta("0/10"),
+        &[TupleValue::Text("1".into()), TupleValue::UnchangedToast],
+    );
+    b.on_commit("0/20".parse().unwrap(), UtcTimestamp::now())
+        .unwrap();
+    let sealed = b.seal().unwrap();
+    let meta_column = sealed
+        .record_batch
+        .column(sealed.record_batch.num_columns() - 1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let committed: SinkMeta = serde_json::from_str(meta_column.value(0)).unwrap();
+
+    assert_eq!(committed.unchanged_toast.as_ref(), &["note".to_string()]);
+}
+
+#[test]
 fn optional_batch_state_is_none_before_push_and_after_seal() {
     let mut b = TableBatcher::new(
         cached(),
@@ -418,6 +444,60 @@ fn drain_with_nothing_committed_is_a_noop() {
         "no committed rows → nothing to seal"
     );
     assert!(!b.has_open_txn(), "the open buffer is still dropped");
+}
+
+#[test]
+fn force_seal_committed_cuts_below_threshold_without_dropping_rows() {
+    let mut b = TableBatcher::new(
+        cached(),
+        triggers(u64::MAX, u64::MAX, Duration::from_secs(3600)),
+        Arc::new(SystemClock),
+    )
+    .unwrap();
+    b.push(meta("0/10"), &row("1"));
+    b.on_commit("0/20".parse().unwrap(), UtcTimestamp::now())
+        .unwrap();
+    assert!(
+        !b.should_flush(),
+        "ordinary triggers deliberately stay idle"
+    );
+
+    let sealed = b
+        .force_seal_committed()
+        .unwrap()
+        .expect("a durability fence force-seals committed rows");
+    assert_eq!(sealed.row_count, 1);
+    assert_eq!(sealed.lsn_start, "0/20".parse().unwrap());
+    assert_eq!(sealed.lsn_end, "0/20".parse().unwrap());
+    assert_eq!(b.committed_rows(), 0);
+    assert!(b.force_seal_committed().unwrap().is_none());
+}
+
+#[test]
+fn force_seal_rejects_and_preserves_an_open_transaction() {
+    let mut b = TableBatcher::new(
+        cached(),
+        triggers(u64::MAX, u64::MAX, Duration::from_secs(3600)),
+        Arc::new(SystemClock),
+    )
+    .unwrap();
+    b.push(meta("0/10"), &row("1"));
+
+    assert!(matches!(
+        b.force_seal_committed(),
+        Err(BatchError::OpenTransaction)
+    ));
+    assert!(b.has_open_txn(), "the fence never drops speculative rows");
+
+    b.on_commit("0/20".parse().unwrap(), UtcTimestamp::now())
+        .unwrap();
+    assert_eq!(
+        b.force_seal_committed()
+            .unwrap()
+            .expect("the same row remains available after commit")
+            .row_count,
+        1
+    );
 }
 
 #[test]

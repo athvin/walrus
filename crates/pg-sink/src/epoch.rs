@@ -6,7 +6,7 @@
 //! under a bumped epoch.
 //!
 //! The single most dangerous bug here is a **false positive** — treating a network blip as slot loss
-//! would nuke and re-snapshot the whole system on every hiccup. So classification is split from the
+//! would replace and re-reconcile the whole system on every hiccup. So classification is split from the
 //! decision: [`classify_slot`] does the I/O (and maps a query failure to [`SlotStatus::Unreachable`]),
 //! and the pure [`decide`] guarantees [`Unreachable`](SlotStatus::Unreachable) routes to a retry,
 //! **never** a fresh slot. Only a catalog that authoritatively says "connected, slot gone" opens a
@@ -37,7 +37,7 @@ impl WalStatus {
     /// Decode the catalog text; `None` for SQL NULL and for any word a later PostgreSQL adds.
     ///
     /// `None` has to stay exactly as harmless as `Reserved` at every call site: a value walrus does
-    /// not recognise is no evidence the slot was invalidated, and a false positive here re-snapshots
+    /// not recognise is no evidence the slot was invalidated, and a false positive here rebuilds
     /// the whole system (see this module's note).
     fn from_catalog(text: &str) -> Option<Self> {
         match text {
@@ -82,7 +82,7 @@ pub enum SlotStatus {
 pub enum SlotAction {
     /// Slot healthy → resume streaming from `confirmed_flush`.
     Resume { confirmed_flush: Lsn },
-    /// Slot gone on a successful connection → open a fresh slot + re-snapshot. A **total-restart**
+    /// Slot gone on a successful connection → open a fresh slot + reconcile every table. A **total-restart**
     /// (epoch bump, loud alert) when a prior epoch exists, or the very first bootstrap when none does —
     /// the caller distinguishes those only to decide whether to alert.
     FreshSlot,

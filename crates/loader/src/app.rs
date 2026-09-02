@@ -77,22 +77,51 @@ async fn pipeline(
     // erased at that one boundary and nowhere else.
     let bootstrapped = bootstrap::bootstrap(cfg, &pool, &store, &s3, state).await?;
     let bootstrap::BootstrapResult {
+        epoch,
         tables: owned,
         catalog_fence,
     } = bootstrapped;
-    state.mark_ready();
+    let current = control::read_current_epoch(&pool).await?.ok_or_else(|| {
+        LoaderError::Internal("control epoch disappeared after loader bootstrap".into())
+    })?;
+    if current.epoch != epoch {
+        return Err(LoaderError::EpochBumped {
+            from: epoch,
+            to: current.epoch,
+        });
+    }
+    if current.status == control::ReplicationStatus::TotalRestart {
+        state.mark_generation_retired();
+        return Err(LoaderError::Internal(format!(
+            "control generation {epoch} is retired by a pending total restart; refusing to serve it"
+        )));
+    }
+    let generation_ready_watch = (current.status == control::ReplicationStatus::Bootstrapping)
+        .then(|| {
+            state.mark_reconciling();
+            crate::epoch::spawn_generation_ready_watch(
+                pool.clone(),
+                epoch,
+                cfg.poll_interval,
+                Arc::clone(state),
+                token.clone(),
+            )
+        });
+    if generation_ready_watch.is_none() {
+        state.mark_ready();
+    }
+    // Local bootstrap itself is progress. This keeps a legitimate zero-table shard live while the
+    // global all-table request is still reconciling.
+    state.stamp_poll();
     let keys: Vec<(String, String)> = owned.iter().map(bootstrap::OwnedTable::to_key).collect();
     // Zero-init every per-table loader series so /metrics lists the owned tables from the first scrape,
     // before any apply cycle has moved a needle.
     for (schema, table) in &keys {
         common::metrics::init_table_series(&format!("{schema}.{table}"));
     }
-    let epoch = control::read_current_epoch(&pool)
-        .await?
-        .map(|s| s.epoch)
-        .unwrap_or(common::EpochNo(1));
     tracing::info!(
         tables = keys.len(),
+        generation_ready = generation_ready_watch.is_none(),
         "bootstrap complete; starting apply loops"
     );
 
@@ -106,8 +135,13 @@ async fn pipeline(
         LeaseTtl::new(cfg.lease_ttl)?,
         token.clone(),
     );
-    let (epoch_rx, epoch_watch) =
-        crate::epoch::spawn_epoch_watch(pool.clone(), epoch, cfg.poll_interval, token.clone());
+    let (epoch_rx, epoch_watch) = crate::epoch::spawn_epoch_watch(
+        pool.clone(),
+        epoch,
+        cfg.poll_interval,
+        Arc::clone(state),
+        token.clone(),
+    );
     let maintenance = (cfg.effective_shard_index()? == 0)
         .then(|| spawn_catalog_maintenance(cfg.ducklake.clone(), s3.clone(), token.clone()));
 
@@ -165,7 +199,6 @@ async fn pipeline(
             compaction_interval: cfg.compaction_interval,
             retention_lsn_lag: cfg.retention_lsn_lag,
             pause_logged: Default::default(),
-            resync_ids: Default::default(),
         };
         let worker_token = token.clone();
         let failures_tx = failures_tx.clone();
@@ -189,8 +222,16 @@ async fn pipeline(
     }
     let no_workers = workers.is_empty();
     let idle_token = token.clone();
-    // Only workers own receivers now; with zero workers, this also stops the poller immediately.
-    drop(epoch_rx);
+    // Workers consume cloned epoch receivers. A zero-table shard has no clone, so retain the
+    // original and turn a forward move into the same supervised failure a table worker would
+    // report. Dropping it here would close the epoch poller and leave an empty shard serving a
+    // retired generation forever.
+    let idle_epoch_guard = if no_workers {
+        Some((epoch_rx, failures_tx.clone()))
+    } else {
+        drop(epoch_rx);
+        None
+    };
     // The receiver closes when the final worker exits; nothing above may keep an extra sender alive.
     drop(failures_tx);
     let first_failure = local
@@ -199,10 +240,11 @@ async fn pipeline(
             token,
             async move {
                 // A legitimate shard can be empty (especially while scaling out). Keep that pod
-                // ready and its catalog-fence watcher alive instead of returning success into a
-                // StatefulSet restart loop. A signal or fence failure cancels this token.
-                if no_workers {
-                    idle_token.cancelled().await;
+                // alive and its catalog-fence watcher fenced instead of returning success into a
+                // StatefulSet restart loop. It still observes epoch changes: otherwise a shard
+                // with no table worker would remain ready on a retired generation indefinitely.
+                if let Some((epoch_rx, failures_tx)) = idle_epoch_guard {
+                    guard_idle_epoch(epoch_rx, epoch, idle_token, failures_tx).await;
                 }
                 // Once the supervisor sees a failure it cancels `token`, so healthy workers leave
                 // their loops and this drain always makes progress. It must run to completion:
@@ -231,6 +273,11 @@ async fn pipeline(
     if let Err(error) = epoch_watch.await {
         tracing::error!(%error, "epoch watch task panicked");
     }
+    if let Some(generation_ready_watch) = generation_ready_watch
+        && let Err(error) = generation_ready_watch.await
+    {
+        tracing::error!(%error, "generation readiness task panicked");
+    }
     if let Some(maintenance) = maintenance
         && let Err(error) = maintenance.await
     {
@@ -253,6 +300,59 @@ async fn pipeline(
         return Err(failure.error);
     }
     Ok(())
+}
+
+/// Give a zero-table shard the same total-restart guard normally supplied by an apply worker.
+///
+/// The caller runs this inside [`crate::supervisor::supervise`]'s drain future. Reporting through
+/// that channel (rather than merely returning) preserves the typed terminal error and lets the
+/// supervisor cancel every token-driven side task before the ordered joins begin.
+async fn guard_idle_epoch(
+    mut epoch_rx: tokio::sync::watch::Receiver<common::EpochNo>,
+    baseline: common::EpochNo,
+    token: CancellationToken,
+    failures: tokio::sync::mpsc::Sender<crate::supervisor::WorkerFailure>,
+) {
+    loop {
+        let changed = tokio::select! {
+            biased;
+            () = token.cancelled() => return,
+            changed = epoch_rx.changed() => changed,
+        };
+        if changed.is_err() {
+            crate::supervisor::report(
+                &failures,
+                crate::supervisor::WorkerFailure {
+                    schema: "_walrus".to_string(),
+                    table: "epoch_guard".to_string(),
+                    error: LoaderError::Internal(
+                        "epoch watch stopped while an empty shard was still running".into(),
+                    ),
+                },
+            );
+            // Keep the supervisor's drain future pending until it consumes the report and cancels
+            // the shared token. Returning in the same poll that enqueues the failure could let the
+            // concurrently-polled drain branch win before `rx.recv()` is polled again.
+            token.cancelled().await;
+            return;
+        }
+        let observed = *epoch_rx.borrow_and_update();
+        if observed > baseline {
+            crate::supervisor::report(
+                &failures,
+                crate::supervisor::WorkerFailure {
+                    schema: "_walrus".to_string(),
+                    table: "epoch_guard".to_string(),
+                    error: LoaderError::EpochBumped {
+                        from: baseline,
+                        to: observed,
+                    },
+                },
+            );
+            token.cancelled().await;
+            return;
+        }
+    }
 }
 
 fn spawn_catalog_maintenance(

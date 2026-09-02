@@ -49,6 +49,10 @@ pub struct InternalTables {
     /// The `reload_signal` relation shape, so [`crate::reload_signal::PendingSignal`] can parse a
     /// decoded tuple by column name.
     reload_signal_rel: Option<common::PgRelation>,
+    /// `walrus.reload_event`'s OID. Requests and fences are commit-gated control events, never data.
+    pub reload_event_oid: Option<u32>,
+    /// Relation shape used to parse append-only request/fence tuples by column name.
+    reload_event_rel: Option<common::PgRelation>,
 }
 
 impl InternalTables {
@@ -60,6 +64,7 @@ impl InternalTables {
         self.heartbeat_oid == Some(rel_oid)
             || self.ddl_audit_oid == Some(rel_oid)
             || self.reload_signal_oid == Some(rel_oid)
+            || self.reload_event_oid == Some(rel_oid)
     }
 
     /// Whether this OID is the DDL-audit table (its INSERTs drive [`crate::ddl::DdlConsumer`]).
@@ -80,6 +85,12 @@ impl InternalTables {
         self.reload_signal_oid == Some(rel_oid)
     }
 
+    /// Whether this OID is the append-only reload request/fence relation.
+    #[must_use]
+    pub fn is_reload_event(&self, rel_oid: u32) -> bool {
+        self.reload_event_oid == Some(rel_oid)
+    }
+
     /// Learn a walrus-internal table's OID + relevant column offsets from its `Relation` message.
     /// The internal-table changes are never cached in the [`crate::relcache::RelationCache`], so any
     /// column offsets needed later (heartbeat `beat_seq`) are captured here.
@@ -97,6 +108,10 @@ impl InternalTables {
             self.reload_signal_oid = Some(relation.oid);
             self.reload_signal_rel = Some(relation.clone());
         }
+        if relation.schema == "walrus" && relation.name == "reload_event" {
+            self.reload_event_oid = Some(relation.oid);
+            self.reload_event_rel = Some(relation.clone());
+        }
     }
 
     /// The `ddl_audit` relation shape, once its `Relation` message has been seen.
@@ -109,6 +124,12 @@ impl InternalTables {
     #[must_use]
     pub const fn reload_signal_rel(&self) -> Option<&common::PgRelation> {
         self.reload_signal_rel.as_ref()
+    }
+
+    /// The `reload_event` relation shape, once its `Relation` message has been seen.
+    #[must_use]
+    pub const fn reload_event_rel(&self) -> Option<&common::PgRelation> {
+        self.reload_event_rel.as_ref()
     }
 
     /// Extract the returned `beat_seq` from a decoded `walrus.heartbeat` new-tuple (text format).

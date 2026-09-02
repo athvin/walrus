@@ -201,28 +201,36 @@ async fn alter_add_column_bumps_version_and_cuts_file() {
                 } if internal.is_ddl_audit(*relation_oid) => {
                     let rel = internal.ddl_audit_rel().unwrap();
                     let ev = DdlEvent::from_tuple(rel, new).unwrap();
-                    let previous = ev
+                    let previous_for_oid = ev
                         .c_rel_oid
                         .and_then(|oid| cache.latest_for(oid))
-                        .or_else(|| cache.latest_for_name(&ev.source_schema, &ev.source_table))
                         .map(|cached| cached.relation.clone());
-                    let observation = ddl.observe(TransactionScope::Ordinary, ev.clone());
+                    let Some(previous_for_oid) = previous_for_oid else {
+                        continue;
+                    };
+                    let observation = ddl.observe(
+                        TransactionScope::Ordinary,
+                        ev.clone(),
+                        Some(&previous_for_oid),
+                    );
                     if let Some(version) = observation.structural_version {
-                        if let Some(after) = ev.relation_after(previous.as_ref()).unwrap()
-                            && let Some(row) =
-                                cache_relation(&mut cache, epoch, after, version).unwrap()
-                        {
-                            if observation.replay {
-                                persist_registry(&pool, &row).await.unwrap();
-                            } else {
-                                ddl.stage_registry(TransactionScope::Ordinary, row);
+                        if !ev.is_table_drop() {
+                            if let Some(after) = ev.relation_after(Some(&previous_for_oid)).unwrap()
+                                && let Some(row) =
+                                    cache_relation(&mut cache, epoch, after, version).unwrap()
+                            {
+                                if observation.replay {
+                                    persist_registry(&pool, &row).await.unwrap();
+                                } else {
+                                    ddl.stage_registry(TransactionScope::Ordinary, row);
+                                }
                             }
-                        }
-                        for sealed in router
-                            .cut_table(&cache, &ev.source_schema, &ev.source_table)
-                            .unwrap()
-                        {
-                            flush_batch(&sink, &pool, epoch, sealed).await.unwrap();
+                            for sealed in router
+                                .cut_table(&cache, &ev.source_schema, &ev.source_table)
+                                .unwrap()
+                            {
+                                flush_batch(&sink, &pool, epoch, sealed).await.unwrap();
+                            }
                         }
                     }
                 }

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT m.id, m.epoch, m.source_schema, m.source_table, m.s3_uri, m.kind, m.row_count,\n       m.lsn_start AS \"lsn_start: Lsn\", m.lsn_end AS \"lsn_end: Lsn\", m.schema_version,\n       m.status, m.reload_id\nFROM walrus.file_manifest m\nWHERE m.epoch = $1 AND m.source_schema = $2 AND m.source_table = $3 AND m.status = 'ready'\n  AND NOT EXISTS (\n      SELECT 1 FROM walrus.table_reload r\n      WHERE r.epoch = m.epoch\n        AND r.source_schema = m.source_schema\n        AND r.source_table = m.source_table\n        AND r.flavor = 'reload'\n        AND r.status IN ('requested', 'exporting')\n  )\nORDER BY m.lsn_end, m.id\nLIMIT $4\n",
+  "query": "SELECT m.id, m.epoch, m.source_schema, m.source_table, m.s3_uri, m.kind, m.row_count,\n       m.lsn_start AS \"lsn_start: Lsn\", m.lsn_end AS \"lsn_end: Lsn\", m.schema_version,\n       m.status, m.reload_id\nFROM walrus.file_manifest m\nWHERE m.epoch = $1 AND m.source_schema = $2 AND m.source_table = $3 AND m.status = 'ready'\n  AND (\n      NOT EXISTS (\n          SELECT 1 FROM walrus.table_reload r\n          WHERE r.epoch = m.epoch\n            AND r.source_schema = m.source_schema\n            AND r.source_table = m.source_table\n            AND r.status IN ('requested', 'exporting')\n      )\n      -- A later source reload may already be queued while the loader is publishing the current\n      -- completed export. That queue must not deadlock the current cutover;\n      -- Phase A itself stops at this export_complete attempt's H, then the next request remains\n      -- paused normally.\n      OR EXISTS (\n          SELECT 1 FROM walrus.table_reload ready\n          WHERE ready.epoch = m.epoch\n            AND ready.source_schema = m.source_schema\n            AND ready.source_table = m.source_table\n            AND ready.status = 'export_complete'\n      )\n  )\nORDER BY m.lsn_end, m.id\nLIMIT $4\n",
   "describe": {
     "columns": [
       {
@@ -97,5 +97,5 @@
       true
     ]
   },
-  "hash": "42186c788d6bc4d4a478f9d07c71c0e4555f9bbb5b202ce07a8e2f09d03f5792"
+  "hash": "32afba68b58f0dbbae5419f1d4a3050fd977f1ca92be6e7e69e4ba83a0773f4b"
 }

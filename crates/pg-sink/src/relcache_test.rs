@@ -78,6 +78,7 @@ fn internal_tables_are_recognised() {
     assert!(is_internal_table("walrus", "heartbeat"));
     assert!(is_internal_table("walrus", "ddl_audit"));
     assert!(is_internal_table("walrus", "reload_signal"));
+    assert!(is_internal_table("walrus", "reload_event"));
     assert!(!is_internal_table("public", "orders"));
     assert!(
         !is_internal_table("public", "reload_signal"),

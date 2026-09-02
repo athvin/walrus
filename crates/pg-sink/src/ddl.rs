@@ -140,12 +140,18 @@ impl DdlEvent {
         !self.c_tag.eq_ignore_ascii_case("COMMENT")
     }
 
+    /// Whether this is the `sql_drop` sentinel for a table that no longer has a catalog shape.
+    #[must_use]
+    pub fn is_table_drop(&self) -> bool {
+        self.c_event.eq_ignore_ascii_case("sql_drop")
+    }
+
     /// Build the authoritative post-change relation described by this event.
     ///
     /// The source snapshot deliberately contains a little more than [`PgColumn`] (`attnum`, nullability);
     /// serde ignores those fields here. On an upgraded source whose older trigger omitted `is_key`, the
-    /// previous relation supplies it by column name. A dropped table uses the prior relation's identity
-    /// with an empty column set.
+    /// previous relation supplies it by column name. A dropped-table sentinel has no post-change
+    /// relation and returns `None`; its unsupported tracked-identity change is commit-gated instead.
     ///
     /// # Errors
     ///
@@ -154,7 +160,7 @@ impl DdlEvent {
         &self,
         previous: Option<&PgRelation>,
     ) -> Result<Option<PgRelation>, DdlError> {
-        if !self.is_structural() {
+        if !self.is_structural() || self.is_table_drop() {
             return Ok(None);
         }
         let Some(columns) = &self.c_columns else {
@@ -196,6 +202,7 @@ struct PendingDdl {
     scope: TransactionScope,
     event: DdlEvent,
     version: SchemaVersionNo,
+    identity_change: Option<TrackedTableIdentityChange>,
 }
 
 #[derive(Debug, Clone)]
@@ -306,7 +313,17 @@ impl DdlConsumer {
     }
 
     /// Stage one decoded DDL event. No control-DB side effect occurs before commit.
-    pub fn observe(&mut self, scope: TransactionScope, event: DdlEvent) -> DdlObservation {
+    ///
+    /// `previous_for_oid` must be the relation already tracked for `event.c_rel_oid`, if any. A
+    /// rename, schema move, or drop is recorded as provisional transaction state here, but is not
+    /// rejected yet: a streamed transaction can still abort. The matching [`Self::on_commit`] or
+    /// [`Self::on_stream_commit`] returns the typed error before opening a control transaction.
+    pub fn observe(
+        &mut self,
+        scope: TransactionScope,
+        event: DdlEvent,
+        previous_for_oid: Option<&PgRelation>,
+    ) -> DdlObservation {
         if let Some(existing) = self.processed.get(&event.source_audit_id).cloned() {
             self.set_committed(
                 &existing.source_schema,
@@ -325,10 +342,13 @@ impl DdlConsumer {
             current
         };
         let structural_version = event.is_structural().then_some(version);
+        let identity_change = previous_for_oid
+            .and_then(|previous| TrackedTableIdentityChange::from_event(previous, &event));
         self.pending.push(PendingDdl {
             scope,
             event,
             version,
+            identity_change,
         });
         DdlObservation {
             structural_version,
@@ -364,7 +384,8 @@ impl DdlConsumer {
     ///
     /// # Errors
     ///
-    /// Returns [`DdlError::Control`] if the atomic control-Postgres transaction fails.
+    /// Returns [`DdlError::TrackedTableIdentityChange`] for a committed tracked-table rename,
+    /// schema move, or drop, or [`DdlError::Control`] if atomic control persistence fails.
     pub async fn on_commit(
         &mut self,
         pool: &sqlx::PgPool,
@@ -378,7 +399,8 @@ impl DdlConsumer {
     ///
     /// # Errors
     ///
-    /// Returns [`DdlError::Control`] if the atomic control-Postgres transaction fails.
+    /// Returns [`DdlError::TrackedTableIdentityChange`] for a committed tracked-table rename,
+    /// schema move, or drop, or [`DdlError::Control`] if atomic control persistence fails.
     pub async fn on_stream_commit(
         &mut self,
         pool: &sqlx::PgPool,
@@ -446,6 +468,16 @@ impl DdlConsumer {
             return Ok(());
         }
 
+        // Identity is part of a loader worker's durable routing key. Fail before any control row is
+        // written; the replication Commit/StreamCommit consequently remains unacknowledged and an
+        // operator cannot mistake an old canonical table for the renamed/recreated relation.
+        if let Some(change) = pending
+            .iter()
+            .find_map(|pending| pending.identity_change.clone())
+        {
+            return Err(DdlError::TrackedTableIdentityChange(change));
+        }
+
         let rows = pending
             .iter()
             .map(|pending| control::DdlRow {
@@ -498,6 +530,98 @@ impl DdlConsumer {
     }
 }
 
+/// A source identity mutation that cannot be reconciled into a worker frozen to `schema.table`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackedTableIdentityChange {
+    /// Stable source relation OID that connected the audit event to the tracked table.
+    pub relation_oid: u32,
+    /// Identity already registered in Walrus.
+    pub previous_schema: String,
+    /// Identity already registered in Walrus.
+    pub previous_table: String,
+    /// Post-DDL schema, absent when the relation was dropped.
+    pub new_schema: Option<String>,
+    /// Post-DDL table, absent when the relation was dropped.
+    pub new_table: Option<String>,
+    /// Kind of unsupported identity mutation.
+    pub kind: TrackedTableIdentityChangeKind,
+}
+
+impl TrackedTableIdentityChange {
+    fn from_event(previous: &PgRelation, event: &DdlEvent) -> Option<Self> {
+        if event.c_rel_oid != Some(previous.oid) {
+            return None;
+        }
+
+        let dropped = event.is_table_drop();
+        let kind = if dropped {
+            TrackedTableIdentityChangeKind::Dropped
+        } else if event.c_tag.eq_ignore_ascii_case("ALTER TABLE")
+            && previous.schema != event.source_schema
+        {
+            TrackedTableIdentityChangeKind::SchemaMoved
+        } else if event.c_tag.eq_ignore_ascii_case("ALTER TABLE")
+            && previous.name != event.source_table
+        {
+            TrackedTableIdentityChangeKind::Renamed
+        } else {
+            return None;
+        };
+
+        Some(Self {
+            relation_oid: previous.oid,
+            previous_schema: previous.schema.clone(),
+            previous_table: previous.name.clone(),
+            new_schema: (!dropped).then(|| event.source_schema.clone()),
+            new_table: (!dropped).then(|| event.source_table.clone()),
+            kind,
+        })
+    }
+}
+
+impl std::fmt::Display for TrackedTableIdentityChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (&self.new_schema, &self.new_table) {
+            (Some(new_schema), Some(new_table)) => write!(
+                f,
+                "{}.{} (OID {}) was {} to {}.{}",
+                self.previous_schema,
+                self.previous_table,
+                self.relation_oid,
+                self.kind,
+                new_schema,
+                new_table
+            ),
+            _ => write!(
+                f,
+                "{}.{} (OID {}) was {}",
+                self.previous_schema, self.previous_table, self.relation_oid, self.kind
+            ),
+        }
+    }
+}
+
+/// Unsupported mutation represented by [`TrackedTableIdentityChange`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackedTableIdentityChangeKind {
+    /// The relation name changed while its OID remained stable.
+    Renamed,
+    /// The relation moved to another schema while its OID remained stable.
+    SchemaMoved,
+    /// The tracked relation was dropped.
+    Dropped,
+}
+
+impl std::fmt::Display for TrackedTableIdentityChangeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Renamed => "renamed",
+            Self::SchemaMoved => "moved",
+            Self::Dropped => "dropped",
+        })
+    }
+}
+
 fn find_version(
     versions: &HashMap<(String, String), SchemaVersionNo>,
     schema: &str,
@@ -538,6 +662,9 @@ pub enum DdlError {
     /// A structured JSON payload was malformed.
     #[error("parse ddl_audit json: {0}")]
     Json(#[from] serde_json::Error),
+    /// A committed DDL transaction changed the durable identity of a tracked relation.
+    #[error("tracked table identity change is unsupported: {0}")]
+    TrackedTableIdentityChange(TrackedTableIdentityChange),
     /// The atomic control-Postgres commit failed.
     #[error(transparent)]
     Control(#[from] control::ControlError),

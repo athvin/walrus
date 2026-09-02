@@ -21,9 +21,10 @@
 -- cycles — the source table was emptied); the window below only repopulates rows STRICTLY after that
 -- tuple. `{truncate_wipe}` is empty when the tail has no truncate.
 {truncate_wipe}
--- Step 1+2 — dedup to the WINNER per PK (latest by the TUPLE (commit_lsn, lsn) DESC; deletes stay in,
--- the winner's op decides — the resurrection guard §5.3; the truncate boundary is the TUPLE, never the
--- scalar commit_lsn), then RESOLVE unchanged-TOAST (§5.6): pgoutput's `'u'` means "column not modified,
+-- Step 1+2 — dedup to the WINNER per PK (latest by the TUPLE (commit_lsn, lsn) DESC, with a non-delete
+-- preferred over its synthetic delete on an exact tie; deletes otherwise stay in and the winner's op
+-- decides — the resurrection guard §5.3; the truncate boundary is the TUPLE, never the scalar
+-- commit_lsn), then RESOLVE unchanged-TOAST (§5.6): pgoutput's `'u'` means "column not modified,
 -- value absent" — NOT a real NULL. For each column named in the winner's `unchanged_toast` meta list,
 -- substitute the last NON-sentinel value for that PK from `<table>_raw` **at or before** the winner's
 -- tuple, falling back to the current mirror value LAST. A mirror-only lookup loses the value when the
@@ -32,11 +33,13 @@
 -- Step 3 makes an already-applied one a no-op.
 CREATE OR REPLACE TEMP TABLE _batch AS
 WITH winners AS (
-    SELECT * FROM "{table}_raw"
-    WHERE "_walrus_op" <> 't' AND "_walrus_commit_lsn" >= '{after_lsn}'{truncate_bound}
+    SELECT raw_winner.* FROM "{table}_raw" raw_winner
+    WHERE raw_winner."_walrus_op" <> 't'
+      AND raw_winner."_walrus_commit_lsn" >= '{after_lsn}'{truncate_bound}
     QUALIFY row_number() OVER (
-        PARTITION BY {pk_list}
-        ORDER BY "_walrus_commit_lsn" DESC, "_walrus_lsn" DESC
+        PARTITION BY {raw_pk_list}
+        ORDER BY raw_winner."_walrus_commit_lsn" DESC, raw_winner."_walrus_lsn" DESC,
+                 CASE WHEN raw_winner."_walrus_op" = 'd' THEN 0 ELSE 1 END DESC
     ) = 1
 )
 SELECT {resolved_select}

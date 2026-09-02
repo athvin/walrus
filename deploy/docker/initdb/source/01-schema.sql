@@ -4,8 +4,8 @@
 -- Adapted from docs/examples/proto-version/01-setup.sql.
 --
 -- NOTE: no replication slots are created here. The sink creates and owns walrus's lifelong
--- logical slot at bootstrap, capturing the exported snapshot. A slot made here would
--- be orphaned and pin WAL forever. Publication-only is correct for this harness.
+-- logical slot at bootstrap without exporting a snapshot. A slot made here would be orphaned and
+-- pin WAL forever. Publication-only is correct for this harness.
 
 -- ---------------------------------------------------------------------------
 -- Schema.
@@ -42,6 +42,6 @@ ALTER TABLE public.items REPLICA IDENTITY FULL;
 -- ---------------------------------------------------------------------------
 -- Publication. pgoutput only decodes tables in the publication named at
 -- START_REPLICATION time; publish everything. The source migrations create the sink's internal
--- ddl_audit, heartbeat, and reload-signal tables after initial database setup.
+-- ddl_audit, heartbeat, reload-signal, and durable reload-event tables after initial database setup.
 -- ---------------------------------------------------------------------------
 CREATE PUBLICATION walrus_pub FOR ALL TABLES;

@@ -3,8 +3,8 @@
 //!
 //! The manifest is a **work queue, not a history**. The single load-bearing line is the claim
 //! ordering: `ORDER BY lsn_end, id` — commit LSN, then `id` as the tiebreaker. It is *not*
-//! `lsn_end > raw_appended_lsn`: the many snapshot files that share `consistent_point` all have the
-//! same `lsn_end`, and a `>` filter would skip them forever. And it keys on the **commit** LSN, not
+//! `lsn_end > raw_appended_lsn`: legacy snapshot files can share one `consistent_point` and therefore
+//! one `lsn_end`, so a `>` filter would skip them forever. And it keys on the **commit** LSN, not
 //! a max-row LSN, or a late-committing large transaction would be silently dropped. Retiring a file
 //! is a `DELETE`, not a status flip — the queue's frontier advances by removal.
 
@@ -21,7 +21,7 @@ string_enum! {
     /// `Spill` is a *single* streamed transaction written before its commit LSN was known; the
     /// loader treats the file's `lsn_end` — not the per-row placeholder — as the authoritative
     /// `commit_lsn` for its rows. `Reload` chunk files enter the same `(lsn_end, id)` claim
-    /// order carrying a `reload_id`; `Snapshot`/`Stream` rows never set it.
+    /// order carrying a `reload_id`; `Snapshot` is retained for legacy manifest compatibility.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ManifestKind {
         error = ParseEnumError;
@@ -50,7 +50,7 @@ string_enum! {
 ///
 /// `kind` is `Snapshot | Stream | Spill | Reload` — reload chunk files enter this same
 /// queue and sort into the same `(lsn_end, id)` order, carrying the `reload_id` the loader's
-/// rebuild trigger routes on. Stream/snapshot/spill rows never set `reload_id`.
+/// rebuild trigger routes on. `Snapshot` remains readable for legacy manifests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestRow {
     /// The row's primary key, and the *tiebreaker* half of the `(lsn_end, id)` claim order — so it
@@ -71,8 +71,8 @@ pub struct ManifestRow {
     /// Lowest commit LSN in the file — diagnostic only; the queue never orders on it.
     pub lsn_start: Lsn,
     /// Highest **commit** LSN in the file: the frontier this file advances, and the primary claim
-    /// sort key. Snapshot files all share one `lsn_end`, which is why the claim uses `>=`-free
-    /// ordering rather than a `>` filter.
+    /// sort key. Legacy snapshot files can share one `lsn_end`, which is why the claim uses
+    /// `>=`-free ordering rather than a `>` filter.
     pub lsn_end: Lsn,
     /// The relation shape these rows were encoded at, so the loader can reconstruct the types.
     pub schema_version: SchemaVersionNo,
@@ -142,18 +142,17 @@ pub async fn insert_ready(
 /// Claim the next `ready` files for a table **in commit order**.
 ///
 /// `ORDER BY lsn_end, id` — `id` breaks equal-`lsn_end` ties. There is deliberately **no**
-/// `lsn_end > raw_appended_lsn` predicate: that would skip the equal-`lsn_end` snapshot files.
+/// `lsn_end > raw_appended_lsn` predicate: that would skip equal-`lsn_end` legacy snapshot files.
 ///
-/// **The pause predicate (reload §2/H8):** while a `flavor='reload'` reload is
+/// **The pause predicate (reload §2/H8):** while either persisted reload flavor is
 /// `requested|exporting`, claiming would apply-and-RETIRE post-`W` stream files into the old
 /// mirror — and the rebuild would then clear that mirror with those events gone from the queue
 /// forever. Not claiming is a complete pause: rows accumulate `ready`, the frontier freezes at
 /// `W`, and the rebuild later replays the world in `(lsn_end, id)` order. The pause lives in the
-/// QUERY (one statement, no check-then-claim TOCTOU) and lifts at `export_complete` — the loader
-/// must claim again to reach the chunk files and trigger the rebuild; pausing through
-/// `export_complete` would deadlock the reload. `resync` never pauses (H3). The `NOT EXISTS`
-/// probe is served by the `table_reload_one_live` partial index (its predicate
-/// `status NOT IN ('complete','failed')` covers `requested|exporting`).
+/// QUERY (one statement, no check-then-claim TOCTOU). An `export_complete` attempt always lifts it,
+/// even when a later source request is already queued: the loader must finish the current cutover
+/// before that queued request can be claimed. Pausing through `export_complete` would deadlock the
+/// FIFO. The legacy `resync` spelling has exactly the same pause and cutover behavior.
 ///
 /// # Errors
 ///
@@ -240,11 +239,11 @@ pub async fn delete_claimed(
     Ok(result.rows_affected())
 }
 
-/// Purge a rebuilding table's SUPERSEDED pending rows at trigger time (reload H8): every
-/// non-reload row with `lsn_end <= first_lsn` describes a commit the chunks re-cover (`C <= L_1`
-/// ⇒ visible to chunk 1's SELECT), so applying it after the rebuild would only re-apply history
-/// the clear just replaced. Chunk 1 itself has `lsn_end = first_lsn` — the `kind` filter is what
-/// lets it survive its own purge. No status filter: a dead-lettered (`failed`) pre-`W` file is
+/// Purge a rebuilding table's SUPERSEDED pending rows at trigger time: every non-reload row with
+/// `lsn_end <= F` describes a commit covered by the post-F consistent baseline, so applying it
+/// after the rebuild would only re-apply history the replacement already contains. Baseline chunk
+/// files themselves carry `lsn_end = F`; the `kind` filter is what lets them survive their own
+/// purge. No status filter: a dead-lettered (`failed`) pre-F file is
 /// equally superseded. Idempotent (a re-run deletes nothing). Returns rows purged.
 ///
 /// # Errors
@@ -255,14 +254,14 @@ pub async fn delete_superseded(
     epoch: EpochNo,
     source_schema: &str,
     source_table: &str,
-    first_lsn: Lsn,
+    fence_lsn: Lsn,
 ) -> Result<u64, ControlError> {
     let done = sqlx::query_file!(
         "sql/postgres/queries/delete_superseded.sql",
         epoch.0,
         source_schema,
         source_table,
-        first_lsn as Lsn,
+        fence_lsn as Lsn,
     )
     .execute(executor)
     .await?;

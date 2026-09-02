@@ -26,7 +26,6 @@
 //! `START_REPLICATION`'s `CopyBothResponse`. "Forgot to `START_REPLICATION`" is a compile error, not
 //! a torn stream.
 
-use crate::config::SlotName;
 use anyhow::{Context, anyhow, bail};
 use bytes::{Bytes, BytesMut};
 use common::{Lsn, PG_EPOCH_UNIX_MICROS};
@@ -85,8 +84,8 @@ pub struct Streaming;
 
 /// A hand-rolled replication connection, typed by which protocol state it is in. [`Streaming`] is the
 /// default because every consumer of this module ([`crate::consume`], [`crate::shutdown`],
-/// [`crate::checkpoint`]) only ever holds a live CopyBoth stream; the [`Idle`] form exists for the
-/// snapshot-export handoff and exposes nothing that would tear the wire.
+/// [`crate::checkpoint`]) only ever holds a live CopyBoth stream; the [`Idle`] form ensures startup
+/// completes before the connection can enter CopyBoth mode.
 ///
 /// Frames cannot be read before `START_REPLICATION`:
 ///
@@ -117,8 +116,7 @@ pub struct ReplicationStream<S = Streaming> {
 
 impl ReplicationStream<Idle> {
     /// Open a `replication=database` connection and complete the startup handshake **without** yet
-    /// issuing `START_REPLICATION` — the idle state a snapshot export needs. The caller then
-    /// either [`create_replication_slot_export`](Self::create_replication_slot_export) or
+    /// issuing `START_REPLICATION`. The caller then consumes it with
     /// [`into_streaming`](Self::into_streaming).
     ///
     /// # Errors
@@ -144,8 +142,7 @@ impl ReplicationStream<Idle> {
     }
 
     /// Issue `START_REPLICATION` from `start_lsn`, seeding the received/durable baselines, and hand
-    /// back the streaming half of the connection. On its own (after [`connect`](Self::connect)) this
-    /// is the snapshot handoff: stream from `consistent_point`.
+    /// back the streaming half of the connection.
     ///
     /// `into_`, not `start_`: the idle connection is **spent** here. Only one of the two states may
     /// exist at a time, so the idle handle cannot linger and issue a second simple query into what is
@@ -165,6 +162,7 @@ impl ReplicationStream<Idle> {
         self.last_received = start_lsn;
         self.durable = start_lsn;
         self.feedback_deadline = Instant::now() + self.feedback_interval;
+        self.try_acquire_publication_ddl_guard().await?;
         self.begin_replication(slot, start_lsn, publication).await?;
         Ok(ReplicationStream {
             stream: self.stream,
@@ -176,68 +174,12 @@ impl ReplicationStream<Idle> {
             _state: PhantomData,
         })
     }
-
-    /// `CREATE_REPLICATION_SLOT <slot> LOGICAL pgoutput (SNAPSHOT 'export')`. Returns
-    /// `(consistent_point, snapshot_name)`. **This connection now holds the exported snapshot** — keep
-    /// it strictly idle until every backfill session has run `SET TRANSACTION SNAPSHOT`; the next
-    /// command on it (e.g. `START_REPLICATION`) ends the snapshot. Unlike
-    /// `pg_create_logical_replication_slot()` (the SQL helper), the replication command is the *only*
-    /// way to export a `snapshot_name`.
-    ///
-    /// The name is interpolated **unquoted** into the command, so this takes a parsed [`SlotName`]
-    /// rather than a bare `&str`: the parameter *is* the proof that the text is one Postgres accepts,
-    /// checked once at the config edge instead of hoped for here.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`anyhow::Error`] for socket/protocol failures, a PostgreSQL error response, a missing
-    /// result column, or an invalid `consistent_point` LSN.
-    pub async fn create_replication_slot_export(
-        &mut self,
-        slot: &SlotName,
-    ) -> anyhow::Result<(Lsn, String)> {
-        // `NOEXPORT_SNAPSHOT`/`USE_SNAPSHOT` are the alternatives; `EXPORT` is what backfill needs.
-        let sql = format!("CREATE_REPLICATION_SLOT {slot} LOGICAL pgoutput (SNAPSHOT 'export')");
-        self.send_query(&sql).await?;
-        let mut data_row: Option<Vec<Option<String>>> = None;
-        loop {
-            let (tag, body) = self.read_message().await?;
-            match tag {
-                // RowDescription 'T' — the column order is fixed and documented; DataRow 'D' carries
-                // the values; CommandComplete 'C'; ReadyForQuery 'Z' ends the simple query.
-                b'T' | b'C' | b'N' | b'S' => {}
-                b'D' => data_row = Some(parse_data_row(&body)?),
-                b'Z' => break,
-                b'E' => bail!("CREATE_REPLICATION_SLOT failed: {}", error_message(&body)),
-                other => bail!(
-                    "unexpected reply '{}' to CREATE_REPLICATION_SLOT",
-                    char::from(other)
-                ),
-            }
-        }
-        let row = data_row.context("CREATE_REPLICATION_SLOT returned no row")?;
-        // Columns: 0 = slot_name, 1 = consistent_point, 2 = snapshot_name, 3 = output_plugin.
-        let consistent = row
-            .get(1)
-            .and_then(Clone::clone)
-            .context("CREATE_REPLICATION_SLOT row missing consistent_point")?;
-        let snapshot_name = row
-            .get(2)
-            .and_then(Clone::clone)
-            .context("CREATE_REPLICATION_SLOT row missing snapshot_name")?;
-        // Context, not `anyhow!("…: {e:?}")`: the typed `LsnParseError` already prints the offending
-        // text, and keeping it as the cause leaves it in `{:#}` and reachable by `downcast_ref`.
-        let consistent_point: Lsn = consistent
-            .parse()
-            .context("parse the slot's consistent_point as a Postgres LSN")?;
-        Ok((consistent_point, snapshot_name))
-    }
 }
 
 impl ReplicationStream<Streaming> {
     /// Connect, hand-shake, and issue `START_REPLICATION SLOT … LOGICAL <lsn> (proto_version '2',
-    /// streaming 'on', publication_names '<publication>')` — the resume path, which needs no exported
-    /// snapshot. `dsn` is parsed for host/port/user/db (its auth is `trust` in the dev harness).
+    /// streaming 'on', publication_names '<publication>')`. `dsn` is parsed for host/port/user/db
+    /// (its auth is `trust` in the dev harness).
     ///
     /// # Errors
     ///
@@ -536,6 +478,44 @@ impl<S: Send> ReplicationStream<S> {
         }
     }
 
+    /// Tie the guard to the CopyBoth backend as well as the orchestration SQL session. This MUST be
+    /// a try-lock: if an exclusive publication-DDL request queued behind the first shared holder,
+    /// blocking for a second shared lock would deadlock startup against that writer.
+    async fn try_acquire_publication_ddl_guard(&mut self) -> anyhow::Result<()> {
+        let key = crate::source_catalog::PUBLICATION_DDL_GUARD_KEY;
+        self.send_query(&format!(
+            "SELECT pg_catalog.pg_try_advisory_lock_shared({key})"
+        ))
+        .await?;
+        let mut acquired = None;
+        loop {
+            let (tag, body) = self.read_message().await?;
+            match tag {
+                b'D' => acquired = Some(data_row_bool(&body)?),
+                b'T' | b'C' | b'I' | b'N' | b'S' => {}
+                b'Z' => {
+                    return match acquired {
+                        Some(true) => Ok(()),
+                        Some(false) => bail!(
+                            "publication DDL queued while replication was starting; retry startup"
+                        ),
+                        None => bail!("publication-DDL guard query returned no row"),
+                    };
+                }
+                b'E' => {
+                    bail!(
+                        "acquire publication-DDL guard failed: {}",
+                        error_message(&body)
+                    );
+                }
+                other => bail!(
+                    "unexpected reply '{}' while acquiring publication-DDL guard",
+                    char::from(other)
+                ),
+            }
+        }
+    }
+
     async fn send_query(&mut self, sql: &str) -> anyhow::Result<()> {
         let capacity = sql
             .len()
@@ -622,39 +602,6 @@ fn build_standby_status(s: StandbyStatus) -> [u8; STANDBY_STATUS_FRAME_BYTES] {
     msg
 }
 
-/// Parse a `DataRow` ('D') body: `Int16` column count, then per column an `Int32` length (`-1` =
-/// NULL) and that many bytes (UTF-8 text values, since walrus never enables binary output).
-fn parse_data_row(body: &[u8]) -> anyhow::Result<Vec<Option<String>>> {
-    let mut out = Vec::new();
-    // The column count is a fixed `Int16` header; a body too short to hold it carries no columns.
-    let Some(&head) = body.first_chunk::<2>() else {
-        return Ok(out);
-    };
-    let ncols = usize::from(u16::from_be_bytes(head));
-    let mut i = 2;
-    for _ in 0..ncols {
-        if i + 4 > body.len() {
-            break;
-        }
-        let len = read_i32(&body[i..i + 4])?;
-        i += 4;
-        if len < 0 {
-            out.push(None);
-            continue;
-        }
-        let len = usize::try_from(len).context("negative DataRow length escaped validation")?;
-        let Some(end) = i.checked_add(len) else {
-            break;
-        };
-        if end > body.len() {
-            break;
-        }
-        out.push(Some(String::from_utf8_lossy(&body[i..end]).into_owned()));
-        i = end;
-    }
-    Ok(out)
-}
-
 /// Take one framed backend message (`tag` + 4-byte self-inclusive length + body) from `buf`, or
 /// `None` if a full message is not yet buffered.
 fn take_message(buf: &mut BytesMut) -> Option<(u8, Bytes)> {
@@ -690,6 +637,28 @@ fn read_i64(b: &[u8]) -> anyhow::Result<i64> {
 }
 fn read_i32(b: &[u8]) -> anyhow::Result<i32> {
     Ok(i32::from_be_bytes(fixed(b, "read_i32")?))
+}
+
+/// Decode the single text boolean returned by `pg_try_advisory_lock_shared`.
+fn data_row_bool(body: &[u8]) -> anyhow::Result<bool> {
+    let count = u16::from_be_bytes(fixed(
+        body.get(..2).unwrap_or_default(),
+        "DataRow column count",
+    )?);
+    anyhow::ensure!(count == 1, "guard DataRow has {count} columns, expected 1");
+    let len = read_i32(
+        body.get(2..6)
+            .context("guard DataRow is missing its value length")?,
+    )?;
+    anyhow::ensure!(
+        len == 1,
+        "guard DataRow boolean has length {len}, expected 1"
+    );
+    match body.get(6).copied() {
+        Some(b't') => Ok(true),
+        Some(b'f') => Ok(false),
+        other => bail!("guard DataRow is not a text boolean: {other:?}"),
+    }
 }
 
 /// The `Int32` sub-type of an Authentication ('R') body. `take_message` frames on the 4-byte length

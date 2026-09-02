@@ -4,11 +4,13 @@
 {truncate_wipe}
 CREATE OR REPLACE TEMP TABLE _batch AS
 WITH winners AS (
-    SELECT * FROM "{table}_raw"
-    WHERE "_walrus_op" <> 't' AND "_walrus_commit_lsn" >= '{after_lsn}'{truncate_bound}
+    SELECT raw_winner.* FROM "{table}_raw" raw_winner
+    WHERE raw_winner."_walrus_op" <> 't'
+      AND raw_winner."_walrus_commit_lsn" >= '{after_lsn}'{truncate_bound}
     QUALIFY row_number() OVER (
-        PARTITION BY {pk_list}
-        ORDER BY "_walrus_commit_lsn" DESC, "_walrus_lsn" DESC
+        PARTITION BY {raw_pk_list}
+        ORDER BY raw_winner."_walrus_commit_lsn" DESC, raw_winner."_walrus_lsn" DESC,
+                 CASE WHEN raw_winner."_walrus_op" = 'd' THEN 0 ELSE 1 END DESC
     ) = 1
 )
 SELECT {resolved_select}

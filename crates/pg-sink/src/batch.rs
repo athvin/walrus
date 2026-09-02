@@ -259,10 +259,23 @@ impl<C: Clock> TableBatcher<C> {
 
     /// Append one change to the OPEN txn buffer (not yet flush-eligible). Its `meta.commit_lsn` and
     /// `meta.batch_id` are patched at [`Self::on_commit`].
-    pub fn push(&mut self, meta: SinkMeta, values: &[TupleValue]) {
+    pub fn push(&mut self, mut meta: SinkMeta, values: &[TupleValue]) {
         self.batch_id.get_or_insert_with(|| {
             format!("{}.{}-{}", meta.source_schema, meta.source_table, meta.lsn)
         });
+        // `UnchangedToast` is represented as Arrow NULL in the typed data column; its column name
+        // in row metadata is the only way the loader can distinguish that sentinel from a real SQL
+        // NULL and back-scan the prior value. Derive the list here, at the single choke point shared
+        // by ordinary WAL, streamed in-memory rows, and speculative spills, so no producer path can
+        // forget it. Reload rows contain no sentinels and retain the allocation-free empty
+        // boxed slice.
+        let mut unchanged_toast = Vec::new();
+        for (column, value) in self.rel.relation.columns.iter().zip(values) {
+            if matches!(value, TupleValue::UnchangedToast) {
+                unchanged_toast.push(column.name.clone());
+            }
+        }
+        meta.unchanged_toast = unchanged_toast.into_boxed_slice();
         self.pending_bytes = self
             .pending_bytes
             .saturating_add(estimate_row_bytes(values));
@@ -374,6 +387,38 @@ impl<C: Clock> TableBatcher<C> {
         self.committed = CommittedRows::None;
         self.batch_id = None;
         Ok(sealed)
+    }
+
+    /// Force the currently committed rows into a file without waiting for a cadence/size trigger.
+    ///
+    /// Unlike [`Self::drain_committed`], this never drops an open transaction.  A table durability
+    /// fence calls this immediately after the fence transaction's `Commit`, where an open ordinary
+    /// transaction is impossible; treating one as an error keeps an accidental mid-transaction
+    /// caller from silently losing its speculative tail.
+    ///
+    /// `None` means the table has no committed rows waiting for durability.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BatchError::OpenTransaction`] if called away from a commit boundary, or the same
+    /// assignment/Arrow errors as [`Self::seal`] when committed rows are present.
+    pub fn force_seal_committed(&mut self) -> Result<Option<SealedBatch>, BatchError> {
+        if self.has_open_txn() {
+            return Err(BatchError::OpenTransaction);
+        }
+        if matches!(self.committed, CommittedRows::None) {
+            return Ok(None);
+        }
+        self.seal().map(Some)
+    }
+
+    /// Whether this batcher owns `schema.table`.
+    ///
+    /// Kept crate-visible for [`crate::consume::BatchRouter`]'s targeted durability fence; callers
+    /// outside the sink should identify tables through the registry rather than in-memory batches.
+    #[must_use]
+    pub(crate) fn is_for_table(&self, schema: &str, table: &str) -> bool {
+        self.rel.relation.schema == schema && self.rel.relation.name == table
     }
 
     /// Rows that are committed and therefore publishable. Excludes anything buffered for a

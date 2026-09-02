@@ -26,6 +26,14 @@ use common::{Lsn, PgRelation};
 /// stored relation shape is invalid.
 pub(crate) async fn current_transform(ctx: &TableCtx) -> Result<TransformSql, LoaderError> {
     let ver = ctx.db.schema_version()?;
+    transform_at_version(ctx, ver, &ctx.table).await
+}
+
+async fn transform_at_version(
+    ctx: &TableCtx,
+    ver: common::SchemaVersionNo,
+    physical_table: &str,
+) -> Result<TransformSql, LoaderError> {
     match control::read_registry(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table, ver).await? {
         Some(r) => {
             // The `schema.table` label is built INSIDE the closure: `map_err` only runs it on a
@@ -37,12 +45,12 @@ pub(crate) async fn current_transform(ctx: &TableCtx) -> Result<TransformSql, Lo
                     source,
                 }
             })?;
-            Ok(TransformSql::from_plan(&TablePlan::from_registry(
-                &rel,
-                &r.descriptors,
-            )))
+            let plan = TablePlan::from_registry(&rel, &r.descriptors).for_table(physical_table);
+            Ok(TransformSql::from_plan(&plan))
         }
-        None => Ok(TransformSql::from_relation(&ctx.rel)),
+        None => Ok(TransformSql::from_plan(
+            &TablePlan::tier1(&ctx.rel).for_table(physical_table),
+        )),
     }
 }
 
@@ -72,8 +80,12 @@ pub async fn run_phase_b(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     // mirror already has — the per-PK `_applied_*` guard makes those a no-op, so the mirror stays exact
     // (`max()` is NULL only when `<table>_raw` is empty). A source that sits idle at the boundary re-scans
     // that one commit's rows each poll; normal streaming advances `transformed_lsn` past it immediately.
+    let build = ctx.db.reload_build()?;
+    let physical_table = build
+        .as_ref()
+        .map_or(ctx.table.as_str(), |build| build.shadow_table.as_str());
     let conn = ctx.db.conn();
-    let raw = DuckTable::<Mirror>::new(&ctx.table).to_raw();
+    let raw = DuckTable::<Mirror>::new(physical_table).to_raw();
     let max_hex: Option<String> = conn
         .query_row(
             &format!(
@@ -84,49 +96,118 @@ pub async fn run_phase_b(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
             |r| r.get(0),
         )
         .duck("scan un-transformed tail")?;
-    let Some(max_hex) = max_hex else {
-        return Ok(None); // <table>_raw is empty — nothing to transform yet
-    };
-    let max_lsn: Lsn = max_hex.parse().map_err(|source| LoaderError::LsnParse {
-        field: "max commit_lsn",
-        source,
-    })?;
+    let mut applied = None;
+    if let Some(max_hex) = max_hex {
+        let max_lsn: Lsn = max_hex.parse().map_err(|source| LoaderError::LsnParse {
+            field: "max commit_lsn",
+            source,
+        })?;
 
-    // The transform must reference exactly the columns the reconciled tables now have — i.e. the shape at
-    // the DuckDB tables' CURRENT reconciled `schema_version` (Phase A advanced it), NOT the stale
-    // bootstrap shape, including Tier-2 recombination from the descriptors.
-    let t = current_transform(ctx).await?;
-    let ducklake = ctx.db.is_ducklake();
-    ctx.db.in_txn("transform", |conn| {
-        if ducklake {
-            apply_transform_ducklake(conn, &t, after)
+        // A live transform uses the canonical schema watermark; a reload transform uses the frozen
+        // version persisted with its shadow. In both cases the physical name is explicit.
+        let version = build
+            .as_ref()
+            .map_or(ctx.db.schema_version()?, |build| build.schema_version);
+        let t = transform_at_version(ctx, version, physical_table).await?;
+        let ducklake = ctx.db.is_ducklake();
+        ctx.db.in_txn("transform", |conn| {
+            if ducklake {
+                apply_transform_ducklake(conn, &t, after)
+            } else {
+                apply_transform(conn, &t, after)
+            }
+        })?;
+
+        // Advance the watermark AFTER the DuckDB commit. The CHECK
+        // (transformed_lsn <= raw_appended_lsn) holds because Phase A ran first this cycle.
+        control::advance_transformed(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table, max_lsn)
+            .await?;
+        if max_lsn > after {
+            tracing::info!(
+                table = %format_args!("{}.{}", ctx.schema, ctx.table),
+                transformed = %max_lsn,
+                generation = physical_table,
+                "Phase B: mirror updated, transformed_lsn advanced"
+            );
         } else {
-            apply_transform(conn, &t, after)
+            tracing::debug!(
+                table = %format_args!("{}.{}", ctx.schema, ctx.table),
+                transformed = %max_lsn,
+                generation = physical_table,
+                "Phase B: boundary re-transform, transformed_lsn unchanged"
+            );
         }
-    })?;
+        applied = Some(max_lsn);
+    }
 
-    // Advance the watermark AFTER the DuckDB commit. The CHECK (transformed_lsn <= raw_appended_lsn)
-    // holds because Phase A ran first this cycle. `max_lsn` can equal the prior `transformed_lsn` (a
-    // boundary re-transform advances it to the same value — a no-op) — that is the snapshot/stream
-    // boundary being held closed. The full-rebuild is the safety net regardless.
-    control::advance_transformed(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table, max_lsn).await?;
-    // Only a watermark that MOVED is a lifecycle event. The boundary re-transform described above
-    // re-applies the same commit on every poll while the source sits idle (`max_lsn == after`, a
-    // no-op against the mirror), so keeping one `info!` here would emit a line per table per
-    // `poll_interval` forever — claiming an advance that did not happen — and bury the cycles that
-    // did move. The idle re-scan is diagnostic detail: `debug`.
-    if max_lsn > after {
+    let Some(build) = build else {
+        return Ok(applied);
+    };
+
+    // `claim_ready` is an ordered read-only claim. Once its head is above H (or absent), every
+    // durable manifest through H has been appended to the shadow. H itself is an explicit marker,
+    // not a data row: advancing both checkpoint fields to it is what lets an empty dump complete.
+    let next = control::claim_ready(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table, 1).await?;
+    if !queue_drained_through(
+        next.first().map(|manifest| manifest.lsn_end),
+        build.final_lsn,
+    ) {
+        return Ok(applied);
+    }
+
+    let mut tx = ctx
+        .pool
+        .begin()
+        .await
+        .map_err(|source| LoaderError::ControlTxn {
+            op: "begin reload marker advance txn",
+            source,
+        })?;
+    control::advance_raw_appended(
+        &mut *tx,
+        ctx.epoch,
+        &ctx.schema,
+        &ctx.table,
+        build.final_lsn,
+    )
+    .await?;
+    control::advance_transformed(
+        &mut *tx,
+        ctx.epoch,
+        &ctx.schema,
+        &ctx.table,
+        build.final_lsn,
+    )
+    .await?;
+    tx.commit()
+        .await
+        .map_err(|source| LoaderError::ControlTxn {
+            op: "commit reload marker advance txn",
+            source,
+        })?;
+
+    if ctx.db.publish_reload_shadow(&ctx.table, build.reload_id)? {
+        // Only publication replaces the quarantined live generation. Beginning an export must not
+        // make readiness healthy while users still see the old incompatible table.
+        ctx.state.clear_quarantine();
         tracing::info!(
             table = %format_args!("{}.{}", ctx.schema, ctx.table),
-            transformed = %max_lsn,
-            "Phase B: mirror updated, transformed_lsn advanced"
-        );
-    } else {
-        tracing::debug!(
-            table = %format_args!("{}.{}", ctx.schema, ctx.table),
-            transformed = %max_lsn,
-            "Phase B: boundary re-transform, transformed_lsn unchanged"
+            reload_id = %build.reload_id,
+            final_lsn = %build.final_lsn,
+            "reload shadow atomically published at its explicit end marker"
         );
     }
-    Ok(Some(max_lsn))
+    Ok(Some(
+        applied.map_or(build.final_lsn, |lsn| lsn.max(build.final_lsn)),
+    ))
 }
+
+/// Whether the ordered ready queue has no remaining file at or below the explicit end marker.
+/// `None` is deliberately success: a zero-row export is represented by markers, not a fake row.
+fn queue_drained_through(next_lsn: Option<Lsn>, final_lsn: Lsn) -> bool {
+    next_lsn.is_none_or(|lsn| lsn > final_lsn)
+}
+
+#[cfg(test)]
+#[path = "phase_b_test.rs"]
+mod tests;

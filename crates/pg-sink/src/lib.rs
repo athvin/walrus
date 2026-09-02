@@ -16,7 +16,6 @@
 //! (`src/main.rs`) is only config, tracing, a runtime and an exit code.
 
 pub mod app;
-pub mod backfill;
 pub mod batch;
 pub mod bootstrap;
 pub mod checkpoint;
@@ -33,11 +32,12 @@ pub mod pgoutput;
 pub mod preflight;
 pub mod relcache;
 pub mod reload;
+pub mod reload_event;
 pub mod reload_export;
 pub mod reload_signal;
 pub mod replication;
 pub mod shutdown;
 pub mod sink;
 pub mod slot;
-pub mod snapshot;
+pub mod source_catalog;
 pub mod stream_txn;

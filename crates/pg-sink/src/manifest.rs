@@ -30,7 +30,8 @@ pub async fn record_ready(
 }
 
 /// As [`record_ready`], carrying the `reload_id` a `kind='reload'` chunk file belongs to
-/// — the loader's routing/purge key. Stream/snapshot/spill objects pass `None`.
+/// — the loader's routing/purge key. Stream/spill objects pass `None`; legacy snapshot manifests
+/// likewise carry no reload id.
 ///
 /// # Errors
 ///

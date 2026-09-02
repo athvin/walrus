@@ -1125,12 +1125,9 @@ fn the_workspace_lint_table_still_denies_formatting_into_an_existing_buffer() {
 /// value, a short wire frame and a malformed range literal are all *expected* — walrus answers each
 /// with a typed `Err` that `main` maps onto a `common::ExitCode`. Nothing in the type system
 /// requires that; these denies are the requirement. All five are `restriction`/`pedantic` lints
-/// outside every group denied above, so only the named entry reaches each one, and four of them —
-/// `panic`, `todo`, `unreachable`, `panic_in_result_fn` — have zero sites, so dropping an entry
-/// breaks no build and reddens no other test, exactly as with `dbg_macro` above. `unimplemented` is
-/// the one that needs no help: `crates/pg-sink/src/backfill.rs` suppresses it with `#[expect]`, and
-/// an expectation left unfulfilled by a dropped deny is itself a denied warning. The other way to
-/// undo this policy — a scoped allow inside a production module — is what
+/// outside every group denied above, so only the named entry reaches each one. Dropping an entry
+/// can leave production compiling unchanged, exactly as with `dbg_macro` above. The other way to
+/// undo this policy — a scoped suppression inside a production module — is what
 /// `crates/common/tests/no_panic_suppression.rs` watches.
 ///
 /// Unlike every other entry in the table, these five carry their rationale on the same line, which

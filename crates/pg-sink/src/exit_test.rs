@@ -66,6 +66,17 @@ fn a_non_keyless_preflight_failure_exits_13() {
 }
 
 #[test]
+fn guarded_publication_revalidation_keeps_its_preflight_exit_through_context() {
+    let issue = crate::source_catalog::PublicationCoverageIssue::DisabledOperations {
+        publication: "walrus_pub".to_string(),
+        disabled: "DELETE".to_string(),
+    };
+    let err = anyhow::Error::new(crate::preflight::PreflightError::from(issue))
+        .context("publication changed after startup preflight");
+    assert_eq!(code_for(&err), common::ExitCode::Preflight);
+}
+
+#[test]
 fn heartbeat_failure_exits_16() {
     let err = anyhow::Error::new(crate::heartbeat::HeartbeatError::Connect(postgres_error()));
     assert_eq!(code_for(&err), common::ExitCode::SourceDb);

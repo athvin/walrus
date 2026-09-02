@@ -11,7 +11,7 @@ use crate::duck::{S3Access, TableDb};
 use crate::error::LoaderError;
 use crate::health::LoaderState;
 use crate::lease;
-use common::{Lsn, PgRelation};
+use common::{EpochNo, Lsn, PgRelation};
 use object_store::ObjectStore;
 use sqlx::Connection as _;
 
@@ -45,6 +45,8 @@ pub struct OwnedTable {
 /// Tables plus the session that holds their PostgreSQL advisory locks.
 #[derive(Debug)]
 pub struct BootstrapResult {
+    /// Exact generation whose registry, leases, checkpoints, and files were opened.
+    pub epoch: EpochNo,
     /// Tables assigned to this shard.
     pub tables: Vec<OwnedTable>,
     /// Catalog-session second fence, held until every table worker has drained.
@@ -226,11 +228,11 @@ pub async fn bootstrap(
         // steady-state per-file forward reconcile lives in Phase A.
         let db = TableDb::open_ducklake(&cfg.ducklake, epoch, &rel.schema, &rel.name, s3)?;
         // Total-restart rebuild (§1.8): if this `.duckdb` was built for a retired generation (its
-        // `_walrus_meta['epoch']` < the control epoch), wipe its mirror + raw so the fresh new-epoch
-        // snapshot rebuilds it. A no-op for a fresh file or a same-epoch resume. Both watermarks reset for
+        // `_walrus_meta['epoch']` < the control epoch), wipe its mirror + raw so the new generation's
+        // full-table reconciliation rebuilds it. A no-op for a fresh file or a same-epoch resume. Both watermarks reset for
         // free — the new epoch's `loader_checkpoint` (loaded below) is a fresh `0/0`.
         crate::epoch::rebuild_for_new_epoch(&db, &rel.name, epoch)?;
-        // Quarantine-recovery: a pending **rebuild-flavor** reload will CREATE OR REPLACE
+        // Quarantine-recovery: a pending reload (either persisted flavor) will replace
         // this table's mirror at the reload's version in Phase A. Reconciling the resumed
         // `.duckdb` to the registry's LATEST version here would re-run the very lossy cast that
         // quarantined it (the mirror still holds the un-castable data) and RE-QUARANTINE during
@@ -329,6 +331,7 @@ pub async fn bootstrap(
     // Liveness: stamp one poll so an idle-but-healthy loader is `/healthz` green (no poll loop yet).
     state.stamp_poll();
     Ok(BootstrapResult {
+        epoch,
         tables: owned,
         catalog_fence,
     })

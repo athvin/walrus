@@ -4,18 +4,15 @@
     clippy::let_underscore_must_use,
     reason = "integration test — unwrap/expect fine in setup + helpers"
 )]
-//! The `resync` flavor against compose (`#[ignore]` — needs control PG + MinIO). Unlike `reload`
-//! (clear + rebuild), `resync` merges chunks over the LIVE mirror: no pause, no
-//! `CREATE OR REPLACE`, no purge, no meta latch, raw history preserved. It repairs stale and
-//! missing rows through the ordinary Phase A/B path — but **never removes phantoms** (a row that
-//! drifted into the mirror and no longer exists upstream is in no chunk and gets no delete). That
-//! caveat is the flavor's defining property, asserted here so a future regression that killed the
-//! phantom would fail loudly (reload H3).
+//! Compatibility coverage for the persisted `resync` flavor against compose (`#[ignore]` — needs
+//! control PG + MinIO). `resync` now aliases `reload`: it pauses claims, builds a hidden full-table
+//! generation, removes phantoms, publishes at H, and then resumes post-H WAL. The enum/database
+//! value remains accepted so existing callers and rows do not need a flag migration.
 //!
 //!   cargo test -p loader --test reload_resync -- --ignored --test-threads=1
 
 use common::{EpochNo, Lsn, PgColumn, PgRelation, ReplicaIdentity};
-use control::reload::{self, ReloadFlavor};
+use control::reload::{self, ReloadFenceIdentity, ReloadFlavor};
 use loader::duck::{S3Access, TableDb};
 use loader::health::LoaderState;
 use loader::phase_a::{TableCtx, run_phase_a};
@@ -167,12 +164,11 @@ async fn setup(epoch: EpochNo) -> (TableCtx, tempfile::TempDir) {
         compaction_interval: Duration::from_secs(3600),
         retention_lsn_lag: 16 << 20,
         pause_logged: Default::default(),
-        resync_ids: Default::default(),
     };
     (ctx, dir)
 }
 
-/// Walk a `resync` reload through the real transitions to `export_complete` at `first_lsn = l1`.
+/// Walk a `resync`-spelled rebuild through the real transitions to `export_complete`.
 async fn drained_resync(
     pool: &sqlx::PgPool,
     epoch: EpochNo,
@@ -185,19 +181,37 @@ async fn drained_resync(
     reload::claim_requested(pool, epoch, "sink-t", 60, 10)
         .await
         .unwrap();
+    let request_id = reload::get(pool, id)
+        .await
+        .unwrap()
+        .unwrap()
+        .parent_request_id
+        .expect("direct resync has a durable fence namespace");
+    let start_lsn = l1.parse::<Lsn>().unwrap();
+    let final_lsn = h.parse::<Lsn>().unwrap();
+    let fence = ReloadFenceIdentity {
+        request_id: Some(request_id),
+        source_schema: "public",
+        source_table: "orders",
+        schema_version: common::SchemaVersionNo(1),
+    };
+    reload::record_start_fence(pool, id, start_lsn, fence)
+        .await
+        .unwrap();
     reload::advance_cursor(
         pool,
         id,
         1,
         &serde_json::json!(["999"]),
-        l1.parse::<Lsn>().unwrap(),
+        start_lsn,
         common::SchemaVersionNo(1),
     )
     .await
     .unwrap();
-    reload::complete_export(pool, id, h.parse::<Lsn>().unwrap())
+    reload::record_end_marker(pool, id, final_lsn, fence)
         .await
         .unwrap();
+    reload::complete_export(pool, id, final_lsn).await.unwrap();
     id
 }
 
@@ -249,7 +263,7 @@ async fn seed_live_mirror(ctx: &TableCtx, epoch: EpochNo) {
 
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
-async fn resync_repairs_drift_but_phantoms_survive() {
+async fn resync_alias_rebuilds_removes_phantoms_and_then_replays_post_h() {
     let _g = LOCK.lock().await;
     let epoch = EpochNo(660_001);
     let (ctx, _dir) = setup(epoch).await;
@@ -265,10 +279,9 @@ async fn resync_repairs_drift_but_phantoms_survive() {
     assert_eq!(mirror_status(&ctx, 1), None, "id 1 is now missing");
     assert_eq!(mirror_status(&ctx, 9999).as_deref(), Some("phantom"));
 
-    // A resync (L_1 = 0/100) carrying the source truth {1,2,3}; and — concurrently — a stream event
-    // at 0/200 updates id 2 to 'newest'. One claim batch: the chunk (0/100) sorts before the stream
-    // (0/200), so both transform together and the applied-(commit_lsn,lsn) guard lets the newer
-    // stream event beat the chunk's stale L_1 copy (the reason resync is safe over a live table).
+    // The full dump at H=0/100 carries source truth {1,2,3}; a later stream event at 0/200 updates
+    // id 2. The first pass must stop at H and publish the replacement before a second pass applies
+    // the post-H event.
     let resync_id = drained_resync(&ctx.pool, epoch, "0/100", "0/100").await;
     let chunk = write_rows(
         epoch,
@@ -297,45 +310,51 @@ async fn resync_repairs_drift_but_phantoms_survive() {
     );
     assert_eq!(
         mirror_status(&ctx, 2).as_deref(),
-        Some("newest"),
-        "the mid-resync stream event beats the chunk's stale stamp (no regression)"
+        Some("v2"),
+        "the first cutover stops exactly at H"
     );
     assert_eq!(mirror_status(&ctx, 3).as_deref(), Some("v3"));
     assert_eq!(
         mirror_status(&ctx, 9999).as_deref(),
-        Some("phantom"),
-        "THE CAVEAT: resync never removes a phantom — use flavor='reload' for that"
+        None,
+        "the resync alias is a full rebuild, so phantoms are removed"
     );
-    // No rebuild happened: no meta latch, raw history preserved.
     assert_eq!(
         ctx.db.recorded_reload_id().unwrap(),
-        None,
-        "resync never writes the reload_id latch"
+        Some(resync_id),
+        "the compatibility spelling records the published generation"
+    );
+
+    run_phase_a(&ctx).await.unwrap();
+    run_phase_b(&ctx).await.unwrap();
+    assert_eq!(
+        mirror_status(&ctx, 2).as_deref(),
+        Some("newest"),
+        "post-H WAL resumes after publication"
     );
     assert!(
         raw_has(&ctx, 1) && raw_has(&ctx, 3),
-        "chunk rows flowed through raw (preserved)"
+        "the published generation contains the full dump raw rows"
     );
 }
 
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
-async fn resync_never_pauses_the_table() {
+async fn resync_alias_pauses_the_table() {
     let _g = LOCK.lock().await;
     let epoch = EpochNo(660_002);
     let (ctx, _dir) = setup(epoch).await;
     seed_live_mirror(&ctx, epoch).await;
 
-    // A LIVE (non-terminal) resync — requested → exporting, never driven to completion.
-    reload::request(&ctx.pool, epoch, "public", "orders", ReloadFlavor::Resync)
+    // A live (non-terminal) compatibility-spelled rebuild: requested → exporting.
+    let reload_id = reload::request(&ctx.pool, epoch, "public", "orders", ReloadFlavor::Resync)
         .await
         .unwrap();
     reload::claim_requested(&ctx.pool, epoch, "sink-t", 60, 10)
         .await
         .unwrap();
 
-    // A post-`W` stream file arrives while the resync is live. A `reload` would PAUSE the table
-    // here; a `resync` must not — `active_rebuilds` scopes the pause to `flavor='reload'`.
+    // A stream file arrives while the export is live. It must remain ready until export_complete.
     let post = write_rows(
         epoch,
         "post",
@@ -344,36 +363,29 @@ async fn resync_never_pauses_the_table() {
     seed_file(&ctx.pool, epoch, &post, "stream", "0/200", None).await;
 
     let lsn = run_phase_a(&ctx).await.unwrap();
-    run_phase_b(&ctx).await.unwrap();
-
-    assert_eq!(lsn, Some("0/200".parse().unwrap()), "claimed, not paused");
-    assert_eq!(
-        mirror_status(&ctx, 5).as_deref(),
-        Some("streamed"),
-        "the stream kept flowing over the live table during the resync"
-    );
-    assert_eq!(ctx.pause_logged.get(), None, "no pause was ever latched");
+    assert_eq!(lsn, None, "the compatibility spelling pauses claims");
+    assert_eq!(mirror_status(&ctx, 5), None, "the stream remains unapplied");
+    assert_eq!(ctx.pause_logged.get(), Some(reload_id));
     let cp = control::read_checkpoint(&ctx.pool, epoch, "public", "orders")
         .await
         .unwrap()
         .unwrap();
     assert_eq!(
         cp.raw_appended_lsn,
-        "0/200".parse().unwrap(),
-        "the frontier advanced (no freeze at W)"
+        "0/50".parse().unwrap(),
+        "the frontier remains frozen until export_complete"
     );
 }
 
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (control PG + MinIO)"]
-async fn resync_chunks_flow_through_raw() {
+async fn resync_chunks_build_a_hidden_generation_before_cutover() {
     let _g = LOCK.lock().await;
     let epoch = EpochNo(660_003);
     let (ctx, _dir) = setup(epoch).await;
     seed_live_mirror(&ctx, epoch).await;
 
-    // The open-question decision, pinned: a resync chunk row lands in `<table>_raw` like any file
-    // (uniform Phase A path) — raw history is preserved, unlike a rebuild which discards it.
+    // The resync-spelled dump goes to a hidden generation while the old mirror remains public.
     let resync_id = drained_resync(&ctx.pool, epoch, "0/100", "0/100").await;
     let chunk = write_rows(
         epoch,
@@ -383,18 +395,25 @@ async fn resync_chunks_flow_through_raw() {
     seed_file(&ctx.pool, epoch, &chunk, "reload", "0/100", Some(resync_id)).await;
 
     run_phase_a(&ctx).await.unwrap();
+    assert_eq!(
+        mirror_status(&ctx, 7),
+        None,
+        "live is untouched before H cutover"
+    );
+    assert_eq!(mirror_count(&ctx), 3);
     run_phase_b(&ctx).await.unwrap();
 
     assert!(
         raw_has(&ctx, 7),
-        "the resync chunk row is in orders_raw (uniform path)"
+        "the dump row is in the published generation's raw table"
     );
     assert!(
-        raw_has(&ctx, 1) && raw_has(&ctx, 2) && raw_has(&ctx, 3),
-        "the pre-resync stream rows are still in raw — no rebuild discarded them"
+        !raw_has(&ctx, 1) && !raw_has(&ctx, 2) && !raw_has(&ctx, 3),
+        "publishing the rebuilt generation replaces old raw history"
     );
     assert_eq!(mirror_status(&ctx, 7).as_deref(), Some("from-chunk"));
-    assert_eq!(ctx.db.recorded_reload_id().unwrap(), None, "no latch");
+    assert_eq!(mirror_count(&ctx), 1);
+    assert_eq!(ctx.db.recorded_reload_id().unwrap(), Some(resync_id));
 }
 
 #[tokio::test]
@@ -404,21 +423,40 @@ async fn resync_ddl_restart_preserves_the_resync_flavor() {
     let epoch = EpochNo(660_004);
     let (ctx, _dir) = setup(epoch).await;
 
-    // A mid-resync DDL restart reissues the attempt — the successor must stay `resync`
-    // (restart_for_ddl copies the flavor via INSERT…SELECT), else a refresh would silently become a
-    // rebuild. Driven at the control layer: request → claim → chunk 1 → restart.
+    // A DDL restart preserves the stored compatibility spelling even though both values now select
+    // the same rebuild behavior. Driven at the control layer: request → claim → chunk 1 → restart.
     let old = reload::request(&ctx.pool, epoch, "public", "orders", ReloadFlavor::Resync)
         .await
         .unwrap();
     reload::claim_requested(&ctx.pool, epoch, "sink-t", 60, 10)
         .await
         .unwrap();
+    let request_id = reload::get(&ctx.pool, old)
+        .await
+        .unwrap()
+        .unwrap()
+        .parent_request_id
+        .expect("direct resync has a durable fence namespace");
+    let start_lsn = "0/100".parse().unwrap();
+    reload::record_start_fence(
+        &ctx.pool,
+        old,
+        start_lsn,
+        ReloadFenceIdentity {
+            request_id: Some(request_id),
+            source_schema: "public",
+            source_table: "orders",
+            schema_version: common::SchemaVersionNo(1),
+        },
+    )
+    .await
+    .unwrap();
     reload::advance_cursor(
         &ctx.pool,
         old,
         1,
         &serde_json::json!(["10"]),
-        "0/100".parse().unwrap(),
+        start_lsn,
         common::SchemaVersionNo(1),
     )
     .await

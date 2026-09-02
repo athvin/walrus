@@ -17,8 +17,9 @@ use object_store::path::Path;
 use parquet::arrow::AsyncArrowWriter;
 use std::sync::Arc;
 
-/// Whether the object holds streamed WAL rows, backfill snapshot rows, or a **speculative
-/// open-txn spill**. A `Spill` file is a *single* streamed transaction's rows written
+/// Whether the object holds streamed WAL rows, fenced reload rows, or a **speculative open-txn
+/// spill**. The canonical enum also retains the legacy `Snapshot` wire value for old manifests. A
+/// `Spill` file is a *single* streamed transaction's rows written
 /// before its commit LSN is known, so its rows carry a placeholder `commit_lsn`; the real commit LSN is
 /// the file's `lsn_end`, stamped onto the manifest at `Stream Commit`. The loader therefore treats
 /// `lsn_end` — not the per-row placeholder — as the authoritative `commit_lsn` for a `Spill` file, which
@@ -102,7 +103,7 @@ impl ParquetSink {
 
     /// Encode `batch` to Parquet (MICROS temporals + Snappy, inherited from the Arrow schema and the
     /// walrus writer properties) and stream it to S3 via multipart. Returns **only once durable**.
-    /// Streamed WAL rows; the backfill uses [`Self::put_with_kind`].
+    /// Streamed WAL rows; reload and spill writers use [`Self::put_with_kind`].
     ///
     /// # Errors
     ///
@@ -112,8 +113,7 @@ impl ParquetSink {
         self.put_with_kind(batch, FileKind::Stream).await
     }
 
-    /// As [`Self::put`], stamping the object's provenance (`stream` vs `snapshot`) — the manifest row's
-    /// `kind`. Snapshot files all share `lsn_end = consistent_point`, `id`-disambiguated.
+    /// As [`Self::put`], stamping the object's provenance in the manifest row's `kind`.
     ///
     /// # Errors
     ///

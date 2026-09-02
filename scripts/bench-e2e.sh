@@ -180,6 +180,7 @@ STACK_STARTED=true
 "${COMPOSE[@]}" exec -T source-pg psql -U postgres -d walrus -v ON_ERROR_STOP=1 -f - <migrations/source/0001_publication.sql
 "${COMPOSE[@]}" exec -T source-pg psql -U postgres -d walrus -v ON_ERROR_STOP=1 -f - <migrations/source/0002_ddl_triggers.sql
 "${COMPOSE[@]}" exec -T source-pg psql -U postgres -d walrus -v ON_ERROR_STOP=1 -f - <migrations/source/0003_reload_signal.sql
+"${COMPOSE[@]}" exec -T source-pg psql -U postgres -d walrus -v ON_ERROR_STOP=1 -f - <migrations/source/0004_reload_event.sql
 
 echo "--- building $PROFILE binaries ---"
 case "$PERF_MODE" in

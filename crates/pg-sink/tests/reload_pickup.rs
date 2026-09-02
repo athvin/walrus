@@ -24,7 +24,7 @@ use control::reload::{self, ReloadFlavor, ReloadStatus};
 use pg_sink::consume::on_frame;
 use pg_sink::pgoutput::{Message, StreamCtx};
 use pg_sink::reload::{ReloadController, ReloadControllerConfig};
-use pg_sink::reload_signal::WatermarkWaiters;
+use pg_sink::reload_event::{self, FenceWaiters};
 use pg_sink::replication::ReplicationStream;
 use pg_sink::sink::ParquetSink;
 use pg_sink::slot::verify_or_create_slot;
@@ -37,6 +37,7 @@ use tokio_util::sync::CancellationToken;
 static SOURCE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const SOURCE_0001: &str = include_str!("../../../migrations/source/0001_publication.sql");
 const SOURCE_0003: &str = include_str!("../../../migrations/source/0003_reload_signal.sql");
+const SOURCE_0004: &str = include_str!("../../../migrations/source/0004_reload_event.sql");
 
 fn source_url() -> String {
     std::env::var("WALRUS_SOURCE_DB_URL")
@@ -112,7 +113,7 @@ async fn seed_registry(
     tables: &[&str],
 ) {
     for table in tables {
-        let rel = pg_sink::snapshot::describe_source_relation(admin, "public", table)
+        let rel = pg_sink::source_catalog::describe_source_relation(admin, "public", table)
             .await
             .unwrap();
         let row = control::RegistryRow {
@@ -157,45 +158,65 @@ async fn await_status(pool: &sqlx::PgPool, reload_id: ReloadId, want: ReloadStat
     .unwrap_or_else(|_| panic!("reload {reload_id} never reached {want:?}"));
 }
 
-/// The exact SQL `just reload` runs (keep in sync with the justfile recipe): epoch comes from
-/// `MAX(epoch)` over `replication_state`, the table arg splits on the dot. Runs in a rolled-back
-/// transaction so the seeded epoch and the inserted request leave no trace.
+/// The production source request is idempotent by UUID and preserves the exact table payload.
+/// Reusing the UUID for a different target fails instead of silently changing history.
 #[tokio::test]
-#[ignore = "requires docker compose up --wait (control PG)"]
-async fn just_reload_recipe_sql_selects_current_epoch_and_parses_table() {
-    let pool = control::connect(&control_url()).await.unwrap();
-    control::run_migrations(&pool).await.unwrap();
-    let mut tx = pool.begin().await.unwrap();
-    let seeded_epoch: i64 =
-        sqlx::query_scalar("SELECT COALESCE(MAX(epoch), 0) + 1 FROM walrus.replication_state")
-            .fetch_one(&mut *tx)
-            .await
-            .unwrap();
-    sqlx::query(
-        "INSERT INTO walrus.replication_state (epoch, slot_name, created_lsn, status)
-         VALUES ($1, 'walrus_recipe_test', '0/0', 'streaming')",
-    )
-    .bind(seeded_epoch)
-    .execute(&mut *tx)
-    .await
-    .unwrap();
-    let (epoch, schema, table, flavor): (i64, String, String, String) = sqlx::query_as(
-        "INSERT INTO walrus.table_reload (epoch, source_schema, source_table, flavor) \
-         SELECT COALESCE(MAX(epoch), 1), split_part('public.orders', '.', 1), \
-                split_part('public.orders', '.', 2), 'reload' \
-         FROM walrus.replication_state \
-         RETURNING epoch, source_schema, source_table, flavor",
-    )
-    .fetch_one(&mut *tx)
-    .await
-    .unwrap();
-    assert_eq!(
-        epoch, seeded_epoch,
-        "the recipe targets the CURRENT (max) epoch"
+#[ignore = "requires docker compose up --wait (source PG)"]
+async fn source_request_api_is_idempotent_and_preserves_table_shape() {
+    let _g = SOURCE_LOCK.lock().await;
+    let admin = admin().await;
+    admin.batch_execute(SOURCE_0004).await.unwrap();
+    let request_id = uuid::Uuid::from_u128(0x8ba4_774b_8ae5_44ac_842e_b99f_7420_764d);
+
+    reload_event::request_table(&admin, request_id, "public", "orders")
+        .await
+        .unwrap();
+    reload_event::request_table(&admin, request_id, "public", "orders")
+        .await
+        .unwrap();
+
+    let request_id_text = request_id.to_string();
+    let count: i64 = admin
+        .query_one(
+            "SELECT count(*) FROM walrus.reload_event WHERE event_id = $1::text::uuid",
+            &[&request_id_text],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 1, "an idempotent retry appends no duplicate event");
+
+    let row = admin
+        .query_one(
+            "SELECT request_id::text, event_kind, scope, source_schema, source_table,
+                    targets::text, reload_id IS NULL, schema_version IS NULL
+             FROM walrus.reload_event WHERE event_id = $1::text::uuid",
+            &[&request_id_text],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>(0), request_id_text);
+    assert_eq!(row.get::<_, String>(1), "request");
+    assert_eq!(row.get::<_, String>(2), "table");
+    assert_eq!(row.get::<_, Option<String>>(3).as_deref(), Some("public"));
+    assert_eq!(row.get::<_, Option<String>>(4).as_deref(), Some("orders"));
+    assert_eq!(row.get::<_, String>(5), "[]");
+    assert!(
+        row.get::<_, bool>(6),
+        "a request has no control reload id yet"
     );
-    assert_eq!((schema.as_str(), table.as_str()), ("public", "orders"));
-    assert_eq!(flavor, "reload");
-    tx.rollback().await.unwrap();
+    assert!(
+        row.get::<_, bool>(7),
+        "a request freezes schema at F, not here"
+    );
+
+    let conflict = reload_event::request_table(&admin, request_id, "public", "customers")
+        .await
+        .expect_err("the same UUID cannot be rebound to another table");
+    assert!(
+        conflict.to_string().contains("different request data"),
+        "UUID payload conflict stays explicit: {conflict:#}"
+    );
 }
 
 async fn lease_expiry_epoch(pool: &sqlx::PgPool, reload_id: ReloadId) -> f64 {
@@ -217,6 +238,7 @@ async fn pickup_flips_to_exporting_with_a_live_advancing_lease() {
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
+    admin.batch_execute(SOURCE_0004).await.unwrap();
     let pool = pool_for(epoch).await;
     seed_registry(&admin, &pool, epoch, &["orders"]).await;
 
@@ -224,13 +246,13 @@ async fn pickup_flips_to_exporting_with_a_live_advancing_lease() {
     let handle = ReloadController::spawn(
         pool.clone(),
         &source_url(),
-        Arc::new(WatermarkWaiters::default()),
+        Arc::new(FenceWaiters::default()),
         minio(epoch),
         controller_cfg(epoch, NonZeroUsize::new(2).unwrap()),
         token.clone(),
     );
 
-    // `just reload table='public.orders'` — the same INSERT the recipe runs.
+    // Legacy direct-control requests remain claimable for rolling compatibility.
     let id = reload::request(&pool, epoch, "public", "orders", ReloadFlavor::Reload)
         .await
         .unwrap();
@@ -277,6 +299,7 @@ async fn preflight_failures_land_in_failed_with_reasons() {
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
+    admin.batch_execute(SOURCE_0004).await.unwrap();
     // A published-but-keyless table: the dev publication is FOR ALL TABLES, so existence ⇒
     // membership; what it lacks is a PK.
     admin
@@ -292,7 +315,7 @@ async fn preflight_failures_land_in_failed_with_reasons() {
     let handle = ReloadController::spawn(
         pool.clone(),
         &source_url(),
-        Arc::new(WatermarkWaiters::default()),
+        Arc::new(FenceWaiters::default()),
         minio(epoch),
         controller_cfg(epoch, NonZeroUsize::new(2).unwrap()),
         token.clone(),
@@ -359,6 +382,7 @@ async fn cap_of_two_holds_and_the_stream_keeps_flowing() {
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
+    admin.batch_execute(SOURCE_0004).await.unwrap();
     admin
         .batch_execute(
             "DELETE FROM public.orders WHERE id = 640001;
@@ -379,7 +403,7 @@ async fn cap_of_two_holds_and_the_stream_keeps_flowing() {
     let handle = ReloadController::spawn(
         pool.clone(),
         &source_url(),
-        Arc::new(WatermarkWaiters::default()),
+        Arc::new(FenceWaiters::default()),
         minio(epoch),
         controller_cfg(epoch, NonZeroUsize::new(2).unwrap()),
         token.clone(),

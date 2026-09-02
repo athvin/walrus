@@ -90,6 +90,7 @@ pub async fn run_shared(cfg: &SinkConfig, deadline: Instant) -> Result<Bootstrap
     // Signal-table existence BEFORE publication coverage: a missing table must yield the
     // migration-naming error, not a failed ALTER PUBLICATION under manage_publication.
     pf.assert_reload_signal().await?;
+    pf.assert_reload_event().await?;
     pf.assert_publication_covers().await?;
     pf.assert_ddl_capture().await?;
     let pk = pf.assert_tables_have_pk(cfg.pk_mode()).await?;

@@ -1,6 +1,10 @@
 use super::*;
 use crate::batch::SystemClock;
-use common::{PgColumn, PgRelation, ReplicaIdentity};
+use arrow::array::{Int32Array, StringArray};
+use arrow::record_batch::RecordBatch;
+use common::{PgColumn, PgRelation, ReplicaIdentity, SinkMeta};
+use object_store::ObjectStore;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use pg_to_arrow::oids;
 use std::num::NonZeroU64;
 use std::time::Duration;
@@ -59,6 +63,29 @@ fn insert_id_v2(id: i32, sub_xid: u32) -> Message {
     }
 }
 
+fn move_id(from: i32, to: i32, sub_xid: u32) -> Message {
+    Message::Update {
+        xid: Some(sub_xid),
+        relation_oid: 42,
+        old_kind: Some(crate::pgoutput::OldTupleKind::Key),
+        old: Some(vec![TupleValue::Text(from.to_string()), TupleValue::Null]),
+        new: vec![
+            TupleValue::Text(to.to_string()),
+            TupleValue::Text("moved".into()),
+        ],
+    }
+}
+
+fn toast_update(sub_xid: u32) -> Message {
+    Message::Update {
+        xid: Some(sub_xid),
+        relation_oid: 42,
+        old_kind: Some(crate::pgoutput::OldTupleKind::Key),
+        old: Some(vec![TupleValue::Text("1".into()), TupleValue::Null]),
+        new: vec![TupleValue::UnchangedToast, TupleValue::UnchangedToast],
+    }
+}
+
 fn add_v2(cache: &mut RelationCache) {
     let mut relation = cache
         .get(42, common::SchemaVersionNo(1))
@@ -91,11 +118,43 @@ fn demux(ceiling: u64) -> StreamDemux {
 }
 
 fn mem_sink() -> ParquetSink {
-    ParquetSink::new(
-        Arc::new(object_store::memory::InMemory::new()),
-        "walrus",
-        common::EpochNo(1),
-    )
+    mem_sink_with_store().1
+}
+
+fn mem_sink_with_store() -> (Arc<object_store::memory::InMemory>, ParquetSink) {
+    let store = Arc::new(object_store::memory::InMemory::new());
+    let store_for_sink = Arc::clone(&store);
+    let sink = ParquetSink::new(store_for_sink, "walrus", common::EpochNo(1));
+    (store, sink)
+}
+
+async fn read_written_batch(
+    store: &object_store::memory::InMemory,
+    written: &WrittenObject,
+) -> RecordBatch {
+    let bytes = store
+        .get(&written.key)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    ParquetRecordBatchReaderBuilder::try_new(bytes)
+        .unwrap()
+        .build()
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+}
+
+fn first_meta(batch: &RecordBatch) -> SinkMeta {
+    let meta = batch
+        .column(batch.num_columns() - 1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    serde_json::from_str(meta.value(0)).unwrap()
 }
 
 #[tokio::test]
@@ -224,6 +283,105 @@ async fn demux_routes_interleaved_xids_to_their_buffers() {
         .unwrap();
     assert_eq!(d.survivor_count(100), 2);
     assert_eq!(d.survivor_count(200), 2);
+}
+
+#[tokio::test]
+async fn streamed_key_change_buffers_old_delete_and_new_update() {
+    let (cache, sink) = (cache(), mem_sink());
+    let mut d = demux(u64::MAX);
+    d.on_stream_start(100, true, Lsn::new(100));
+    d.bind_relation(100, 42, common::SchemaVersionNo(1));
+
+    d.on_change(&cache, &move_id(1, 2, 101), &sink, Lsn::new(110))
+        .await
+        .unwrap();
+
+    let changes = &d.open[&100].changes;
+    assert_eq!(changes.len(), 2);
+    assert_eq!((changes[0].op, changes[1].op), (Op::Delete, Op::Update));
+    assert_eq!(
+        (&changes[0].values[0], &changes[1].values[0]),
+        (&TupleValue::Text("1".into()), &TupleValue::Text("2".into()))
+    );
+}
+
+#[tokio::test]
+async fn streamed_materialize_normalizes_key_toast_and_records_non_key_toast() {
+    let (cache, (store, sink)) = (cache(), mem_sink_with_store());
+    let mut d = demux(u64::MAX);
+    d.on_stream_start(100, true, Lsn::new(100));
+    d.bind_relation(100, 42, common::SchemaVersionNo(1));
+    d.on_change(&cache, &toast_update(101), &sink, Lsn::new(110))
+        .await
+        .unwrap();
+
+    let files = d
+        .on_stream_commit(100, Lsn::new(120), UtcTimestamp::now(), &cache, &sink)
+        .await
+        .unwrap();
+    assert_eq!(files.len(), 1);
+    let batch = read_written_batch(store.as_ref(), &files[0]).await;
+    let ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(ids.value(0), 1, "key sentinel was replaced from old image");
+    assert_eq!(
+        first_meta(&batch).unchanged_toast.as_ref(),
+        &["note".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn speculative_spill_records_unchanged_toast_metadata() {
+    let (cache, (store, sink)) = (cache(), mem_sink_with_store());
+    let mut d = demux(1);
+    d.on_stream_start(100, true, Lsn::new(100));
+    d.bind_relation(100, 42, common::SchemaVersionNo(1));
+    d.on_change(&cache, &toast_update(101), &sink, Lsn::new(110))
+        .await
+        .unwrap();
+    assert_eq!(d.spill_count(), 1, "the one-row ceiling forces a spill");
+
+    let files = d
+        .on_stream_commit(100, Lsn::new(120), UtcTimestamp::now(), &cache, &sink)
+        .await
+        .unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].kind, FileKind::Spill);
+    let batch = read_written_batch(store.as_ref(), &files[0]).await;
+    assert_eq!(
+        first_meta(&batch).unchanged_toast.as_ref(),
+        &["note".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn streamed_truncate_buffers_a_data_free_boundary() {
+    let (cache, sink) = (cache(), mem_sink());
+    let mut d = demux(u64::MAX);
+    d.on_stream_start(100, true, Lsn::new(100));
+    d.bind_relation(100, 42, common::SchemaVersionNo(1));
+    let truncate = Message::Truncate {
+        xid: Some(101),
+        cascade: false,
+        restart_identity: false,
+        relations: vec![42],
+    };
+
+    assert!(is_streamed_change(&truncate));
+    d.on_change(&cache, &truncate, &sink, Lsn::new(110))
+        .await
+        .unwrap();
+
+    let changes = &d.open[&100].changes;
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].op, Op::Truncate);
+    assert_eq!(
+        changes[0].values.as_ref(),
+        &[TupleValue::Null, TupleValue::Null]
+    );
 }
 
 #[test]

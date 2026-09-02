@@ -33,6 +33,7 @@ use tokio_postgres::NoTls;
 static SOURCE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const SOURCE_0001: &str = include_str!("../../../migrations/source/0001_publication.sql");
 const SOURCE_0003: &str = include_str!("../../../migrations/source/0003_reload_signal.sql");
+const SOURCE_0004: &str = include_str!("../../../migrations/source/0004_reload_event.sql");
 
 fn source_url() -> String {
     std::env::var("WALRUS_SOURCE_DB_URL")
@@ -72,6 +73,7 @@ async fn signal_insert_resolves_waiter_and_never_reaches_parquet() {
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
+    admin.batch_execute(SOURCE_0004).await.unwrap();
     // Cleanup BEFORE the slot exists so these deletes' WAL never streams.
     admin
         .execute(

@@ -92,8 +92,8 @@ spec:
                 secretKeyRef:
                   name: walrus-secrets
                   key: WALRUS_SOURCE_DB_URL
-          # startup GATES bootstrap and, while it is failing, K8s runs neither readiness nor liveness —
-          # so a long initial backfill/catch-up can never be killed mid-progress. 120×5s = 10 min budget.
+          # startup GATES local bootstrap and, while it is failing, K8s runs neither readiness nor
+          # liveness. Initial table reconciliation continues after local startup. 120×5s = 10 min budget.
           startupProbe:
             httpGet:
               path: /startup

@@ -5,8 +5,9 @@
     reason = "integration test — unwrap/expect fine in setup + helpers"
 )]
 //! Restart-on-DDL against compose (`#[ignore]` — needs source PG + control PG + MinIO). A schema
-//! change landing BETWEEN chunks invalidates the attempt: the exporter's per-chunk staleness check
-//! returns `SchemaChanged`, and the controller fails-and-reissues in one transaction — the old row
+//! change queued while the consistent dump snapshot is open lands before the end fence and
+//! invalidates the attempt: the exporter returns `SchemaChanged`, and the controller
+//! fails-and-reissues in one transaction — the old row
 //! turns `failed`, its chunk files are purged, and a successor `exporting` at `restart_count+1`
 //! starts with a fresh cursor. The successor then re-exports from chunk zero at the NEW schema.
 //! Past `reload_max_restarts` the reload fails outright with the cap named and no successor. Both
@@ -24,23 +25,22 @@ use common::{EpochNo, Lsn, ReloadId, SchemaVersionNo};
 use object_store::ObjectStore;
 use object_store::path::Path;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use pg_sink::consume::on_frame;
-use pg_sink::heartbeat::InternalTables;
-use pg_sink::pgoutput::{Message, StreamCtx};
 use pg_sink::reload::{RestartDecision, handle_ddl_restart};
+use pg_sink::reload_event::FenceWaiters;
 use pg_sink::reload_export::{ChunkExportConfig, ChunkExporter, RunOutcome};
-use pg_sink::reload_signal::{PendingSignal, PendingSignals, WatermarkWaiters};
-use pg_sink::replication::ReplicationStream;
 use pg_sink::sink::ParquetSink;
-use pg_sink::slot::verify_or_create_slot;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_postgres::NoTls;
 use tokio_util::sync::CancellationToken;
 
+#[path = "support/reload_fence.rs"]
+mod reload_fence_support;
+
 static SOURCE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const SOURCE_0001: &str = include_str!("../../../migrations/source/0001_publication.sql");
 const SOURCE_0003: &str = include_str!("../../../migrations/source/0003_reload_signal.sql");
+const SOURCE_0004: &str = include_str!("../../../migrations/source/0004_reload_event.sql");
 const TABLE: &str = "_walrus_ddl_orders";
 
 #[track_caller]
@@ -84,16 +84,6 @@ fn store() -> Arc<dyn ObjectStore> {
     )
 }
 
-async fn drop_slot(admin: &tokio_postgres::Client, slot: &str) {
-    let _ = admin
-        .execute(
-            "SELECT pg_drop_replication_slot(slot_name)
-             FROM pg_replication_slots WHERE slot_name = $1 AND NOT active",
-            &[&slot],
-        )
-        .await;
-}
-
 /// Seed the target table (a plain 2-column table) with `n` rows and register its shape at v1.
 async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: EpochNo, n: i64) {
     admin
@@ -115,7 +105,7 @@ async fn register(
     epoch: EpochNo,
     version: SchemaVersionNo,
 ) {
-    let rel = pg_sink::snapshot::describe_source_relation(admin, "public", TABLE)
+    let rel = pg_sink::source_catalog::describe_source_relation(admin, "public", TABLE)
         .await
         .unwrap();
     control::upsert_registry(
@@ -133,6 +123,52 @@ async fn register(
     .unwrap();
 }
 
+/// Queue an AccessExclusive schema change behind the export snapshot's AccessShare lock. Once the
+/// exporter drains and commits that snapshot, PostgreSQL grants this older waiter before the H
+/// fence; the task then publishes the simulated decoded registry bump.
+async fn queue_priority_ddl(
+    observer: &tokio_postgres::Client,
+    pool: &sqlx::PgPool,
+    epoch: EpochNo,
+) -> tokio::task::JoinHandle<()> {
+    let pool = pool.clone();
+    let task = tokio::spawn(async move {
+        let ddl = admin().await;
+        ddl.batch_execute(&format!(
+            "ALTER TABLE public.{TABLE} ADD COLUMN priority int"
+        ))
+        .await
+        .unwrap();
+        register(&ddl, &pool, epoch, SchemaVersionNo(2)).await;
+    });
+
+    let relation = format!("public.{TABLE}");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let queued: bool = observer
+                .query_one(
+                    "SELECT EXISTS (
+                       SELECT 1 FROM pg_locks
+                       WHERE relation = to_regclass($1)
+                         AND mode = 'AccessExclusiveLock'
+                         AND NOT granted
+                     )",
+                    &[&relation],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if queued {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("schema DDL queues behind the consistent dump snapshot");
+    task
+}
+
 async fn scrub(pool: &sqlx::PgPool, epoch: EpochNo) {
     for tbl in ["file_manifest", "table_reload", "schema_registry"] {
         sqlx::query(&format!("DELETE FROM walrus.{tbl} WHERE epoch = $1"))
@@ -143,94 +179,13 @@ async fn scrub(pool: &sqlx::PgPool, epoch: EpochNo) {
     }
 }
 
-/// The decode-loop half of echo-wait, minimally: resolve signal echoes against `waiters`. Runs
-/// until cancelled. (No overlap probe here — the DDL tests don't need the watch channel.)
-fn spawn_echo_resolver(
-    slot: &'static str,
-    waiters: Arc<WatermarkWaiters>,
-    token: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let admin = admin().await;
-        drop_slot(&admin, slot).await;
-        let resume = verify_or_create_slot(&admin, slot).await.unwrap();
-        let mut stream =
-            ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
-                .await
-                .unwrap();
-        let mut ctx = StreamCtx::default();
-        let mut internal = InternalTables::default();
-        let mut pending = PendingSignals::default();
-        loop {
-            let frame = tokio::select! {
-                _ = token.cancelled() => break,
-                f = stream.next() => f.unwrap().unwrap(),
-            };
-            let Some(msg) = on_frame(&mut ctx, frame).unwrap() else {
-                continue;
-            };
-            match &msg {
-                Message::Relation { relation, .. } => internal.note_relation(relation),
-                Message::Insert {
-                    relation_oid,
-                    new,
-                    xid,
-                } if internal.is_reload_signal(*relation_oid) => {
-                    let rel = internal.reload_signal_rel().unwrap();
-                    if let Ok(sig) = PendingSignal::from_tuple(rel, new, *xid) {
-                        pending.push(sig);
-                    }
-                }
-                Message::Commit { commit_lsn, .. } => pending.on_commit(*commit_lsn, &waiters),
-                _ => {}
-            }
-        }
-        drop(stream);
-        drop_slot(&admin, slot).await;
-    })
-}
-
-/// Prove the resolver is live before the exporter signals through it (a handshake, not a sleep).
-async fn await_resolver_ready(
-    admin: &tokio_postgres::Client,
-    waiters: &WatermarkWaiters,
-    epoch: EpochNo,
-) {
-    let sentinel = -epoch.0;
-    let mut ready = false;
-    for _ in 0..20 {
-        let rx = waiters.subscribe(ReloadId(sentinel), 1);
-        admin
-            .batch_execute(&format!(
-                "DELETE FROM walrus.reload_signal WHERE reload_id = {sentinel}; \
-                 INSERT INTO walrus.reload_signal (reload_id, chunk_no) VALUES ({sentinel}, 1);"
-            ))
-            .await
-            .unwrap();
-        if tokio::time::timeout(Duration::from_millis(500), rx)
-            .await
-            .is_ok()
-        {
-            ready = true;
-            break;
-        }
-    }
-    assert!(ready, "the echo resolver never answered the sentinel");
-    admin
-        .execute(
-            "DELETE FROM walrus.reload_signal WHERE reload_id = $1",
-            &[&sentinel],
-        )
-        .await
-        .unwrap();
-}
-
 fn export_cfg(epoch: EpochNo, chunk_rows: u64) -> ChunkExportConfig {
     ChunkExportConfig {
         chunk_rows: std::num::NonZeroU64::new(chunk_rows).unwrap(),
         echo_timeout: Duration::from_secs(20),
         instance: "walrus-sink-test".to_string(),
         epoch,
+        publication_name: "walrus_pub".to_string(),
     }
 }
 
@@ -352,17 +307,30 @@ async fn mid_export_ddl_restarts_fresh_attempt_at_new_schema() {
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
+    admin.batch_execute(SOURCE_0004).await.unwrap();
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     scrub(&pool, epoch).await;
     seed(&admin, &pool, epoch, 5).await;
 
-    let waiters = Arc::new(WatermarkWaiters::default());
+    let waiters = Arc::new(FenceWaiters::default());
     let token = CancellationToken::new();
-    let resolver = spawn_echo_resolver("walrus_ddl_restart", Arc::clone(&waiters), token.clone());
-    await_resolver_ready(&admin, &waiters, epoch).await;
+    let resolver = reload_fence_support::spawn(
+        source_url(),
+        "walrus_ddl_restart",
+        pool.clone(),
+        Arc::clone(&waiters),
+        None,
+        token.clone(),
+    );
+    tokio::time::timeout(Duration::from_secs(10), resolver.ready)
+        .await
+        .expect("fence resolver starts")
+        .expect("fence resolver ready sender remains live");
+    let resolver = resolver.handle;
 
-    // Chunk 1 at v1 (freezes schema_version=1), then DDL lands: ALTER + re-register at v2.
+    // Chunk 1 opens the one v1 snapshot. Queue DDL behind that transaction; it will land after the
+    // snapshot drains but before H acquires its fence lock.
     let req = request_and_claim(&pool, epoch).await;
     let old_id = req.reload_id;
     let mut exporter = ChunkExporter::connect(
@@ -376,17 +344,13 @@ async fn mid_export_ddl_restarts_fresh_attempt_at_new_schema() {
     .await
     .unwrap();
     exporter.export_next_chunk().await.unwrap();
-    admin
-        .batch_execute(&format!(
-            "ALTER TABLE public.{TABLE} ADD COLUMN priority int"
-        ))
-        .await
-        .unwrap();
-    register(&admin, &pool, epoch, SchemaVersionNo(2)).await;
+    let ddl = queue_priority_ddl(&admin, &pool, epoch).await;
 
-    // The next chunk's staleness check trips: the run returns SchemaChanged (no chunk 2 at v1).
+    // The old snapshot stays internally consistent. Its queued DDL wins before H, whose live-shape
+    // check returns SchemaChanged instead of publishing the obsolete baseline.
     let restarts_before = counter_value(common::metrics::names::RELOAD_RESTARTS_TOTAL);
-    let outcome = exporter.run().await.unwrap();
+    let outcome = exporter.run(false).await.unwrap();
+    ddl.await.unwrap();
     assert_eq!(
         outcome,
         RunOutcome::SchemaChanged {
@@ -451,7 +415,7 @@ async fn mid_export_ddl_restarts_fresh_attempt_at_new_schema() {
     .await
     .unwrap();
     assert!(matches!(
-        resumed.run().await.unwrap(),
+        resumed.run(false).await.unwrap(),
         RunOutcome::Drained { .. }
     ));
 
@@ -491,15 +455,27 @@ async fn restart_cap_exhaustion_fails_loudly() {
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
+    admin.batch_execute(SOURCE_0004).await.unwrap();
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     scrub(&pool, epoch).await;
     seed(&admin, &pool, epoch, 5).await;
 
-    let waiters = Arc::new(WatermarkWaiters::default());
+    let waiters = Arc::new(FenceWaiters::default());
     let token = CancellationToken::new();
-    let resolver = spawn_echo_resolver("walrus_ddl_cap", Arc::clone(&waiters), token.clone());
-    await_resolver_ready(&admin, &waiters, epoch).await;
+    let resolver = reload_fence_support::spawn(
+        source_url(),
+        "walrus_ddl_cap",
+        pool.clone(),
+        Arc::clone(&waiters),
+        None,
+        token.clone(),
+    );
+    tokio::time::timeout(Duration::from_secs(10), resolver.ready)
+        .await
+        .expect("fence resolver starts")
+        .expect("fence resolver ready sender remains live");
+    let resolver = resolver.handle;
 
     let req = request_and_claim(&pool, epoch).await;
     let old_id = req.reload_id;
@@ -514,19 +490,14 @@ async fn restart_cap_exhaustion_fails_loudly() {
     .await
     .unwrap();
     exporter.export_next_chunk().await.unwrap();
-    admin
-        .batch_execute(&format!(
-            "ALTER TABLE public.{TABLE} ADD COLUMN priority int"
-        ))
-        .await
-        .unwrap();
-    register(&admin, &pool, epoch, SchemaVersionNo(2)).await;
+    let ddl = queue_priority_ddl(&admin, &pool, epoch).await;
     assert_eq!(
-        exporter.run().await.unwrap(),
+        exporter.run(false).await.unwrap(),
         RunOutcome::SchemaChanged {
             new_version: SchemaVersionNo(2)
         }
     );
+    ddl.await.unwrap();
 
     // Cap 0: the first mid-export DDL fails the reload outright — no successor.
     let cap_before = counter_value(common::metrics::names::RELOAD_RESTART_CAP_EXHAUSTED_TOTAL);

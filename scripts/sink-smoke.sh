@@ -40,13 +40,15 @@ wait_for() { # url expected_code timeout_secs
 
 COMPOSE="docker compose -f deploy/docker/docker-compose.yml"
 
-echo "=== 0/2 apply source migrations (heartbeat + ddl_audit + DDL triggers, idempotent) ==="
+echo "=== 0/2 apply source migrations (internal WAL tables + DDL triggers, idempotent) ==="
 $COMPOSE exec -T source-pg psql -U postgres -d walrus -v ON_ERROR_STOP=1 -f - \
   <migrations/source/0001_publication.sql
 $COMPOSE exec -T source-pg psql -U postgres -d walrus -v ON_ERROR_STOP=1 -f - \
   <migrations/source/0002_ddl_triggers.sql
 $COMPOSE exec -T source-pg psql -U postgres -d walrus -v ON_ERROR_STOP=1 -f - \
   <migrations/source/0003_reload_signal.sql
+$COMPOSE exec -T source-pg psql -U postgres -d walrus -v ON_ERROR_STOP=1 -f - \
+  <migrations/source/0004_reload_event.sql
 
 echo "=== 1/2 happy path: source preflight passes, /startup -> /ready flip + graceful SIGTERM ==="
 export WALRUS_CONTROL_DB_URL="postgres://postgres:postgres@localhost:5433/walrus_control"

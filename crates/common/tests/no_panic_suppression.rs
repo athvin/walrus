@@ -24,11 +24,8 @@
 //! under `#[cfg(test)]` and has no counterpart for `unreachable`, which is why
 //! `crates/pg-sink/src/reload_test.rs` names that one for itself.
 //!
-//! walrus keeps exactly one production exception, and its *spelling* is load-bearing: [`CARVE_OUT`]
-//! writes `#[expect(…)]`, not `#[allow(…)]`. `backfill::plan_ctid_ranges` is the marked seam for
-//! the deferred parallel CTID-range backfill and nothing calls it; the day someone implements it
-//! the expectation goes unfulfilled, `warnings = "deny"` fails the build, and the exception retires
-//! itself. An `#[allow]` there would outlive its reason with nothing to say so.
+//! There are no production exceptions. Both `#[allow(…)]` and `#[expect(…)]` weaken the workspace
+//! deny at their local scope, so this scan rejects either spelling.
 
 use std::path::{Path, PathBuf};
 
@@ -42,18 +39,6 @@ const PANIC_LINTS: [&str; 5] = [
     "clippy::unreachable",
     "clippy::panic_in_result_fn",
 ];
-
-/// The one production module allowed to name one of them, and the only lint it may name. The
-/// deferred CTID-range seam is an unwritten function, not a failure walrus chose to crash on.
-const CARVE_OUT: &str = "crates/pg-sink/src/backfill.rs";
-const CARVE_OUT_LINT: &str = "clippy::unimplemented";
-
-/// The attribute form that expires on its own. Written without the leading `#` so one needle matches
-/// both the outer `#[expect(…)]` and the inner `#![expect(…)]` spelling.
-const EXPECT_FORM: &str = "[expect(";
-
-/// The form that does not expire: a suppression that outlives the reason for it.
-const ALLOW_FORM: &str = "[allow(";
 
 /// Repo root, derived from this crate's manifest dir (`<root>/crates/common`).
 fn repo_root() -> PathBuf {
@@ -111,19 +96,16 @@ fn names_lint(line: &str, lint: &str) -> bool {
     false
 }
 
-/// Every suppression of a [`PANIC_LINTS`] entry in `source`, as a reportable line. The carve-out is
-/// exempt for its one lint only — the seam is no licence to suppress the other four. A line whose
+/// Every suppression of a [`PANIC_LINTS`] entry in `source`, as a reportable line. A line whose
 /// first non-space characters are `//` is prose: a doc comment may name the lint it explains.
 fn offences(relative: &str, source: &str) -> Vec<String> {
-    let exempt = (relative == CARVE_OUT).then_some(CARVE_OUT_LINT);
-
     let mut found = Vec::new();
     for (index, line) in source.lines().enumerate() {
         if line.trim_start().starts_with("//") {
             continue;
         }
         for lint in PANIC_LINTS {
-            if Some(lint) == exempt || !names_lint(line, lint) {
+            if !names_lint(line, lint) {
                 continue;
             }
             let line_number = index + 1;
@@ -131,22 +113,6 @@ fn offences(relative: &str, source: &str) -> Vec<String> {
         }
     }
     found
-}
-
-/// The attribute enclosing the first mention of `lint` in `source`: which family it belongs to, and
-/// its text up to the closing `)]`. `None` when `source` never names the lint, or names it outside
-/// any attribute.
-fn enclosing_attribute<'a>(source: &'a str, lint: &str) -> Option<(&'static str, &'a str)> {
-    let head = &source[..source.find(lint)?];
-    let (form, start) = match (head.rfind(EXPECT_FORM), head.rfind(ALLOW_FORM)) {
-        (Some(expect_at), None) => (EXPECT_FORM, expect_at),
-        (None, Some(allow_at)) => (ALLOW_FORM, allow_at),
-        (Some(expect_at), Some(allow_at)) if expect_at > allow_at => (EXPECT_FORM, expect_at),
-        (Some(_), Some(allow_at)) => (ALLOW_FORM, allow_at),
-        (None, None) => return None,
-    };
-    let end = start + source[start..].find(")]")?;
-    Some((form, &source[start..end]))
 }
 
 #[test]
@@ -159,8 +125,8 @@ fn no_production_source_reopens_the_panic_denies() {
         .collect::<Vec<_>>();
 
     assert!(
-        relatives.iter().any(|path| path == CARVE_OUT),
-        "the scan must reach {CARVE_OUT}, the one file it exempts — otherwise it is vacuous"
+        !relatives.is_empty(),
+        "the production-source scan is not vacuous"
     );
 
     let mut found = Vec::new();
@@ -171,38 +137,9 @@ fn no_production_source_reopens_the_panic_denies() {
 
     assert!(
         found.is_empty(),
-        "a scoped allow turns an expected error back into a crash for a whole module while the \
-         manifest still reads as policy; {CARVE_OUT} is the one exception:\n{}",
+        "a scoped suppression turns an expected error back into a crash for a whole module while \
+         the manifest still reads as policy:\n{}",
         found.join("\n")
-    );
-}
-
-/// The other half of "one exception": the exception itself. It must stay an `#[expect]`, because
-/// that is what makes it self-retiring, and it must stay scoped to `unimplemented`, because a
-/// deferred seam is the only thing in this tree entitled to diverge on purpose.
-#[test]
-fn the_deferred_backfill_seam_is_still_a_self_retiring_expect() {
-    let source = std::fs::read_to_string(repo_root().join(CARVE_OUT))
-        .expect("read the one production module with a carve-out");
-
-    for lint in PANIC_LINTS {
-        assert!(
-            lint == CARVE_OUT_LINT || !source.contains(lint),
-            "{CARVE_OUT} is exempt for the deferred seam alone; it must never suppress {lint}"
-        );
-    }
-
-    let (form, attribute) = enclosing_attribute(&source, CARVE_OUT_LINT)
-        .expect("the carve-out module must still carry the deferred-seam suppression");
-
-    assert_eq!(
-        form, EXPECT_FORM,
-        "the carve-out must be #[expect(…)], so an unfulfilled expectation retires it the day the \
-         parallel CTID-range backfill lands; #[allow(…)] would sit there forever"
-    );
-    assert!(
-        attribute.contains("reason ="),
-        "a suppression must say why (clippy::allow_attributes_without_reason):\n{attribute}"
     );
 }
 
@@ -232,13 +169,10 @@ fn the_scan_rejects_a_planted_suppression_and_spares_prose() {
     }
 }
 
-/// The carve-out is a property of one path, not of the lint: the same attribute anywhere else is an
-/// offence.
 #[test]
-fn the_carve_out_exempts_only_its_own_file() {
+fn an_expect_is_also_a_suppression() {
     let seam = "#[expect(clippy::unimplemented, reason = \"deferred goal\")]\n";
 
-    assert!(offences(CARVE_OUT, seam).is_empty());
     assert_eq!(offences("crates/loader/src/port.rs", seam).len(), 1);
 }
 
@@ -253,25 +187,4 @@ fn the_lint_matcher_reads_whole_paths_not_prefixes() {
     assert_eq!(found, [expected]);
     assert!(names_lint("clippy::panic,", "clippy::panic"));
     assert!(!names_lint("clippy::panicky", "clippy::panic"));
-}
-
-#[test]
-fn the_attribute_reader_tells_a_self_retiring_expect_from_an_allow() {
-    let retiring = concat!(
-        "#[expect(\n",
-        "    clippy::unimplemented,\n",
-        "    reason = \"deferred goal\"\n",
-        ")]\n",
-        "fn plan() -> Plan { unimplemented!() }\n",
-    );
-    let permanent = "#![allow(clippy::unimplemented, reason = \"legacy\")]\n";
-    let unsuppressed = "fn plan() -> Plan { unimplemented!() }\n";
-
-    let (form, attribute) = enclosing_attribute(retiring, CARVE_OUT_LINT).unwrap();
-    let (permanent_form, _) = enclosing_attribute(permanent, CARVE_OUT_LINT).unwrap();
-
-    assert_eq!(form, EXPECT_FORM);
-    assert!(attribute.contains("reason = \"deferred goal\""));
-    assert_eq!(permanent_form, ALLOW_FORM);
-    assert!(enclosing_attribute(unsuppressed, CARVE_OUT_LINT).is_none());
 }
