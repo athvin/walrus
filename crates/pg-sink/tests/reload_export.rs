@@ -466,6 +466,10 @@ async fn adopted_cursor_is_purged_and_successor_reexports_one_snapshot() {
         format!("{stale_err:#}").contains("illegal reload transition"),
         "the failed predecessor rejects a late cursor commit: {stale_err:#}"
     );
+    // The rejected chunk leaves this diagnostic exporter's repeatable-read transaction open so
+    // production `run()` could roll it back. This test called the one-chunk seam directly, so
+    // release the connection now; otherwise its final fixture DROP waits forever on our own lock.
+    drop(stale);
 
     let successor = control::reload::get(&pool, successor_id)
         .await

@@ -213,24 +213,24 @@ async fn alter_add_column_bumps_version_and_cuts_file() {
                         ev.clone(),
                         Some(&previous_for_oid),
                     );
-                    if let Some(version) = observation.structural_version {
-                        if !ev.is_table_drop() {
-                            if let Some(after) = ev.relation_after(Some(&previous_for_oid)).unwrap()
-                                && let Some(row) =
-                                    cache_relation(&mut cache, epoch, after, version).unwrap()
-                            {
-                                if observation.replay {
-                                    persist_registry(&pool, &row).await.unwrap();
-                                } else {
-                                    ddl.stage_registry(TransactionScope::Ordinary, row);
-                                }
+                    if let Some(version) = observation.structural_version
+                        && !ev.is_table_drop()
+                    {
+                        if let Some(after) = ev.relation_after(Some(&previous_for_oid)).unwrap()
+                            && let Some(row) =
+                                cache_relation(&mut cache, epoch, after, version).unwrap()
+                        {
+                            if observation.replay {
+                                persist_registry(&pool, &row).await.unwrap();
+                            } else {
+                                ddl.stage_registry(TransactionScope::Ordinary, row);
                             }
-                            for sealed in router
-                                .cut_table(&cache, &ev.source_schema, &ev.source_table)
-                                .unwrap()
-                            {
-                                flush_batch(&sink, &pool, epoch, sealed).await.unwrap();
-                            }
+                        }
+                        for sealed in router
+                            .cut_table(&cache, &ev.source_schema, &ev.source_table)
+                            .unwrap()
+                        {
+                            flush_batch(&sink, &pool, epoch, sealed).await.unwrap();
                         }
                     }
                 }
