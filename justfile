@@ -77,6 +77,17 @@ perf-e2e scenario="mixed":
 bench-e2e scenario="mixed":
     @just perf-e2e {{scenario}}
 
+# One-slot table-reload benchmark. Defaults to the worker-scaling matrix over a warm 10M-row
+# narrow fixture; the table matrix holds its requested-table workload fixed while varying only the
+# concurrent-table cap. Use `wide`, `tables`, `chunks`, or `all` explicitly. An external pre-change
+# sink can be included with `LEGACY_SINK_BIN=/absolute/path/to/walrus-pg-sink`.
+perf-reload fixture="narrow" matrix="workers":
+    bash scripts/bench-reload.sh {{fixture}} {{matrix}}
+
+# Compatibility alias for callers that group every performance entry point under `bench-*`.
+bench-reload fixture="narrow" matrix="workers":
+    @just perf-reload {{fixture}} {{matrix}}
+
 # Direction-aware comparison. It refuses different workloads, CPU/OS, toolchains or build modes.
 perf-compare baseline candidate:
     python3 scripts/perf_report.py compare {{baseline}} {{candidate}}

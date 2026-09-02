@@ -3,8 +3,9 @@
 //! The one rule (walrus-pg-sink.md §2.1): DuckDB reads Parquet's **native** logical types, so we
 //! must **not** coerce temporals. arrow-rs already emits `TIMESTAMP(MICROS, isAdjustedToUTC=…)`
 //! straight from `Timestamp(Microsecond, tz)` — coercing to NANOS/MILLIS is exactly the bug §2.1
-//! warns about. So [`default_writer_properties`] only sets compression and leaves the temporal
-//! encoding to arrow-rs. The conformance tests prove the round-trip through in-process DuckDB.
+//! warns about. So [`default_writer_properties`] sets compression and bounded byte-array
+//! statistics while leaving temporal encoding to arrow-rs. The conformance tests prove the
+//! round-trip through in-process DuckDB.
 
 use crate::error::Error;
 use arrow::array::RecordBatch;
@@ -12,12 +13,18 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
+/// Bound retained row-group min/max values. Reload objects intentionally contain many small row
+/// groups; without truncation, one oversized TEXT/BYTEA value could be copied into footer metadata
+/// for every group and defeat the streaming memory bound.
+const STATISTICS_TRUNCATE_LENGTH: usize = 64;
+
 /// The walrus writer settings: Snappy compression + arrow-rs's native MICROS temporal encoding
 /// (no NANOS/MILLIS coercion).
 #[must_use]
 pub fn default_writer_properties() -> WriterProperties {
     WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
+        .set_statistics_truncate_length(Some(STATISTICS_TRUNCATE_LENGTH))
         .build()
 }
 

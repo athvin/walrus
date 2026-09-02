@@ -11,8 +11,8 @@
 
 use common::{DdlId, EpochNo, Lsn, SchemaVersionNo, Tier, TypeDescriptor, TypeMeta};
 use control::{
-    DdlRow, RegistryRow, connect, insert_ddl, read_all_ddl, read_latest_version, read_pending_ddl,
-    read_registry, run_migrations, upsert_registry,
+    DdlRow, RegistryRow, connect, insert_ddl, read_all_ddl, read_latest_ddl_version_through,
+    read_latest_version, read_pending_ddl, read_registry, run_migrations, upsert_registry,
 };
 use sqlx::postgres::PgPool;
 
@@ -273,6 +273,32 @@ async fn read_pending_ddl_orders_by_c_lsn() {
     .unwrap();
     assert_eq!(after.len(), 2);
     assert_eq!(after[0].c_lsn, "0/200".parse::<Lsn>().unwrap());
+
+    assert_eq!(
+        read_latest_ddl_version_through(
+            &mut *tx,
+            epoch,
+            "public",
+            "orders",
+            "0/250".parse().unwrap(),
+        )
+        .await
+        .unwrap(),
+        Some(SchemaVersionNo(2)),
+        "post-boundary DDL must not invalidate an earlier reload fence"
+    );
+    assert_eq!(
+        read_latest_ddl_version_through(
+            &mut *tx,
+            epoch,
+            "public",
+            "orders",
+            "0/50".parse().unwrap(),
+        )
+        .await
+        .unwrap(),
+        None
+    );
 
     tx.rollback().await.unwrap();
 }

@@ -25,6 +25,10 @@ fn preflight_errors_map_to_exit_codes() {
             used: 10,
             max: 10,
         },
+        PreflightError::SlotNameDrift {
+            configured: "walrus_new".into(),
+            recorded: "walrus_owned".into(),
+        },
         PreflightError::PublicationGap {
             pub_name: "walrus_pub".into(),
             schema: "walrus".into(),

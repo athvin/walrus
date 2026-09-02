@@ -24,7 +24,9 @@ pub use checkpoint::{
     Checkpoint, advance_raw_appended, advance_transformed, ensure_checkpoint, read_checkpoint,
 };
 pub use db::{ControlError, connect, run_migrations};
-pub use ddl_manifest::{DdlRow, insert_ddl, read_all_ddl, read_pending_ddl};
+pub use ddl_manifest::{
+    DdlRow, insert_ddl, read_all_ddl, read_latest_ddl_version_through, read_pending_ddl,
+};
 pub use manifest::{
     ManifestKind, ManifestRow, ManifestStatus, NewManifestFile, claim_ready, delete_claimed,
     delete_superseded, insert_ready, mark_failed, max_ready_lsn_end,

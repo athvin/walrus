@@ -37,6 +37,10 @@ use tokio::time::Instant;
 
 /// Default feedback cadence: well under any sane `wal_sender_timeout` (the dev harness uses 5s).
 const DEFAULT_FEEDBACK_INTERVAL: Duration = Duration::from_secs(1);
+/// Pin session-sensitive PostgreSQL text output to the grammar shared by WAL decoding and reload
+/// COPY. Startup `options` applies these before pgoutput can emit a tuple.
+const CANONICAL_TEXT_OUTPUT_STARTUP_OPTIONS: &str = "-c DateStyle=ISO,YMD -c IntervalStyle=postgres -c bytea_output=hex \
+     -c extra_float_digits=3 -c TimeZone=UTC";
 
 /// One CopyBoth frame off the wire. The XLogData payload stays opaque `Bytes` — the pgoutput
 /// decoder consumes it directly (zero-copy).
@@ -561,6 +565,9 @@ fn build_startup(user: &str, database: &str) -> anyhow::Result<Vec<u8>> {
         ("database", database),
         ("replication", "database"),
         ("client_encoding", "UTF8"),
+        // pgoutput sends text values through the source type-output functions. Pin their
+        // session-sensitive forms to the exact grammar pg-to-arrow parses, matching reload COPY.
+        ("options", CANONICAL_TEXT_OUTPUT_STARTUP_OPTIONS),
     ] {
         params.extend_from_slice(k.as_bytes());
         params.push(0);

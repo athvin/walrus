@@ -6,18 +6,18 @@
               high-water mark is reported, not asserted, so stderr is its destination"
 )]
 //! End-to-end: N-table reloads at scale on ONE slot (reload §2/§5). Three tables are
-//! seeded and streamed by the real sink+loader, then reloaded concurrently with the sink's
-//! `max_concurrent_reloads = 2`. The load-bearing assertions: never more than 2 `exporting` at any
-//! sample, exactly **one** replication slot on the source the entire time, all three reloads reach
-//! `complete`, and all three mirrors equal the source row-for-row. This is the "at scale" clause of
-//! the original ask — N reloads, one slot, no per-reload slot proliferation.
+//! seeded and streamed by the real sink+loader, then reloaded concurrently with explicit settings
+//! for the table cap, per-table COPY workers, and remote-object row count. The load-bearing
+//! assertions: neither the table nor derived SQL-worker cap is breached, exactly **one** replication
+//! slot remains on the source, every reload completes, and every mirror equals the source.
 //!
 //!   cargo test -p e2e --features it -- --ignored n_table_reloads
 
 #![cfg(feature = "it")]
 
-use e2e::Harness;
+use e2e::{Harness, ReloadExtractionConfig};
 use std::time::Duration;
+use uuid::Uuid;
 
 // Harness-owned fixtures created before bootstrap so the loader owns them.
 const TABLES: [&str; 3] = ["rl1", "rl2", "rl3"];
@@ -25,7 +25,13 @@ const TABLES: [&str; 3] = ["rl1", "rl2", "rl3"];
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires docker compose up --wait (source PG + control PG + MinIO)"]
 async fn n_table_reloads_respect_the_cap_on_one_slot() {
-    let mut h = Harness::start().await.unwrap();
+    let mut h = Harness::start_with_reload_extraction(ReloadExtractionConfig {
+        max_concurrent_reloads: 2,
+        reload_workers_per_table: 4,
+        reload_chunk_rows: 250,
+    })
+    .await
+    .unwrap();
 
     // Seed the harness-owned tables (truncated at start) and let the pipeline mirror each. 5k rows
     // is a middle ground: big enough that the reloads take real work (so the cap semaphore genuinely
@@ -52,21 +58,38 @@ async fn n_table_reloads_respect_the_cap_on_one_slot() {
             .unwrap();
     }
 
-    // Request a rebuild-flavor reload on all three at once. The sink's cap is 2. Own the pool
+    // Request source-WAL reloads on all three at once. The sink's table cap is 2 and each table may
+    // own at most 4 COPY pipelines. Own the pool
     // (Arc-backed) so it doesn't borrow `h` across the `stop_loader()` (`&mut h`) before the diff.
     let epoch = h.epoch;
     let pool = h.control_pool().clone();
     let mut reload_ids = Vec::new();
     for t in TABLES {
-        let id = control::reload::request(
-            &pool,
-            epoch.into(),
-            "public",
-            t,
-            control::reload::ReloadFlavor::Reload,
-        )
-        .await
-        .unwrap();
+        let request_id = Uuid::new_v4();
+        h.request_table_reload(request_id, "public", t)
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let id = loop {
+            let id: Option<i64> = sqlx::query_scalar(
+                "SELECT reload_id FROM walrus.table_reload \
+                 WHERE epoch = $1 AND source_request_id = $2 AND source_table = $3",
+            )
+            .bind(epoch)
+            .bind(request_id)
+            .bind(t)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+            if let Some(id) = id {
+                break common::ReloadId::from(id);
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "source reload request for {t} was not decoded"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
         reload_ids.push(id);
     }
     let owned_reload_ids: Vec<i64> = reload_ids.iter().map(|id| id.0).collect();
@@ -95,11 +118,35 @@ async fn n_table_reloads_respect_the_cap_on_one_slot() {
             "cap breached: {exporting} exporting at once"
         );
 
+        let reload_connections: i64 = sqlx::query_scalar(
+            "SELECT count(DISTINCT activity.pid)
+             FROM pg_stat_activity activity
+             JOIN pg_locks lock ON lock.pid = activity.pid
+             JOIN pg_class relation ON relation.oid = lock.relation
+             JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+             WHERE activity.backend_type = 'client backend'
+               AND lock.granted AND lock.mode = 'AccessShareLock'
+               AND namespace.nspname = 'public'
+               AND relation.relname IN ('rl1', 'rl2', 'rl3')",
+        )
+        .fetch_one(h.source_pool())
+        .await
+        .unwrap();
+        assert!(
+            reload_connections <= 8,
+            "derived table×worker cap breached: {reload_connections} reload SQL connections"
+        );
+
         let slots: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_replication_slots")
             .fetch_one(h.source_pool())
             .await
             .unwrap();
         assert_eq!(slots, 1, "exactly one slot throughout (got {slots})");
+        let walsenders: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_stat_replication")
+            .fetch_one(h.source_pool())
+            .await
+            .unwrap();
+        assert_eq!(walsenders, 1, "exactly one walsender throughout");
 
         // Bootstrap also creates terminal reload rows in this epoch. Count only the attempts this
         // test requested; otherwise the global completed total can exceed three before these finish.
@@ -139,4 +186,315 @@ async fn n_table_reloads_respect_the_cap_on_one_slot() {
     for t in TABLES {
         h.assert_mirror_equals_source(t).await.unwrap();
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker compose up --wait (source PG + control PG + MinIO)"]
+async fn one_worker_honors_the_configured_record_chunk_size() {
+    let mut h = Harness::start_with_reload_extraction_and_source_seed(
+        ReloadExtractionConfig {
+            max_concurrent_reloads: 1,
+            reload_workers_per_table: 1,
+            reload_chunk_rows: 37,
+        },
+        Some(
+            "INSERT INTO public.rl1 \
+             SELECT g, 'chunk-' || g FROM generate_series(1, 1001) g;",
+        ),
+    )
+    .await
+    .unwrap();
+    let floor = h.source_wal_lsn().await.unwrap();
+    h.source_exec("UPDATE public.rl1 SET status = 'ready' WHERE id = 1")
+        .await
+        .unwrap();
+    h.await_transformed_past("rl1", floor, Duration::from_secs(90))
+        .await
+        .unwrap();
+    let initial: (String, i64) = sqlx::query_as(
+        "SELECT status, chunk_no FROM walrus.table_reload \
+         WHERE epoch = $1 AND source_schema = 'public' AND source_table = 'rl1' \
+         ORDER BY reload_id DESC LIMIT 1",
+    )
+    .bind(h.epoch)
+    .fetch_one(h.control_pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        initial.0, "complete",
+        "non-empty first startup reached cutover"
+    );
+    assert_eq!(
+        initial.1, 28,
+        "first startup honored the same 37-record object size"
+    );
+
+    // Hold the loader so exported manifests remain inspectable instead of being claimed/deleted.
+    // This lets the test assert the record-count contract on every remote object, not merely the
+    // final file counter.
+    h.stop_loader().await.unwrap();
+    let request_id = Uuid::new_v4();
+    h.request_table_reload(request_id, "public", "rl1")
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    let completed = loop {
+        let row = sqlx::query_as::<_, (i64, String, i64)>(
+            "SELECT reload_id, status, chunk_no FROM walrus.table_reload \
+             WHERE epoch = $1 AND source_request_id = $2",
+        )
+        .bind(h.epoch)
+        .bind(request_id)
+        .fetch_optional(h.control_pool())
+        .await
+        .unwrap();
+        if let Some((reload_id, status, chunk_no)) = row {
+            assert_ne!(status, "failed", "reload {reload_id} failed");
+            if status == "export_complete" {
+                break (reload_id, chunk_no);
+            }
+        }
+        let slots: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_replication_slots")
+            .fetch_one(h.source_pool())
+            .await
+            .unwrap();
+        assert_eq!(slots, 1);
+        let walsenders: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_stat_replication")
+            .fetch_one(h.source_pool())
+            .await
+            .unwrap();
+        assert_eq!(walsenders, 1);
+        let reload_connections: i64 = sqlx::query_scalar(
+            "SELECT count(DISTINCT activity.pid)
+             FROM pg_stat_activity activity
+             JOIN pg_locks lock ON lock.pid = activity.pid
+             JOIN pg_class relation ON relation.oid = lock.relation
+             JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+             WHERE activity.backend_type = 'client backend'
+               AND lock.granted AND lock.mode = 'AccessShareLock'
+               AND namespace.nspname = 'public' AND relation.relname = 'rl1'",
+        )
+        .fetch_one(h.source_pool())
+        .await
+        .unwrap();
+        assert!(
+            reload_connections <= 1,
+            "one-worker mode opened {reload_connections} reload SQL connections"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "single-worker reload did not complete"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        completed.1, 28,
+        "1001 rows must produce 27 full objects plus one tail"
+    );
+    let object_rows: Vec<i64> = sqlx::query_scalar(
+        "SELECT row_count FROM walrus.file_manifest \
+         WHERE reload_id = $1 AND kind = 'reload' ORDER BY id",
+    )
+    .bind(completed.0)
+    .fetch_all(h.control_pool())
+    .await
+    .unwrap();
+    assert_eq!(object_rows.len(), 28);
+    assert_eq!(object_rows.iter().filter(|rows| **rows == 37).count(), 27);
+    assert_eq!(object_rows.iter().filter(|rows| **rows == 2).count(), 1);
+
+    h.restart_loader().await.unwrap();
+    let cutover_deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM walrus.table_reload WHERE reload_id = $1")
+                .bind(completed.0)
+                .fetch_one(h.control_pool())
+                .await
+                .unwrap();
+        if status == "complete" {
+            break;
+        }
+        assert_ne!(status, "failed");
+        assert!(tokio::time::Instant::now() < cutover_deadline);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    h.stop_loader().await.unwrap();
+    h.assert_mirror_equals_source("rl1").await.unwrap();
+}
+
+/// A process crash loses every PostgreSQL exported snapshot, even though some baseline objects may
+/// already be durable. Restart must therefore fail/purge the abandoned attempt, open a successor
+/// with a fresh snapshot, and converge without creating a second replication slot or walsender.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker compose up --wait (source PG + control PG + MinIO)"]
+async fn sink_crash_mid_reload_starts_a_correct_successor_on_one_slot() {
+    let mut h = Harness::start_with_reload_extraction(ReloadExtractionConfig {
+        max_concurrent_reloads: 1,
+        reload_workers_per_table: 2,
+        // Many small objects give the test a deterministic, observable window after the first
+        // durable chunk but before the snapshot export reaches H.
+        reload_chunk_rows: 50,
+    })
+    .await
+    .expect("bring up sink + loader");
+
+    // Do not race the source-backed request against the empty bootstrap reconciliation for rl1.
+    let bootstrap_deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        let status: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM walrus.table_reload \
+             WHERE epoch = $1 AND source_schema = 'public' AND source_table = 'rl1' \
+             ORDER BY reload_id DESC LIMIT 1",
+        )
+        .bind(h.epoch)
+        .fetch_optional(h.control_pool())
+        .await
+        .unwrap();
+        if status.as_deref() == Some("complete") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < bootstrap_deadline,
+            "rl1 bootstrap reload did not complete"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // One transaction keeps setup quick; 400 remote objects keep the later COPY observably in
+    // flight. The request is committed after these rows, so its decoded reload sees all of them.
+    h.source_batch(
+        "INSERT INTO public.rl1 \
+         SELECT g, repeat('before-crash-', 8) || g FROM generate_series(1, 20000) g;",
+    )
+    .await
+    .unwrap();
+    let request_id = Uuid::new_v4();
+    h.request_table_reload(request_id, "public", "rl1")
+        .await
+        .unwrap();
+
+    // Kill only after control PG proves at least one completed object is durable while the attempt
+    // still owns its connection-local snapshot. This is not a sleep-based approximation.
+    let progress_deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let predecessor_id = loop {
+        let row: Option<(i64, String, i64)> = sqlx::query_as(
+            "SELECT reload_id, status, chunk_no FROM walrus.table_reload \
+             WHERE epoch = $1 AND source_request_id = $2 \
+             ORDER BY reload_id DESC LIMIT 1",
+        )
+        .bind(h.epoch)
+        .bind(request_id)
+        .fetch_optional(h.control_pool())
+        .await
+        .unwrap();
+        if let Some((reload_id, status, chunk_no)) = row {
+            assert_ne!(status, "failed", "reload {reload_id} failed before crash");
+            if status == "exporting" && chunk_no > 0 {
+                break reload_id;
+            }
+        }
+        assert_one_slot_and_at_most_one_walsender(&h).await;
+        assert!(
+            tokio::time::Instant::now() < progress_deadline,
+            "reload completed before an in-flight durable chunk could be observed"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_one_slot_and_at_most_one_walsender(&h).await;
+    h.kill_sink().await.expect("SIGKILL sink during reload");
+    assert_one_slot_and_at_most_one_walsender(&h).await;
+
+    // Changes committed while the sink is dead must survive in retained WAL and be included by
+    // the successor's fresh snapshot/replay boundary, never resurrecting the abandoned baseline.
+    h.source_batch(
+        "UPDATE public.rl1 SET status = 'changed-while-down' WHERE id % 97 = 0; \
+         INSERT INTO public.rl1 VALUES (20001, 'inserted-while-down');",
+    )
+    .await
+    .unwrap();
+    h.restart_sink()
+        .await
+        .expect("sink restarts and adopts the abandoned reload");
+
+    let recovery_deadline = tokio::time::Instant::now() + Duration::from_secs(240);
+    let successor_id = loop {
+        let row: Option<(i64, String)> = sqlx::query_as(
+            "SELECT reload_id, status FROM walrus.table_reload \
+             WHERE epoch = $1 \
+               AND (source_request_id = $2 OR parent_request_id = $2) \
+             ORDER BY reload_id DESC LIMIT 1",
+        )
+        .bind(h.epoch)
+        .bind(request_id)
+        .fetch_optional(h.control_pool())
+        .await
+        .unwrap();
+        if let Some((reload_id, status)) = row {
+            if reload_id != predecessor_id && status == "complete" {
+                break reload_id;
+            }
+            assert!(
+                reload_id == predecessor_id || status != "failed",
+                "successor reload {reload_id} failed"
+            );
+        }
+        assert_one_slot_and_at_most_one_walsender(&h).await;
+        assert!(
+            tokio::time::Instant::now() < recovery_deadline,
+            "no successor reload completed after the process crash"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(successor_id > predecessor_id);
+    let predecessor_status: String =
+        sqlx::query_scalar("SELECT status FROM walrus.table_reload WHERE reload_id = $1")
+            .bind(predecessor_id)
+            .fetch_one(h.control_pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        predecessor_status, "failed",
+        "the lost-snapshot attempt must be made terminal"
+    );
+    let predecessor_files: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM walrus.file_manifest WHERE reload_id = $1")
+            .bind(predecessor_id)
+            .fetch_one(h.control_pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        predecessor_files, 0,
+        "every durable object manifest from the lost snapshot must be purged"
+    );
+    let successor_files: i64 =
+        sqlx::query_scalar("SELECT chunk_no FROM walrus.table_reload WHERE reload_id = $1")
+            .bind(successor_id)
+            .fetch_one(h.control_pool())
+            .await
+            .unwrap();
+    assert!(
+        (401..=402).contains(&successor_files),
+        "20,001 rows at 50 rows/object must produce the 401-object minimum plus at most one extra worker tail (got {successor_files})"
+    );
+    assert_one_slot_and_at_most_one_walsender(&h).await;
+
+    h.stop_loader().await.unwrap();
+    h.assert_mirror_equals_source("rl1").await.unwrap();
+}
+
+async fn assert_one_slot_and_at_most_one_walsender(h: &Harness) {
+    let slots: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_replication_slots")
+        .fetch_one(h.source_pool())
+        .await
+        .unwrap();
+    assert_eq!(slots, 1, "reload recovery must retain exactly one slot");
+    let walsenders: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_stat_replication")
+        .fetch_one(h.source_pool())
+        .await
+        .unwrap();
+    assert!(
+        walsenders <= 1,
+        "reload recovery opened {walsenders} walsenders"
+    );
 }

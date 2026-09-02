@@ -164,6 +164,45 @@ fn flushes_on_row_count_at_commit_boundary() {
 }
 
 #[test]
+fn already_committed_rows_bypass_the_open_transaction_buffer() {
+    let mut b = TableBatcher::new(
+        cached(),
+        triggers(2, u64::MAX, Duration::from_secs(3600)),
+        Arc::new(SystemClock),
+    )
+    .unwrap();
+    let commit_lsn: Lsn = "0/30".parse().unwrap();
+    let mut first = meta("0/10");
+    first.commit_lsn = commit_lsn;
+    let mut second = meta("0/20");
+    second.commit_lsn = commit_lsn;
+
+    b.push_committed(first, &row("1")).unwrap();
+    b.push_committed(second, &row("2")).unwrap();
+
+    assert!(!b.has_open_txn(), "reload rows never enter the pending Vec");
+    assert!(b.pending.is_empty());
+    assert_eq!(b.committed_rows(), 2);
+    assert!(b.should_flush());
+    let sealed = b.seal().unwrap();
+    assert_eq!(sealed.row_count, 2);
+    assert_eq!(sealed.lsn_start, commit_lsn);
+    assert_eq!(sealed.lsn_end, commit_lsn);
+
+    let meta_column = sealed
+        .record_batch
+        .column(sealed.record_batch.num_columns() - 1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    for encoded in meta_column.iter().flatten() {
+        let meta: SinkMeta = serde_json::from_str(encoded).unwrap();
+        assert_eq!(meta.commit_lsn, commit_lsn);
+        assert_eq!(meta.batch_id, "public.widgets-0000000000000010");
+    }
+}
+
+#[test]
 fn committed_rows_keep_byte_identical_batch_id_with_clone_from() {
     assert!(include_str!("batch.rs").contains("meta.batch_id.clone_from(batch_id);"));
 

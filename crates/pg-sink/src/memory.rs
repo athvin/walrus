@@ -15,6 +15,121 @@
 
 use std::collections::{BinaryHeap, HashMap};
 use std::num::NonZeroU64;
+use std::sync::{Arc, Mutex, MutexGuard};
+use tokio::sync::Notify;
+
+/// Live accounting shared by streamed-WAL buffers and reload worker routes.
+///
+/// The ordinary streaming meter publishes its current estimate here. Reload workers reserve a
+/// conservative fixed allowance before allocating their Arrow/Parquet/multipart pipeline. This is
+/// accounting rather than an allocator: one source value can be larger than its estimate, but the
+/// two ingestion paths cannot each independently spend the full configured ceiling.
+#[derive(Debug)]
+pub(crate) struct ProcessMemoryBudget {
+    ceiling_bytes: NonZeroU64,
+    // LOCK-CHOICE: every access is a short counter mutation and no guard crosses an await.
+    state: Mutex<ProcessMemoryState>,
+    changed: Notify,
+}
+
+#[derive(Debug, Default)]
+struct ProcessMemoryState {
+    wal_bytes: u64,
+    reload_bytes: u64,
+}
+
+impl ProcessMemoryBudget {
+    #[must_use]
+    pub(crate) fn new(ceiling_bytes: NonZeroU64) -> Self {
+        Self {
+            ceiling_bytes,
+            state: Mutex::new(ProcessMemoryState::default()),
+            changed: Notify::new(),
+        }
+    }
+
+    fn lock_state(&self) -> MutexGuard<'_, ProcessMemoryState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set_wal_bytes(&self, bytes: u64) {
+        let decreased = {
+            let mut state = self.lock_state();
+            let decreased = bytes < state.wal_bytes;
+            state.wal_bytes = bytes;
+            decreased
+        };
+        if decreased {
+            self.changed.notify_one();
+        }
+    }
+
+    fn reload_bytes(&self) -> u64 {
+        self.lock_state().reload_bytes
+    }
+
+    /// Reserve a reload route. When the WAL side already occupies most of the ceiling, one route
+    /// may exceed it so reload cannot deadlock; further routes wait. The WAL meter observes this
+    /// reservation and spills on its next change, keeping the progress exception bounded to one
+    /// route rather than admitting the entire configured fan-out.
+    pub(crate) async fn reserve_reload(
+        self: &Arc<Self>,
+        bytes: NonZeroU64,
+    ) -> ReloadMemoryReservation {
+        loop {
+            // Create the waiter before reading shared state. Producers use `notify_one`, which
+            // retains a permit even if this future has not been polled yet, so a release between
+            // the check and await cannot become a lost wake-up.
+            let changed = self.changed.notified();
+            let admitted = {
+                // WAL publication and reload reservation share this short critical section. The
+                // combined ceiling check is therefore linearizable rather than a cross-atomic
+                // handshake whose two Acquire loads could both observe stale values.
+                let mut state = self.lock_state();
+                let within_ceiling = state
+                    .wal_bytes
+                    .saturating_add(state.reload_bytes)
+                    .saturating_add(bytes.get())
+                    <= self.ceiling_bytes.get();
+                if within_ceiling || state.reload_bytes == 0 {
+                    state.reload_bytes = state.reload_bytes.saturating_add(bytes.get());
+                    true
+                } else {
+                    false
+                }
+            };
+            if admitted {
+                // Continue an admission chain when the remaining shared budget can fit more
+                // routes. `notify_one` retains a permit if the next waiter has not registered yet.
+                self.changed.notify_one();
+                return ReloadMemoryReservation {
+                    budget: Arc::clone(self),
+                    bytes: bytes.get(),
+                };
+            }
+            changed.await;
+        }
+    }
+}
+
+/// RAII release for one reload worker's conservative memory reservation.
+#[derive(Debug)]
+pub(crate) struct ReloadMemoryReservation {
+    budget: Arc<ProcessMemoryBudget>,
+    bytes: u64,
+}
+
+impl Drop for ReloadMemoryReservation {
+    fn drop(&mut self) {
+        {
+            let mut state = self.budget.lock_state();
+            state.reload_bytes = state.reload_bytes.saturating_sub(self.bytes);
+        }
+        self.budget.changed.notify_one();
+    }
+}
 
 /// A pg relation OID (a stable table id).
 ///
@@ -38,6 +153,13 @@ pub struct InflightMeter {
     ceiling_bytes: NonZeroU64,
     total: u64,
     by_stream: HashMap<(TableId, u32), u64>,
+    process_budget: Arc<ProcessMemoryBudget>,
+}
+
+impl Drop for InflightMeter {
+    fn drop(&mut self) {
+        self.process_budget.set_wal_bytes(0);
+    }
 }
 
 impl InflightMeter {
@@ -48,10 +170,24 @@ impl InflightMeter {
     /// rejection from having to be re-checked here.
     #[must_use]
     pub fn new(ceiling_bytes: NonZeroU64) -> Self {
+        Self::with_process_budget(
+            ceiling_bytes,
+            Arc::new(ProcessMemoryBudget::new(ceiling_bytes)),
+        )
+    }
+
+    /// Build a meter against the accounting object reload workers also reserve from.
+    #[must_use]
+    pub(crate) fn with_process_budget(
+        ceiling_bytes: NonZeroU64,
+        process_budget: Arc<ProcessMemoryBudget>,
+    ) -> Self {
+        debug_assert_eq!(ceiling_bytes, process_budget.ceiling_bytes);
         InflightMeter {
             ceiling_bytes,
             total: 0,
             by_stream: HashMap::new(),
+            process_budget,
         }
     }
 
@@ -64,6 +200,7 @@ impl InflightMeter {
         let stream = self.by_stream.entry(key).or_insert(0);
         *stream = stream.saturating_add(bytes);
         self.total = self.total.saturating_add(bytes);
+        self.process_budget.set_wal_bytes(self.total);
     }
 
     /// Drop all accounting for `(table, xid)` (its buffer was flushed or spilled).
@@ -80,6 +217,7 @@ impl InflightMeter {
             } else {
                 self.total.saturating_sub(bytes)
             };
+            self.process_budget.set_wal_bytes(self.total);
         }
     }
 
@@ -98,8 +236,10 @@ impl InflightMeter {
 
     /// Whether the aggregate has passed the ceiling — the single question shedding is driven by.
     #[must_use = "the ceiling check drives shedding — ignoring it silently disables backpressure"]
-    pub const fn is_over_ceiling(&self) -> bool {
-        self.total > self.ceiling_bytes.get()
+    pub fn is_over_ceiling(&self) -> bool {
+        self.total
+            .saturating_add(self.process_budget.reload_bytes())
+            > self.ceiling_bytes.get()
     }
 
     /// A one-shot snapshot of spill candidates, largest first: `(bytes, table_id, xid)`.

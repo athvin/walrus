@@ -10,12 +10,25 @@
 //! with `lsn_end` as zero-padded 16-hex ([`common::Lsn`]'s `Display`) so keys sort in commit order.
 
 use crate::batch::SealedBatch;
+use arrow::datatypes::SchemaRef;
+use arrow::record_batch::RecordBatch;
+use bytes::Bytes;
 use common::{EpochNo, Lsn, SchemaVersionNo};
+use futures_util::FutureExt;
 use object_store::ObjectStore;
 use object_store::buffered::BufWriter;
 use object_store::path::Path;
 use parquet::arrow::AsyncArrowWriter;
+use parquet::arrow::async_writer::AsyncFileWriter;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex;
+
+/// Multipart parts on the reload path are large enough for S3's 5 MiB minimum while still fitting
+/// inside the router's roughly 8 MiB per-worker envelope. One part may be in flight at a time, so
+/// awaiting a row-group flush applies backpressure all the way to the source COPY stream.
+const RELOAD_MULTIPART_PART_BYTES: usize = 8 * 1024 * 1024;
 
 /// Whether the object holds streamed WAL rows, fenced reload rows, or a **speculative open-txn
 /// spill**. The canonical enum also retains the legacy `Snapshot` wire value for old manifests. A
@@ -62,6 +75,143 @@ pub struct ParquetSink {
     epoch: EpochNo,
 }
 
+/// One open reload Parquet object.
+///
+/// Unlike [`ParquetSink::put_with_kind`], this writer accepts a sequence of small Arrow batches.
+/// Every [`write_batch`](Self::write_batch) call closes and awaits one Parquet row group, allowing a
+/// reload worker to alternate source reads with remote writes instead of retaining a whole output
+/// object in memory. The object does not become visible until [`finish`](Self::finish) succeeds.
+pub struct ReloadParquetWriter {
+    writer: AsyncArrowWriter<AbortableObjectWriter>,
+    upload: AbortableObjectWriter,
+    arrow_schema: SchemaRef,
+    bucket: String,
+    key: Path,
+    source_schema: String,
+    source_table: String,
+    fence_lsn: Lsn,
+    schema_version: SchemaVersionNo,
+    row_count: u64,
+    write_duration: Duration,
+    terminal: bool,
+}
+
+impl std::fmt::Debug for ReloadParquetWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReloadParquetWriter")
+            .field("key", &self.key)
+            .field("source_schema", &self.source_schema)
+            .field("source_table", &self.source_table)
+            .field("fence_lsn", &self.fence_lsn)
+            .field("schema_version", &self.schema_version)
+            .field("row_count", &self.row_count)
+            .field("terminal", &self.terminal)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Shared ownership lets the reload writer explicitly abort the multipart upload even though
+/// `AsyncArrowWriter` owns the byte sink and does not expose it again.
+#[derive(Clone, Debug)]
+struct AbortableObjectWriter {
+    state: Arc<Mutex<UploadState>>,
+}
+
+#[derive(Debug)]
+struct UploadState {
+    writer: Option<BufWriter>,
+    /// `BufWriter` cannot abort once shutdown has started. Retain that fact if completion fails so
+    /// cleanup never calls its documented panic path.
+    completing: bool,
+}
+
+impl AbortableObjectWriter {
+    fn new(writer: BufWriter) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(UploadState {
+                writer: Some(writer),
+                completing: false,
+            })),
+        }
+    }
+
+    async fn abort(&self) -> Result<(), object_store::Error> {
+        let writer = {
+            let mut state = self.state.lock().await;
+            if state.completing {
+                // A failed shutdown may have moved BufWriter into its non-abortable Flush state.
+                // Dropping it is the only safe best effort at that point.
+                state.writer.take();
+                return Ok(());
+            }
+            state.writer.take()
+        };
+        if let Some(mut writer) = writer {
+            writer.abort().await?;
+        }
+        Ok(())
+    }
+}
+
+impl AsyncFileWriter for AbortableObjectWriter {
+    fn write(
+        &mut self,
+        mut bytes: Bytes,
+    ) -> futures_util::future::BoxFuture<'_, parquet::errors::Result<()>> {
+        async move {
+            let mut state = self.state.lock().await;
+            if state.completing {
+                return Err(parquet::errors::ParquetError::General(
+                    "reload object upload is already completing".into(),
+                ));
+            }
+            let writer = state.writer.as_mut().ok_or_else(|| {
+                parquet::errors::ParquetError::General(
+                    "reload object upload is already closed".into(),
+                )
+            })?;
+            // BufWriter checks its concurrency limit before each `put`, while one very large put
+            // could otherwise split into several concurrently-uploaded parts internally. Feed it
+            // at most one part per call, then an empty write to await the last scheduled part. This
+            // makes return from a Parquet row-group flush a true remote backpressure boundary.
+            while !bytes.is_empty() {
+                let take = bytes.len().min(RELOAD_MULTIPART_PART_BYTES);
+                writer
+                    .put(bytes.split_to(take))
+                    .await
+                    .map_err(|error| parquet::errors::ParquetError::External(Box::new(error)))?;
+            }
+            let result = writer
+                .put(Bytes::new())
+                .await
+                .map_err(|error| parquet::errors::ParquetError::External(Box::new(error)));
+            drop(state);
+            result
+        }
+        .boxed()
+    }
+
+    fn complete(&mut self) -> futures_util::future::BoxFuture<'_, parquet::errors::Result<()>> {
+        async move {
+            let mut state = self.state.lock().await;
+            state.completing = true;
+            let writer = state.writer.as_mut().ok_or_else(|| {
+                parquet::errors::ParquetError::General(
+                    "reload object upload is already closed".into(),
+                )
+            })?;
+            writer
+                .shutdown()
+                .await
+                .map_err(|error| parquet::errors::ParquetError::External(Box::new(error)))?;
+            state.writer = None;
+            drop(state);
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
 impl ParquetSink {
     /// `bucket` is *stored*, so it is taken as `impl Into<String>` and converted exactly once here:
     /// `app::establish_stream` hands over the owned name from its
@@ -99,6 +249,59 @@ impl ParquetSink {
             "{}/{}/{}/{}-{}.parquet",
             self.epoch, schema, table, lsn_end, uuid
         ))
+    }
+
+    /// Open one incrementally-written reload object at `fence_lsn`.
+    ///
+    /// Construction performs no remote I/O. Callers feed bounded Arrow micro-batches through
+    /// [`ReloadParquetWriter::write_batch`], then publish the returned object in the control
+    /// manifest only after [`ReloadParquetWriter::finish`] succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SinkError::Encode`] if the Arrow schema cannot initialize a Parquet writer.
+    pub fn begin_reload_stream(
+        &self,
+        arrow_schema: SchemaRef,
+        source_schema: impl Into<String>,
+        source_table: impl Into<String>,
+        fence_lsn: Lsn,
+        schema_version: SchemaVersionNo,
+    ) -> Result<ReloadParquetWriter, SinkError> {
+        let source_schema = source_schema.into();
+        let source_table = source_table.into();
+        let uuid = uuid::Uuid::new_v4().to_string();
+        let key = self.object_key(&source_schema, &source_table, fence_lsn, &uuid);
+        // A single part in flight gives the COPY -> Arrow -> Parquet -> object-store pipeline a
+        // concrete backpressure point. The capacity is fixed implementation policy, not a fourth
+        // reload tuning knob alongside tables, workers, and rows per object.
+        let buf_writer = BufWriter::with_capacity(
+            Arc::clone(&self.store),
+            key.clone(),
+            RELOAD_MULTIPART_PART_BYTES,
+        )
+        .with_max_concurrency(1);
+        let upload = AbortableObjectWriter::new(buf_writer);
+        let writer = AsyncArrowWriter::try_new(
+            upload.clone(),
+            Arc::clone(&arrow_schema),
+            Some(pg_to_arrow::default_writer_properties()),
+        )?;
+
+        Ok(ReloadParquetWriter {
+            writer,
+            upload,
+            arrow_schema,
+            bucket: self.bucket.clone(),
+            key,
+            source_schema,
+            source_table,
+            fence_lsn,
+            schema_version,
+            row_count: 0,
+            write_duration: Duration::ZERO,
+            terminal: false,
+        })
     }
 
     /// Encode `batch` to Parquet (MICROS temporals + Snappy, inherited from the Arrow schema and the
@@ -159,6 +362,150 @@ impl ParquetSink {
     }
 }
 
+impl ReloadParquetWriter {
+    /// Store-relative key reserved for this object. It is useful for diagnostics and cleanup but
+    /// does not imply that the object is durable or visible yet.
+    #[must_use]
+    pub const fn key(&self) -> &Path {
+        &self.key
+    }
+
+    /// Rows successfully encoded and flushed into this open Parquet object.
+    #[must_use]
+    pub const fn row_count(&self) -> u64 {
+        self.row_count
+    }
+
+    /// Encode one Arrow micro-batch and explicitly flush its Parquet row group to the bounded
+    /// multipart writer. Awaiting this call is the worker's backpressure boundary.
+    ///
+    /// Empty batches are harmless no-ops. A write failure automatically attempts to abort the
+    /// multipart upload and permanently closes this writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SinkError::SchemaMismatch`] when `batch` does not have the schema supplied at
+    /// construction, [`SinkError::ClosedStream`] after an earlier failure/finish/abort, or
+    /// [`SinkError::Encode`] for Parquet or object-store write failures.
+    pub async fn write_batch(&mut self, batch: &RecordBatch) -> Result<(), SinkError> {
+        if self.terminal {
+            return Err(SinkError::ClosedStream);
+        }
+        if batch.schema().as_ref() != self.arrow_schema.as_ref() {
+            self.terminal = true;
+            if let Err(abort_error) = self.upload.abort().await {
+                tracing::warn!(%abort_error, key = %self.key, "failed to abort schema-mismatched reload upload");
+            }
+            return Err(SinkError::SchemaMismatch);
+        }
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+
+        let write_started = Instant::now();
+        let result = async {
+            self.writer.write(batch).await?;
+            // AsyncArrowWriter otherwise retains an in-progress row group until it reaches the
+            // writer property threshold. An explicit flush is what keeps reload memory bounded by
+            // the caller's micro-batch rather than the output object's row count.
+            self.writer.flush().await
+        }
+        .await;
+        self.write_duration = self.write_duration.saturating_add(write_started.elapsed());
+        if let Err(error) = result {
+            self.terminal = true;
+            if let Err(abort_error) = self.upload.abort().await {
+                tracing::warn!(%abort_error, key = %self.key, "failed to abort reload multipart upload");
+            }
+            return Err(SinkError::Encode(error));
+        }
+
+        self.row_count = self
+            .row_count
+            .saturating_add(u64::try_from(batch.num_rows()).unwrap_or(u64::MAX));
+        Ok(())
+    }
+
+    /// Finalize the Parquet footer and complete the multipart upload, returning only after the
+    /// object is durable. This is the first point at which a manifest may reference the object.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SinkError::EmptyStream`] if no rows were written, [`SinkError::ClosedStream`] after
+    /// an earlier failure/abort, or [`SinkError::Encode`] when footer/upload completion fails.
+    pub async fn finish(mut self) -> Result<WrittenObject, SinkError> {
+        if self.terminal {
+            return Err(SinkError::ClosedStream);
+        }
+        if self.row_count == 0 {
+            self.terminal = true;
+            if let Err(error) = self.upload.abort().await {
+                tracing::warn!(%error, key = %self.key, "failed to abort empty reload upload");
+            }
+            return Err(SinkError::EmptyStream);
+        }
+
+        let finish_started = Instant::now();
+        if let Err(error) = self.writer.finish().await {
+            self.terminal = true;
+            if let Err(abort_error) = self.upload.abort().await {
+                tracing::warn!(%abort_error, key = %self.key, "failed to abort reload upload after finalization error");
+            }
+            return Err(SinkError::Encode(error));
+        }
+        self.write_duration = self.write_duration.saturating_add(finish_started.elapsed());
+        self.terminal = true;
+        common::metrics::record_batch_flush(self.write_duration.as_secs_f64(), self.row_count);
+
+        Ok(WrittenObject {
+            s3_uri: format!("s3://{}/{}", self.bucket, self.key),
+            key: self.key.clone(),
+            source_schema: self.source_schema.clone(),
+            source_table: self.source_table.clone(),
+            lsn_start: self.fence_lsn,
+            lsn_end: self.fence_lsn,
+            row_count: self.row_count,
+            schema_version: self.schema_version,
+            kind: FileKind::Reload,
+        })
+    }
+
+    /// Explicitly cancel this object and clean up uploaded multipart parts where the store permits.
+    /// Buffered, not-yet-uploaded bytes are simply dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SinkError::Store`] when the object store rejects multipart cleanup.
+    pub async fn abort(mut self) -> Result<(), SinkError> {
+        if self.terminal {
+            return Ok(());
+        }
+        self.terminal = true;
+        self.upload.abort().await?;
+        Ok(())
+    }
+}
+
+impl Drop for ReloadParquetWriter {
+    fn drop(&mut self) {
+        if self.terminal {
+            return;
+        }
+        // Drop cannot await. Under a Tokio runtime, schedule best-effort multipart cleanup; outside
+        // one, dropping the upload still leaves no completed/visible object. Store lifecycle rules
+        // remain the final guard for process death, as with every multipart client.
+        let upload = self.upload.clone();
+        let key = self.key.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            std::mem::drop(runtime.spawn(async move {
+                if let Err(error) = upload.abort().await {
+                    tracing::warn!(%error, %key, "failed to abort dropped reload multipart upload");
+                }
+            }));
+        }
+    }
+}
+
 /// This taxonomy is still growing; new variants must remain additive for downstream crates.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -172,6 +519,15 @@ pub enum SinkError {
     /// `object_store::Error` already names the operation and the path.
     #[error(transparent)]
     Store(#[from] object_store::Error),
+    /// A reload micro-batch does not match the schema used to open its Parquet object.
+    #[error("reload record batch schema does not match the open Parquet object")]
+    SchemaMismatch,
+    /// A reload stream is empty; publishing an empty Parquet object would create bogus progress.
+    #[error("cannot finish an empty reload Parquet stream")]
+    EmptyStream,
+    /// The reload stream already failed, finished, or was aborted.
+    #[error("reload Parquet stream is already closed")]
+    ClosedStream,
 }
 
 /// Every Parquet failure on the writer path — builder, `write`, footer/multipart `close` — is the
@@ -191,6 +547,7 @@ impl From<SinkError> for common::Error {
             SinkError::Encode(source) => {
                 common::Error::Internal(format!("parquet encode: {source}"))
             }
+            other => common::Error::Internal(other.to_string()),
         }
     }
 }

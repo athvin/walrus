@@ -1,7 +1,7 @@
 //! Source-side preflight (§1.1, architecture "Startup & bootstrap" steps 1–3, 6).
 //!
 //! Assert every server-side precondition before a single byte of WAL is read: the connecting role has
-//! the `REPLICATION` privilege, `wal_level = logical`, server ≥ 14, slot / wal-sender headroom, the
+//! the `REPLICATION` privilege, `wal_level = logical`, server ≥ 14, wal-sender headroom, the
 //! publication covers `walrus.ddl_audit` + `walrus.heartbeat`, and every published **user** table has
 //! a usable replica identity (a PK for `DEFAULT`). Any mismatch is **terminal** — a
 //! [`PreflightError`] mapped to a distinct, greppable [`common::ExitCode`] (`CrashLoopBackOff`, not
@@ -81,6 +81,15 @@ pub enum PreflightError {
         used: i32,
         max: i32,
     },
+    /// The configured slot is not the slot owned by the durable control generation. Silently
+    /// switching names would strand retained WAL and can consume a second source slot.
+    #[error(
+        "configured slot {configured:?} differs from current generation slot {recorded:?}; refusing to mutate replication slots"
+    )]
+    SlotNameDrift {
+        configured: String,
+        recorded: String,
+    },
     /// The configured publication does not exist on the source.
     #[error("publication {pub_name} does not exist")]
     PublicationMissing { pub_name: String },
@@ -157,6 +166,7 @@ impl From<PreflightError> for common::Error {
             PreflightError::WalLevel { .. }
             | PreflightError::ServerTooOld { .. }
             | PreflightError::NoHeadroom { .. }
+            | PreflightError::SlotNameDrift { .. }
             | PreflightError::PublicationMissing { .. }
             | PreflightError::PublicationGap { .. }
             | PreflightError::PublicationCoverage(_)
@@ -278,7 +288,9 @@ impl<'a> SourcePreflight<'a> {
     }
 
     /// The role has `REPLICATION`, `wal_level = logical`, `server_version_num ≥ 140000`, and free
-    /// slot / wal-sender headroom.
+    /// wal-sender headroom. Replication-slot headroom is intentionally deferred until slot
+    /// classification: resuming a healthy slot needs no additional slot, and replacing an
+    /// invalidated same-name slot frees its own capacity before recreating it.
     ///
     /// # Errors
     ///
@@ -304,13 +316,6 @@ impl<'a> SourcePreflight<'a> {
         if version_num < 140_000 {
             return Err(PreflightError::ServerTooOld { found: version_num });
         }
-        // Headroom = *free* capacity over current usage (an existing slot still counts).
-        self.assert_headroom(
-            "replication_slots",
-            "max_replication_slots",
-            "SELECT count(*) FROM pg_replication_slots",
-        )
-        .await?;
         self.assert_headroom(
             "wal_senders",
             "max_wal_senders",
@@ -321,6 +326,26 @@ impl<'a> SourcePreflight<'a> {
             version_num,
             wal_level,
         })
+    }
+
+    /// Assert capacity for a genuinely absent configured slot immediately before its creation.
+    ///
+    /// This is deliberately not part of [`Self::assert_server_prereqs`]. An existing healthy slot
+    /// can resume at `max_replication_slots`, while an invalidated same-name slot is dropped before
+    /// recreation and therefore replaces itself net-zero. Only authoritative absence needs a free
+    /// slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PreflightError::NoHeadroom`] when all replication slots are occupied, or the usual
+    /// catalog query/result errors.
+    pub async fn assert_slot_creation_headroom(&self) -> Result<(), PreflightError> {
+        self.assert_headroom(
+            "replication_slots",
+            "max_replication_slots",
+            "SELECT count(*) FROM pg_replication_slots",
+        )
+        .await
     }
 
     /// The reload signal table is installed with its PK. Missing → terminal, because an

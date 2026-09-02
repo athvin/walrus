@@ -150,14 +150,19 @@ pub struct SinkConfig {
     /// Concurrent single-table reload exports (reload H6). "Reload N tables" drains a
     /// queue this wide — a polite cap, never N simultaneous load spikes on the source. ≥ 1.
     pub max_concurrent_reloads: NonZeroU64,
+    /// Concurrent source COPY workers assigned to each exporting table. Together with
+    /// `max_concurrent_reloads`, this gives operators the exact upper bound on reload SQL streams:
+    /// `max_concurrent_reloads * reload_workers_per_table`. `1` retains the streaming exporter but
+    /// disables within-table fan-out. ≥ 1.
+    pub reload_workers_per_table: NonZeroU64,
     /// Reload lease TTL (reload H7): a live exporter renews at TTL/3, so a failed exporter
     /// sink is detectable within one TTL. Bounds-checked so the renewal cadence fits inside it.
     #[serde(with = "humantime_serde")]
     pub reload_lease_ttl: Duration,
-    /// Rows per reload chunk (reload H2): bounds each PK-ordered SELECT and its in-memory result.
-    /// All chunks share one repeatable-read transaction so the baseline is coherent; total export
-    /// time therefore determines how long the source snapshot can hold back VACUUM.
-    /// `max_concurrent_reloads` bounds the number of tables doing this concurrently. ≥ 1.
+    /// Records per completed remote reload object. COPY rows flow through bounded Arrow
+    /// micro-batches into a multipart upload, so this controls file granularity without buffering
+    /// the entire object in memory. All workers for a table import one repeatable-read snapshot;
+    /// total export time therefore determines how long that snapshot can hold back VACUUM. ≥ 1.
     pub reload_chunk_rows: NonZeroU64,
     /// How long a chunk waits for its watermark echo before the reload fails loudly (reload H11):
     /// an unpublished signal table never echoes, so this timeout turns that silent
@@ -203,6 +208,7 @@ impl Default for SinkConfig {
             startup_deadline: Duration::from_secs(60),
             health_addr: SocketAddr::from(([0, 0, 0, 0], 8080)),
             max_concurrent_reloads: nz(2),
+            reload_workers_per_table: nz(4),
             reload_lease_ttl: Duration::from_secs(60),
             reload_chunk_rows: nz(10_000),
             reload_echo_timeout: Duration::from_secs(30),
@@ -412,6 +418,37 @@ impl SinkConfig {
                 ),
             });
         }
+        let concurrent_tables =
+            usize::try_from(self.max_concurrent_reloads.get()).map_err(|_| {
+                ConfigError::OutOfBounds {
+                    field: "max_concurrent_reloads",
+                    detail: "does not fit this platform's connection-count type".to_string(),
+                }
+            })?;
+        if concurrent_tables > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(ConfigError::OutOfBounds {
+                field: "max_concurrent_reloads",
+                detail: format!(
+                    "{concurrent_tables} exceeds Tokio's semaphore limit {}",
+                    tokio::sync::Semaphore::MAX_PERMITS
+                ),
+            });
+        }
+        let workers_per_table =
+            usize::try_from(self.reload_workers_per_table.get()).map_err(|_| {
+                ConfigError::OutOfBounds {
+                    field: "reload_workers_per_table",
+                    detail: "does not fit this platform's connection-count type".to_string(),
+                }
+            })?;
+        concurrent_tables.checked_mul(workers_per_table).ok_or(
+            ConfigError::OutOfBounds {
+                field: "reload_workers_per_table",
+                detail: format!(
+                    "{concurrent_tables} tables × {workers_per_table} workers overflows the derived COPY-stream limit"
+                ),
+            },
+        )?;
         self.hysteresis_band()?;
         Ok(())
     }

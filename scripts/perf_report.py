@@ -8,7 +8,9 @@ import csv
 import datetime as dt
 import json
 import platform
+import re
 import signal
+import statistics
 import subprocess
 import sys
 import time
@@ -46,6 +48,96 @@ PROMETHEUS_NAMES = {
     "sink_spill_total": "walrus_sink_spill_total",
     "replication_lag_bytes": "walrus_sink_replication_lag_bytes",
 }
+
+RELOAD_SAMPLE_COLUMNS = (
+    "implementation",
+    "fixture",
+    "matrix",
+    "tables_requested",
+    "max_concurrent_reloads",
+    "workers_per_table",
+    "chunk_rows",
+    "iteration",
+    "warmup",
+    "status",
+    "failure_reason",
+    "rows_expected",
+    "rows_exported",
+    "source_bytes",
+    "export_seconds",
+    "publish_seconds",
+    "rows_per_second",
+    "source_mib_per_second",
+    "sink_cpu_seconds",
+    "sink_peak_rss_bytes",
+    "loader_peak_rss_bytes",
+    "source_blks_read",
+    "source_blks_hit",
+    "peak_copy_connections",
+    "peak_copy_tables",
+    "peak_wal_lag_bytes",
+    "chunk_files",
+    "slot_count_min",
+    "slot_count_max",
+    "walsenders_min",
+    "walsenders_max",
+    "mirror_diff_rows",
+)
+RELOAD_TEXT_COLUMNS = {
+    "implementation",
+    "fixture",
+    "matrix",
+    "status",
+    "failure_reason",
+}
+RELOAD_INTEGER_COLUMNS = {
+    "tables_requested",
+    "max_concurrent_reloads",
+    "workers_per_table",
+    "chunk_rows",
+    "iteration",
+    "rows_expected",
+    "rows_exported",
+    "source_bytes",
+    "sink_peak_rss_bytes",
+    "loader_peak_rss_bytes",
+    "source_blks_read",
+    "source_blks_hit",
+    "peak_copy_connections",
+    "peak_copy_tables",
+    "peak_wal_lag_bytes",
+    "chunk_files",
+    "slot_count_min",
+    "slot_count_max",
+    "walsenders_min",
+    "walsenders_max",
+    "mirror_diff_rows",
+}
+RELOAD_GROUP_COLUMNS = (
+    "implementation",
+    "fixture",
+    "matrix",
+    "tables_requested",
+    "max_concurrent_reloads",
+    "workers_per_table",
+    "chunk_rows",
+)
+RELOAD_MATRICES = ("workers", "tables", "chunks")
+RELOAD_MEDIAN_COLUMNS = (
+    "export_seconds",
+    "publish_seconds",
+    "rows_per_second",
+    "source_mib_per_second",
+    "sink_cpu_seconds",
+    "sink_peak_rss_bytes",
+    "loader_peak_rss_bytes",
+    "source_blks_read",
+    "source_blks_hit",
+    "peak_copy_connections",
+    "peak_copy_tables",
+    "peak_wal_lag_bytes",
+    "chunk_files",
+)
 
 
 def utc_now() -> str:
@@ -580,6 +672,748 @@ def compare_runs(args: argparse.Namespace) -> int:
     return 0
 
 
+def parse_csv_numbers(value: str) -> list[int]:
+    """Parse a non-empty, positive, comma-separated integer list."""
+    parts = value.split(",")
+    if not value or any(not part.strip() for part in parts):
+        raise ValueError(f"expected positive comma-separated integers, got {value!r}")
+    try:
+        numbers = [int(part) for part in parts]
+    except ValueError as error:
+        raise ValueError(f"expected comma-separated integers, got {value!r}") from error
+    if not numbers or any(number <= 0 for number in numbers):
+        raise ValueError(f"expected positive comma-separated integers, got {value!r}")
+    if len(numbers) != len(set(numbers)):
+        raise ValueError(f"expected distinct comma-separated integers, got {value!r}")
+    return numbers
+
+
+def selected_reload_matrices(matrix: str) -> tuple[str, ...]:
+    return RELOAD_MATRICES if matrix == "all" else (matrix,)
+
+
+def expected_effective_reload_settings(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Return the exact candidate settings exercised, including the bootstrap settings."""
+    workload = metadata["workload"]
+    matrices = selected_reload_matrices(metadata["matrix"])
+    max_concurrent = {workload["base_concurrent_tables"]}
+    workers = {workload["base_workers_per_table"]}
+    chunks = {workload["base_chunk_rows"]}
+    if "tables" in matrices:
+        max_concurrent.update(workload["max_concurrent_reloads"])
+    if "workers" in matrices:
+        workers.update(workload["workers_per_table"])
+    if "chunks" in matrices:
+        chunks.update(workload["chunk_rows"])
+    return {
+        "max_concurrent_reloads": sorted(max_concurrent),
+        "reload_workers_per_table": sorted(workers),
+        "reload_chunk_rows": sorted(chunks),
+        "max_inflight_bytes": workload["max_inflight_bytes"],
+        "max_bytes": workload["max_bytes"],
+        "max_rows": workload["max_rows"],
+        "max_fill": workload["max_fill"],
+        "heartbeat_idle_after": workload["heartbeat_idle_after"],
+    }
+
+
+def reload_metadata_failures(metadata: dict[str, Any]) -> list[str]:
+    """Validate the matrix envelope needed to reproduce and audit a reload run."""
+    failures: list[str] = []
+    if metadata.get("schema_version") != SCHEMA_VERSION:
+        failures.append(
+            f"metadata schema_version is {metadata.get('schema_version')!r}, "
+            f"expected {SCHEMA_VERSION}"
+        )
+    if metadata.get("kind") != "reload_matrix":
+        failures.append(f"metadata kind is invalid: {metadata.get('kind')!r}")
+    matrix = metadata.get("matrix")
+    if matrix not in (*RELOAD_MATRICES, "all"):
+        failures.append(f"metadata matrix is invalid: {matrix!r}")
+
+    fixtures = metadata.get("fixtures")
+    if (
+        not isinstance(fixtures, list)
+        or not fixtures
+        or any(
+            not isinstance(fixture, str) or fixture not in {"narrow", "wide"}
+            for fixture in fixtures
+        )
+        or len(fixtures) != len(set(fixtures))
+    ):
+        failures.append(
+            "metadata fixtures must be a distinct non-empty narrow/wide list: "
+            f"{fixtures!r}"
+        )
+
+    workload = metadata.get("workload")
+    if not isinstance(workload, dict):
+        return failures + ["metadata workload is missing"]
+
+    list_fields = (
+        "workers_per_table",
+        "max_concurrent_reloads",
+        "chunk_rows",
+    )
+    for field in list_fields:
+        values = workload.get(field)
+        if (
+            not isinstance(values, list)
+            or not values
+            or any(type(value) is not int or value <= 0 for value in values)
+            or len(values) != len(set(values))
+        ):
+            failures.append(f"metadata workload.{field} must contain distinct positive integers")
+
+    positive_fields = (
+        "narrow_rows",
+        "narrow_payload_bytes",
+        "wide_rows",
+        "wide_payload_bytes",
+        "base_workers_per_table",
+        "base_concurrent_tables",
+        "base_chunk_rows",
+        "samples",
+        "timeout_seconds",
+        "max_inflight_bytes",
+        "max_bytes",
+        "max_rows",
+    )
+    for field in positive_fields:
+        value = workload.get(field)
+        if type(value) is not int or value <= 0:
+            failures.append(f"metadata workload.{field} must be a positive integer")
+    warmups = workload.get("warmups")
+    if type(warmups) is not int or warmups < 0:
+        failures.append("metadata workload.warmups must be a non-negative integer")
+    sample_interval = workload.get("sample_interval_seconds")
+    if (
+        not isinstance(sample_interval, (int, float))
+        or isinstance(sample_interval, bool)
+        or sample_interval <= 0
+    ):
+        failures.append("metadata workload.sample_interval_seconds must be positive")
+    for field in ("max_fill", "heartbeat_idle_after"):
+        if not isinstance(workload.get(field), str) or not workload[field].strip():
+            failures.append(f"metadata workload.{field} must be a non-empty duration")
+
+    if matrix in ("workers", "all"):
+        workers = workload.get("workers_per_table")
+        if isinstance(workers, list) and 1 not in workers:
+            failures.append("workers matrix requires workers_per_table=1 serial baseline")
+    if matrix in ("tables", "all"):
+        table_caps = workload.get("max_concurrent_reloads")
+        if isinstance(table_caps, list) and 1 not in table_caps:
+            failures.append("tables matrix requires max_concurrent_reloads=1 serial baseline")
+
+    binaries = metadata.get("binaries")
+    if not isinstance(binaries, dict):
+        failures.append("metadata binaries are missing")
+    else:
+        for implementation in ("candidate", "legacy"):
+            binary = binaries.get(implementation)
+            if implementation == "legacy" and binary is None:
+                continue
+            if (
+                not isinstance(binary, dict)
+                or not isinstance(binary.get("path"), str)
+                or not binary["path"]
+            ):
+                failures.append(f"metadata binaries.{implementation}.path is missing")
+                continue
+            digest = binary.get("sha256")
+            if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                failures.append(f"metadata binaries.{implementation}.sha256 is invalid")
+
+    effective = metadata.get("effective_settings")
+    required_workload_fields = {
+        *list_fields,
+        *positive_fields,
+        "warmups",
+        "sample_interval_seconds",
+        "max_fill",
+        "heartbeat_idle_after",
+    }
+    if not isinstance(effective, dict):
+        failures.append("metadata effective_settings are missing")
+    elif required_workload_fields <= workload.keys() and matrix in (*RELOAD_MATRICES, "all"):
+        try:
+            expected = expected_effective_reload_settings(metadata)
+        except (KeyError, TypeError, ValueError):
+            pass
+        else:
+            for field, expected_value in expected.items():
+                if effective.get(field) != expected_value:
+                    failures.append(
+                        f"metadata effective_settings.{field} is {effective.get(field)!r}, "
+                        f"expected {expected_value!r}"
+                    )
+    return failures
+
+
+def expected_reload_configs(metadata: dict[str, Any]) -> set[tuple[Any, ...]]:
+    """Derive every raw CSV configuration promised by valid matrix metadata."""
+    workload = metadata["workload"]
+    fixtures = metadata["fixtures"]
+    matrices = selected_reload_matrices(metadata["matrix"])
+    base_tables = workload["base_concurrent_tables"]
+    base_workers = workload["base_workers_per_table"]
+    base_chunk = workload["base_chunk_rows"]
+    table_workload = max(workload["max_concurrent_reloads"])
+    has_legacy = metadata["binaries"].get("legacy") is not None
+    configs: set[tuple[Any, ...]] = set()
+
+    def add(
+        implementation: str,
+        fixture: str,
+        matrix: str,
+        tables_requested: int,
+        max_concurrent_reloads: int,
+        workers_per_table: int,
+        chunk_rows: int,
+    ) -> None:
+        configs.add(
+            (
+                implementation,
+                fixture,
+                matrix,
+                tables_requested,
+                max_concurrent_reloads,
+                workers_per_table,
+                chunk_rows,
+            )
+        )
+
+    for fixture in fixtures:
+        if "workers" in matrices:
+            for workers in workload["workers_per_table"]:
+                add("candidate", fixture, "workers", base_tables, base_tables, workers, base_chunk)
+            if has_legacy:
+                add("legacy", fixture, "workers", base_tables, base_tables, 1, base_chunk)
+        if "tables" in matrices:
+            for table_cap in workload["max_concurrent_reloads"]:
+                add(
+                    "candidate",
+                    fixture,
+                    "tables",
+                    table_workload,
+                    table_cap,
+                    base_workers,
+                    base_chunk,
+                )
+                if has_legacy:
+                    add(
+                        "legacy",
+                        fixture,
+                        "tables",
+                        table_workload,
+                        table_cap,
+                        1,
+                        base_chunk,
+                    )
+        if "chunks" in matrices:
+            for chunk_rows in workload["chunk_rows"]:
+                add(
+                    "candidate",
+                    fixture,
+                    "chunks",
+                    base_tables,
+                    base_tables,
+                    base_workers,
+                    chunk_rows,
+                )
+                if has_legacy:
+                    add(
+                        "legacy",
+                        fixture,
+                        "chunks",
+                        base_tables,
+                        base_tables,
+                        1,
+                        chunk_rows,
+                    )
+    return configs
+
+
+def reload_start_run(args: argparse.Namespace) -> int:
+    """Create the self-describing envelope for a reload benchmark matrix."""
+    run_dir = Path(args.run_dir)
+    try:
+        workers = parse_csv_numbers(args.workers)
+        tables = parse_csv_numbers(args.tables)
+        chunks = parse_csv_numbers(args.chunks)
+        effective_max_concurrent = parse_csv_numbers(args.effective_max_concurrent_reloads)
+        effective_workers = parse_csv_numbers(args.effective_workers_per_table)
+        effective_chunks = parse_csv_numbers(args.effective_chunk_rows)
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        return 2
+    fixtures = [fixture.strip() for fixture in args.fixtures.split(",")]
+    candidate_sha256 = args.candidate_sha256.lower()
+    legacy_sha256 = args.legacy_sha256.lower() if args.legacy_sha256 else ""
+    metadata = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "reload_matrix",
+        "run_id": run_dir.name,
+        "status": "running",
+        "started_at": utc_now(),
+        "ended_at": None,
+        "build_profile": "release",
+        "matrix": args.matrix,
+        "fixtures": fixtures,
+        "workload": {
+            "narrow_rows": args.narrow_rows,
+            "narrow_payload_bytes": args.narrow_payload_bytes,
+            "wide_rows": args.wide_rows,
+            "wide_payload_bytes": args.wide_payload_bytes,
+            "workers_per_table": workers,
+            "max_concurrent_reloads": tables,
+            "chunk_rows": chunks,
+            "base_workers_per_table": args.base_workers,
+            "base_concurrent_tables": args.base_tables,
+            "base_chunk_rows": args.base_chunk_rows,
+            "warmups": args.warmups,
+            "samples": args.samples,
+            "sample_interval_seconds": args.sample_interval,
+            "timeout_seconds": args.timeout_seconds,
+            "max_inflight_bytes": args.max_inflight_bytes,
+            "max_bytes": args.max_bytes,
+            "max_rows": args.max_rows,
+            "max_fill": args.max_fill,
+            "heartbeat_idle_after": args.heartbeat_idle_after,
+        },
+        "effective_settings": {
+            "max_concurrent_reloads": sorted(effective_max_concurrent),
+            "reload_workers_per_table": sorted(effective_workers),
+            "reload_chunk_rows": sorted(effective_chunks),
+            "max_inflight_bytes": args.max_inflight_bytes,
+            "max_bytes": args.max_bytes,
+            "max_rows": args.max_rows,
+            "max_fill": args.max_fill,
+            "heartbeat_idle_after": args.heartbeat_idle_after,
+        },
+        "binaries": {
+            "candidate": {"path": args.candidate_bin, "sha256": candidate_sha256},
+            "legacy": (
+                {"path": args.legacy_bin, "sha256": legacy_sha256}
+                if args.legacy_bin
+                else None
+            ),
+        },
+        "source": {
+            "git_commit": command_output("git", "rev-parse", "HEAD"),
+            "git_dirty": bool(command_output("git", "status", "--porcelain")),
+        },
+        "host": {
+            "os": platform.system(),
+            "kernel": platform.release(),
+            "architecture": platform.machine(),
+            "cpu_model": cpu_model(),
+        },
+        "toolchain": {
+            "rustc": tool_version("rustc"),
+            "cargo": tool_version("cargo"),
+            "python": platform.python_version(),
+            "docker": tool_version("docker"),
+        },
+    }
+    failures = reload_metadata_failures(metadata)
+    if args.legacy_bin and not legacy_sha256:
+        failures.append("--legacy-sha256 is required when --legacy-bin is set")
+    if not args.legacy_bin and legacy_sha256:
+        failures.append("--legacy-sha256 requires --legacy-bin")
+    if failures:
+        for failure in dict.fromkeys(failures):
+            print(f"invalid reload benchmark metadata: {failure}", file=sys.stderr)
+        return 2
+    run_dir.mkdir(parents=True, exist_ok=False)
+    write_json(run_dir / "metadata.json", metadata)
+    with (run_dir / "reload-samples.csv").open("w", newline="", encoding="utf-8") as handle:
+        csv.DictWriter(handle, fieldnames=RELOAD_SAMPLE_COLUMNS).writeheader()
+    return 0
+
+
+def read_reload_samples(path: Path) -> list[dict[str, Any]]:
+    """Read the reload harness's raw CSV into typed values."""
+    samples: list[dict[str, Any]] = []
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        if tuple(reader.fieldnames or ()) != RELOAD_SAMPLE_COLUMNS:
+            raise ValueError(
+                "reload sample CSV columns differ: "
+                f"expected {list(RELOAD_SAMPLE_COLUMNS)!r}, got {reader.fieldnames!r}"
+            )
+        for raw in reader:
+            parsed: dict[str, Any] = {}
+            for column in RELOAD_SAMPLE_COLUMNS:
+                value = raw.get(column, "")
+                if column in RELOAD_TEXT_COLUMNS:
+                    parsed[column] = value or ""
+                elif column == "warmup":
+                    normalized = value.lower()
+                    if normalized not in {"0", "1", "false", "true", "no", "yes"}:
+                        raise ValueError(f"invalid warmup value {value!r}")
+                    parsed[column] = normalized in {"1", "true", "yes"}
+                elif value in (None, ""):
+                    parsed[column] = None
+                elif column in RELOAD_INTEGER_COLUMNS:
+                    parsed[column] = int(value)
+                else:
+                    parsed[column] = float(value)
+            for column, allowed in (
+                ("implementation", {"candidate", "legacy"}),
+                ("fixture", {"narrow", "wide"}),
+                ("matrix", set(RELOAD_MATRICES)),
+                ("status", {"success", "failed"}),
+            ):
+                if parsed[column] not in allowed:
+                    raise ValueError(
+                        f"line {reader.line_num}: invalid {column} value {parsed[column]!r}"
+                    )
+            for column in (
+                "tables_requested",
+                "max_concurrent_reloads",
+                "workers_per_table",
+                "chunk_rows",
+                "iteration",
+            ):
+                if type(parsed[column]) is not int or parsed[column] <= 0:
+                    raise ValueError(
+                        f"line {reader.line_num}: {column} must be a positive integer"
+                    )
+            samples.append(parsed)
+    return samples
+
+
+def median_present(samples: list[dict[str, Any]], column: str) -> float | None:
+    values = [float(sample[column]) for sample in samples if sample.get(column) is not None]
+    return statistics.median(values) if values else None
+
+
+def format_reload_config(config: tuple[Any, ...]) -> str:
+    values = dict(zip(RELOAD_GROUP_COLUMNS, config, strict=True))
+    return (
+        f"{values['implementation']}/{values['fixture']}/{values['matrix']} "
+        f"tables_requested={values['tables_requested']} "
+        f"max_concurrent_reloads={values['max_concurrent_reloads']} "
+        f"workers={values['workers_per_table']} chunk={values['chunk_rows']}"
+    )
+
+
+def reload_matrix_failures(
+    metadata: dict[str, Any], samples: list[dict[str, Any]]
+) -> list[str]:
+    """Check that the CSV contains exactly the configurations and rounds promised."""
+    if reload_metadata_failures(metadata):
+        return []
+    expected_configs = expected_reload_configs(metadata)
+    actual_by_config: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for sample in samples:
+        config = tuple(sample[column] for column in RELOAD_GROUP_COLUMNS)
+        actual_by_config.setdefault(config, []).append(sample)
+
+    failures: list[str] = []
+    actual_configs = set(actual_by_config)
+    for config in sorted(expected_configs - actual_configs, key=repr):
+        failures.append(f"missing benchmark configuration: {format_reload_config(config)}")
+    for config in sorted(actual_configs - expected_configs, key=repr):
+        failures.append(f"unexpected benchmark configuration: {format_reload_config(config)}")
+
+    warmups = metadata["workload"]["warmups"]
+    measured = metadata["workload"]["samples"]
+    expected_rounds = {
+        *((True, iteration) for iteration in range(1, warmups + 1)),
+        *((False, iteration) for iteration in range(1, measured + 1)),
+    }
+    for config in sorted(expected_configs & actual_configs, key=repr):
+        round_counts: dict[tuple[bool, Any], int] = {}
+        for sample in actual_by_config[config]:
+            round_key = (sample["warmup"], sample["iteration"])
+            round_counts[round_key] = round_counts.get(round_key, 0) + 1
+        for round_key, count in sorted(round_counts.items()):
+            if count > 1:
+                kind = "warmup" if round_key[0] else "measured"
+                failures.append(
+                    f"duplicate {kind} iteration {round_key[1]} ({count} rows): "
+                    f"{format_reload_config(config)}"
+                )
+        for warmup, iteration in sorted(expected_rounds - set(round_counts)):
+            kind = "warmup" if warmup else "measured"
+            failures.append(
+                f"missing {kind} iteration {iteration}: {format_reload_config(config)}"
+            )
+        for warmup, iteration in sorted(set(round_counts) - expected_rounds):
+            kind = "warmup" if warmup else "measured"
+            failures.append(
+                f"unexpected {kind} iteration {iteration}: {format_reload_config(config)}"
+            )
+
+    row_counts = {
+        "narrow": metadata["workload"]["narrow_rows"],
+        "wide": metadata["workload"]["wide_rows"],
+    }
+    for sample in samples:
+        fixture = sample.get("fixture")
+        tables_requested = sample.get("tables_requested")
+        if fixture not in row_counts or type(tables_requested) is not int:
+            continue
+        expected_rows = row_counts[fixture] * tables_requested
+        if sample.get("rows_expected") != expected_rows:
+            config = tuple(sample[column] for column in RELOAD_GROUP_COLUMNS)
+            failures.append(
+                f"{format_reload_config(config)} iteration={sample['iteration']}: "
+                f"rows_expected is {sample.get('rows_expected')}, expected {expected_rows}"
+            )
+    return list(dict.fromkeys(failures))
+
+
+def reload_sample_failures(samples: list[dict[str, Any]]) -> list[str]:
+    """Return correctness/invariant failures observed by the benchmark, without duplicates."""
+    failures: list[str] = []
+    for sample in samples:
+        identity = (
+            f"{sample['implementation']}/{sample['fixture']}/{sample['matrix']} "
+            f"tables_requested={sample['tables_requested']} "
+            f"max_concurrent_reloads={sample['max_concurrent_reloads']} "
+            f"workers={sample['workers_per_table']} "
+            f"chunk={sample['chunk_rows']} iteration={sample['iteration']}"
+        )
+        if sample["status"] != "success":
+            reason = sample["failure_reason"] or "harness marked sample failed"
+            failures.append(f"{identity}: {reason}")
+        expected = sample.get("rows_expected")
+        exported = sample.get("rows_exported")
+        if expected is None or exported is None:
+            failures.append(
+                f"{identity}: exported/expected row count is missing "
+                f"(exported={exported}, expected={expected})"
+            )
+        elif expected != exported:
+            failures.append(f"{identity}: exported {exported} rows, expected {expected}")
+        mirror_diff = sample.get("mirror_diff_rows")
+        if not sample.get("warmup") and sample.get("status") == "success" and mirror_diff is None:
+            failures.append(f"{identity}: exact mirror comparison is missing")
+        elif mirror_diff not in (None, 0):
+            failures.append(f"{identity}: mirror differs by {mirror_diff} rows")
+        for low, high, label in (
+            ("slot_count_min", "slot_count_max", "replication slot"),
+            ("walsenders_min", "walsenders_max", "active walsender"),
+        ):
+            if sample.get(low) != 1 or sample.get(high) != 1:
+                failures.append(
+                    f"{identity}: {label} count left 1 "
+                    f"(min={sample.get(low)}, max={sample.get(high)})"
+                )
+        tables_requested = sample.get("tables_requested")
+        max_concurrent = sample.get("max_concurrent_reloads")
+        workers = sample.get("workers_per_table")
+        peak_copy = sample.get("peak_copy_connections")
+        peak_copy_tables = sample.get("peak_copy_tables")
+        if all(
+            type(value) is int and value > 0
+            for value in (tables_requested, max_concurrent, workers)
+        ):
+            allowed_tables = min(tables_requested, max_concurrent)
+            allowed_copy = min(tables_requested, max_concurrent) * workers
+            if type(peak_copy) is not int:
+                failures.append(f"{identity}: peak COPY connection count is missing")
+            elif peak_copy > allowed_copy:
+                failures.append(
+                    f"{identity}: peak COPY connections {peak_copy} exceeded allowed {allowed_copy}"
+                )
+            elif allowed_copy > 1 and peak_copy < 2:
+                failures.append(
+                    f"{identity}: no parallel COPY activity observed "
+                    f"(peak={peak_copy}, allowed={allowed_copy})"
+                )
+            if type(peak_copy_tables) is not int or peak_copy_tables < 0:
+                failures.append(f"{identity}: peak COPY table count is missing or invalid")
+            elif peak_copy_tables > allowed_tables:
+                failures.append(
+                    f"{identity}: peak COPY tables {peak_copy_tables} exceeded allowed "
+                    f"{allowed_tables}"
+                )
+            elif (
+                sample.get("matrix") == "tables"
+                and allowed_tables > 1
+                and peak_copy_tables < 2
+            ):
+                failures.append(
+                    f"{identity}: table-cap concurrency was not observed "
+                    f"(peak_tables={peak_copy_tables}, allowed_tables={allowed_tables})"
+                )
+            if (
+                type(peak_copy) is int
+                and type(peak_copy_tables) is int
+                and peak_copy_tables > peak_copy
+            ):
+                failures.append(
+                    f"{identity}: peak COPY tables {peak_copy_tables} exceeded peak COPY "
+                    f"connections {peak_copy}"
+                )
+    return list(dict.fromkeys(failures))
+
+
+def aggregate_reload_samples(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group measured samples, compute medians, and attach serial/legacy speedups."""
+    measured = [sample for sample in samples if not sample["warmup"]]
+    grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for sample in measured:
+        key = tuple(sample[column] for column in RELOAD_GROUP_COLUMNS)
+        grouped.setdefault(key, []).append(sample)
+
+    aggregates: list[dict[str, Any]] = []
+    for key, group in sorted(grouped.items(), key=lambda item: item[0]):
+        successful = [sample for sample in group if sample["status"] == "success"]
+        aggregate = dict(zip(RELOAD_GROUP_COLUMNS, key, strict=True))
+        aggregate["sample_count"] = len(group)
+        aggregate["failed_count"] = len(group) - len(successful)
+        for column in RELOAD_MEDIAN_COLUMNS:
+            aggregate[f"median_{column}"] = median_present(successful, column)
+        aggregate["speedup_vs_serial"] = None
+        aggregate["speedup_vs_legacy"] = None
+        aggregates.append(aggregate)
+
+    def index_key(aggregate: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            aggregate["implementation"],
+            aggregate["fixture"],
+            aggregate["matrix"],
+            aggregate["tables_requested"],
+            aggregate["max_concurrent_reloads"],
+            aggregate["workers_per_table"],
+            aggregate["chunk_rows"],
+        )
+
+    index = {index_key(aggregate): aggregate for aggregate in aggregates}
+    for aggregate in aggregates:
+        duration = aggregate["median_export_seconds"]
+        if duration in (None, 0):
+            continue
+        serial_key = None
+        if aggregate["matrix"] == "workers":
+            serial_key = (
+                aggregate["implementation"],
+                aggregate["fixture"],
+                aggregate["matrix"],
+                aggregate["tables_requested"],
+                aggregate["max_concurrent_reloads"],
+                1,
+                aggregate["chunk_rows"],
+            )
+        elif aggregate["matrix"] == "tables":
+            serial_key = (
+                aggregate["implementation"],
+                aggregate["fixture"],
+                aggregate["matrix"],
+                aggregate["tables_requested"],
+                1,
+                aggregate["workers_per_table"],
+                aggregate["chunk_rows"],
+            )
+        serial = index.get(serial_key) if serial_key is not None else None
+        legacy = index.get(
+            (
+                "legacy",
+                aggregate["fixture"],
+                aggregate["matrix"],
+                aggregate["tables_requested"],
+                aggregate["max_concurrent_reloads"],
+                1,
+                aggregate["chunk_rows"],
+            )
+        )
+        if serial and serial["median_export_seconds"] is not None:
+            aggregate["speedup_vs_serial"] = serial["median_export_seconds"] / duration
+        if legacy and legacy["median_export_seconds"] is not None:
+            aggregate["speedup_vs_legacy"] = legacy["median_export_seconds"] / duration
+    return aggregates
+
+
+def reload_finish_run(args: argparse.Namespace) -> int:
+    """Finalize raw reload samples into JSON and CSV matrix summaries."""
+    run_dir = Path(args.run_dir)
+    metadata_path = run_dir / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    try:
+        samples = read_reload_samples(run_dir / "reload-samples.csv")
+    except (OSError, ValueError) as error:
+        print(f"cannot read reload samples: {error}", file=sys.stderr)
+        return 2
+    failures = [reason for reason in args.failure_reason if reason]
+    metadata_failures = reload_metadata_failures(metadata)
+    failures.extend(metadata_failures)
+    failures.extend(reload_sample_failures(samples))
+    if not metadata_failures:
+        failures.extend(reload_matrix_failures(metadata, samples))
+    failures = list(dict.fromkeys(failures))
+    if not samples:
+        failures.append("benchmark produced no samples")
+    aggregates = aggregate_reload_samples(samples)
+    status = "success" if not failures else "failed"
+    measured = [sample for sample in samples if not sample["warmup"]]
+    summary = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "reload_matrix",
+        "run_id": metadata["run_id"],
+        "status": status,
+        "failure_reasons": failures,
+        "comparable": status == "success",
+        "matrix": metadata["matrix"],
+        "fixtures": metadata["fixtures"],
+        "workload": metadata["workload"],
+        "effective_settings": metadata["effective_settings"],
+        "binaries": metadata["binaries"],
+        "source": metadata["source"],
+        "host": metadata["host"],
+        "toolchain": metadata["toolchain"],
+        "sample_count": len(measured),
+        "warmup_count": len(samples) - len(measured),
+        "aggregates": aggregates,
+        "artifacts": {
+            "metadata": "metadata.json",
+            "samples": "reload-samples.csv",
+            "summary_csv": "summary.csv",
+            "sink_log": "sink.log",
+            "loader_log": "loader.log",
+        },
+    }
+    csv_columns = (
+        *RELOAD_GROUP_COLUMNS,
+        "sample_count",
+        "failed_count",
+        *(f"median_{column}" for column in RELOAD_MEDIAN_COLUMNS),
+        "speedup_vs_serial",
+        "speedup_vs_legacy",
+    )
+    with (run_dir / "summary.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=csv_columns)
+        writer.writeheader()
+        writer.writerows(aggregates)
+    metadata["status"] = status
+    metadata["ended_at"] = utc_now()
+    write_json(metadata_path, metadata)
+    write_json(run_dir / "summary.json", summary)
+    print(f"reload benchmark: status={status} measured={len(measured)} bundle={run_dir}")
+    for aggregate in aggregates:
+        print(
+            f"  {aggregate['implementation']}/{aggregate['fixture']}/{aggregate['matrix']} "
+            f"tables_requested={aggregate['tables_requested']} "
+            f"max_concurrent_reloads={aggregate['max_concurrent_reloads']} "
+            f"workers={aggregate['workers_per_table']} "
+            f"chunk={aggregate['chunk_rows']}: "
+            f"median F→H={format_number(aggregate['median_export_seconds'], 's')} "
+            f"rows/s={format_number(aggregate['median_rows_per_second'])} "
+            f"serial×={format_number(aggregate['speedup_vs_serial'])} "
+            f"legacy×={format_number(aggregate['speedup_vs_legacy'])}"
+        )
+    if failures:
+        print("reload benchmark failures:", file=sys.stderr)
+        for failure in failures:
+            print(f"  {failure}", file=sys.stderr)
+    return 0 if status == "success" else 1
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     commands = root.add_subparsers(dest="command", required=True)
@@ -643,6 +1477,45 @@ def parser() -> argparse.ArgumentParser:
     compare.add_argument("candidate")
     compare.add_argument("--allow-mismatch", action="store_true")
     compare.set_defaults(function=compare_runs)
+
+    reload_start = commands.add_parser("reload-start")
+    reload_start.add_argument("--run-dir", required=True)
+    reload_start.add_argument(
+        "--matrix", choices=("workers", "tables", "chunks", "all"), required=True
+    )
+    reload_start.add_argument("--fixtures", required=True)
+    reload_start.add_argument("--narrow-rows", type=int, required=True)
+    reload_start.add_argument("--narrow-payload-bytes", type=int, required=True)
+    reload_start.add_argument("--wide-rows", type=int, required=True)
+    reload_start.add_argument("--wide-payload-bytes", type=int, required=True)
+    reload_start.add_argument("--workers", required=True)
+    reload_start.add_argument("--tables", required=True)
+    reload_start.add_argument("--chunks", required=True)
+    reload_start.add_argument("--base-workers", type=int, required=True)
+    reload_start.add_argument("--base-tables", type=int, required=True)
+    reload_start.add_argument("--base-chunk-rows", type=int, required=True)
+    reload_start.add_argument("--warmups", type=int, required=True)
+    reload_start.add_argument("--samples", type=int, required=True)
+    reload_start.add_argument("--sample-interval", type=float, required=True)
+    reload_start.add_argument("--timeout-seconds", type=int, required=True)
+    reload_start.add_argument("--max-inflight-bytes", type=int, required=True)
+    reload_start.add_argument("--max-bytes", type=int, required=True)
+    reload_start.add_argument("--max-rows", type=int, required=True)
+    reload_start.add_argument("--max-fill", required=True)
+    reload_start.add_argument("--heartbeat-idle-after", required=True)
+    reload_start.add_argument("--effective-max-concurrent-reloads", required=True)
+    reload_start.add_argument("--effective-workers-per-table", required=True)
+    reload_start.add_argument("--effective-chunk-rows", required=True)
+    reload_start.add_argument("--candidate-bin", required=True)
+    reload_start.add_argument("--candidate-sha256", required=True)
+    reload_start.add_argument("--legacy-bin", default="")
+    reload_start.add_argument("--legacy-sha256", default="")
+    reload_start.set_defaults(function=reload_start_run)
+
+    reload_finish = commands.add_parser("reload-finish")
+    reload_finish.add_argument("--run-dir", required=True)
+    reload_finish.add_argument("--failure-reason", action="append", default=[])
+    reload_finish.set_defaults(function=reload_finish_run)
     return root
 
 

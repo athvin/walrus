@@ -1,5 +1,62 @@
 use super::*;
 
+fn next_startup_cstring<'a>(message: &'a [u8], cursor: &mut usize) -> &'a str {
+    let relative_end = message[*cursor..]
+        .iter()
+        .position(|byte| *byte == 0)
+        .expect("StartupMessage field must be NUL-terminated");
+    let end = *cursor + relative_end;
+    let value =
+        std::str::from_utf8(&message[*cursor..end]).expect("StartupMessage fields must be UTF-8");
+    *cursor = end + 1;
+    value
+}
+
+fn decode_startup_fields(message: &[u8]) -> Vec<(&str, &str)> {
+    assert!(message.len() >= 9, "StartupMessage is too short");
+    let declared = usize::try_from(u32::from_be_bytes([
+        message[0], message[1], message[2], message[3],
+    ]))
+    .expect("u32 StartupMessage length fits usize");
+    assert_eq!(declared, message.len());
+    assert_eq!(
+        u32::from_be_bytes([message[4], message[5], message[6], message[7]]),
+        196_608,
+        "protocol 3.0"
+    );
+
+    let mut cursor = 8;
+    let mut fields = Vec::new();
+    while message[cursor] != 0 {
+        let key = next_startup_cstring(message, &mut cursor);
+        let value = next_startup_cstring(message, &mut cursor);
+        fields.push((key, value));
+    }
+    cursor += 1;
+    assert_eq!(cursor, message.len(), "one final NUL terminates the fields");
+    fields
+}
+
+#[test]
+fn startup_message_pins_canonical_postgres_text_output() {
+    const EXPECTED_OPTIONS: &str = "-c DateStyle=ISO,YMD -c IntervalStyle=postgres -c bytea_output=hex \
+         -c extra_float_digits=3 -c TimeZone=UTC";
+    assert_eq!(CANONICAL_TEXT_OUTPUT_STARTUP_OPTIONS, EXPECTED_OPTIONS);
+
+    let message = build_startup("walrus_replicator", "source").unwrap();
+    let fields = decode_startup_fields(&message);
+    assert_eq!(
+        fields,
+        vec![
+            ("user", "walrus_replicator"),
+            ("database", "source"),
+            ("replication", "database"),
+            ("client_encoding", "UTF8"),
+            ("options", EXPECTED_OPTIONS),
+        ]
+    );
+}
+
 #[test]
 fn lsn_formats_as_x_slash_y() {
     assert_eq!(lsn_xy(Lsn::ZERO), "0/0");

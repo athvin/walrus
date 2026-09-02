@@ -603,6 +603,16 @@ pub struct ReloadControllerConfig {
     /// and `adopt_and_resume` would find no free permits, return early every cadence, and leave
     /// `requested` rows queued forever with nothing in the logs to say why.
     pub max_concurrent_reloads: NonZeroUsize,
+    /// Maximum source COPY workers assigned to one exporting table. The total configured source
+    /// COPY-stream ceiling is this value multiplied by [`Self::max_concurrent_reloads`].
+    pub workers_per_table: NonZeroUsize,
+    /// Per-worker Arrow router allowance derived from the process-wide in-flight ceiling and the
+    /// maximum COPY-stream count. This is internal policy, not an operator-facing fourth knob.
+    pub router_batch_bytes: NonZeroU64,
+    /// Process-wide memory admission shared by every table export. Its permit count is derived from
+    /// `max_inflight_bytes`, so high table/worker settings cannot multiply fixed multipart buffers
+    /// without bound.
+    pub worker_admission: crate::reload_export::ReloadWorkerAdmission,
     /// How long an exporter's lease stays valid without renewal. Renewal runs at a third of this.
     pub lease_ttl: Duration,
     /// `lease_holder` — the same identity the heartbeat/ownership machinery uses (never a second one).
@@ -611,7 +621,7 @@ pub struct ReloadControllerConfig {
     pub publication_name: String,
     /// The generation exported chunks are stamped with.
     pub epoch: EpochNo,
-    /// Rows per chunk SELECT.
+    /// Records per completed remote reload object; source COPY remains streaming.
     pub chunk_rows: NonZeroU64,
     /// How long a chunk waits for its watermark echo before failing loudly (H11).
     pub echo_timeout: Duration,
@@ -866,6 +876,9 @@ impl ReloadController {
         let child = self.token.child_token();
         let export_cfg = crate::reload_export::ChunkExportConfig {
             chunk_rows: self.cfg.chunk_rows,
+            router_batch_bytes: self.cfg.router_batch_bytes,
+            worker_admission: self.cfg.worker_admission.clone(),
+            workers_per_table: self.cfg.workers_per_table,
             echo_timeout: self.cfg.echo_timeout,
             instance: self.cfg.instance.clone(),
             epoch: self.cfg.epoch,

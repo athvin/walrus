@@ -21,6 +21,85 @@ fn over_ceiling_when_sum_across_streams_exceeds_budget() {
     assert!(!m.is_over_ceiling());
 }
 
+#[tokio::test]
+async fn reload_reservations_and_wal_buffers_share_one_ceiling() {
+    let budget = std::sync::Arc::new(ProcessMemoryBudget::new(nz(96)));
+    let mut meter = InflightMeter::with_process_budget(nz(96), std::sync::Arc::clone(&budget));
+    meter.add((TableId(1), 100), 32);
+
+    let first = budget.reserve_reload(nz(32)).await;
+    let second = budget.reserve_reload(nz(32)).await;
+    assert!(!meter.is_over_ceiling(), "32 WAL + 64 reload == 96");
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            budget.reserve_reload(nz(32)),
+        )
+        .await
+        .is_err(),
+        "a third reload route waits instead of independently spending another ceiling"
+    );
+
+    drop(second);
+    let third = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        budget.reserve_reload(nz(32)),
+    )
+    .await
+    .expect("releasing a route wakes one waiter");
+    assert!(!meter.is_over_ceiling());
+    drop(third);
+    drop(first);
+}
+
+#[tokio::test]
+async fn one_reload_route_can_make_progress_past_a_wal_heavy_ceiling() {
+    let budget = std::sync::Arc::new(ProcessMemoryBudget::new(nz(64)));
+    let mut meter = InflightMeter::with_process_budget(nz(64), std::sync::Arc::clone(&budget));
+    meter.add((TableId(1), 100), 60);
+
+    let progress = budget.reserve_reload(nz(32)).await;
+    assert!(
+        meter.is_over_ceiling(),
+        "WAL shedding observes the single-route progress reservation"
+    );
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            budget.reserve_reload(nz(32)),
+        )
+        .await
+        .is_err(),
+        "only one over-ceiling progress exception is admitted"
+    );
+    drop(progress);
+}
+
+#[tokio::test]
+async fn wal_growth_atomically_blocks_a_second_reload_route() {
+    let budget = std::sync::Arc::new(ProcessMemoryBudget::new(nz(96)));
+    let first = budget.reserve_reload(nz(32)).await;
+    budget.set_wal_bytes(64);
+    assert_eq!(budget.reload_bytes(), 32);
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            budget.reserve_reload(nz(32)),
+        )
+        .await
+        .is_err(),
+        "WAL publication and reload admission share one linearized ceiling check"
+    );
+
+    drop(first);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        budget.reserve_reload(nz(32)),
+    )
+    .await
+    .expect("one route remains the progress exception after the prior route releases");
+}
+
 #[test]
 fn largest_open_picks_the_biggest_stream() {
     let mut m = InflightMeter::new(nz(10_000));

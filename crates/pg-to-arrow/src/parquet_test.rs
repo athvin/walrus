@@ -67,3 +67,12 @@ fn round_trips_a_batch_through_parquet() {
     // arrow-rs restores the exact schema (incl. Decimal(10,2) and the "UTC" tz) and values.
     assert_eq!(read[0], batch);
 }
+
+#[test]
+fn row_group_statistics_have_a_fixed_byte_bound() {
+    assert_eq!(
+        default_writer_properties().statistics_truncate_length(),
+        Some(STATISTICS_TRUNCATE_LENGTH),
+        "multi-row-group reload footers must not retain whole oversized TEXT/BYTEA values"
+    );
+}
