@@ -33,9 +33,14 @@ pub use parse::ParseEnumError;
 // The reload transition functions stay module-qualified (`reload::request`, `reload::fail`, …):
 // several of their names (`renew_lease`, `complete`, `get`) would collide with or read vaguer
 // than the flat exports above. Only the types go flat.
-pub use reload::{ReloadFlavor, ReloadRow, ReloadStatus};
+pub use reload::{
+    ReloadFenceIdentity, ReloadFlavor, ReloadMarkerKind, ReloadMarkerRow, ReloadRow, ReloadScope,
+    ReloadStatus, SourceReloadRequest,
+};
 pub use replication_state::{
-    ReplicationState, ReplicationStatus, bump_epoch, insert_epoch, read_current_epoch,
+    BootstrapProgress, ReplicationState, ReplicationStatus, bump_bootstrap_epoch, bump_epoch,
+    complete_bootstrap, insert_epoch, mark_total_restart, read_bootstrap_progress,
+    read_current_epoch,
 };
 pub use schema_registry::{
     RegistryRow, read_all_latest_registry, read_latest_version, read_registry, upsert_registry,

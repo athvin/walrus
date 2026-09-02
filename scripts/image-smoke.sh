@@ -74,12 +74,13 @@ for img in "$SINK_IMG" "$LOADER_IMG"; do
 done
 echo "runtime images: slim (no toolchain) + CA bundle present"
 
-# 3. Boot the backing stack and apply the source migrations the sink's preflight requires (publication
-#    + ddl_audit/triggers; idempotent — mirrors scripts/sink-smoke.sh).
+# 3. Boot the backing stack and apply the source migrations the sink's preflight requires
+#    (publication + internal WAL tables + ddl_audit triggers; idempotent — mirrors sink-smoke).
 $COMPOSE up --wait
 $COMPOSE exec -T source-pg psql -U postgres -d walrus -v ON_ERROR_STOP=1 -f - <migrations/source/0001_publication.sql
 $COMPOSE exec -T source-pg psql -U postgres -d walrus -v ON_ERROR_STOP=1 -f - <migrations/source/0002_ddl_triggers.sql
 $COMPOSE exec -T source-pg psql -U postgres -d walrus -v ON_ERROR_STOP=1 -f - <migrations/source/0003_reload_signal.sql
+$COMPOSE exec -T source-pg psql -U postgres -d walrus -v ON_ERROR_STOP=1 -f - <migrations/source/0004_reload_event.sql
 
 # Credentials + object-store config shared by both containers (they reach compose by service DNS on
 # the compose network — portable across Linux CI and local Docker Desktop).

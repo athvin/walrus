@@ -1,26 +1,28 @@
 //! Total-restart on the loader side (§1.8). When the control plane opens a new generation (the sink
 //! bumped `replication_state.epoch` after the single lifelong slot was lost/invalidated), every
 //! DuckLake namespace built for the retired generation holds stale `<table>`/`<table>_raw` data. The
-//! fix is a whole-table **rebuild**: wipe the mirror + CDC log so the fresh new-epoch snapshot re-appends from
-//! scratch and the transform re-derives the mirror. **Both watermarks reset for free** — the new epoch's
+//! fix is a whole-table **rebuild**: wipe the mirror + CDC log so the new generation's fenced full
+//! exports repopulate every table. **Both watermarks reset for free** — the new epoch's
 //! `loader_checkpoint` row is a fresh `(0/0, 0/0)`, since checkpoints are epoch-keyed.
 //!
 //! Detection is at **bootstrap** (compare each file's `_walrus_meta['epoch']` to the control epoch) and,
 //! for a *running* loader, through one shared epoch poller ([`apply_loop`](crate::apply_loop) exits loudly
 //! on a bump so the orchestrator restarts it into a rebuild). A rebuild is **whole-system** by
-//! construction — every table shares the epoch and is rebuilt together; there is no per-table reload
-//! (a deferred goal, §1.8).
+//! construction — every table shares the epoch and is rebuilt together. The same fenced protocol also
+//! handles later per-table reloads without an epoch change.
 
 use crate::duck::TableDb;
 use crate::error::LoaderError;
+use crate::health::LoaderState;
 use common::EpochNo;
-use std::time::Duration;
+use control::ReplicationStatus;
+use std::{sync::Arc, time::Duration};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 /// If `db` was built for an older generation than `control_epoch`, wipe its mirror + raw so the caller's
-/// subsequent `ensure_tables*` recreates them empty and the new-epoch snapshot rebuilds the file. Returns
-/// `true` iff a rebuild happened. A no-op (returns `false`) when the file is brand-new (never stamped) or
+/// subsequent `ensure_tables*` recreates them empty and the new generation's reconciliation rebuilds
+/// the file. Returns `true` iff a rebuild happened. A no-op (returns `false`) when the file is brand-new (never stamped) or
 /// already at `control_epoch` — so first-bootstrap and steady resume are untouched.
 ///
 /// # Errors
@@ -62,6 +64,7 @@ pub fn spawn_epoch_watch(
     pool: sqlx::PgPool,
     baseline: EpochNo,
     period: Duration,
+    state: Arc<LoaderState>,
     token: CancellationToken,
 ) -> (watch::Receiver<EpochNo>, tokio::task::JoinHandle<()>) {
     let (tx, rx) = watch::channel(baseline);
@@ -84,7 +87,27 @@ pub fn spawn_epoch_watch(
                 return;
             }
 
-            match control::read_current_epoch(&pool).await {
+            let observed = tokio::select! {
+                biased;
+                () = token.cancelled() => return,
+                () = tx.closed() => return,
+                observed = control::read_current_epoch(&pool) => observed,
+            };
+            match observed {
+                Ok(Some(observed))
+                    if generation_is_retired(observed.epoch, observed.status, baseline) =>
+                {
+                    // `total_restart` is written before the source slot changes. Waiting for its
+                    // successor epoch would leave this provably stale generation ready forever if
+                    // the sink crashes in that seam, so gate readiness and terminate now.
+                    state.mark_generation_retired();
+                    tracing::error!(
+                        epoch = %observed.epoch,
+                        "TOTAL-RESTART: current loader generation was retired before slot replacement; draining and exiting"
+                    );
+                    token.cancel();
+                    return;
+                }
                 Ok(observed) => {
                     advance(&tx, observed.map(|state| state.epoch));
                 }
@@ -95,6 +118,75 @@ pub fn spawn_epoch_watch(
         }
     });
     (rx, handle)
+}
+
+pub(crate) fn generation_is_retired(
+    observed_epoch: EpochNo,
+    observed_status: ReplicationStatus,
+    baseline: EpochNo,
+) -> bool {
+    observed_epoch >= baseline && observed_status == ReplicationStatus::TotalRestart
+}
+
+/// Keep a freshly-created generation out of service until the sink has observed every frozen
+/// all-table child publish and atomically promoted `replication_state` to `streaming`.
+///
+/// This watcher is deliberately independent of table workers: a loader shard can own zero tables,
+/// but it still must not advertise the generation before the global reconciliation is complete.
+/// Failed control reads delay readiness and are retried; they never fail open.
+#[must_use]
+pub fn spawn_generation_ready_watch(
+    pool: sqlx::PgPool,
+    epoch: EpochNo,
+    period: Duration,
+    state: Arc<LoaderState>,
+    token: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                biased;
+                () = token.cancelled() => return,
+                _ = tick.tick() => {}
+            }
+
+            // A pool wait or network read must not hold the app's ordered shutdown join after the
+            // token is cancelled. Dropping this query future is safe and leaves the next process to
+            // retry the read from scratch.
+            let observed = tokio::select! {
+                biased;
+                () = token.cancelled() => return,
+                observed = control::read_current_epoch(&pool) => observed,
+            };
+            match observed {
+                Ok(Some(observed))
+                    if observed.epoch == epoch
+                        && observed.status == ReplicationStatus::Streaming =>
+                {
+                    state.mark_generation_ready();
+                    tracing::info!(%epoch, "initial all-table reconciliation published; loader ready");
+                    return;
+                }
+                Ok(Some(observed)) if observed.epoch > epoch => {
+                    // The ordinary epoch guard makes workers exit. Staying unready here is the
+                    // conservative behavior for an empty shard while its process winds down.
+                    tracing::warn!(
+                        baseline = %epoch,
+                        current = %observed.epoch,
+                        "generation changed before initial reconciliation published"
+                    );
+                    return;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "generation readiness read failed; retrying next tick");
+                }
+            }
+        }
+    })
 }
 
 /// Publish only a genuine forward epoch move, returning whether receivers were notified.

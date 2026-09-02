@@ -34,3 +34,9 @@ fn a_canonical_lsn_still_parses() {
     let lsn = parse_lsn("0/199BAC8", "consistent_point").expect("a canonical X/Y LSN parses");
     assert_eq!(lsn, Lsn::new(0x0199_BAC8));
 }
+
+#[test]
+fn invalidated_slot_replacement_can_only_drop_a_catalog_lost_slot() {
+    assert!(DROP_INVALIDATED_SLOT_SQL.contains("wal_status = 'lost'"));
+    assert!(DROP_INVALIDATED_SLOT_SQL.contains("slot_name = $1"));
+}

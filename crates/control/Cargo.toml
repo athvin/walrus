@@ -24,9 +24,11 @@ sqlx = { workspace = true, features = [
     "macros",
     "migrate",
     "json",
+    "uuid",
 ] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 serde_json = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

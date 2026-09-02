@@ -2,7 +2,7 @@ use super::*;
 use std::str::FromStr;
 
 #[test]
-fn status_and_flavor_round_trip_their_sql_strings() {
+fn reload_enums_round_trip_their_sql_strings() {
     // The strings are the contract with the migration's CHECK constraints AND with the
     // sqlx::Type derive (`rename_all`) — a drift in any of the three is a bug this catches.
     for status in [
@@ -25,6 +25,22 @@ fn status_and_flavor_round_trip_their_sql_strings() {
         "five statuses, ever"
     );
     assert!(ReloadFlavor::from_str("rebuild").is_err());
+
+    for (scope, encoded) in [
+        (ReloadScope::Table, "table"),
+        (ReloadScope::AllPublished, "all_published"),
+    ] {
+        assert_eq!(scope.as_str(), encoded);
+        assert_eq!(ReloadScope::from_str(encoded), Ok(scope));
+    }
+
+    for (kind, encoded) in [
+        (ReloadMarkerKind::Baseline, "baseline"),
+        (ReloadMarkerKind::End, "end"),
+    ] {
+        assert_eq!(kind.as_str(), encoded);
+        assert_eq!(ReloadMarkerKind::from_str(encoded), Ok(kind));
+    }
 }
 
 #[test]
@@ -85,9 +101,13 @@ mod expansion_site_needs_no_imports {
         source_schema: String,
         source_table: String,
         flavor: crate::reload::ReloadFlavor,
+        source_request_id: Option<uuid::Uuid>,
+        parent_request_id: Option<uuid::Uuid>,
+        request_scope: crate::reload::ReloadScope,
         status: crate::reload::ReloadStatus,
         chunk_no: i64,
         cursor_pk: Option<serde_json::Value>,
+        start_lsn: Option<common::Lsn>,
         first_lsn: Option<common::Lsn>,
         final_lsn: Option<common::Lsn>,
         schema_version: Option<i64>,
@@ -104,9 +124,13 @@ mod expansion_site_needs_no_imports {
             source_schema: "public".to_string(),
             source_table: "orders".to_string(),
             flavor: crate::reload::ReloadFlavor::Resync,
+            source_request_id: None,
+            parent_request_id: None,
+            request_scope: crate::reload::ReloadScope::Table,
             status: crate::reload::ReloadStatus::Exporting,
             chunk_no: 2,
             cursor_pk: None,
+            start_lsn: Some(common::Lsn::new(8)),
             first_lsn: Some(common::Lsn::new(16)),
             final_lsn: None,
             schema_version: Some(5),
@@ -120,6 +144,7 @@ mod expansion_site_needs_no_imports {
         assert_eq!(row.reload_id, common::ReloadId(7));
         assert_eq!(row.epoch, common::EpochNo(3));
         assert_eq!(row.schema_version, Some(common::SchemaVersionNo(5)));
+        assert_eq!(row.start_lsn, Some(common::Lsn::new(8)));
         assert_eq!(row.first_lsn, Some(common::Lsn::new(16)));
         assert_eq!(row.status, crate::reload::ReloadStatus::Exporting);
     }

@@ -30,11 +30,8 @@ const fn is_slot_char(c: char) -> bool {
 ///
 /// [`SinkConfig::slot_name`] stays a bare [`String`] because that is its *wire* shape: a `slot_name`
 /// key in a config file or a `WALRUS_SLOT_NAME` variable. [`SlotName::new`] is the single gate that
-/// turns that raw text into a name the server can accept, and slot creation
-/// ([`crate::replication::ReplicationStream::create_replication_slot_export`]) takes nothing else —
-/// so the one command that interpolates the name **unquoted** cannot be handed text Postgres would
-/// reject. `START_REPLICATION` keeps taking a plain `&str`: it names a slot the catalog has already
-/// shown to exist, and an existing slot's name is legal by construction. The catalog lookups in
+/// turns that raw text into a name the server can accept before `START_REPLICATION` embeds it as an
+/// unquoted identifier. The catalog lookups in
 /// [`crate::slot`] and [`crate::epoch`] bind the name as a query *parameter* and likewise stay on
 /// `&str`.
 ///
@@ -129,9 +126,8 @@ pub struct SinkConfig {
     /// A beat un-returned after this long marks the sink `degraded` (observability, never a kill).
     #[serde(with = "humantime_serde")]
     pub heartbeat_roundtrip_deadline: Duration,
-    /// `statement_timeout` for each initial-backfill copy session. `0` = disabled — a huge
-    /// table's snapshot copy must not be killed mid-flight (the whole backfill is bounded by the slot's
-    /// WAL retention, not a per-statement clock).
+    /// Compatibility-only input retained for rolling upgrades. Snapshot backfill no longer exists,
+    /// so this value is accepted but ignored; remove it from deployment overlays when convenient.
     #[serde(with = "humantime_serde")]
     pub backfill_statement_timeout: Duration,
     /// Row-count flush threshold.
@@ -158,9 +154,10 @@ pub struct SinkConfig {
     /// sink is detectable within one TTL. Bounds-checked so the renewal cadence fits inside it.
     #[serde(with = "humantime_serde")]
     pub reload_lease_ttl: Duration,
-    /// Rows per reload chunk (reload H2): each chunk is one short PK-ordered SELECT — no
-    /// hours-long transaction pinning xmin. Bounds each statement; `max_concurrent_reloads` bounds
-    /// tables. ≥ 1.
+    /// Rows per reload chunk (reload H2): bounds each PK-ordered SELECT and its in-memory result.
+    /// All chunks share one repeatable-read transaction so the baseline is coherent; total export
+    /// time therefore determines how long the source snapshot can hold back VACUUM.
+    /// `max_concurrent_reloads` bounds the number of tables doing this concurrently. ≥ 1.
     pub reload_chunk_rows: NonZeroU64,
     /// How long a chunk waits for its watermark echo before the reload fails loudly (reload H11):
     /// an unpublished signal table never echoes, so this timeout turns that silent
@@ -196,7 +193,7 @@ impl Default for SinkConfig {
             max_fill: Duration::from_secs(5),
             heartbeat_idle_after: Duration::from_secs(10),
             heartbeat_roundtrip_deadline: Duration::from_secs(30),
-            backfill_statement_timeout: Duration::ZERO, // disabled — never kill a big table's copy
+            backfill_statement_timeout: Duration::ZERO,
 
             max_rows: nz(100_000),
             max_bytes: nz(128 * 1024 * 1024),

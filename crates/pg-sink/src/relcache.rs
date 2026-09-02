@@ -27,12 +27,15 @@ pub struct CachedRelation {
     pub schema_version: SchemaVersionNo,
 }
 
-/// The three walrus-internal source tables: control-plane, never registered or schematised as user
-/// data. `reload_signal` is consumed for its echo — the chunk watermark — exactly as
-/// `ddl_audit` is consumed for DDL events: never batched, never a Parquet file, never a manifest row.
+/// Walrus-internal source tables: control-plane, never registered or schematised as user data.
+/// Reload signals/events and DDL audit rows are consumed in-band, never materialised.
 #[must_use]
 pub fn is_internal_table(schema: &str, table: &str) -> bool {
-    schema == "walrus" && matches!(table, "ddl_audit" | "heartbeat" | "reload_signal")
+    schema == "walrus"
+        && matches!(
+            table,
+            "ddl_audit" | "heartbeat" | "reload_signal" | "reload_event"
+        )
 }
 
 /// Every relation shape the decode loop has seen, keyed by OID **and** schema version.

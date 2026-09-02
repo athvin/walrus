@@ -360,11 +360,6 @@ jobs:
       - name: Graceful shutdown drain (compose)
         run: cargo test -p pg-sink --test graceful_shutdown -- --ignored --test-threads=1
 
-      # snapshot backfill — preloaded rows produce kind='snapshot' files sharing one
-      # lsn_end=consistent_point; a row written after the export streams once (no double count).
-      - name: Snapshot backfill (compose)
-        run: cargo test -p pg-sink --test snapshot_backfill -- --ignored --test-threads=1
-
       # large-txn streaming — an 8000-row txn (logical_decoding_work_mem=64kB) writes ready
       # rows only after Stream Commit; a whole-txn abort writes none.
       - name: Streaming large txn (compose)
@@ -386,8 +381,9 @@ jobs:
         run: cargo test -p pg-sink --test ddl_capture -- --ignored --test-threads=1
 
       # the reload signal table — a signal INSERT is decode-visible through the slot
-      # (wal_insert_lsn stamped by the DEFAULT), backfill never copies it, and preflight is terminal
-      # on a missing/unpublished table (or heals the gap under manage_publication).
+      # (wal_insert_lsn stamped by the DEFAULT), source catalog enumeration excludes it from
+      # reconciliation targets, and preflight is terminal on a missing/unpublished table (or heals
+      # the gap under manage_publication).
       - name: Reload signal (compose)
         run: cargo test -p pg-sink --test reload_signal -- --ignored --test-threads=1
 
@@ -404,8 +400,8 @@ jobs:
         run: cargo test -p pg-sink --test reload_pickup -- --ignored --test-threads=1
 
       # the chunk export engine — 2,500 rows at chunk_rows=1000 ⇒ exactly 3 kind='reload'
-      # files whose union is the table, every row stamped commit_lsn = lsn = L_i; cursor resume
-      # never re-exports; a never-arriving echo fails loudly with the publication hint.
+      # files whose union is the table, all stamped at one baseline F; a lost connection-local
+      # snapshot purges its cursor and re-exports, while a missing F echo fails before table reads.
       - name: Reload export (compose)
         run: cargo test -p pg-sink --test reload_export -- --ignored --test-threads=1
 
@@ -415,9 +411,9 @@ jobs:
       - name: Reload DDL restart (compose)
         run: cargo test -p pg-sink --test reload_ddl -- --ignored --test-threads=1
 
-      # completion & crash recovery — a dropped export is adopted from control-pg and
-      # resumes from the cursor (no re-export), flips export_complete(H); the loader flips complete
-      # only once transformed_lsn ≥ H; a live foreign lease is never stolen, an expired one is.
+      # completion & crash recovery — a dropped mid-export snapshot starts a fresh successor,
+      # an attempt already fenced at H is resumed without exporting post-H rows, and the loader
+      # completes only at H; a live foreign lease is never stolen, an expired one is.
       - name: Reload recovery (compose)
         run: cargo test -p pg-sink --test reload_recovery -- --ignored --test-threads=1
 
@@ -556,6 +552,8 @@ jobs:
           - reload_quarantine
           - reload_scale
           - ddl_transactions
+          - source_reload_event
+          - total_restart
     # A DEDICATED job: the e2e harness spawns the real sink+loader binaries — its
     # `build_bins` compiles the bundled DuckDB in the DEV profile ON TOP of the test-profile builds,
     # which overflowed the integration runner's disk ("No space left on device"). A fresh runner with
@@ -612,7 +610,7 @@ jobs:
         run: docker compose -f deploy/docker/docker-compose.yml down -v
 
   # Preserve the pre-matrix check name as a stable branch-protection interface. `result` is the
-  # aggregate result of every expanded matrix child, so this succeeds only when all three pass.
+  # aggregate result of every expanded matrix child, so this succeeds only when all five pass.
   e2e:
     name: e2e (full pipeline — reload + transactional DDL)
     needs: [changes, e2e_matrix]

@@ -5,27 +5,25 @@
     reason = "integration test — unwrap/expect fine in setup + helpers"
 )]
 //! Reload observability against compose (`#[ignore]` — source + control PG + MinIO). Proves the
-//! reload metrics move during a reload: chunk/row counters and the echo-wait histogram tick as an
-//! export runs; the failed counter ticks on an echo timeout; the active gauge rises to 1 while an
-//! exporter is in flight and returns to 0 when it ends; and the cross-check violation counter stays
-//! 0 on a healthy run (its whole point is to be 0). The named-metric registration is covered by
+//! reload metrics move during a reload: chunk/row counters and the F/H echo-wait histogram tick as
+//! an export runs; a missing decoder makes F establishment observably time out; the active gauge
+//! rises to 1 while an exporter is in flight and returns to 0 when it ends; and the cross-check
+//! violation counter stays 0 on a healthy run. Named registration is covered by
 //! `metrics_scrape.rs`; this is the movement proof.
 //!
 //!   cargo test -p pg-sink --test reload_metrics -- --ignored --test-threads=1
 
-use pg_sink::consume::on_frame;
-use pg_sink::heartbeat::InternalTables;
-use pg_sink::pgoutput::{Message, StreamCtx};
 use pg_sink::reload::{ReloadController, ReloadControllerConfig};
+use pg_sink::reload_event::FenceWaiters;
 use pg_sink::reload_export::{ChunkExportConfig, ChunkExporter};
-use pg_sink::reload_signal::{PendingSignal, PendingSignals, WatermarkWaiters};
-use pg_sink::replication::ReplicationStream;
 use pg_sink::sink::ParquetSink;
-use pg_sink::slot::verify_or_create_slot;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_postgres::NoTls;
 use tokio_util::sync::CancellationToken;
+
+#[path = "support/reload_fence.rs"]
+mod reload_fence_support;
 
 use common::EpochNo;
 use control::reload::{self, ReloadFlavor, ReloadStatus};
@@ -33,6 +31,7 @@ use control::reload::{self, ReloadFlavor, ReloadStatus};
 static SOURCE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const SOURCE_0001: &str = include_str!("../../../migrations/source/0001_publication.sql");
 const SOURCE_0003: &str = include_str!("../../../migrations/source/0003_reload_signal.sql");
+const SOURCE_0004: &str = include_str!("../../../migrations/source/0004_reload_event.sql");
 const TABLE: &str = "_walrus_met_orders";
 
 #[track_caller]
@@ -80,16 +79,6 @@ fn minio(epoch: EpochNo) -> ParquetSink {
     )
 }
 
-async fn drop_slot(admin: &tokio_postgres::Client, slot: &str) {
-    let _ = admin
-        .execute(
-            "SELECT pg_drop_replication_slot(slot_name)
-             FROM pg_replication_slots WHERE slot_name = $1 AND NOT active",
-            &[&slot],
-        )
-        .await;
-}
-
 async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: EpochNo, n: i64) {
     admin
         .batch_execute(&format!(
@@ -99,7 +88,7 @@ async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: EpochN
         ))
         .await
         .unwrap();
-    let rel = pg_sink::snapshot::describe_source_relation(admin, "public", TABLE)
+    let rel = pg_sink::source_catalog::describe_source_relation(admin, "public", TABLE)
         .await
         .unwrap();
     control::upsert_registry(
@@ -127,91 +116,13 @@ async fn scrub(pool: &sqlx::PgPool, epoch: EpochNo) {
     }
 }
 
-fn spawn_echo_resolver(
-    slot: &'static str,
-    waiters: Arc<WatermarkWaiters>,
-    token: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let admin = admin().await;
-        drop_slot(&admin, slot).await;
-        let resume = verify_or_create_slot(&admin, slot).await.unwrap();
-        let mut stream =
-            ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
-                .await
-                .unwrap();
-        let mut ctx = StreamCtx::default();
-        let mut internal = InternalTables::default();
-        let mut pending = PendingSignals::default();
-        loop {
-            let frame = tokio::select! {
-                _ = token.cancelled() => break,
-                f = stream.next() => f.unwrap().unwrap(),
-            };
-            let Some(msg) = on_frame(&mut ctx, frame).unwrap() else {
-                continue;
-            };
-            match &msg {
-                Message::Relation { relation, .. } => internal.note_relation(relation),
-                Message::Insert {
-                    relation_oid,
-                    new,
-                    xid,
-                } if internal.is_reload_signal(*relation_oid) => {
-                    let rel = internal.reload_signal_rel().unwrap();
-                    if let Ok(sig) = PendingSignal::from_tuple(rel, new, *xid) {
-                        pending.push(sig);
-                    }
-                }
-                Message::Commit { commit_lsn, .. } => pending.on_commit(*commit_lsn, &waiters),
-                _ => {}
-            }
-        }
-        drop(stream);
-        drop_slot(&admin, slot).await;
-    })
-}
-
-async fn await_resolver_ready(
-    admin: &tokio_postgres::Client,
-    waiters: &WatermarkWaiters,
-    epoch: EpochNo,
-) {
-    let sentinel = -epoch.0;
-    let mut ready = false;
-    for _ in 0..20 {
-        let rx = waiters.subscribe(common::ReloadId(sentinel), 1);
-        admin
-            .batch_execute(&format!(
-                "DELETE FROM walrus.reload_signal WHERE reload_id = {sentinel}; \
-                 INSERT INTO walrus.reload_signal (reload_id, chunk_no) VALUES ({sentinel}, 1);"
-            ))
-            .await
-            .unwrap();
-        if tokio::time::timeout(Duration::from_millis(500), rx)
-            .await
-            .is_ok()
-        {
-            ready = true;
-            break;
-        }
-    }
-    assert!(ready, "the echo resolver never answered the sentinel");
-    admin
-        .execute(
-            "DELETE FROM walrus.reload_signal WHERE reload_id = $1",
-            &[&sentinel],
-        )
-        .await
-        .unwrap();
-}
-
 fn export_cfg(epoch: EpochNo, chunk_rows: u64, echo_timeout: Duration) -> ChunkExportConfig {
     ChunkExportConfig {
         chunk_rows: std::num::NonZeroU64::new(chunk_rows).unwrap(),
         echo_timeout,
         instance: "walrus-sink-test".to_string(),
         epoch,
+        publication_name: "walrus_pub".to_string(),
     }
 }
 
@@ -253,22 +164,34 @@ async fn chunk_export_moves_chunk_row_and_echo_metrics() {
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
+    admin.batch_execute(SOURCE_0004).await.unwrap();
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     scrub(&pool, epoch).await;
     seed(&admin, &pool, epoch, 5).await;
 
-    let waiters = Arc::new(WatermarkWaiters::default());
+    let waiters = Arc::new(FenceWaiters::default());
     let token = CancellationToken::new();
-    let resolver = spawn_echo_resolver("walrus_met_export", Arc::clone(&waiters), token.clone());
-    await_resolver_ready(&admin, &waiters, epoch).await;
+    let resolver = reload_fence_support::spawn(
+        source_url(),
+        "walrus_met_export",
+        pool.clone(),
+        Arc::clone(&waiters),
+        None,
+        token.clone(),
+    );
+    tokio::time::timeout(Duration::from_secs(10), resolver.ready)
+        .await
+        .expect("fence resolver starts")
+        .expect("fence resolver ready sender remains live");
+    let resolver = resolver.handle;
 
     let chunks_before = metric_sum(common::metrics::names::RELOAD_CHUNKS_TOTAL);
     let rows_before = metric_sum(common::metrics::names::RELOAD_ROWS_EXPORTED_TOTAL);
     let echo_before = metric_sum("walrus_reload_echo_wait_seconds_count");
     let crosscheck_before = metric_sum(common::metrics::names::RELOAD_CROSSCHECK_VIOLATIONS);
 
-    // 5 rows at chunk_rows=2 ⇒ 3 chunks (2+2+1), each preceded by an echo round-trip.
+    // 5 rows at chunk_rows=2 ⇒ 3 chunks (2+2+1), bracketed by F/H echo round-trips.
     let req = request_and_claim(&pool, epoch).await;
     let mut exporter = ChunkExporter::connect(
         &source_url(),
@@ -280,7 +203,7 @@ async fn chunk_export_moves_chunk_row_and_echo_metrics() {
     )
     .await
     .unwrap();
-    exporter.run().await.unwrap();
+    exporter.run(false).await.unwrap();
 
     assert_approx_eq(
         metric_sum(common::metrics::names::RELOAD_CHUNKS_TOTAL) - chunks_before,
@@ -291,8 +214,8 @@ async fn chunk_export_moves_chunk_row_and_echo_metrics() {
         5.0,
     );
     assert!(
-        metric_sum("walrus_reload_echo_wait_seconds_count") - echo_before >= 3.0,
-        "the echo-wait histogram observed at least one round-trip per chunk"
+        metric_sum("walrus_reload_echo_wait_seconds_count") - echo_before >= 2.0,
+        "the echo-wait histogram observed the start and end fences"
     );
     assert_approx_eq(
         metric_sum(common::metrics::names::RELOAD_CROSSCHECK_VIOLATIONS) - crosscheck_before,
@@ -310,24 +233,24 @@ async fn chunk_export_moves_chunk_row_and_echo_metrics() {
 
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (source + control PG + MinIO)"]
-async fn echo_timeout_moves_the_failed_metric() {
+async fn start_fence_timeout_is_observable_and_resumable() {
     let _g = SOURCE_LOCK.lock().await;
     common::metrics::init();
     let epoch = EpochNo(700_002);
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
+    admin.batch_execute(SOURCE_0004).await.unwrap();
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     scrub(&pool, epoch).await;
     seed(&admin, &pool, epoch, 3).await;
 
-    let failed_before = metric_sum(common::metrics::names::RELOAD_FAILED_TOTAL);
-
-    // NO resolver: the echo never arrives, so the reload fails loudly (short timeout to keep it snappy).
-    let waiters = Arc::new(WatermarkWaiters::default());
+    // NO resolver: establishing F times out before any read/file and leaves the leased row
+    // resumable. The controller owns terminal classification; a raw exporter reports the error.
+    let waiters = Arc::new(FenceWaiters::default());
     let req = request_and_claim(&pool, epoch).await;
-    let mut exporter = ChunkExporter::connect(
+    let err = ChunkExporter::connect(
         &source_url(),
         pool.clone(),
         waiters,
@@ -336,20 +259,15 @@ async fn echo_timeout_moves_the_failed_metric() {
         &req,
     )
     .await
-    .unwrap();
-    let err = exporter.run().await.unwrap_err();
-    assert!(format!("{err:#}").contains("no echo after"));
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("decode echo timed out"));
     assert_eq!(
         reload::get(&pool, req.reload_id)
             .await
             .unwrap()
             .unwrap()
             .status,
-        ReloadStatus::Failed
-    );
-    assert_approx_eq(
-        metric_sum(common::metrics::names::RELOAD_FAILED_TOTAL) - failed_before,
-        1.0,
+        ReloadStatus::Exporting
     );
 
     scrub(&pool, epoch).await;
@@ -368,6 +286,7 @@ async fn active_gauge_rises_and_returns_to_zero() {
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
+    admin.batch_execute(SOURCE_0004).await.unwrap();
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     scrub(&pool, epoch).await;
@@ -376,7 +295,7 @@ async fn active_gauge_rises_and_returns_to_zero() {
     // The controller spawns an exporter that PARKS on the echo await (no resolver) — long enough to
     // observe active=1; cancelling the token ends it and drops the gauge back to 0.
     let token = CancellationToken::new();
-    let waiters = Arc::new(WatermarkWaiters::default());
+    let waiters = Arc::new(FenceWaiters::default());
     let handle = ReloadController::spawn(
         pool.clone(),
         &source_url(),

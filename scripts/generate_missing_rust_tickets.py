@@ -268,7 +268,7 @@ SPECS: dict[str, Spec] = {
     "doc-panics-section": spec(
         "evidence", "—",
         r"rg -n 'panic!|unimplemented!|unreachable!|\.expect\(|\.unwrap\(' crates --glob '*.rs' --glob '!**/*_test.rs' --glob '!**/tests/**' --glob '!**/benches/**' || true",
-        "PRs 7.7 and 10.9 deny production panic paths; the remaining metrics invariant and deferred backfill stub are not caller-triggerable public contracts.",
+        "PRs 7.7 and 10.9 deny production panic paths; any remaining hits must be classified by visibility and reachability.",
         "`docs/implementation/notes/rust-skills/doc-panics-section.md` only.",
         "Classify every residual production panic construct by visibility and reachability, cite its narrow lint expectation, and confirm there is no public precondition requiring `# Panics`.",
         "The note accounts for every probe hit and names the exact condition that would require adding a `# Panics` section later.",

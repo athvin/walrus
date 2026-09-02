@@ -1,10 +1,10 @@
 //! The loader's K8s health endpoints (loader §8.3) — **the catch-up-lag trap avoided**.
 //!
 //! - `/startup` — 200 once bootstrap completes (gates lease/fence acquisition + DuckLake attach).
-//! - `/ready`   — 200 iff bootstrap done (leases/fences held + connections open) **and not quarantined**. Never
-//!   gated on "backlog drained": a legitimately-behind loader is still *ready*; gating on lag flaps a
-//!   busy pod out. A **quarantined** table (a failed lossy DDL cast) degrades `/ready` — a loud,
-//!   terminal signal, not a silent continue.
+//! - `/ready`   — 200 iff local bootstrap is done, the initial frozen all-table reconciliation has
+//!   published, and the process is **not quarantined**. It is never gated on ordinary WAL backlog:
+//!   a legitimately-behind streaming loader is still ready. A **quarantined** table (a failed
+//!   lossy DDL cast) degrades `/ready` — a loud, terminal signal, not a silent continue.
 //! - `/healthz` — liveness = *progress*, read from an in-memory `last_poll_completed_at` stamped every
 //!   cycle (even a no-op). It reflects **no** lag metric — an idle-but-healthy loader must stay live.
 
@@ -13,7 +13,7 @@ use axum::{
 };
 use parking_lot::Mutex;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -29,7 +29,7 @@ pub enum LoaderPhase {
     /// answer 503. The default, and byte `0` — which `AtomicPhase`'s zero default depends on.
     #[default]
     Bootstrapping = 0,
-    /// Serving normally: every probe answers 200.
+    /// Local bootstrap is complete. `/ready` additionally consults the generation-published latch.
     Ready = 1,
     /// Latched by a failed lossy DDL cast. A reload rebuild is its only exit.
     Quarantined = 2,
@@ -120,6 +120,10 @@ impl AtomicPhase {
 #[derive(Debug, Default)]
 pub struct LoaderState {
     phase: AtomicPhase,
+    /// Fresh all-table reconciliation gates external readiness independently of local startup.
+    /// Keeping this separate from quarantine means a repaired table cannot accidentally advertise
+    /// ready before the rest of its bootstrap group has published.
+    generation_ready: AtomicBool,
     /// The end of the last poll cycle — liveness proof, NOT a lag metric. `None` until bootstrap ends.
     // LOCK-CHOICE: parking_lot::Mutex — poll-cycle writes dominate the one-expression kubelet read.
     last_poll_completed_at: Mutex<Option<Instant>>,
@@ -136,9 +140,29 @@ impl LoaderState {
         Arc::new(LoaderState::default())
     }
 
-    /// Bootstrap finished: leases held + files open → `/startup` and `/ready` answer 200.
+    /// Local bootstrap finished for an already-published generation: leases held + files open →
+    /// `/startup` and `/ready` answer 200.
     pub fn mark_ready(&self) {
+        self.generation_ready.store(true, Ordering::Release);
         self.phase.store(LoaderPhase::Ready);
+    }
+
+    /// Local bootstrap finished, but the control generation is still reconciling its frozen table
+    /// group. `/startup` succeeds and liveness runs; `/ready` remains gated.
+    pub fn mark_reconciling(&self) {
+        self.generation_ready.store(false, Ordering::Release);
+        self.phase.store(LoaderPhase::Ready);
+    }
+
+    /// The sink promoted this generation after every table shadow was published.
+    pub fn mark_generation_ready(&self) {
+        self.generation_ready.store(true, Ordering::Release);
+    }
+
+    /// The sink durably retired this generation before replacing its lost slot. Drop readiness
+    /// immediately; the loader process then drains and exits while the successor is established.
+    pub fn mark_generation_retired(&self) {
+        self.generation_ready.store(false, Ordering::Release);
     }
 
     // The four probe reads in this impl (`is_started`, `is_ready`, `is_quarantined`, `is_live`)
@@ -156,10 +180,11 @@ impl LoaderState {
         )
     }
 
-    /// `/ready` answers 200 only in the ready phase.
+    /// `/ready` answers 200 only after local startup and generation publication.
     #[must_use]
     pub fn is_ready(&self) -> bool {
         matches!(self.phase.load(), LoaderPhase::Ready)
+            && self.generation_ready.load(Ordering::Acquire)
     }
 
     /// Latch the quarantine flag — a failed lossy DDL cast. `/ready` degrades and stays

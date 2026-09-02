@@ -42,7 +42,7 @@ pg-to-arrow = { workspace = true }
 arrow = { workspace = true }
 # Parquet encode → S3: AsyncArrowWriter streams into an object_store multipart writer.
 parquet = { workspace = true, features = ["async"] }
-uuid = { workspace = true, features = ["v4"] }
+uuid = { workspace = true, features = ["v4", "v5"] }
 figment = { workspace = true, features = ["env", "toml", "yaml"] }
 humantime-serde = { workspace = true }
 tokio = { workspace = true, features = [

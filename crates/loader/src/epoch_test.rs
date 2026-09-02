@@ -91,3 +91,23 @@ fn a_pinned_receiver_still_borrows_after_its_sender_is_gone() {
 
     assert_eq!(*rx.borrow(), common::EpochNo(11));
 }
+
+#[test]
+fn same_epoch_total_restart_retires_a_running_loader() {
+    let epoch = common::EpochNo(11);
+    assert!(generation_is_retired(
+        epoch,
+        control::ReplicationStatus::TotalRestart,
+        epoch
+    ));
+    assert!(!generation_is_retired(
+        epoch,
+        control::ReplicationStatus::Streaming,
+        epoch
+    ));
+    assert!(!generation_is_retired(
+        common::EpochNo(10),
+        control::ReplicationStatus::TotalRestart,
+        epoch
+    ));
+}

@@ -40,9 +40,11 @@ pub fn code_for(err: &anyhow::Error) -> ExitCode {
             | crate::preflight::PreflightError::NoHeadroom { .. }
             | crate::preflight::PreflightError::PublicationMissing { .. }
             | crate::preflight::PreflightError::PublicationGap { .. }
+            | crate::preflight::PreflightError::PublicationCoverage(_)
             | crate::preflight::PreflightError::NoReplicationPriv
             | crate::preflight::PreflightError::DdlCaptureMissing { .. }
             | crate::preflight::PreflightError::ReloadSignalMissing { .. }
+            | crate::preflight::PreflightError::ReloadEventMissing { .. }
             | crate::preflight::PreflightError::Query(_)
             | crate::preflight::PreflightError::UnusableResult(_)
             | crate::preflight::PreflightError::Ident(_) => ExitCode::Preflight,

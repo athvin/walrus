@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "INSERT INTO walrus.table_reload (epoch, source_schema, source_table, flavor)\nVALUES ($1, $2, $3, $4)\nRETURNING reload_id\n",
+  "query": "INSERT INTO walrus.table_reload\n  (epoch, source_schema, source_table, flavor, parent_request_id)\nVALUES ($1, $2, $3, $4, $5)\nRETURNING reload_id\n",
   "describe": {
     "columns": [
       {
@@ -14,12 +14,13 @@
         "Int8",
         "Text",
         "Text",
-        "Text"
+        "Text",
+        "Uuid"
       ]
     },
     "nullable": [
       false
     ]
   },
-  "hash": "94f227ce05acc99e36ba7eba6f0bbc05d0d44736d57cb51465faa7802a63bb0b"
+  "hash": "820a95dc238c9a07e7493eb03b29a4e5cb64fb805d467f69c74464dc5d89323a"
 }

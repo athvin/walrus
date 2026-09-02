@@ -9,9 +9,9 @@
 //!   cargo test -p pg-sink --test reload_signal -- --ignored
 //!
 //! Three properties, one per test: a signal INSERT is decode-visible through the slot (the echo
-//! waiter depends on this), the backfill's table source never contains the signal table (so no
-//! snapshot file can ever exist for it), and preflight refuses a missing/unpublished signal table
-//! loudly (reload H11) — or heals it under `manage_publication=true`.
+//! waiter depends on this), source catalog enumeration never treats the signal table as a user
+//! reconciliation target, and preflight refuses a missing/unpublished signal table loudly (reload
+//! H11) — or heals it under `manage_publication=true`.
 
 use common::{FailureClass, Lsn, TupleValue};
 use pg_sink::config::SinkConfig;
@@ -20,12 +20,13 @@ use pg_sink::pgoutput::{Message, StreamCtx};
 use pg_sink::preflight::{PreflightError, SourcePreflight, connect_source};
 use pg_sink::replication::{ReplicationMessage, ReplicationStream};
 use pg_sink::slot::verify_or_create_slot;
-use pg_sink::snapshot::published_user_tables;
+use pg_sink::source_catalog::published_user_tables;
 use std::time::Duration;
 use tokio_postgres::NoTls;
 
 const SOURCE_0001: &str = include_str!("../../../migrations/source/0001_publication.sql");
 const SOURCE_0003: &str = include_str!("../../../migrations/source/0003_reload_signal.sql");
+const SOURCE_0004: &str = include_str!("../../../migrations/source/0004_reload_event.sql");
 
 static SOURCE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -84,6 +85,7 @@ async fn signal_insert_is_visible_in_decoded_stream() {
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
+    admin.batch_execute(SOURCE_0004).await.unwrap();
     // Cleanup BEFORE the slot exists so the DELETE's WAL is never streamed. Operator-run pruning
     // DELETEs on this table do flow through the slot, and the routing must ignore them.
     admin
@@ -166,11 +168,12 @@ async fn signal_insert_is_visible_in_decoded_stream() {
 
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (source PG)"]
-async fn backfill_never_copies_walrus_reload_signal() {
+async fn source_catalog_excludes_walrus_reload_signal_from_reconciliation() {
     let _guard = SOURCE_LOCK.lock().await;
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
+    admin.batch_execute(SOURCE_0004).await.unwrap();
 
     // Published — the precondition for the echo ever arriving…
     let published: i64 = admin
@@ -185,19 +188,18 @@ async fn backfill_never_copies_walrus_reload_signal() {
         .get(0);
     assert_eq!(published, 1, "reload_signal is in the publication");
 
-    // …but never a backfill target: `published_user_tables` is the EXACT list the snapshot walks
-    // (its SQL excludes schemaname = 'walrus'), so exclusion here IS "no snapshot file, ever" —
-    // the same inherited invariant snapshot_backfill.rs asserts for the whole walrus schema.
+    // …but never a reconciliation target: the frozen all-table request inventory comes from this
+    // exact user-table list, whose SQL excludes the `walrus` schema.
     let tables = published_user_tables(&admin, "walrus_pub").await.unwrap();
     assert!(
         !tables
             .iter()
             .any(|(s, t)| s == "walrus" && t == "reload_signal"),
-        "the signal table must never be snapshotted/backfilled: {tables:?}"
+        "the signal table must never be a reconciliation target: {tables:?}"
     );
     assert!(
         tables.iter().any(|(s, t)| s == "public" && t == "orders"),
-        "sanity: user tables still backfill"
+        "sanity: user tables remain reconciliation targets"
     );
 }
 
@@ -207,6 +209,7 @@ async fn missing_signal_table_is_terminal_and_manage_publication_heals_the_gap()
     let _guard = SOURCE_LOCK.lock().await;
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
+    admin.batch_execute(SOURCE_0004).await.unwrap();
 
     // (a) Table absent → terminal, and the error names the migration to apply.
     admin

@@ -98,36 +98,130 @@ profile-heap target="loader" scenario="mixed":
 profile-async target="loader" scenario="mixed":
     PERF_MODE=async PERF_TARGET={{target}} bash scripts/bench-e2e.sh {{scenario}}
 
-# Request a single-table reload (flavor: reload | resync) — the operator entry point (reload §5.1).
-# INSERTs the request into control-pg's walrus.table_reload at the current epoch; the sink's reload
-# controller picks it up within one heartbeat cadence. Runs psql inside the compose
-# control-pg (the host needs no postgres-client), like `smoke`. Just args are positional, so both
-# `just reload public.orders` and the self-documenting `just reload table='public.orders'` work —
-# the optional key= prefixes are stripped.
-reload table flavor='reload':
+# Request a single-table rebuild through the source WAL. The sink observes this committed event,
+# records the durable control request, and coordinates the fenced export. `request_id` is optional;
+# pass the UUID printed by an earlier invocation to make a command retry idempotent. Runs psql inside
+# source-pg (the host needs no postgres-client). Just args are positional, so both
+# `just reload public.orders`, `just reload public.orders request_id=<uuid>`, and the explicit
+# `just reload table='public.orders' flavor=reload request_id=<uuid>` work; key= prefixes are
+# stripped. `flavor` remains accepted for CLI compatibility, but the unified source-WAL protocol
+# intentionally supports only a rebuilding `reload`.
+reload table flavor='reload' request_id='':
     #!/usr/bin/env bash
     set -euo pipefail
     t="{{table}}"; t="${t#table=}"
-    f="{{flavor}}"; f="${f#flavor=}"
-    {{compose}} exec -T control-pg psql -U postgres -d walrus_control -v ON_ERROR_STOP=1 \
-      -c "INSERT INTO walrus.table_reload (epoch, source_schema, source_table, flavor) \
-          SELECT COALESCE(MAX(epoch), 1), split_part('$t', '.', 1), split_part('$t', '.', 2), '$f' \
-          FROM walrus.replication_state \
-          RETURNING reload_id, source_schema, source_table, flavor, status"
+    f="{{flavor}}"
+    r="{{request_id}}"; r="${r#request_id=}"
+    if [[ "$f" == request_id=* && -z "$r" ]]; then
+      r="${f#request_id=}"
+      f="reload"
+    else
+      f="${f#flavor=}"
+    fi
+    if [[ "$f" != "reload" ]]; then
+      echo "reload_event supports only flavor=reload; resync cannot be mapped without changing semantics" >&2
+      exit 2
+    fi
+    if [[ "$t" != *.* ]]; then
+      echo "table must be schema-qualified (for example public.orders)" >&2
+      exit 2
+    fi
+    source_schema="${t%%.*}"
+    source_table="${t#*.}"
+    if [[ -z "$source_schema" || -z "$source_table" || "$source_table" == *.* ]]; then
+      echo "table must contain exactly one non-empty schema/table separator" >&2
+      exit 2
+    fi
+    {{compose}} exec -T source-pg psql -U postgres -d walrus -v ON_ERROR_STOP=1 \
+      -v request_id="$r" -v source_schema="$source_schema" -v source_table="$source_table" \
+      <<'SQL'
+    WITH request AS (
+      SELECT COALESCE(NULLIF(:'request_id', '')::uuid, gen_random_uuid()) AS request_id
+    ), payload AS (
+      SELECT request_id AS event_id, request_id, 'request'::text AS event_kind,
+             'table'::text AS scope, :'source_schema'::text AS source_schema,
+             :'source_table'::text AS source_table
+      FROM request
+    ), inserted AS (
+      INSERT INTO walrus.reload_event
+        (event_id, request_id, event_kind, scope, source_schema, source_table)
+      SELECT event_id, request_id, event_kind, scope, source_schema, source_table
+      FROM payload
+      ON CONFLICT (event_id) DO NOTHING
+      RETURNING request_id, event_kind, scope, source_schema, source_table, wal_insert_lsn
+    )
+    SELECT request_id, event_kind, scope, source_schema, source_table, wal_insert_lsn,
+           'inserted' AS result
+    FROM inserted
+    UNION ALL
+    SELECT event.request_id, event.event_kind, event.scope, event.source_schema,
+           event.source_table, event.wal_insert_lsn, 'already_exists' AS result
+    FROM walrus.reload_event AS event
+    JOIN payload USING (event_id)
+    WHERE NOT EXISTS (SELECT 1 FROM inserted)
+      AND event.request_id = payload.request_id
+      AND event.event_kind = payload.event_kind
+      AND event.scope = payload.scope
+      AND event.source_schema = payload.source_schema
+      AND event.source_table = payload.source_table;
+    \if :ROW_COUNT
+    \else
+      DO $$ BEGIN RAISE EXCEPTION 'request_id already belongs to a different reload request'; END $$;
+    \endif
+    SQL
 
-# Queue a rebuilding reload for every table in the current epoch. This is the data migration from
-# frozen `.duckdb` files: the sink exports fresh source snapshots and the DuckLake loader rebuilds
-# each mirror. Already-live requests are left alone by the partial unique-index conflict target.
-reload-all:
-    {{compose}} exec -T control-pg psql -U postgres -d walrus_control -v ON_ERROR_STOP=1 \
-      -c "WITH e AS (SELECT MAX(epoch) AS epoch FROM walrus.replication_state), \
-           tables AS (SELECT DISTINCT r.epoch, r.source_schema, r.source_table \
-                      FROM walrus.schema_registry r JOIN e USING (epoch)) \
-          INSERT INTO walrus.table_reload (epoch, source_schema, source_table, flavor) \
-          SELECT epoch, source_schema, source_table, 'reload' FROM tables \
-          ON CONFLICT (epoch, source_schema, source_table) \
-            WHERE status NOT IN ('complete', 'failed') DO NOTHING \
-          RETURNING reload_id, source_schema, source_table, status"
+# Request one coordinated rebuild of every published user table through the source WAL. The sink
+# expands this committed parent request from the target array frozen in the same row. Reuse
+# `request_id` to retry safely.
+reload-all request_id='':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    r="{{request_id}}"; r="${r#request_id=}"
+    publication_name="${WALRUS_PUBLICATION_NAME:-walrus_pub}"
+    {{compose}} exec -T source-pg psql -U postgres -d walrus -v ON_ERROR_STOP=1 \
+      -v request_id="$r" -v publication_name="$publication_name" \
+      <<'SQL'
+    WITH request AS (
+      SELECT COALESCE(NULLIF(:'request_id', '')::uuid, gen_random_uuid()) AS request_id
+    ), targets AS (
+      SELECT COALESCE(
+        jsonb_agg(
+          jsonb_build_object('schema', schemaname, 'table', tablename)
+          ORDER BY schemaname, tablename
+        ),
+        '[]'::jsonb
+      ) AS targets
+      FROM pg_publication_tables
+      WHERE pubname = :'publication_name' AND schemaname <> 'walrus'
+    ), payload AS (
+      SELECT request_id AS event_id, request_id, 'request'::text AS event_kind,
+             'all_published'::text AS scope, targets
+      FROM request CROSS JOIN targets
+    ), inserted AS (
+      INSERT INTO walrus.reload_event (event_id, request_id, event_kind, scope, targets)
+      SELECT event_id, request_id, event_kind, scope, targets FROM payload
+      ON CONFLICT (event_id) DO NOTHING
+      RETURNING request_id, event_kind, scope, targets, wal_insert_lsn
+    )
+    SELECT request_id, event_kind, scope, targets, wal_insert_lsn, 'inserted' AS result
+    FROM inserted
+    UNION ALL
+    SELECT event.request_id, event.event_kind, event.scope, event.targets,
+           event.wal_insert_lsn, 'already_exists' AS result
+    FROM walrus.reload_event AS event
+    JOIN payload USING (event_id)
+    WHERE NOT EXISTS (SELECT 1 FROM inserted)
+      AND event.request_id = payload.request_id
+      AND event.event_kind = payload.event_kind
+      AND event.scope = payload.scope
+      AND event.source_schema IS NULL
+      AND event.source_table IS NULL
+      AND event.targets = payload.targets;
+    \if :ROW_COUNT
+    \else
+      DO $$ BEGIN RAISE EXCEPTION 'request_id already belongs to a different reload request'; END $$;
+    \endif
+    SQL
 
 # Connectivity smoke: both Postgres instances ready + MinIO health + the walrus bucket exists.
 # Postgres checks run inside the containers (the host needs no postgres-client); MinIO health is

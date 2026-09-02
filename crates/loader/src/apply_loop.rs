@@ -124,6 +124,17 @@ fn drain(ctx: &TableCtx) -> Result<(), LoaderError> {
 
 /// One compaction pass: full-rebuild (self-heal + reclaim) then prune raw below the retention floor.
 async fn compact(ctx: &TableCtx, shutdown: &CancellationToken) -> Result<(), LoaderError> {
+    // The global checkpoint intentionally follows the hidden generation while it catches up to H.
+    // Rebuilding/pruning the still-published old generation against that newer frontier would be
+    // meaningless work and would complicate recovery evidence, so defer maintenance until cutover.
+    if let Some(build) = ctx.db.reload_build()? {
+        tracing::debug!(
+            table = %format_args!("{}.{}", ctx.schema, ctx.table),
+            reload_id = %build.reload_id,
+            "compaction deferred while a reload shadow is being reconciled"
+        );
+        return Ok(());
+    }
     let cp = control::read_checkpoint(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table).await?;
     let transformed = cp.map(|c| c.transformed_lsn).unwrap_or(Lsn::ZERO);
     let t = crate::phase_b::current_transform(ctx).await?;

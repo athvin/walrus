@@ -9,12 +9,12 @@
               anyhow failure is the test failure; synchronous child-log creation and log scrapes \
               observe out-of-process services, not walrus runtime I/O"
 )]
-//! The walrus end-to-end harness (`architecture.md` "Local harness"). It brings up **both binaries** —
-//! `walrus-pg-sink` and `walrus-loader` — as child processes against the already-running compose stack
-//! (source PG :5432, control PG :5433, MinIO :9000), drives the *source* database, and lets a test assert
-//! the full two-hop contract: Parquet in MinIO → verbatim `<table>_raw` → the `<table>` mirror equals the
-//! current source. Everything is `#[ignore]` and gated behind `--features it`, so a plain
-//! `cargo build/test --workspace` compiles this crate with zero active tests and never needs docker.
+//! The walrus end-to-end harness brings up **both binaries** — `walrus-pg-sink` and `walrus-loader` —
+//! as child processes against the already-running compose stack (source PG :5432, control PG :5433,
+//! MinIO :9000), drives the *source* database, and lets a test assert the full two-hop contract:
+//! Parquet in MinIO → verbatim `<table>_raw` → the `<table>` mirror equals the current source.
+//! Everything is `#[ignore]` and gated behind `--features it`, so a plain `cargo build/test
+//! --workspace` compiles this crate with zero active tests and never needs docker.
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -95,6 +95,12 @@ impl Harness {
         .execute(&source)
         .await
         .context("source 0003")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/source/0004_reload_event.sql"
+        ))
+        .execute(&source)
+        .await
+        .context("source 0004")?;
         // The wide fidelity table — one column per mapped type family + a TOAST-able `big`. It
         // must exist BEFORE the sink bootstraps so the sink registers it and the loader owns it.
         sqlx::raw_sql(
@@ -133,6 +139,13 @@ impl Harness {
         .execute(&source)
         .await
         .context("normalize orders DDL test columns")?;
+        // The quarantine recovery test narrows this fixture after correcting its out-of-range row.
+        // Restore the persistent compose source before dropping the old slot so repeated local runs
+        // always bootstrap the intended v1 INTEGER shape.
+        sqlx::raw_sql("ALTER TABLE public.q_target ALTER COLUMN n TYPE INTEGER USING n::INTEGER;")
+            .execute(&source)
+            .await
+            .context("normalize q_target quarantine-test type")?;
         sqlx::raw_sql(&format!(
             "TRUNCATE public.orders; TRUNCATE public.types_matrix; \
              TRUNCATE public.q_target; TRUNCATE public.rl1; TRUNCATE public.rl2; TRUNCATE public.rl3; \
@@ -244,6 +257,35 @@ impl Harness {
         Ok(())
     }
 
+    /// Append a table-reload request to source Postgres through the production source-event API.
+    ///
+    /// The separate `tokio-postgres` connection is intentional: the request must enter through
+    /// [`pg_sink::reload_event::request_table`], not through a test-only insert into control PG.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source connection, request commit, or connection driver fails.
+    pub async fn request_table_reload(
+        &self,
+        request_id: uuid::Uuid,
+        source_schema: &str,
+        source_table: &str,
+    ) -> Result<()> {
+        let (client, connection) = tokio_postgres::connect(SOURCE_URL, tokio_postgres::NoTls)
+            .await
+            .context("connect source PG for reload request")?;
+        let driver = tokio::spawn(connection);
+        let requested =
+            pg_sink::reload_event::request_table(&client, request_id, source_schema, source_table)
+                .await;
+        drop(client);
+        driver
+            .await
+            .context("join source reload-request connection driver")?
+            .context("drive source reload-request connection")?;
+        requested.context("append source table-reload request")
+    }
+
     /// List S3 object keys under `<epoch>/<schema>/<table>/`.
     pub async fn s3_list(&self, table: &str) -> Result<Vec<String>> {
         use object_store::{ObjectStore, aws::AmazonS3Builder};
@@ -332,9 +374,24 @@ impl Harness {
     /// Respawn the sink fresh and block until `/ready`. After a `SIGKILL` the source still marks the
     /// replication slot **active** until it notices the dropped connection, and the sink's resume path
     /// issues `START_REPLICATION` with no retry — so wait for the slot to go inactive first (what a real
-    /// orchestrator's backoff-restart achieves), then spawn. Resume is from `confirmed_flush_lsn`.
+    /// orchestrator's backoff-restart achieves), then reap the old process so its health listener is
+    /// definitely released before spawning. Resume is from `confirmed_flush_lsn`.
     pub async fn restart_sink(&mut self) -> Result<()> {
         self.await_slot_inactive(Duration::from_secs(30)).await?;
+        match tokio::time::timeout(Duration::from_secs(10), self.sink.wait()).await {
+            Ok(status) => {
+                status.context("reap old sink before restart")?;
+            }
+            Err(_) => {
+                self.sink
+                    .start_kill()
+                    .context("SIGKILL stale sink before restart")?;
+                self.sink
+                    .wait()
+                    .await
+                    .context("reap stale sink before restart")?;
+            }
+        }
         self.sink = spawn_sink(&self.bins, &self.sink_log)?;
         wait_ready("http://127.0.0.1:8130", Duration::from_secs(45))
             .await

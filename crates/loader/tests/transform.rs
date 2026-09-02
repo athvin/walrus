@@ -10,7 +10,7 @@
 use common::{PgColumn, PgRelation, ReplicaIdentity};
 use duckdb::Connection;
 use loader::duck::TableDb;
-use loader::transform::{TransformSql, apply_transform};
+use loader::transform::{TransformSql, TruncateBoundary, apply_transform};
 
 fn orders_rel() -> PgRelation {
     let col = |name: &str, oid: u32, is_key: bool| PgColumn {
@@ -400,6 +400,27 @@ fn transformed_lsn_advances_past_a_truncate_only_tail() {
     );
 }
 
+/// Phase B deliberately re-examines the checkpoint commit. A truncate at that exact boundary must
+/// be re-examined too; otherwise a crash after advancing the checkpoint but before applying the
+/// wipe can leave rows that the restarted scan can never remove.
+#[test]
+fn truncate_at_checkpoint_is_still_a_boundary() {
+    let c = db();
+    seed(&c, &[(0, 't', 100, 1, "")]);
+
+    let boundary = TransformSql::from_relation(&orders_rel())
+        .latest_truncate(&c, "0/64".parse().unwrap())
+        .unwrap();
+
+    assert_eq!(
+        boundary,
+        Some(TruncateBoundary {
+            ct: "0/64".parse().unwrap(),
+            lt: "0/1".parse().unwrap(),
+        })
+    );
+}
+
 /// `<table>_raw` is NEVER truncated — the `t` op stays a logged row (raw-vs-mirror asymmetry).
 #[test]
 fn raw_retains_the_truncate_op_row() {
@@ -708,7 +729,7 @@ fn columns_of(conn: &Connection, name: &str) -> Vec<String> {
 }
 
 // ---- the snapshot/stream boundary through the transform. Snapshot rows are just more raw
-// rows the window ranks by `(commit_lsn, lsn)` — no bespoke backfill mode. ----
+// rows the window ranks by `(commit_lsn, lsn)` — no bespoke legacy-snapshot mode. ----
 
 /// A snapshot row (`commit_lsn = consistent_point`) plus a LATER overlapping stream change on the same
 /// PK → the stream value wins by tuple, zero loss / zero dupes.

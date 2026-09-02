@@ -43,14 +43,14 @@ pub enum Op {
     Truncate,
 }
 
-/// Where the row originated: an exported-snapshot backfill row, a live WAL-stream row, or a
-/// single-table-reload chunk row (stamped `commit_lsn = lsn = L_i`, with snapshot-op
-/// semantics so any overlapping stream event wins the loader's dedup).
+/// Where the row originated: a legacy bootstrap snapshot, the live WAL stream, or a fenced
+/// table-reload export.
 /// Wire form locked by `crates/common/tests/enum_wire_form.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
-    /// A row read from the exported snapshot during initial backfill.
+    /// A row from the retired exported-snapshot bootstrap path. Retained so existing Parquet and
+    /// manifest data remain readable during upgrades.
     Snapshot,
     /// A row decoded from the live WAL stream — the steady state.
     Stream,
@@ -248,7 +248,7 @@ pub struct SinkMeta {
     pub source_schema: String,
     /// Source table name.
     pub source_table: String,
-    /// Whether the row came from the exported snapshot or the live stream.
+    /// Whether the row came from legacy snapshot bootstrap, the WAL stream, or reload export.
     pub kind: Kind,
     /// Columns delivered as unchanged-TOAST placeholders (values absent from the wire).
     ///

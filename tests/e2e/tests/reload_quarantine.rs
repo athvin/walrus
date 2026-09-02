@@ -24,36 +24,12 @@
 
 #![cfg(feature = "it")]
 
-use common::{Lsn, PgColumn, PgRelation, ReplicaIdentity};
+use common::{Lsn, PgRelation};
 use e2e::Harness;
 use std::time::Duration;
 
 // Harness-owned fixtures created before bootstrap so the loader owns them.
 const OTHERS: [&str; 2] = ["rl1", "rl2"];
-
-fn col(name: &str, oid: u32, key: bool) -> PgColumn {
-    PgColumn {
-        name: name.into(),
-        type_oid: oid,
-        type_modifier: -1,
-        is_key: key,
-    }
-}
-
-fn q_target_rel(n_oid: u32) -> PgRelation {
-    PgRelation {
-        oid: 42,
-        schema: "public".into(),
-        name: "q_target".into(),
-        replica_identity: ReplicaIdentity::Default,
-        // int4=23, text=25, int2=21
-        columns: vec![
-            col("id", 23, true),
-            col("status", 25, false),
-            col("n", n_oid, false),
-        ],
-    }
-}
 
 /// Write a one-row `(id, status, n)` v2 Parquet to MinIO (the reconcile trigger's file — its data is
 /// never appended, the quarantine fires on the reconcile before the append). DuckDB writes it.
@@ -148,6 +124,26 @@ async fn quarantined_table_recovers_via_reload_without_stalling_others() {
     // Own the pool (PgPool is Arc-backed) so it doesn't borrow `h` across the `&mut h` calls
     // (await_loader_exited / restart_loader) below.
     let pool = h.control_pool().clone();
+    let mut v2_relation: PgRelation = serde_json::from_value(
+        control::read_registry(
+            &pool,
+            epoch.into(),
+            "public",
+            "q_target",
+            common::SchemaVersionNo(1),
+        )
+        .await
+        .unwrap()
+        .expect("bootstrap registered q_target v1")
+        .columns,
+    )
+    .unwrap();
+    v2_relation
+        .columns
+        .iter_mut()
+        .find(|column| column.name == "n")
+        .expect("q_target v1 contains n")
+        .type_oid = 21; // int2
     control::upsert_registry(
         &pool,
         &control::RegistryRow {
@@ -156,7 +152,7 @@ async fn quarantined_table_recovers_via_reload_without_stalling_others() {
             source_table: "q_target".into(),
             schema_version: common::SchemaVersionNo(2),
             descriptors: Vec::new(),
-            columns: serde_json::to_value(q_target_rel(21)).unwrap(),
+            columns: serde_json::to_value(v2_relation).unwrap(),
         },
     )
     .await
@@ -214,6 +210,13 @@ async fn quarantined_table_recovers_via_reload_without_stalling_others() {
     // n=99999 fits int4 but must fit int2 for the rebuild — so shrink it first (the value the mirror
     // could never cast is corrected at the source; the reload carries the fitting value).
     h.source_exec("UPDATE public.q_target SET n = 100 WHERE id = 1")
+        .await
+        .unwrap();
+    // Complete the source-side narrowing now that its data fits. The synthetic registry v2 above
+    // preserved the real v1 relation identity, so the fenced exporter can prove the live source
+    // shape is exactly the SMALLINT shape it will stamp on the replacement baseline. The sink may
+    // decode this DDL before or during the export; either way it idempotently fills the same v2 row.
+    h.source_exec("ALTER TABLE public.q_target ALTER COLUMN n TYPE SMALLINT USING n::SMALLINT")
         .await
         .unwrap();
     let reload_id = control::reload::request(

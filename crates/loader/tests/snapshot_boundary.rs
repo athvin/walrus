@@ -172,7 +172,6 @@ async fn setup(epoch: EpochNo, max_files: i64) -> (TableCtx, tempfile::TempDir) 
         compaction_interval: Duration::from_secs(3600),
         retention_lsn_lag: 16 << 20,
         pause_logged: Default::default(),
-        resync_ids: Default::default(),
     };
     (ctx, dir)
 }

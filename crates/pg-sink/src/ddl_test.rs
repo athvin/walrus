@@ -76,6 +76,27 @@ fn registry(table: &str, version: i64) -> control::RegistryRow {
     }
 }
 
+fn tracked_orders() -> PgRelation {
+    PgRelation {
+        oid: 42,
+        schema: "public".into(),
+        name: "orders".into(),
+        replica_identity: ReplicaIdentity::Default,
+        columns: vec![PgColumn {
+            name: "id".into(),
+            type_oid: 23,
+            type_modifier: -1,
+            is_key: true,
+        }],
+    }
+}
+
+fn disconnected_pool() -> sqlx::PgPool {
+    sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://walrus@127.0.0.1:1/unused")
+        .expect("a lazy pool parses its DSN without connecting")
+}
+
 #[test]
 fn ddl_audit_insert_parses_identity_snapshot_and_audit_sql() {
     let ev = DdlEvent::from_tuple(
@@ -139,6 +160,7 @@ fn comment_is_metadata_only_and_does_not_advance_projected_version() {
     let observation = consumer.observe(
         TransactionScope::Ordinary,
         event(1, "public", "orders", "COMMENT"),
+        None,
     );
     assert_eq!(observation.structural_version, None);
     assert_eq!(consumer.version_of("public", "orders"), SchemaVersionNo(1));
@@ -155,7 +177,7 @@ fn provisional_version_is_visible_only_inside_its_streamed_transaction() {
         top_xid: 200,
         sub_xid: 200,
     };
-    let observation = consumer.observe(owner, event(1, "public", "orders", "ALTER TABLE"));
+    let observation = consumer.observe(owner, event(1, "public", "orders", "ALTER TABLE"), None);
     assert_eq!(observation.structural_version, Some(SchemaVersionNo(2)));
     assert_eq!(
         consumer.version_for(owner, "public", "orders"),
@@ -182,8 +204,16 @@ fn subtransaction_abort_removes_only_its_schema_version() {
         top_xid: 100,
         sub_xid: 102,
     };
-    consumer.observe(orders_scope, event(1, "public", "orders", "ALTER TABLE"));
-    consumer.observe(items_scope, event(2, "public", "items", "ALTER TABLE"));
+    consumer.observe(
+        orders_scope,
+        event(1, "public", "orders", "ALTER TABLE"),
+        None,
+    );
+    consumer.observe(
+        items_scope,
+        event(2, "public", "items", "ALTER TABLE"),
+        None,
+    );
     consumer.stage_registry(orders_scope, registry("orders", 2));
     consumer.stage_registry(items_scope, registry("items", 2));
 
@@ -208,6 +238,7 @@ fn whole_stream_abort_removes_every_provisional_ddl_for_the_top_xid() {
                 sub_xid: sub,
             },
             event(id, "public", "orders", "ALTER TABLE"),
+            None,
         );
     }
     assert_eq!(consumer.version_of("public", "orders"), SchemaVersionNo(3));
@@ -237,8 +268,134 @@ fn hydrated_audit_identity_replays_without_another_version_bump() {
     let observation = consumer.observe(
         TransactionScope::Ordinary,
         event(55, "public", "orders", "ALTER TABLE"),
+        None,
     );
     assert!(observation.replay);
     assert_eq!(observation.structural_version, Some(SchemaVersionNo(2)));
     assert_eq!(consumer.version_of("public", "orders"), SchemaVersionNo(2));
+}
+
+#[tokio::test]
+async fn committed_tracked_table_rename_fails_before_control_persistence() {
+    let mut consumer = DdlConsumer::new(EpochNo(1));
+    let previous = tracked_orders();
+    let rename = event(1, "public", "orders_v2", "ALTER TABLE");
+
+    let observation = consumer.observe(TransactionScope::Ordinary, rename, Some(&previous));
+    assert_eq!(observation.structural_version, Some(SchemaVersionNo(2)));
+
+    let err = consumer
+        .on_commit(&disconnected_pool(), Lsn::new(10))
+        .await
+        .unwrap_err();
+    let DdlError::TrackedTableIdentityChange(change) = err else {
+        panic!("expected tracked identity error, got {err:?}");
+    };
+    assert_eq!(change.kind, TrackedTableIdentityChangeKind::Renamed);
+    assert_eq!(change.relation_oid, 42);
+    assert_eq!(change.previous_schema, "public");
+    assert_eq!(change.previous_table, "orders");
+    assert_eq!(change.new_schema.as_deref(), Some("public"));
+    assert_eq!(change.new_table.as_deref(), Some("orders_v2"));
+}
+
+#[tokio::test]
+async fn committed_tracked_table_schema_move_fails_loudly() {
+    let mut consumer = DdlConsumer::new(EpochNo(1));
+    let previous = tracked_orders();
+    consumer.observe(
+        TransactionScope::Ordinary,
+        event(1, "archive", "orders", "ALTER TABLE"),
+        Some(&previous),
+    );
+
+    let err = consumer
+        .on_commit(&disconnected_pool(), Lsn::new(10))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        DdlError::TrackedTableIdentityChange(TrackedTableIdentityChange {
+            kind: TrackedTableIdentityChangeKind::SchemaMoved,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn committed_streamed_tracked_table_drop_fails_loudly() {
+    let mut consumer = DdlConsumer::new(EpochNo(1));
+    let previous = tracked_orders();
+    let scope = TransactionScope::Streamed {
+        top_xid: 100,
+        sub_xid: 100,
+    };
+    let mut drop_event = event(1, "public", "orders", "DROP SCHEMA");
+    drop_event.c_event = "sql_drop".into();
+    consumer.observe(scope, drop_event, Some(&previous));
+
+    let err = consumer
+        .on_stream_commit(&disconnected_pool(), 100, Lsn::new(10))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        DdlError::TrackedTableIdentityChange(TrackedTableIdentityChange {
+            kind: TrackedTableIdentityChangeKind::Dropped,
+            new_schema: None,
+            new_table: None,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn aborted_streamed_drop_sentinel_has_no_relation_shape_or_commit_failure() {
+    let mut consumer = DdlConsumer::new(EpochNo(1));
+    let previous = tracked_orders();
+    let scope = TransactionScope::Streamed {
+        top_xid: 200,
+        sub_xid: 201,
+    };
+    let mut drop_event = event(2, "public", "orders", "DROP SCHEMA");
+    drop_event.c_event = "sql_drop".into();
+
+    assert!(
+        drop_event
+            .relation_after(Some(&previous))
+            .unwrap()
+            .is_none(),
+        "a drop sentinel must never reach cache_relation as an empty shape"
+    );
+    consumer.observe(scope, drop_event, Some(&previous));
+    assert_eq!(consumer.on_stream_abort(200, 201).len(), 1);
+    consumer
+        .on_stream_commit(&disconnected_pool(), 200, Lsn::new(20))
+        .await
+        .expect("StreamAbort must discard the provisional drop failure");
+}
+
+#[tokio::test]
+async fn aborted_streamed_identity_change_is_discarded_without_failing() {
+    let mut consumer = DdlConsumer::new(EpochNo(1));
+    let previous = tracked_orders();
+    let scope = TransactionScope::Streamed {
+        top_xid: 100,
+        sub_xid: 101,
+    };
+    consumer.observe(
+        scope,
+        event(1, "public", "orders_v2", "ALTER TABLE"),
+        Some(&previous),
+    );
+
+    let removed = consumer.on_stream_abort(100, 101);
+    assert_eq!(
+        removed,
+        vec![("public".into(), "orders_v2".into(), SchemaVersionNo(2))]
+    );
+    consumer
+        .on_stream_commit(&disconnected_pool(), 100, Lsn::new(10))
+        .await
+        .expect("an aborted provisional rename must not fail at StreamCommit");
 }

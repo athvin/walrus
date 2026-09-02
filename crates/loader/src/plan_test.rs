@@ -81,9 +81,7 @@ fn mirror_names(plan: &TablePlan) -> Vec<&str> {
 /// `MirrorValue` has no `PartialEq` (a plan is never compared in production), so render it.
 fn mirror_value(c: &MirrorCol) -> String {
     match &c.value {
-        MirrorValue::Passthrough {
-            toast_resolvable: t,
-        } => format!("passthrough({t})"),
+        MirrorValue::Passthrough => "passthrough".to_string(),
         MirrorValue::Recombine(expr) => format!("recombine({expr})"),
     }
 }
@@ -167,8 +165,10 @@ fn the_tier1_plan_makes_every_non_key_column_toast_resolvable() {
         raw_shape(&plan),
         vec![("id", "INTEGER"), ("body", "VARCHAR")]
     );
-    assert_eq!(mirror_value(&plan.mirror_cols[0]), "passthrough(false)");
-    assert_eq!(mirror_value(&plan.mirror_cols[1]), "passthrough(true)");
+    assert_eq!(mirror_value(&plan.mirror_cols[0]), "passthrough");
+    assert_eq!(mirror_value(&plan.mirror_cols[1]), "passthrough");
+    assert_eq!(plan.mirror_cols[0].toast_source, None);
+    assert_eq!(plan.mirror_cols[1].toast_source.as_deref(), Some("body"));
 }
 
 #[test]
@@ -186,7 +186,7 @@ fn a_column_with_no_descriptor_keeps_the_tier1_shape() {
         raw_shape(&plan),
         vec![("id", "INTEGER"), ("body", "VARCHAR")]
     );
-    assert_eq!(mirror_value(&plan.mirror_cols[0]), "passthrough(false)");
+    assert_eq!(mirror_value(&plan.mirror_cols[0]), "passthrough");
 }
 
 #[test]
@@ -209,15 +209,59 @@ fn a_tier2_interval_collapses_its_emit_columns_into_one_mirror_column() {
 
     let recombined = mirror_value(&plan.mirror_cols[1]);
     assert!(recombined.starts_with("recombine("), "got {recombined}");
-    // An interval is never a replica-identity key, whatever the relation said.
+    assert_eq!(plan.mirror_cols[1].toast_source.as_deref(), Some("elapsed"));
+    // This source column is non-key, so its recombined mirror value remains non-key.
     assert!(!plan.mirror_cols[1].is_key);
+}
+
+#[test]
+fn tier2_replica_identity_columns_propagate_to_every_mirror_component() {
+    let mut rel = relation(vec![
+        key("id"),
+        col("elapsed", INTERVAL, true),
+        col("span", oids::INT4RANGE, true),
+    ]);
+    rel.replica_identity = ReplicaIdentity::Full;
+    let elapsed = TypeDescriptor {
+        pg_type_oid: INTERVAL,
+        tier: Tier::Two,
+        duckdb: "INTERVAL".into(),
+        emit: emit(&INTERVAL_EMIT),
+        ..descriptor("elapsed")
+    };
+    let span = TypeDescriptor {
+        pg_type_oid: oids::INT4RANGE,
+        tier: Tier::Two,
+        duckdb: "IGNORED".into(),
+        emit: emit(&RANGE_EMIT),
+        ..descriptor("span")
+    };
+
+    let plan = TablePlan::from_registry(&rel, &[elapsed, span]);
+
+    let elapsed = plan
+        .mirror_cols
+        .iter()
+        .find(|c| c.name == "elapsed")
+        .unwrap();
+    assert!(elapsed.is_key);
+    assert_eq!(elapsed.toast_source, None);
+    for sibling in plan
+        .mirror_cols
+        .iter()
+        .filter(|c| c.name.starts_with("span_"))
+    {
+        assert!(sibling.is_key, "{}", sibling.name);
+        assert_eq!(sibling.toast_source, None, "{}", sibling.name);
+    }
 }
 
 #[test]
 fn a_tier2_range_fans_out_to_flat_mirror_columns() {
     // DuckDB has no range type, so a range IS its five siblings: one mirror column per emit
-    // column, none of them a key and none TOAST-resolvable. The descriptor's `duckdb` is never
-    // read on this path — the emit types are.
+    // column. They are not independent scalar sentinels: every sibling resolves against the
+    // original source-column name recorded in metadata. The descriptor's `duckdb` is never read on
+    // this path — the emit types are.
     let rel = relation(vec![key("id"), text("span")]);
     let span = TypeDescriptor {
         pg_type_oid: oids::INT4RANGE,
@@ -235,7 +279,8 @@ fn a_tier2_range_fans_out_to_flat_mirror_columns() {
 
     for c in plan.mirror_cols.iter().skip(1) {
         assert!(!c.is_key, "{}", c.name);
-        assert_eq!(mirror_value(c), "passthrough(false)", "{}", c.name);
+        assert_eq!(mirror_value(c), "passthrough", "{}", c.name);
+        assert_eq!(c.toast_source.as_deref(), Some("span"), "{}", c.name);
     }
 }
 

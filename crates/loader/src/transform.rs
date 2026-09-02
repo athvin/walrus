@@ -63,7 +63,7 @@ fn render_transform_template(template: &str, replacements: &[(&str, &str)]) -> S
 /// "The tail holds no truncate" is the *absence* of this value — producers and consumers carry it
 /// as `Option<TruncateBoundary>` — so a half-resolved boundary (one LSN of the pair without the
 /// other) cannot be constructed, and no call site has to re-check the second field.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TruncateBoundary {
     /// The TRUNCATE's commit LSN — which transaction wiped the table.
     pub ct: Lsn,
@@ -72,18 +72,17 @@ pub struct TruncateBoundary {
     pub lt: Lsn,
 }
 
-/// One mirror column and the SQL producing its value from the winning raw row `s` (and, for a
-/// TOAST-resolvable scalar, the current mirror `t`). A Tier-2 column recombines/flattens from
-/// its emit columns; a Tier-1 scalar is the same TOAST-resolved passthrough the transform always used.
+/// One mirror column and the SQL producing its value from the winning raw row `s` (and, for an
+/// unchanged-TOAST value, the current mirror `t`). `raw_value_expr` always addresses the raw emit
+/// shape; the two resolved expressions differ because an incremental winner still has that raw
+/// shape while a rebuild winner has already been collapsed to the mirror shape.
 #[derive(Debug)]
 struct MirrorCol {
     name: String,
     is_key: bool,
-    /// Whether `value_expr` recombines from raw emit columns (Tier-2) — in the full-rebuild the recombine
-    /// happens in the raw arm of the union (the mirror baseline can't be decomposed back), then the
-    /// column passes through; the incremental path just uses `value_expr` directly over the raw winner.
-    is_recombine: bool,
-    value_expr: String,
+    raw_value_expr: String,
+    incremental_value_expr: String,
+    rebuild_value_expr: String,
 }
 
 /// A table's mirror-column layout for rendering the transform (order preserved). Built from the
@@ -98,6 +97,259 @@ pub struct TransformSql {
     mirror: Box<[MirrorCol]>,
 }
 
+/// One logical identity component in its two physical shapes. A Tier-2 recombine is one value in
+/// the mirror but several emit columns in raw, while a flat Tier-2 identity contributes several of
+/// these entries. Keeping both expressions is what lets history traversal address either table.
+#[derive(Debug)]
+struct ToastKey {
+    mirror_name: String,
+    raw_value_expr: String,
+}
+
+/// Re-qualify a plan expression from its canonical raw-row alias `s` to another raw-table alias.
+fn raw_expr_for(expr: &str, alias: &str) -> String {
+    expr.replace("s.\"", &format!("{alias}.\""))
+}
+
+/// Render the unchanged-TOAST membership predicate against the original PostgreSQL source-column
+/// name. Tier-2 emit siblings have different physical names, so testing the mirror name would miss
+/// their one shared sentinel.
+fn toast_listed(alias: &str, source: &str) -> String {
+    // SinkMeta is compact JSON, and the surrounding JSON quotes keep `a` distinct from `aa`. Escape
+    // LIKE metacharacters in an otherwise arbitrary PostgreSQL identifier before adding our own
+    // leading/trailing wildcards.
+    let json_name = serde_json::Value::String(source.to_owned()).to_string();
+    let escaped_name = json_name
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let pattern = format!("%{escaped_name}%");
+    format!(
+        "COALESCE(json_extract_string({alias}.\"walrus_pg_sink_meta\", '$.unchanged_toast'), '[]') LIKE '{}' ESCAPE '\\'",
+        common::sql::sql_literal(&pattern)
+    )
+}
+
+/// Render the latest key-changing update edge for one key lifetime. pgoutput represents the edge as
+/// a new-key `u` plus an old-key synthetic `d` at the exact same tuple. `upper_inclusive` is true
+/// only for the seed lifetime, where the winner itself may be that `u`; every recursive hop is
+/// strict so the edge tuple decreases and the walk must terminate.
+fn toast_edge_select(
+    raw_table: &str,
+    keys: &[ToastKey],
+    current_keys: &[String],
+    upper_commit: &str,
+    upper_lsn: &str,
+    upper_inclusive: bool,
+) -> String {
+    let q = |c: &str| format!("\"{c}\"");
+    let new_key_match = keys
+        .iter()
+        .zip(current_keys)
+        .map(|(key, current)| {
+            format!(
+                "{} IS NOT DISTINCT FROM ({current})",
+                raw_expr_for(&key.raw_value_expr, "u")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let key_really_changed = keys
+        .iter()
+        .map(|key| {
+            format!(
+                "{} IS NOT DISTINCT FROM {}",
+                raw_expr_for(&key.raw_value_expr, "d"),
+                raw_expr_for(&key.raw_value_expr, "u")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let old_keys = keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| {
+            format!(
+                "{} AS {}",
+                raw_expr_for(&key.raw_value_expr, "d"),
+                q(&format!("_walrus_old_key_{index}"))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let bound = if upper_inclusive { "<=" } else { "<" };
+
+    format!(
+        "SELECT TRUE AS \"_walrus_edge_found\", \
+                u.\"_walrus_commit_lsn\" AS \"_walrus_edge_commit_lsn\", \
+                u.\"_walrus_lsn\" AS \"_walrus_edge_lsn\", {old_keys} \
+         FROM \"{raw_table}\" u \
+         JOIN \"{raw_table}\" d \
+           ON d.\"_walrus_op\" = 'd' \
+          AND d.\"_walrus_commit_lsn\" IS NOT DISTINCT FROM u.\"_walrus_commit_lsn\" \
+          AND d.\"_walrus_lsn\" IS NOT DISTINCT FROM u.\"_walrus_lsn\" \
+         WHERE u.\"_walrus_op\" = 'u' AND {new_key_match} \
+           AND (u.\"_walrus_commit_lsn\", u.\"_walrus_lsn\") {bound} ({upper_commit}, {upper_lsn}) \
+           AND NOT ({key_really_changed}) \
+         ORDER BY u.\"_walrus_commit_lsn\" DESC, u.\"_walrus_lsn\" DESC LIMIT 1"
+    )
+}
+
+/// Resolve one mirror value. `winner_value_expr` reads the current winner (raw-shaped during the
+/// incremental transform, mirror-shaped after the rebuild union); `raw_value_expr` always reads a
+/// raw-shaped `s`. If a winner inherited a TOAST value through one or more key changes, the
+/// recursive lineage walks the paired-delete edges back until it finds the nearest retained setter
+/// or current mirror row.
+fn resolved_toast_expr(
+    col: &crate::plan::MirrorCol,
+    winner_value_expr: &str,
+    raw_value_expr: &str,
+    raw_table: &str,
+    mirror_table: &str,
+    keys: &[ToastKey],
+    winner_is_raw: bool,
+) -> String {
+    let Some(source) = col.toast_source.as_deref() else {
+        return winner_value_expr.to_owned();
+    };
+    debug_assert!(!keys.is_empty(), "unchanged TOAST requires a row identity");
+    if keys.is_empty() {
+        return winner_value_expr.to_owned();
+    }
+
+    let q = |c: &str| format!("\"{c}\"");
+    let qc = format!("\"{}\"", col.name);
+    let prior_value_expr = raw_expr_for(raw_value_expr, "r");
+    let lineage_keys = (0..keys.len())
+        .map(|index| q(&format!("_walrus_key_{index}")))
+        .collect::<Vec<_>>();
+    let old_lineage_keys = (0..keys.len())
+        .map(|index| q(&format!("_walrus_old_key_{index}")))
+        .collect::<Vec<_>>();
+    let winner_keys = keys
+        .iter()
+        .map(|key| {
+            if winner_is_raw {
+                raw_expr_for(&key.raw_value_expr, "s")
+            } else {
+                format!("s.{}", q(&key.mirror_name))
+            }
+        })
+        .collect::<Vec<_>>();
+    let seed_edge = toast_edge_select(
+        raw_table,
+        keys,
+        &winner_keys,
+        "s.\"_walrus_commit_lsn\"",
+        "s.\"_walrus_lsn\"",
+        true,
+    );
+    let recursive_current_keys = old_lineage_keys
+        .iter()
+        .map(|key| format!("lineage.{key}"))
+        .collect::<Vec<_>>();
+    let recursive_edge = toast_edge_select(
+        raw_table,
+        keys,
+        &recursive_current_keys,
+        "lineage.\"_walrus_edge_commit_lsn\"",
+        "lineage.\"_walrus_edge_lsn\"",
+        false,
+    );
+    let cte_columns = std::iter::once(q("_walrus_depth"))
+        .chain(lineage_keys.iter().cloned())
+        .chain([
+            q("_walrus_upper_commit_lsn"),
+            q("_walrus_upper_lsn"),
+            q("_walrus_has_edge"),
+            q("_walrus_edge_commit_lsn"),
+            q("_walrus_edge_lsn"),
+        ])
+        .chain(old_lineage_keys.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let seed_keys = winner_keys.join(", ");
+    let recursive_keys = old_lineage_keys
+        .iter()
+        .map(|key| format!("lineage.{key}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let seed_old_keys = old_lineage_keys
+        .iter()
+        .map(|key| format!("edge.{key}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let recursive_old_keys = seed_old_keys.clone();
+    let raw_key_match = keys
+        .iter()
+        .zip(&lineage_keys)
+        .map(|(key, lineage_key)| {
+            format!(
+                "{} IS NOT DISTINCT FROM lineage.{lineage_key}",
+                raw_expr_for(&key.raw_value_expr, "r")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let mirror_key_match = keys
+        .iter()
+        .zip(&lineage_keys)
+        .map(|(key, lineage_key)| {
+            format!(
+                "m.{} IS NOT DISTINCT FROM lineage.{lineage_key}",
+                q(&key.mirror_name)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+
+    // Every candidate value is wrapped in a one-element LIST. The envelope remains non-NULL when
+    // the value it contains is a real SQL NULL, so a found NULL stops the walk instead of falling
+    // through to an older setter or mirror value. The edge lower bound also confines a reused key
+    // to the lifetime that led to this winner.
+    format!(
+        "CASE WHEN {winner} THEN COALESCE(( \
+           WITH RECURSIVE \"_walrus_toast_lineage\"({cte_columns}) AS ( \
+             SELECT 0, {seed_keys}, s.\"_walrus_commit_lsn\", s.\"_walrus_lsn\", \
+                    edge.\"_walrus_edge_found\" IS NOT NULL, \
+                    edge.\"_walrus_edge_commit_lsn\", edge.\"_walrus_edge_lsn\", {seed_old_keys} \
+             FROM (VALUES (TRUE)) AS seed(\"_walrus_dummy\") \
+             LEFT JOIN LATERAL ({seed_edge}) edge ON TRUE \
+             UNION ALL \
+             SELECT lineage.\"_walrus_depth\" + 1, {recursive_keys}, \
+                    lineage.\"_walrus_edge_commit_lsn\", lineage.\"_walrus_edge_lsn\", \
+                    edge.\"_walrus_edge_found\" IS NOT NULL, \
+                    edge.\"_walrus_edge_commit_lsn\", edge.\"_walrus_edge_lsn\", {recursive_old_keys} \
+             FROM \"_walrus_toast_lineage\" lineage \
+             LEFT JOIN LATERAL ({recursive_edge}) edge ON TRUE \
+             WHERE lineage.\"_walrus_has_edge\" \
+           ) \
+           SELECT COALESCE(raw_value.\"_walrus_value\", mirror_value.\"_walrus_value\") \
+           FROM \"_walrus_toast_lineage\" lineage \
+           LEFT JOIN LATERAL ( \
+             SELECT list_value({prior_value_expr}) AS \"_walrus_value\" \
+             FROM \"{raw_table}\" r \
+             WHERE {raw_key_match} AND r.\"_walrus_op\" NOT IN ('d', 't') AND NOT ({raw}) \
+               AND (r.\"_walrus_commit_lsn\", r.\"_walrus_lsn\") \
+                   <= (lineage.\"_walrus_upper_commit_lsn\", lineage.\"_walrus_upper_lsn\") \
+               AND (NOT lineage.\"_walrus_has_edge\" OR \
+                    (r.\"_walrus_commit_lsn\", r.\"_walrus_lsn\") \
+                      >= (lineage.\"_walrus_edge_commit_lsn\", lineage.\"_walrus_edge_lsn\")) \
+             ORDER BY r.\"_walrus_commit_lsn\" DESC, r.\"_walrus_lsn\" DESC LIMIT 1 \
+           ) raw_value ON TRUE \
+           LEFT JOIN LATERAL ( \
+             SELECT list_value(m.{qc}) AS \"_walrus_value\" FROM \"{mirror_table}\" m \
+             WHERE {mirror_key_match} LIMIT 1 \
+           ) mirror_value ON TRUE \
+           WHERE raw_value.\"_walrus_value\" IS NOT NULL \
+              OR mirror_value.\"_walrus_value\" IS NOT NULL \
+           ORDER BY lineage.\"_walrus_depth\" LIMIT 1 \
+         ), list_value(t.{qc}))[1] ELSE {winner_value_expr} END",
+        winner = toast_listed("s", source),
+        raw = toast_listed("r", source),
+    )
+}
+
 impl TransformSql {
     /// Tier-1 (scalar) transform from a bare relation — unchanged from the pre-descriptor path.
     #[must_use]
@@ -105,64 +357,57 @@ impl TransformSql {
         Self::from_plan(&crate::plan::TablePlan::tier1(rel))
     }
 
-    /// The full transform from a schema [`crate::plan::TablePlan`]: each mirror column's value is precomputed as SQL
-    /// over the winner `s` — a recombine expression (Tier-2), an unchanged-TOAST-resolved back-scan
-    /// (Tier-1 non-key, §5.6), or a plain `s."col"` (keys / flat siblings).
+    /// The full transform from a schema [`crate::plan::TablePlan`]: each mirror column's value is
+    /// precomputed as SQL over the winner `s`. Every non-key source column, including Tier-2
+    /// recombines and flat siblings, resolves the source column named by `unchanged_toast`.
     #[must_use]
     pub(crate) fn from_plan(plan: &crate::plan::TablePlan) -> Self {
         use crate::plan::MirrorValue;
         let q = |c: &str| format!("\"{c}\"");
         let table = DuckTable::<Mirror>::new(plan.table.as_ref());
         let raw_table = table.to_raw();
-        // The TOAST back-scan's key predicate is the only thing the key names feed here, so the
-        // filter streams straight into the rendered equalities — the join needs a slice, nothing
-        // upstream of it does.
-        let r_pk_eq_s = plan
+        let planned_raw_value = |c: &crate::plan::MirrorCol| match &c.value {
+            MirrorValue::Recombine(expr) => expr.clone(),
+            MirrorValue::Passthrough => format!("s.{}", q(&c.name)),
+        };
+        let toast_keys = plan
             .mirror_cols
             .iter()
             .filter(|c| c.is_key)
-            .map(|c| format!("r.{} = s.{}", q(&c.name), q(&c.name)))
-            .collect::<Vec<_>>()
-            .join(" AND ");
+            .map(|c| ToastKey {
+                mirror_name: c.name.clone(),
+                raw_value_expr: planned_raw_value(c),
+            })
+            .collect::<Vec<_>>();
         let mirror = plan
             .mirror_cols
             .iter()
             .map(|c| {
-                let is_recombine = matches!(c.value, MirrorValue::Recombine(_));
-                let value_expr = match &c.value {
-                    MirrorValue::Recombine(expr) => expr.clone(),
-                    MirrorValue::Passthrough {
-                        toast_resolvable: false,
-                    } => format!("s.{}", q(&c.name)),
-                    MirrorValue::Passthrough {
-                        toast_resolvable: true,
-                    } => {
-                        let qc = q(&c.name);
-                        // Membership test on the JSON array text (`["big"]`) — the quotes disambiguate.
-                        let listed = |alias: &str| {
-                            format!(
-                                "COALESCE(json_extract_string({alias}.\"walrus_pg_sink_meta\", '$.unchanged_toast'), '[]') LIKE '%\"{}\"%'",
-                                c.name
-                            )
-                        };
-                        format!(
-                            "CASE WHEN {winner} THEN COALESCE(( \
-                               SELECT r.{qc} FROM \"{raw_table}\" r \
-                               WHERE {r_pk_eq_s} AND NOT ({raw}) \
-                                 AND (r.\"_walrus_commit_lsn\", r.\"_walrus_lsn\") <= (s.\"_walrus_commit_lsn\", s.\"_walrus_lsn\") \
-                               ORDER BY r.\"_walrus_commit_lsn\" DESC, r.\"_walrus_lsn\" DESC LIMIT 1), t.{qc}) \
-                             ELSE s.{qc} END",
-                            winner = listed("s"),
-                            raw_table = raw_table.as_str(),
-                            raw = listed("r"),
-                        )
-                    }
-                };
+                let raw_value_expr = planned_raw_value(c);
+                let incremental_value_expr = resolved_toast_expr(
+                    c,
+                    &raw_value_expr,
+                    &raw_value_expr,
+                    raw_table.as_str(),
+                    table.as_str(),
+                    &toast_keys,
+                    true,
+                );
+                let rebuild_value_expr = resolved_toast_expr(
+                    c,
+                    &format!("s.{}", q(&c.name)),
+                    &raw_value_expr,
+                    raw_table.as_str(),
+                    table.as_str(),
+                    &toast_keys,
+                    false,
+                );
                 MirrorCol {
                     name: c.name.clone(),
                     is_key: c.is_key,
-                    is_recombine,
-                    value_expr,
+                    raw_value_expr,
+                    incremental_value_expr,
+                    rebuild_value_expr,
                 }
             })
             .collect();
@@ -188,7 +433,7 @@ impl TransformSql {
             .collect()
     }
 
-    /// The latest `TRUNCATE` `(Ct, Lt)` in the tail (`op='t'`, `commit_lsn > after_lsn`), ordered by the
+    /// The latest `TRUNCATE` `(Ct, Lt)` in the tail (`op='t'`, `commit_lsn >= after_lsn`), ordered by the
     /// tuple. `None` if the tail holds no truncate — every downstream predicate is then simply omitted.
     ///
     /// # Errors
@@ -204,7 +449,7 @@ impl TransformSql {
         let raw = self.table.to_raw();
         let sql = format!(
             "SELECT \"_walrus_commit_lsn\", \"_walrus_lsn\" FROM \"{}\" \
-             WHERE \"_walrus_op\" = 't' AND \"_walrus_commit_lsn\" > '{}' \
+             WHERE \"_walrus_op\" = 't' AND \"_walrus_commit_lsn\" >= '{}' \
              ORDER BY \"_walrus_commit_lsn\" DESC, \"_walrus_lsn\" DESC LIMIT 1",
             raw.as_str(),
             after_lsn
@@ -254,10 +499,18 @@ impl TransformSql {
         let pk = self.to_pk_names();
         let non_key = self.to_non_key_names();
         let all: Vec<&str> = self.mirror.iter().map(|c| c.name.as_str()).collect();
-        let pk_list = pk.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
+        // Incremental winners still have the raw emit shape. A recombined Tier-2 identity therefore
+        // partitions by its expression over `raw_winner`, not by a mirror-only logical name.
+        let raw_pk_list = self
+            .mirror
+            .iter()
+            .filter(|c| c.is_key)
+            .map(|c| raw_expr_for(&c.raw_value_expr, "raw_winner"))
+            .collect::<Vec<_>>()
+            .join(", ");
         let pk_join = pk
             .iter()
-            .map(|c| format!("t.{} = s.{}", q(c), q(c)))
+            .map(|c| format!("t.{} IS NOT DISTINCT FROM s.{}", q(c), q(c)))
             .collect::<Vec<_>>()
             .join(" AND ");
         // MATCHED UPDATE assigns the non-key mirror columns; if a table is all-PK, a self-assignment keeps
@@ -301,7 +554,7 @@ impl TransformSql {
         let mut select_parts: Vec<String> = self
             .mirror
             .iter()
-            .map(|c| format!("{} AS {}", c.value_expr, q(&c.name)))
+            .map(|c| format!("{} AS {}", c.incremental_value_expr, q(&c.name)))
             .collect();
         select_parts.push("s.\"_walrus_op\"".to_string());
         select_parts.push("s.\"_walrus_commit_lsn\"".to_string());
@@ -320,7 +573,7 @@ impl TransformSql {
             template,
             &[
                 ("{table}", table),
-                ("{pk_list}", &pk_list),
+                ("{raw_pk_list}", &raw_pk_list),
                 ("{pk_join}", &pk_join),
                 ("{set_cols}", &set_cols),
                 ("{insert_cols}", &insert_cols),
@@ -372,21 +625,18 @@ impl TransformSql {
         let pk_list = pk.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
         let pk_join = pk
             .iter()
-            .map(|c| format!("t.{} = s.{}", q(c), q(c)))
+            .map(|c| format!("t.{} IS NOT DISTINCT FROM s.{}", q(c), q(c)))
             .collect::<Vec<_>>()
             .join(" AND ");
         // The raw arm collapses each mirror column FROM the raw emit columns (aliased `s`): a Tier-2
-        // recombine, or a plain `s."col"` for Tier-1 (its TOAST resolution happens in the final SELECT).
+        // recombine, or a plain `s."col"`. Unchanged-TOAST resolution happens after winner selection,
+        // while its metadata and tuple are still available.
         let raw_exprs: Vec<String> = self
             .mirror
             .iter()
             .map(|c| {
                 let qc = q(&c.name);
-                if c.is_recombine {
-                    format!("{} AS {qc}", c.value_expr)
-                } else {
-                    format!("s.{qc} AS {qc}")
-                }
+                format!("{} AS {qc}", c.raw_value_expr)
             })
             .collect();
         let mirror_names = self
@@ -417,19 +667,15 @@ impl TransformSql {
             }
             None => String::new(),
         };
-        // The rebuilt row list: Tier-1 columns TOAST-resolve (over `s` = the collapsed winner + the raw
-        // back-scan + the mirror `t` fallback); Tier-2 (recombined) columns pass through `s`. Then the
-        // `_applied_*` stamps re-seeded from the winner's tuple so the incremental guard keeps working.
+        // The rebuilt row list resolves every source column's unchanged-TOAST marker over `s` (the
+        // collapsed winner), the retained raw back-scan, and finally the current mirror `t`. Then the
+        // `_applied_*` stamps are re-seeded from the winner's tuple for the incremental guard.
         let mut cols: Vec<String> = self
             .mirror
             .iter()
             .map(|c| {
                 let qc = q(&c.name);
-                if c.is_recombine {
-                    format!("s.{qc} AS {qc}")
-                } else {
-                    format!("{} AS {qc}", c.value_expr)
-                }
+                format!("{} AS {qc}", c.rebuild_value_expr)
             })
             .collect();
         cols.push("s.\"_walrus_commit_lsn\" AS \"_applied_commit_lsn\"".to_string());
@@ -440,7 +686,8 @@ impl TransformSql {
              WITH src AS ({src}), \
              winners AS (SELECT * FROM src{truncate_bound} \
                  QUALIFY row_number() OVER (PARTITION BY {pk_list} \
-                     ORDER BY \"_walrus_commit_lsn\" DESC, \"_walrus_lsn\" DESC) = 1) \
+                     ORDER BY \"_walrus_commit_lsn\" DESC, \"_walrus_lsn\" DESC, \
+                              CASE WHEN \"_walrus_op\" = 'd' THEN 0 ELSE 1 END DESC) = 1) \
              SELECT {resolved} FROM winners s LEFT JOIN \"{t}\" t ON {pk_join} \
              WHERE s.\"_walrus_op\" <> 'd'; \
              DROP VIEW IF EXISTS \"{t}_current\"; \

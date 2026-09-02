@@ -221,6 +221,120 @@ fn owned_duckdb_handles_meet_the_blocking_pool_send_bound() {
     requires_spawn_blocking_bounds(|| 1_i64);
 }
 
+#[test]
+fn reload_shadow_resumes_without_clearing_and_stays_hidden_until_publish() {
+    let db = TableDb::open(":memory:").unwrap();
+    let rel = orders();
+    let plan = crate::plan::TablePlan::tier1(&rel);
+    let version = common::SchemaVersionNo(3);
+    let reload_id = common::ReloadId(41);
+    let start = "0/100".parse().unwrap();
+    let end = "0/180".parse().unwrap();
+    db.ensure_tables_planned(&plan, version).unwrap();
+    db.conn()
+        .execute(
+            "INSERT INTO orders (id, status) VALUES (1, 'live'), (99, 'phantom')",
+            [],
+        )
+        .unwrap();
+
+    let BeginReload::Ready(build) = db
+        .begin_reload_shadow(&plan, version, reload_id, start, end)
+        .unwrap()
+    else {
+        panic!("a new reload must create a shadow");
+    };
+    db.conn()
+        .execute(
+            &format!(
+                "INSERT INTO \"{}\" (id, status) VALUES (1, 'dump'), (2, 'new')",
+                build.shadow_table
+            ),
+            [],
+        )
+        .unwrap();
+
+    let live: Vec<(i64, String)> = db
+        .conn()
+        .prepare("SELECT id, status FROM orders_current ORDER BY id")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        live,
+        vec![(1, "live".into()), (99, "phantom".into())],
+        "an in-progress export never leaks into or clears the live view"
+    );
+
+    let resumed = db
+        .begin_reload_shadow(&plan, version, reload_id, start, end)
+        .unwrap();
+    assert_eq!(resumed, BeginReload::Ready(build.clone()));
+    let shadow_rows: i64 = db
+        .conn()
+        .query_row(
+            &format!("SELECT count(*) FROM \"{}\"", build.shadow_table),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        shadow_rows, 2,
+        "a crash-redo resumes the deterministic shadow instead of clearing it"
+    );
+
+    assert!(db.publish_reload_shadow("orders", reload_id).unwrap());
+    let published: Vec<(i64, String)> = db
+        .conn()
+        .prepare("SELECT id, status FROM orders_current ORDER BY id")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(published, vec![(1, "dump".into()), (2, "new".into())]);
+    assert_eq!(db.recorded_reload_id().unwrap(), Some(reload_id));
+    assert_eq!(db.reload_build().unwrap(), None);
+    assert!(
+        !db.publish_reload_shadow("orders", reload_id).unwrap(),
+        "a cutover retry is an idempotent no-op"
+    );
+}
+
+#[test]
+fn publishing_an_empty_shadow_clears_phantoms() {
+    let db = TableDb::open(":memory:").unwrap();
+    let rel = orders();
+    let plan = crate::plan::TablePlan::tier1(&rel);
+    let version = common::SchemaVersionNo(1);
+    let reload_id = common::ReloadId(42);
+    db.ensure_tables_planned(&plan, version).unwrap();
+    db.conn()
+        .execute("INSERT INTO orders (id, status) VALUES (99, 'phantom')", [])
+        .unwrap();
+
+    db.begin_reload_shadow(
+        &plan,
+        version,
+        reload_id,
+        "0/200".parse().unwrap(),
+        "0/240".parse().unwrap(),
+    )
+    .unwrap();
+    assert!(db.publish_reload_shadow("orders", reload_id).unwrap());
+
+    let rows: i64 = db
+        .conn()
+        .query_row("SELECT count(*) FROM orders_current", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        rows, 0,
+        "the marker-delimited empty generation is data: it removes every phantom"
+    );
+}
+
 /// A `spill` file's per-row `commit_lsn` placeholder is overridden by the file's `lsn_end`
 /// (the real commit LSN), while a non-spill file appends the per-row value verbatim.
 #[test]

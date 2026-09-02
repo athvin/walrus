@@ -165,7 +165,6 @@ async fn setup(epoch: EpochNo) -> (TableCtx, tempfile::TempDir) {
         compaction_interval: Duration::from_secs(3600),
         retention_lsn_lag: 16 << 20,
         pause_logged: Default::default(),
-        resync_ids: Default::default(),
     };
     (ctx, dir)
 }
@@ -280,7 +279,7 @@ async fn pause_withholds_claims_and_lifts_on_failed() {
         .await
         .unwrap();
 
-    // A live rebuild-flavor reload: Phase A must treat the table as PAUSED, not idle.
+    // A live reload: Phase A must treat the table as PAUSED, not idle.
     let reload_id = control::reload::request(
         &ctx.pool,
         epoch,

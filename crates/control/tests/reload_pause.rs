@@ -5,18 +5,19 @@
 )]
 //! Compose-gated integration tests for the loader-pause claim predicate.
 //!
-//! "Pausing is not claiming" (reload §2): a live `flavor='reload'` reload in
+//! "Pausing is not claiming" (reload §2): a live reload of either persisted flavor in
 //! `requested|exporting` makes `claim_ready` return nothing for THAT table while its `ready`
 //! rows accumulate; every other table claims normally; `export_complete` (and the terminal
-//! states) lift the pause and the backlog drains in unchanged `(lsn_end, id)` order; `resync`
-//! never pauses. Rolled-back transactions + unique epochs, like the manifest tests.
+//! states) lift the pause and the backlog drains in unchanged `(lsn_end, id)` order. `resync`
+//! remains a compatibility spelling for the identical rebuild behavior.
 #![cfg(feature = "integration")]
 
 use common::{EpochNo, Lsn, SchemaVersionNo};
-use control::reload::{self, ReloadFlavor};
+use control::reload::{self, ReloadFenceIdentity, ReloadFlavor, ReloadScope, SourceReloadRequest};
 use control::{ManifestRow, NewManifestFile};
 use control::{claim_ready, connect, insert_ready, max_ready_lsn_end, run_migrations};
-use sqlx::postgres::PgPool;
+use sqlx::postgres::{PgConnection, PgPool};
+use uuid::Uuid;
 
 fn control_dsn() -> String {
     std::env::var("WALRUS_CONTROL_DB_URL").unwrap_or_else(|_| {
@@ -50,6 +51,27 @@ fn stream_file(epoch: EpochNo, table: &str, lsn_end: &str) -> NewManifestFile {
 
 fn ids(rows: &[ManifestRow]) -> Vec<common::ManifestId> {
     rows.iter().map(|r| r.id).collect()
+}
+
+async fn finish_fenced(conn: &mut PgConnection, reload_id: common::ReloadId, h: Lsn) {
+    let row = reload::get(&mut *conn, reload_id).await.unwrap().unwrap();
+    let schema_version = row.schema_version.unwrap_or(SchemaVersionNo(1));
+    let f = row.start_lsn.or(row.first_lsn).unwrap_or(h);
+    let identity = ReloadFenceIdentity {
+        request_id: row.source_request_id.or(row.parent_request_id),
+        source_schema: &row.source_schema,
+        source_table: &row.source_table,
+        schema_version,
+    };
+    reload::record_start_fence(&mut *conn, reload_id, f, identity)
+        .await
+        .unwrap();
+    reload::record_end_marker(&mut *conn, reload_id, h, identity)
+        .await
+        .unwrap();
+    reload::complete_export(&mut *conn, reload_id, h)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -142,7 +164,7 @@ async fn export_complete_and_terminal_states_lift_the_pause() {
     // export_complete lifts the pause — exactly then the loader MUST claim again to reach the
     // chunk files and trigger the rebuild (pausing through export_complete deadlocks).
     let h: Lsn = "0/100".parse().unwrap();
-    reload::complete_export(&mut *tx, orders, h).await.unwrap();
+    finish_fenced(&mut tx, orders, h).await;
     assert_eq!(
         ids(&claim_ready(&mut *tx, epoch, "public", "orders", 100)
             .await
@@ -189,35 +211,104 @@ async fn export_complete_and_terminal_states_lift_the_pause() {
 }
 
 #[tokio::test]
-async fn resync_flavor_never_pauses() {
+async fn resync_alias_pauses_in_both_live_states() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
     let epoch = EpochNo(920_003);
 
-    let id = insert_ready(&mut *tx, &stream_file(epoch, "orders", "0/10"))
+    insert_ready(&mut *tx, &stream_file(epoch, "orders", "0/10"))
         .await
         .unwrap();
     reload::request(&mut *tx, epoch, "public", "orders", ReloadFlavor::Resync)
         .await
         .unwrap();
-    assert_eq!(
-        ids(&claim_ready(&mut *tx, epoch, "public", "orders", 100)
+    assert!(
+        claim_ready(&mut *tx, epoch, "public", "orders", 100)
             .await
-            .unwrap()),
-        vec![id],
-        "a requested resync pauses nothing (H3 — it merges over the LIVE mirror)"
+            .unwrap()
+            .is_empty(),
+        "the resync compatibility spelling pauses while requested"
     );
-    // Claiming consumes nothing (the queue retires by DELETE, which the loader does after
-    // appending) — flip to exporting and claim again to cover both live states.
+    // Flip to exporting and probe again to cover both live states.
     reload::claim_requested(&mut *tx, epoch, "sink-a", 60, 10)
         .await
         .unwrap();
+    assert!(
+        claim_ready(&mut *tx, epoch, "public", "orders", 100)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the resync compatibility spelling remains paused while exporting"
+    );
+
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn completed_resync_can_drain_before_a_queued_source_reload_starts() {
+    let pool = pool().await;
+    let mut tx = pool.begin().await.unwrap();
+    let epoch = EpochNo(920_004);
+
+    let manifest = insert_ready(&mut *tx, &stream_file(epoch, "orders", "0/10"))
+        .await
+        .unwrap();
+    let current = reload::request(&mut *tx, epoch, "public", "orders", ReloadFlavor::Resync)
+        .await
+        .unwrap();
+    reload::claim_requested(&mut *tx, epoch, "sink-a", 60, 10)
+        .await
+        .unwrap();
+
+    // Source-backed rows queue even behind an active legacy resync. Both spellings engage the
+    // pause, so the current attempt needs the flavor-agnostic export_complete escape.
+    let queued = reload::request_from_source(
+        &mut *tx,
+        &SourceReloadRequest {
+            epoch,
+            source_request_id: Uuid::from_u128(0x920_004),
+            parent_request_id: None,
+            scope: ReloadScope::Table,
+            source_schema: "public",
+            source_table: "orders",
+            flavor: ReloadFlavor::Reload,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        claim_ready(&mut *tx, epoch, "public", "orders", 100)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the queued reload pauses claims until the current export is ready to cut over"
+    );
+
+    finish_fenced(&mut tx, current, "0/20".parse().unwrap()).await;
     assert_eq!(
         ids(&claim_ready(&mut *tx, epoch, "public", "orders", 100)
             .await
             .unwrap()),
-        vec![id],
-        "an exporting resync pauses nothing either"
+        vec![manifest],
+        "a queued reload must not deadlock an export_complete resync"
+    );
+    assert!(
+        reload::claim_requested(&mut *tx, epoch, "sink-b", 60, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the queued reload still waits for the resync's loader completion"
+    );
+
+    reload::complete(&mut *tx, current).await.unwrap();
+    assert_eq!(
+        reload::claim_requested(&mut *tx, epoch, "sink-b", 60, 10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.reload_id)
+            .collect::<Vec<_>>(),
+        vec![queued]
     );
 
     tx.rollback().await.unwrap();

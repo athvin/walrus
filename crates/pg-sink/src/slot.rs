@@ -5,13 +5,15 @@
 //! `pg_create_logical_replication_slot`) — the `START_REPLICATION` streaming itself is the
 //! hand-rolled connection in [`crate::replication`].
 //!
-//! **Snapshot note:** SQL creation does not export a consistent snapshot (that needs the
-//! `CREATE_REPLICATION_SLOT … SNAPSHOT 'export'` *replication* command). The exported snapshot is only
-//! needed for the initial backfill. The production bootstrap creates that slot through the
-//! replication command; [`verify_or_create_slot`] is the SQL-created, snapshot-free test helper.
+//! The creation LSN retains WAL before the source-WAL-triggered all-table reconciliation establishes
+//! each table's own `F`; bootstrap and later repair therefore use one reconciliation path.
 
 use anyhow::Context as _;
 use common::Lsn;
+
+const DROP_INVALIDATED_SLOT_SQL: &str = "SELECT pg_drop_replication_slot(slot_name)
+     FROM pg_replication_slots
+     WHERE slot_name = $1 AND wal_status = 'lost'";
 
 /// A pre-existing slot's resume position.
 #[derive(Debug, Clone, Copy)]
@@ -24,17 +26,14 @@ pub struct SlotInfo {
 }
 
 /// Whether the slot already existed or we just created it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum SlotResume {
     /// The slot was already there; resume from what it has confirmed.
     Existing(SlotInfo),
-    /// The slot was created by this run, so there is no history to resume — only the point the
-    /// source became consistent, and possibly a snapshot to backfill from first.
+    /// The slot was created by this run, so there is no history to resume — only its creation point.
     Created {
         /// The LSN at which the new slot became consistent; where streaming starts.
         consistent_point: Lsn,
-        /// `None` for a SQL-created slot; production backfill creates an exported snapshot instead.
-        snapshot_name: Option<String>,
     },
 }
 
@@ -63,7 +62,7 @@ fn parse_lsn(s: &str, field: &'static str) -> anyhow::Result<Lsn> {
 }
 
 /// Read a slot's resume position **without** creating it — `None` if it does not exist. The bootstrap
-/// uses this to decide between resuming (`Some`) and a first-time snapshot+backfill (`None`).
+/// uses this to decide between resuming (`Some`) and first-time reconciliation (`None`).
 ///
 /// # Errors
 ///
@@ -138,18 +137,72 @@ pub async fn verify_or_create_slot(
         }));
     }
 
-    let row = client
+    let row = match client
         .query_one(
             "SELECT lsn::text FROM pg_create_logical_replication_slot($1, 'pgoutput')",
             &[&slot],
         )
         .await
-        .with_context(|| format!("create logical replication slot {slot:?} with pgoutput"))?;
+    {
+        Ok(row) => row,
+        Err(error) if error.code() == Some(&tokio_postgres::error::SqlState::DUPLICATE_OBJECT) => {
+            let info = read_slot(client, slot).await?.with_context(|| {
+                format!("replication slot {slot:?} disappeared during concurrent creation")
+            })?;
+            return Ok(SlotResume::Existing(info));
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("create logical replication slot {slot:?} with pgoutput")
+            });
+        }
+    };
     let lsn: String = row.get(0);
     Ok(SlotResume::Created {
         consistent_point: parse_lsn(&lsn, "consistent_point")?,
-        snapshot_name: None,
     })
+}
+
+/// Drop a slot only if the catalog still identifies that exact name as invalidated, then establish
+/// a replacement. If another actor has already removed or replaced it, this never drops the new
+/// healthy slot: [`verify_or_create_slot`] returns that slot as [`SlotResume::Existing`] and the
+/// caller retries classification.
+///
+/// # Errors
+///
+/// Returns [`anyhow::Error`] if the conditional drop, catalog read, or replacement creation fails.
+pub async fn recreate_invalidated_slot(
+    client: &tokio_postgres::Client,
+    slot: &str,
+) -> anyhow::Result<SlotResume> {
+    client
+        .query("SELECT pg_advisory_lock(hashtextextended($1, 0))", &[&slot])
+        .await
+        .with_context(|| format!("lock invalidated slot replacement for {slot:?}"))?;
+    let result = async {
+        client
+            .query(DROP_INVALIDATED_SLOT_SQL, &[&slot])
+            .await
+            .with_context(|| format!("drop invalidated replication slot {slot:?}"))?;
+        verify_or_create_slot(client, slot).await
+    }
+    .await;
+    let unlocked = client
+        .query(
+            "SELECT pg_advisory_unlock(hashtextextended($1, 0))",
+            &[&slot],
+        )
+        .await
+        .with_context(|| format!("unlock invalidated slot replacement for {slot:?}"));
+    match (result, unlocked) {
+        (Ok(resume), Ok(_)) => Ok(resume),
+        (Err(error), Ok(_)) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(unlock_error)) => {
+            tracing::warn!(%unlock_error, slot, "failed to release slot replacement advisory lock");
+            Err(error)
+        }
+    }
 }
 
 #[cfg(test)]

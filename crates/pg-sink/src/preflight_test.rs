@@ -30,6 +30,12 @@ fn preflight_errors_map_to_exit_codes() {
             schema: "walrus".into(),
             table: "heartbeat".into(),
         },
+        PreflightError::PublicationCoverage(
+            crate::source_catalog::PublicationCoverageIssue::DisabledOperations {
+                publication: "walrus_pub".into(),
+                disabled: "DELETE".into(),
+            },
+        ),
         PreflightError::NoReplicationPriv,
         PreflightError::ReloadSignalMissing {
             detail: "walrus.reload_signal table absent",
@@ -63,17 +69,17 @@ fn quoting_doubles_delimiters_and_rejects_unusable_idents() {
 }
 
 #[test]
-fn only_a_keyless_default_identity_is_unusable() {
-    // `DEFAULT` is the one identity whose usability depends on the PK; the other three answer on
-    // their own, so `has_pk` must not change their verdict.
-    assert!(identity_is_usable(ReplicaIdentity::Default, true));
-    assert!(!identity_is_usable(ReplicaIdentity::Default, false));
-
-    for has_pk in [true, false] {
-        assert!(identity_is_usable(ReplicaIdentity::Full, has_pk));
-        assert!(identity_is_usable(ReplicaIdentity::Index, has_pk));
-        assert!(!identity_is_usable(ReplicaIdentity::Nothing, has_pk));
+fn unified_export_requires_a_real_primary_key() {
+    for identity in [
+        ReplicaIdentity::Default,
+        ReplicaIdentity::Full,
+        ReplicaIdentity::Index,
+    ] {
+        assert!(identity_is_usable(identity, true));
+        assert!(!identity_is_usable(identity, false));
     }
+    assert!(!identity_is_usable(ReplicaIdentity::Nothing, true));
+    assert!(!identity_is_usable(ReplicaIdentity::Nothing, false));
 }
 
 #[test]
@@ -96,5 +102,14 @@ fn gap_and_signal_errors_name_their_remediation() {
         missing
             .to_string()
             .contains("migrations/source/0003_reload_signal.sql")
+    );
+
+    let missing = PreflightError::ReloadEventMissing {
+        detail: "walrus.reload_event table absent",
+    };
+    assert!(
+        missing
+            .to_string()
+            .contains("migrations/source/0004_reload_event.sql")
     );
 }

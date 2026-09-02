@@ -7,24 +7,22 @@
 //! from the two middle states. There is deliberately **no** `superseded` status: a DDL restart
 //! is [`fail()`](fail) with an explanatory reason plus a fresh successor row.
 //!
-//! `reload_id` is a **bigserial, not a UUID** (a recorded deviation from the design doc): "honor
-//! only the latest reload_id" (H9) becomes a numeric max, and the id fits the loader's
-//! `_walrus_meta` `v BIGINT` store verbatim. The duplicate-request guarantee a UUID key was for
-//! lives in the `table_reload_one_live` partial unique index instead — one non-terminal reload
-//! per `(epoch, schema, table)`, enforced by the database, mapped to the typed
-//! [`ControlError::ReloadInProgress`]. What a client-supplied UUID *would* have bought —
-//! caller-side idempotency keys — is not needed: "the same table, again" *is* the idempotency
-//! rule here.
+//! `reload_id` remains the monotonic attempt identity used by the loader. Source-WAL requests also
+//! carry a UUID idempotency key: one event may fan out to several tables, while replay of the same
+//! `(epoch, request UUID, table)` returns the original attempt. Direct control-plane requests keep
+//! the historical one-live-request behavior but also persist a private UUID namespace for their
+//! source-side fence events.
 
 use crate::{ControlError, parse::ParseEnumError};
 use common::string_enum;
 use common::{EpochNo, Lsn, ReloadId, SchemaVersionNo};
-use sqlx::{Connection, PgConnection, PgExecutor};
+use sqlx::{Connection, PgConnection, PgExecutor, Row};
+use uuid::Uuid;
 
 string_enum! {
-    /// `reload` rebuilds (clear + re-export — the quarantine-recovery flavor); `resync` merges chunks
-    /// over the *live* mirror and tolerates phantoms (reload H3). Both flavors share every state and
-    /// every transition in this module.
+    /// Persisted spelling of a full-table reconciliation request. `resync` is retained for database
+    /// and API compatibility, but is a behavioral alias of `reload`: both pause claims and publish
+    /// a hidden-generation full rebuild through the same state machine.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
     #[sqlx(rename_all = "lowercase")]
     pub enum ReloadFlavor {
@@ -33,6 +31,80 @@ string_enum! {
         Reload => "reload",
         Resync => "resync",
     }
+}
+
+string_enum! {
+    /// Whether the source event names one table or is one child of an all-published-tables fanout.
+    /// Every persisted `table_reload` row still represents exactly one concrete target table.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+    #[sqlx(rename_all = "snake_case")]
+    pub enum ReloadScope {
+        error = ParseEnumError;
+        column = "table_reload.request_scope";
+        Table => "table",
+        AllPublished => "all_published",
+    }
+}
+
+string_enum! {
+    /// Durable, data-free boundaries for a reload. `Baseline` is the safe lower fence `F`; `End`
+    /// is the capture-durability barrier `H`. Their rows exist even when an export has zero data
+    /// files, so lifecycle progress never depends on a Parquet row.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+    #[sqlx(rename_all = "lowercase")]
+    pub enum ReloadMarkerKind {
+        error = ParseEnumError;
+        column = "table_reload_marker.marker_kind";
+        Baseline => "baseline",
+        End => "end",
+    }
+}
+
+/// A source-WAL reload request after it has been expanded to one concrete table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceReloadRequest<'a> {
+    /// Slot generation in which the request event was decoded.
+    pub epoch: EpochNo,
+    /// Stable UUID carried by the source event. All-table children may share this UUID.
+    pub source_request_id: Uuid,
+    /// Optional group identity used to correlate a larger orchestration request.
+    pub parent_request_id: Option<Uuid>,
+    /// Single-table request or child of an all-published fanout.
+    pub scope: ReloadScope,
+    /// Concrete child table schema.
+    pub source_schema: &'a str,
+    /// Concrete child table name.
+    pub source_table: &'a str,
+    /// Persisted request spelling; `resync` remains accepted as a rebuild alias.
+    pub flavor: ReloadFlavor,
+}
+
+/// One durable reload boundary record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReloadMarkerRow {
+    /// Attempt the marker belongs to.
+    pub reload_id: ReloadId,
+    /// Lower baseline fence or upper durability barrier.
+    pub kind: ReloadMarkerKind,
+    /// Commit LSN of the boundary.
+    pub lsn: Lsn,
+    /// Frozen schema used by the attempt at this boundary.
+    pub schema_version: SchemaVersionNo,
+}
+
+/// Immutable source identity carried by a start/end fence. Source-backed attempts require the
+/// request UUID to match `source_request_id` (or a successor's/direct request's
+/// `parent_request_id`). `None` remains representable only for reading pre-migration rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReloadFenceIdentity<'a> {
+    /// Stable source-event namespace for this fence.
+    pub request_id: Option<Uuid>,
+    /// Exact target schema.
+    pub source_schema: &'a str,
+    /// Exact target table.
+    pub source_table: &'a str,
+    /// Frozen structural version carried by the event.
+    pub schema_version: SchemaVersionNo,
 }
 
 string_enum! {
@@ -63,19 +135,30 @@ pub struct ReloadRow {
     pub source_schema: String,
     /// Table being reloaded.
     pub source_table: String,
-    /// Rebuild (`reload`) or merge-over-live (`resync`); see [`ReloadFlavor`].
+    /// Persisted request spelling; both values use the same rebuild behavior. See [`ReloadFlavor`].
     pub flavor: ReloadFlavor,
+    /// Stable source-WAL request identity; `None` for legacy direct control-plane requests.
+    pub source_request_id: Option<Uuid>,
+    /// Fanout/ancestor UUID, or a direct request's private durable fence namespace.
+    pub parent_request_id: Option<Uuid>,
+    /// Whether this row is a direct table request or an all-published child.
+    pub scope: ReloadScope,
     /// Where the attempt sits in the state walk; see [`ReloadStatus`].
     pub status: ReloadStatus,
     /// Last COMPLETED chunk; 0 = none exported yet.
     pub chunk_no: i64,
     /// Last exported PK bound (a JSON array, so composite PKs need no special casing); `None` = start.
     pub cursor_pk: Option<serde_json::Value>,
-    /// L₁ — the first chunk's echo watermark; frozen by the first `advance_cursor`, immutable after.
+    /// Authoritative safe lower fence `F`, recorded before the first export query and therefore
+    /// present for empty tables too. Legacy attempts may leave it `None`.
+    pub start_lsn: Option<Lsn>,
+    /// Legacy L₁ — the first data chunk's echo watermark. It remains for rolling compatibility,
+    /// but new reconciliation correctness uses `start_lsn` instead.
     pub first_lsn: Option<Lsn>,
     /// H — set at `export_complete`; the loader flips `complete` once `transformed_lsn >= H`.
     pub final_lsn: Option<Lsn>,
-    /// The single schema version this attempt exports at; frozen alongside `first_lsn`.
+    /// The single schema version this attempt exports at; frozen with the explicit start fence for
+    /// unified attempts or the first chunk for legacy attempts.
     pub schema_version: Option<SchemaVersionNo>,
     /// DDL restarts consumed so far; `reload_max_restarts` caps it.
     pub restart_count: i32,
@@ -90,11 +173,12 @@ pub struct ReloadRow {
 ///
 /// A macro — not a function, a generic, or an `impl From<_> for ReloadRow` — for the one narrow
 /// reason that sanctions reaching for one: every `sqlx::query_file!` mints its OWN record struct
-/// inside its own expansion, so the four readers below ([`claim_requested`], [`adopt_resumable`],
-/// [`active_rebuilds`], [`get`]) hand in four *distinct*, unnameable types that merely happen to
+/// inside its own expansion, so readers such as [`claim_requested`], [`adopt_resumable`],
+/// [`active_rebuilds`], [`ready_rebuild`], and [`get`] hand in distinct, unnameable types that
+/// merely happen to
 /// share a field set. Rust has no structural typing, so there is no bound to make a function
-/// generic over and no type to name in a `From` impl; the only alternative is these fourteen
-/// fields written out four times. Sibling modules ([`crate::manifest`], [`crate::ddl_manifest`])
+/// generic over and no type to name in a `From` impl; the only alternative is this field mapping
+/// written out four times. Sibling modules ([`crate::manifest`], [`crate::ddl_manifest`])
 /// build their row struct inline precisely because each has a single reader.
 ///
 /// `expr_2021` holds the capture to the 2021 expression grammar rather than edition 2024's wider
@@ -112,9 +196,13 @@ macro_rules! typed_reload_row {
             source_schema: row.source_schema,
             source_table: row.source_table,
             flavor: row.flavor,
+            source_request_id: row.source_request_id,
+            parent_request_id: row.parent_request_id,
+            scope: row.request_scope,
             status: row.status,
             chunk_no: row.chunk_no,
             cursor_pk: row.cursor_pk,
+            start_lsn: row.start_lsn,
             first_lsn: row.first_lsn,
             final_lsn: row.final_lsn,
             schema_version: row.schema_version.map(Into::into),
@@ -144,12 +232,14 @@ pub async fn request(
     source_table: &str,
     flavor: ReloadFlavor,
 ) -> Result<ReloadId, ControlError> {
+    let fence_request_id = Uuid::new_v4();
     let rec = sqlx::query_file!(
         "sql/postgres/queries/request_reload.sql",
         epoch.0,
         source_schema,
         source_table,
         flavor.as_str(),
+        fence_request_id,
     )
     .fetch_one(ex)
     .await
@@ -168,10 +258,63 @@ pub async fn request(
     Ok(rec.reload_id.into())
 }
 
+/// Idempotently persist one concrete table child decoded from a source-WAL request event.
+///
+/// Replaying the same `(epoch, source_request_id, schema, table)` returns the original
+/// [`ReloadId`], including after that attempt is terminal. An all-published request deliberately
+/// reuses its source UUID across children; the table coordinates distinguish them. Reusing the key
+/// with a different flavor, scope, or parent is rejected instead of silently changing history. A
+/// distinct source request for a busy table is durably appended in `requested`; [`claim_requested`]
+/// serializes those rows in per-table `reload_id` order once the current attempt is terminal.
+///
+/// # Errors
+///
+/// Returns [`ControlError::SourceRequestConflict`] when the UUID's immutable payload changed, or a
+/// database connectivity/invariant error.
+pub async fn request_from_source(
+    ex: impl PgExecutor<'_>,
+    request: &SourceReloadRequest<'_>,
+) -> Result<ReloadId, ControlError> {
+    let rec = sqlx::query_file!(
+        "sql/postgres/queries/request_reload_from_source.sql",
+        request.epoch.0,
+        request.source_schema,
+        request.source_table,
+        request.flavor.as_str(),
+        request.source_request_id,
+        request.parent_request_id,
+        request.scope.as_str(),
+    )
+    .fetch_optional(ex)
+    .await
+    .map_err(|e| {
+        if let sqlx::Error::Database(db) = &e
+            && db.code().as_deref() == Some("23505")
+            && db.constraint() == Some("table_reload_one_live")
+        {
+            return ControlError::ReloadInProgress {
+                schema: request.source_schema.to_string(),
+                table: request.source_table.to_string(),
+            };
+        }
+        ControlError::from(e)
+    })?;
+
+    rec.map(|row| row.reload_id.into())
+        .ok_or_else(|| ControlError::SourceRequestConflict {
+            request_id: request.source_request_id,
+            schema: request.source_schema.to_string(),
+            table: request.source_table.to_string(),
+        })
+}
+
 /// Claim up to `limit` `requested` rows for this holder: set the lease, flip to `exporting`.
 ///
 /// `FOR UPDATE SKIP LOCKED` under the guarded UPDATE makes concurrent claimers partition the
-/// queue instead of double-exporting; a fully-raced claimer just gets an empty `Vec`.
+/// queue instead of double-exporting; a fully-raced claimer just gets an empty `Vec`. Source-WAL
+/// rows form a per-table FIFO: only the oldest may claim, and it waits until the current
+/// `exporting | export_complete` attempt becomes terminal. Legacy direct requests keep their
+/// immediate duplicate rejection and take priority over an unclaimed source queue.
 ///
 /// # Errors
 ///
@@ -202,7 +345,9 @@ pub async fn claim_requested(
 /// dead preflight connection, a control-pg blip while recording a rejection. An infra error must
 /// neither terminally `fail` a valid request nor leave it `exporting` unowned; back in
 /// `requested`, the next tick re-claims and retries. Holder-guarded (only the claimant un-claims)
-/// and `exporting`-guarded, so it can never clobber a row someone else adopted.
+/// and `exporting`-guarded, so it can never clobber a row someone else adopted. The SQL also
+/// requires the pristine cursor and no start fence: once F exists, returning to ordinary pickup
+/// would lose ownership of the connection-local source snapshot and is therefore forbidden.
 ///
 /// # Errors
 ///
@@ -245,11 +390,110 @@ pub async fn renew_lease(
     Ok(done.rows_affected() > 0)
 }
 
+/// Freeze the authoritative safe lower fence `F` and schema, and create its durable baseline
+/// marker in the same control-Postgres statement.
+///
+/// Unlike legacy `first_lsn`, this happens before any table query or Parquet file. Consequently an
+/// empty export still has a baseline that can trigger reconstruction. An exact retry is accepted
+/// while the attempt remains `exporting`; a changed LSN/schema or illegal state changes zero rows.
+///
+/// # Errors
+///
+/// Returns [`ControlError::ReloadTransition`] unless the attempt is `exporting` with compatible
+/// frozen values, or a database connectivity/invariant error.
+pub async fn record_start_fence(
+    ex: impl PgExecutor<'_>,
+    reload_id: ReloadId,
+    start_lsn: Lsn,
+    identity: ReloadFenceIdentity<'_>,
+) -> Result<(), ControlError> {
+    let row = sqlx::query_file!(
+        "sql/postgres/queries/record_start_fence.sql",
+        reload_id.0,
+        start_lsn as Lsn,
+        identity.schema_version.0,
+        identity.request_id,
+        identity.source_schema,
+        identity.source_table,
+    )
+    .fetch_optional(ex)
+    .await?;
+    if row.is_none() {
+        return Err(ControlError::ReloadTransition {
+            reload_id,
+            expected: "exporting (same start_lsn and schema_version)",
+        });
+    }
+    Ok(())
+}
+
+/// Persist the data-free upper barrier `H` after target WAL through `H` is durable.
+///
+/// This does not change status: [`complete_export`] separately verifies the exact marker and then
+/// performs `exporting → export_complete`. Splitting the operations makes the durability point
+/// explicit and crash-replayable. The marker works for empty tables because it has no file/row
+/// dependency.
+///
+/// # Errors
+///
+/// Returns [`ControlError::ReloadTransition`] unless the attempt is `exporting`, has a frozen
+/// baseline/schema, and `H >= F`, or when an existing end marker disagrees.
+pub async fn record_end_marker(
+    ex: impl PgExecutor<'_>,
+    reload_id: ReloadId,
+    final_lsn: Lsn,
+    identity: ReloadFenceIdentity<'_>,
+) -> Result<(), ControlError> {
+    let row = sqlx::query_file!(
+        "sql/postgres/queries/record_end_marker.sql",
+        reload_id.0,
+        final_lsn as Lsn,
+        identity.schema_version.0,
+        identity.request_id,
+        identity.source_schema,
+        identity.source_table,
+    )
+    .fetch_optional(ex)
+    .await?;
+    if row.is_none() {
+        return Err(ControlError::ReloadTransition {
+            reload_id,
+            expected: "exporting (frozen baseline, H >= F, same end marker)",
+        });
+    }
+    Ok(())
+}
+
+/// Read the durable boundary records for one attempt in baseline-then-end order.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the marker rows cannot be read or decoded.
+pub async fn read_markers(
+    ex: impl PgExecutor<'_>,
+    reload_id: ReloadId,
+) -> Result<Vec<ReloadMarkerRow>, ControlError> {
+    let rows = sqlx::query_file!("sql/postgres/queries/read_reload_markers.sql", reload_id.0,)
+        .fetch_all(ex)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ReloadMarkerRow {
+            reload_id: row.reload_id.into(),
+            kind: row.marker_kind,
+            lsn: row.lsn,
+            schema_version: row.schema_version.into(),
+        })
+        .collect())
+}
+
 /// Record chunk `chunk_no` done: bump the cursor, store the new PK bound.
 ///
-/// On the FIRST chunk this freezes `first_lsn = L₁` (the `COALESCE`: later chunks legitimately
-/// carry a new `L_i` each call, so their values are simply not the first and never overwrite it)
-/// and `schema_version` — which, unlike the LSN, is also **asserted**: every reload attempt is
+/// On the first chunk this retains `first_lsn` as diagnostic compatibility data (the `COALESCE`
+/// prevents later chunks from overwriting it). Every executable attempt has already frozen the
+/// authoritative `start_lsn` and `schema_version` through [`record_start_fence`], and SQL requires
+/// each chunk watermark to equal that exact F.
+/// `schema_version` is always **asserted**: every reload attempt is
 /// single-schema *by construction* (H9), so a later chunk arriving with a different version means
 /// the export engine missed a DDL restart — the WHERE rejects it and the mismatch is the
 /// same loud zero-rows error as any illegal transition, never a silent swallow. The
@@ -290,12 +534,14 @@ pub async fn advance_cursor(
 }
 
 /// `exporting → export_complete`, recording the final watermark `H`. The sink's last act; from
-/// here the LOADER finishes the walk (`complete` once `transformed_lsn >= H`).
+/// here the LOADER finishes the walk (`complete` once `transformed_lsn >= H`). Every request source
+/// and both persisted flavor spellings must already have matching durable baseline/end markers.
 ///
 /// # Errors
 ///
-/// Returns [`ControlError::ReloadTransition`] unless the attempt is still `exporting`; database
-/// failures become [`ControlError::Connect`] or [`ControlError::CheckViolation`].
+/// Returns [`ControlError::ReloadTransition`] unless the attempt is still `exporting` and its
+/// markers match; database failures become [`ControlError::Connect`] or
+/// [`ControlError::CheckViolation`].
 pub async fn complete_export(
     ex: impl PgExecutor<'_>,
     reload_id: ReloadId,
@@ -311,15 +557,15 @@ pub async fn complete_export(
     if done.rows_affected() == 0 {
         return Err(ControlError::ReloadTransition {
             reload_id,
-            expected: "exporting",
+            expected: "exporting (with matching durable baseline/end markers)",
         });
     }
     Ok(())
 }
 
 /// `export_complete → complete` — the loader calls this once `transformed_lsn >= final_lsn`.
-/// Terminal: the row leaves the `table_reload_one_live` index and the table can be
-/// reloaded again.
+/// Terminal: the row leaves the `table_reload_one_live` index, allowing the oldest queued source
+/// request to be claimed and direct/operator requests to be accepted again.
 ///
 /// # Errors
 ///
@@ -391,45 +637,58 @@ pub const fn restart_would_exceed_cap(restart_count: i32, max_restarts: i32) -> 
     }
 }
 
-/// H9 restart-on-DDL: in ONE transaction, fail the old attempt — [`fail`]'s coupling
+/// Why one exporter attempt must be superseded by a fresh fenced attempt.
+#[derive(Debug, Clone, Copy)]
+enum AttemptRestartCause {
+    Ddl(SchemaVersionNo),
+    LostSnapshot,
+}
+
+impl AttemptRestartCause {
+    fn reason(self, capped: bool, max_restarts: i32) -> String {
+        let cap = if capped {
+            format!("; restart cap {max_restarts} exhausted")
+        } else {
+            String::new()
+        };
+        match self {
+            Self::Ddl(new_schema_version) => {
+                format!("superseded: ddl bumped schema_version to {new_schema_version}{cap}")
+            }
+            Self::LostSnapshot => {
+                format!("superseded: exporter lost its source snapshot ownership{cap}")
+            }
+        }
+    }
+}
+
+/// Restart one exporter attempt: in ONE transaction, fail the old attempt — [`fail`]'s coupling
 /// purges its `kind='reload'` manifest rows, so no observer ever sees a terminal attempt with
 /// claimable chunk files — and, unless the restart cap is spent, INSERT its successor.
 ///
 /// The successor is born `exporting`, carrying the old row's identity **and its lease** (an
 /// `INSERT … SELECT` copies `lease_holder`/`lease_expiry` verbatim, so the running exporter keeps
 /// ownership and no pickup round-trip is spent) with a FRESH cursor: `chunk_no` 0, `cursor_pk`
-/// NULL, and — the point of the whole exercise — `schema_version` NULL so chunk 1 re-freezes it at
-/// the NEW version. `restart_count` is `old + 1`. The `table_reload_one_live` partial unique index
+/// NULL, and `schema_version` NULL so the successor resolves the current registry version before
+/// opening its new snapshot. `restart_count` is `old + 1`. The `table_reload_one_live` partial unique index
 /// tolerates the successor only because the predecessor turns terminal in the SAME transaction.
 ///
 /// Returns the successor `reload_id`, or `None` when `restart_count + 1 > max_restarts`: then the
 /// attempt is failed-only (the cap named in the reason) and no successor is written — visible
 /// waste, never silent mis-reconciliation (the design's H9 choice).
 ///
-/// # Errors
-///
-/// Returns [`ControlError::ReloadTransition`] if the predecessor can no longer be failed, or
-/// [`ControlError::Connect`] / [`ControlError::CheckViolation`] if the transaction, purge, successor
-/// insert, or commit fails.
-pub async fn restart_for_ddl(
+async fn restart_attempt(
     conn: &mut PgConnection,
     old: &ReloadRow,
-    new_schema_version: SchemaVersionNo,
     max_restarts: i32,
+    cause: AttemptRestartCause,
 ) -> Result<Option<ReloadId>, ControlError> {
     // Computed before `capped` is known, so it saturates for the same reason the cap check is
     // checked: an `i32::MAX` predecessor must not wrap here either. The capped path discards it, and
     // on the path that keeps it the cap has already proved the successor count is exact.
     let next_restart = old.restart_count.saturating_add(1);
     let capped = restart_would_exceed_cap(old.restart_count, max_restarts);
-    let reason = if capped {
-        format!(
-            "superseded: ddl bumped schema_version to {new_schema_version}; \
-             restart cap {max_restarts} exhausted"
-        )
-    } else {
-        format!("superseded: ddl bumped schema_version to {new_schema_version}")
-    };
+    let reason = cause.reason(capped, max_restarts);
 
     let mut tx = conn.begin().await?;
     // Reuse fail() (a savepoint inside this tx): one place owns "terminal ⇒ no claimable files".
@@ -453,6 +712,100 @@ pub async fn restart_for_ddl(
     .await?;
     tx.commit().await?;
     Ok(Some(rec.reload_id.into()))
+}
+
+/// H9 restart-on-DDL. The successor gets a fresh cursor, schema resolution, and F fence.
+///
+/// # Errors
+///
+/// Returns [`ControlError::ReloadTransition`] if the predecessor can no longer be failed, or
+/// [`ControlError::Connect`] / [`ControlError::CheckViolation`] if the transaction, purge,
+/// successor insert, or commit fails.
+pub async fn restart_for_ddl(
+    conn: &mut PgConnection,
+    old: &ReloadRow,
+    new_schema_version: SchemaVersionNo,
+    max_restarts: i32,
+) -> Result<Option<ReloadId>, ControlError> {
+    restart_attempt(
+        conn,
+        old,
+        max_restarts,
+        AttemptRestartCause::Ddl(new_schema_version),
+    )
+    .await
+}
+
+/// Crash recovery for an adopted exporter whose source snapshot no longer exists. A read-only
+/// PostgreSQL snapshot is connection-local and cannot be resumed from a durable chunk cursor, so
+/// the predecessor is failed/purged and a lease-carrying successor starts at chunk zero with a
+/// fresh F. This uses the same bounded restart budget as DDL supersession.
+///
+/// # Errors
+///
+/// Returns [`ControlError::ReloadTransition`] if the predecessor can no longer be failed, or
+/// [`ControlError::Connect`] / [`ControlError::CheckViolation`] if the transaction, purge,
+/// successor insert, or commit fails.
+pub async fn restart_for_lost_snapshot(
+    conn: &mut PgConnection,
+    old: &ReloadRow,
+    max_restarts: i32,
+) -> Result<Option<ReloadId>, ControlError> {
+    restart_attempt(conn, old, max_restarts, AttemptRestartCause::LostSnapshot).await
+}
+
+/// Crash recovery for an adopted attempt that has not committed any baseline chunk. The old
+/// connection may nevertheless have appended F or H to source WAL just before it disappeared, so
+/// reusing its fence identity would let a delayed marker bound a later snapshot. Atomically fail
+/// the predecessor and create a fresh lease-carrying successor, but preserve `restart_count`: no
+/// durable baseline work was lost, so this recovery does not spend the bounded DDL/snapshot-loss
+/// restart budget.
+///
+/// The successor insert rechecks the pristine cursor under the same transaction. If the abandoned
+/// exporter raced adoption and committed a chunk after the caller read `old`, the whole transition
+/// rolls back and reports [`ControlError::ReloadTransition`]; a later adoption will then use the
+/// ordinary, budgeted lost-snapshot path.
+///
+/// # Errors
+///
+/// Returns [`ControlError::ReloadTransition`] if the predecessor is no longer live or no longer
+/// pristine, or [`ControlError::Connect`] / [`ControlError::CheckViolation`] if the transaction,
+/// purge, successor insert, or commit fails.
+pub async fn restart_pristine_adoption(
+    conn: &mut PgConnection,
+    old: &ReloadRow,
+) -> Result<ReloadId, ControlError> {
+    let mut tx = conn.begin().await?;
+    fail(
+        &mut tx,
+        old.reload_id,
+        "superseded: adopted pristine attempt gets a fresh source fence identity",
+    )
+    .await?;
+    let successor = sqlx::query(
+        "INSERT INTO walrus.table_reload
+             (epoch, source_schema, source_table, flavor, status, restart_count,
+              lease_holder, lease_expiry, parent_request_id, request_scope)
+         SELECT epoch, source_schema, source_table, flavor, 'exporting', $2,
+                lease_holder, lease_expiry, COALESCE(source_request_id, parent_request_id),
+                request_scope
+         FROM walrus.table_reload
+         WHERE reload_id = $1 AND chunk_no = 0 AND cursor_pk IS NULL
+         RETURNING reload_id",
+    )
+    .bind(old.reload_id.0)
+    .bind(old.restart_count)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(successor) = successor else {
+        return Err(ControlError::ReloadTransition {
+            reload_id: old.reload_id,
+            expected: "exporting with no durable chunk progress",
+        });
+    };
+    let successor_id = ReloadId(successor.try_get("reload_id")?);
+    tx.commit().await?;
+    Ok(successor_id)
 }
 
 /// The loader's completion flip (H10): every `export_complete` reload for this table whose
@@ -484,13 +837,14 @@ pub async fn complete_reached(
     Ok(rows.into_iter().map(|row| row.reload_id.into()).collect())
 }
 
-/// The floor `first_lsn` (`L₁`) below which a pending **rebuild** supersedes this table's pending
+/// The authoritative `start_lsn` (`F`) below which a pending **rebuild** supersedes this table's
 /// manifest files. A live `reload`-flavor reload's rebuild trigger will `CREATE OR
 /// REPLACE` the mirror at the new schema and `delete_superseded` every non-reload file with
-/// `lsn_end <= first_lsn` — so the loader must NOT reconcile (and possibly quarantine on) such a
-/// file: it skips it and lets the rebuild replace the mirror. Returns `first_lsn` for a
-/// `reload`-flavor reload in `requested|exporting|export_complete` with `first_lsn` frozen, else
-/// `None` (there is at most one live reload per table — the `table_reload_one_live` index).
+/// `lsn_end <= start_lsn` — so the loader must NOT reconcile (and possibly quarantine on) such a
+/// file: it skips it and lets the rebuild replace the mirror. Only the explicit start fence is
+/// authoritative; legacy `first_lsn` is diagnostic and can never authorize reconciliation. There
+/// is at most one active (`exporting | export_complete`) attempt per table; later source-backed
+/// `requested` rows carry no fence yet and remain queued behind it.
 ///
 /// This is what closes the quarantine-recovery loop: without it, a lossy-`ALTER` stream file
 /// (lower `lsn_end` than the reload's `first_lsn`) re-quarantines the loader on every restart before
@@ -516,8 +870,8 @@ pub async fn reload_supersede_floor(
     Ok(rec.and_then(|r| r.first_lsn))
 }
 
-/// Startup crash-recovery (H7): the `exporting` reloads this sink may resume — its OWN
-/// lease (a restart of the same instance) or an EXPIRED one (a dead instance). Re-acquires the
+/// Crash recovery (H7): the `exporting` reloads this sink may resume — its OWN live lease when
+/// `include_own_live_lease` is enabled for startup, or an EXPIRED lease on any later scan. Re-acquires the
 /// lease in the SAME guarded `UPDATE … RETURNING` (with `FOR UPDATE SKIP LOCKED`) so two racing
 /// pods can never both adopt one row. A live FOREIGN lease (`lease_holder <> me AND lease_expiry >
 /// now()`) is deliberately excluded — never stolen. `requested` rows are excluded too: those go
@@ -537,6 +891,7 @@ pub async fn adopt_resumable(
     holder: &str,
     lease_ttl_secs: i64,
     limit: i64,
+    include_own_live_lease: bool,
 ) -> Result<Vec<ReloadRow>, ControlError> {
     let rows = sqlx::query_file!(
         "sql/postgres/queries/adopt_resumable.sql",
@@ -544,6 +899,7 @@ pub async fn adopt_resumable(
         holder,
         lease_ttl_secs as f64,
         limit,
+        include_own_live_lease,
     )
     .fetch_all(ex)
     .await?;
@@ -573,10 +929,10 @@ pub async fn stuck_exporting(
 
 /// Tables mid-rebuild — the loader-pause predicate's input.
 ///
-/// Deliberately `flavor = 'reload'` only (a `resync` never pauses anything — H3) and deliberately
-/// `requested | exporting` only: the pause MUST lift at `export_complete`, because the rebuild is
-/// *triggered by the loader claiming the chunk files* — pausing through `export_complete` would
-/// deadlock the reload forever; keep the boundary here so no caller re-derives it.
+/// This includes both persisted flavors because `resync` is a compatibility alias for the same
+/// rebuild. It deliberately includes `requested | exporting` only: the pause MUST lift at
+/// `export_complete`, because the rebuild is triggered by the loader claiming the chunk files;
+/// pausing through `export_complete` would deadlock the reload forever.
 ///
 /// # Errors
 ///
@@ -589,6 +945,33 @@ pub async fn active_rebuilds(
         .fetch_all(ex)
         .await?;
     Ok(rows.into_iter().map(|row| typed_reload_row!(row)).collect())
+}
+
+/// Return the marker-complete rebuild ready for this table's hidden-generation reconciliation.
+///
+/// This is deliberately independent of `file_manifest`: an empty table has no reload Parquet file,
+/// but its matching baseline/end records are sufficient to initialize and publish an empty shadow.
+/// The query verifies that both marker LSNs and schema versions exactly match the attempt before
+/// exposing it to the loader.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the ready rebuild cannot be queried or decoded.
+pub async fn ready_rebuild(
+    ex: impl PgExecutor<'_>,
+    epoch: EpochNo,
+    source_schema: &str,
+    source_table: &str,
+) -> Result<Option<ReloadRow>, ControlError> {
+    let row = sqlx::query_file!(
+        "sql/postgres/queries/ready_rebuild.sql",
+        epoch.0,
+        source_schema,
+        source_table,
+    )
+    .fetch_optional(ex)
+    .await?;
+    Ok(row.map(|row| typed_reload_row!(row)))
 }
 
 /// Read one reload attempt, if it exists.

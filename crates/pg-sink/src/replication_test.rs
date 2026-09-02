@@ -77,6 +77,21 @@ fn auth_sub_type_reports_a_truncated_body_instead_of_panicking() {
 }
 
 #[test]
+fn advisory_guard_data_row_requires_one_text_boolean() {
+    let mut yes = Vec::new();
+    yes.extend_from_slice(&1_u16.to_be_bytes());
+    yes.extend_from_slice(&1_i32.to_be_bytes());
+    yes.push(b't');
+    assert!(data_row_bool(&yes).unwrap());
+
+    let mut no = yes.clone();
+    *no.last_mut().unwrap() = b'f';
+    assert!(!data_row_bool(&no).unwrap());
+    assert!(data_row_bool(&[]).is_err());
+    assert!(data_row_bool(&[0, 2, 0, 0, 0, 1, b't']).is_err());
+}
+
+#[test]
 fn parse_dsn_rejects_a_dsn_without_a_tcp_host() {
     let err = parse_dsn("user=walrus dbname=walrus").unwrap_err();
     assert!(err.to_string().contains("needs a TCP host"));

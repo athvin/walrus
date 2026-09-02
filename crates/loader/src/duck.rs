@@ -11,7 +11,7 @@ use common::oids::{
     TIMESTAMPTZ, UUID,
 };
 use common::sql::SqlStrExt;
-use common::{EpochNo, ManifestId, PgRelation, Redacted, ReloadId, SchemaVersionNo};
+use common::{EpochNo, Lsn, ManifestId, PgRelation, Redacted, ReloadId, SchemaVersionNo};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -35,7 +35,6 @@ const CREATE_USER_VIEW: &str = include_str!("../sql/duckdb/templates/create_user
 const CREATE_META: &str = include_str!("../sql/duckdb/templates/create_meta.sql");
 const CONFIGURE_S3: &str = include_str!("../sql/duckdb/templates/configure_s3.sql");
 const APPEND_PARQUET: &str = include_str!("../sql/duckdb/templates/append_parquet.sql");
-const RELOAD_REBUILD_DROP: &str = include_str!("../sql/duckdb/templates/reload_rebuild_drop.sql");
 const WIPE_GENERATION: &str = include_str!("../sql/duckdb/templates/wipe_generation.sql");
 const MIGRATE_RAW_REPLAY_FENCE: &str =
     include_str!("../sql/duckdb/templates/migrate_raw_replay_fence.sql");
@@ -53,6 +52,35 @@ CREATE TABLE IF NOT EXISTS "_walrus_ingested_files" (
     "manifest_id" BIGINT NOT NULL
 );
 "#;
+
+const CREATE_RELOAD_STATE: &str = r#"
+CREATE TABLE IF NOT EXISTS "_walrus_reload_state" (
+    "reload_id" BIGINT NOT NULL,
+    "shadow_table" VARCHAR NOT NULL,
+    "schema_version" BIGINT NOT NULL,
+    "start_lsn" VARCHAR NOT NULL,
+    "final_lsn" VARCHAR NOT NULL
+);
+"#;
+
+/// A durable, unpublished full-table generation being reconciled.
+///
+/// There is at most one row per table namespace. It lives beside the canonical mirror so a worker
+/// restart can continue appending and transforming the same shadow instead of clearing partial work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReloadBuild {
+    pub(crate) reload_id: ReloadId,
+    pub(crate) shadow_table: String,
+    pub(crate) schema_version: SchemaVersionNo,
+    pub(crate) start_lsn: Lsn,
+    pub(crate) final_lsn: Lsn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BeginReload {
+    Ready(ReloadBuild),
+    Stale,
+}
 
 /// Owns one table's DuckDB execution connection (mirror `<table>` + CDC log `<table>_raw`).
 ///
@@ -210,6 +238,37 @@ impl TableDb {
         plan: &TablePlan,
         schema_version: SchemaVersionNo,
     ) -> Result<(), LoaderError> {
+        let generation = self.generation_sql(plan);
+        let table = &plan.table;
+        // The per-table DDL-reconcile watermark. Seeded once; the applier advances it.
+        let meta = if self.is_ducklake() {
+            CREATE_DUCKLAKE_META.replace("{schema_version}", &schema_version.to_string())
+        } else {
+            CREATE_META.replace("{schema_version}", &schema_version.to_string())
+        };
+        let ledger = if self.is_ducklake() {
+            CREATE_DUCKLAKE_LEDGER
+        } else {
+            CREATE_INGEST_LEDGER
+        };
+
+        self.conn
+            .execute_batch(&format!(
+                "{generation} {meta} {ledger} {CREATE_RELOAD_STATE}"
+            ))
+            .duck_with(|| format!("ensure tables for {table}"))?;
+        // `CREATE TABLE IF NOT EXISTS` intentionally leaves an upgraded raw table's old primary
+        // key intact. Phase A uses it as a compatibility fence until all potentially pre-appended
+        // manifests have drained, then calls `migrate_legacy_replay_fence` exactly once.
+        self.legacy_raw_replay_pk
+            .set(!self.is_ducklake() && self.raw_has_primary_key(table)?);
+        self.publish_current_view()?;
+        Ok(())
+    }
+
+    /// Render one physical mirror/raw/view generation. Reload shadows share the canonical metadata
+    /// and ingest ledger, so neither is part of this fragment.
+    fn generation_sql(&self, plan: &TablePlan) -> String {
         let cols: Vec<String> = plan
             .mirror_cols
             .iter()
@@ -248,18 +307,6 @@ impl TableDb {
         // user projections"). Users read `<table>_current`; `_applied_*` never leak. Recreated by the DDL
         // applier after any structural change (a `SELECT *` view binds its columns at creation time).
         let user_view = user_view_sql(table);
-        // The per-table DDL-reconcile watermark. Seeded once; the applier advances it.
-        let meta = if self.is_ducklake() {
-            CREATE_DUCKLAKE_META.replace("{schema_version}", &schema_version.to_string())
-        } else {
-            CREATE_META.replace("{schema_version}", &schema_version.to_string())
-        };
-        let ledger = if self.is_ducklake() {
-            CREATE_DUCKLAKE_LEDGER
-        } else {
-            CREATE_INGEST_LEDGER
-        };
-
         // The CDC log: every change verbatim (the emit columns), with the intact
         // `walrus_pg_sink_meta` JSON plus four promoted columns. It is deliberately a HEAP: a
         // per-row composite primary key made each append build an ART index even though replay is a
@@ -268,18 +315,7 @@ impl TableDb {
             .replace("{table}", table)
             .replace("{raw_cols}", &raw_cols.join(", "));
 
-        self.conn
-            .execute_batch(&format!(
-                "{mirror} {applied_cols} {raw} {user_view} {meta} {ledger}"
-            ))
-            .duck_with(|| format!("ensure tables for {table}"))?;
-        // `CREATE TABLE IF NOT EXISTS` intentionally leaves an upgraded raw table's old primary
-        // key intact. Phase A uses it as a compatibility fence until all potentially pre-appended
-        // manifests have drained, then calls `migrate_legacy_replay_fence` exactly once.
-        self.legacy_raw_replay_pk
-            .set(!self.is_ducklake() && self.raw_has_primary_key(table)?);
-        self.publish_current_view()?;
-        Ok(())
+        format!("{mirror} {applied_cols} {raw} {user_view}")
     }
 
     /// Configure DuckDB's bundled httpfs for the S3/MinIO staging bucket — **once per connection**, so
@@ -579,7 +615,7 @@ impl TableDb {
     /// The **epoch (generation)** this `.duckdb` was last built for (`_walrus_meta['epoch']`), or `None`
     /// if never stamped (a brand-new file — no `_walrus_meta` yet — or a pre-4.6 file). A value below the
     /// control-plane epoch means the mirror + raw hold a **retired generation** (total-restart, §1.8) and
-    /// must be wiped before the new-epoch snapshot reloads.
+    /// must be wiped before the new generation's full-table reconciliation publishes.
     ///
     /// # Errors
     ///
@@ -686,54 +722,265 @@ impl TableDb {
         Ok(count > 0)
     }
 
-    /// The reload rebuild (reload H8, §5 step 4): atomically replace BOTH tables at the
-    /// triggering file's `schema_version` — empty, at exactly the shape the attempt's chunks carry
-    /// — then let ordinary Phase A/B replay chunks + post-`W` stream files in `(lsn_end, id)`
-    /// order.
-    ///
-    /// **The raw-history decision (design §6, resolved here):** a rebuild DISCARDS the table's raw
-    /// CDC history in DuckDB by design. The pre-reload raw rows describe the world the clear is
-    /// replacing — replaying them against the rebuilt mirror would resurrect exactly the drift the
-    /// reload exists to kill — and the staged Parquet persists in S3 per its GC policy for
-    /// forensic replay. Acceptable for quarantine recovery, the feature's anchor use case.
-    ///
-    /// `_walrus_meta` survives (the epoch + reload_id latches live there); the schema_version
-    /// watermark is set to the FILE's version explicitly — `ensure_tables_planned`'s seed is
-    /// `ON CONFLICT DO NOTHING` and the pre-rebuild watermark may differ in either direction.
+    /// Read the durable unpublished reload generation, if one exists.
     ///
     /// # Errors
     ///
-    /// Returns [`LoaderError::Duck`] if dropping, recreating, or stamping either table fails.
-    pub(crate) fn rebuild_for_reload(
+    /// Returns [`LoaderError::Duck`] for a metadata read failure or [`LoaderError::LsnParse`] when
+    /// persisted boundary text is corrupt.
+    pub(crate) fn reload_build(&self) -> Result<Option<ReloadBuild>, LoaderError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT reload_id, shadow_table, schema_version, start_lsn, final_lsn \
+                 FROM \"_walrus_reload_state\" ORDER BY reload_id DESC LIMIT 1",
+            )
+            .duck("prepare reload build read")?;
+        let mut rows = stmt.query([]).duck("read reload build")?;
+        let Some(row) = rows.next().duck("step reload build")? else {
+            return Ok(None);
+        };
+        let start_hex: String = row.get(3).duck("read reload start_lsn")?;
+        let final_hex: String = row.get(4).duck("read reload final_lsn")?;
+        Ok(Some(ReloadBuild {
+            reload_id: ReloadId(row.get(0).duck("read reload_id")?),
+            shadow_table: row.get(1).duck("read reload shadow table")?,
+            schema_version: SchemaVersionNo(row.get(2).duck("read reload schema version")?),
+            start_lsn: start_hex.parse().map_err(|source| LoaderError::LsnParse {
+                field: "reload start_lsn",
+                source,
+            })?,
+            final_lsn: final_hex.parse().map_err(|source| LoaderError::LsnParse {
+                field: "reload final_lsn",
+                source,
+            })?,
+        }))
+    }
+
+    /// Create (or resume) a hidden full-table generation without changing the live projection.
+    ///
+    /// The physical name is deterministic from `reload_id`. Repeating the exact begin after a crash
+    /// returns the existing generation without clearing it. A newer attempt discards only the older
+    /// unpublished shadow; an attempt at or below the published latch is stale.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] when shadow DDL/state persistence fails, or
+    /// [`LoaderError::Internal`] when an existing attempt's immutable boundaries changed.
+    pub(crate) fn begin_reload_shadow(
         &self,
         plan: &TablePlan,
         schema_version: SchemaVersionNo,
-    ) -> Result<(), LoaderError> {
-        let table = &plan.table;
-        self.unpublish_current_view()?;
-        self.conn
-            .execute_batch(&RELOAD_REBUILD_DROP.replace("{table}", table))
-            .duck_with(|| format!("reload rebuild drop for {table}"))?;
-        self.ensure_tables_planned(plan, schema_version)?;
-        self.set_schema_version(schema_version)?;
-        Ok(())
+        reload_id: ReloadId,
+        start_lsn: Lsn,
+        final_lsn: Lsn,
+    ) -> Result<BeginReload, LoaderError> {
+        if self
+            .recorded_reload_id()?
+            .is_some_and(|published| reload_id <= published)
+        {
+            return Ok(BeginReload::Stale);
+        }
+        if let Some(existing) = self.reload_build()? {
+            if reload_id < existing.reload_id {
+                return Ok(BeginReload::Stale);
+            }
+            if reload_id == existing.reload_id {
+                if existing.schema_version != schema_version
+                    || existing.start_lsn != start_lsn
+                    || existing.final_lsn != final_lsn
+                {
+                    return Err(LoaderError::Internal(format!(
+                        "reload {reload_id} marker/shape changed while its shadow was being built"
+                    )));
+                }
+                return Ok(BeginReload::Ready(existing));
+            }
+        }
+
+        let shadow_table = format!("__walrus_reload_{}", reload_id.0);
+        let build = ReloadBuild {
+            reload_id,
+            shadow_table: shadow_table.clone(),
+            schema_version,
+            start_lsn,
+            final_lsn,
+        };
+        let shadow_plan = plan.for_table(shadow_table.as_str());
+        let create_shadow = self.generation_sql(&shadow_plan);
+        let prior = self.reload_build()?;
+        self.in_txn("begin reload shadow", |conn| {
+            if let Some(prior) = &prior {
+                conn.execute_batch(&drop_generation_sql(&prior.shadow_table))
+                    .duck_with(|| {
+                        format!("drop superseded reload shadow {}", prior.shadow_table)
+                    })?;
+            }
+            // This also cleans up a residue left by an old implementation/manual repair. In the
+            // normal path the state row and generation were created in this same transaction.
+            conn.execute_batch(&drop_generation_sql(&shadow_table))
+                .duck_with(|| format!("drop stale reload shadow {shadow_table}"))?;
+            conn.execute_batch(&create_shadow)
+                .duck_with(|| format!("create reload shadow {shadow_table}"))?;
+            conn.execute("DELETE FROM \"_walrus_reload_state\"", [])
+                .duck("clear prior reload state")?;
+            conn.execute(
+                "INSERT INTO \"_walrus_reload_state\" \
+                 (reload_id, shadow_table, schema_version, start_lsn, final_lsn) \
+                 VALUES (?, ?, ?, ?, ?)",
+                duckdb::params![
+                    reload_id.0,
+                    shadow_table,
+                    schema_version.0,
+                    start_lsn.to_string(),
+                    final_lsn.to_string(),
+                ],
+            )
+            .duck("record reload shadow")?;
+            Ok(())
+        })?;
+        Ok(BeginReload::Ready(build))
+    }
+
+    /// Atomically replace the canonical generation with a fully reconciled shadow.
+    ///
+    /// The public DuckLake view continues to name the canonical internal view. That view, the live
+    /// tables, the shadow tables, the schema watermark, and the reload latch change in one DuckDB
+    /// transaction, so readers observe either the old complete generation or the new complete one.
+    /// An already-published retry is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] when the transactional swap fails, or
+    /// [`LoaderError::Internal`] when the requested attempt does not own the current shadow.
+    pub(crate) fn publish_reload_shadow(
+        &self,
+        canonical_table: &str,
+        reload_id: ReloadId,
+    ) -> Result<bool, LoaderError> {
+        if self
+            .recorded_reload_id()?
+            .is_some_and(|published| reload_id <= published)
+        {
+            return Ok(false);
+        }
+        let build = self.reload_build()?.ok_or_else(|| {
+            LoaderError::Internal(format!(
+                "cannot publish reload {reload_id}: no durable shadow generation"
+            ))
+        })?;
+        if build.reload_id != reload_id {
+            return Err(LoaderError::Internal(format!(
+                "cannot publish reload {reload_id}: shadow belongs to reload {}",
+                build.reload_id
+            )));
+        }
+
+        let canonical_view = format!("{canonical_table}_current");
+        let canonical_raw = format!("{canonical_table}_raw");
+        let shadow_view = format!("{}_current", build.shadow_table);
+        let shadow_raw = format!("{}_raw", build.shadow_table);
+        let recreate_view = user_view_sql(canonical_table);
+        let (drop_public_view, recreate_public_view) = match &self.backend {
+            Backend::Native => (String::new(), String::new()),
+            Backend::DuckLake(names) => {
+                let catalog = ident(&names.attach_name)?;
+                let source_schema = ident(&names.source_schema)?;
+                let internal_schema = ident(&names.internal_schema)?;
+                let public_view = ident(&format!("{}_current", names.source_table))?;
+                let internal_view = ident(&format!("{canonical_table}_current"))?;
+                (
+                    format!("DROP VIEW IF EXISTS {catalog}.{source_schema}.{public_view};"),
+                    format!(
+                        "CREATE VIEW {catalog}.{source_schema}.{public_view} AS \
+                         SELECT * FROM {catalog}.{internal_schema}.{internal_view};"
+                    ),
+                )
+            }
+        };
+        self.in_txn("publish reload shadow", |conn| {
+            conn.execute_batch(&format!(
+                "{drop_public_view} \
+                 DROP VIEW IF EXISTS \"{canonical_view}\"; \
+                 DROP VIEW IF EXISTS \"{shadow_view}\"; \
+                 DROP TABLE IF EXISTS \"{canonical_table}\"; \
+                 DROP TABLE IF EXISTS \"{canonical_raw}\"; \
+                 ALTER TABLE \"{}\" RENAME TO \"{canonical_table}\"; \
+                 ALTER TABLE \"{shadow_raw}\" RENAME TO \"{canonical_raw}\"; \
+                 {recreate_view} \
+                 {recreate_public_view}",
+                build.shadow_table,
+            ))
+            .duck_with(|| format!("swap reload {reload_id} into {canonical_table}"))?;
+            conn.execute(
+                "DELETE FROM \"_walrus_meta\" WHERE k IN ('schema_version', 'reload_id')",
+                [],
+            )
+            .duck("clear cutover metadata")?;
+            conn.execute(
+                "INSERT INTO \"_walrus_meta\" (k, v) \
+                 VALUES ('schema_version', ?), ('reload_id', ?)",
+                duckdb::params![build.schema_version.0, reload_id.0],
+            )
+            .duck("record reload cutover")?;
+            conn.execute("DELETE FROM \"_walrus_reload_state\"", [])
+                .duck("clear published reload state")?;
+            Ok(())
+        })?;
+        self.legacy_raw_replay_pk.set(false);
+        Ok(true)
     }
 
     /// Wipe a retired generation from this `.duckdb` (total-restart, §1.8): drop the user view, the mirror,
     /// the CDC log, and `_walrus_meta`. The caller then re-runs `ensure_tables*` to recreate them empty, so
-    /// the fresh new-epoch snapshot re-appends into `<table>_raw` and the transform re-derives `<table>`
+    /// the new generation's full-table reconciliation repopulates and publishes `<table>`
     /// from scratch (both watermarks reset — the new epoch's `loader_checkpoint` is a fresh `0/0`).
     ///
     /// # Errors
     ///
     /// Returns [`LoaderError::Duck`] if DuckDB cannot drop the retired generation's objects.
     pub fn wipe_generation(&self, table: &str) -> Result<(), LoaderError> {
+        let shadow = if self.has_reload_state_table()? {
+            self.reload_build()?.map(|build| build.shadow_table)
+        } else {
+            None
+        };
         self.unpublish_current_view()?;
+        if let Some(shadow) = shadow {
+            self.conn
+                .execute_batch(&drop_generation_sql(&shadow))
+                .duck_with(|| format!("wipe reload shadow {shadow}"))?;
+        }
         self.conn
             .execute_batch(&WIPE_GENERATION.replace("{table}", table))
             .duck_with(|| format!("wipe generation for {table}"))?;
         self.legacy_raw_replay_pk.set(false);
         Ok(())
+    }
+
+    fn has_reload_state_table(&self) -> Result<bool, LoaderError> {
+        let count: i64 = match &self.backend {
+            Backend::Native => self
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM information_schema.tables \
+                     WHERE table_name = '_walrus_reload_state'",
+                    [],
+                    |row| row.get(0),
+                )
+                .duck("probe _walrus_reload_state")?,
+            Backend::DuckLake(names) => self
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM information_schema.tables \
+                     WHERE table_catalog = ? AND table_schema = ? \
+                       AND table_name = '_walrus_reload_state'",
+                    duckdb::params![names.attach_name, names.internal_schema],
+                    |row| row.get(0),
+                )
+                .duck("probe DuckLake _walrus_reload_state")?,
+        };
+        Ok(count > 0)
     }
 
     /// Re-publish the stable source-schema read contract after creating or evolving the internal
@@ -999,6 +1246,14 @@ fn ident(raw: &str) -> Result<common::sql::SqlIdent, LoaderError> {
 /// re-runs this after any structural change to pick up added/renamed columns.
 pub(crate) fn user_view_sql(table: &str) -> String {
     CREATE_USER_VIEW.replace("{table}", table)
+}
+
+fn drop_generation_sql(table: &str) -> String {
+    format!(
+        "DROP VIEW IF EXISTS \"{table}_current\"; \
+         DROP TABLE IF EXISTS \"{table}\"; \
+         DROP TABLE IF EXISTS \"{table}_raw\";"
+    )
 }
 
 /// DuckDB S3/httpfs credentials for reading the staging bucket.

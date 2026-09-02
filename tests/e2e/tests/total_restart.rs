@@ -4,8 +4,8 @@
     reason = "integration test — unwrap/expect fine in setup + helpers"
 )]
 //! End-to-end total-restart (`architecture.md` "Slot loss / total-restart" + §1.8): when the single
-//! lifelong slot is **lost** on a successful connection, the sink bumps the epoch, opens a new slot with
-//! a fresh exported snapshot, and re-snapshots every table under the new generation; the loaders detect
+//! lifelong slot is **lost** on a successful connection, the sink bumps the epoch, opens a new slot,
+//! and requests fenced reconciliation for every table under the new generation; the loaders detect
 //! the new epoch and rebuild every `.duckdb` (raw re-appended, mirror re-derived), resetting **both**
 //! watermarks. And the load-bearing guard: a **transient disconnect is NOT slot loss** — it resumes from
 //! `confirmed_flush` and must never bump the epoch.
@@ -22,9 +22,9 @@
 use e2e::Harness;
 use std::time::Duration;
 
-/// Drop the slot mid-run → the sink total-restarts (epoch bump + re-snapshot) and the loader rebuilds
+/// Drop the slot mid-run → the sink total-restarts (epoch bump + full reconciliation) and the loader rebuilds
 /// every `.duckdb` under the new generation, resetting both watermarks; the mirror converges to the
-/// source (a prior DELETE stays deleted — the mirror is re-derived from the new snapshot, not the stale one).
+/// source (a prior DELETE stays deleted because the mirror is re-derived from the new full dump).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires docker compose up --wait (source PG + control PG + MinIO)"]
 async fn dropping_the_slot_triggers_epoch_bump_and_full_rebuild() {
@@ -52,7 +52,7 @@ async fn dropping_the_slot_triggers_epoch_bump_and_full_rebuild() {
 
     // DROP the slot mid-run → the sink's walsender is terminated and the sink exits; the change history
     // since confirmed_flush is now gone. Restart the sink: on a SUCCESSFUL connection it finds the slot
-    // ABSENT → TOTAL-RESTART (bump the epoch, new slot, re-snapshot every table under epoch 2).
+    // ABSENT → TOTAL-RESTART (bump the epoch, new slot, reconcile every table under epoch 2).
     h.drop_slot().await.expect("drop the replication slot");
     h.restart_sink()
         .await
@@ -96,7 +96,7 @@ async fn dropping_the_slot_triggers_epoch_bump_and_full_rebuild() {
         "epoch-2 watermarks reset then advanced consistently"
     );
 
-    // Rebuilt-from-the-new-snapshot mirror == source (0..200 minus id=100, plus the sentinel).
+    // Rebuilt-from-the-new-generation dump == source (0..200 minus id=100, plus the sentinel).
     h.assert_mirror_equals_source("orders").await.unwrap();
     let n = h
         .duckdb_scalar("orders", "SELECT count(*) FROM orders_current")
@@ -142,7 +142,7 @@ async fn transient_disconnect_does_not_trigger_total_restart() {
 
     // A TRANSIENT disconnect: terminate the sink's walsender WITHOUT dropping the slot (the slot survives).
     // The sink exits on the dropped connection; restart it — it classifies the slot HEALTHY (present) and
-    // RESUMES from confirmed_flush. This must NOT bump the epoch or re-snapshot.
+    // RESUMES from confirmed_flush. This must NOT bump the epoch or request a full reconciliation.
     h.terminate_walsender()
         .await
         .expect("bounce the sink's replication connection");
@@ -172,4 +172,39 @@ async fn transient_disconnect_does_not_trigger_total_restart() {
         .duckdb_scalar("orders", "SELECT count(*) FROM orders_current")
         .unwrap();
     assert_eq!(n, 101, "100 rows + sentinel, resumed intact");
+}
+
+/// A crash after creating a replacement slot but before opening its successor generation leaves a
+/// healthy slot alongside a durable `total_restart` intent. The next process must finish the restart,
+/// not stream that new slot into the old epoch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker compose up --wait (source PG + control PG + MinIO)"]
+async fn healthy_slot_with_restart_intent_opens_a_reconciled_successor() {
+    let mut h = Harness::start().await.expect("bring up sink + loader");
+    let old_epoch = control::read_current_epoch(h.control_pool())
+        .await
+        .unwrap()
+        .expect("initial generation");
+    assert_eq!(old_epoch.epoch.0, 1);
+
+    h.kill_sink().await.expect("crash sink with slot retained");
+    assert!(
+        control::mark_total_restart(h.control_pool(), old_epoch.epoch)
+            .await
+            .unwrap(),
+        "model the durable intent written immediately before the source slot mutation"
+    );
+    h.await_loader_exited(Duration::from_secs(30))
+        .await
+        .expect("loader must stop serving the retired generation before a successor exists");
+    h.restart_sink()
+        .await
+        .expect("healthy slot plus intent completes total restart");
+
+    let new_epoch = h
+        .await_epoch_past(1, Duration::from_secs(60))
+        .await
+        .expect("restart intent opens a successor generation");
+    assert_eq!(new_epoch, 2);
+    assert!(h.sink_log_contains("TOTAL-RESTART"));
 }

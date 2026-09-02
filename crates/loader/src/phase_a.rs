@@ -10,12 +10,11 @@
 //! advance+delete txn. A crash between them re-claims the still-`ready` file, finds its marker, and
 //! returns zero without rebuilding a per-row index.
 
-use crate::duck::TableDb;
+use crate::duck::{BeginReload, ReloadBuild, TableDb};
 use crate::error::LoaderError;
 use crate::health::LoaderState;
 use common::{EpochNo, Lsn, PgRelation, ReloadId, SchemaVersionNo};
-use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::cell::Cell;
 use std::num::NonZeroI64;
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,12 +59,6 @@ pub struct TableCtx {
     /// `run_phase_a(&ctx)`, not synchronisation. `Option<ReloadId>` is `Copy`, so `Cell` has no borrow
     /// flag or runtime panic path.
     pub pause_logged: Cell<Option<ReloadId>>,
-    /// reload_ids already identified as `resync`. A resync never sets the meta latch, so
-    /// every one of its chunk files would otherwise re-enter `route_reload_file`'s "greater" arm and
-    /// re-fetch the reload row; caching the flavor here makes chunks 2…n a plain append with no
-    /// per-file lookup. `HashSet` is not `Copy`, so this uses `RefCell`; it remains confined to the
-    /// same single worker and every borrow ends before an await.
-    pub resync_ids: RefCell<HashSet<ReloadId>>,
 }
 
 /// The once-per-pause transition: `Some(reload_id)` exactly when a NEW pause begins (a different
@@ -124,6 +117,12 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     let (max_ready, raw_appended) = read_lag_inputs(ctx).await?;
     common::metrics::set_raw_append_lag(&ctx.series, raw_append_lag_bytes(max_ready, raw_appended));
 
+    // A source-driven attempt is discoverable from its durable marker rows even when the table
+    // exported zero rows and therefore produced no reload manifest. Start (or resume) its hidden
+    // generation before looking at the file queue; this also purges the pre-fence backlog so a
+    // large backlog cannot keep the first reload chunk outside every bounded claim forever.
+    let mut reload_build = prepare_ready_reload(ctx).await?;
+
     // 1. Claim in (lsn_end, id) order — NEVER `lsn_end > raw_appended_lsn` (that skips equal-lsn_end
     //    snapshot files forever).
     let claimed = control::claim_ready(
@@ -134,8 +133,19 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
         ctx.max_files.get(),
     )
     .await?;
+
+    // Close the readiness/claim check-use seam. If the first read saw `exporting` but
+    // `complete_export` became visible to the claim and lifted its pause, the newer read must
+    // create the hidden generation before any claimed (F,H] WAL is routed. This second read is
+    // needed even when `claimed` is empty: a zero-row dump still has marker-only work to publish.
+    // A completion after this read is safe: a claim that saw the existing attempt as requested or
+    // exporting returned no rows, while files claimed before a brand-new request all precede its F.
+    if reload_build.is_none() {
+        reload_build = prepare_ready_reload(ctx).await?;
+    }
+
     if claimed.is_empty() {
-        // Distinguish IDLE from PAUSED: a live rebuild-flavor reload withholds this
+        // Distinguish IDLE from PAUSED: a live reload attempt withholds this
         // table's claims (reload §2 — claiming would retire post-`W` files the rebuild must
         // replay). Only probe when a backlog exists, and log the reason once per pause.
         if max_ready.is_some() {
@@ -174,8 +184,8 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     //    file at a NEWER version, reconcile both tables UP TO it — so `<table>_raw` always has
     //    exactly the file's columns and the verbatim `SELECT *` append lines up; already-appended older
     //    rows read NULL for the freshly-added column (additive superset).
-    // A pending rebuild-flavor reload will CREATE OR REPLACE the mirror at the new schema
-    // and `delete_superseded` every non-reload file at `lsn_end <= first_lsn`. Such a file must NOT
+    // A pending reload will publish a replacement mirror at the new schema
+    // and `delete_superseded` every non-reload file at `lsn_end <= F`. Such a file must NOT
     // reconcile here: a lossy cast would re-quarantine the loader on every restart BEFORE it ever
     // reaches the reload chunk file that clears the quarantine (the claim order puts the low-`lsn_end`
     // blocker first). Compute the floor once; skip superseded version-crossing files in the loop.
@@ -183,14 +193,48 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
         control::reload::reload_supersede_floor(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table)
             .await?;
 
-    let mut max_lsn = Lsn::ZERO;
+    let mut max_lsn = raw_appended;
     let mut ids = Vec::with_capacity(claimed.len());
     let mut appended = 0u64;
     for f in &claimed {
-        // kind='reload' routing (H8/H9): greater ⇒ rebuild-then-append; equal ⇒ plain
-        // append (chunks 2…n); less ⇒ a stale attempt's file — retire it unapplied (its id joins
-        // the end-of-batch delete, its lsn_end never advances the frontier, DuckDB is untouched).
-        if f.kind == control::ManifestKind::Reload && !route_reload_file(ctx, f).await? {
+        // Validate this attempt's baseline identity before the generic H barrier. A malformed
+        // same-attempt reload file above H is not "future WAL": allowing it to hide behind the
+        // break would let Phase B publish an incomplete shadow while the bad baseline remained
+        // queued. A genuinely newer attempt has a different reload_id and stays queued normally.
+        if let Some(build) = &reload_build
+            && f.kind == control::ManifestKind::Reload
+            && f.reload_id == Some(build.reload_id)
+        {
+            validate_reload_manifest_at_f(f, build)?;
+        }
+
+        // H is a real, row-independent cut line. Leave later WAL in the ordered ready queue until
+        // Phase B has transformed and atomically published this shadow. That prevents canonical
+        // schema reconciliation or post-H writes from mutating either generation mid-cutover.
+        if reload_build
+            .as_ref()
+            .is_some_and(|build| f.lsn_end > build.final_lsn)
+        {
+            break;
+        }
+
+        let route = if f.kind == control::ManifestKind::Reload {
+            let route = route_reload_file(ctx, f).await?;
+            reload_build = ctx.db.reload_build()?;
+            route
+        } else if let Some(build) = &reload_build {
+            // The purge ran before this claim, but rows that were already returned in `claimed`
+            // remain in this in-memory vector. Retire those pre-fence rows without appending them.
+            if f.lsn_end <= build.start_lsn {
+                ids.push(f.id);
+                continue;
+            }
+            FileRoute::Shadow(build.shadow_table.clone())
+        } else {
+            FileRoute::Live
+        };
+
+        if route == FileRoute::Retire {
             tracing::debug!(
                 table = %format_args!("{}.{}", ctx.schema, ctx.table),
                 manifest_id = f.id.0,
@@ -205,7 +249,8 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
         // `delete_superseded` purges it, and so the loop reaches the reload chunk file that clears
         // the quarantine. Same-version files still apply normally and drop through the rebuild's
         // clear as the "wasted but harmless" pre-`W` backlog.
-        if f.kind != control::ManifestKind::Reload
+        if route == FileRoute::Live
+            && f.kind != control::ManifestKind::Reload
             && f.schema_version > ctx.db.schema_version()?
             && supersede_floor.is_some_and(|floor| f.lsn_end <= floor)
         {
@@ -218,7 +263,34 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
             );
             continue;
         }
-        if f.schema_version > ctx.db.schema_version()?
+        if let FileRoute::Shadow(_) = &route
+            && reload_build
+                .as_ref()
+                .is_none_or(|build| f.schema_version != build.schema_version)
+        {
+            return Err(LoaderError::Internal(format!(
+                "manifest {} at schema version {} crossed frozen reload {} shape",
+                f.id,
+                f.schema_version,
+                reload_build.as_ref().map_or_else(
+                    || "<missing>".to_string(),
+                    |build| build.reload_id.to_string()
+                )
+            )));
+        }
+        if f.kind == control::ManifestKind::Reload
+            && let FileRoute::Shadow(_) = &route
+        {
+            let build = reload_build.as_ref().ok_or_else(|| {
+                LoaderError::Internal(format!(
+                    "reload manifest {} was routed to a shadow with no active build",
+                    f.id
+                ))
+            })?;
+            validate_reload_manifest_at_f(f, build)?;
+        }
+        if route == FileRoute::Live
+            && f.schema_version > ctx.db.schema_version()?
             && let Err(e) = crate::ddl::reconcile_to_version(
                 &ctx.db,
                 &ctx.pool,
@@ -248,8 +320,18 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
         // committed inside the spill's placeholder range (architecture.md §1.6). Other kinds append verbatim.
         let commit_lsn_override =
             (f.kind == control::ManifestKind::Spill).then(|| f.lsn_end.to_string());
+        let destination = match &route {
+            FileRoute::Live => ctx.table.as_str(),
+            FileRoute::Shadow(table) => table.as_str(),
+            FileRoute::Retire => {
+                return Err(LoaderError::Internal(format!(
+                    "retired manifest {} reached the append path",
+                    f.id
+                )));
+            }
+        };
         appended += ctx.db.append_parquet(
-            &ctx.table,
+            destination,
             f.id,
             &f.s3_uri,
             f.schema_version,
@@ -261,6 +343,9 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
 
     // 3. ONE control-DB txn: advance the watermark to the batch max AND delete the claimed queue rows.
     //    (The append is already durable in DuckDB — step 2 committed.)
+    if ids.is_empty() {
+        return Ok(None);
+    }
     let mut tx = ctx
         .pool
         .begin()
@@ -303,43 +388,161 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     Ok(Some(max_lsn))
 }
 
-/// Route one claimed `kind='reload'` file. Returns `true` to append it, `false` when it
-/// is a STALE attempt's file to retire unapplied.
-///
-/// The trigger's order of operations — rebuild DuckDB → clear quarantine → purge superseded
-/// manifest rows → set the meta latch → (caller) append — is crash-walked as follows: a crash
-/// anywhere BEFORE the latch re-runs the whole trigger on redo, and every step is idempotent
-/// (`CREATE OR REPLACE`-style drop+recreate, the flag clear, the purge). A crash AFTER the latch
-/// but before the append leaves the file still claimed/ready, and the redo takes the
-/// `equal ⇒ append` arm. Nothing needs a rewind: chunk stamps `L_i > W`, so the frozen frontier
-/// only ever moves forward (H8).
-async fn route_reload_file(ctx: &TableCtx, f: &control::ManifestRow) -> Result<bool, LoaderError> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileRoute {
+    Live,
+    Shadow(String),
+    Retire,
+}
+
+fn validate_reload_manifest_at_f(
+    file: &control::ManifestRow,
+    build: &ReloadBuild,
+) -> Result<(), LoaderError> {
+    if file.reload_id != Some(build.reload_id)
+        || file.lsn_start != build.start_lsn
+        || file.lsn_end != build.start_lsn
+    {
+        return Err(LoaderError::Internal(format!(
+            "reload manifest {} identity/boundaries ({:?}, [{}, {}]) do not equal active reload {} at frozen F {}",
+            file.id, file.reload_id, file.lsn_start, file.lsn_end, build.reload_id, build.start_lsn
+        )));
+    }
+    Ok(())
+}
+
+/// Discover a marker-delimited, source-driven rebuild without depending on a data file.
+async fn prepare_ready_reload(ctx: &TableCtx) -> Result<Option<ReloadBuild>, LoaderError> {
+    let existing = ctx.db.reload_build()?;
+    let ready =
+        control::reload::ready_rebuild(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table).await?;
+    let Some(row) = ready else {
+        let Some(build) = existing else {
+            return Ok(None);
+        };
+        let row = control::reload::get(&ctx.pool, build.reload_id).await?;
+        let still_ready = if let Some(row) = &row
+            && row.status == control::ReloadStatus::ExportComplete
+        {
+            let (start_lsn, schema_version, final_lsn) = rebuild_boundaries(ctx, row).await?;
+            start_lsn == build.start_lsn
+                && schema_version == build.schema_version
+                && final_lsn == build.final_lsn
+        } else {
+            false
+        };
+        if still_ready {
+            return Ok(Some(build));
+        }
+        return Err(LoaderError::Internal(format!(
+            "unpublished reload {} is no longer export_complete; a newer marker-ready attempt is required to supersede it",
+            build.reload_id
+        )));
+    };
+    let (start_lsn, schema_version, final_lsn) = rebuild_boundaries(ctx, &row).await?;
+    let plan = plan_at_version(ctx, schema_version).await?;
+    let BeginReload::Ready(build) =
+        ctx.db
+            .begin_reload_shadow(&plan, schema_version, row.reload_id, start_lsn, final_lsn)?
+    else {
+        return Ok(None);
+    };
+    let purged =
+        control::delete_superseded(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table, start_lsn)
+            .await?;
+    tracing::info!(
+        table = %format_args!("{}.{}", ctx.schema, ctx.table),
+        reload_id = %row.reload_id,
+        schema_version = %schema_version,
+        start_lsn = %start_lsn,
+        final_lsn = %final_lsn,
+        purged,
+        "reload reconciliation started in a hidden generation"
+    );
+    Ok(Some(build))
+}
+
+async fn rebuild_boundaries(
+    ctx: &TableCtx,
+    row: &control::ReloadRow,
+) -> Result<(Lsn, SchemaVersionNo, Lsn), LoaderError> {
+    let schema_version = row.schema_version.ok_or_else(|| {
+        LoaderError::Internal(format!(
+            "reload {} has no frozen schema version",
+            row.reload_id
+        ))
+    })?;
+    let final_lsn = row.final_lsn.ok_or_else(|| {
+        LoaderError::Internal(format!("reload {} has no end boundary", row.reload_id))
+    })?;
+    let start_lsn = row.start_lsn.ok_or_else(|| {
+        LoaderError::Internal(format!(
+            "reload {} has no durable start fence",
+            row.reload_id
+        ))
+    })?;
+    if final_lsn < start_lsn {
+        return Err(LoaderError::Internal(format!(
+            "reload {} has inverted boundaries: H {final_lsn} precedes F {start_lsn}",
+            row.reload_id
+        )));
+    }
+
+    let markers = control::reload::read_markers(&ctx.pool, row.reload_id).await?;
+    let baseline = markers
+        .iter()
+        .find(|marker| marker.kind == control::ReloadMarkerKind::Baseline);
+    let end = markers
+        .iter()
+        .find(|marker| marker.kind == control::ReloadMarkerKind::End);
+    let valid = baseline
+        .is_some_and(|marker| marker.lsn == start_lsn && marker.schema_version == schema_version)
+        && end.is_some_and(|marker| {
+            marker.lsn == final_lsn && marker.schema_version == schema_version
+        })
+        && markers.len() == 2;
+    if !valid {
+        return Err(LoaderError::Internal(format!(
+            "reload {} boundaries do not match its durable baseline/end markers",
+            row.reload_id
+        )));
+    }
+    Ok((start_lsn, schema_version, final_lsn))
+}
+
+/// Route one claimed `kind='reload'` file to the live generation, the matching hidden generation,
+/// or retirement when it belongs to a stale attempt.
+async fn route_reload_file(
+    ctx: &TableCtx,
+    f: &control::ManifestRow,
+) -> Result<FileRoute, LoaderError> {
     let file_reload_id = f.reload_id.ok_or_else(|| {
         LoaderError::Internal(format!(
             "manifest row {} is kind='reload' but carries no reload_id",
             f.id
         ))
     })?;
-    // Fast path: a resync we've already classified — plain append, no `recorded` read and
-    // no per-file reload-row fetch. A resync never latches, so without this cache every chunk would
-    // re-enter the "greater" arm below and re-fetch.
-    if ctx.resync_ids.borrow().contains(&file_reload_id) {
-        return Ok(true);
+    if let Some(build) = ctx.db.reload_build()? {
+        if file_reload_id < build.reload_id {
+            return Ok(FileRoute::Retire);
+        }
+        if file_reload_id == build.reload_id {
+            return Ok(FileRoute::Shadow(build.shadow_table));
+        }
     }
     // `None` = the latch was never set, so this file can only be a NEW attempt: fall through to
     // the "greater" arm below rather than compare it against a stand-in id.
     if let Some(recorded) = ctx.db.recorded_reload_id()? {
         if file_reload_id < recorded {
-            return Ok(false); // a superseded attempt whose purge raced the claim (H9): retire
+            return Ok(FileRoute::Retire); // a superseded attempt whose purge raced the claim (H9)
         }
         if file_reload_id == recorded {
-            return Ok(true); // chunks 2…n of the attempt already rebuilt for
+            return Ok(FileRoute::Retire); // a crash-window chunk discovered after publication
         }
     }
 
-    // Greater (or unlatched): the first file of a NEW attempt. The reload row carries the flavor: a
-    // `resync` merges over the LIVE mirror (H3) — no clear, no purge, no latch, and raw history
-    // preserved (chunks flow through Phase A like any file); only a `reload` rebuilds.
+    // Greater (or unlatched): the first file of a NEW attempt. Both persisted flavors use the same
+    // hidden-generation reconciliation; `resync` is retained only as a compatibility spelling.
     let row = control::reload::get(&ctx.pool, file_reload_id)
         .await?
         .ok_or_else(|| {
@@ -347,42 +550,45 @@ async fn route_reload_file(ctx: &TableCtx, f: &control::ManifestRow) -> Result<b
                 "reload {file_reload_id} has chunk files but no table_reload row"
             ))
         })?;
-    if row.flavor == control::ReloadFlavor::Resync {
-        ctx.resync_ids.borrow_mut().insert(file_reload_id);
-        return Ok(true);
+    let (start_lsn, schema_version, final_lsn) = rebuild_boundaries(ctx, &row).await?;
+    if f.schema_version != schema_version {
+        return Err(LoaderError::Internal(format!(
+            "reload {file_reload_id} chunk schema {} differs from frozen schema {schema_version}",
+            f.schema_version
+        )));
     }
-    let first_lsn = row.first_lsn.ok_or_else(|| {
-        LoaderError::Internal(format!(
-            "reload {file_reload_id} has chunk files but no first_lsn"
-        ))
-    })?;
+    if f.lsn_end > final_lsn {
+        return Err(LoaderError::Internal(format!(
+            "reload {file_reload_id} chunk {} lies beyond end marker {final_lsn}",
+            f.id
+        )));
+    }
 
-    // 1. Rebuild both tables, empty, at the FILE's schema_version (all of an attempt's chunks
-    //    share it by construction; restart-on-DDL preserves that invariant).
-    let plan = plan_at_version(ctx, f.schema_version).await?;
-    ctx.db.rebuild_for_reload(&plan, f.schema_version)?;
-    // 2. The quarantine latch clears: the rebuild replaced the data the lossy cast
-    //    could not be applied to — this is the per-table recovery path v1 never had.
-    ctx.state.clear_quarantine();
-    // 3. Purge superseded pending rows: every non-reload file at lsn_end <= first_lsn describes a
-    //    commit the chunks re-cover; applying them after the clear would only churn. Post-`W`
-    //    stream files (lsn_end > first_lsn) survive and apply AFTER the chunks in (lsn_end, id)
-    //    order — the interleave H8 promises.
+    // Build both replacement tables under a hidden deterministic name. The public/live generation
+    // remains untouched until Phase B reaches the explicit H barrier.
+    let plan = plan_at_version(ctx, schema_version).await?;
+    let BeginReload::Ready(build) =
+        ctx.db
+            .begin_reload_shadow(&plan, schema_version, file_reload_id, start_lsn, final_lsn)?
+    else {
+        return Ok(FileRoute::Retire);
+    };
+    // Purge superseded pending rows: every non-reload file at lsn_end <= the start fence describes a
+    // commit the consistent baseline re-covers; applying it after replacement would only churn.
+    // Post-F stream files survive and apply after the baseline chunks in (lsn_end, id) order.
     let purged =
-        control::delete_superseded(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table, first_lsn)
+        control::delete_superseded(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table, start_lsn)
             .await?;
-    // 4. The latch: the rebuild happens exactly once per reload_id — a crash-redo of this same
-    //    file now takes the equal ⇒ append arm and cannot re-clear the table.
-    ctx.db.set_recorded_reload_id(file_reload_id)?;
     tracing::info!(
         table = %format_args!("{}.{}", ctx.schema, ctx.table),
         reload_id = %file_reload_id,
-        schema_version = %f.schema_version,
-        first_lsn = %first_lsn,
+        schema_version = %schema_version,
+        start_lsn = %start_lsn,
+        final_lsn = %final_lsn,
         purged,
-        "reload rebuild: tables replaced at the attempt's version; superseded rows purged; latch set"
+        "reload reconciliation started in a hidden generation"
     );
-    Ok(true)
+    Ok(FileRoute::Shadow(build.shadow_table))
 }
 
 /// The registry shape at `version` as a [`crate::plan::TablePlan`] (the Tier-2 emit/recombine

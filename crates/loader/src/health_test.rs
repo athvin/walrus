@@ -19,7 +19,7 @@ fn clearing_quarantine_does_not_promote_bootstrapping() {
 }
 
 #[test]
-fn quarantine_from_bootstrapping_implies_startup_completed() {
+fn quarantine_from_bootstrapping_does_not_publish_the_generation() {
     let s = LoaderState::new();
     s.quarantine();
 
@@ -28,8 +28,14 @@ fn quarantine_from_bootstrapping_implies_startup_completed() {
     assert!(s.is_quarantined());
 
     s.clear_quarantine();
-    assert!(s.is_ready());
+    assert!(
+        !s.is_ready(),
+        "repairing a table cannot infer that the global generation published"
+    );
     assert!(!s.is_quarantined());
+
+    s.mark_generation_ready();
+    assert!(s.is_ready());
 }
 
 #[test]
@@ -41,6 +47,49 @@ fn ready_and_live_are_independent() {
     assert!(s.is_live(), "a stamped cycle → live");
     assert!(!s.is_ready(), "live does not imply ready");
     s.mark_ready();
+    assert!(s.is_ready());
+}
+
+#[test]
+fn reconciling_generation_is_started_but_not_ready_until_published() {
+    let s = LoaderState::new();
+    s.mark_reconciling();
+
+    assert!(s.is_started(), "local bootstrap completed");
+    assert!(!s.is_ready(), "the frozen table group has not published");
+
+    s.mark_generation_ready();
+    assert!(s.is_ready(), "generation publication opens readiness");
+}
+
+#[test]
+fn retiring_a_published_generation_immediately_drops_readiness() {
+    let s = LoaderState::new();
+    s.mark_ready();
+    assert!(s.is_ready());
+
+    s.mark_generation_retired();
+    assert!(!s.is_ready());
+    assert!(
+        s.is_started(),
+        "local bootstrap remains complete while the process drains"
+    );
+}
+
+#[test]
+fn clearing_quarantine_does_not_bypass_generation_gate() {
+    let s = LoaderState::new();
+    s.mark_reconciling();
+    s.quarantine();
+    s.clear_quarantine();
+
+    assert!(!s.is_quarantined());
+    assert!(
+        !s.is_ready(),
+        "a table repair cannot publish the whole generation"
+    );
+
+    s.mark_generation_ready();
     assert!(s.is_ready());
 }
 

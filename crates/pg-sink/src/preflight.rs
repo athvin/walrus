@@ -95,6 +95,10 @@ pub enum PreflightError {
         schema: String,
         table: String,
     },
+    /// The publication exists, but its action flags or a per-table filter/column list make it an
+    /// incomplete source of truth for full-table reconciliation.
+    #[error(transparent)]
+    PublicationCoverage(#[from] crate::source_catalog::PublicationCoverageIssue),
     /// A published table has no key, so its updates and deletes could not be applied downstream.
     /// Raised only under [`PkMode::Strict`]; [`PkMode::Lenient`] reports it in a [`PkReport`].
     #[error("table {schema}.{table} has no PRIMARY KEY / usable replica identity")]
@@ -113,6 +117,12 @@ pub enum PreflightError {
          (apply migrations/source/0003_reload_signal.sql)"
     )]
     ReloadSignalMissing { detail: &'static str },
+    /// The append-only request/fence relation is absent or cannot identify its rows.
+    #[error(
+        "reload event table not installed: {detail} \
+         (apply migrations/source/0004_reload_event.sql)"
+    )]
+    ReloadEventMissing { detail: &'static str },
     /// A catalog query failed on the wire. `source` keeps tokio-postgres's typed failure — SQLSTATE,
     /// severity, hint — reachable by [`source()`](std::error::Error::source)/`downcast_ref`, exactly
     /// as [`HeartbeatError`](crate::heartbeat::HeartbeatError) already does for the same client.
@@ -149,9 +159,11 @@ impl From<PreflightError> for common::Error {
             | PreflightError::NoHeadroom { .. }
             | PreflightError::PublicationMissing { .. }
             | PreflightError::PublicationGap { .. }
+            | PreflightError::PublicationCoverage(_)
             | PreflightError::NoReplicationPriv
             | PreflightError::DdlCaptureMissing { .. }
             | PreflightError::ReloadSignalMissing { .. }
+            | PreflightError::ReloadEventMissing { .. }
             | PreflightError::Query(_)
             | PreflightError::UnusableResult(_)
             | PreflightError::Ident(_) => common::Error::Preflight(e.to_string()),
@@ -204,11 +216,12 @@ impl<'a> SourcePreflight<'a> {
     }
 
     /// The DDL-capture tap is installed: the `walrus.ddl_audit` table has the sink's columns
-    /// and **both** event triggers exist. Missing → terminal (schema changes would silently drift).
+    /// and all three event triggers exist with the required guarded command tags. Missing → terminal
+    /// (schema changes would silently drift).
     ///
     /// # Errors
     ///
-    /// Returns [`PreflightError::DdlCaptureMissing`] when the audit shape or either trigger is absent,
+    /// Returns [`PreflightError::DdlCaptureMissing`] when the audit shape or a trigger/tag is absent,
     /// [`PreflightError::Query`] when a catalog query fails, or [`PreflightError::UnusableResult`]
     /// when one answers with no row to read.
     pub async fn assert_ddl_capture(&self) -> Result<(), PreflightError> {
@@ -225,14 +238,34 @@ impl<'a> SourcePreflight<'a> {
                 detail: "walrus.ddl_audit table/columns absent",
             });
         }
-        for (name, event) in [
-            ("walrus_intercept_ddl", "ddl_command_end"),
-            ("walrus_intercept_drop", "sql_drop"),
+        for (name, event, function, tags) in [
+            (
+                "walrus_intercept_ddl",
+                "ddl_command_end",
+                "walrus.intercept_ddl()",
+                "true",
+            ),
+            (
+                "walrus_intercept_drop",
+                "sql_drop",
+                "walrus.intercept_ddl()",
+                "true",
+            ),
+            (
+                "walrus_guard_publication_ddl",
+                "ddl_command_start",
+                "walrus.guard_publication_ddl()",
+                "evttags @> ARRAY['CREATE PUBLICATION', 'ALTER PUBLICATION', \
+                                   'DROP PUBLICATION', 'ALTER SCHEMA']::text[]",
+            ),
         ] {
             let present = self
                 .first_text(&format!(
                     "SELECT EXISTS (SELECT 1 FROM pg_event_trigger
-                                    WHERE evtname='{name}' AND evtevent='{event}')::text",
+                                    WHERE evtname='{name}' AND evtevent='{event}'
+                                      AND evtfoid = to_regprocedure('{function}')
+                                      AND evtenabled IN ('O', 'A')
+                                      AND ({tags}))::text",
                 ))
                 .await?;
             if present != "true" {
@@ -336,10 +369,87 @@ impl<'a> SourcePreflight<'a> {
         Ok(())
     }
 
-    /// The publication exists and covers the walrus-internal tables — `heartbeat`, `ddl_audit`,
-    /// and `reload_signal` (create/extend when `manage_publication`, else a gap is terminal, with
-    /// the exact `ALTER PUBLICATION` fix in the error). `pg_publication_tables` already expands
-    /// `FOR ALL TABLES` and partition roots, so we read it directly.
+    /// The append-only request/fence table exists with a primary key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PreflightError::ReloadEventMissing`] for a missing table/key and the normal query
+    /// variants for catalog failures.
+    pub async fn assert_reload_event(&self) -> Result<(), PreflightError> {
+        if self
+            .first_text(
+                "SELECT EXISTS (SELECT 1 FROM pg_class c
+                                JOIN pg_namespace n ON n.oid = c.relnamespace
+                                WHERE n.nspname = 'walrus' AND c.relname = 'reload_event'
+                                  AND c.relkind = 'r')::text",
+            )
+            .await?
+            != "true"
+        {
+            return Err(PreflightError::ReloadEventMissing {
+                detail: "walrus.reload_event table absent",
+            });
+        }
+        if self
+            .first_text(
+                "SELECT EXISTS (SELECT 1 FROM pg_index i
+                                JOIN pg_class c ON c.oid = i.indrelid
+                                JOIN pg_namespace n ON n.oid = c.relnamespace
+                                WHERE n.nspname = 'walrus' AND c.relname = 'reload_event'
+                                  AND i.indisprimary)::text",
+            )
+            .await?
+            != "true"
+        {
+            return Err(PreflightError::ReloadEventMissing {
+                detail: "walrus.reload_event has no PRIMARY KEY",
+            });
+        }
+        if self
+            .first_text(
+                "SELECT (count(*) = 10)::text
+                 FROM information_schema.columns
+                 WHERE table_schema = 'walrus' AND table_name = 'reload_event'
+                   AND column_name IN (
+                     'event_id', 'request_id', 'reload_id', 'event_kind', 'scope',
+                     'source_schema', 'source_table', 'targets', 'schema_version',
+                     'wal_insert_lsn'
+                   )",
+            )
+            .await?
+            != "true"
+        {
+            return Err(PreflightError::ReloadEventMissing {
+                detail: "walrus.reload_event is missing required request/fence columns",
+            });
+        }
+        if self
+            .first_text(
+                "SELECT EXISTS (
+                   SELECT 1
+                   FROM pg_trigger t
+                   JOIN pg_class c ON c.oid = t.tgrelid
+                   JOIN pg_namespace n ON n.oid = c.relnamespace
+                   WHERE n.nspname = 'walrus' AND c.relname = 'reload_event'
+                     AND t.tgname = 'reload_event_append_only'
+                     AND t.tgenabled IN ('O', 'A')
+                 )::text",
+            )
+            .await?
+            != "true"
+        {
+            return Err(PreflightError::ReloadEventMissing {
+                detail: "walrus.reload_event append-only trigger absent or disabled",
+            });
+        }
+        Ok(())
+    }
+
+    /// The publication emits INSERT/UPDATE/DELETE/TRUNCATE, covers the walrus-internal tables, and
+    /// applies no row filters or column lists to any user target (create/extend/fix global flags
+    /// when `manage_publication`, else a mismatch is terminal). `pg_publication_tables` expands
+    /// `FOR ALL TABLES` and partition roots; [`crate::source_catalog`] additionally inspects the
+    /// underlying membership rows so an explicit all-current-columns list is still rejected.
     ///
     /// # Errors
     ///
@@ -365,7 +475,8 @@ impl<'a> SourcePreflight<'a> {
             if self.cfg.manage_publication {
                 self.exec(&format!(
                     "CREATE PUBLICATION {pub_ident} FOR TABLE walrus.heartbeat, walrus.ddl_audit, \
-                     walrus.reload_signal WITH (publish_via_partition_root = true)"
+                     walrus.reload_signal, walrus.reload_event \
+                     WITH (publish_via_partition_root = true)"
                 ))
                 .await?;
             } else {
@@ -375,11 +486,23 @@ impl<'a> SourcePreflight<'a> {
             }
         }
 
+        let mut actions = crate::source_catalog::publication_actions(self.client, pubname).await?;
+        if actions.is_some_and(|actions| !actions.is_complete()) && self.cfg.manage_publication {
+            self.exec(&format!(
+                "ALTER PUBLICATION {pub_ident} SET \
+                 (publish = 'insert, update, delete, truncate')"
+            ))
+            .await?;
+            actions = crate::source_catalog::publication_actions(self.client, pubname).await?;
+        }
+        crate::source_catalog::require_publication_actions(pubname, actions)?;
+
         let published = self.published_tables(pubname).await?;
         for (schema, table) in [
             ("walrus", "heartbeat"),
             ("walrus", "ddl_audit"),
             ("walrus", "reload_signal"),
+            ("walrus", "reload_event"),
         ] {
             let id = TableId {
                 schema: schema.to_string(),
@@ -401,6 +524,24 @@ impl<'a> SourcePreflight<'a> {
                     });
                 }
             }
+        }
+
+        // Re-read after any authorized ADD TABLE above. Validate the exact effective targets the
+        // decoder will see, not merely the four internal membership checks.
+        let published = self.published_tables(pubname).await?;
+        let required_internal = ["heartbeat", "ddl_audit", "reload_signal", "reload_event"];
+        for id in published
+            .iter()
+            .filter(|id| id.schema != "walrus" || required_internal.contains(&id.table.as_str()))
+        {
+            let options = crate::source_catalog::publication_target_options(
+                self.client,
+                pubname,
+                &id.schema,
+                &id.table,
+            )
+            .await?;
+            crate::source_catalog::require_full_target(pubname, &id.schema, &id.table, options)?;
         }
         Ok(())
     }
@@ -543,8 +684,8 @@ impl<'a> SourcePreflight<'a> {
     }
 }
 
-/// Can a published table's replica identity source a key? `DEFAULT` supplies one only with a
-/// PRIMARY KEY; `FULL` and `INDEX` carry their own old image; `NOTHING` never carries one.
+/// Can a published table participate in the unified resumable exporter? Every supported table
+/// needs a real primary key; replica identity alone cannot provide the stable keyset cursor.
 ///
 /// Exhaustive (no `_` arm) for the same reason the `From<PreflightError>` conversion above is:
 /// which identities the sink can decode is data, never a guess, so a new [`ReplicaIdentity`]
@@ -552,8 +693,7 @@ impl<'a> SourcePreflight<'a> {
 #[deny(clippy::wildcard_enum_match_arm)]
 const fn identity_is_usable(identity: ReplicaIdentity, has_pk: bool) -> bool {
     match identity {
-        ReplicaIdentity::Default => has_pk,
-        ReplicaIdentity::Full | ReplicaIdentity::Index => true,
+        ReplicaIdentity::Default | ReplicaIdentity::Full | ReplicaIdentity::Index => has_pk,
         ReplicaIdentity::Nothing => false,
     }
 }

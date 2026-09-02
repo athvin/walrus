@@ -6,13 +6,12 @@
 )]
 //! Chunk export engine against compose (`#[ignore]` — needs source PG + control PG + MinIO).
 //! 2,500 seeded rows at `chunk_rows=1000` become exactly 3 `kind='reload'` files whose union is
-//! the table exactly, every row stamped `commit_lsn = lsn =` its chunk's `L_i`; a crashed export
-//! resumes from the cursor without re-exporting; a never-arriving echo fails the reload loudly
-//! with the publication hint. The SQL/stamp shapes are unit-tested in `src/reload_export.rs`.
+//! the table exactly, every row stamped `commit_lsn = lsn = F`; a crashed snapshot is purged and
+//! replaced by a fresh fenced successor; and a missing decoder cannot let an exporter query before
+//! F is durable. The SQL/stamp shapes are unit-tested in `src/reload_export.rs`.
 //!
-//! Each test spins a mini echo-resolver: a real slot + `on_frame` + `PendingSignals` resolving
-//! the shared `WatermarkWaiters` — the decode-loop half of echo-wait, which the engine
-//! blocks on.
+//! Each test spins a mini fence resolver: a real slot commit-gates `reload_event`, durably records
+//! baseline `F` / terminal `H`, and only then resolves the shared `FenceWaiters`.
 //!
 //!   cargo test -p pg-sink --test reload_export -- --ignored --test-threads=1
 
@@ -21,23 +20,23 @@ use common::{EpochNo, Lsn, ReloadId, SchemaVersionNo};
 use object_store::ObjectStore;
 use object_store::path::Path;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use pg_sink::consume::on_frame;
-use pg_sink::heartbeat::InternalTables;
-use pg_sink::pgoutput::{Message, StreamCtx};
-use pg_sink::reload_export::{ChunkExportConfig, ChunkExporter, ChunkOutcome};
-use pg_sink::reload_signal::{PendingSignal, PendingSignals, WatermarkWaiters};
-use pg_sink::replication::ReplicationStream;
+use pg_sink::reload::{RestartDecision, handle_lost_snapshot_restart};
+use pg_sink::reload_event::FenceWaiters;
+use pg_sink::reload_export::{ChunkExportConfig, ChunkExporter, ChunkOutcome, RunOutcome};
 use pg_sink::sink::ParquetSink;
-use pg_sink::slot::verify_or_create_slot;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_postgres::NoTls;
 use tokio_util::sync::CancellationToken;
 
+#[path = "support/reload_fence.rs"]
+mod reload_fence_support;
+
 static SOURCE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const SOURCE_0001: &str = include_str!("../../../migrations/source/0001_publication.sql");
 const SOURCE_0003: &str = include_str!("../../../migrations/source/0003_reload_signal.sql");
+const SOURCE_0004: &str = include_str!("../../../migrations/source/0004_reload_event.sql");
 const TABLE: &str = "_walrus_re_orders";
 
 fn source_url() -> String {
@@ -72,16 +71,6 @@ fn store() -> Arc<dyn ObjectStore> {
     )
 }
 
-async fn drop_slot(admin: &tokio_postgres::Client, slot: &str) {
-    let _ = admin
-        .execute(
-            "SELECT pg_drop_replication_slot(slot_name)
-             FROM pg_replication_slots WHERE slot_name = $1 AND NOT active",
-            &[&slot],
-        )
-        .await;
-}
-
 /// Seed the target table with `n` rows and register its shape at the test epoch.
 async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: EpochNo, n: i64) {
     admin
@@ -92,7 +81,7 @@ async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: EpochN
         ))
         .await
         .unwrap();
-    let rel = pg_sink::snapshot::describe_source_relation(admin, "public", TABLE)
+    let rel = pg_sink::source_catalog::describe_source_relation(admin, "public", TABLE)
         .await
         .unwrap();
     control::upsert_registry(
@@ -121,131 +110,13 @@ async fn scrub(pool: &sqlx::PgPool, epoch: EpochNo) {
     }
 }
 
-/// The decode-loop half of echo-wait, minimally: resolve signal echoes against `waiters`, and
-/// publish the commit LSN of any transaction that carried a change on `watch_oid`'s table (the
-/// overlap/no-stall probe). Runs until cancelled.
-///
-/// The probe only ever asks "what is the newest overlap commit?", never for the history, so that
-/// LSN rides a `watch`: latest-value semantics, so there is no capacity to size and no queue of
-/// superseded LSNs to retain. `None` is "no overlap commit decoded yet".
-fn spawn_echo_resolver(
-    slot: &'static str,
-    waiters: Arc<WatermarkWaiters>,
-    watch_table: &'static str,
-    token: CancellationToken,
-) -> (
-    tokio::task::JoinHandle<()>,
-    tokio::sync::watch::Receiver<Option<Lsn>>,
-) {
-    let (tx, rx) = tokio::sync::watch::channel(None);
-    let handle = tokio::spawn(async move {
-        let admin = admin().await;
-        drop_slot(&admin, slot).await;
-        let resume = verify_or_create_slot(&admin, slot).await.unwrap();
-        let mut stream =
-            ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
-                .await
-                .unwrap();
-        let mut ctx = StreamCtx::default();
-        let mut internal = InternalTables::default();
-        let mut pending = PendingSignals::default();
-        let mut watch_oid: Option<u32> = None;
-        let mut txn_touched_watch = false;
-        loop {
-            let frame = tokio::select! {
-                _ = token.cancelled() => break,
-                f = stream.next() => f.unwrap().unwrap(),
-            };
-            let Some(msg) = on_frame(&mut ctx, frame).unwrap() else {
-                continue;
-            };
-            match &msg {
-                Message::Relation { relation, .. } => {
-                    internal.note_relation(relation);
-                    if relation.name == watch_table {
-                        watch_oid = Some(relation.oid);
-                    }
-                }
-                Message::Insert {
-                    relation_oid,
-                    new,
-                    xid,
-                } if internal.is_reload_signal(*relation_oid) => {
-                    let rel = internal.reload_signal_rel().unwrap();
-                    if let Ok(sig) = PendingSignal::from_tuple(rel, new, *xid) {
-                        pending.push(sig);
-                    }
-                }
-                Message::Insert { relation_oid, .. } | Message::Update { relation_oid, .. }
-                    if watch_oid == Some(*relation_oid) =>
-                {
-                    txn_touched_watch = true;
-                }
-                Message::Commit { commit_lsn, .. } => {
-                    pending.on_commit(*commit_lsn, &waiters);
-                    if std::mem::take(&mut txn_touched_watch) {
-                        // Never park the echo resolver: a blocked `send().await` would stop
-                        // watermark resolution and misreport an exporter echo timeout.
-                        // `send_replace` overwrites in place, so it can neither wait on a slow
-                        // probe nor fail once a finished probe has dropped its receiver.
-                        tx.send_replace(Some(*commit_lsn));
-                    }
-                }
-                _ => {}
-            }
-        }
-        drop(stream);
-        drop_slot(&admin, slot).await;
-    });
-    (handle, rx)
-}
-
-/// Prove the resolver is live end-to-end before the exporter signals through it: a sentinel
-/// signal row must echo back. A handshake, not a hopeful sleep — slot creation racing the first
-/// real signal would otherwise surface as a misleading echo timeout.
-async fn await_resolver_ready(
-    admin: &tokio_postgres::Client,
-    waiters: &WatermarkWaiters,
-    epoch: EpochNo,
-) {
-    let sentinel = -epoch.0; // never collides with real (bigserial, positive) reload ids
-    // Retry the sentinel until the resolver answers: a signal committed BEFORE the resolver's
-    // slot exists is never streamed, so each attempt re-signals fresh (DELETE + INSERT in one
-    // implicit txn — the engine's own re-signal shape; only an INSERT echoes).
-    let mut ready = false;
-    for _ in 0..20 {
-        let rx = waiters.subscribe(ReloadId(sentinel), 1);
-        admin
-            .batch_execute(&format!(
-                "DELETE FROM walrus.reload_signal WHERE reload_id = {sentinel}; \
-                 INSERT INTO walrus.reload_signal (reload_id, chunk_no) VALUES ({sentinel}, 1);"
-            ))
-            .await
-            .unwrap();
-        if tokio::time::timeout(Duration::from_millis(500), rx)
-            .await
-            .is_ok()
-        {
-            ready = true;
-            break;
-        }
-    }
-    assert!(ready, "the echo resolver never answered the sentinel");
-    admin
-        .execute(
-            "DELETE FROM walrus.reload_signal WHERE reload_id = $1",
-            &[&sentinel],
-        )
-        .await
-        .unwrap();
-}
-
 fn export_cfg(epoch: EpochNo, chunk_rows: u64, echo_timeout: Duration) -> ChunkExportConfig {
     ChunkExportConfig {
         chunk_rows: std::num::NonZeroU64::new(chunk_rows).unwrap(),
         echo_timeout,
         instance: "walrus-sink-test".to_string(),
         epoch,
+        publication_name: "walrus_pub".to_string(),
     }
 }
 
@@ -336,26 +207,34 @@ async fn read_chunk_file(uri: &str) -> (Vec<i32>, Vec<(String, String)>) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires docker compose up --wait (source + control PG + MinIO)"]
-async fn chunks_cover_the_table_exactly_with_per_chunk_stamps() {
+async fn chunks_cover_the_table_exactly_with_shared_baseline_stamp() {
     let _g = SOURCE_LOCK.lock().await;
     let epoch = EpochNo(650_001);
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
+    admin.batch_execute(SOURCE_0004).await.unwrap();
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     scrub(&pool, epoch).await;
     seed(&admin, &pool, epoch, 2500).await;
 
-    let waiters = Arc::new(WatermarkWaiters::default());
+    let waiters = Arc::new(FenceWaiters::default());
     let token = CancellationToken::new();
-    let (resolver, mut watch_rx) = spawn_echo_resolver(
+    let resolver = reload_fence_support::spawn(
+        source_url(),
         "walrus_re_cover",
+        pool.clone(),
         Arc::clone(&waiters),
-        TABLE,
+        Some(TABLE),
         token.clone(),
     );
-    await_resolver_ready(&admin, &waiters, epoch).await;
+    tokio::time::timeout(Duration::from_secs(10), resolver.ready)
+        .await
+        .expect("fence resolver starts")
+        .expect("fence resolver ready sender remains live");
+    let mut watch_rx = resolver.watched_commit;
+    let resolver = resolver.handle;
 
     let req = request_and_claim(&pool, epoch).await;
     let reload_id = req.reload_id;
@@ -389,21 +268,45 @@ async fn chunks_cover_the_table_exactly_with_per_chunk_stamps() {
     // channel, never held across an await (`clippy.toml`'s `await-holding-invalid-types`).
     let overlap_commit =
         (*watch_rx.borrow_and_update()).expect("a change is always a published overlap commit");
-    let chunk1_l1 = control::reload::get(&pool, reload_id)
+    let baseline_f = control::reload::get(&pool, reload_id)
         .await
         .unwrap()
         .unwrap()
-        .first_lsn
+        .start_lsn
         .unwrap();
     assert!(
-        overlap_commit > chunk1_l1,
-        "the mid-export stream event ({overlap_commit}) outranks chunk 1's stamp ({chunk1_l1}) — \
+        overlap_commit > baseline_f,
+        "the mid-export stream event ({overlap_commit}) outranks baseline F ({baseline_f}) — \
          it wins the loader's dedup for that PK"
     );
 
-    exporter.run().await.unwrap();
+    let final_h = match exporter.run(false).await.unwrap() {
+        RunOutcome::Drained { final_lsn } => final_lsn,
+        RunOutcome::SchemaChanged { new_version } => {
+            panic!("unexpected schema change to {new_version}")
+        }
+        RunOutcome::SnapshotLost => panic!("a freshly claimed exporter owns its snapshot"),
+    };
+    assert!(
+        final_h > overlap_commit,
+        "terminal H ({final_h}) follows the overlapping WAL commit ({overlap_commit})"
+    );
+    let markers = control::reload::read_markers(&pool, reload_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        markers
+            .iter()
+            .map(|marker| (marker.kind, marker.lsn))
+            .collect::<Vec<_>>(),
+        vec![
+            (control::ReloadMarkerKind::Baseline, baseline_f),
+            (control::ReloadMarkerKind::End, final_h),
+        ],
+        "the decoder persisted F then H before resolving each waiter"
+    );
 
-    // Exactly 3 chunk files: 1000 + 1000 + 500, strictly increasing lsn_end, all this reload's.
+    // Exactly 3 chunk files: 1000 + 1000 + 500, all sharing safe baseline F.
     let files = reload_manifest_rows(&pool, epoch).await;
     assert_eq!(files.len(), 3, "2500 rows at chunk_rows=1000 ⇒ 3 files");
     assert_eq!(
@@ -412,19 +315,24 @@ async fn chunks_cover_the_table_exactly_with_per_chunk_stamps() {
     );
     let ends: Vec<Lsn> = files.iter().map(|f| f.2.parse().unwrap()).collect();
     assert!(
-        ends[0] < ends[1] && ends[1] < ends[2],
-        "strictly increasing L_i"
+        ends.iter().all(|end| *end == baseline_f),
+        "all chunks use F"
     );
     assert!(files.iter().all(|f| f.3 == reload_id));
 
-    // Cursor/freeze bookkeeping: chunk_no 3, cursor at the last PK, first_lsn = L_1, forever.
+    // Cursor/freeze bookkeeping: chunk_no 3, cursor at the last PK, and one immutable F.
     let row = control::reload::get(&pool, reload_id)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(row.chunk_no, 3);
     assert_eq!(row.cursor_pk, Some(serde_json::json!(["2500"])));
-    assert_eq!(row.first_lsn, Some(ends[0]), "first_lsn is chunk 1's L_1");
+    assert_eq!(row.start_lsn, Some(baseline_f), "start_lsn is baseline F");
+    assert_eq!(
+        row.first_lsn,
+        Some(baseline_f),
+        "legacy first_lsn aliases F"
+    );
     assert_eq!(
         row.status,
         control::reload::ReloadStatus::Exporting,
@@ -432,7 +340,7 @@ async fn chunks_cover_the_table_exactly_with_per_chunk_stamps() {
     );
 
     // Read the 3 files back: the union is the table exactly, and EVERY row's meta carries
-    // commit_lsn = lsn = its file's lsn_end (the stamp).
+    // commit_lsn = lsn = shared F, which is every file's lsn_end.
     let mut all_ids = Vec::new();
     // `ends` was parsed out of `files` above, so zipping pairs each file with its own stamp — the
     // row index that carried the pairing before was only ever a way to reach back into `ends`.
@@ -453,12 +361,6 @@ async fn chunks_cover_the_table_exactly_with_per_chunk_stamps() {
     assert_eq!(unique.len(), 2500, "no misses");
     assert_eq!(*unique.first().unwrap(), 1);
     assert_eq!(*unique.last().unwrap(), 2500);
-    assert_eq!(
-        waiters.crosscheck_violations(),
-        0,
-        "embedded < L_i held on every chunk"
-    );
-
     token.cancel();
     resolver.await.unwrap();
     scrub(&pool, epoch).await;
@@ -470,26 +372,33 @@ async fn chunks_cover_the_table_exactly_with_per_chunk_stamps() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires docker compose up --wait (source + control PG + MinIO)"]
-async fn resume_from_cursor_never_reexports_completed_chunks() {
+async fn adopted_cursor_is_purged_and_successor_reexports_one_snapshot() {
     let _g = SOURCE_LOCK.lock().await;
     let epoch = EpochNo(650_002);
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
+    admin.batch_execute(SOURCE_0004).await.unwrap();
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     scrub(&pool, epoch).await;
     seed(&admin, &pool, epoch, 2500).await;
 
-    let waiters = Arc::new(WatermarkWaiters::default());
+    let waiters = Arc::new(FenceWaiters::default());
     let token = CancellationToken::new();
-    let (resolver, _watch) = spawn_echo_resolver(
+    let resolver = reload_fence_support::spawn(
+        source_url(),
         "walrus_re_resume",
+        pool.clone(),
         Arc::clone(&waiters),
-        TABLE,
+        None,
         token.clone(),
     );
-    await_resolver_ready(&admin, &waiters, epoch).await;
+    tokio::time::timeout(Duration::from_secs(10), resolver.ready)
+        .await
+        .expect("fence resolver starts")
+        .expect("fence resolver ready sender remains live");
+    let resolver = resolver.handle;
 
     let req = request_and_claim(&pool, epoch).await;
     let reload_id = req.reload_id;
@@ -515,12 +424,33 @@ async fn resume_from_cursor_never_reexports_completed_chunks() {
         .unwrap()
         .unwrap();
     assert_eq!(mid.chunk_no, 1);
-    let frozen_first_lsn = mid.first_lsn.expect("L_1 frozen at chunk 1");
+    let baseline_f = mid.start_lsn.expect("F persisted before chunk 1");
 
-    // A STALE exporter (crash-redo shape: built from the pre-chunk-1 row) re-signals the same
-    // (reload_id, 1) via DELETE + INSERT and gets a FRESH echo — then its manifest+cursor txn
-    // hits the in-order cursor guard and rolls back: the duplicate S3 file is orphaned (eaten by
-    // design), the manifest stays clean, and the real cursor is untouched.
+    // Adoption cannot resurrect the connection-local repeatable-read snapshot, so it returns a
+    // control-flow outcome without another source-table SELECT.
+    let mut adopted = ChunkExporter::connect(
+        &source_url(),
+        pool.clone(),
+        Arc::clone(&waiters),
+        sink.clone(),
+        export_cfg(epoch, 1000, Duration::from_secs(20)),
+        &mid,
+    )
+    .await
+    .unwrap();
+    assert_eq!(adopted.run(true).await.unwrap(), RunOutcome::SnapshotLost);
+    let successor_id = match handle_lost_snapshot_restart(&pool, &mid, 3).await.unwrap() {
+        RestartDecision::Restarted(id) => id,
+        RestartDecision::Capped => panic!("first lost-snapshot restart must be under the cap"),
+    };
+    assert_eq!(
+        reload_manifest_rows(&pool, epoch).await.len(),
+        0,
+        "the predecessor's chunk is purged with its terminal transition"
+    );
+
+    // A lease-expired predecessor that wakes late cannot commit another chunk after the atomic
+    // terminal+successor transaction. Its duplicate object is an orphan; no manifest gap forms.
     let mut stale = ChunkExporter::connect(
         &source_url(),
         pool.clone(),
@@ -534,33 +464,35 @@ async fn resume_from_cursor_never_reexports_completed_chunks() {
     let stale_err = stale.export_next_chunk().await.unwrap_err();
     assert!(
         format!("{stale_err:#}").contains("illegal reload transition"),
-        "the cursor guard rejects the stale advance (fresh echo notwithstanding): {stale_err:#}"
+        "the failed predecessor rejects a late cursor commit: {stale_err:#}"
     );
+    // The rejected chunk leaves this diagnostic exporter's repeatable-read transaction open so
+    // production `run()` could roll it back. This test called the one-chunk seam directly, so
+    // release the connection now; otherwise its final fixture DROP waits forever on our own lock.
     drop(stale);
-    let after_stale = control::reload::get(&pool, reload_id)
+
+    let successor = control::reload::get(&pool, successor_id)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(
-        after_stale.chunk_no, 1,
-        "the stale attempt advanced nothing"
-    );
-
-    // Resume from the cursor: chunks 2..3 export; chunk 1 is NOT re-exported.
-    let mut resumed = ChunkExporter::connect(
+    let mut restarted = ChunkExporter::connect(
         &source_url(),
         pool.clone(),
         Arc::clone(&waiters),
         sink,
         export_cfg(epoch, 1000, Duration::from_secs(20)),
-        &mid,
+        &successor,
     )
     .await
     .unwrap();
-    resumed.run().await.unwrap();
+    assert!(matches!(
+        restarted.run(false).await.unwrap(),
+        RunOutcome::Drained { .. }
+    ));
 
     let files = reload_manifest_rows(&pool, epoch).await;
-    assert_eq!(files.len(), 3, "1 pre-crash + 2 post-resume, never 4");
+    assert_eq!(files.len(), 3, "the successor exports 1000+1000+500");
+    assert!(files.iter().all(|file| file.3 == successor_id));
     let mut total = 0usize;
     let mut unique = BTreeSet::new();
     for (uri, _, _, _) in &files {
@@ -568,18 +500,17 @@ async fn resume_from_cursor_never_reexports_completed_chunks() {
         total += ids.len();
         unique.extend(ids);
     }
-    assert_eq!(total, 2500, "no chunk re-exported (no duplicate rows)");
-    assert_eq!(unique.len(), 2500, "and no gap either");
+    assert_eq!(total, 2500, "one consistent successor baseline");
+    assert_eq!(unique.len(), 2500, "no gap in the restarted snapshot");
 
-    let done = control::reload::get(&pool, reload_id)
+    let done = control::reload::get(&pool, successor_id)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(done.chunk_no, 3);
-    assert_eq!(
-        done.first_lsn,
-        Some(frozen_first_lsn),
-        "first_lsn never changes across a resume"
+    assert!(
+        matches!(done.start_lsn, Some(new_f) if new_f > baseline_f),
+        "the successor must establish a fresh F"
     );
 
     token.cancel();
@@ -593,22 +524,23 @@ async fn resume_from_cursor_never_reexports_completed_chunks() {
 
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (source + control PG + MinIO)"]
-async fn echo_timeout_fails_the_reload_with_publication_hint() {
+async fn start_fence_timeout_leaves_the_reload_resumable() {
     let _g = SOURCE_LOCK.lock().await;
     let epoch = EpochNo(650_003);
     let admin = admin().await;
     admin.batch_execute(SOURCE_0001).await.unwrap();
     admin.batch_execute(SOURCE_0003).await.unwrap();
+    admin.batch_execute(SOURCE_0004).await.unwrap();
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     scrub(&pool, epoch).await;
     seed(&admin, &pool, epoch, 10).await;
 
-    // NO echo resolver runs — the production analogue of an unpublished signal table: the echo
-    // simply never arrives. The timeout must turn that silence into a failed row naming the fix.
-    let waiters = Arc::new(WatermarkWaiters::default());
+    // NO fence resolver runs. Establishing F fails before any table SELECT or file write; the row
+    // remains exporting so lease adoption can retry the same deterministic source event safely.
+    let waiters = Arc::new(FenceWaiters::default());
     let req = request_and_claim(&pool, epoch).await;
-    let mut exporter = ChunkExporter::connect(
+    let err = ChunkExporter::connect(
         &source_url(),
         pool.clone(),
         waiters,
@@ -617,20 +549,19 @@ async fn echo_timeout_fails_the_reload_with_publication_hint() {
         &req,
     )
     .await
-    .unwrap();
-    let err = exporter.run().await.unwrap_err();
-    assert!(format!("{err:#}").contains("no echo after"), "got: {err:#}");
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("decode echo timed out"),
+        "got: {err:#}"
+    );
 
     let row = control::reload::get(&pool, req.reload_id)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(row.status, control::reload::ReloadStatus::Failed);
-    let reason = row.error.unwrap();
-    assert!(
-        reason.contains("publication") && reason.contains("0003_reload_signal"),
-        "the failure names the fix: {reason}"
-    );
+    assert_eq!(row.status, control::reload::ReloadStatus::Exporting);
+    assert_eq!(row.start_lsn, None, "no decoded F was persisted");
+    assert_eq!(reload_manifest_rows(&pool, epoch).await.len(), 0);
 
     scrub(&pool, epoch).await;
     admin

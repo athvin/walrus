@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn unreachable_never_triggers_total_restart() {
-    // A connection hiccup must route to Retry — never FreshSlot (which would nuke + re-snapshot the
+    // A connection hiccup must route to Retry — never FreshSlot (which would replace + rebuild the
     // whole system on every transient blip). This is the load-bearing false-positive guard.
     assert_eq!(decide(SlotStatus::Unreachable), SlotAction::Retry);
     assert_ne!(decide(SlotStatus::Unreachable), SlotAction::FreshSlot);

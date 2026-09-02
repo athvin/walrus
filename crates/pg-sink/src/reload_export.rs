@@ -1,18 +1,17 @@
 //! The chunk export engine (reload H1/H2, §5 step 3).
 //!
-//! Per PK-ordered chunk: INSERT a watermark signal row → await its echo ⇒ `L_i` → SELECT
-//! the chunk on this exporter's own SQL connection → write Parquet with **every row stamped
-//! `commit_lsn = lsn = L_i`** → manifest row `kind='reload'`, the `reload_id`,
-//! `lsn_start = lsn_end = L_i` → advance the cursor. No stream pause, no chunk buffer, no high
-//! watermark. Chunks are short autocommit single statements — deliberately no long
-//! `REPEATABLE READ` pinning xmin — and a crash resumes from the cursor, not row zero.
+//! Each attempt first appends a start event and waits for its decoded commit `F`. It then walks the
+//! table in PK order inside one read-only `REPEATABLE READ` transaction, writing every baseline row
+//! with `commit_lsn = lsn = F`. After committing that source snapshot it appends an end event `H`;
+//! decode force-flushes this table's WAL and persists the end marker before resolving the exporter.
+//! A PostgreSQL snapshot is connection-local: an adopted attempt without durable H is superseded by
+//! a fresh attempt/F rather than resuming its cursor against a different snapshot.
 //!
-//! **Why the early stamp converges (the whole proof):** every chunk row was committed by some
-//! transaction at commit LSN `C`, and the chunk read happens after `L_i` was observed in-stream.
-//! If `C ≤ L_i`, the chunk's copy (stamped `L_i ≥ C`) wins the loader's `(commit_lsn, lsn)` dedup
-//! over the stream event at `C` — same data, so nothing is lost. If `C > L_i`, the stream event
-//! outranks the chunk copy and wins. Either way the mirror converges; over-inclusion is free and
-//! under-inclusion is bounded by the echo round-trip (`notes/commit-visibility-race.md`).
+//! **Why the early stamp converges (the whole proof):** one consistent snapshot `S`, with
+//! `F < S < H`, supplies a complete row anchor. WAL changes in `(F, H]` outrank the F-stamped
+//! baseline, including old-key deletes/new-key upserts and unchanged-TOAST updates. Transactions
+//! after `H` stay queued for the normal live path after the atomic shadow cutover. TRUNCATE is a
+//! table-level WAL boundary, so the overlay cannot leave ghosts.
 //!
 //! **Cursor-vs-manifest ordering:** the manifest `insert_ready` and the cursor advance share ONE
 //! control-pg transaction. A crash between "file durable in S3" and that commit re-exports one
@@ -22,10 +21,12 @@
 //! For very large tables, a future CTID-range fan-out (deferred goal §3) would parallelise
 //! *within* a chunk — the composition point is `export_next_chunk`'s SELECT; nothing else changes.
 
-use crate::reload_signal::WatermarkWaiters;
+use crate::reload_event::{
+    FenceEmission, FencePhase, FenceSpec, FenceTarget, FenceTimeouts, FenceWaiters,
+};
 use crate::sink::{FileKind, ParquetSink};
 use anyhow::Context;
-use common::sql::SqlStrExt;
+use common::sql::{SqlIdent, SqlStrExt};
 use common::{
     EpochNo, Kind, Lsn, Op, PgRelation, ReloadId, SchemaVersionNo, SinkMeta, TupleValue,
     UtcTimestamp,
@@ -36,6 +37,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_postgres::NoTls;
 use tracing::Instrument as _;
+use uuid::Uuid;
+
+/// Bound how long one queued schema-fence lock may wait behind structural DDL before it retries.
+const FENCE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What one chunk did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,22 +48,48 @@ pub enum ChunkOutcome {
     /// A full chunk exported; more rows may remain.
     Exported { rows: u64 },
     /// The table is drained: this chunk came back short (possibly empty). A short-but-non-empty
-    /// chunk still produced a file; an empty one produced nothing. `final_lsn` is this drain
-    /// probe's watermark `H`, always available since every probe echoes (and thus sets the
-    /// watermark) before it can report drained.
-    Drained { rows: u64, final_lsn: Lsn },
+    /// chunk still produced a file; an empty one produced nothing. Lifecycle progress comes from
+    /// explicit baseline/end markers, never from the presence of this file.
+    Drained { rows: u64 },
 }
 
 /// How a whole [`ChunkExporter::run`] ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunOutcome {
     /// The table drained at this attempt's frozen schema — the export is done. `final_lsn` is `H`:
-    /// the drain probe's watermark, `>=` every chunk's `L_i` and `>= first_lsn` (LSNs are monotonic
-    /// in the stream). The controller flips `export_complete(H)`; the loader then flips
+    /// the explicit end-event commit, `>=` the shared baseline `F`. The controller flips
+    /// `export_complete(H)`; the loader then flips
     /// `complete` once `transformed_lsn >= H`.
     Drained { final_lsn: Lsn },
     /// DDL bumped the table's structural `schema_version` past the frozen one between chunks: this
     /// attempt is invalid and the controller must restart it at `new_version` (reload H9).
+    SchemaChanged { new_version: SchemaVersionNo },
+    /// This exporter was adopted after losing ownership of its connection-local source snapshot.
+    /// Even a zero-chunk cursor cannot safely reuse the attempt: the expired prior exporter may
+    /// still emit H from an older snapshot. The controller atomically fails/purges this attempt and
+    /// creates a fresh lease-carrying successor with a fresh F.
+    SnapshotLost,
+}
+
+/// A structural change discovered while constructing an exporter or establishing its initial
+/// fence. This is a control-flow outcome for the controller's bounded DDL restart loop, not a
+/// terminal exporter failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("source shape changed before reload export started (new schema version {new_version})")]
+pub struct ConnectSchemaChanged {
+    /// Registry version that supersedes the attempt's frozen version.
+    pub new_version: SchemaVersionNo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndFenceOutcome {
+    Durable(Lsn),
+    SchemaChanged(SchemaVersionNo),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotExportOutcome {
+    Drained { rows: u64 },
     SchemaChanged { new_version: SchemaVersionNo },
 }
 
@@ -82,21 +113,22 @@ fn version_changed(
 pub struct ChunkExportConfig {
     /// Rows per chunk SELECT. Non-zero, or the export would make no progress.
     pub chunk_rows: NonZeroU64,
-    /// How long a chunk waits for its watermark echo to come back through the decode loop before
-    /// the attempt fails loudly.
+    /// How long a start/end fence waits to return through the decode loop.
     pub echo_timeout: Duration,
     /// This pod's identity, written as the reload's `lease_holder`.
     pub instance: String,
     /// The generation the exported chunks are stamped with.
     pub epoch: EpochNo,
+    /// The logical publication whose complete target coverage both fences revalidate.
+    pub publication_name: String,
 }
 
 /// One table's chunked export (reload §5.3). Owns a side SQL connection; talks to the consume
-/// loop only through [`WatermarkWaiters`]; never touches the replication connection.
+/// loop only through [`FenceWaiters`]; never touches the replication connection.
 #[derive(Debug)]
 pub struct ChunkExporter {
     client: tokio_postgres::Client,
-    waiters: Arc<WatermarkWaiters>,
+    fence_waiters: Arc<FenceWaiters>,
     pool: sqlx::PgPool,
     sink: ParquetSink,
     cfg: ChunkExportConfig,
@@ -113,8 +145,14 @@ pub struct ChunkExporter {
     chunk_no: i64,
     /// Last exported PK bound as a JSON array of text values in PK-column order; `None` = start.
     cursor: Option<serde_json::Value>,
-    /// Chunk 1's `L_1` once frozen (mirrors `table_reload.first_lsn`).
-    first_lsn: Option<Lsn>,
+    /// One safe lower fence shared by every chunk in the consistent baseline snapshot.
+    start_lsn: Lsn,
+    /// Stable source request correlation; synthesized deterministically for legacy callers.
+    request_id: Uuid,
+    /// Whether this connection currently owns the one repeatable-read dump transaction. Public
+    /// one-chunk test/diagnostic calls share this state with [`Self::run`], so no caller can
+    /// accidentally build one attempt from multiple source snapshots.
+    snapshot_open: bool,
 }
 
 impl ChunkExporter {
@@ -129,12 +167,12 @@ impl ChunkExporter {
     pub async fn connect(
         source_db_url: &str,
         pool: sqlx::PgPool,
-        waiters: Arc<WatermarkWaiters>,
+        fence_waiters: Arc<FenceWaiters>,
         sink: ParquetSink,
         cfg: ChunkExportConfig,
         req: &control::ReloadRow,
     ) -> anyhow::Result<Self> {
-        let (client, connection) = tokio_postgres::connect(source_db_url, NoTls)
+        let (mut client, connection) = tokio_postgres::connect(source_db_url, NoTls)
             .await
             .context("open chunk-export SQL connection")?;
         // `tokio::spawn` starts its task with an EMPTY span stack — the caller's span is
@@ -153,7 +191,7 @@ impl ChunkExporter {
         // two instead of their sum — `main::establish_stream`'s argument, paid on every attempt and
         // again on every DDL restart. Both branches are terminal-on-error and fail fast: whichever
         // resolves first drops the other, and either way the exporter never connects.
-        let ((rel, schema_version), pk_cols) = tokio::try_join!(
+        let ((rel, schema_version), (live_relation, pk_cols)) = tokio::try_join!(
             async {
                 // A resumed attempt exports at its FROZEN version; a fresh one at the
                 // registry's latest.
@@ -178,7 +216,7 @@ impl ChunkExporter {
                 // catalog — so every chunk file's columns match the descriptor set the loader
                 // will fetch for its stamped schema_version. (A live `describe` can be ahead of
                 // the registry: DDL bumps the registry only when the next Relation message
-                // decodes, and e.g. `ADD COLUMN … DEFAULT` backfills without any DML. Files
+                // decodes, and e.g. `ADD COLUMN … DEFAULT` materializes values without any DML. Files
                 // carrying a shape their version doesn't describe would silently break Phase B's
                 // column plan.)
                 let registry_row = control::read_registry(
@@ -205,27 +243,69 @@ impl ChunkExporter {
             // row-comparison WHERE and the ORDER BY are served by the PK btree instead of a
             // per-chunk top-N sort.
             async {
-                pk_columns_in_index_order(&client, &req.source_schema, &req.source_table)
-                    .await
-                    .context("read PK index column order")
+                tokio::try_join!(
+                    async {
+                        crate::source_catalog::describe_source_relation(
+                            &client,
+                            &req.source_schema,
+                            &req.source_table,
+                        )
+                        .await
+                        .context("describe live relation for reload")
+                    },
+                    async {
+                        pk_columns_in_index_order(&client, &req.source_schema, &req.source_table)
+                            .await
+                            .context("read PK index column order")
+                    },
+                )
             },
         )?;
-        let registry_keys: std::collections::BTreeSet<&str> =
-            rel.to_key_columns().into_iter().collect();
-        let live_keys: std::collections::BTreeSet<&str> =
-            pk_cols.iter().map(String::as_str).collect();
-        if registry_keys != live_keys {
-            // The live PK drifted from the registered shape (a between-attempts DDL): stop
-            // without failing the row — the restart-on-DDL is the mechanism that reissues
-            // the attempt at the new schema; until then the loud error is the breadcrumb.
-            anyhow::bail!(
-                "reload {}: live PK {live_keys:?} != registered key set {registry_keys:?} at version {schema_version} — schema drifted; restart-on-DDL will reissue",
-                req.reload_id
-            );
+        if live_relation != rel {
+            return Err(ConnectSchemaChanged {
+                new_version: await_schema_change(
+                    &pool,
+                    req.epoch,
+                    &req.source_schema,
+                    &req.source_table,
+                    schema_version,
+                    req.reload_id,
+                    cfg.echo_timeout,
+                )
+                .await?,
+            }
+            .into());
         }
+        validate_export_keys(&rel, &pk_cols)
+            .with_context(|| format!("validate reload {} export keys", req.reload_id))?;
+        let request_id = req
+            .source_request_id
+            .or(req.parent_request_id)
+            .with_context(|| {
+                format!(
+                    "reload {} has no durable source-fence request namespace",
+                    req.reload_id
+                )
+            })?;
+        let start_lsn = match req.start_lsn {
+            Some(lsn) => lsn,
+            None => {
+                StartFenceContext {
+                    pool: &pool,
+                    waiters: &fence_waiters,
+                    cfg: &cfg,
+                    request_id,
+                    req,
+                    expected_relation: &rel,
+                    schema_version,
+                }
+                .establish(&mut client)
+                .await?
+            }
+        };
         Ok(ChunkExporter {
             client,
-            waiters,
+            fence_waiters,
             pool,
             sink,
             cfg,
@@ -236,13 +316,16 @@ impl ChunkExporter {
             reload_id: req.reload_id,
             chunk_no: req.chunk_no,
             cursor: req.cursor_pk.clone(),
-            first_lsn: req.first_lsn,
+            start_lsn,
+            request_id,
+            snapshot_open: false,
         })
     }
 
-    /// Fresh start or cursor resume (H7): loop `export_next_chunk` until a short chunk says
-    /// drained. The row then stays `exporting`, fully drained with its cursor at the end, until the
-    /// controller records `export_complete` and the final watermark `H`.
+    /// Walk one fresh, connection-owned snapshot until a short chunk says drained. The row then
+    /// stays `exporting`, fully drained with its cursor at the end, until the controller records
+    /// `export_complete` and the final watermark `H`. An adopted call may recover durable H, but
+    /// otherwise returns [`RunOutcome::SnapshotLost`] before opening or scanning a new snapshot.
     ///
     /// Before each chunk, re-check the table's structural version (H9): a DDL that bumped
     /// it past this attempt's frozen version returns [`RunOutcome::SchemaChanged`] so the
@@ -262,9 +345,10 @@ impl ChunkExporter {
     /// races this future in [`lease_guarded_export`](crate::reload::lease_guarded_export), so a drop
     /// mid-[`Self::export_next_chunk`] is a normal shutdown/lost-lease outcome rather than a bug: the
     /// chunk's manifest row and its cursor advance share ONE control-pg transaction, so an
-    /// uncommitted chunk simply never happened and the row stays `exporting` at its previous cursor
-    /// for the adoption to resume. A drop between that chunk's S3 PUT and the commit orphans the
-    /// object exactly as [`crate::consume::flush_batch_kind`] does, and the re-export regenerates it.
+    /// uncommitted chunk simply never happened and the row stays `exporting`; adoption terminally
+    /// supersedes/purges that attempt and starts a fresh fenced successor. A drop between that
+    /// chunk's S3 PUT and the commit orphans the object exactly as
+    /// [`crate::consume::flush_batch_kind`] does, and the successor regenerates it.
     /// What a drop can never recover is partial progress *inside* one chunk — those rows live in this
     /// future's batcher — which is why the cursor only ever moves at a committed chunk boundary.
     ///
@@ -272,7 +356,93 @@ impl ChunkExporter {
     ///
     /// Returns [`anyhow::Error`] if schema checks, chunk export, echo handling, control transitions,
     /// or final export completion fails.
-    pub async fn run(&mut self) -> anyhow::Result<RunOutcome> {
+    pub async fn run(&mut self, lost_snapshot_ownership: bool) -> anyhow::Result<RunOutcome> {
+        // H is the irreversible upper boundary for this attempt. Decode persists it only after all
+        // target WAL through H is durable, but the exporter can crash in the tiny window before its
+        // controller flips `exporting -> export_complete`. An adopter must finish from that durable
+        // fact: querying the source again could copy a row committed *after* H and stamp it at F,
+        // incorrectly pulling future state into the H rebuild.
+        //
+        // Validate the whole persisted fence identity before trusting H, then repeat the same
+        // post-H registry check used by the normal drain path. Neither operation reads table data.
+        if let Some(final_lsn) = self.recover_durable_end().await? {
+            if let Some(new_version) = self.check_schema_still_current().await? {
+                return Ok(RunOutcome::SchemaChanged { new_version });
+            }
+            tracing::info!(
+                reload_id = %self.reload_id,
+                final_lsn = %final_lsn,
+                "reload recovered durable end marker (controller flips export_complete)"
+            );
+            return Ok(RunOutcome::Drained { final_lsn });
+        }
+
+        // A PostgreSQL snapshot belongs to one backend transaction; neither the PK cursor nor the
+        // lease can resurrect it after adoption. This applies even at chunk zero: the expired old
+        // exporter could still finish an empty/short snapshot and emit H while this adopter starts
+        // a later one. Durable H above is the only safe same-attempt recovery fact.
+        if lost_snapshot_ownership {
+            return Ok(RunOutcome::SnapshotLost);
+        }
+
+        if !self.snapshot_open {
+            self.begin_dump_snapshot().await?;
+        }
+        let snapshot_outcome = match self.export_snapshot().await {
+            Ok(outcome) => outcome,
+            Err(export_error) => {
+                if let Err(rollback_error) = self.rollback_dump_snapshot().await {
+                    return Err(export_error.context(format!(
+                        "rolling back the failed reload snapshot also failed: {rollback_error:#}"
+                    )));
+                }
+                return Err(export_error);
+            }
+        };
+        match snapshot_outcome {
+            SnapshotExportOutcome::SchemaChanged { new_version } => {
+                self.rollback_dump_snapshot().await?;
+                Ok(RunOutcome::SchemaChanged { new_version })
+            }
+            SnapshotExportOutcome::Drained { rows } => {
+                // H must follow the snapshot commit. Releasing the source transaction first also
+                // lets queued DDL win its table lock; H's live-shape fence will then reject this
+                // attempt instead of publishing a boundary for an obsolete shape.
+                self.client
+                    .batch_execute("COMMIT")
+                    .await
+                    .context("commit repeatable-read reload snapshot before H")?;
+                self.snapshot_open = false;
+                let final_lsn = match self.establish_end_fence().await? {
+                    EndFenceOutcome::Durable(lsn) => lsn,
+                    EndFenceOutcome::SchemaChanged(new_version) => {
+                        return Ok(RunOutcome::SchemaChanged { new_version });
+                    }
+                };
+                // The catalog shape check inside H catches ordinary column/OID changes. A
+                // topology-only ALTER TABLE (for example ATTACH/DETACH PARTITION) can leave
+                // that shape byte-for-byte identical while changing which rows a published
+                // root contains. Its ddl_audit row precedes H in the same WAL stream, so once
+                // H's echo resolves the committed registry version is authoritative. Reject
+                // the attempt if that boundary crossed any structural DDL.
+                if let Some(new_version) = self.check_schema_still_current().await? {
+                    return Ok(RunOutcome::SchemaChanged { new_version });
+                }
+                tracing::info!(
+                    reload_id = %self.reload_id,
+                    chunk_no = self.chunk_no,
+                    rows,
+                    final_lsn = %final_lsn,
+                    "reload export drained (controller flips export_complete)"
+                );
+                Ok(RunOutcome::Drained { final_lsn })
+            }
+        }
+    }
+
+    /// Walk all keyset chunks under the source transaction opened by
+    /// [`Self::begin_dump_snapshot`]. This method never commits H; its caller owns rollback/commit.
+    async fn export_snapshot(&mut self) -> anyhow::Result<SnapshotExportOutcome> {
         loop {
             if let Some(new_version) = self.check_schema_still_current().await? {
                 tracing::info!(
@@ -281,7 +451,7 @@ impl ChunkExporter {
                     new_version = %new_version,
                     "reload interrupted: DDL bumped schema_version between chunks — restarting (H9)"
                 );
-                return Ok(RunOutcome::SchemaChanged { new_version });
+                return Ok(SnapshotExportOutcome::SchemaChanged { new_version });
             }
             match self.export_next_chunk().await? {
                 ChunkOutcome::Exported { rows } => {
@@ -292,20 +462,83 @@ impl ChunkExporter {
                         "reload chunk exported"
                     );
                 }
-                ChunkOutcome::Drained { rows, final_lsn } => {
-                    // H = the last probe's watermark, carried by the drain outcome itself (every
-                    // probe echoes and sets the watermark before it can report drained).
-                    tracing::info!(
-                        reload_id = %self.reload_id,
-                        chunk_no = self.chunk_no,
-                        rows,
-                        final_lsn = %final_lsn,
-                        "reload export drained (controller flips export_complete)"
-                    );
-                    return Ok(RunOutcome::Drained { final_lsn });
+                ChunkOutcome::Drained { rows } => {
+                    if let Some(new_version) = self.check_schema_still_current().await? {
+                        return Ok(SnapshotExportOutcome::SchemaChanged { new_version });
+                    }
+                    return Ok(SnapshotExportOutcome::Drained { rows });
                 }
             }
         }
+    }
+
+    /// Open the one consistent source snapshot used by every chunk in this attempt. Turning row
+    /// security off is deliberate: for a role subject to an RLS policy PostgreSQL errors instead
+    /// of silently exporting a policy-filtered partial table.
+    async fn begin_dump_snapshot(&mut self) -> anyhow::Result<()> {
+        let begin = self
+            .client
+            .batch_execute(
+                "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; \
+                 SET LOCAL row_security = off",
+            )
+            .await;
+        if let Err(begin_error) = begin {
+            let rollback_error = self.client.batch_execute("ROLLBACK").await.err();
+            let error = anyhow::Error::new(begin_error)
+                .context("begin read-only repeatable-read reload snapshot with RLS disabled");
+            if let Some(rollback_error) = rollback_error {
+                return Err(error.context(format!(
+                    "rolling back the failed snapshot setup also failed: {rollback_error}"
+                )));
+            }
+            return Err(error);
+        }
+        self.snapshot_open = true;
+        Ok(())
+    }
+
+    async fn rollback_dump_snapshot(&mut self) -> anyhow::Result<()> {
+        self.client
+            .batch_execute("ROLLBACK")
+            .await
+            .context("roll back repeatable-read reload snapshot")?;
+        self.snapshot_open = false;
+        Ok(())
+    }
+
+    /// Recover the crash seam after decode persisted H but before the controller recorded
+    /// `export_complete(H)`. An end marker is trusted only when the durable reload row, F marker,
+    /// and H marker all name this exact attempt, table, schema version, and request namespace.
+    async fn recover_durable_end(&self) -> anyhow::Result<Option<Lsn>> {
+        let markers = control::reload::read_markers(&self.pool, self.reload_id)
+            .await
+            .context("read reload markers for end-fence recovery")?;
+        if !markers
+            .iter()
+            .any(|marker| marker.kind == control::ReloadMarkerKind::End)
+        {
+            return Ok(None);
+        }
+
+        let reload = control::reload::get(&self.pool, self.reload_id)
+            .await
+            .context("read reload row for end-fence recovery")?
+            .with_context(|| {
+                format!(
+                    "reload {} disappeared while recovering its durable end marker",
+                    self.reload_id
+                )
+            })?;
+        validate_durable_end(
+            &reload,
+            &markers,
+            self.cfg.epoch,
+            &self.rel,
+            self.schema_version,
+            self.start_lsn,
+            self.request_id,
+        )
     }
 
     /// The per-chunk staleness check: is the table still at this attempt's frozen
@@ -330,107 +563,109 @@ impl ChunkExporter {
         Ok(version_changed(self.schema_version, latest))
     }
 
-    /// Signal chunk `chunk_no` and wait for its echo, retrying the full
-    /// subscribe → re-signal → await cycle up to [`ECHO_ATTEMPTS`] times.
-    ///
-    /// One timeout is NOT proof of the H11 misconfiguration — a badly lagged slot (a huge
-    /// transaction ahead of the echo in the WAL) delays echoes too, and terminally failing a
-    /// reload for lag would also purge its already-exported chunks. Retries ride out lag;
-    /// persistent silence then fails loudly, naming both candidate causes. Each retry re-signals
-    /// via DELETE + INSERT in one implicit transaction (one simple-query batch = one commit = one
-    /// FRESH echo — an `ON CONFLICT DO NOTHING` would echo nothing); the same statement shape
-    /// serves a crash-redone chunk. The DELETE also rides the slot; the routing ignores
-    /// non-insert signal ops by design.
-    async fn await_echo(&self, chunk_no: i64) -> anyhow::Result<crate::reload_signal::Echo> {
-        const ECHO_ATTEMPTS: u32 = 3;
-        for attempt in 1..=ECHO_ATTEMPTS {
-            // Subscribe-then-insert: the waiter must exist before the echo can arrive.
-            let rx = self.waiters.subscribe(self.reload_id, chunk_no);
-            let signalled_at = std::time::Instant::now();
-            self.client
-                .batch_execute(&format!(
-                    "DELETE FROM walrus.reload_signal WHERE reload_id = {r} AND chunk_no = {c}; \
-                     INSERT INTO walrus.reload_signal (reload_id, chunk_no) VALUES ({r}, {c});",
-                    r = self.reload_id,
-                    c = chunk_no,
-                ))
+    /// Emit the terminal source event and return only after decode has force-flushed the target and
+    /// persisted its durable end marker.
+    async fn establish_end_fence(&mut self) -> anyhow::Result<EndFenceOutcome> {
+        match crate::reload_event::emit_fence(
+            &mut self.client,
+            &self.fence_waiters,
+            FenceSpec {
+                publication: &self.cfg.publication_name,
+                request_id: self.request_id,
+                reload_id: self.reload_id,
+                phase: FencePhase::End,
+                target: FenceTarget {
+                    schema: &self.rel.schema,
+                    table: &self.rel.name,
+                    expected_relation: &self.rel,
+                    schema_version: self.schema_version,
+                },
+                timeouts: FenceTimeouts {
+                    lock: FENCE_LOCK_TIMEOUT,
+                    echo: self.cfg.echo_timeout,
+                },
+            },
+        )
+        .await?
+        {
+            FenceEmission::Observed(echo) => {
+                // Decode resolves an end fence only after the target flush. Recording again here is
+                // an idempotent crash seam and keeps this exporter usable with a rolling decoder.
+                control::reload::record_end_marker(
+                    &self.pool,
+                    self.reload_id,
+                    echo.commit_lsn,
+                    control::ReloadFenceIdentity {
+                        request_id: Some(self.request_id),
+                        source_schema: &self.rel.schema,
+                        source_table: &self.rel.name,
+                        schema_version: self.schema_version,
+                    },
+                )
                 .await
-                .context("insert reload watermark signal")?;
-            match tokio::time::timeout(self.cfg.echo_timeout, rx).await {
-                Ok(Ok(echo)) => {
-                    // The echo round-trip: signal INSERT → decoded-commit echo. Its p99
-                    // bounds reload throughput and tracks end-to-end decode latency.
-                    common::metrics::record_reload_echo_wait(signalled_at.elapsed().as_secs_f64());
-                    return Ok(echo);
-                }
-                Ok(Err(_)) => {
-                    anyhow::bail!("echo waiter superseded (a newer subscriber replaced it)")
-                }
-                Err(_) => tracing::warn!(
-                    reload_id = %self.reload_id,
-                    chunk_no,
-                    attempt,
-                    timeout = ?self.cfg.echo_timeout,
-                    "no echo within the timeout; re-signalling"
-                ),
+                .context("record durable reload end marker")?;
+                Ok(EndFenceOutcome::Durable(echo.commit_lsn))
             }
+            FenceEmission::AlreadyExists => {
+                let lsn = wait_for_marker(
+                    &self.pool,
+                    self.reload_id,
+                    control::ReloadMarkerKind::End,
+                    self.cfg.echo_timeout,
+                )
+                .await?;
+                Ok(EndFenceOutcome::Durable(lsn))
+            }
+            FenceEmission::SchemaChanged => Ok(EndFenceOutcome::SchemaChanged(
+                await_schema_change(
+                    &self.pool,
+                    self.cfg.epoch,
+                    &self.rel.schema,
+                    &self.rel.name,
+                    self.schema_version,
+                    self.reload_id,
+                    self.cfg.echo_timeout,
+                )
+                .await?,
+            )),
         }
-        // H11's silent failure, made loud — after enough patience that plain decode lag has had
-        // its chance. fail() purges this reload's staged chunks; a later re-request
-        // re-exports them.
-        let reason = format!(
-            "no echo after {ECHO_ATTEMPTS} attempts × {:?} on chunk {chunk_no} — either \
-             walrus.reload_signal is not in the publication \
-             (migrations/source/0003_reload_signal.sql) or the replication stream is severely \
-             lagged",
-            self.cfg.echo_timeout
-        );
-        let mut conn = self.pool.acquire().await.with_context(|| {
-            format!(
-                "acquire a control-pg connection to fail reload {}",
-                self.reload_id
-            )
-        })?;
-        control::reload::fail(&mut conn, self.reload_id, &reason)
-            .await
-            .with_context(|| format!("mark reload {} failed", self.reload_id))?;
-        common::metrics::record_reload_failed(&self.series);
-        anyhow::bail!("reload {} failed: {reason}", self.reload_id);
     }
 
-    /// One chunk: subscribe → signal → echo ⇒ `L_n` → SELECT the next PK slice → stamped Parquet
-    /// → one control-pg txn { manifest row + cursor advance }. Returns the outcome; a chunk
-    /// shorter than `chunk_rows` means the table is drained.
+    /// One chunk: ensure the attempt's single repeatable-read transaction is open, SELECT the next
+    /// PK slice, write Parquet stamped at the fixed `F`, then commit one control-pg transaction
+    /// containing the manifest row and cursor advance. The source transaction remains open for the
+    /// next call or [`Self::run`]. A chunk shorter than `chunk_rows` means the table is drained.
     ///
     /// # Errors
     ///
-    /// Returns [`anyhow::Error`] when the watermark echo times out, the source slice cannot be read,
+    /// Returns [`anyhow::Error`] when the source slice cannot be read,
     /// Arrow/Parquet/S3 export fails, or the manifest-plus-cursor control transaction cannot commit.
     pub async fn export_next_chunk(&mut self) -> anyhow::Result<ChunkOutcome> {
+        // Keep the public one-chunk seam honest: integration tests and diagnostics may step an
+        // exporter manually, but every such step must still belong to the exact snapshot that a
+        // later `run()` continues. Production `run()` has already opened it, making this a no-op.
+        if !self.snapshot_open {
+            self.begin_dump_snapshot().await?;
+        }
         let chunk_no = self.chunk_no + 1;
-        let echo = self.await_echo(chunk_no).await?;
-        // The probe's watermark — carried into every `ChunkOutcome`'s `final_lsn` below so even an
-        // empty drain (no file, no cursor advance) reports a valid `H` (>= first_lsn and every
-        // chunk `L_i`, because LSNs are monotonic).
-        let watermark = echo.commit_lsn;
+        let watermark = self.start_lsn;
 
-        // The chunk read: one short autocommit statement, strictly after the echo was observed.
+        // The chunk read stays inside this attempt's one repeatable-read snapshot, established
+        // strictly after the start-fence echo was observed.
+        let chunk_sql = self.chunk_sql()?;
         let rows = self
             .client
-            .query(&self.chunk_sql(), &[])
+            .query(&chunk_sql, &[])
             .await
             .context("reload chunk SELECT")?;
         // The chunk's last row is its next cursor (built once the file is written, below), and its
         // absence is the drain: nothing at all past the cursor, so no file (the signal row for this
         // empty probe is harmless; its echo resolved above).
         let Some(last) = rows.last() else {
-            return Ok(ChunkOutcome::Drained {
-                rows: 0,
-                final_lsn: watermark,
-            });
+            return Ok(ChunkOutcome::Drained { rows: 0 });
         };
 
-        // Stamp + write: every row `commit_lsn = lsn = L_i` (see the module doc for the proof).
+        // Stamp + write: every row `commit_lsn = lsn = F` (see the module doc for the proof).
         let cached = crate::relcache::RelationCache::default()
             .upsert_from_relation(self.rel.clone(), self.schema_version)
             .context("build Arrow schema for reload chunk")?;
@@ -453,7 +688,7 @@ impl ChunkExporter {
         }
         batcher
             .on_commit(watermark, UtcTimestamp::now())
-            .context("promote reload chunk rows at L_i")?;
+            .context("promote reload chunk rows at the baseline fence")?;
         let sealed = batcher.seal().context("seal reload chunk")?;
         let obj = self
             .sink
@@ -490,18 +725,11 @@ impl ChunkExporter {
 
         self.chunk_no = chunk_no;
         self.cursor = Some(cursor);
-        if self.first_lsn.is_none() {
-            self.first_lsn = Some(watermark);
-        }
-
         let n = u64::try_from(rows.len()).unwrap_or(u64::MAX);
         // One chunk file exported: bump the per-table chunk + row counters.
         common::metrics::record_reload_chunk(&self.series, n);
         if n < self.cfg.chunk_rows.get() {
-            Ok(ChunkOutcome::Drained {
-                rows: n,
-                final_lsn: watermark,
-            })
+            Ok(ChunkOutcome::Drained { rows: n })
         } else {
             Ok(ChunkOutcome::Exported { rows: n })
         }
@@ -510,7 +738,7 @@ impl ChunkExporter {
     /// `SELECT "c1"::text, … FROM t [WHERE (pk…) > (cursor…)] ORDER BY pk… LIMIT n` — keyset
     /// pagination via row comparison over the PK-INDEX column order: index-friendly and
     /// composite-safe (never OFFSET).
-    fn chunk_sql(&self) -> String {
+    fn chunk_sql(&self) -> anyhow::Result<String> {
         continuation_sql(
             &self.rel,
             &self.pk_cols,
@@ -522,10 +750,10 @@ impl ChunkExporter {
     fn chunk_meta(&self, watermark: Lsn) -> SinkMeta {
         SinkMeta {
             op: Op::Insert,
-            // The stamp: chunk rows carry the chunk's low watermark as BOTH LSNs, so any
-            // overlapping stream event (commit LSN > L_i) wins the loader's dedup.
+            // The stamp: every chunk row carries the attempt's lower fence as BOTH LSNs, so any
+            // overlapping stream event (commit LSN > F) wins the loader's dedup.
             lsn: watermark,
-            commit_lsn: Lsn::ZERO, // patched to L_i by the batcher's on_commit
+            commit_lsn: Lsn::ZERO, // patched to F by the batcher's on_commit
             commit_ts: UtcTimestamp::now(),
             xid: 0,
             epoch: self.cfg.epoch,
@@ -539,6 +767,239 @@ impl ChunkExporter {
             sink_processed_at: UtcTimestamp::now(),
         }
     }
+}
+
+/// Validate that a persisted H belongs to this exact exporter attempt. Kept pure so corruption and
+/// identity mismatches are testable without a live control database.
+fn validate_durable_end(
+    reload: &control::ReloadRow,
+    markers: &[control::ReloadMarkerRow],
+    expected_epoch: EpochNo,
+    expected_relation: &PgRelation,
+    expected_schema_version: SchemaVersionNo,
+    expected_start_lsn: Lsn,
+    expected_request_id: Uuid,
+) -> anyhow::Result<Option<Lsn>> {
+    let Some(end) = markers
+        .iter()
+        .find(|marker| marker.kind == control::ReloadMarkerKind::End)
+    else {
+        return Ok(None);
+    };
+    let Some(baseline) = markers
+        .iter()
+        .find(|marker| marker.kind == control::ReloadMarkerKind::Baseline)
+    else {
+        anyhow::bail!(
+            "reload {} has an end marker without its durable baseline marker",
+            reload.reload_id
+        );
+    };
+    let end_count = markers
+        .iter()
+        .filter(|marker| marker.kind == control::ReloadMarkerKind::End)
+        .count();
+    let baseline_count = markers
+        .iter()
+        .filter(|marker| marker.kind == control::ReloadMarkerKind::Baseline)
+        .count();
+
+    anyhow::ensure!(
+        end_count == 1 && baseline_count == 1 && markers.len() == 2,
+        "reload {} has an incomplete or duplicate durable F/H marker set",
+        reload.reload_id
+    );
+    anyhow::ensure!(
+        reload.status == control::ReloadStatus::Exporting,
+        "reload {} durable H recovery requires exporting status, found {:?}",
+        reload.reload_id,
+        reload.status
+    );
+    anyhow::ensure!(
+        reload.epoch == expected_epoch
+            && reload.source_schema == expected_relation.schema
+            && reload.source_table == expected_relation.name,
+        "reload {} durable H target identity disagrees with the exporter",
+        reload.reload_id
+    );
+    anyhow::ensure!(
+        reload.schema_version == Some(expected_schema_version)
+            && reload.start_lsn == Some(expected_start_lsn)
+            && reload.final_lsn.is_none(),
+        "reload {} durable H boundaries disagree with the frozen exporter attempt",
+        reload.reload_id
+    );
+    let Some(durable_request_id) = reload.source_request_id.or(reload.parent_request_id) else {
+        anyhow::bail!(
+            "reload {} durable H has no source-fence request namespace",
+            reload.reload_id
+        );
+    };
+    anyhow::ensure!(
+        durable_request_id == expected_request_id,
+        "reload {} durable H request identity disagrees with the exporter",
+        reload.reload_id
+    );
+    anyhow::ensure!(
+        baseline.reload_id == reload.reload_id
+            && baseline.kind == control::ReloadMarkerKind::Baseline
+            && baseline.lsn == expected_start_lsn
+            && baseline.schema_version == expected_schema_version,
+        "reload {} durable baseline marker disagrees with frozen F/schema",
+        reload.reload_id
+    );
+    anyhow::ensure!(
+        end.reload_id == reload.reload_id
+            && end.kind == control::ReloadMarkerKind::End
+            && end.schema_version == expected_schema_version
+            && end.lsn >= expected_start_lsn,
+        "reload {} durable end marker disagrees with frozen F/schema",
+        reload.reload_id
+    );
+    Ok(Some(end.lsn))
+}
+
+struct StartFenceContext<'a> {
+    pool: &'a sqlx::PgPool,
+    waiters: &'a FenceWaiters,
+    cfg: &'a ChunkExportConfig,
+    request_id: Uuid,
+    req: &'a control::ReloadRow,
+    expected_relation: &'a PgRelation,
+    schema_version: SchemaVersionNo,
+}
+
+impl StartFenceContext<'_> {
+    async fn establish(self, client: &mut tokio_postgres::Client) -> anyhow::Result<Lsn> {
+        match crate::reload_event::emit_fence(
+            client,
+            self.waiters,
+            FenceSpec {
+                publication: &self.cfg.publication_name,
+                request_id: self.request_id,
+                reload_id: self.req.reload_id,
+                phase: FencePhase::Start,
+                target: FenceTarget {
+                    schema: &self.req.source_schema,
+                    table: &self.req.source_table,
+                    expected_relation: self.expected_relation,
+                    schema_version: self.schema_version,
+                },
+                timeouts: FenceTimeouts {
+                    lock: FENCE_LOCK_TIMEOUT,
+                    echo: self.cfg.echo_timeout,
+                },
+            },
+        )
+        .await?
+        {
+            FenceEmission::Observed(echo) => {
+                control::reload::record_start_fence(
+                    self.pool,
+                    self.req.reload_id,
+                    echo.commit_lsn,
+                    control::ReloadFenceIdentity {
+                        request_id: Some(self.request_id),
+                        source_schema: &self.req.source_schema,
+                        source_table: &self.req.source_table,
+                        schema_version: self.schema_version,
+                    },
+                )
+                .await
+                .context("record safe reload start fence")?;
+                Ok(echo.commit_lsn)
+            }
+            FenceEmission::AlreadyExists => {
+                wait_for_marker(
+                    self.pool,
+                    self.req.reload_id,
+                    control::ReloadMarkerKind::Baseline,
+                    self.cfg.echo_timeout,
+                )
+                .await
+            }
+            FenceEmission::SchemaChanged => Err(ConnectSchemaChanged {
+                new_version: await_schema_change(
+                    self.pool,
+                    self.req.epoch,
+                    &self.req.source_schema,
+                    &self.req.source_table,
+                    self.schema_version,
+                    self.req.reload_id,
+                    self.cfg.echo_timeout,
+                )
+                .await?,
+            }
+            .into()),
+        }
+    }
+}
+
+async fn await_schema_change(
+    pool: &sqlx::PgPool,
+    epoch: EpochNo,
+    schema: &str,
+    table: &str,
+    frozen: SchemaVersionNo,
+    reload_id: ReloadId,
+    timeout: Duration,
+) -> anyhow::Result<SchemaVersionNo> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let latest = control::read_latest_version(pool, epoch, schema, table)
+            .await
+            .context("read registry latest version after live shape change")?;
+        if let Some(version) = version_changed(frozen, latest) {
+            return Ok(version);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "live source shape changed for reload {reload_id}, but schema_registry did not advance within {timeout:?}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn validate_export_keys(rel: &PgRelation, pk_cols: &[String]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !rel.to_key_columns().is_empty(),
+        "{}.{} has no replica-identity key",
+        rel.schema,
+        rel.name
+    );
+    for pk in pk_cols {
+        anyhow::ensure!(
+            rel.columns.iter().any(|column| &column.name == pk),
+            "PRIMARY KEY column {pk:?} is absent from frozen relation {}.{}",
+            rel.schema,
+            rel.name
+        );
+    }
+    Ok(())
+}
+
+async fn wait_for_marker(
+    pool: &sqlx::PgPool,
+    reload_id: ReloadId,
+    kind: control::ReloadMarkerKind,
+    timeout: Duration,
+) -> anyhow::Result<Lsn> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            if let Some(marker) = control::reload::read_markers(pool, reload_id)
+                .await
+                .context("read reload boundary markers")?
+                .into_iter()
+                .find(|marker| marker.kind == kind)
+            {
+                return anyhow::Ok(marker.lsn);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .with_context(|| format!("timed out waiting for {kind:?} marker on reload {reload_id}"))?
 }
 
 /// The PRIMARY KEY's columns in INDEX order (`pg_index.indkey` position) — the order the PK
@@ -558,6 +1019,7 @@ async fn pk_columns_in_index_order(
              JOIN unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON true
              JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum
              WHERE n.nspname = $1 AND c.relname = $2 AND i.indisprimary
+               AND k.ord <= i.indnkeyatts
              ORDER BY k.ord",
             &[&schema, &table],
         )
@@ -582,18 +1044,31 @@ fn continuation_sql(
     pk_cols: &[String],
     cursor: Option<&serde_json::Value>,
     limit: u64,
-) -> String {
+) -> anyhow::Result<String> {
     let cols: Vec<String> = rel
         .columns
         .iter()
-        .map(|c| format!("\"{}\"::text", c.name))
-        .collect();
-    let key_cols: Vec<String> = pk_cols.iter().map(|c| format!("_src.\"{c}\"")).collect();
+        .map(|column| {
+            SqlIdent::new(&column.name)
+                .map(|ident| format!("{ident}::text"))
+                .context("validate reload SELECT column")
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let key_cols: Vec<String> = pk_cols
+        .iter()
+        .map(|column| {
+            SqlIdent::new(column)
+                .map(|ident| format!("_src.{ident}"))
+                .context("validate reload PRIMARY KEY column")
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let schema = SqlIdent::new(&rel.schema).context("validate reload SELECT schema")?;
+    let table = SqlIdent::new(&rel.name).context("validate reload SELECT table")?;
     let mut sql = format!(
-        "SELECT {} FROM \"{}\".\"{}\" AS _src",
+        "SELECT {} FROM {}.{} AS _src",
         cols.join(", "),
-        rel.schema,
-        rel.name
+        schema,
+        table
     );
     if let Some(serde_json::Value::Array(values)) = cursor {
         let literals: Vec<String> = values
@@ -611,7 +1086,7 @@ fn continuation_sql(
         );
     }
     let _write_result = write!(&mut sql, " ORDER BY {} LIMIT {limit}", key_cols.join(", "));
-    sql
+    Ok(sql)
 }
 
 /// The last row's PK values, in PK-INDEX order, as their text output form.

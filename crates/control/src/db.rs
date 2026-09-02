@@ -3,6 +3,7 @@
 use crate::parse::ParseEnumError;
 use common::{FailureClass, ReloadId};
 use sqlx::postgres::{PgPool, PgPoolOptions};
+use uuid::Uuid;
 
 /// Errors from the control-DB entrypoint, classified terminal-vs-transient like [`common::Error`].
 /// This taxonomy is still growing; new variants must remain additive for downstream crates.
@@ -30,11 +31,24 @@ pub enum ControlError {
         source: sqlx::Error,
     },
 
-    /// A reload was requested for a table that already has a live (non-terminal) one — the
-    /// `table_reload_one_live` partial unique index fired. Terminal for THIS request:
-    /// retrying is pointless until the live reload reaches `complete`/`failed`.
+    /// A direct/operator reload was requested for a table that already has a live attempt — the
+    /// `table_reload_one_live` partial unique index fired. Terminal for THIS direct request:
+    /// retrying is pointless until the active attempt reaches `complete`/`failed`. Source-WAL
+    /// requests use their UUID for idempotency and queue instead of returning this error.
     #[error("a reload is already in progress for {schema}.{table}")]
     ReloadInProgress { schema: String, table: String },
+
+    /// A source request UUID was replayed for the same target with a different immutable payload.
+    /// Treating that as a fresh request would destroy idempotency; accepting the changed payload
+    /// would make the UUID ambiguous, so it is a terminal caller/protocol error.
+    #[error(
+        "source reload request {request_id} was replayed with different data for {schema}.{table}"
+    )]
+    SourceRequestConflict {
+        request_id: Uuid,
+        schema: String,
+        table: String,
+    },
 
     /// A reload transition's guarded UPDATE matched zero rows — the row was not in the expected
     /// state (an illegal jump, a lost race, or a stale caller). Terminal: it means a bug or a
@@ -60,6 +74,7 @@ impl FailureClass for ControlError {
             ControlError::Migrate(_)
             | ControlError::CheckViolation { .. }
             | ControlError::ReloadInProgress { .. }
+            | ControlError::SourceRequestConflict { .. }
             | ControlError::ReloadTransition { .. }
             | ControlError::Decode(_) => true,
             ControlError::Connect(_) => false,
