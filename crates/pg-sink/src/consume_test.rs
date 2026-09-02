@@ -44,6 +44,39 @@ fn orders_relation(with_extra: bool) -> PgRelation {
     }
 }
 
+fn wide_key_relation() -> PgRelation {
+    let columns = (1..=32)
+        .map(|index| PgColumn {
+            name: format!("key_{index:02}"),
+            type_oid: oids::INT4,
+            type_modifier: -1,
+            is_key: true,
+        })
+        .chain(std::iter::once(PgColumn {
+            name: "payload".into(),
+            type_oid: oids::TEXT,
+            type_modifier: -1,
+            is_key: false,
+        }))
+        .collect();
+    PgRelation {
+        oid: 43,
+        schema: "public".into(),
+        name: "wide_keys".into(),
+        replica_identity: ReplicaIdentity::Default,
+        columns,
+    }
+}
+
+fn wide_key_values(last_key: &str, payload: &str) -> Vec<TupleValue> {
+    let mut values = (1..=32)
+        .map(|_| TupleValue::Text("1".into()))
+        .collect::<Vec<_>>();
+    *values.last_mut().unwrap() = TupleValue::Text(last_key.into());
+    values.push(TupleValue::Text(payload.into()));
+    values
+}
+
 #[test]
 fn malformed_reload_event_is_a_decode_error() {
     let rel = PgRelation {
@@ -435,6 +468,23 @@ fn update_with_unchanged_key_emits_only_new_image() {
     let batch = sealed.pop().unwrap();
     assert_eq!(batch.row_count, 1);
     assert_eq!(batch_ops(&batch), vec![Op::Update]);
+}
+
+#[test]
+fn wide_key_change_detection_uses_the_final_component() {
+    let relation = wide_key_relation();
+    let before = wide_key_values("1", "before");
+    let payload_only = wide_key_values("1", "after");
+    let moved = wide_key_values("2", "after");
+
+    assert!(
+        !update_changes_key(&relation, &before, &payload_only).unwrap(),
+        "a non-key payload update must not become a key move"
+    );
+    assert!(
+        update_changes_key(&relation, &before, &moved).unwrap(),
+        "the 32nd key component must participate in key-change detection"
+    );
 }
 
 #[test]

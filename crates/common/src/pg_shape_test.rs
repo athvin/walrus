@@ -135,6 +135,28 @@ fn key_columns_preserve_relation_order() {
 }
 
 #[test]
+fn key_columns_have_no_walrus_specific_width_limit() {
+    const POSTGRES_MAX_INDEX_KEYS: usize = 32;
+    let columns = (1..=POSTGRES_MAX_INDEX_KEYS)
+        .map(|index| col(&format!("key_{index:02}"), 23, -1, true))
+        .chain(std::iter::once(col("payload", 25, -1, false)))
+        .collect();
+    let rel = PgRelation {
+        oid: 43,
+        schema: "public".to_string(),
+        name: "wide_keys".to_string(),
+        replica_identity: ReplicaIdentity::Default,
+        columns,
+    };
+
+    let keys = rel.to_key_columns();
+    assert_eq!(keys.len(), POSTGRES_MAX_INDEX_KEYS);
+    assert_eq!(keys.first(), Some(&"key_01"));
+    assert_eq!(keys.last(), Some(&"key_32"));
+    assert!(!keys.contains(&"payload"));
+}
+
+#[test]
 fn tuple_value_null_and_unchanged_toast_are_distinct() {
     assert_ne!(TupleValue::Null, TupleValue::UnchangedToast);
     assert_eq!(TupleValue::Null, TupleValue::Null);
