@@ -224,6 +224,9 @@ pub struct PendingSignal {
     /// The per-message xid — `Some` only inside a streamed transaction (which a single-row signal
     /// txn can never be; kept so the defensive stream paths stay precise).
     pub xid: Option<u32>,
+    /// Top-level streamed transaction that owns this signal. `StreamCommit` names the top xid while
+    /// the insert itself can carry a savepoint's sub-xid.
+    pub top_xid: Option<u32>,
 }
 
 /// Why a decoded `walrus.reload_signal` tuple is not a [`PendingSignal`] — the column that failed.
@@ -270,13 +273,19 @@ impl PendingSignal {
         rel: &common::PgRelation,
         new: &[common::TupleValue],
         xid: Option<u32>,
+        top_xid: Option<u32>,
     ) -> Result<Self, SignalTupleError> {
-        Ok(PendingSignal {
+        let signal = PendingSignal {
             reload_id: signal_field(rel, new, "reload_id")?,
             chunk_no: signal_field(rel, new, "chunk_no")?,
             embedded_lsn: signal_field(rel, new, "wal_insert_lsn")?,
             xid,
-        })
+            top_xid,
+        };
+        if signal.xid.is_some() != signal.top_xid.is_some() {
+            return Err(SignalTupleError("xid/top_xid"));
+        }
+        Ok(signal)
     }
 }
 
@@ -319,8 +328,8 @@ impl PendingSignals {
     /// Can't-happen defense: a signal insert arrived inside a streamed transaction. The surviving
     /// (non-aborted) buffered streamed signals resolve at its `Stream Commit` — with a warning,
     /// because a streamed signal txn means something upstream changed.
-    pub fn on_stream_commit(&mut self, commit_lsn: Lsn, waiters: &WatermarkWaiters) {
-        for sig in extract(&mut self.pending, |s| s.xid.is_some()) {
+    pub fn on_stream_commit(&mut self, top_xid: u32, commit_lsn: Lsn, waiters: &WatermarkWaiters) {
+        for sig in extract(&mut self.pending, |s| s.top_xid == Some(top_xid)) {
             tracing::warn!(
                 reload_id = %sig.reload_id,
                 chunk_no = sig.chunk_no,
@@ -344,7 +353,7 @@ impl PendingSignals {
     /// resolving would stamp a chunk with a watermark for rows that don't exist.
     pub fn on_stream_abort(&mut self, top_xid: u32, sub_xid: u32) {
         let dropped = extract(&mut self.pending, |s| {
-            s.xid == Some(sub_xid) || (top_xid == sub_xid && s.xid.is_some())
+            s.top_xid == Some(top_xid) && (top_xid == sub_xid || s.xid == Some(sub_xid))
         });
         for sig in &dropped {
             tracing::warn!(

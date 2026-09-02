@@ -188,6 +188,7 @@ fn defaults_are_the_shipped_contract() {
     assert_eq!(cfg.compaction_interval, Duration::from_secs(3600));
     assert_eq!(cfg.retention_lsn_lag, 16 << 20);
     assert_eq!(cfg.max_files_per_cycle.get(), 32);
+    assert_eq!(cfg.max_integrity_resnapshots, 1);
     assert_eq!(cfg.startup_deadline, Duration::from_secs(60));
     assert_eq!(cfg.health_addr, SocketAddr::from(([0, 0, 0, 0], 8080)));
     assert_eq!(cfg.worker_threads, None);
@@ -356,6 +357,19 @@ fn zero_max_files_per_cycle_is_rejected_during_deserialization() {
         .extract::<LoaderConfig>();
     let err = result.expect_err("zero must not deserialize into max_files_per_cycle");
     assert!(err.to_string().contains("max_files_per_cycle"), "{err}");
+}
+
+#[test]
+fn integrity_resnapshot_budget_must_fit_the_control_schema() {
+    let mut cfg = valid();
+    cfg.max_integrity_resnapshots = i32::MAX as u32 + 1;
+    let err = cfg.validate().unwrap_err();
+    assert!(matches!(
+        err,
+        ConfigError::IntegrityResnapshotBudget { configured }
+            if configured == i32::MAX as u32 + 1
+    ));
+    assert!(common::Error::from(err).is_terminal());
 }
 
 #[test]

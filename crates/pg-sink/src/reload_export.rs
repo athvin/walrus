@@ -234,6 +234,8 @@ pub struct ChunkExporter {
     series: String,
     schema_version: SchemaVersionNo,
     reload_id: ReloadId,
+    /// Exact claim/adoption generation carried into every control-plane mutation.
+    lease: control::ExporterLease,
     /// One safe lower fence shared by every chunk in the consistent baseline snapshot.
     start_lsn: Lsn,
     /// Stable source request correlation; synthesized deterministically for legacy callers.
@@ -257,6 +259,9 @@ impl ChunkExporter {
         cfg: ChunkExportConfig,
         req: &control::ReloadRow,
     ) -> anyhow::Result<Self> {
+        let lease = req
+            .exporter_lease(&cfg.instance)
+            .context("resolve exporter fencing generation from claimed reload")?;
         let (mut client, connection) = tokio_postgres::connect(source_db_url, NoTls)
             .await
             .context("open chunk-export SQL connection")?;
@@ -383,6 +388,7 @@ impl ChunkExporter {
             rel,
             schema_version,
             reload_id: req.reload_id,
+            lease,
             start_lsn,
             request_id,
         })
@@ -483,7 +489,7 @@ impl ChunkExporter {
     /// slot is created anywhere on this path.
     async fn export_parallel_snapshot(&mut self) -> anyhow::Result<SnapshotExportOutcome> {
         let plan = match self.begin_parallel_snapshot().await? {
-            SnapshotPlanOutcome::Ready(plan) => plan,
+            SnapshotPlanOutcome::Ready(plan) => *plan,
             SnapshotPlanOutcome::SchemaChanged(new_version) => {
                 return Ok(SnapshotExportOutcome::SchemaChanged { new_version });
             }
@@ -499,6 +505,7 @@ impl ChunkExporter {
             match connect_snapshot_worker(
                 self.source_db_url.expose(),
                 &plan.snapshot_id,
+                &plan.snapshot_identity,
                 &self.rel,
                 worker_index,
             )
@@ -534,6 +541,7 @@ impl ChunkExporter {
             start_lsn: self.start_lsn,
             schema_version: self.schema_version,
             reload_id: self.reload_id,
+            lease: self.lease.clone(),
             epoch: self.cfg.epoch,
             instance: self.cfg.instance.clone(),
             series: self.series.clone(),
@@ -611,6 +619,25 @@ impl ChunkExporter {
             .await
             .context("commit exported reload coordinator snapshot")?;
         self.client = Some(coordinator.client);
+        let mut control_conn = self
+            .pool
+            .acquire()
+            .await
+            .context("acquire control connection to seal reload snapshot")?;
+        let seal = control::reload::seal_export(
+            &mut control_conn,
+            &self.lease,
+            self.start_lsn,
+            self.schema_version,
+        )
+        .await
+        .context("seal complete reload snapshot range plan")?;
+        let rows_i64 = i64::try_from(rows).context("reload row count exceeds control bigint")?;
+        anyhow::ensure!(
+            seal.row_count == rows_i64,
+            "sealed reload row count {} disagrees with worker total {rows_i64}",
+            seal.row_count
+        );
         Ok(SnapshotExportOutcome::Drained { rows })
     }
 
@@ -665,11 +692,20 @@ impl ChunkExporter {
         }
 
         let client = self.client.as_ref().context("coordinator disappeared")?;
-        let snapshot_id: String = client
-            .query_one("SELECT pg_catalog.pg_export_snapshot()", &[])
+        let snapshot = client
+            .query_one(
+                "SELECT pg_catalog.pg_export_snapshot(),
+                        pg_catalog.pg_current_snapshot()::text,
+                        pg_catalog.pg_snapshot_xmin(pg_catalog.pg_current_snapshot())::text::bigint,
+                        pg_catalog.pg_snapshot_xmax(pg_catalog.pg_current_snapshot())::text::bigint",
+                &[],
+            )
             .await
-            .context("export reload coordinator snapshot")?
-            .get(0);
+            .context("export and identify reload coordinator snapshot")?;
+        let snapshot_id: String = snapshot.get(0);
+        let snapshot_identity: String = snapshot.get(1);
+        let snapshot_xmin: i64 = snapshot.get(2);
+        let snapshot_xmax: i64 = snapshot.get(3);
         let storage = client
             .query_one(
                 "SELECT am.amname,
@@ -704,6 +740,58 @@ impl ChunkExporter {
             vec![ScanRange::Full]
         };
         let worker_count = self.cfg.workers_per_table.get().min(ranges.len()).max(1);
+        let durable_ranges = ranges
+            .iter()
+            .enumerate()
+            .map(|(range_no, range)| {
+                let range_no =
+                    i64::try_from(range_no).context("reload range number exceeds bigint")?;
+                let (full_scan, start_block, end_block) = match range {
+                    ScanRange::Full => (true, None, None),
+                    ScanRange::Blocks { start, end } => (
+                        false,
+                        Some(i64::try_from(*start).context("reload block start exceeds bigint")?),
+                        end.map(i64::try_from)
+                            .transpose()
+                            .context("reload block end exceeds bigint")?,
+                    ),
+                };
+                anyhow::Ok(control::ExportRangePlan {
+                    range_no,
+                    full_scan,
+                    start_block,
+                    end_block,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut control_conn = self
+            .pool
+            .acquire()
+            .await
+            .context("acquire control connection for reload snapshot plan")?;
+        if let Err(error) = control::reload::begin_export_plan(
+            &mut control_conn,
+            &self.lease,
+            self.start_lsn,
+            self.schema_version,
+            control::ExportSnapshot {
+                identity: &snapshot_identity,
+                xmin: snapshot_xmin,
+                xmax: snapshot_xmax,
+            },
+            &durable_ranges,
+        )
+        .await
+        {
+            let rollback_error = self.rollback_dump_snapshot().await.err();
+            let error = anyhow::Error::new(error).context("durably record reload snapshot plan");
+            return Err(match rollback_error {
+                Some(rollback_error) => error.context(format!(
+                    "rolling back rejected snapshot plan also failed: {rollback_error:#}"
+                )),
+                None => error,
+            });
+        }
         tracing::info!(
             reload_id = %self.reload_id,
             workers = worker_count,
@@ -712,11 +800,12 @@ impl ChunkExporter {
             access_method = access_method.as_deref().unwrap_or("none"),
             "reload snapshot exported; starting ordinary SQL COPY workers"
         );
-        Ok(SnapshotPlanOutcome::Ready(SourceSnapshotPlan {
+        Ok(SnapshotPlanOutcome::Ready(Box::new(SourceSnapshotPlan {
             snapshot_id,
+            snapshot_identity,
             ranges,
             worker_count,
-        }))
+        })))
     }
 
     async fn rollback_dump_snapshot(&self) -> anyhow::Result<()> {
@@ -938,13 +1027,14 @@ enum ScanRange {
 #[derive(Debug)]
 struct SourceSnapshotPlan {
     snapshot_id: String,
+    snapshot_identity: String,
     ranges: Vec<ScanRange>,
     worker_count: usize,
 }
 
 #[derive(Debug)]
 enum SnapshotPlanOutcome {
-    Ready(SourceSnapshotPlan),
+    Ready(Box<SourceSnapshotPlan>),
     SchemaChanged(SchemaVersionNo),
 }
 
@@ -962,10 +1052,10 @@ impl RangeQueue {
         }
     }
 
-    fn claim(&self) -> Option<ScanRange> {
-        self.ranges
-            .get(self.next.fetch_add(1, Ordering::Relaxed))
-            .copied()
+    fn claim(&self) -> Option<(i64, ScanRange)> {
+        let index = self.next.fetch_add(1, Ordering::Relaxed);
+        let range = self.ranges.get(index).copied()?;
+        i64::try_from(index).ok().map(|range_no| (range_no, range))
     }
 }
 
@@ -981,6 +1071,7 @@ struct CopyWorkerContext {
     start_lsn: Lsn,
     schema_version: SchemaVersionNo,
     reload_id: ReloadId,
+    lease: control::ExporterLease,
     epoch: EpochNo,
     instance: String,
     series: String,
@@ -1075,6 +1166,7 @@ fn snapshot_worker_setup_sql(snapshot_id: &str, rel: &PgRelation) -> anyhow::Res
 async fn connect_snapshot_worker(
     source_db_url: &str,
     snapshot_id: &str,
+    expected_snapshot_identity: &str,
     rel: &PgRelation,
     worker_index: usize,
 ) -> anyhow::Result<tokio_postgres::Client> {
@@ -1095,6 +1187,19 @@ async fn connect_snapshot_worker(
             "import shared snapshot in reload COPY worker {worker_index}"
         )));
     }
+    let imported_identity: String = client
+        .query_one("SELECT pg_catalog.pg_current_snapshot()::text", &[])
+        .await
+        .with_context(|| {
+            format!("read imported snapshot identity in reload worker {worker_index}")
+        })?
+        .get(0);
+    if imported_identity != expected_snapshot_identity {
+        rollback_source_client(&client, "COPY worker imported wrong snapshot").await;
+        anyhow::bail!(
+            "reload COPY worker {worker_index} imported snapshot {imported_identity}, expected {expected_snapshot_identity}"
+        );
+    }
     Ok(client)
 }
 
@@ -1107,11 +1212,15 @@ async fn run_copy_worker(
     // encoder scratch, and multipart buffer. Holding it through `finish` makes remote backpressure
     // release memory capacity before another table's worker can begin polling COPY.
     let _memory_permit = ctx.worker_admission.acquire().await?;
-    let mut router = ReloadRouter::new(ctx.clone())?;
     let column_types = vec![Type::TEXT; ctx.cached.relation.columns.len()];
     let mut tuple = Vec::with_capacity(ctx.cached.relation.columns.len());
     let mut rows = 0u64;
-    while let Some(range) = ctx.ranges.claim() {
+    while let Some((range_no, range)) = ctx.ranges.claim() {
+        // One router per physical range makes its durable completion receipt exact: every object
+        // counted below contains rows from this range only, and completion is recorded only after
+        // the final buffered object manifest is committed.
+        let mut router = ReloadRouter::new(ctx.clone())?;
+        let mut range_rows = 0u64;
         let sql = copy_sql(&ctx.cached.relation, range)?;
         let copy = client
             .copy_out(&sql)
@@ -1129,9 +1238,19 @@ async fn run_copy_worker(
             }
             router.push(&tuple).await?;
             rows = rows.saturating_add(1);
+            range_rows = range_rows.saturating_add(1);
         }
+        let range_files = router.finish().await?;
+        control::reload::record_export_range(
+            &ctx.pool,
+            &ctx.lease,
+            range_no,
+            range_files,
+            i64::try_from(range_rows).context("reload range row count exceeds control bigint")?,
+        )
+        .await
+        .with_context(|| format!("record completed reload range {range_no}"))?;
     }
-    router.finish().await?;
     tracing::debug!(worker_index, rows, "reload COPY worker drained");
     Ok(CopyWorkerResult {
         worker_index,
@@ -1147,6 +1266,7 @@ struct ReloadRouter {
     buffered_rows: u64,
     object_row_groups: usize,
     max_object_row_groups: usize,
+    completed_files: i64,
 }
 
 impl ReloadRouter {
@@ -1173,6 +1293,7 @@ impl ReloadRouter {
             buffered_rows: 0,
             object_row_groups: 0,
             max_object_row_groups,
+            completed_files: 0,
         })
     }
 
@@ -1262,7 +1383,7 @@ impl ReloadRouter {
         .context("record streamed reload object manifest")?;
         let file_no = control::reload::record_exported_file(
             &mut *tx,
-            self.ctx.reload_id,
+            &self.ctx.lease,
             self.ctx.start_lsn,
             self.ctx.schema_version,
         )
@@ -1271,6 +1392,9 @@ impl ReloadRouter {
         tx.commit()
             .await
             .context("commit reload object manifest and completed-file count")?;
+        self.completed_files = self.completed_files.checked_add(1).context(
+            "reload range produced more files than the control bigint counter can represent",
+        )?;
         common::metrics::record_reload_chunk(&self.ctx.series, object.row_count);
         tracing::debug!(
             reload_id = %self.ctx.reload_id,
@@ -1282,12 +1406,12 @@ impl ReloadRouter {
         Ok(())
     }
 
-    async fn finish(mut self) -> anyhow::Result<()> {
+    async fn finish(mut self) -> anyhow::Result<i64> {
         self.flush_micro_batch().await?;
         if self.writer.is_some() {
             self.finish_object().await?;
         }
-        Ok(())
+        Ok(self.completed_files)
     }
 }
 

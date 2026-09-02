@@ -1,4 +1,4 @@
-use super::{Message, Reader, StreamCtx, parse_message, parse_tuple};
+use super::{DecodeError, Message, Reader, StreamCtx, parse_message, parse_tuple};
 use common::TupleValue;
 
 const PG_MAX_COLUMNS: u16 = 1_600;
@@ -60,4 +60,13 @@ fn relation_decodes_every_postgres_key_flag() {
     assert!(relation.columns.iter().all(|column| column.is_key));
     assert_eq!(relation.to_key_columns().first(), Some(&"key_01"));
     assert_eq!(relation.to_key_columns().last(), Some(&"key_32"));
+}
+
+#[test]
+fn stream_start_rejects_a_non_boolean_first_segment_flag() {
+    let bytes = [b'S', 0, 0, 0, 42, 2];
+
+    let error = parse_message(&mut Reader::new(&bytes), &mut StreamCtx::default()).unwrap_err();
+
+    assert_eq!(error, DecodeError::BadStreamStartFlag { byte: 2 });
 }

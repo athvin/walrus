@@ -13,6 +13,18 @@ use tokio_util::sync::CancellationToken;
 /// Floor for the renew cadence: never tick sub-second, however small the admitted TTL.
 pub(crate) const MIN_RENEW_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Exact per-table ownership capability held by this loader process. The token is part of the
+/// identity: two processes configured with the same instance name must still fence one another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldLease {
+    /// Source schema.
+    pub schema: String,
+    /// Source table.
+    pub table: String,
+    /// Token minted by this process's successful explicit acquisition.
+    pub fencing_token: i64,
+}
+
 // `renew_interval`'s `clamp` bounds invert — and panic — if its floor exceeds the TTL. A `LeaseTtl`
 // admits nothing below `MIN_LEASE_TTL`, so keeping that floor at or above this one is what turns the
 // ordering into a compile-time fact rather than a runtime hope.
@@ -59,7 +71,9 @@ pub async fn acquire(
         })
 }
 
-/// Renew every owned table's lease every `ttl/3`, off the apply-loop thread, until cancelled.
+/// Renew every owned table's lease every `ttl/3`, off the apply-loop thread, until cancelled. A
+/// stale token or expired lease cancels the shared service token immediately so the process drops
+/// its Duck catalog lock instead of continuing as an unfenced writer.
 ///
 /// Takes a parsed [`LeaseTtl`] rather than a bare `Duration`: the renew cadence is only well-defined
 /// for a TTL the renewal can land inside, and that check belongs at the config edge, once.
@@ -67,7 +81,7 @@ pub async fn acquire(
 pub fn spawn_renewer(
     pool: sqlx::PgPool,
     epoch: EpochNo,
-    keys: Vec<(String, String)>,
+    leases: Vec<HeldLease>,
     self_pod: String,
     ttl: LeaseTtl,
     token: CancellationToken,
@@ -79,10 +93,29 @@ pub fn spawn_renewer(
                 biased;
                 _ = token.cancelled() => return,
                 _ = tick.tick() => {
-                    for (schema, table) in &keys {
-                        match control::renew_lease(&pool, epoch, schema, table, &self_pod, ttl_secs(ttl.get())).await {
+                    for lease in &leases {
+                        match control::renew_lease(
+                            &pool,
+                            epoch,
+                            &lease.schema,
+                            &lease.table,
+                            &self_pod,
+                            lease.fencing_token,
+                            ttl_secs(ttl.get()),
+                        ).await {
                             Ok(true) => {}
-                            Ok(false) => tracing::error!(table = %format_args!("{schema}.{table}"), "lease lost — no longer owner"),
+                            Ok(false) => {
+                                tracing::error!(
+                                    table = %format_args!("{}.{}", lease.schema, lease.table),
+                                    fencing_token = lease.fencing_token,
+                                    "lease lost — owner/token is stale or the lease expired; draining loader"
+                                );
+                                // Continuing under the Duck catalog lock would block the rightful
+                                // successor while this process no longer has a control-plane write
+                                // capability. Drain all workers and release the hard lock instead.
+                                token.cancel();
+                                return;
+                            }
                             Err(e) => tracing::warn!(error = %e, "lease renew failed (will retry)"),
                         }
                     }
@@ -96,11 +129,20 @@ pub fn spawn_renewer(
 pub async fn release_all(
     pool: &sqlx::PgPool,
     epoch: EpochNo,
-    keys: &[(String, String)],
+    leases: &[HeldLease],
     self_pod: &str,
 ) {
-    for (schema, table) in keys {
-        if let Err(e) = control::release_lease(pool, epoch, schema, table, self_pod).await {
+    for lease in leases {
+        if let Err(e) = control::release_lease(
+            pool,
+            epoch,
+            &lease.schema,
+            &lease.table,
+            self_pod,
+            lease.fencing_token,
+        )
+        .await
+        {
             tracing::warn!(error = %e, "lease release failed");
         }
     }

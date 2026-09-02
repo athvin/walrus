@@ -203,12 +203,36 @@ struct PendingDdl {
     event: DdlEvent,
     version: SchemaVersionNo,
     identity_change: Option<TrackedTableIdentityChange>,
+    replay: bool,
 }
 
 #[derive(Debug, Clone)]
 struct PendingRegistry {
     scope: TransactionScope,
     row: control::RegistryRow,
+}
+
+/// Validated control-plane payload for one protocol-v2 `StreamCommit`.
+///
+/// Preparing this value is deliberately read-only. The pending DDL/registry state remains intact
+/// until the caller has atomically published this payload with every streamed data object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedStreamDdl {
+    top_xid: u32,
+    ddl_rows: Vec<control::DdlRow>,
+    registry_rows: Vec<control::RegistryRow>,
+}
+
+impl PreparedStreamDdl {
+    #[must_use]
+    pub(crate) fn ddl_rows(&self) -> &[control::DdlRow] {
+        &self.ddl_rows
+    }
+
+    #[must_use]
+    pub(crate) fn registry_rows(&self) -> &[control::RegistryRow] {
+        &self.registry_rows
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -301,15 +325,65 @@ impl DdlConsumer {
         schema: &str,
         table: &str,
     ) -> SchemaVersionNo {
-        self.pending
-            .iter()
-            .filter(|pending| {
-                same_transaction(pending.scope, scope)
-                    && table_matches(&pending.event, schema, table)
-            })
-            .map(|pending| pending.version)
-            .max()
+        self.pending_version_for(scope, schema, table)
             .unwrap_or_else(|| self.committed_version_of(schema, table))
+    }
+
+    /// Resolve a pgoutput `Relation` message to its exact historical schema version.
+    ///
+    /// A restart can replay WAL older than the newest durable registry row. Falling back to the
+    /// committed maximum would then bind old tuples to a future shape. A transaction-local DDL
+    /// version wins when present; otherwise the durable DDL history is cut at this Relation frame's
+    /// WAL position and that exact registry version must match the wire shape. An unseen relation is
+    /// admitted only when neither its OID nor qualified name has any durable history (fresh bootstrap).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DdlError::RelationVersionBinding`] when a relation conflicts with its scoped DDL
+    /// version or does not match the registry version valid at `frame_lsn`.
+    pub fn relation_version_for(
+        &self,
+        scope: TransactionScope,
+        relation: &PgRelation,
+        frame_lsn: Lsn,
+        cache: &RelationCache,
+    ) -> Result<SchemaVersionNo, DdlError> {
+        let exact_versions = cache
+            .iter()
+            .filter(|cached| cached.relation == *relation)
+            .map(|cached| cached.schema_version)
+            .collect::<Vec<_>>();
+        let scoped_version = self.pending_version_for(scope, &relation.schema, &relation.name);
+        let expected = scoped_version.unwrap_or_else(|| {
+            self.historical_version_through(&relation.schema, &relation.name, frame_lsn)
+        });
+        let expected_cached = cache.get(relation.oid, expected);
+        if expected_cached
+            .as_ref()
+            .is_some_and(|cached| cached.relation == *relation)
+        {
+            return Ok(expected);
+        }
+        if expected_cached.is_none()
+            && cache.latest_for(relation.oid).is_none()
+            && cache
+                .latest_for_name(&relation.schema, &relation.name)
+                .is_none()
+            && self.processed.values().all(|row| {
+                row.source_schema != relation.schema || row.source_table != relation.name
+            })
+        {
+            return Ok(expected);
+        }
+        Err(DdlError::RelationVersionBinding {
+            relation_oid: relation.oid,
+            schema: relation.schema.clone(),
+            table: relation.name.clone(),
+            frame_lsn,
+            expected_version: expected,
+            scoped_version,
+            exact_versions,
+        })
     }
 
     /// Stage one decoded DDL event. No control-DB side effect occurs before commit.
@@ -317,7 +391,7 @@ impl DdlConsumer {
     /// `previous_for_oid` must be the relation already tracked for `event.c_rel_oid`, if any. A
     /// rename, schema move, or drop is recorded as provisional transaction state here, but is not
     /// rejected yet: a streamed transaction can still abort. The matching [`Self::on_commit`] or
-    /// [`Self::on_stream_commit`] returns the typed error before opening a control transaction.
+    /// [`Self::prepare_stream_commit`] returns the typed error before opening a control transaction.
     pub fn observe(
         &mut self,
         scope: TransactionScope,
@@ -330,6 +404,18 @@ impl DdlConsumer {
                 &existing.source_table,
                 existing.schema_version,
             );
+            if !self.pending.iter().any(|pending| {
+                pending.event.source_audit_id == event.source_audit_id
+                    && same_transaction(pending.scope, scope)
+            }) {
+                self.pending.push(PendingDdl {
+                    scope,
+                    event: event.clone(),
+                    version: existing.schema_version,
+                    identity_change: None,
+                    replay: true,
+                });
+            }
             return DdlObservation {
                 structural_version: event.is_structural().then_some(existing.schema_version),
                 replay: true,
@@ -349,6 +435,7 @@ impl DdlConsumer {
             event,
             version,
             identity_change,
+            replay: false,
         });
         DdlObservation {
             structural_version,
@@ -356,7 +443,9 @@ impl DdlConsumer {
         }
     }
 
-    /// Whether `version` is provisional rather than globally committed.
+    /// Whether `version` belongs to DDL state that must be commit-gated in the current decode pass.
+    /// This includes both genuinely provisional DDL and hydrated history being reconstructed for a
+    /// lost-ACK replay.
     #[must_use]
     pub fn is_provisional(&self, schema: &str, table: &str, version: SchemaVersionNo) -> bool {
         self.pending.iter().any(|pending| {
@@ -395,20 +484,35 @@ impl DdlConsumer {
             .await
     }
 
-    /// Commit one streamed top-level transaction's DDL and registry state with its StreamCommit LSN.
+    /// Validate and extract one streamed top-level transaction's DDL/registry payload without
+    /// mutating pending or committed in-memory state.
     ///
     /// # Errors
     ///
     /// Returns [`DdlError::TrackedTableIdentityChange`] for a committed tracked-table rename,
-    /// schema move, or drop, or [`DdlError::Control`] if atomic control persistence fails.
-    pub async fn on_stream_commit(
-        &mut self,
-        pool: &sqlx::PgPool,
+    /// schema move, or drop. The caller must include the returned rows in the same durable control
+    /// transaction as the streamed data manifests, then call [`Self::finalize_stream_commit`].
+    pub(crate) fn prepare_stream_commit(
+        &self,
         top_xid: u32,
         commit_lsn: Lsn,
-    ) -> Result<(), DdlError> {
-        self.commit_selected(pool, commit_lsn, CommitSelector::Streamed(top_xid))
-            .await
+    ) -> Result<PreparedStreamDdl, DdlError> {
+        let (ddl_rows, registry_rows) =
+            self.prepare_selected(commit_lsn, CommitSelector::Streamed(top_xid))?;
+        Ok(PreparedStreamDdl {
+            top_xid,
+            ddl_rows,
+            registry_rows,
+        })
+    }
+
+    /// Make a previously prepared streamed DDL payload globally visible in this process after the
+    /// enclosing control publication returned either `Published` or `AlreadyPublished`.
+    pub(crate) fn finalize_stream_commit(&mut self, prepared: PreparedStreamDdl) {
+        self.finalize_selected(
+            CommitSelector::Streamed(prepared.top_xid),
+            prepared.ddl_rows,
+        );
     }
 
     /// Discard DDL and provisional registry rows rolled back by `StreamAbort`.
@@ -435,7 +539,7 @@ impl DdlConsumer {
             .retain(|pending| !aborts(pending.scope));
         removed
             .into_iter()
-            .filter(|pending| pending.event.is_structural())
+            .filter(|pending| pending.event.is_structural() && !pending.replay)
             .map(|pending| {
                 (
                     pending.event.source_schema,
@@ -452,6 +556,29 @@ impl DdlConsumer {
         commit_lsn: Lsn,
         selector: CommitSelector,
     ) -> Result<(), DdlError> {
+        let (rows, registry) = self.prepare_selected(commit_lsn, selector)?;
+        if rows.is_empty() && registry.is_empty() {
+            return Ok(());
+        }
+
+        let mut tx = pool.begin().await.map_err(control::ControlError::from)?;
+        for row in &rows {
+            control::insert_ddl(&mut *tx, row).await?;
+        }
+        for row in &registry {
+            control::upsert_registry(&mut *tx, row).await?;
+        }
+        tx.commit().await.map_err(control::ControlError::from)?;
+
+        self.finalize_selected(selector, rows);
+        Ok(())
+    }
+
+    fn prepare_selected(
+        &self,
+        commit_lsn: Lsn,
+        selector: CommitSelector,
+    ) -> Result<(Vec<control::DdlRow>, Vec<control::RegistryRow>), DdlError> {
         let pending = self
             .pending
             .iter()
@@ -462,11 +589,8 @@ impl DdlConsumer {
             .pending_registry
             .iter()
             .filter(|row| selector.matches(row.scope))
-            .cloned()
+            .map(|pending| pending.row.clone())
             .collect::<Vec<_>>();
-        if pending.is_empty() && registry.is_empty() {
-            return Ok(());
-        }
 
         // Identity is part of a loader worker's durable routing key. Fail before any control row is
         // written; the replication Commit/StreamCommit consequently remains unacknowledged and an
@@ -496,16 +620,10 @@ impl DdlConsumer {
                 c_ddl_text: pending.event.c_ddl_text.clone(),
             })
             .collect::<Vec<_>>();
+        Ok((rows, registry))
+    }
 
-        let mut tx = pool.begin().await.map_err(control::ControlError::from)?;
-        for row in &rows {
-            control::insert_ddl(&mut *tx, row).await?;
-        }
-        for pending in &registry {
-            control::upsert_registry(&mut *tx, &pending.row).await?;
-        }
-        tx.commit().await.map_err(control::ControlError::from)?;
-
+    fn finalize_selected(&mut self, selector: CommitSelector, rows: Vec<control::DdlRow>) {
         for row in rows {
             self.set_committed(&row.source_schema, &row.source_table, row.schema_version);
             self.processed.insert(row.source_audit_id, row);
@@ -513,7 +631,6 @@ impl DdlConsumer {
         self.pending.retain(|row| !selector.matches(row.scope));
         self.pending_registry
             .retain(|row| !selector.matches(row.scope));
-        Ok(())
     }
 
     fn set_committed(&mut self, schema: &str, table: &str, version: SchemaVersionNo) {
@@ -527,6 +644,37 @@ impl DdlConsumer {
             self.committed_versions
                 .insert((schema.to_string(), table.to_string()), version);
         }
+    }
+
+    fn pending_version_for(
+        &self,
+        scope: TransactionScope,
+        schema: &str,
+        table: &str,
+    ) -> Option<SchemaVersionNo> {
+        self.pending
+            .iter()
+            .filter(|pending| {
+                same_transaction(pending.scope, scope)
+                    && table_matches(&pending.event, schema, table)
+            })
+            .map(|pending| pending.version)
+            .max()
+    }
+
+    fn historical_version_through(
+        &self,
+        schema: &str,
+        table: &str,
+        frame_lsn: Lsn,
+    ) -> SchemaVersionNo {
+        self.processed
+            .values()
+            .filter(|row| {
+                row.source_schema == schema && row.source_table == table && row.c_lsn <= frame_lsn
+            })
+            .max_by_key(|row| (row.c_lsn, row.schema_version))
+            .map_or(SchemaVersionNo(1), |row| row.schema_version)
     }
 }
 
@@ -665,6 +813,27 @@ pub enum DdlError {
     /// A committed DDL transaction changed the durable identity of a tracked relation.
     #[error("tracked table identity change is unsupported: {0}")]
     TrackedTableIdentityChange(TrackedTableIdentityChange),
+    /// A Relation message could not be assigned to one exact historical schema version without
+    /// falling forward to a newer durable shape.
+    #[error(
+        "cannot bind relation {schema}.{table} (OID {relation_oid}) at WAL {frame_lsn} to expected schema version {expected_version}: scoped={scoped_version:?}, matching historical shapes={exact_versions:?}"
+    )]
+    RelationVersionBinding {
+        /// Source relation identity carried by pgoutput.
+        relation_oid: u32,
+        /// Qualified source schema carried by pgoutput.
+        schema: String,
+        /// Qualified source table carried by pgoutput.
+        table: String,
+        /// WAL position of the Relation frame used to cut durable DDL history.
+        frame_lsn: Lsn,
+        /// Version the transaction-local state or durable history requires at this position.
+        expected_version: SchemaVersionNo,
+        /// Exact transaction-local DDL version, when one exists.
+        scoped_version: Option<SchemaVersionNo>,
+        /// Hydrated versions whose persisted relation snapshots exactly matched the wire relation.
+        exact_versions: Vec<SchemaVersionNo>,
+    },
     /// The atomic control-Postgres commit failed.
     #[error(transparent)]
     Control(#[from] control::ControlError),

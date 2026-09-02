@@ -56,3 +56,42 @@ fn empty_input_is_reported_verbatim() {
     assert_eq!(err.column, "file_manifest.status");
     assert_eq!(err.input, "");
 }
+
+fn grouped_row(id: i64, ordinal: i64) -> ManifestRow {
+    ManifestRow {
+        id: ManifestId(id),
+        epoch: EpochNo(7),
+        source_schema: "public".into(),
+        source_table: "orders".into(),
+        s3_uri: format!("s3://walrus/7/public/orders/{id}.parquet"),
+        kind: ManifestKind::Spill,
+        row_count: 2,
+        object_size: 128,
+        sha256: vec![u8::try_from(id).unwrap_or_default(); 32],
+        lsn_start: Lsn::new(90),
+        lsn_end: Lsn::new(100),
+        schema_version: SchemaVersionNo(3),
+        status: ManifestStatus::Ready,
+        reload_id: None,
+        stream_group_id: Some(ManifestGroupId(11)),
+        stream_group_ordinal: Some(ordinal),
+        stream_commit_ts: Some("2026-09-02T00:00:00Z".into()),
+        stream_top_xid: Some(42),
+        stream_group_expected_files: Some(2),
+        stream_group_row_count: Some(4),
+    }
+}
+
+#[test]
+fn complete_stream_group_is_accepted() {
+    validate_claimed_groups(&[grouped_row(1, 0), grouped_row(2, 1)]).unwrap();
+}
+
+#[test]
+fn partial_or_duplicate_stream_group_is_rejected() {
+    let partial = validate_claimed_groups(&[grouped_row(1, 0)]).unwrap_err();
+    assert!(partial.to_string().contains("returned 1 children"));
+
+    let duplicate = validate_claimed_groups(&[grouped_row(1, 0), grouped_row(2, 0)]).unwrap_err();
+    assert!(duplicate.to_string().contains("invalid/duplicate ordinal"));
+}

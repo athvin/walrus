@@ -10,7 +10,11 @@
 //! integration job runs `cargo test -p control --features integration --test migrations`.
 #![cfg(feature = "integration")]
 
-use control::{connect, run_migrations};
+use common::{EpochNo, Lsn, SchemaVersionNo};
+use control::{
+    ManifestKind, NewManifestFile, claim_ready, connect, delete_claimed, insert_ready,
+    run_migrations,
+};
 use sqlx::Connection;
 use sqlx::postgres::PgPool;
 use uuid::Uuid;
@@ -46,6 +50,10 @@ async fn migrations_create_all_tables() {
         "ddl_manifest",
         "table_reload",
         "table_reload_marker",
+        "table_reload_export_range",
+        "stream_txn_publication",
+        "stream_manifest_group",
+        "table_integrity_recovery",
     ] {
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
@@ -134,6 +142,241 @@ async fn unified_reconcile_migration_installs_request_fences_and_marker_constrai
     .await
     .unwrap();
     assert_eq!(marker_pk, ["reload_id", "marker_kind"]);
+}
+
+#[tokio::test]
+async fn protocol_v2_migration_installs_export_publication_and_integrity_fences() {
+    let pool = migrated_pool().await;
+
+    for column in [
+        "publication_nonce",
+        "publisher_owner_pod",
+        "publisher_fencing_token",
+        "exporter_generation",
+        "export_snapshot",
+        "export_snapshot_xmin",
+        "export_snapshot_xmax",
+        "export_range_count",
+        "export_sealed_at",
+        "export_file_count",
+        "export_row_count",
+    ] {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns
+             WHERE table_schema = 'walrus' AND table_name = 'table_reload'
+               AND column_name = $1)",
+        )
+        .bind(column)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(exists, "walrus.table_reload.{column} must exist");
+    }
+
+    for column in [
+        "object_size",
+        "sha256",
+        "stream_group_id",
+        "stream_group_ordinal",
+    ] {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns
+             WHERE table_schema = 'walrus' AND table_name = 'file_manifest'
+               AND column_name = $1)",
+        )
+        .bind(column)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(exists, "walrus.file_manifest.{column} must exist");
+    }
+
+    let file_shape_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'walrus' AND table_name = 'stream_manifest_group'
+           AND column_name = 'file_shape')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        file_shape_exists,
+        "stream group replay shape must be durable"
+    );
+
+    for trigger in [
+        "table_reload_exporter_protocol_v2",
+        "table_reload_exporter_acquisition_v2",
+        "table_reload_v2_completion_guard",
+        "file_manifest_reload_attempt_guard",
+        "file_manifest_delete_protocol_v2",
+    ] {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+               SELECT 1 FROM pg_trigger t
+               JOIN pg_class c ON c.oid = t.tgrelid
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'walrus' AND t.tgname = $1 AND NOT t.tgisinternal
+             )",
+        )
+        .bind(trigger)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(exists, "rollout/integrity trigger {trigger} must exist");
+    }
+
+    let live_index: String = sqlx::query_scalar(
+        "SELECT indexdef FROM pg_indexes
+         WHERE schemaname = 'walrus' AND indexname = 'table_reload_one_live'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(live_index.contains("publishing"), "{live_index}");
+}
+
+#[tokio::test]
+async fn protocol_v2_rollout_tripwires_reject_embedded_pre_v2_sql() {
+    let pool = migrated_pool().await;
+    let mut tx = pool.begin().await.unwrap();
+    let epoch = EpochNo(9_900_009);
+    let reload_id = control::reload::request(
+        &mut *tx,
+        epoch,
+        "public",
+        "old_exporter_guard",
+        control::reload::ReloadFlavor::Reload,
+    )
+    .await
+    .unwrap();
+
+    // This is the essential shape of the old embedded claim: it enters exporting but never mints
+    // exporter_generation. The database must reject it even if an old process survives rollout.
+    let mut savepoint = Connection::begin(&mut *tx).await.unwrap();
+    let old_claim = sqlx::query(
+        "UPDATE walrus.table_reload
+         SET status = 'exporting', lease_holder = 'pre-v2',
+             lease_expiry = statement_timestamp() + interval '60 seconds'
+         WHERE reload_id = $1",
+    )
+    .bind(reload_id.0)
+    .execute(&mut *savepoint)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        old_claim
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code),
+        Some(std::borrow::Cow::Borrowed("23514"))
+    );
+    savepoint.rollback().await.unwrap();
+
+    let claimed = control::reload::claim_requested(&mut *tx, epoch, "v2-exporter", 60, 1)
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert!(claimed[0].exporter_generation > 0);
+
+    // A v2 controller may return a pristine claim to the queue. Its positive generation remains
+    // as durable history; that must not let an old claim reuse the token without incrementing it.
+    let first_generation = claimed[0].exporter_generation;
+    let first_lease = claimed[0].exporter_lease("v2-exporter").unwrap();
+    assert!(
+        control::reload::release_claim(&mut *tx, &first_lease)
+            .await
+            .unwrap()
+    );
+    let mut savepoint = Connection::begin(&mut *tx).await.unwrap();
+    let old_reclaim = sqlx::query(
+        "UPDATE walrus.table_reload
+         SET status = 'exporting', lease_holder = 'pre-v2',
+             lease_expiry = statement_timestamp() + interval '60 seconds'
+         WHERE reload_id = $1",
+    )
+    .bind(reload_id.0)
+    .execute(&mut *savepoint)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        old_reclaim
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code),
+        Some(std::borrow::Cow::Borrowed("23514"))
+    );
+    savepoint.rollback().await.unwrap();
+
+    let reclaimed = control::reload::claim_requested(&mut *tx, epoch, "v2-exporter", 60, 1)
+        .await
+        .unwrap();
+    assert_eq!(reclaimed.len(), 1);
+    assert!(reclaimed[0].exporter_generation > first_generation);
+
+    // The old adopter assigns lease_holder even when the configured pod name is unchanged. An
+    // UPDATE OF trigger must still reject it because it did not mint a newer generation.
+    let mut savepoint = Connection::begin(&mut *tx).await.unwrap();
+    let old_same_holder_adopt = sqlx::query(
+        "UPDATE walrus.table_reload
+         SET lease_holder = 'v2-exporter',
+             lease_expiry = statement_timestamp() + interval '60 seconds',
+             updated_at = now()
+         WHERE reload_id = $1 AND status = 'exporting'",
+    )
+    .bind(reload_id.0)
+    .execute(&mut *savepoint)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        old_same_holder_adopt
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code),
+        Some(std::borrow::Cow::Borrowed("23514"))
+    );
+    savepoint.rollback().await.unwrap();
+
+    let lsn: Lsn = "0/100".parse().unwrap();
+    let manifest_id = insert_ready(
+        &mut *tx,
+        &NewManifestFile {
+            epoch,
+            source_schema: "public".to_string(),
+            source_table: "old_loader_guard".to_string(),
+            s3_uri: format!("s3://walrus/rollout-{}.parquet", Uuid::new_v4()),
+            kind: ManifestKind::Stream,
+            row_count: 1,
+            object_size: 1,
+            sha256: vec![7; 32],
+            lsn_start: lsn,
+            lsn_end: lsn,
+            schema_version: SchemaVersionNo(1),
+            reload_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // The old loader's unconditional DELETE must fail closed. The modern grouped deletion path
+    // opts into the v2 protocol transaction-locally and remains usable.
+    let mut savepoint = Connection::begin(&mut *tx).await.unwrap();
+    let old_delete = sqlx::query("DELETE FROM walrus.file_manifest WHERE id = $1")
+        .bind(manifest_id.0)
+        .execute(&mut *savepoint)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        old_delete
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code),
+        Some(std::borrow::Cow::Borrowed("23514"))
+    );
+    savepoint.rollback().await.unwrap();
+
+    let ready = claim_ready(&mut *tx, epoch, "public", "old_loader_guard", 1)
+        .await
+        .unwrap();
+    assert_eq!(ready.len(), 1);
+    assert_eq!(delete_claimed(&mut *tx, &[manifest_id]).await.unwrap(), 1);
+    tx.rollback().await.unwrap();
 }
 
 #[tokio::test]
@@ -341,6 +584,19 @@ async fn markerless_upgrade_attempts_fail_and_purge_only_their_files() {
     let mut tx = pool.begin().await.unwrap();
     let epoch = 9_008_001_i64;
 
+    // This test deliberately recreates rows as they existed immediately before migration 0008.
+    // Protocol-v2's later insert/delete guards must be suspended while seeding and running that
+    // historical migration; the enclosing transaction restores them even if the test fails.
+    sqlx::raw_sql(
+        "ALTER TABLE walrus.file_manifest
+           DISABLE TRIGGER file_manifest_reload_attempt_guard;
+         ALTER TABLE walrus.file_manifest
+           DISABLE TRIGGER file_manifest_delete_protocol_v2;",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
     let markerless: i64 = sqlx::query_scalar(
         "INSERT INTO walrus.table_reload
            (epoch, source_schema, source_table, flavor, status, chunk_no,
@@ -370,8 +626,9 @@ async fn markerless_upgrade_attempts_fail_and_purge_only_their_files() {
         sqlx::query(
             "INSERT INTO walrus.file_manifest
                (epoch, source_schema, source_table, s3_uri, kind, row_count,
-                lsn_start, lsn_end, schema_version, reload_id)
+                object_size, sha256, lsn_start, lsn_end, schema_version, reload_id)
              VALUES ($1, 'public', $2, $3, 'reload', 1,
+                     1, decode(repeat('00', 32), 'hex'),
                      '0/10'::pg_lsn, '0/10'::pg_lsn, 1, $4)",
         )
         .bind(epoch)
@@ -389,6 +646,15 @@ async fn markerless_upgrade_attempts_fail_and_purge_only_their_files() {
     .execute(&mut *tx)
     .await
     .expect("0008 upgrade cleanup applies to an existing v7-shaped fixture");
+    sqlx::raw_sql(
+        "ALTER TABLE walrus.file_manifest
+           ENABLE TRIGGER file_manifest_reload_attempt_guard;
+         ALTER TABLE walrus.file_manifest
+           ENABLE TRIGGER file_manifest_delete_protocol_v2;",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
 
     let markerless_state: (String, Option<String>) =
         sqlx::query_as("SELECT status, error FROM walrus.table_reload WHERE reload_id = $1")

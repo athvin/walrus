@@ -171,7 +171,7 @@ fn write_local_fixture(dir: &Path, name: &str, ids: (i64, i64), placeholder: &st
         )
     };
     w.execute_batch(&format!(
-        "CREATE TABLE fixture (id BIGINT, status VARCHAR, walrus_pg_sink_meta VARCHAR); \
+        "CREATE TABLE fixture (id INTEGER, status VARCHAR, walrus_pg_sink_meta VARCHAR); \
              INSERT INTO fixture VALUES \
                ({}, 'a', '{}'), ({}, 'b', '{}'); \
              COPY fixture TO '{uri}' (FORMAT PARQUET);",
@@ -182,6 +182,93 @@ fn write_local_fixture(dir: &Path, name: &str, ids: (i64, i64), placeholder: &st
     ))
     .unwrap();
     uri
+}
+
+fn attested_meta(source_table: &str) -> common::SinkMeta {
+    common::SinkMeta {
+        op: common::Op::Insert,
+        lsn: common::Lsn::new(0x10),
+        commit_lsn: common::Lsn::new(0x20),
+        commit_ts: "2026-07-08T12:00:00Z".parse().unwrap(),
+        xid: 7,
+        epoch: common::EpochNo(1),
+        batch_id: "batch-1".to_string(),
+        schema_version: common::SchemaVersionNo(1),
+        source_schema: "public".to_string(),
+        source_table: source_table.to_string(),
+        kind: common::Kind::Stream,
+        unchanged_toast: Box::default(),
+        sink_instance: "sink-0".to_string(),
+        sink_processed_at: "2026-07-08T12:00:01Z".parse().unwrap(),
+    }
+}
+
+fn write_attested_metas(dir: &Path, name: &str, metas: &[common::SinkMeta]) -> String {
+    let path = dir.join(name);
+    let uri = path.to_string_lossy().replace('\'', "''");
+    let writer = duckdb::Connection::open_in_memory().unwrap();
+    writer
+        .execute_batch(
+            "CREATE TABLE fixture (id INTEGER, status VARCHAR, walrus_pg_sink_meta VARCHAR);",
+        )
+        .unwrap();
+    for (index, meta) in metas.iter().enumerate() {
+        let id = i32::try_from(index + 1).unwrap();
+        let status = format!("row-{id}");
+        let encoded = serde_json::to_string(meta).unwrap();
+        writer
+            .execute(
+                "INSERT INTO fixture VALUES (?, ?, ?)",
+                duckdb::params![id, status, encoded],
+            )
+            .unwrap();
+    }
+    writer
+        .execute_batch(&format!("COPY fixture TO '{uri}' (FORMAT PARQUET);"))
+        .unwrap();
+    uri
+}
+
+fn write_attested_fixture(dir: &Path, name: &str, source_table: &str) -> String {
+    write_attested_metas(dir, name, &[attested_meta(source_table)])
+}
+
+fn validate_attested_fixture(
+    dir: &Path,
+    name: &str,
+    metas: &[common::SinkMeta],
+    expectation: ManifestExpectation<'_>,
+) -> Result<(), LoaderError> {
+    let uri = write_attested_metas(dir, name, metas);
+    let reader = duckdb::Connection::open_in_memory().unwrap();
+    validate_manifest_rows(&reader, &uri, "s3://walrus/attested.parquet", expectation)
+}
+
+fn assert_integrity_reason(result: Result<(), LoaderError>, needle: &str) {
+    match result {
+        Err(LoaderError::ObjectIntegrity { reason, .. }) => {
+            assert!(
+                reason.contains(needle),
+                "{reason:?} does not contain {needle:?}"
+            );
+        }
+        other => panic!("expected object-integrity error containing {needle:?}, got {other:?}"),
+    }
+}
+
+fn manifest_expectation(row_count: i64) -> ManifestExpectation<'static> {
+    ManifestExpectation {
+        row_count,
+        epoch: common::EpochNo(1),
+        source_schema: "public",
+        source_table: "orders",
+        source_columns: &[],
+        schema_version: common::SchemaVersionNo(1),
+        kind: common::Kind::Stream,
+        lsn_start: common::Lsn::new(0x10),
+        lsn_end: common::Lsn::new(0x20),
+        speculative_commit_lsn: false,
+    }
 }
 
 fn commit_lsns(db: &TableDb, ids: (i64, i64)) -> Vec<String> {
@@ -264,6 +351,7 @@ fn reload_shadow_resumes_without_clearing_and_stays_hidden_until_publish() {
     let plan = crate::plan::TablePlan::tier1(&rel);
     let version = common::SchemaVersionNo(3);
     let reload_id = common::ReloadId(41);
+    let publication_nonce = uuid::Uuid::from_u128(41);
     let start = "0/100".parse().unwrap();
     let end = "0/180".parse().unwrap();
     db.ensure_tables_planned(&plan, version).unwrap();
@@ -275,7 +363,7 @@ fn reload_shadow_resumes_without_clearing_and_stays_hidden_until_publish() {
         .unwrap();
 
     let BeginReload::Ready(build) = db
-        .begin_reload_shadow(&plan, version, reload_id, start, end)
+        .begin_reload_shadow(&plan, version, reload_id, start, end, publication_nonce)
         .unwrap()
     else {
         panic!("a new reload must create a shadow");
@@ -305,7 +393,7 @@ fn reload_shadow_resumes_without_clearing_and_stays_hidden_until_publish() {
     );
 
     let resumed = db
-        .begin_reload_shadow(&plan, version, reload_id, start, end)
+        .begin_reload_shadow(&plan, version, reload_id, start, end, publication_nonce)
         .unwrap();
     assert_eq!(resumed, BeginReload::Ready(build.clone()));
     let shadow_rows: i64 = db
@@ -321,6 +409,8 @@ fn reload_shadow_resumes_without_clearing_and_stays_hidden_until_publish() {
         "a crash-redo resumes the deterministic shadow instead of clearing it"
     );
 
+    db.seal_reload_at_h(reload_id, publication_nonce, end)
+        .unwrap();
     assert!(db.publish_reload_shadow("orders", reload_id).unwrap());
     let published: Vec<(i64, String)> = db
         .conn()
@@ -332,11 +422,18 @@ fn reload_shadow_resumes_without_clearing_and_stays_hidden_until_publish() {
         .collect();
     assert_eq!(published, vec![(1, "dump".into()), (2, "new".into())]);
     assert_eq!(db.recorded_reload_id().unwrap(), Some(reload_id));
-    assert_eq!(db.reload_build().unwrap(), None);
+    let receipt = db.reload_build().unwrap().unwrap();
+    assert_eq!(receipt.phase, super::ReloadPhase::Published);
+    assert_eq!(receipt.publication_nonce, publication_nonce);
     assert!(
         !db.publish_reload_shadow("orders", reload_id).unwrap(),
         "a cutover retry is an idempotent no-op"
     );
+    assert!(
+        db.clear_reload_publication(reload_id, publication_nonce)
+            .unwrap()
+    );
+    assert_eq!(db.reload_build().unwrap(), None);
 }
 
 #[test]
@@ -346,6 +443,8 @@ fn publishing_an_empty_shadow_clears_phantoms() {
     let plan = crate::plan::TablePlan::tier1(&rel);
     let version = common::SchemaVersionNo(1);
     let reload_id = common::ReloadId(42);
+    let publication_nonce = uuid::Uuid::from_u128(42);
+    let end = "0/240".parse().unwrap();
     db.ensure_tables_planned(&plan, version).unwrap();
     db.conn()
         .execute("INSERT INTO orders (id, status) VALUES (99, 'phantom')", [])
@@ -356,9 +455,12 @@ fn publishing_an_empty_shadow_clears_phantoms() {
         version,
         reload_id,
         "0/200".parse().unwrap(),
-        "0/240".parse().unwrap(),
+        end,
+        publication_nonce,
     )
     .unwrap();
+    db.seal_reload_at_h(reload_id, publication_nonce, end)
+        .unwrap();
     assert!(db.publish_reload_shadow("orders", reload_id).unwrap());
 
     let rows: i64 = db
@@ -368,6 +470,60 @@ fn publishing_an_empty_shadow_clears_phantoms() {
     assert_eq!(
         rows, 0,
         "the marker-delimited empty generation is data: it removes every phantom"
+    );
+}
+
+#[test]
+fn abandoning_a_reload_requires_the_exact_unpublished_identity() {
+    let db = TableDb::open(":memory:").unwrap();
+    let plan = crate::plan::TablePlan::tier1(&orders());
+    let version = common::SchemaVersionNo(1);
+    let reload_id = common::ReloadId(51);
+    let nonce = uuid::Uuid::from_u128(51);
+    let start = "0/300".parse().unwrap();
+    let end = "0/340".parse().unwrap();
+    db.ensure_tables_planned(&plan, version).unwrap();
+    let BeginReload::Ready(build) = db
+        .begin_reload_shadow(&plan, version, reload_id, start, end, nonce)
+        .unwrap()
+    else {
+        panic!("fresh reload must create a shadow");
+    };
+
+    assert!(
+        !db.abandon_reload_build(reload_id, uuid::Uuid::from_u128(52))
+            .unwrap(),
+        "a different publication nonce has no deletion authority"
+    );
+    assert!(db.reload_build().unwrap().is_some());
+    assert!(db.abandon_reload_build(reload_id, nonce).unwrap());
+    assert_eq!(db.reload_build().unwrap(), None);
+    let shadow_raw = format!("{}_raw", build.shadow_table);
+    let shadow_tables: i64 = db
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM information_schema.tables WHERE table_name IN (?, ?)",
+            duckdb::params![build.shadow_table, shadow_raw],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(shadow_tables, 0);
+
+    let BeginReload::Ready(_) = db
+        .begin_reload_shadow(&plan, version, reload_id, start, end, nonce)
+        .unwrap()
+    else {
+        panic!("abandoned reload can be rebuilt for this test");
+    };
+    db.seal_reload_at_h(reload_id, nonce, end).unwrap();
+    assert!(db.publish_reload_shadow("orders", reload_id).unwrap());
+    assert!(
+        !db.abandon_reload_build(reload_id, nonce).unwrap(),
+        "a published receipt is never removable by the building cleanup path"
+    );
+    assert_eq!(
+        db.reload_build().unwrap().unwrap().phase,
+        super::ReloadPhase::Published
     );
 }
 
@@ -428,6 +584,446 @@ fn spill_override_stamps_lsn_end_but_verbatim_otherwise() {
     );
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous unit-test helper fingerprints a local temporary Parquet fixture"
+)]
+fn fixture_fingerprint(path: &str) -> (i64, Vec<u8>) {
+    use sha2::Digest as _;
+    let bytes = std::fs::read(path).unwrap();
+    (
+        i64::try_from(bytes.len()).unwrap(),
+        sha2::Sha256::digest(bytes).to_vec(),
+    )
+}
+
+#[test]
+fn attested_parquet_metadata_and_row_count_are_checked_before_receipt_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = TableDb::open(dir.path().join("attested.duckdb")).unwrap();
+    db.ensure_tables(&orders(), common::SchemaVersionNo(1))
+        .unwrap();
+    db.conn.execute_batch("INSTALL json; LOAD json;").unwrap();
+    let parquet = write_attested_fixture(dir.path(), "attested.parquet", "orders");
+    let (size, sha) = fixture_fingerprint(&parquet);
+    let file = ManifestAppend {
+        manifest_id: common::ManifestId(450),
+        original_uri: "s3://walrus/attested.parquet",
+        verified_uri: Some(&parquet),
+        object_size: size,
+        sha256: &sha,
+        stream_group_id: None,
+        schema_version: common::SchemaVersionNo(1),
+        commit_lsn_override: None,
+        expectation: Some(manifest_expectation(1)),
+    };
+    assert_eq!(db.append_manifest_unit("orders", &[file]).unwrap(), 1);
+    assert_eq!((raw_rows(&db), ingest_markers(&db)), (1, 1));
+
+    let wrong_table = write_attested_fixture(dir.path(), "wrong-table.parquet", "other");
+    let (wrong_size, wrong_sha) = fixture_fingerprint(&wrong_table);
+    let wrong = ManifestAppend {
+        manifest_id: common::ManifestId(451),
+        original_uri: "s3://walrus/wrong-table.parquet",
+        verified_uri: Some(&wrong_table),
+        object_size: wrong_size,
+        sha256: &wrong_sha,
+        expectation: Some(manifest_expectation(1)),
+        ..file
+    };
+    assert!(matches!(
+        db.append_manifest_unit("orders", &[wrong]),
+        Err(crate::error::LoaderError::ObjectIntegrity { .. })
+    ));
+    assert_eq!(
+        (raw_rows(&db), ingest_markers(&db)),
+        (1, 1),
+        "invalid metadata rolls back both raw rows and the ingest receipt"
+    );
+}
+
+#[test]
+fn attested_row_count_mismatch_rolls_back_the_atomic_append() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = TableDb::open(dir.path().join("row-count.duckdb")).unwrap();
+    db.ensure_tables(&orders(), common::SchemaVersionNo(1))
+        .unwrap();
+    db.conn.execute_batch("INSTALL json; LOAD json;").unwrap();
+    let parquet = write_attested_fixture(dir.path(), "one-row.parquet", "orders");
+    let (size, sha) = fixture_fingerprint(&parquet);
+    let file = ManifestAppend {
+        manifest_id: common::ManifestId(460),
+        original_uri: "s3://walrus/one-row.parquet",
+        verified_uri: Some(&parquet),
+        object_size: size,
+        sha256: &sha,
+        stream_group_id: None,
+        schema_version: common::SchemaVersionNo(1),
+        commit_lsn_override: None,
+        expectation: Some(manifest_expectation(2)),
+    };
+    assert!(matches!(
+        db.append_manifest_unit("orders", &[file]),
+        Err(crate::error::LoaderError::ObjectIntegrity { .. })
+    ));
+    assert_eq!((raw_rows(&db), ingest_markers(&db)), (0, 0));
+}
+
+#[test]
+fn unchanged_toast_is_limited_to_distinct_non_key_source_columns_on_updates() {
+    let dir = tempfile::tempdir().unwrap();
+    let relation = orders();
+    let expectation = ManifestExpectation {
+        source_columns: &relation.columns,
+        ..manifest_expectation(1)
+    };
+    let mut valid = attested_meta("orders");
+    valid.op = common::Op::Update;
+    valid.unchanged_toast = vec!["status".to_string()].into_boxed_slice();
+    validate_attested_fixture(
+        dir.path(),
+        "toast-valid.parquet",
+        &[valid.clone()],
+        expectation,
+    )
+    .unwrap();
+
+    let invalid = [
+        ("toast-insert.parquet", {
+            let mut meta = valid.clone();
+            meta.op = common::Op::Insert;
+            meta
+        }),
+        ("toast-key.parquet", {
+            let mut meta = valid.clone();
+            meta.unchanged_toast = vec!["id".to_string()].into_boxed_slice();
+            meta
+        }),
+        ("toast-unknown.parquet", {
+            let mut meta = valid.clone();
+            meta.unchanged_toast = vec!["missing".to_string()].into_boxed_slice();
+            meta
+        }),
+        ("toast-meta.parquet", {
+            let mut meta = valid.clone();
+            meta.unchanged_toast = vec!["walrus_pg_sink_meta".to_string()].into_boxed_slice();
+            meta
+        }),
+        ("toast-duplicate.parquet", {
+            let mut meta = valid;
+            meta.unchanged_toast =
+                vec!["status".to_string(), "status".to_string()].into_boxed_slice();
+            meta
+        }),
+    ];
+    for (name, meta) in invalid {
+        assert_integrity_reason(
+            validate_attested_fixture(dir.path(), name, &[meta], expectation),
+            "invalid unchanged_toast column",
+        );
+    }
+}
+
+#[test]
+fn snapshot_and_reload_rows_are_exact_fence_insert_images() {
+    let dir = tempfile::tempdir().unwrap();
+    let relation = orders();
+    let fence = common::Lsn::new(0x30);
+    for (name, kind) in [
+        ("snapshot-valid.parquet", common::Kind::Snapshot),
+        ("reload-valid.parquet", common::Kind::Reload),
+    ] {
+        let mut meta = attested_meta("orders");
+        meta.kind = kind;
+        meta.lsn = fence;
+        meta.commit_lsn = fence;
+        let expectation = ManifestExpectation {
+            kind,
+            lsn_start: fence,
+            lsn_end: fence,
+            source_columns: &relation.columns,
+            ..manifest_expectation(1)
+        };
+        validate_attested_fixture(dir.path(), name, &[meta], expectation).unwrap();
+    }
+
+    let reload_expectation = ManifestExpectation {
+        kind: common::Kind::Reload,
+        lsn_start: fence,
+        lsn_end: fence,
+        source_columns: &relation.columns,
+        ..manifest_expectation(1)
+    };
+    let mut update = attested_meta("orders");
+    update.kind = common::Kind::Reload;
+    update.op = common::Op::Update;
+    update.lsn = fence;
+    update.commit_lsn = fence;
+    assert_integrity_reason(
+        validate_attested_fixture(
+            dir.path(),
+            "reload-update.parquet",
+            &[update],
+            reload_expectation,
+        ),
+        "not an insert image",
+    );
+
+    let mut wrong_kind = attested_meta("orders");
+    wrong_kind.lsn = fence;
+    wrong_kind.commit_lsn = fence;
+    assert_integrity_reason(
+        validate_attested_fixture(
+            dir.path(),
+            "reload-wrong-kind.parquet",
+            &[wrong_kind],
+            reload_expectation,
+        ),
+        "metadata identity does not match",
+    );
+
+    let ranged_expectation = ManifestExpectation {
+        lsn_end: common::Lsn::new(fence.as_u64() + 1),
+        ..reload_expectation
+    };
+    let mut ranged = attested_meta("orders");
+    ranged.kind = common::Kind::Reload;
+    ranged.lsn = fence;
+    ranged.commit_lsn = fence;
+    assert_integrity_reason(
+        validate_attested_fixture(
+            dir.path(),
+            "reload-range.parquet",
+            &[ranged],
+            ranged_expectation,
+        ),
+        "lies outside manifest",
+    );
+}
+
+#[test]
+fn batch_and_sink_identity_are_nonempty_and_stable_within_each_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let relation = orders();
+    let expectation = ManifestExpectation {
+        row_count: 2,
+        source_columns: &relation.columns,
+        ..manifest_expectation(2)
+    };
+    let first = attested_meta("orders");
+    validate_attested_fixture(
+        dir.path(),
+        "identity-valid.parquet",
+        &[first.clone(), first.clone()],
+        expectation,
+    )
+    .unwrap();
+
+    let mut changed_batch = first.clone();
+    changed_batch.batch_id = "batch-2".to_string();
+    assert_integrity_reason(
+        validate_attested_fixture(
+            dir.path(),
+            "identity-batch-change.parquet",
+            &[first.clone(), changed_batch],
+            expectation,
+        ),
+        "changes batch_id",
+    );
+
+    let mut changed_sink = first.clone();
+    changed_sink.sink_instance = "sink-1".to_string();
+    assert_integrity_reason(
+        validate_attested_fixture(
+            dir.path(),
+            "identity-sink-change.parquet",
+            &[first.clone(), changed_sink],
+            expectation,
+        ),
+        "changes sink_instance",
+    );
+
+    for (name, mut meta) in [
+        ("identity-empty-batch.parquet", first.clone()),
+        ("identity-empty-sink.parquet", first),
+    ] {
+        if name.contains("batch") {
+            meta.batch_id.clear();
+        } else {
+            meta.sink_instance.clear();
+        }
+        assert_integrity_reason(
+            validate_attested_fixture(dir.path(), name, &[meta.clone(), meta], expectation),
+            "empty batch_id or sink_instance",
+        );
+    }
+}
+
+#[test]
+fn speculative_spill_rows_use_the_begin_placeholder_and_stay_inside_the_txn_bounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let relation = orders();
+    let begin = common::Lsn::new(0x40);
+    let commit = common::Lsn::new(0x60);
+    let expectation = ManifestExpectation {
+        source_columns: &relation.columns,
+        lsn_start: begin,
+        lsn_end: commit,
+        speculative_commit_lsn: true,
+        ..manifest_expectation(1)
+    };
+    let mut valid = attested_meta("orders");
+    valid.commit_lsn = begin;
+    valid.lsn = common::Lsn::new(0x50);
+    validate_attested_fixture(
+        dir.path(),
+        "spill-valid.parquet",
+        &[valid.clone()],
+        expectation,
+    )
+    .unwrap();
+
+    let invalid = [
+        ("spill-placeholder.parquet", {
+            let mut meta = valid.clone();
+            meta.commit_lsn = common::Lsn::new(begin.as_u64() + 1);
+            meta
+        }),
+        ("spill-before-begin.parquet", {
+            let mut meta = valid.clone();
+            meta.lsn = common::Lsn::new(begin.as_u64() - 1);
+            meta
+        }),
+        ("spill-after-commit.parquet", {
+            let mut meta = valid;
+            meta.lsn = common::Lsn::new(commit.as_u64() + 1);
+            meta
+        }),
+    ];
+    for (name, meta) in invalid {
+        assert_integrity_reason(
+            validate_attested_fixture(dir.path(), name, &[meta], expectation),
+            "lies outside manifest",
+        );
+    }
+}
+
+#[test]
+fn complete_stream_group_appends_rows_and_receipts_atomically() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = TableDb::open(dir.path().join("group.duckdb")).unwrap();
+    db.ensure_tables(&orders(), common::SchemaVersionNo(1))
+        .unwrap();
+    db.conn.execute_batch("INSTALL json; LOAD json;").unwrap();
+    let first = write_local_fixture(dir.path(), "group-0.parquet", (1, 2), "1");
+    let second = write_local_fixture(dir.path(), "group-1.parquet", (3, 4), "1");
+    let (first_size, first_sha) = fixture_fingerprint(&first);
+    let (second_size, second_sha) = fixture_fingerprint(&second);
+    let files = [
+        ManifestAppend {
+            manifest_id: common::ManifestId(501),
+            original_uri: "s3://walrus/group-0.parquet",
+            verified_uri: Some(&first),
+            object_size: first_size,
+            sha256: &first_sha,
+            stream_group_id: Some(77),
+            schema_version: common::SchemaVersionNo(1),
+            commit_lsn_override: None,
+            expectation: None,
+        },
+        ManifestAppend {
+            manifest_id: common::ManifestId(502),
+            original_uri: "s3://walrus/group-1.parquet",
+            verified_uri: Some(&second),
+            object_size: second_size,
+            sha256: &second_sha,
+            stream_group_id: Some(77),
+            schema_version: common::SchemaVersionNo(1),
+            commit_lsn_override: None,
+            expectation: None,
+        },
+    ];
+    assert_eq!(db.append_manifest_unit("orders", &files).unwrap(), 4);
+    assert_eq!((raw_rows(&db), ingest_markers(&db)), (4, 2));
+    assert_eq!(db.append_manifest_unit("orders", &files).unwrap(), 0);
+    assert_eq!((raw_rows(&db), ingest_markers(&db)), (4, 2));
+}
+
+#[test]
+fn second_stream_group_file_failure_rolls_back_first_file_and_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = TableDb::open(dir.path().join("group-rollback.duckdb")).unwrap();
+    db.ensure_tables(&orders(), common::SchemaVersionNo(1))
+        .unwrap();
+    db.conn.execute_batch("INSTALL json; LOAD json;").unwrap();
+    let first = write_local_fixture(dir.path(), "good.parquet", (1, 2), "1");
+    let missing = dir
+        .path()
+        .join("missing.parquet")
+        .to_string_lossy()
+        .into_owned();
+    let (first_size, first_sha) = fixture_fingerprint(&first);
+    let files = [
+        ManifestAppend {
+            manifest_id: common::ManifestId(601),
+            original_uri: "s3://walrus/good.parquet",
+            verified_uri: Some(&first),
+            object_size: first_size,
+            sha256: &first_sha,
+            stream_group_id: Some(88),
+            schema_version: common::SchemaVersionNo(1),
+            commit_lsn_override: None,
+            expectation: None,
+        },
+        ManifestAppend {
+            manifest_id: common::ManifestId(602),
+            original_uri: "s3://walrus/missing.parquet",
+            verified_uri: Some(&missing),
+            object_size: 1,
+            sha256: &[9_u8; 32],
+            stream_group_id: Some(88),
+            schema_version: common::SchemaVersionNo(1),
+            commit_lsn_override: None,
+            expectation: None,
+        },
+    ];
+    assert!(db.append_manifest_unit("orders", &files).is_err());
+    assert_eq!((raw_rows(&db), ingest_markers(&db)), (0, 0));
+}
+
+#[test]
+fn replay_metadata_mismatch_never_reuses_an_ingest_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = TableDb::open(dir.path().join("receipt-mismatch.duckdb")).unwrap();
+    db.ensure_tables(&orders(), common::SchemaVersionNo(1))
+        .unwrap();
+    db.conn.execute_batch("INSTALL json; LOAD json;").unwrap();
+    let parquet = write_local_fixture(dir.path(), "receipt.parquet", (1, 2), "1");
+    let (size, sha) = fixture_fingerprint(&parquet);
+    let file = ManifestAppend {
+        manifest_id: common::ManifestId(701),
+        original_uri: "s3://walrus/receipt.parquet",
+        verified_uri: Some(&parquet),
+        object_size: size,
+        sha256: &sha,
+        stream_group_id: None,
+        schema_version: common::SchemaVersionNo(1),
+        commit_lsn_override: None,
+        expectation: None,
+    };
+    db.append_manifest_unit("orders", &[file]).unwrap();
+    let wrong_sha = [4_u8; 32];
+    let changed = ManifestAppend {
+        verified_uri: None,
+        sha256: &wrong_sha,
+        ..file
+    };
+    assert!(matches!(
+        db.ingest_receipt_state(&changed),
+        Err(crate::error::LoaderError::ManifestInvariant { .. })
+    ));
+}
+
 #[test]
 #[allow(
     clippy::disallowed_methods,
@@ -456,13 +1052,13 @@ fn fresh_raw_is_a_heap_and_uri_replay_skips_the_parquet_read() {
     );
     assert_eq!((raw_rows(&db), ingest_markers(&db)), (2, 1));
 
-    // A retry can carry a newly allocated control-row id but the immutable object URI is the
-    // durable identity. Removing it proves the ledger check happens before DESCRIBE/read_parquet.
+    // An exact receipt retry does not reopen the object. Manifest id and URI are both immutable;
+    // reusing either with different metadata is rejected by the production unit API.
     std::fs::remove_file(dir.path().join("once.parquet")).unwrap();
     assert_eq!(
         db.append_parquet(
             "orders",
-            common::ManifestId(102),
+            common::ManifestId(101),
             &parquet,
             common::SchemaVersionNo(1),
             None,
@@ -488,7 +1084,8 @@ fn marker_failure_rolls_back_the_raw_append() {
         .execute_batch(
             "DROP TABLE \"_walrus_ingested_files\"; \
              CREATE TABLE \"_walrus_ingested_files\" (s3_uri VARCHAR PRIMARY KEY, \
-                 manifest_id BIGINT NOT NULL CHECK (manifest_id > 0));",
+                 manifest_id BIGINT NOT NULL CHECK (manifest_id > 0), \
+                 object_size BIGINT, sha256 VARCHAR, stream_group_id BIGINT);",
         )
         .unwrap();
     let error = db
@@ -501,7 +1098,7 @@ fn marker_failure_rolls_back_the_raw_append() {
         )
         .unwrap_err();
     assert!(
-        error.to_string().contains("record ingest marker"),
+        error.to_string().contains("record ingest receipt"),
         "{error:?}"
     );
     assert_eq!(
@@ -573,26 +1170,23 @@ fn legacy_primary_key_absorbs_the_upgrade_replay_then_migrates_losslessly() {
 }
 
 #[test]
-fn parquet_column_cache_hit_then_mutation_capable_miss() {
-    assert!(
-        include_str!("duck.rs")
-            .contains("let cached = { self.parquet_cols.borrow().get(&schema_version).cloned() };")
-    );
-
+fn expected_schema_is_cached_but_every_parquet_is_still_verified() {
     let dir = tempfile::tempdir().unwrap();
     let db = TableDb::open(dir.path().join("cache.duckdb")).unwrap();
+    db.ensure_tables(&orders(), common::SchemaVersionNo(1))
+        .unwrap();
     let parquet = write_local_fixture(dir.path(), "columns.parquet", (1, 2), "0");
 
     let initial = db
-        .columns_for(&parquet, common::SchemaVersionNo(1))
+        .columns_for("orders", &parquet, &parquet, common::SchemaVersionNo(1))
         .unwrap();
     let hit = db
-        .columns_for("not-read-on-cache-hit.parquet", common::SchemaVersionNo(1))
+        .columns_for("orders", &parquet, &parquet, common::SchemaVersionNo(1))
         .unwrap();
-    assert!(Arc::ptr_eq(&initial, &hit), "cache hit reuses the same Arc");
+    assert_eq!(initial, hit);
 
     let miss = db
-        .columns_for(&parquet, common::SchemaVersionNo(2))
+        .columns_for("orders", &parquet, &parquet, common::SchemaVersionNo(2))
         .unwrap();
     assert_eq!(&*miss, &*initial);
     assert_eq!(
@@ -600,6 +1194,27 @@ fn parquet_column_cache_hit_then_mutation_capable_miss() {
         2,
         "the miss can mutably insert after the hit borrow ends"
     );
+
+    let extra = dir.path().join("extra.parquet");
+    let extra_uri = extra.to_string_lossy().replace('\'', "''");
+    let writer = duckdb::Connection::open_in_memory().unwrap();
+    writer
+        .execute_batch(&format!(
+            "CREATE TABLE fixture (id INTEGER, status VARCHAR, unexpected VARCHAR, \
+             walrus_pg_sink_meta VARCHAR); \
+             INSERT INTO fixture VALUES (1, 'a', 'must-not-be-dropped', '{{}}'); \
+             COPY fixture TO '{extra_uri}' (FORMAT PARQUET);"
+        ))
+        .unwrap();
+    assert!(matches!(
+        db.columns_for(
+            "orders",
+            &extra_uri,
+            "s3://walrus/extra.parquet",
+            common::SchemaVersionNo(1),
+        ),
+        Err(crate::error::LoaderError::ObjectIntegrity { .. })
+    ));
 }
 
 #[test]

@@ -70,12 +70,12 @@ async fn pipeline(
     state: &Arc<LoaderState>,
 ) -> Result<(), LoaderError> {
     let pool = control::connect(cfg.control_db_url.expose()).await?;
-    let store = build_store(cfg)?;
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(build_store(cfg)?);
     let s3 = duck_s3_access(cfg);
 
     // `&store` unsize-coerces to the `&dyn ObjectStore` bootstrap takes, so the concrete client is
     // erased at that one boundary and nowhere else.
-    let bootstrapped = bootstrap::bootstrap(cfg, &pool, &store, &s3, state).await?;
+    let bootstrapped = bootstrap::bootstrap(cfg, &pool, store.as_ref(), &s3, state).await?;
     let bootstrap::BootstrapResult {
         epoch,
         tables: owned,
@@ -113,7 +113,14 @@ async fn pipeline(
     // Local bootstrap itself is progress. This keeps a legitimate zero-table shard live while the
     // global all-table request is still reconciling.
     state.stamp_poll();
-    let keys: Vec<(String, String)> = owned.iter().map(bootstrap::OwnedTable::to_key).collect();
+    let held_leases: Vec<lease::HeldLease> = owned
+        .iter()
+        .map(bootstrap::OwnedTable::to_held_lease)
+        .collect();
+    let keys: Vec<(String, String)> = held_leases
+        .iter()
+        .map(|lease| (lease.schema.clone(), lease.table.clone()))
+        .collect();
     // Zero-init every per-table loader series so /metrics lists the owned tables from the first scrape,
     // before any apply cycle has moved a needle.
     for (schema, table) in &keys {
@@ -130,7 +137,7 @@ async fn pipeline(
     let renewer = lease::spawn_renewer(
         pool.clone(),
         epoch,
-        keys.clone(),
+        held_leases.clone(),
         cfg.instance.clone(),
         LeaseTtl::new(cfg.lease_ttl)?,
         token.clone(),
@@ -188,6 +195,10 @@ async fn pipeline(
             pool: pool.clone(),
             epoch,
             epoch_rx: epoch_rx.clone(),
+            owner_pod: cfg.instance.clone(),
+            fencing_token: o.fencing_token,
+            store: Arc::clone(&store),
+            staging_bucket: cfg.object_store.bucket.clone(),
             schema: o.schema,
             table: o.table,
             series,
@@ -195,6 +206,7 @@ async fn pipeline(
             db: o.db,
             state: Arc::clone(state),
             max_files: cfg.max_files_per_cycle,
+            max_integrity_resnapshots: cfg.max_integrity_resnapshots,
             poll_interval: cfg.poll_interval,
             compaction_interval: cfg.compaction_interval,
             retention_lsn_lag: cfg.retention_lsn_lag,
@@ -284,18 +296,16 @@ async fn pipeline(
         tracing::error!(%error, "DuckLake maintenance task panicked");
     }
     // Cancel-then-join, never `abort()`: the renewer already observes this token, and `abort()` only
-    // *requests* a stop — it returns while an in-flight renewal may still be on the wire. That matters
-    // because `release_lease` merely pushes `lease_expiry` into the past and leaves `owner_pod` set,
-    // while `renew_lease` is guarded on the owner alone: a renewal landing AFTER the release would
-    // push the expiry a whole TTL forward, and the successor's `acquire` reads that as a live owner —
-    // a terminal `LeaseContended`, not a wait. Awaiting the cancelled renewer is what proves no
-    // renewal can outlive this line. It is bounded by the same control-DB latency `release_all` is
-    // about to pay anyway (the renewer's cancellation arm is `biased`, so at most the current round).
+    // *requests* a stop — it returns while an in-flight renewal may still be on the wire. Exact
+    // owner+token guards now make a renewal from an older acquisition harmless after a successor
+    // acquires, but ordering the final renewal before release still makes this process's graceful
+    // handoff immediate and deterministic. The join is bounded by the same control-DB latency
+    // `release_all` is about to pay (the cancellation arm is `biased`, so at most the current round).
     token.cancel();
     if let Err(error) = renewer.await {
         tracing::error!(%error, "lease renewer task panicked");
     }
-    lease::release_all(&pool, epoch, &keys, &cfg.instance).await;
+    lease::release_all(&pool, epoch, &held_leases, &cfg.instance).await;
     if let Some(failure) = first_failure {
         return Err(failure.error);
     }

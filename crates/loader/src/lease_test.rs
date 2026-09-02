@@ -29,12 +29,10 @@ fn renew_interval_floors_at_one_second() {
 }
 
 /// `app::pipeline` cancels the token and **joins** the renewer before `release_all`, instead of
-/// aborting it: `control::release_lease` only expires the row and leaves `owner_pod` set, while
-/// `control::renew_lease` is guarded on the owner alone — so a renewal that outlived the release
-/// would push `lease_expiry` a whole TTL forward and the successor's `acquire` would read a live
-/// owner (terminal `LeaseContended`). That join is only finite because cancellation ends the task,
-/// so assert exactly that, under a timeout: a renewer that ever stopped observing the token fails
-/// here rather than hanging a production drain.
+/// aborting it. Owner+token fencing makes a stale renewal incapable of reviving a successor's
+/// acquisition, but joining still proves this process has finished using its lease capability
+/// before it performs its graceful release. That join is only finite because cancellation ends the
+/// task, so assert exactly that under a timeout.
 #[tokio::test]
 async fn a_cancelled_renewer_ends_so_the_drain_can_join_it() {
     // Lazy: the DSN is parsed, never dialled. With no owned keys the renewer touches no connection,

@@ -11,7 +11,8 @@ use common::oids::{
     TIMESTAMPTZ, UUID,
 };
 use common::sql::SqlStrExt;
-use common::{EpochNo, Lsn, ManifestId, PgRelation, Redacted, ReloadId, SchemaVersionNo};
+use common::{EpochNo, Kind, Lsn, ManifestId, PgRelation, Redacted, ReloadId, SchemaVersionNo};
+use duckdb::OptionalExt as _;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -49,8 +50,14 @@ WHERE NOT EXISTS (SELECT 1 FROM "_walrus_meta" WHERE k = 'schema_version');
 const CREATE_DUCKLAKE_LEDGER: &str = r#"
 CREATE TABLE IF NOT EXISTS "_walrus_ingested_files" (
     "s3_uri" VARCHAR NOT NULL,
-    "manifest_id" BIGINT NOT NULL
+    "manifest_id" BIGINT NOT NULL,
+    "object_size" BIGINT NOT NULL,
+    "sha256" VARCHAR NOT NULL,
+    "stream_group_id" BIGINT
 );
+ALTER TABLE "_walrus_ingested_files" ADD COLUMN IF NOT EXISTS "object_size" BIGINT;
+ALTER TABLE "_walrus_ingested_files" ADD COLUMN IF NOT EXISTS "sha256" VARCHAR;
+ALTER TABLE "_walrus_ingested_files" ADD COLUMN IF NOT EXISTS "stream_group_id" BIGINT;
 "#;
 
 const CREATE_RELOAD_STATE: &str = r#"
@@ -59,8 +66,21 @@ CREATE TABLE IF NOT EXISTS "_walrus_reload_state" (
     "shadow_table" VARCHAR NOT NULL,
     "schema_version" BIGINT NOT NULL,
     "start_lsn" VARCHAR NOT NULL,
-    "final_lsn" VARCHAR NOT NULL
+    "final_lsn" VARCHAR NOT NULL,
+    "publication_nonce" VARCHAR NOT NULL,
+    "raw_appended_lsn" VARCHAR NOT NULL,
+    "transformed_lsn" VARCHAR NOT NULL,
+    "phase" VARCHAR NOT NULL
 );
+ALTER TABLE "_walrus_reload_state"
+  ADD COLUMN IF NOT EXISTS "publication_nonce" VARCHAR
+  DEFAULT '00000000-0000-0000-0000-000000000000';
+ALTER TABLE "_walrus_reload_state"
+  ADD COLUMN IF NOT EXISTS "raw_appended_lsn" VARCHAR DEFAULT '0000000000000000';
+ALTER TABLE "_walrus_reload_state"
+  ADD COLUMN IF NOT EXISTS "transformed_lsn" VARCHAR DEFAULT '0000000000000000';
+ALTER TABLE "_walrus_reload_state"
+  ADD COLUMN IF NOT EXISTS "phase" VARCHAR DEFAULT 'building';
 "#;
 
 /// A durable, unpublished full-table generation being reconciled.
@@ -74,12 +94,84 @@ pub(crate) struct ReloadBuild {
     pub(crate) schema_version: SchemaVersionNo,
     pub(crate) start_lsn: Lsn,
     pub(crate) final_lsn: Lsn,
+    pub(crate) publication_nonce: uuid::Uuid,
+    pub(crate) raw_appended_lsn: Lsn,
+    pub(crate) transformed_lsn: Lsn,
+    pub(crate) phase: ReloadPhase,
+}
+
+/// Durable local side of the two-database publication protocol. `Published` is retained until the
+/// matching control row and canonical checkpoint commit, making the cross-database crash window
+/// explicitly recoverable rather than inferred from missing shadow state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReloadPhase {
+    Building,
+    Published,
+}
+
+impl ReloadPhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Building => "building",
+            Self::Published => "published",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BeginReload {
-    Ready(ReloadBuild),
+    Ready(Box<ReloadBuild>),
     Stale,
+}
+
+/// One immutable manifest object prepared for an atomic raw append. `original_uri` is the durable
+/// control-plane identity; `verified_uri` is a private local file whose bytes were size/hash checked
+/// immediately before this call.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ManifestAppend<'a> {
+    pub(crate) manifest_id: ManifestId,
+    pub(crate) original_uri: &'a str,
+    pub(crate) verified_uri: Option<&'a str>,
+    pub(crate) object_size: i64,
+    pub(crate) sha256: &'a [u8],
+    pub(crate) stream_group_id: Option<i64>,
+    pub(crate) schema_version: SchemaVersionNo,
+    pub(crate) commit_lsn_override: Option<&'a str>,
+    /// Production-only semantic receipt for the rows inside the verified Parquet. The public
+    /// local-fixture helper leaves this absent because it has no control manifest to attest against.
+    pub(crate) expectation: Option<ManifestExpectation<'a>>,
+}
+
+/// Control-plane facts every row in one immutable staged object must agree with before the object
+/// can receive a durable Duck ingest receipt.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ManifestExpectation<'a> {
+    pub(crate) row_count: i64,
+    pub(crate) epoch: EpochNo,
+    pub(crate) source_schema: &'a str,
+    pub(crate) source_table: &'a str,
+    /// Original Postgres columns, retained separately from the staged emit schema because one
+    /// Tier-2 source column may fan out to several physical Parquet columns.
+    pub(crate) source_columns: &'a [common::PgColumn],
+    pub(crate) schema_version: SchemaVersionNo,
+    pub(crate) kind: Kind,
+    pub(crate) lsn_start: Lsn,
+    pub(crate) lsn_end: Lsn,
+    /// Speculative protocol-v2 spill metadata carries a pre-commit placeholder; the manifest's
+    /// authoritative commit LSN is stamped during append instead of being checked against the JSON.
+    pub(crate) speculative_commit_lsn: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StagedColumn {
+    name: String,
+    duckdb_type: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IngestReceiptState {
+    Missing,
+    Ingested,
 }
 
 /// Owns one table's DuckDB execution connection (mirror `<table>` + CDC log `<table>_raw`).
@@ -101,20 +193,19 @@ pub(crate) enum BeginReload {
 pub struct TableDb {
     conn: duckdb::Connection,
     backend: Backend,
-    /// Parquet column lists by `schema_version`. A version's file shape is immutable — the
-    /// sink's homogeneous-file rule (walrus-pg-sink §3.5) cuts a fresh file at every DDL bump, so all
-    /// files at one version share their columns and a DDL bump is a *new* key. So this cache never
-    /// invalidates, and a Phase-A cycle claiming N same-version files runs one `DESCRIBE`, not N.
+    /// Expected staged-object schemas by `schema_version`, derived from the destination raw table.
+    /// Every Parquet is still independently DESCRIBEd and compared with this cached expectation;
+    /// trusting the first file would let a later same-version object add a silently ignored column.
     /// `RefCell` provides interior mutability behind `&self`. `TableDb` is `Send + !Sync`:
     /// duckdb-rs declares `Connection: Send`, but the connection's `RefCell<InnerConnection>` and
     /// this cache's `RefCell` prevent shared access. That `!Sync` makes a future holding `&TableCtx`
     /// non-`Send`, hence one apply worker per `.duckdb` file on a `LocalSet`. Those tasks share one
     /// driver thread, so a long DuckDB call can delay sibling tables.
-    /// `Arc<[String]>` keeps reads to one indirection while preserving `TableDb: Send`. The `Rc`
+    /// `Arc<[StagedColumn]>` keeps reads to one indirection while preserving `TableDb: Send`. The `Rc`
     /// this `LocalSet`-confined cache would otherwise invite is declined: `Rc` is `!Send`, so it
     /// would break `assert_send::<TableDb>()` below and foreclose the owned-move redesign that
     /// note leaves open.
-    parquet_cols: RefCell<HashMap<SchemaVersionNo, Arc<[String]>>>,
+    parquet_cols: RefCell<HashMap<SchemaVersionNo, Arc<[StagedColumn]>>>,
     /// `true` only for a database created by a pre-ledger Walrus release. Such a raw table keeps
     /// its row-level primary key until Phase A has drained every possibly replayed manifest, then a
     /// one-time transactional CTAS removes it. Fresh databases never pay the per-row index cost.
@@ -342,85 +433,218 @@ impl TableDb {
         self.conn.execute_batch(&sql).duck("configure S3")
     }
 
-    /// Phase A: append one Parquet file **verbatim** into `<table>_raw`, promoting
-    /// `op`/`commit_lsn`/`lsn`/`sink_processed_at` out of `walrus_pg_sink_meta`. The append and a
-    /// marker in `_walrus_ingested_files` commit in one DuckDB transaction; a replay of the same
-    /// immutable object URI returns zero without reopening the Parquet. **Never touches the mirror.**
-    ///
-    /// `commit_lsn_override`: for a **speculative-spill** file (manifest `kind = 'spill'`)
-    /// the per-row `commit_lsn` in the Parquet is a *placeholder* — the file was written before its txn's
-    /// commit LSN was known. A spill file is one whole transaction, so its authoritative `commit_lsn` is
-    /// the file's `lsn_end` (stamped on the manifest at `Stream Commit`); passing `Some(lsn_end)` here
-    /// stamps every appended row with it, so a concurrently-committed neighbour txn is never dropped by
-    /// the transform's commit-LSN window (architecture.md §1.6). `None` keeps the verbatim per-row value.
+    /// Inspect the durable ingest receipt for a manifest object without reopening the object.
     ///
     /// # Errors
     ///
     /// Returns [`LoaderError::Ident`] if the Parquet schema contains a column name that cannot be
     /// represented as a SQL identifier, or [`LoaderError::Duck`] if the schema cannot be inspected
     /// or its rows cannot be appended into the raw table.
-    pub fn append_parquet(
+    pub(crate) fn ingest_receipt_state(
+        &self,
+        file: &ManifestAppend<'_>,
+    ) -> Result<IngestReceiptState, LoaderError> {
+        ingest_receipt_state_on(&self.conn, file)
+    }
+
+    /// Append one singleton or one complete protocol-v2 per-table stream group. Every raw INSERT
+    /// and every fingerprint-bearing ledger receipt commits in one Duck transaction. Exact receipt
+    /// replays are no-ops; partial groups and identity/fingerprint collisions are terminal.
+    pub(crate) fn append_manifest_unit(
         &self,
         table: &str,
-        manifest_id: ManifestId,
-        s3_uri: &str,
-        schema_version: SchemaVersionNo,
-        commit_lsn_override: Option<&str>,
+        files: &[ManifestAppend<'_>],
     ) -> Result<u64, LoaderError> {
-        let uri = common::sql::sql_literal(s3_uri);
+        let Some(first) = files.first() else {
+            return Err(LoaderError::ManifestInvariant {
+                message: "cannot append an empty manifest unit".to_string(),
+            });
+        };
+        if files.len() > 1 && first.stream_group_id.is_none()
+            || files
+                .iter()
+                .any(|file| file.stream_group_id != first.stream_group_id)
+        {
+            return Err(LoaderError::ManifestInvariant {
+                message: "an atomic append unit mixed stream groups or singleton files".to_string(),
+            });
+        }
         let on_conflict = if self.legacy_raw_replay_pk.get() {
             " ON CONFLICT DO NOTHING"
         } else {
             ""
         };
-        self.in_txn("append manifest", |conn| {
-            let ingested: bool = conn
-                .query_row(
-                    "SELECT EXISTS (SELECT 1 FROM \"_walrus_ingested_files\" WHERE s3_uri = ?)",
-                    [s3_uri],
-                    |row| row.get(0),
-                )
-                .duck_with(|| format!("check ingest marker for {s3_uri}"))?;
-            if ingested {
+        self.in_txn("append manifest unit", |conn| {
+            let states = files
+                .iter()
+                .map(|file| ingest_receipt_state_on(conn, file))
+                .collect::<Result<Vec<_>, _>>()?;
+            if states
+                .iter()
+                .all(|state| *state == IngestReceiptState::Ingested)
+            {
                 return Ok(0);
             }
+            if states.contains(&IngestReceiptState::Ingested) {
+                return Err(LoaderError::ManifestInvariant {
+                    message: format!(
+                        "stream group {:?} has a partial durable ingest receipt",
+                        first.stream_group_id
+                    ),
+                });
+            }
 
-            // Map the file's columns into `<table>_raw` **by name**, not by position.
-            // The list is cached per `schema_version`. This happens after the marker check,
-            // so a crash-window replay does not require the staged object to remain readable.
-            let file_cols = self.columns_for(&uri, schema_version)?;
-            let quoted = file_cols
-                .iter()
-                .map(|column| {
-                    common::sql::SqlIdent::new(column)
-                        .map(|ident| ident.to_string())
-                        .map_err(|source| LoaderError::Ident {
-                            uri: s3_uri.to_string(),
-                            source,
-                        })
-                })
-                .collect::<Result<Vec<_>, LoaderError>>()?
-                .join(", ");
-            let commit_lsn_expr = match commit_lsn_override {
-                Some(lsn) => lsn.to_quoted_literal(),
-                None => "json_extract_string(walrus_pg_sink_meta, '$.commit_lsn')".to_string(),
-            };
-            let sql = APPEND_PARQUET
-                .replace("{table}", table)
-                .replace("{quoted}", &quoted)
-                .replace("{commit_lsn_expr}", &commit_lsn_expr)
-                .replace("{uri}", &uri)
-                .replace("{on_conflict}", on_conflict);
-            let n = conn
-                .execute(&sql, [])
-                .duck_with(|| format!("append {s3_uri} → {table}_raw"))?;
-            conn.execute(
-                "INSERT INTO \"_walrus_ingested_files\" (s3_uri, manifest_id) VALUES (?, ?)",
-                duckdb::params![s3_uri, manifest_id.0],
-            )
-            .duck_with(|| format!("record ingest marker for {s3_uri}"))?;
-            Ok(u64::try_from(n).unwrap_or(u64::MAX))
+            let mut appended = 0_u64;
+            for file in files {
+                let verified_uri =
+                    file.verified_uri
+                        .ok_or_else(|| LoaderError::ManifestInvariant {
+                            message: format!(
+                                "manifest {} is missing its verified local object",
+                                file.manifest_id
+                            ),
+                        })?;
+                let uri = common::sql::sql_literal(verified_uri);
+                let file_cols =
+                    self.columns_for(table, &uri, file.original_uri, file.schema_version)?;
+                if let Some(expectation) = file.expectation {
+                    validate_manifest_rows(conn, &uri, file.original_uri, expectation)?;
+                }
+                let quoted = file_cols
+                    .iter()
+                    .map(|column| {
+                        common::sql::SqlIdent::new(column)
+                            .map(|ident| ident.to_string())
+                            .map_err(|source| LoaderError::Ident {
+                                uri: file.original_uri.to_string(),
+                                source,
+                            })
+                    })
+                    .collect::<Result<Vec<_>, LoaderError>>()?
+                    .join(", ");
+                let commit_lsn_expr = match file.commit_lsn_override {
+                    Some(lsn) => lsn.to_quoted_literal(),
+                    None => "json_extract_string(walrus_pg_sink_meta, '$.commit_lsn')".to_string(),
+                };
+                let sql = APPEND_PARQUET
+                    .replace("{table}", table)
+                    .replace("{quoted}", &quoted)
+                    .replace("{commit_lsn_expr}", &commit_lsn_expr)
+                    .replace("{uri}", &uri)
+                    .replace("{on_conflict}", on_conflict);
+                let n = conn
+                    .execute(&sql, [])
+                    .map_err(|source| LoaderError::ObjectIntegrity {
+                        uri: file.original_uri.to_string(),
+                        reason: format!(
+                            "verified Parquet could not be appended to {table}_raw: {source}"
+                        ),
+                    })?;
+                if !self.legacy_raw_replay_pk.get()
+                    && let Some(expectation) = file.expectation
+                    && i64::try_from(n).ok() != Some(expectation.row_count)
+                {
+                    return Err(LoaderError::ObjectIntegrity {
+                        uri: file.original_uri.to_string(),
+                        reason: format!(
+                            "manifest receipt records {} rows but DuckDB appended {n}",
+                            expectation.row_count
+                        ),
+                    });
+                }
+                appended = appended.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+                conn.execute(
+                    "INSERT INTO \"_walrus_ingested_files\" \
+                     (s3_uri, manifest_id, object_size, sha256, stream_group_id) \
+                     VALUES (?, ?, ?, ?, ?)",
+                    duckdb::params![
+                        file.original_uri,
+                        file.manifest_id.0,
+                        file.object_size,
+                        hex::encode(file.sha256),
+                        file.stream_group_id,
+                    ],
+                )
+                .duck_with(|| format!("record ingest receipt for {}", file.original_uri))?;
+            }
+            Ok(appended)
         })
+    }
+
+    /// Compatibility helper for local tests/benchmarks. Production Phase A uses
+    /// [`TableDb::append_manifest_unit`] with control-provided fingerprints and verified temp files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the local fixture cannot be read, its schema is invalid, its receipt
+    /// conflicts with an existing identity, or its rows and receipt cannot commit atomically.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "this synchronous fixture/benchmark helper runs beside blocking DuckDB work; production downloads asynchronously before this layer"
+    )]
+    pub fn append_parquet(
+        &self,
+        table: &str,
+        manifest_id: ManifestId,
+        uri: &str,
+        schema_version: SchemaVersionNo,
+        commit_lsn_override: Option<&str>,
+    ) -> Result<u64, LoaderError> {
+        let existing: Option<(String, i64)> = self
+            .conn
+            .query_row(
+                "SELECT s3_uri, manifest_id FROM \"_walrus_ingested_files\" \
+                 WHERE s3_uri = ? OR manifest_id = ? LIMIT 1",
+                duckdb::params![uri, manifest_id.0],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .duck("read local-fixture ingest receipt")?;
+        if let Some((stored_uri, stored_id)) = existing {
+            if stored_uri == uri && stored_id == manifest_id.0 {
+                return Ok(0);
+            }
+            return Err(LoaderError::ManifestInvariant {
+                message: format!(
+                    "manifest {manifest_id} / URI {uri} conflicts with a local-fixture receipt"
+                ),
+            });
+        }
+        use std::io::Read as _;
+
+        let mut fixture = std::fs::File::open(uri).map_err(|source| LoaderError::File {
+            op: "read local Parquet fixture",
+            path: uri.to_string(),
+            source,
+        })?;
+        let mut bytes = Vec::new();
+        fixture
+            .read_to_end(&mut bytes)
+            .map_err(|source| LoaderError::File {
+                op: "read local Parquet fixture",
+                path: uri.to_string(),
+                source,
+            })?;
+        use sha2::Digest as _;
+        let digest = sha2::Sha256::digest(&bytes);
+        let object_size =
+            i64::try_from(bytes.len()).map_err(|_| LoaderError::ManifestInvariant {
+                message: format!("local fixture {uri} is larger than bigint"),
+            })?;
+        self.append_manifest_unit(
+            table,
+            &[ManifestAppend {
+                manifest_id,
+                original_uri: uri,
+                verified_uri: Some(uri),
+                object_size,
+                sha256: digest.as_slice(),
+                stream_group_id: None,
+                schema_version,
+                commit_lsn_override,
+                expectation: None,
+            }],
+        )
     }
 
     /// Whether this upgraded database still carries the old per-row replay index.
@@ -460,24 +684,47 @@ impl TableDb {
             .duck_with(|| format!("inspect replay constraint on {table}_raw"))
     }
 
-    /// The Parquet column list for `schema_version`, introspecting `uri` **once** per version and
-    /// caching it (sound by the homogeneous-file rule — see [`TableDb::parquet_cols`]).
+    /// Verify one Parquet's complete column name/type sequence against the destination raw table.
+    /// The expected sequence is cached by schema version, but `uri` is DESCRIBEd on every call.
     fn columns_for(
         &self,
+        table: &str,
         uri: &str,
+        original_uri: &str,
         schema_version: SchemaVersionNo,
     ) -> Result<Arc<[String]>, LoaderError> {
-        // The shared borrow is released before the miss path: an `entry` call would hold the
-        // `RefCell` across the DESCRIBE below, and one saved hash is nothing beside that query.
+        // Release the shared borrow before a miss runs DESCRIBE on the destination table.
         let cached = { self.parquet_cols.borrow().get(&schema_version).cloned() };
-        if let Some(columns) = cached {
-            return Ok(columns);
+        let expected = match cached {
+            Some(expected) => expected,
+            None => {
+                let expected: Arc<[StagedColumn]> = self.expected_staged_columns(table)?.into();
+                self.parquet_cols
+                    .borrow_mut()
+                    .insert(schema_version, Arc::clone(&expected));
+                expected
+            }
+        };
+        let actual = self
+            .parquet_columns(uri)
+            .map_err(|error| LoaderError::ObjectIntegrity {
+                uri: original_uri.to_string(),
+                reason: format!("verified object is not a readable Parquet file: {error}"),
+            })?;
+        if actual.as_slice() != expected.as_ref() {
+            return Err(LoaderError::ObjectIntegrity {
+                uri: original_uri.to_string(),
+                reason: format!(
+                    "Parquet schema {:?} does not equal expected {:?}",
+                    actual, expected
+                ),
+            });
         }
-        let cols: Arc<[String]> = self.parquet_columns(uri)?.into();
-        self.parquet_cols
-            .borrow_mut()
-            .insert(schema_version, Arc::clone(&cols));
-        Ok(cols)
+        Ok(actual
+            .into_iter()
+            .map(|column| column.name)
+            .collect::<Vec<_>>()
+            .into())
     }
 
     /// Number of distinct `schema_version`s whose column list is cached; exposed only to tests.
@@ -486,18 +733,66 @@ impl TableDb {
         self.parquet_cols.borrow().len()
     }
 
-    /// The column names of a staged Parquet file, in file order (source columns + `walrus_pg_sink_meta`).
-    fn parquet_columns(&self, uri: &str) -> Result<Vec<String>, LoaderError> {
+    /// The exact columns of a staged Parquet file, in file order (source columns + metadata).
+    fn parquet_columns(&self, uri: &str) -> Result<Vec<StagedColumn>, LoaderError> {
         let mut stmt = self
             .conn
             .prepare(&format!("DESCRIBE SELECT * FROM read_parquet('{uri}')"))
             .duck_with(|| format!("describe {uri}"))?;
         let cols = stmt
-            .query_map([], |r| r.get::<_, String>(0))
+            .query_map([], |row| {
+                Ok(StagedColumn {
+                    name: row.get(0)?,
+                    duckdb_type: row.get(1)?,
+                })
+            })
             .duck_with(|| format!("describe {uri}"))?
             .collect::<Result<Vec<_>, _>>()
             .duck_with(|| format!("describe {uri}"))?;
         Ok(cols)
+    }
+
+    fn expected_staged_columns(&self, table: &str) -> Result<Vec<StagedColumn>, LoaderError> {
+        let raw = format!("{table}_raw");
+        let mut stmt = self
+            .conn
+            .prepare(&format!("DESCRIBE SELECT * FROM \"{raw}\""))
+            .duck_with(|| format!("describe expected staged schema for {raw}"))?;
+        let mut columns = stmt
+            .query_map([], |row| {
+                Ok(StagedColumn {
+                    name: row.get(0)?,
+                    duckdb_type: row.get(1)?,
+                })
+            })
+            .duck_with(|| format!("describe expected staged schema for {raw}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .duck_with(|| format!("describe expected staged schema for {raw}"))?;
+        const PROMOTED: [&str; 4] = [
+            "_walrus_op",
+            "_walrus_commit_lsn",
+            "_walrus_lsn",
+            "_walrus_sink_processed_at",
+        ];
+        if columns.len() < PROMOTED.len() + 1
+            || !columns
+                .iter()
+                .rev()
+                .take(PROMOTED.len())
+                .map(|column| column.name.as_str())
+                .eq(PROMOTED.iter().rev().copied())
+        {
+            return Err(LoaderError::ManifestInvariant {
+                message: format!("{raw} does not end with the four promoted Walrus columns"),
+            });
+        }
+        columns.truncate(columns.len() - PROMOTED.len());
+        if columns.last().map(|column| column.name.as_str()) != Some("walrus_pg_sink_meta") {
+            return Err(LoaderError::ManifestInvariant {
+                message: format!("{raw} has no trailing walrus_pg_sink_meta staged column"),
+            });
+        }
+        Ok(columns)
     }
 
     /// The `.duckdb` connection used by transform, compaction, and schema-reconciliation callers.
@@ -732,7 +1027,8 @@ impl TableDb {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT reload_id, shadow_table, schema_version, start_lsn, final_lsn \
+                "SELECT reload_id, shadow_table, schema_version, start_lsn, final_lsn, \
+                        publication_nonce, raw_appended_lsn, transformed_lsn, phase \
                  FROM \"_walrus_reload_state\" ORDER BY reload_id DESC LIMIT 1",
             )
             .duck("prepare reload build read")?;
@@ -742,9 +1038,21 @@ impl TableDb {
         };
         let start_hex: String = row.get(3).duck("read reload start_lsn")?;
         let final_hex: String = row.get(4).duck("read reload final_lsn")?;
+        let publication_nonce: String = row.get(5).duck("read reload publication nonce")?;
+        let raw_hex: String = row.get(6).duck("read reload raw frontier")?;
+        let transformed_hex: String = row.get(7).duck("read reload transformed frontier")?;
+        let phase: String = row.get(8).duck("read reload phase")?;
+        let reload_id = ReloadId(row.get(0).duck("read reload_id")?);
+        let shadow_table: String = row.get(1).duck("read reload shadow table")?;
+        let expected_shadow = format!("__walrus_reload_{}", reload_id.0);
+        if shadow_table != expected_shadow {
+            return Err(LoaderError::Internal(format!(
+                "reload {reload_id} state names unsafe shadow table {shadow_table:?}; expected {expected_shadow:?}"
+            )));
+        }
         Ok(Some(ReloadBuild {
-            reload_id: ReloadId(row.get(0).duck("read reload_id")?),
-            shadow_table: row.get(1).duck("read reload shadow table")?,
+            reload_id,
+            shadow_table,
             schema_version: SchemaVersionNo(row.get(2).duck("read reload schema version")?),
             start_lsn: start_hex.parse().map_err(|source| LoaderError::LsnParse {
                 field: "reload start_lsn",
@@ -754,6 +1062,30 @@ impl TableDb {
                 field: "reload final_lsn",
                 source,
             })?,
+            publication_nonce: publication_nonce.parse().map_err(|_| {
+                LoaderError::Internal(format!(
+                    "reload state contains invalid publication nonce {publication_nonce:?}"
+                ))
+            })?,
+            raw_appended_lsn: raw_hex.parse().map_err(|source| LoaderError::LsnParse {
+                field: "reload raw_appended_lsn",
+                source,
+            })?,
+            transformed_lsn: transformed_hex
+                .parse()
+                .map_err(|source| LoaderError::LsnParse {
+                    field: "reload transformed_lsn",
+                    source,
+                })?,
+            phase: match phase.as_str() {
+                "building" => ReloadPhase::Building,
+                "published" => ReloadPhase::Published,
+                _ => {
+                    return Err(LoaderError::Internal(format!(
+                        "reload state contains invalid phase {phase:?}"
+                    )));
+                }
+            },
         }))
     }
 
@@ -774,6 +1106,7 @@ impl TableDb {
         reload_id: ReloadId,
         start_lsn: Lsn,
         final_lsn: Lsn,
+        publication_nonce: uuid::Uuid,
     ) -> Result<BeginReload, LoaderError> {
         if self
             .recorded_reload_id()?
@@ -789,12 +1122,13 @@ impl TableDb {
                 if existing.schema_version != schema_version
                     || existing.start_lsn != start_lsn
                     || existing.final_lsn != final_lsn
+                    || existing.publication_nonce != publication_nonce
                 {
                     return Err(LoaderError::Internal(format!(
                         "reload {reload_id} marker/shape changed while its shadow was being built"
                     )));
                 }
-                return Ok(BeginReload::Ready(existing));
+                return Ok(BeginReload::Ready(Box::new(existing)));
             }
         }
 
@@ -805,6 +1139,10 @@ impl TableDb {
             schema_version,
             start_lsn,
             final_lsn,
+            publication_nonce,
+            raw_appended_lsn: start_lsn,
+            transformed_lsn: start_lsn,
+            phase: ReloadPhase::Building,
         };
         let shadow_plan = plan.for_table(shadow_table.as_str());
         let create_shadow = self.generation_sql(&shadow_plan);
@@ -826,20 +1164,120 @@ impl TableDb {
                 .duck("clear prior reload state")?;
             conn.execute(
                 "INSERT INTO \"_walrus_reload_state\" \
-                 (reload_id, shadow_table, schema_version, start_lsn, final_lsn) \
-                 VALUES (?, ?, ?, ?, ?)",
+                 (reload_id, shadow_table, schema_version, start_lsn, final_lsn, \
+                  publication_nonce, raw_appended_lsn, transformed_lsn, phase) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 duckdb::params![
                     reload_id.0,
                     shadow_table,
                     schema_version.0,
                     start_lsn.to_string(),
                     final_lsn.to_string(),
+                    publication_nonce.to_string(),
+                    start_lsn.to_string(),
+                    start_lsn.to_string(),
+                    ReloadPhase::Building.as_str(),
                 ],
             )
             .duck("record reload shadow")?;
             Ok(())
         })?;
-        Ok(BeginReload::Ready(build))
+        Ok(BeginReload::Ready(Box::new(build)))
+    }
+
+    /// Advance the hidden generation's raw frontier after its Duck append transaction commits.
+    /// This is deliberately local: the canonical control checkpoint remains frozen until publish.
+    pub(crate) fn advance_reload_raw(
+        &self,
+        reload_id: ReloadId,
+        publication_nonce: uuid::Uuid,
+        lsn: Lsn,
+    ) -> Result<(), LoaderError> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE \"_walrus_reload_state\" SET raw_appended_lsn = ? \
+                 WHERE reload_id = ? AND publication_nonce = ? AND phase = 'building' \
+                   AND raw_appended_lsn <= ? AND final_lsn >= ?",
+                duckdb::params![
+                    lsn.to_string(),
+                    reload_id.0,
+                    publication_nonce.to_string(),
+                    lsn.to_string(),
+                    lsn.to_string(),
+                ],
+            )
+            .duck("advance reload raw frontier")?;
+        if changed != 1 {
+            return Err(LoaderError::Internal(format!(
+                "reload {reload_id} raw frontier advance was not owned by the building receipt"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Advance the hidden generation's transform frontier after its mirror transaction commits.
+    pub(crate) fn advance_reload_transformed(
+        &self,
+        reload_id: ReloadId,
+        publication_nonce: uuid::Uuid,
+        lsn: Lsn,
+    ) -> Result<(), LoaderError> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE \"_walrus_reload_state\" SET transformed_lsn = ? \
+                 WHERE reload_id = ? AND publication_nonce = ? AND phase = 'building' \
+                   AND transformed_lsn <= ? AND raw_appended_lsn >= ?",
+                duckdb::params![
+                    lsn.to_string(),
+                    reload_id.0,
+                    publication_nonce.to_string(),
+                    lsn.to_string(),
+                    lsn.to_string(),
+                ],
+            )
+            .duck("advance reload transformed frontier")?;
+        if changed != 1 {
+            return Err(LoaderError::Internal(format!(
+                "reload {reload_id} transformed frontier advance exceeded raw or lost ownership"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Seal an otherwise-empty tail at H after control-pg proves no manifest in any status remains
+    /// through that boundary. The shadow's local frontiers become the durable precondition to swap.
+    pub(crate) fn seal_reload_at_h(
+        &self,
+        reload_id: ReloadId,
+        publication_nonce: uuid::Uuid,
+        final_lsn: Lsn,
+    ) -> Result<(), LoaderError> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE \"_walrus_reload_state\" \
+                 SET raw_appended_lsn = ?, transformed_lsn = ? \
+                 WHERE reload_id = ? AND publication_nonce = ? AND phase = 'building' \
+                   AND final_lsn = ? AND raw_appended_lsn <= ? AND transformed_lsn <= ?",
+                duckdb::params![
+                    final_lsn.to_string(),
+                    final_lsn.to_string(),
+                    reload_id.0,
+                    publication_nonce.to_string(),
+                    final_lsn.to_string(),
+                    final_lsn.to_string(),
+                    final_lsn.to_string(),
+                ],
+            )
+            .duck("seal reload frontiers at H")?;
+        if changed != 1 {
+            return Err(LoaderError::Internal(format!(
+                "reload {reload_id} could not seal its building receipt at H {final_lsn}"
+            )));
+        }
+        Ok(())
     }
 
     /// Atomically replace the canonical generation with a fully reconciled shadow.
@@ -873,6 +1311,15 @@ impl TableDb {
             return Err(LoaderError::Internal(format!(
                 "cannot publish reload {reload_id}: shadow belongs to reload {}",
                 build.reload_id
+            )));
+        }
+        if build.phase != ReloadPhase::Building
+            || build.raw_appended_lsn != build.final_lsn
+            || build.transformed_lsn != build.final_lsn
+        {
+            return Err(LoaderError::Internal(format!(
+                "cannot publish reload {reload_id}: local building receipt is not sealed at H {}",
+                build.final_lsn
             )));
         }
 
@@ -923,11 +1370,74 @@ impl TableDb {
                 duckdb::params![build.schema_version.0, reload_id.0],
             )
             .duck("record reload cutover")?;
-            conn.execute("DELETE FROM \"_walrus_reload_state\"", [])
-                .duck("clear published reload state")?;
+            conn.execute(
+                "UPDATE \"_walrus_reload_state\" SET phase = 'published' \
+                 WHERE reload_id = ? AND publication_nonce = ? AND phase = 'building'",
+                duckdb::params![reload_id.0, build.publication_nonce.to_string()],
+            )
+            .duck("record durable published reload receipt")?;
             Ok(())
         })?;
         self.legacy_raw_replay_pk.set(false);
+        Ok(true)
+    }
+
+    /// Clear the durable Duck-side receipt only after control-pg is `complete` with the same nonce.
+    /// A missing receipt is an idempotent no-op; a different receipt is never removed.
+    pub(crate) fn clear_reload_publication(
+        &self,
+        reload_id: ReloadId,
+        publication_nonce: uuid::Uuid,
+    ) -> Result<bool, LoaderError> {
+        let deleted = self
+            .conn
+            .execute(
+                "DELETE FROM \"_walrus_reload_state\" \
+                 WHERE reload_id = ? AND publication_nonce = ? AND phase = 'published'",
+                duckdb::params![reload_id.0, publication_nonce.to_string()],
+            )
+            .duck("clear completed reload publication receipt")?;
+        Ok(deleted == 1)
+    }
+
+    /// Drop an exact unpublished reload generation after control Postgres has fenced that attempt.
+    /// A missing build, a different nonce/id, or an already-published receipt is an idempotent
+    /// no-op: none of those identities authorizes deleting the local generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::Duck`] if the transactional shadow cleanup fails.
+    pub(crate) fn abandon_reload_build(
+        &self,
+        reload_id: ReloadId,
+        publication_nonce: uuid::Uuid,
+    ) -> Result<bool, LoaderError> {
+        let Some(build) = self.reload_build()? else {
+            return Ok(false);
+        };
+        if build.reload_id != reload_id
+            || build.publication_nonce != publication_nonce
+            || build.phase != ReloadPhase::Building
+        {
+            return Ok(false);
+        }
+        self.in_txn("abandon reload build", |conn| {
+            conn.execute_batch(&drop_generation_sql(&build.shadow_table))
+                .duck_with(|| format!("drop abandoned reload shadow {}", build.shadow_table))?;
+            let deleted = conn
+                .execute(
+                    "DELETE FROM \"_walrus_reload_state\" \
+                     WHERE reload_id = ? AND publication_nonce = ? AND phase = 'building'",
+                    duckdb::params![reload_id.0, publication_nonce.to_string()],
+                )
+                .duck("delete abandoned reload state")?;
+            if deleted != 1 {
+                return Err(LoaderError::Internal(format!(
+                    "reload {reload_id} changed while abandoning its local building receipt"
+                )));
+            }
+            Ok(())
+        })?;
         Ok(true)
     }
 
@@ -1248,6 +1758,182 @@ pub(crate) fn user_view_sql(table: &str) -> String {
     CREATE_USER_VIEW.replace("{table}", table)
 }
 
+fn ingest_receipt_state_on(
+    conn: &duckdb::Connection,
+    file: &ManifestAppend<'_>,
+) -> Result<IngestReceiptState, LoaderError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT s3_uri, manifest_id, object_size, sha256, stream_group_id \
+             FROM \"_walrus_ingested_files\" WHERE s3_uri = ? OR manifest_id = ?",
+        )
+        .duck("prepare ingest receipt lookup")?;
+    let mut rows = stmt
+        .query(duckdb::params![file.original_uri, file.manifest_id.0])
+        .duck_with(|| format!("read ingest receipt for {}", file.original_uri))?;
+    let Some(row) = rows.next().duck("step ingest receipt")? else {
+        return Ok(IngestReceiptState::Missing);
+    };
+    let stored_uri: String = row.get(0).duck("read receipt URI")?;
+    let stored_id: i64 = row.get(1).duck("read receipt manifest id")?;
+    let stored_size: Option<i64> = row.get(2).duck("read receipt object size")?;
+    let stored_sha: Option<String> = row.get(3).duck("read receipt SHA-256")?;
+    let stored_group: Option<i64> = row.get(4).duck("read receipt stream group")?;
+    if rows
+        .next()
+        .duck("check duplicate ingest receipts")?
+        .is_some()
+    {
+        return Err(LoaderError::ManifestInvariant {
+            message: format!(
+                "manifest {} / URI {} matched multiple ingest receipts",
+                file.manifest_id, file.original_uri
+            ),
+        });
+    }
+    let expected_sha = hex::encode(file.sha256);
+    if stored_uri != file.original_uri
+        || stored_id != file.manifest_id.0
+        || stored_size != Some(file.object_size)
+        || stored_sha.as_deref() != Some(expected_sha.as_str())
+        || stored_group != file.stream_group_id
+    {
+        return Err(LoaderError::ManifestInvariant {
+            message: format!(
+                "manifest {} replay metadata does not match its durable ingest receipt",
+                file.manifest_id
+            ),
+        });
+    }
+    Ok(IngestReceiptState::Ingested)
+}
+
+fn validate_manifest_rows(
+    conn: &duckdb::Connection,
+    uri: &str,
+    original_uri: &str,
+    expectation: ManifestExpectation<'_>,
+) -> Result<(), LoaderError> {
+    let poison = |reason: String| LoaderError::ObjectIntegrity {
+        uri: original_uri.to_string(),
+        reason,
+    };
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT walrus_pg_sink_meta FROM read_parquet('{uri}')"
+        ))
+        .map_err(|source| {
+            poison(format!(
+                "cannot inspect verified Parquet metadata: {source}"
+            ))
+        })?;
+    let mut rows = statement
+        .query([])
+        .map_err(|source| poison(format!("cannot scan verified Parquet metadata: {source}")))?;
+    let mut row_count = 0_i64;
+    let mut batch_id: Option<String> = None;
+    let mut sink_instance: Option<String> = None;
+    while let Some(row) = rows
+        .next()
+        .map_err(|source| poison(format!("cannot read verified Parquet metadata: {source}")))?
+    {
+        row_count = row_count
+            .checked_add(1)
+            .ok_or_else(|| poison("Parquet row count overflowed bigint".to_string()))?;
+        let raw = row
+            .get::<_, Option<String>>(0)
+            .map_err(|source| poison(format!("cannot decode walrus_pg_sink_meta: {source}")))?
+            .ok_or_else(|| poison(format!("row {row_count} has NULL walrus_pg_sink_meta")))?;
+        let meta: common::SinkMeta = serde_json::from_str(&raw).map_err(|source| {
+            poison(format!(
+                "row {row_count} has invalid walrus_pg_sink_meta: {source}"
+            ))
+        })?;
+        if meta.epoch != expectation.epoch
+            || meta.schema_version != expectation.schema_version
+            || meta.source_schema != expectation.source_schema
+            || meta.source_table != expectation.source_table
+            || meta.kind != expectation.kind
+        {
+            return Err(poison(format!(
+                "row {row_count} metadata identity does not match epoch/table/schema-version/kind receipt"
+            )));
+        }
+        if meta.batch_id.is_empty() || meta.sink_instance.is_empty() {
+            return Err(poison(format!(
+                "row {row_count} metadata has an empty batch_id or sink_instance"
+            )));
+        }
+        match &batch_id {
+            Some(expected) if expected != &meta.batch_id => {
+                return Err(poison(format!(
+                    "row {row_count} changes batch_id inside one immutable object"
+                )));
+            }
+            None => batch_id = Some(meta.batch_id.clone()),
+            _ => {}
+        }
+        match &sink_instance {
+            Some(expected) if expected != &meta.sink_instance => {
+                return Err(poison(format!(
+                    "row {row_count} changes sink_instance inside one immutable object"
+                )));
+            }
+            None => sink_instance = Some(meta.sink_instance.clone()),
+            _ => {}
+        }
+        for (index, column) in meta.unchanged_toast.iter().enumerate() {
+            if meta.op != common::Op::Update
+                || column == "walrus_pg_sink_meta"
+                || !expectation
+                    .source_columns
+                    .iter()
+                    .any(|candidate| !candidate.is_key && candidate.name == *column)
+                || meta.unchanged_toast[..index].contains(column)
+            {
+                return Err(poison(format!(
+                    "row {row_count} has an invalid unchanged_toast column {column:?}"
+                )));
+            }
+        }
+        if expectation.kind != common::Kind::Stream && meta.op != common::Op::Insert {
+            return Err(poison(format!(
+                "row {row_count} in a snapshot/reload object is not an insert image"
+            )));
+        }
+        let lsn_invalid = if expectation.speculative_commit_lsn {
+            // Spill bytes were written before commit. Their placeholder is the transaction's
+            // begin LSN (the manifest start), while row-frame LSNs must still precede the real
+            // StreamCommit LSN stored as the manifest end.
+            expectation.lsn_start > expectation.lsn_end
+                || meta.commit_lsn != expectation.lsn_start
+                || meta.lsn < expectation.lsn_start
+                || meta.lsn > expectation.lsn_end
+        } else if expectation.kind != common::Kind::Stream {
+            expectation.lsn_start != expectation.lsn_end
+                || meta.commit_lsn != expectation.lsn_start
+                || meta.lsn != expectation.lsn_start
+        } else {
+            meta.commit_lsn < expectation.lsn_start
+                || meta.commit_lsn > expectation.lsn_end
+                || meta.lsn > meta.commit_lsn
+        };
+        if lsn_invalid {
+            return Err(poison(format!(
+                "row {row_count} WAL/commit LSN lies outside manifest [{}, {}]",
+                expectation.lsn_start, expectation.lsn_end
+            )));
+        }
+    }
+    if row_count != expectation.row_count {
+        return Err(poison(format!(
+            "manifest receipt records {} rows but Parquet contains {row_count}",
+            expectation.row_count
+        )));
+    }
+    Ok(())
+}
+
 fn drop_generation_sql(table: &str) -> String {
     format!(
         "DROP VIEW IF EXISTS \"{table}_current\"; \
@@ -1313,7 +1999,9 @@ const _: fn() = || {
     assert_sync::<Arc<crate::health::LoaderState>>();
 
     // Pin walrus's own source of `!Sync`; DuckDB independently keeps the overall type `!Sync`.
-    const fn cache_refcell(db: &TableDb) -> &RefCell<HashMap<SchemaVersionNo, Arc<[String]>>> {
+    const fn cache_refcell(
+        db: &TableDb,
+    ) -> &RefCell<HashMap<SchemaVersionNo, Arc<[StagedColumn]>>> {
         &db.parquet_cols
     }
     let _cache_refcell_fn = cache_refcell;

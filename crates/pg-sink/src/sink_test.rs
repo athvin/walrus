@@ -142,6 +142,9 @@ async fn reload_stream_writes_incremental_row_groups_then_returns_a_durable_obje
     assert_eq!(written.kind, FileKind::Reload);
 
     let bytes = store.get(&key).await.unwrap().bytes().await.unwrap();
+    assert_eq!(written.object_size, u64::try_from(bytes.len()).unwrap());
+    let digest = Sha256::digest(&bytes);
+    assert_eq!(written.sha256.as_slice(), &digest[..]);
     let batches: Vec<_> = ParquetRecordBatchReaderBuilder::try_new(bytes)
         .unwrap()
         .build()

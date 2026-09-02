@@ -303,7 +303,7 @@ async fn sigterm_mid_stream_drains_commits_and_resumes() {
             let _ = store.delete(&Path::from(key)).await;
         }
     }
-    sqlx::query("DELETE FROM walrus.file_manifest WHERE epoch = $1")
+    sqlx::query("WITH authorized AS MATERIALIZED (SELECT set_config('walrus.manifest_delete_protocol','2',true) AS protocol) DELETE FROM walrus.file_manifest WHERE epoch = $1 AND (SELECT protocol='2' FROM authorized)")
         .bind(epoch)
         .execute(&pool)
         .await

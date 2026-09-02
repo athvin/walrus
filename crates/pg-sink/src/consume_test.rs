@@ -6,6 +6,7 @@ use crate::reload_event::{
 };
 use arrow::array::{Array, Int32Array, StringArray};
 use common::{PgColumn, PgRelation, ReplicaIdentity, SchemaVersionNo, SinkMeta, TupleValue};
+use object_store::path::Path;
 use pg_to_arrow::oids;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -94,6 +95,56 @@ fn malformed_reload_event_is_a_decode_error() {
             .contains("parse walrus.reload_event tuple"),
         "malformed source control rows must stop decoding: {error:#}"
     );
+}
+
+#[test]
+fn stream_commit_publication_contains_every_materialised_object_and_real_timestamp() {
+    let epoch = EpochNo(7);
+    let commit_lsn = Lsn::new(900);
+    let commit_ts = "2026-09-02T12:34:56Z".parse::<UtcTimestamp>().unwrap();
+    let objects = [
+        crate::sink::WrittenObject {
+            s3_uri: "s3://walrus/7/public/orders/first.parquet".into(),
+            key: Path::from("7/public/orders/first.parquet"),
+            source_schema: "public".into(),
+            source_table: "orders".into(),
+            lsn_start: Lsn::new(100),
+            lsn_end: commit_lsn,
+            row_count: 3,
+            object_size: 128,
+            sha256: [1; 32],
+            schema_version: SchemaVersionNo(1),
+            kind: crate::sink::FileKind::Spill,
+        },
+        crate::sink::WrittenObject {
+            s3_uri: "s3://walrus/7/public/invoices/second.parquet".into(),
+            key: Path::from("7/public/invoices/second.parquet"),
+            source_schema: "public".into(),
+            source_table: "invoices".into(),
+            lsn_start: Lsn::new(200),
+            lsn_end: commit_lsn,
+            row_count: 5,
+            object_size: 256,
+            sha256: [2; 32],
+            schema_version: SchemaVersionNo(2),
+            kind: crate::sink::FileKind::Stream,
+        },
+    ];
+
+    let publication =
+        stream_commit_publication(epoch, 857, commit_lsn, commit_ts, &objects, &[], &[]);
+
+    assert_eq!(publication.epoch, epoch);
+    assert_eq!(publication.top_xid, 857);
+    assert_eq!(publication.commit_lsn, commit_lsn);
+    assert_eq!(publication.commit_ts, commit_ts);
+    assert!(publication.ddl_rows.is_empty());
+    assert!(publication.registry_rows.is_empty());
+    assert_eq!(publication.files.len(), objects.len());
+    assert_eq!(publication.files[0].s3_uri, objects[0].s3_uri);
+    assert_eq!(publication.files[0].kind, control::ManifestKind::Spill);
+    assert_eq!(publication.files[1].s3_uri, objects[1].s3_uri);
+    assert_eq!(publication.files[1].kind, control::ManifestKind::Stream);
 }
 
 #[test]

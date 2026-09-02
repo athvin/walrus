@@ -17,7 +17,7 @@ use common::EpochNo;
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use tokio::time::Instant;
+use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
 /// The lifecycle: install signals, bind health (so probes see 503 during the slow bootstrap), run
@@ -89,9 +89,9 @@ async fn pipeline(
         start_lsn,
         sink,
     } = establish_stream(cfg, &ctx, &mut cache, SCHEMA_VERSION).await?;
-    // DDL state is restartable: hydrate both the latest registered shapes and every processed source
-    // audit identity before reading another WAL frame. A replayed audit row then reuses its committed
-    // version instead of manufacturing version N+1.
+    // DDL state is restartable: hydrate every historical registered shape and processed source
+    // audit identity before reading another WAL frame. A replayed transaction then reconstructs
+    // its exact old version instead of manufacturing N+1 or falling forward to the latest shape.
     let mut ddl = crate::ddl::DdlConsumer::new(epoch);
     ddl.hydrate_versions(&cache);
     ddl.hydrate_history(
@@ -196,6 +196,12 @@ async fn pipeline(
         },
         token.clone(),
     );
+    let slot_guard = crate::guard_monitor::spawn(
+        cfg.source_db_url.expose().clone(),
+        cfg.slot_name.clone(),
+        cfg.heartbeat_idle_after,
+        token.clone(),
+    );
 
     let result = consume::DecodeLoop::builder()
         .stream(&mut stream)
@@ -220,9 +226,13 @@ async fn pipeline(
     // Whatever ended the loop (SIGTERM, stream end, or a decode error), drain the side tasks.
     state.mark_terminating();
     token.cancel();
+    let slot_guard_result = slot_guard
+        .await
+        .context("replication-slot guard task join")?;
     reload_controller
         .await
         .context("reload controller task join")?;
+    slot_guard_result?;
     result
 }
 
@@ -468,9 +478,9 @@ async fn establish_stream(
                 .await;
             }
             let epoch = state.epoch;
-            let rows = control::read_all_latest_registry(&ctx.control_pool, epoch)
+            let rows = control::read_all_registry(&ctx.control_pool, epoch)
                 .await
-                .context("read schema_registry for hydration")?;
+                .context("read complete schema_registry history for hydration")?;
             let registered_targets = rows
                 .iter()
                 .map(|row| (row.source_schema.clone(), row.source_table.clone()))
@@ -560,7 +570,11 @@ async fn establish_stream(
                 .context("re-emit unfinished bootstrap request")?;
             }
             cache.hydrate(rows).context("hydrate relation cache")?;
-            let stream = ReplicationStream::start(
+            // Claim the configured slot before deleting anything. PostgreSQL permits only one active
+            // consumer per slot, so a rolling replacement fails here while the prior pod can still own
+            // unmanifested speculative spills. The sweep then runs while this CopyBoth connection is
+            // the source-enforced singleton; no decoder, exporter, or other local writer exists yet.
+            let mut stream = ReplicationStream::start(
                 cfg.source_db_url.expose(),
                 slot.as_str(),
                 confirmed_flush,
@@ -568,6 +582,15 @@ async fn establish_stream(
             )
             .await
             .context("START_REPLICATION (resume)")?;
+            cleanup_epoch_orphans_while_holding_slot(
+                &mut stream,
+                ctx.object_store.as_ref(),
+                &cfg.object_store.bucket,
+                &ctx.control_pool,
+                epoch,
+            )
+            .await
+            .context("collect abandoned epoch objects after claiming resumed slot")?;
             tracing::info!(
                 epoch = %epoch,
                 cached_relations = cache.len(),
@@ -744,7 +767,7 @@ async fn establish_bootstrap_generation(
     crate::reload_event::request_all_targets(&ctx.source_client, request_id, &targets)
         .await
         .context("append initial all-table request to source WAL")?;
-    let stream = ReplicationStream::start(
+    let mut stream = ReplicationStream::start(
         cfg.source_db_url.expose(),
         slot,
         start_lsn,
@@ -752,6 +775,15 @@ async fn establish_bootstrap_generation(
     )
     .await
     .context("START_REPLICATION (bootstrap reconciliation)")?;
+    cleanup_epoch_orphans_while_holding_slot(
+        &mut stream,
+        ctx.object_store.as_ref(),
+        &cfg.object_store.bucket,
+        &ctx.control_pool,
+        epoch,
+    )
+    .await
+    .context("collect abandoned bootstrap-epoch objects after claiming slot")?;
     tracing::info!(
         epoch = %epoch,
         tables = targets.len(),
@@ -771,9 +803,53 @@ async fn establish_bootstrap_generation(
     })
 }
 
+/// Sweep only while PostgreSQL has granted this process the configured replication slot. Entering
+/// CopyBoth is the race-free singleton test: a prior/competing pod either still owns the slot (so
+/// `START_REPLICATION` failed before this function was reachable) or cannot begin decoding until this
+/// connection releases it. Pump feedback while object listing/deletion is in flight so the ownership
+/// connection itself cannot time out during a large sweep.
+async fn cleanup_epoch_orphans_while_holding_slot(
+    stream: &mut ReplicationStream,
+    store: &dyn object_store::ObjectStore,
+    bucket: &str,
+    pool: &sqlx::PgPool,
+    epoch: EpochNo,
+) -> anyhow::Result<crate::orphan::OrphanCleanupStats> {
+    let cleanup = crate::orphan::cleanup_epoch_orphans(store, bucket, pool, epoch);
+    tokio::pin!(cleanup);
+    loop {
+        let budget = stream.feedback_budget();
+        tokio::select! {
+            biased;
+            result = &mut cleanup => return result,
+            _ = sleep(budget) => stream
+                .send_received_feedback(false)
+                .await
+                .context("send replication feedback while sweeping epoch orphans")?,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn orphan_sweep_is_reachable_only_through_the_active_slot_guard() {
+        let source = include_str!("app.rs");
+        let cleanup_call = ["crate::orphan::", "cleanup_epoch_orphans("].concat();
+        assert_eq!(
+            source.matches(&cleanup_call).count(),
+            1,
+            "startup must never call the destructive sweep outside the helper that requires an active ReplicationStream"
+        );
+        let guarded_signature = [
+            "async fn cleanup_epoch_orphans_while_holding_slot(\n",
+            "    stream: &mut ReplicationStream,",
+        ]
+        .concat();
+        assert!(source.contains(&guarded_signature));
+    }
 
     #[test]
     fn slot_loss_recovery_distinguishes_absence_from_invalidation() {

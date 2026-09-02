@@ -108,11 +108,8 @@ async fn alter_add_column_bumps_version_and_cuts_file() {
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     for tbl in ["file_manifest", "ddl_manifest", "schema_registry"] {
-        sqlx::query(&format!("DELETE FROM walrus.{tbl} WHERE epoch = $1"))
-            .bind(epoch)
-            .execute(&pool)
-            .await
-            .unwrap();
+        let sql = cleanup_sql(tbl);
+        sqlx::query(&sql).bind(epoch).execute(&pool).await.unwrap();
     }
     let mut stream =
         ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
@@ -263,7 +260,7 @@ async fn alter_add_column_bumps_version_and_cuts_file() {
     .expect("the DDL + rows stream within 30s");
 
     // Final drain: force-seal the buffered v2 rows into a v2 file.
-    for sealed in router.drain_committed().unwrap() {
+    for sealed in router.drain_for_shutdown().unwrap() {
         flush_batch(&sink, &pool, epoch, sealed).await.unwrap();
     }
 
@@ -338,10 +335,8 @@ async fn alter_add_column_bumps_version_and_cuts_file() {
         }
     }
     for tbl in ["file_manifest", "ddl_manifest", "schema_registry"] {
-        let _ = sqlx::query(&format!("DELETE FROM walrus.{tbl} WHERE epoch = $1"))
-            .bind(epoch)
-            .execute(&pool)
-            .await;
+        let sql = cleanup_sql(tbl);
+        let _ = sqlx::query(&sql).bind(epoch).execute(&pool).await;
     }
     let _ = admin
         .execute(
@@ -357,4 +352,14 @@ async fn alter_add_column_bumps_version_and_cuts_file() {
         .await;
     drop(stream);
     drop_slot(&admin, slot).await;
+}
+
+fn cleanup_sql(table: &str) -> String {
+    if table == "file_manifest" {
+        format!(
+            "WITH authorized AS MATERIALIZED (SELECT set_config('walrus.manifest_delete_protocol','2',true) AS protocol) DELETE FROM walrus.{table} WHERE epoch = $1 AND (SELECT protocol = '2' FROM authorized)"
+        )
+    } else {
+        format!("DELETE FROM walrus.{table} WHERE epoch = $1")
+    }
 }

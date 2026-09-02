@@ -11,8 +11,9 @@
 
 use common::{DdlId, EpochNo, Lsn, SchemaVersionNo, Tier, TypeDescriptor, TypeMeta};
 use control::{
-    DdlRow, RegistryRow, connect, insert_ddl, read_all_ddl, read_latest_ddl_version_through,
-    read_latest_version, read_pending_ddl, read_registry, run_migrations, upsert_registry,
+    DdlRow, RegistryRow, connect, insert_ddl, read_all_ddl, read_all_registry,
+    read_latest_ddl_version_through, read_latest_version, read_pending_ddl, read_registry,
+    run_migrations, upsert_registry,
 };
 use sqlx::postgres::PgPool;
 
@@ -149,6 +150,16 @@ async fn upsert_registry_is_idempotent_per_version() {
     upsert_registry(&mut *tx, &registry_row(epoch, SchemaVersionNo(5)))
         .await
         .unwrap();
+    assert_eq!(
+        read_all_registry(&mut *tx, epoch)
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.schema_version)
+            .collect::<Vec<_>>(),
+        vec![SchemaVersionNo(1), SchemaVersionNo(5)],
+        "restart hydration retains every historical relation shape"
+    );
     let latest = read_latest_version(&mut *tx, epoch, "public", "orders")
         .await
         .unwrap();
@@ -209,6 +220,16 @@ async fn source_audit_identity_makes_ddl_replay_idempotent() {
     let second_id = insert_ddl(&mut *tx, &original).await.unwrap();
     assert_eq!(second_id, first_id, "WAL replay must reuse the history row");
 
+    let mut changed = original.clone();
+    changed.c_tag = "CREATE TABLE".into();
+    assert!(matches!(
+        insert_ddl(&mut *tx, &changed).await,
+        Err(control::ControlError::ImmutableHistoryConflict {
+            entity: "ddl_manifest",
+            ..
+        })
+    ));
+
     let history = read_all_ddl(&mut *tx, epoch).await.unwrap();
     assert_eq!(
         history,
@@ -227,6 +248,34 @@ async fn source_audit_identity_makes_ddl_replay_idempotent() {
     .await
     .unwrap();
     assert_eq!(count, 1);
+
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn registry_replay_cannot_rewrite_an_existing_version() {
+    let pool = pool().await;
+    let mut tx = pool.begin().await.unwrap();
+    let epoch = EpochNo(800_006);
+    let original = registry_row(epoch, SchemaVersionNo(2));
+    upsert_registry(&mut *tx, &original).await.unwrap();
+
+    let mut changed = original.clone();
+    changed.columns = serde_json::json!([{"name": "different"}]);
+    assert!(matches!(
+        upsert_registry(&mut *tx, &changed).await,
+        Err(control::ControlError::ImmutableHistoryConflict {
+            entity: "schema_registry",
+            ..
+        })
+    ));
+    assert_eq!(
+        read_registry(&mut *tx, epoch, "public", "orders", SchemaVersionNo(2))
+            .await
+            .unwrap(),
+        Some(original),
+        "the conflicting replay must leave durable history unchanged"
+    );
 
     tx.rollback().await.unwrap();
 }

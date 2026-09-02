@@ -14,6 +14,7 @@ use crate::lease;
 use common::{EpochNo, Lsn, PgRelation};
 use object_store::ObjectStore;
 use sqlx::Connection as _;
+use std::collections::HashSet;
 
 /// The two commit-LSN watermarks for one table.
 #[derive(Debug, Clone, Copy)]
@@ -142,11 +143,14 @@ impl CatalogFence {
 }
 
 impl OwnedTable {
-    /// The `(schema, table)` identity as an owned pair. Clones both names — hence `to_`; callers
-    /// that only need to read them can borrow the fields directly.
+    /// Clone the exact control-plane ownership capability retained for renewal and release.
     #[must_use]
-    pub fn to_key(&self) -> (String, String) {
-        (self.schema.clone(), self.table.clone())
+    pub fn to_held_lease(&self) -> lease::HeldLease {
+        lease::HeldLease {
+            schema: self.schema.clone(),
+            table: self.table.clone(),
+            fencing_token: self.fencing_token,
+        }
     }
 }
 
@@ -182,6 +186,14 @@ pub async fn bootstrap(
         .epoch;
 
     let registry = control::read_all_latest_registry(pool, epoch).await?;
+    // Unlike `reload_supersede_floor`, this includes requested/exporting attempts before F exists.
+    // That distinction matters after an integrity failure: bootstrap must not cast the old live
+    // generation forward while the fresh replacement snapshot is still waiting to start.
+    let active_rebuilds = control::reload::active_rebuilds(pool, epoch)
+        .await?
+        .into_iter()
+        .map(|reload| (reload.source_schema, reload.source_table))
+        .collect::<HashSet<_>>();
     let mut owned = Vec::with_capacity(registry.len());
     let mut catalog_fence = CatalogFence::connect(cfg).await?;
     for row in registry {
@@ -213,7 +225,11 @@ pub async fn bootstrap(
             lease::release_all(
                 pool,
                 epoch,
-                &[(rel.schema.clone(), rel.name.clone())],
+                &[lease::HeldLease {
+                    schema: rel.schema.clone(),
+                    table: rel.name.clone(),
+                    fencing_token: lease.fencing_token,
+                }],
                 &cfg.instance,
             )
             .await;
@@ -240,10 +256,23 @@ pub async fn bootstrap(
         // rebuild is pending, ensure the tables at the `.duckdb`'s CURRENT version and SKIP the
         // forward reconcile; the rebuild resets both shape and data. Steady-state has no pending
         // rebuild, so this is the normal ensure-at-latest + reconcile.
+        let integrity =
+            control::read_integrity_recovery(pool, epoch, &rel.schema, &rel.name).await?;
+        let integrity_active = integrity.as_ref().is_some_and(|recovery| {
+            matches!(
+                recovery.status,
+                control::IntegrityRecoveryStatus::Retrying
+                    | control::IntegrityRecoveryStatus::Quarantined
+            )
+        });
+        if integrity_active {
+            // Seed the process-wide readiness latch before `app::pipeline` calls `mark_ready`.
+            // `LoaderState::mark_ready` preserves this per-table set, closing the restart window in
+            // which a poisoned table could otherwise briefly serve readiness 200.
+            state.quarantine_table(&rel.schema, &rel.name);
+        }
         let pending_rebuild =
-            control::reload::reload_supersede_floor(pool, epoch, &rel.schema, &rel.name)
-                .await?
-                .is_some();
+            integrity_active || active_rebuilds.contains(&(rel.schema.clone(), rel.name.clone()));
         if pending_rebuild {
             // A brand-new `.duckdb` has no persisted version to hold at, so it falls back to the
             // registry's. A *failed* read must not answer with that same fallback: it would send

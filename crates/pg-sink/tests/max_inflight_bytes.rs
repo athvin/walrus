@@ -91,7 +91,7 @@ async fn large_txn_low_ceiling_spills_and_stays_bounded() {
     let sink = ParquetSink::new(minio(), "walrus", epoch);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
-    sqlx::query("DELETE FROM walrus.file_manifest WHERE epoch = $1")
+    sqlx::query("WITH authorized AS MATERIALIZED (SELECT set_config('walrus.manifest_delete_protocol','2',true) AS protocol) DELETE FROM walrus.file_manifest WHERE epoch = $1 AND (SELECT protocol='2' FROM authorized)")
         .bind(epoch)
         .execute(&pool)
         .await
@@ -143,16 +143,29 @@ async fn large_txn_low_ceiling_spills_and_stays_bounded() {
                 continue;
             };
             match &msg {
-                Message::Relation { relation, .. } => {
+                Message::Relation { relation, xid } => {
                     cache
                         .upsert_from_relation(relation.clone(), common::SchemaVersionNo(1))
                         .unwrap();
+                    if let (Some(sub_xid), Some(top_xid)) = (*xid, demux.current_top()) {
+                        demux.bind_relation(
+                            top_xid,
+                            sub_xid,
+                            relation.oid,
+                            common::SchemaVersionNo(1),
+                        );
+                    }
                 }
                 Message::StreamStart { xid, first_segment } => {
-                    demux.on_stream_start(*xid, *first_segment, frame_lsn);
-                    checkpoint.set_open_txn_floor(demux.open_floor());
+                    let pre_start_ceiling = checkpoint.capture_pre_stream_start_ceiling();
+                    demux
+                        .on_stream_start(*xid, *first_segment, frame_lsn)
+                        .unwrap();
+                    if *first_segment {
+                        checkpoint.on_stream_start(*xid, pre_start_ceiling).unwrap();
+                    }
                 }
-                Message::StreamStop => demux.on_stream_stop(),
+                Message::StreamStop => demux.on_stream_stop().unwrap(),
                 m @ (Message::Insert { xid: Some(_), .. }
                 | Message::Update { xid: Some(_), .. }
                 | Message::Delete { xid: Some(_), .. }) => {
@@ -192,7 +205,7 @@ async fn large_txn_low_ceiling_spills_and_stays_bounded() {
                             .await
                             .unwrap();
                     }
-                    checkpoint.set_open_txn_floor(demux.open_floor());
+                    checkpoint.on_stream_end(*xid).unwrap();
                     checkpoint.on_batch_durable(*commit_lsn);
                     committed = true;
                 }
@@ -238,7 +251,7 @@ async fn large_txn_low_ceiling_spills_and_stays_bounded() {
             let _ = store.delete(&object_store::path::Path::from(key)).await;
         }
     }
-    let _ = sqlx::query("DELETE FROM walrus.file_manifest WHERE epoch = $1")
+    let _ = sqlx::query("WITH authorized AS MATERIALIZED (SELECT set_config('walrus.manifest_delete_protocol','2',true) AS protocol) DELETE FROM walrus.file_manifest WHERE epoch = $1 AND (SELECT protocol='2' FROM authorized)")
         .bind(epoch)
         .execute(&pool)
         .await;

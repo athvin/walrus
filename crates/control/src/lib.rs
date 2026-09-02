@@ -13,6 +13,7 @@
 pub(crate) mod checkpoint;
 pub(crate) mod db;
 pub(crate) mod ddl_manifest;
+pub(crate) mod integrity;
 pub(crate) mod manifest;
 pub(crate) mod parse;
 pub mod reload;
@@ -27,17 +28,24 @@ pub use db::{ControlError, connect, run_migrations};
 pub use ddl_manifest::{
     DdlRow, insert_ddl, read_all_ddl, read_latest_ddl_version_through, read_pending_ddl,
 };
+pub use integrity::{
+    IntegrityFailure, IntegrityFailureOutcome, IntegrityPublicationFence, IntegrityRecoveryRow,
+    IntegrityRecoveryStatus, handle_integrity_failure, read_integrity_recovery,
+};
 pub use manifest::{
-    ManifestKind, ManifestRow, ManifestStatus, NewManifestFile, claim_ready, delete_claimed,
-    delete_superseded, insert_ready, mark_failed, max_ready_lsn_end,
+    ManifestGroupId, ManifestKind, ManifestRow, ManifestStatus, NewManifestFile,
+    NewStreamCommitPublication, PublishStreamOutcome, claim_ready, delete_claimed,
+    delete_publication_superseded, insert_ready, list_manifest_uris, max_ready_lsn_end,
+    publish_stream_commit, validate_claimed_groups,
 };
 pub use parse::ParseEnumError;
 // The reload transition functions stay module-qualified (`reload::request`, `reload::fail`, …):
 // several of their names (`renew_lease`, `complete`, `get`) would collide with or read vaguer
 // than the flat exports above. Only the types go flat.
 pub use reload::{
-    ReloadFenceIdentity, ReloadFlavor, ReloadMarkerKind, ReloadMarkerRow, ReloadRow, ReloadScope,
-    ReloadStatus, SourceReloadRequest,
+    ExportRangePlan, ExportSeal, ExportSnapshot, ExporterLease, ReloadFenceIdentity, ReloadFlavor,
+    ReloadMarkerKind, ReloadMarkerRow, ReloadPublication, ReloadRow, ReloadScope, ReloadStatus,
+    SourceReloadRequest,
 };
 pub use replication_state::{
     BootstrapProgress, ReplicationState, ReplicationStatus, bump_bootstrap_epoch, bump_epoch,
@@ -45,6 +53,7 @@ pub use replication_state::{
     read_current_epoch,
 };
 pub use schema_registry::{
-    RegistryRow, read_all_latest_registry, read_latest_version, read_registry, upsert_registry,
+    RegistryRow, read_all_latest_registry, read_all_registry, read_latest_version, read_registry,
+    upsert_registry,
 };
 pub use table_ownership::{Lease, acquire_lease, release_lease, renew_lease};

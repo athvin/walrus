@@ -179,6 +179,44 @@ async fn fence_waiter_resolves_by_phase() {
 }
 
 #[tokio::test]
+async fn fence_waiter_resolves_every_subscriber_for_the_same_phase() {
+    let waiters = FenceWaiters::default();
+    let reload_id = ReloadId(9);
+    let first = waiters.subscribe(reload_id, FencePhase::End);
+    let second = waiters.subscribe(reload_id, FencePhase::End);
+    assert_eq!(waiters.waiter_count(), 2);
+
+    let echo = FenceEcho {
+        commit_lsn: "0/40".parse().unwrap(),
+        embedded_lsn: "0/30".parse().unwrap(),
+    };
+    waiters.resolve(reload_id, FencePhase::End, echo);
+
+    assert_eq!(first.await.unwrap(), echo);
+    assert_eq!(second.await.unwrap(), echo);
+    assert_eq!(waiters.waiter_count(), 0);
+}
+
+#[tokio::test]
+async fn dropping_one_fence_subscriber_preserves_the_others() {
+    let waiters = FenceWaiters::default();
+    let reload_id = ReloadId(10);
+    let dropped = waiters.subscribe(reload_id, FencePhase::Start);
+    let live = waiters.subscribe(reload_id, FencePhase::Start);
+    drop(dropped);
+    assert_eq!(waiters.waiter_count(), 1);
+
+    let echo = FenceEcho {
+        commit_lsn: "0/40".parse().unwrap(),
+        embedded_lsn: "0/30".parse().unwrap(),
+    };
+    waiters.resolve(reload_id, FencePhase::Start, echo);
+
+    assert_eq!(live.await.unwrap(), echo);
+    assert_eq!(waiters.waiter_count(), 0);
+}
+
+#[tokio::test]
 async fn fence_waiter_counts_lsn_crosscheck_violations() {
     let waiters = FenceWaiters::default();
     let reload_id = ReloadId(8);

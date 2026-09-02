@@ -91,11 +91,8 @@ async fn signal_insert_resolves_waiter_and_never_reaches_parquet() {
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     for tbl in ["file_manifest", "schema_registry"] {
-        sqlx::query(&format!("DELETE FROM walrus.{tbl} WHERE epoch = $1"))
-            .bind(epoch)
-            .execute(&pool)
-            .await
-            .unwrap();
+        let sql = cleanup_sql(tbl);
+        sqlx::query(&sql).bind(epoch).execute(&pool).await.unwrap();
     }
 
     let resume = verify_or_create_slot(&admin, slot).await.unwrap();
@@ -178,7 +175,7 @@ async fn signal_insert_resolves_waiter_and_never_reaches_parquet() {
                     xid,
                 } if internal.is_reload_signal(*relation_oid) => {
                     let rel = internal.reload_signal_rel().expect("noted relation");
-                    pending.push(PendingSignal::from_tuple(rel, new, *xid).expect("parses"));
+                    pending.push(PendingSignal::from_tuple(rel, new, *xid, None).expect("parses"));
                     signal_seen = true;
                     signal_insert_frame_lsn = frame_lsn;
                 }
@@ -289,10 +286,17 @@ async fn signal_insert_resolves_waiter_and_never_reaches_parquet() {
         .await
         .unwrap();
     for tbl in ["file_manifest", "schema_registry"] {
-        sqlx::query(&format!("DELETE FROM walrus.{tbl} WHERE epoch = $1"))
-            .bind(epoch)
-            .execute(&pool)
-            .await
-            .unwrap();
+        let sql = cleanup_sql(tbl);
+        sqlx::query(&sql).bind(epoch).execute(&pool).await.unwrap();
+    }
+}
+
+fn cleanup_sql(table: &str) -> String {
+    if table == "file_manifest" {
+        format!(
+            "WITH authorized AS MATERIALIZED (SELECT set_config('walrus.manifest_delete_protocol','2',true) AS protocol) DELETE FROM walrus.{table} WHERE epoch = $1 AND (SELECT protocol = '2' FROM authorized)"
+        )
+    } else {
+        format!("DELETE FROM walrus.{table} WHERE epoch = $1")
     }
 }

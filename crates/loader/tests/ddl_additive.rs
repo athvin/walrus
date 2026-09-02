@@ -4,12 +4,15 @@
     clippy::let_underscore_must_use,
     reason = "integration test — unwrap/expect fine in setup + helpers"
 )]
+
 //! Additive/lossless DDL apply (loader §5.7, architecture per-change-type). The four hermetic tests
 //! (`Connection::open_in_memory()` via `TableDb`) prove the schema-DIFF + DuckDB `ALTER`s per taxonomy
 //! row; the `#[ignore]` compose test proves both tables evolve at the correct LSN relative to data.
 //!
 //!   cargo test -p loader --test ddl_additive              # hermetic
 //!   cargo test -p loader --test ddl_additive -- --ignored # + compose
+
+mod support;
 
 use common::{EpochNo, PgColumn, PgRelation, ReplicaIdentity};
 use loader::ddl::{AdditiveChange, CommentTarget, SchemaVersion, apply_additive, diff_additive};
@@ -363,23 +366,21 @@ fn tmpdir(name: &str) -> tempfile::TempDir {
     tempfile::Builder::new().prefix(&prefix).tempdir().unwrap()
 }
 
-fn meta(op: &str, commit_hex: &str, l: u64) -> String {
-    format!(
-        "{{\"op\":\"{op}\",\"commit_lsn\":\"{commit_hex}\",\"lsn\":\"{:016X}\",\"sink_processed_at\":\"2026-07-07T12:00:{:02}Z\"}}",
-        l,
-        l % 60
-    )
-}
-
 /// Write a homogeneous Parquet fixture to S3. `with_note` = the v2 shape (adds the `note` column).
 fn write_fixture(
     epoch: EpochNo,
     tag: &str,
+    batch_no: u64,
+    schema_version: common::SchemaVersionNo,
     with_note: bool,
-    rows: &[(i64, &str, &str, &str, u64)],
+    commit_lsn: &str,
+    rows: &[(i64, &str, &str, &str)],
 ) -> String {
     let w = duckdb::Connection::open_in_memory().unwrap();
     let a = s3();
+    let epoch_bits = u64::try_from(epoch.0).unwrap();
+    let batch_id =
+        uuid::Uuid::from_u128((u128::from(epoch_bits) << 64) | u128::from(batch_no)).to_string();
     w.execute_batch(&format!(
         "INSTALL httpfs; LOAD httpfs; SET s3_region='{}'; SET s3_endpoint='{}'; \
          SET s3_url_style='path'; SET s3_use_ssl=false; \
@@ -395,10 +396,22 @@ fn write_fixture(
             "CREATE TABLE fixture (id INTEGER, status VARCHAR, note VARCHAR, walrus_pg_sink_meta VARCHAR);",
         )
         .unwrap();
-        for (id, status, note, op, l) in rows {
+        for (id, status, note, op) in rows {
+            let metadata = serde_json::to_string(&support::sink_meta(
+                epoch,
+                &batch_id,
+                schema_version,
+                "public",
+                "orders",
+                common::Kind::Stream,
+                op,
+                commit_lsn,
+                commit_lsn,
+            ))
+            .unwrap();
             w.execute(
                 "INSERT INTO fixture VALUES (?, ?, ?, ?)",
-                duckdb::params![id, status, note, meta(op, "00000000000000C8", *l)],
+                duckdb::params![id, status, note, metadata],
             )
             .unwrap();
         }
@@ -407,10 +420,22 @@ fn write_fixture(
             "CREATE TABLE fixture (id INTEGER, status VARCHAR, walrus_pg_sink_meta VARCHAR);",
         )
         .unwrap();
-        for (id, status, _note, op, l) in rows {
+        for (id, status, _note, op) in rows {
+            let metadata = serde_json::to_string(&support::sink_meta(
+                epoch,
+                &batch_id,
+                schema_version,
+                "public",
+                "orders",
+                common::Kind::Stream,
+                op,
+                commit_lsn,
+                commit_lsn,
+            ))
+            .unwrap();
             w.execute(
                 "INSERT INTO fixture VALUES (?, ?, ?)",
-                duckdb::params![id, status, meta(op, "0000000000000064", *l)],
+                duckdb::params![id, status, metadata],
             )
             .unwrap();
         }
@@ -439,17 +464,12 @@ async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
     let epoch = EpochNo(3_800_001);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
-    for tbl in [
-        "file_manifest",
-        "loader_checkpoint",
-        "schema_registry",
-        "replication_state",
-    ] {
-        let _ = sqlx::query(&format!("DELETE FROM walrus.{tbl} WHERE epoch = $1"))
-            .bind(epoch)
-            .execute(&pool)
-            .await;
-    }
+    support::cleanup_epoch(&pool, epoch).await;
+    sqlx::query("DELETE FROM walrus.schema_registry WHERE epoch = $1")
+        .bind(epoch.0)
+        .execute(&pool)
+        .await
+        .unwrap();
     control::insert_epoch(
         &pool,
         &control::ReplicationState {
@@ -487,16 +507,23 @@ async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
     let v1 = write_fixture(
         epoch,
         "v1",
+        1,
+        common::SchemaVersionNo(1),
         false,
-        &[(1, "a1", "", "i", 1), (2, "b1", "", "i", 2)],
+        "0/64",
+        &[(1, "a1", "", "i"), (2, "b1", "", "i")],
     );
     let v2 = write_fixture(
         epoch,
         "v2",
+        2,
+        common::SchemaVersionNo(2),
         true,
-        &[(2, "b2", "N2", "u", 10), (3, "c2", "N3", "i", 11)],
+        "0/C8",
+        &[(2, "b2", "N2", "u"), (3, "c2", "N3", "i")],
     );
     for (uri, ver, lsn) in [(v1, 1, "0/64"), (v2, 2, "0/C8")] {
+        let (object_size, sha256) = support::fingerprint(&uri).await;
         control::insert_ready(
             &pool,
             &control::NewManifestFile {
@@ -506,6 +533,8 @@ async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
                 s3_uri: uri,
                 kind: control::ManifestKind::Stream,
                 row_count: 2,
+                object_size,
+                sha256,
                 lsn_start: lsn.parse().unwrap(),
                 lsn_end: lsn.parse().unwrap(),
                 schema_version: common::SchemaVersionNo(ver),
@@ -522,10 +551,15 @@ async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
     db.ensure_tables(&orders_v1(), common::SchemaVersionNo(1))
         .unwrap();
     db.configure_s3(&s3()).unwrap();
+    let (owner_pod, fencing_token) = support::acquire_table(&pool, epoch, "public", "orders").await;
     let ctx = TableCtx {
         pool,
         epoch,
         epoch_rx: loader::epoch::fixed_epoch_watch(epoch),
+        owner_pod,
+        fencing_token,
+        store: support::store(),
+        staging_bucket: "walrus".into(),
         schema: "public".into(),
         table: "orders".into(),
         series: "public.orders".into(),
@@ -533,6 +567,7 @@ async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
         db,
         state: LoaderState::new(),
         max_files: std::num::NonZeroI64::new(100).unwrap(),
+        max_integrity_resnapshots: 1,
         poll_interval: Duration::from_secs(5),
         compaction_interval: Duration::from_secs(3600),
         retention_lsn_lag: 16 << 20,

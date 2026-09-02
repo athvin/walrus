@@ -6,10 +6,11 @@
 )]
 //! Parallel export engine against compose (`#[ignore]` — needs source PG + control PG + MinIO).
 //! The remote files' union is the table exactly, every row is stamped `commit_lsn = lsn = F`, a
-//! crashed shared snapshot is purged and replaced by a fresh fenced successor, and a missing
-//! decoder cannot let an exporter query before F is durable. Per-worker tails may add files beyond
-//! `ceil(total_rows/chunk_rows)`; `chunk_no` is the durable completed-file count, never a keyset
-//! cursor. The SQL/stamp shapes are unit-tested in `src/reload_export.rs`.
+//! crashed shared snapshot is purged and replaced by a fresh fenced successor, a protocol-v2
+//! transaction opened before F and committed after H remains a later WAL event, and a missing decoder
+//! cannot let an exporter query before F is durable. Per-worker tails may add files beyond
+//! `ceil(total_rows/chunk_rows)`; `chunk_no` is the durable completed-file count, never a keyset cursor.
+//! The SQL/stamp shapes are unit-tested in `src/reload_export.rs`.
 //!
 //! Each test spins a mini fence resolver: a real slot commit-gates `reload_event`, durably records
 //! baseline `F` / terminal `H`, and only then resolves the shared `FenceWaiters`.
@@ -63,6 +64,10 @@ fn control_url() -> String {
 }
 
 async fn admin() -> tokio_postgres::Client {
+    source_client().await
+}
+
+async fn source_client() -> tokio_postgres::Client {
     let (c, conn) = tokio_postgres::connect(&source_url(), NoTls).await.unwrap();
     tokio::spawn(async move {
         let _ = conn.await;
@@ -175,11 +180,18 @@ async fn seed_guc_sensitive_types(
 /// Control-side hygiene for a test epoch (safe to run before and after).
 async fn scrub(pool: &sqlx::PgPool, epoch: EpochNo) {
     for tbl in ["file_manifest", "table_reload", "schema_registry"] {
-        sqlx::query(&format!("DELETE FROM walrus.{tbl} WHERE epoch = $1"))
-            .bind(epoch)
-            .execute(pool)
-            .await
-            .unwrap();
+        let sql = cleanup_sql(tbl);
+        sqlx::query(&sql).bind(epoch).execute(pool).await.unwrap();
+    }
+}
+
+fn cleanup_sql(table: &str) -> String {
+    if table == "file_manifest" {
+        format!(
+            "WITH authorized AS MATERIALIZED (SELECT set_config('walrus.manifest_delete_protocol','2',true) AS protocol) DELETE FROM walrus.{table} WHERE epoch = $1 AND (SELECT protocol = '2' FROM authorized)"
+        )
+    } else {
+        format!("DELETE FROM walrus.{table} WHERE epoch = $1")
     }
 }
 
@@ -330,7 +342,23 @@ async fn chunks_cover_the_table_exactly_with_shared_baseline_stamp() {
         .expect("fence resolver starts")
         .expect("fence resolver ready sender remains live");
     let mut watch_rx = resolver.watched_commit;
+    let mut streamed_watch_rx = resolver.watched_stream_commit;
     let resolver = resolver.handle;
+
+    // Open a transaction before F, make it large enough to force protocol-v2 segments, and leave it
+    // uncommitted through the entire export. Its rows are absent from PostgreSQL's exported snapshot;
+    // logical decoding must retain the open transaction and surface it only at its later commit LSN.
+    let long_tx = source_client().await;
+    long_tx
+        .batch_execute(&format!(
+            "BEGIN;
+             SET LOCAL logical_decoding_work_mem = '64kB';
+             INSERT INTO public.{TABLE} (id, val)
+             SELECT g, repeat('long-open-', 32) || g
+               FROM generate_series(2502, 10501) g;"
+        ))
+        .await
+        .unwrap();
 
     let req = request_and_claim(&pool, epoch).await;
     let reload_id = req.reload_id;
@@ -400,6 +428,17 @@ async fn chunks_cover_the_table_exactly_with_shared_baseline_stamp() {
     assert!(
         final_h > overlap_commit,
         "terminal H ({final_h}) follows the overlapping WAL commit ({overlap_commit})"
+    );
+    long_tx.batch_execute("COMMIT").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(20), streamed_watch_rx.changed())
+        .await
+        .expect("the pre-F large transaction eventually reaches StreamCommit")
+        .expect("the resolver holds the streamed watcher until cancellation");
+    let long_commit = (*streamed_watch_rx.borrow_and_update())
+        .expect("a protocol-v2 watched transaction has a commit LSN");
+    assert!(
+        long_commit > final_h,
+        "a transaction begun before F but committed after H must remain a later WAL event: {long_commit} > {final_h}"
     );
     let markers = control::reload::read_markers(&pool, reload_id)
         .await
@@ -479,6 +518,10 @@ async fn chunks_cover_the_table_exactly_with_shared_baseline_stamp() {
     assert!(
         !unique.contains(&2501),
         "all workers exclude rows committed after S"
+    );
+    assert!(
+        !unique.contains(&2502) && !unique.contains(&10501),
+        "all workers exclude the long transaction that was open in S"
     );
     token.cancel();
     resolver.await.unwrap();

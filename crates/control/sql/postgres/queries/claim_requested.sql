@@ -1,19 +1,23 @@
-UPDATE walrus.table_reload
-SET status = 'exporting',
-    lease_holder = $2,
-    lease_expiry = now() + make_interval(secs => $3),
-    updated_at = now()
-WHERE reload_id IN (
+WITH candidates AS MATERIALIZED (
     SELECT candidate.reload_id
     FROM walrus.table_reload AS candidate
     WHERE candidate.epoch = $1 AND candidate.status = 'requested'
+      -- A spent integrity-recovery budget is a durable stop, not permission for the exporter to
+      -- keep producing replacement generations the loader is forbidden to publish.
+      AND NOT EXISTS (
+          SELECT 1 FROM walrus.table_integrity_recovery AS recovery
+          WHERE recovery.epoch = candidate.epoch
+            AND recovery.source_schema = candidate.source_schema
+            AND recovery.source_table = candidate.source_table
+            AND recovery.status = 'quarantined'
+      )
       -- Do not start the next queued source request until the loader has published the current one.
       AND NOT EXISTS (
           SELECT 1 FROM walrus.table_reload AS active
           WHERE active.epoch = candidate.epoch
             AND active.source_schema = candidate.source_schema
             AND active.source_table = candidate.source_table
-            AND active.status IN ('exporting', 'export_complete')
+            AND active.status IN ('exporting', 'export_complete', 'publishing')
       )
       AND (
           -- A legacy direct request keeps its historical priority/duplicate semantics.
@@ -42,12 +46,26 @@ WHERE reload_id IN (
     ORDER BY candidate.reload_id
     LIMIT $4
     FOR UPDATE OF candidate SKIP LOCKED
+), claimed AS (
+    UPDATE walrus.table_reload AS reload
+    SET status = 'exporting',
+        lease_holder = $2,
+        exporter_generation = reload.exporter_generation + 1,
+        lease_expiry = statement_timestamp() + make_interval(secs => $3),
+        updated_at = now()
+    FROM candidates
+    WHERE reload.reload_id = candidates.reload_id
+      AND reload.status = 'requested'
+    RETURNING reload.reload_id, reload.epoch, reload.source_schema, reload.source_table,
+              reload.flavor, reload.status,
+              reload.source_request_id, reload.parent_request_id,
+              reload.request_scope,
+              reload.chunk_no, reload.cursor_pk,
+              reload.start_lsn, reload.first_lsn, reload.final_lsn,
+              reload.schema_version, reload.restart_count, reload.lease_holder,
+              reload.exporter_generation,
+              reload.export_snapshot IS NOT NULL AS has_export_plan, reload.error
 )
-RETURNING reload_id, epoch, source_schema, source_table,
-          flavor AS "flavor: ReloadFlavor", status AS "status: ReloadStatus",
-          source_request_id, parent_request_id,
-          request_scope AS "request_scope: ReloadScope",
-          chunk_no, cursor_pk,
-          start_lsn AS "start_lsn: Lsn",
-          first_lsn AS "first_lsn: Lsn", final_lsn AS "final_lsn: Lsn",
-          schema_version, restart_count, lease_holder, error
+SELECT *
+FROM claimed
+ORDER BY reload_id

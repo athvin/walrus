@@ -93,7 +93,7 @@ async fn savepoint_rollback_ready_file_has_exactly_6000_rows() {
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     // Start clean: a prior failed run may have left ready rows for this epoch.
-    sqlx::query("DELETE FROM walrus.file_manifest WHERE epoch = $1")
+    sqlx::query("WITH authorized AS MATERIALIZED (SELECT set_config('walrus.manifest_delete_protocol','2',true) AS protocol) DELETE FROM walrus.file_manifest WHERE epoch = $1 AND (SELECT protocol='2' FROM authorized)")
         .bind(epoch)
         .execute(&pool)
         .await
@@ -147,15 +147,25 @@ async fn savepoint_rollback_ready_file_has_exactly_6000_rows() {
                 continue;
             };
             match &msg {
-                Message::Relation { relation, .. } => {
+                Message::Relation { relation, xid } => {
                     cache
                         .upsert_from_relation(relation.clone(), common::SchemaVersionNo(1))
                         .unwrap();
+                    if let (Some(sub_xid), Some(top_xid)) = (*xid, demux.current_top()) {
+                        demux.bind_relation(
+                            top_xid,
+                            sub_xid,
+                            relation.oid,
+                            common::SchemaVersionNo(1),
+                        );
+                    }
                 }
                 Message::StreamStart { xid, first_segment } => {
-                    demux.on_stream_start(*xid, *first_segment, frame_lsn);
+                    demux
+                        .on_stream_start(*xid, *first_segment, frame_lsn)
+                        .unwrap();
                 }
-                Message::StreamStop => demux.on_stream_stop(),
+                Message::StreamStop => demux.on_stream_stop().unwrap(),
                 m @ (Message::Insert { xid: Some(_), .. }
                 | Message::Update { xid: Some(_), .. }
                 | Message::Delete { xid: Some(_), .. }) => {
@@ -165,7 +175,10 @@ async fn savepoint_rollback_ready_file_has_exactly_6000_rows() {
                     if top_xid != sub_xid {
                         saw_subabort = true;
                     }
-                    demux.on_stream_abort(*top_xid, *sub_xid, &sink).await;
+                    demux
+                        .on_stream_abort(*top_xid, *sub_xid, &sink)
+                        .await
+                        .unwrap();
                 }
                 Message::StreamCommit {
                     xid,
@@ -237,7 +250,7 @@ async fn savepoint_rollback_ready_file_has_exactly_6000_rows() {
             let _ = store.delete(&object_store::path::Path::from(key)).await;
         }
     }
-    let _ = sqlx::query("DELETE FROM walrus.file_manifest WHERE epoch = $1")
+    let _ = sqlx::query("WITH authorized AS MATERIALIZED (SELECT set_config('walrus.manifest_delete_protocol','2',true) AS protocol) DELETE FROM walrus.file_manifest WHERE epoch = $1 AND (SELECT protocol='2' FROM authorized)")
         .bind(epoch)
         .execute(&pool)
         .await;

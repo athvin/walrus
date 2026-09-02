@@ -174,6 +174,10 @@ pub struct LoaderConfig {
     /// Manifest files claimed per Phase-A cycle. A zero cap would make the loop claim nothing
     /// forever, so the invariant is encoded in the type and enforced during deserialization.
     pub max_files_per_cycle: NonZeroI64,
+    /// Maximum fresh full-table snapshots scheduled after immutable staging-object verification
+    /// fails. `1` permits one automatic replacement; a bad input in that replacement quarantines
+    /// the table instead of retrying forever. `0` quarantines the first incident.
+    pub max_integrity_resnapshots: u32,
     /// Bootstrap retry budget for transient deps.
     #[serde(with = "humantime_serde")]
     pub startup_deadline: Duration,
@@ -197,6 +201,7 @@ impl Default for LoaderConfig {
             compaction_interval: Duration::from_secs(3600),
             retention_lsn_lag: 16 << 20, // 16 MiB of WAL retained behind transformed_lsn
             max_files_per_cycle: nonzero_i64(32),
+            max_integrity_resnapshots: 1,
             startup_deadline: Duration::from_secs(60),
             health_addr: SocketAddr::from(([0, 0, 0, 0], 8080)),
         }
@@ -306,6 +311,11 @@ impl LoaderConfig {
             ));
         }
         common::runtime::validate_worker_threads(self.worker_threads)?;
+        if i32::try_from(self.max_integrity_resnapshots).is_err() {
+            return Err(ConfigError::IntegrityResnapshotBudget {
+                configured: self.max_integrity_resnapshots,
+            });
+        }
         Ok(())
     }
 
@@ -385,6 +395,10 @@ pub enum ConfigError {
     /// [`common::runtime::WorkerThreadsError`] so callers can recover the offending count.
     #[error("worker_threads: {0}")]
     WorkerThreads(#[from] common::runtime::WorkerThreadsError),
+    /// PostgreSQL stores the durable retry counter as `int`; larger budgets could not be persisted
+    /// exactly and are rejected before the loader starts.
+    #[error("max_integrity_resnapshots {configured} exceeds PostgreSQL int")]
+    IntegrityResnapshotBudget { configured: u32 },
 }
 
 impl From<ConfigError> for common::Error {

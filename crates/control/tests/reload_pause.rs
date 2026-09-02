@@ -6,16 +6,22 @@
 //! Compose-gated integration tests for the loader-pause claim predicate.
 //!
 //! "Pausing is not claiming" (reload §2): a live reload of either persisted flavor in
-//! `requested|exporting` makes `claim_ready` return nothing for THAT table while its `ready`
-//! rows accumulate; every other table claims normally; `export_complete` (and the terminal
-//! states) lift the pause and the backlog drains in unchanged `(lsn_end, id)` order. `resync`
-//! remains a compatibility spelling for the identical rebuild behavior.
+//! `requested|exporting|export_complete|publishing` makes generic `claim_ready` return nothing for
+//! THAT table while its `ready` rows accumulate; every other table claims normally. A fenced
+//! publication-specific claim drains the frozen `[F,H]` set, and only terminal states lift the
+//! generic pause. `resync` remains a compatibility spelling for the identical rebuild behavior.
 #![cfg(feature = "integration")]
 
 use common::{EpochNo, Lsn, SchemaVersionNo};
-use control::reload::{self, ReloadFenceIdentity, ReloadFlavor, ReloadScope, SourceReloadRequest};
+use control::reload::{
+    self, ExportRangePlan, ExportSnapshot, ReloadFenceIdentity, ReloadFlavor, ReloadScope,
+    SourceReloadRequest,
+};
 use control::{ManifestRow, NewManifestFile};
-use control::{claim_ready, connect, insert_ready, max_ready_lsn_end, run_migrations};
+use control::{
+    acquire_lease, claim_ready, connect, delete_claimed, ensure_checkpoint, insert_ready,
+    max_ready_lsn_end, run_migrations,
+};
 use sqlx::postgres::{PgConnection, PgPool};
 use uuid::Uuid;
 
@@ -42,6 +48,8 @@ fn stream_file(epoch: EpochNo, table: &str, lsn_end: &str) -> NewManifestFile {
         s3_uri: format!("s3://walrus/{epoch}/public/{table}/{lsn_end}.parquet"),
         kind: control::ManifestKind::Stream,
         row_count: 1,
+        object_size: 1,
+        sha256: vec![0; 32],
         lsn_start: lsn,
         lsn_end: lsn,
         schema_version: SchemaVersionNo(1),
@@ -57,6 +65,8 @@ async fn finish_fenced(conn: &mut PgConnection, reload_id: common::ReloadId, h: 
     let row = reload::get(&mut *conn, reload_id).await.unwrap().unwrap();
     let schema_version = row.schema_version.unwrap_or(SchemaVersionNo(1));
     let f = row.start_lsn.or(row.first_lsn).unwrap_or(h);
+    let holder = row.lease_holder.clone().unwrap();
+    let lease = row.exporter_lease(&holder).unwrap();
     let identity = ReloadFenceIdentity {
         request_id: row.source_request_id.or(row.parent_request_id),
         source_schema: &row.source_schema,
@@ -66,10 +76,36 @@ async fn finish_fenced(conn: &mut PgConnection, reload_id: common::ReloadId, h: 
     reload::record_start_fence(&mut *conn, reload_id, f, identity)
         .await
         .unwrap();
+    let snapshot = format!("1:{}:", reload_id.0 + 2);
+    reload::begin_export_plan(
+        conn,
+        &lease,
+        f,
+        schema_version,
+        ExportSnapshot {
+            identity: &snapshot,
+            xmin: 1,
+            xmax: reload_id.0 + 2,
+        },
+        &[ExportRangePlan {
+            range_no: 0,
+            full_scan: true,
+            start_block: None,
+            end_block: None,
+        }],
+    )
+    .await
+    .unwrap();
+    reload::record_export_range(&mut *conn, &lease, 0, 0, 0)
+        .await
+        .unwrap();
+    reload::seal_export(conn, &lease, f, schema_version)
+        .await
+        .unwrap();
     reload::record_end_marker(&mut *conn, reload_id, h, identity)
         .await
         .unwrap();
-    reload::complete_export(&mut *conn, reload_id, h)
+    reload::complete_export(&mut *conn, &lease, h)
         .await
         .unwrap();
 }
@@ -132,12 +168,13 @@ async fn live_rebuild_pauses_claims_for_that_table_only() {
 }
 
 #[tokio::test]
-async fn export_complete_and_terminal_states_lift_the_pause() {
+async fn publication_claim_drains_through_h_before_complete_lifts_the_generic_pause() {
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
     let epoch = EpochNo(920_002);
 
-    // Backlog inserted OUT of order, so the lift must return it in (lsn_end, id) order.
+    // Backlog inserted OUT of order, so the publication claim must return it in
+    // `(lsn_end, id)` order.
     let c = insert_ready(&mut *tx, &stream_file(epoch, "orders", "0/30"))
         .await
         .unwrap();
@@ -145,6 +182,9 @@ async fn export_complete_and_terminal_states_lift_the_pause() {
         .await
         .unwrap();
     let b = insert_ready(&mut *tx, &stream_file(epoch, "orders", "0/20"))
+        .await
+        .unwrap();
+    let after_h = insert_ready(&mut *tx, &stream_file(epoch, "orders", "0/200"))
         .await
         .unwrap();
 
@@ -161,25 +201,92 @@ async fn export_complete_and_terminal_states_lift_the_pause() {
             .is_empty()
     );
 
-    // export_complete lifts the pause — exactly then the loader MUST claim again to reach the
-    // chunk files and trigger the rebuild (pausing through export_complete deadlocks).
+    // `export_complete` keeps the generic path paused. The loader must first acquire the table
+    // fence and enter the publication-specific path.
     let h: Lsn = "0/100".parse().unwrap();
     finish_fenced(&mut tx, orders, h).await;
+    assert!(
+        claim_ready(&mut *tx, epoch, "public", "orders", 100)
+            .await
+            .unwrap()
+            .is_empty(),
+        "export_complete remains paused on the generic claim path"
+    );
+    assert_eq!(
+        reload::active_rebuilds(&mut *tx, epoch)
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.reload_id)
+            .collect::<Vec<_>>(),
+        vec![orders],
+        "export_complete remains an active rebuild"
+    );
+
+    let owner = "loader-a";
+    let lease = acquire_lease(&mut *tx, epoch, "public", "orders", owner, 60)
+        .await
+        .unwrap()
+        .unwrap();
+    ensure_checkpoint(&mut *tx, epoch, "public", "orders")
+        .await
+        .unwrap();
+    let publication = reload::claim_publication(
+        &mut *tx,
+        epoch,
+        "public",
+        "orders",
+        owner,
+        lease.fencing_token,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        claim_ready(&mut *tx, epoch, "public", "orders", 100)
+            .await
+            .unwrap()
+            .is_empty(),
+        "publishing remains paused on the generic claim path"
+    );
+    assert_eq!(
+        reload::active_rebuilds(&mut *tx, epoch)
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.reload_id)
+            .collect::<Vec<_>>(),
+        vec![orders],
+        "publishing remains an active rebuild"
+    );
+
+    let through_h =
+        reload::claim_publication_ready(&mut *tx, &publication, owner, lease.fencing_token, 100)
+            .await
+            .unwrap();
+    assert_eq!(
+        ids(&through_h),
+        vec![a, b, c],
+        "the publication claim drains only [F,H] in unchanged (lsn_end, id) order"
+    );
+    assert_eq!(delete_claimed(&mut *tx, &ids(&through_h)).await.unwrap(), 3);
+    assert!(
+        reload::publication_drained(&mut *tx, &publication, owner, lease.fencing_token)
+            .await
+            .unwrap()
+    );
+    assert!(
+        reload::finish_publication(&mut *tx, &publication, owner, lease.fencing_token)
+            .await
+            .unwrap(),
+        "the first finish transitions publishing to complete"
+    );
     assert_eq!(
         ids(&claim_ready(&mut *tx, epoch, "public", "orders", 100)
             .await
             .unwrap()),
-        vec![a, b, c],
-        "the backlog drains in unchanged (lsn_end, id) order"
-    );
-    // `complete` keeps it lifted.
-    reload::complete(&mut *tx, orders).await.unwrap();
-    assert_eq!(
-        claim_ready(&mut *tx, epoch, "public", "orders", 100)
-            .await
-            .unwrap()
-            .len(),
-        3
+        vec![after_h],
+        "complete lifts the generic pause while preserving rows above H"
     );
 
     // `failed` equally lifts: a second table walks requested → exporting → failed.
@@ -261,7 +368,8 @@ async fn completed_resync_can_drain_before_a_queued_source_reload_starts() {
         .unwrap();
 
     // Source-backed rows queue even behind an active legacy resync. Both spellings engage the
-    // pause, so the current attempt needs the flavor-agnostic export_complete escape.
+    // pause, so the current attempt must complete its fenced publication before the queued one
+    // starts.
     let queued = reload::request_from_source(
         &mut *tx,
         &SourceReloadRequest {
@@ -285,12 +393,12 @@ async fn completed_resync_can_drain_before_a_queued_source_reload_starts() {
     );
 
     finish_fenced(&mut tx, current, "0/20".parse().unwrap()).await;
-    assert_eq!(
-        ids(&claim_ready(&mut *tx, epoch, "public", "orders", 100)
+    assert!(
+        claim_ready(&mut *tx, epoch, "public", "orders", 100)
             .await
-            .unwrap()),
-        vec![manifest],
-        "a queued reload must not deadlock an export_complete resync"
+            .unwrap()
+            .is_empty(),
+        "export_complete keeps the generic claim paused"
     );
     assert!(
         reload::claim_requested(&mut *tx, epoch, "sink-b", 60, 10)
@@ -300,7 +408,39 @@ async fn completed_resync_can_drain_before_a_queued_source_reload_starts() {
         "the queued reload still waits for the resync's loader completion"
     );
 
-    reload::complete(&mut *tx, current).await.unwrap();
+    let owner = "loader-a";
+    let lease = acquire_lease(&mut *tx, epoch, "public", "orders", owner, 60)
+        .await
+        .unwrap()
+        .unwrap();
+    ensure_checkpoint(&mut *tx, epoch, "public", "orders")
+        .await
+        .unwrap();
+    let publication = reload::claim_publication(
+        &mut *tx,
+        epoch,
+        "public",
+        "orders",
+        owner,
+        lease.fencing_token,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let claimed =
+        reload::claim_publication_ready(&mut *tx, &publication, owner, lease.fencing_token, 100)
+            .await
+            .unwrap();
+    assert_eq!(ids(&claimed), vec![manifest]);
+    assert_eq!(delete_claimed(&mut *tx, &ids(&claimed)).await.unwrap(), 1);
+    assert!(
+        reload::publication_drained(&mut *tx, &publication, owner, lease.fencing_token)
+            .await
+            .unwrap()
+    );
+    reload::finish_publication(&mut *tx, &publication, owner, lease.fencing_token)
+        .await
+        .unwrap();
     assert_eq!(
         reload::claim_requested(&mut *tx, epoch, "sink-b", 60, 10)
             .await

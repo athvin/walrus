@@ -1,15 +1,16 @@
 SELECT r.reload_id, r.epoch, r.source_schema, r.source_table,
-       r.flavor AS "flavor: ReloadFlavor", r.status AS "status: ReloadStatus",
+       r.flavor, r.status,
        r.source_request_id, r.parent_request_id,
-       r.request_scope AS "request_scope: ReloadScope",
+       r.request_scope,
        r.chunk_no, r.cursor_pk,
-       r.start_lsn AS "start_lsn: Lsn",
-       r.first_lsn AS "first_lsn: Lsn", r.final_lsn AS "final_lsn: Lsn",
-       r.schema_version, r.restart_count, r.lease_holder, r.error
+       r.start_lsn, r.first_lsn, r.final_lsn,
+       r.schema_version, r.restart_count, r.lease_holder, r.exporter_generation,
+       r.export_snapshot IS NOT NULL AS has_export_plan, r.error
 FROM walrus.table_reload r
 WHERE r.epoch = $1 AND r.source_schema = $2 AND r.source_table = $3
   AND r.status = 'export_complete'
   AND r.start_lsn IS NOT NULL AND r.final_lsn IS NOT NULL AND r.schema_version IS NOT NULL
+  AND r.export_sealed_at IS NOT NULL
   AND r.final_lsn >= r.start_lsn
   AND EXISTS (
     SELECT 1 FROM walrus.table_reload_marker m

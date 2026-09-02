@@ -426,7 +426,7 @@ impl<C: Clock> TableBatcher<C> {
 
     /// Force the currently committed rows into a file without waiting for a cadence/size trigger.
     ///
-    /// Unlike [`Self::drain_committed`], this never drops an open transaction.  A table durability
+    /// Unlike [`Self::drain_for_shutdown`], this never drops an open transaction. A table durability
     /// fence calls this immediately after the fence transaction's `Commit`, where an open ordinary
     /// transaction is impossible; treating one as an error keeps an accidental mid-transaction
     /// caller from silently losing its speculative tail.
@@ -445,6 +445,45 @@ impl<C: Clock> TableBatcher<C> {
             return Ok(None);
         }
         self.seal().map(Some)
+    }
+
+    /// Seal committed rows at an interleaved `StreamCommit` boundary while preserving any ordinary
+    /// transaction currently buffered in `pending`.
+    ///
+    /// The committed builder and speculative pending rows normally share one file identity. Cutting
+    /// the committed prefix therefore gives the preserved transaction a fresh identity before it can
+    /// later commit; its rows remain memory-only throughout this operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the assignment/Arrow errors from [`Self::seal`]. An open transaction is explicitly
+    /// supported and restored on both success and error.
+    pub fn seal_committed_boundary(&mut self) -> Result<Option<SealedBatch>, BatchError> {
+        if matches!(self.committed, CommittedRows::None) {
+            return Ok(None);
+        }
+        if !self.has_open_txn() {
+            return self.seal().map(Some);
+        }
+
+        let pending = std::mem::take(&mut self.pending);
+        let pending_bytes = std::mem::take(&mut self.pending_bytes);
+        let sealed = self.seal();
+
+        self.pending = pending;
+        self.pending_bytes = pending_bytes;
+        if sealed.is_ok() {
+            let batch_id = self.pending.first().map(|(meta, _)| {
+                format!("{}.{}-{}", meta.source_schema, meta.source_table, meta.lsn)
+            });
+            if let Some(batch_id) = &batch_id {
+                for (meta, _) in &mut self.pending {
+                    meta.batch_id.clone_from(batch_id);
+                }
+            }
+            self.batch_id = batch_id;
+        }
+        sealed.map(Some)
     }
 
     /// Whether this batcher owns `schema.table`.
@@ -493,7 +532,7 @@ impl<C: Clock> TableBatcher<C> {
     /// Returns [`BatchError::Unassigned`] if the committed rows carry no batch id, or the
     /// [`BatchError::Arrow`] produced while sealing committed rows. The open transaction is
     /// deliberately discarded first, so [`BatchError::OpenTransaction`] is not expected here.
-    pub fn drain_committed(&mut self) -> Result<Option<SealedBatch>, BatchError> {
+    pub fn drain_for_shutdown(&mut self) -> Result<Option<SealedBatch>, BatchError> {
         self.drop_open_txn();
         if matches!(self.committed, CommittedRows::None) {
             return Ok(None);

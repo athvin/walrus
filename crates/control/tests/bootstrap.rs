@@ -6,14 +6,18 @@
 //! Compose-gated integration coverage for the bootstrap reconciliation group.
 #![cfg(feature = "integration")]
 
-use common::{Lsn, SchemaVersionNo};
-use control::reload::{self, ReloadFenceIdentity, ReloadFlavor, ReloadScope, SourceReloadRequest};
+use common::{EpochNo, Lsn, ReloadId, SchemaVersionNo};
+use control::reload::{
+    self, ExportRangePlan, ExportSnapshot, ExporterLease, ReloadFenceIdentity, ReloadFlavor,
+    ReloadScope, SourceReloadRequest,
+};
 use control::{
-    ControlError, ReplicationStatus, bump_bootstrap_epoch, bump_epoch, complete_bootstrap, connect,
-    mark_total_restart, read_bootstrap_progress, read_current_epoch, run_migrations,
+    ControlError, ReplicationStatus, acquire_lease, bump_bootstrap_epoch, bump_epoch,
+    complete_bootstrap, connect, ensure_checkpoint, mark_total_restart, read_bootstrap_progress,
+    read_current_epoch, run_migrations,
 };
 use sqlx::Connection;
-use sqlx::postgres::PgPool;
+use sqlx::postgres::{PgConnection, PgPool};
 use uuid::Uuid;
 
 fn control_dsn() -> String {
@@ -28,6 +32,74 @@ async fn pool() -> PgPool {
         .expect("connect to control PG");
     run_migrations(&pool).await.expect("migrations apply");
     pool
+}
+
+async fn publish_fenced(conn: &mut PgConnection, epoch: EpochNo, table: &str, reload_id: ReloadId) {
+    let owner = "bootstrap-loader";
+    let lease = acquire_lease(&mut *conn, epoch, "public", table, owner, 60)
+        .await
+        .unwrap()
+        .unwrap();
+    ensure_checkpoint(&mut *conn, epoch, "public", table)
+        .await
+        .unwrap();
+    let publication = reload::claim_publication(
+        &mut *conn,
+        epoch,
+        "public",
+        table,
+        owner,
+        lease.fencing_token,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(publication.reload_id, reload_id);
+    assert!(
+        reload::publication_drained(&mut *conn, &publication, owner, lease.fencing_token)
+            .await
+            .unwrap(),
+        "bootstrap fixtures have no pending manifest rows"
+    );
+    assert!(
+        reload::finish_publication(&mut *conn, &publication, owner, lease.fencing_token)
+            .await
+            .unwrap()
+    );
+}
+
+async fn seal_empty_export(
+    conn: &mut PgConnection,
+    lease: &ExporterLease,
+    f: Lsn,
+    schema_version: SchemaVersionNo,
+) {
+    let snapshot = format!("1:{}:", lease.reload_id.0 + 2);
+    reload::begin_export_plan(
+        conn,
+        lease,
+        f,
+        schema_version,
+        ExportSnapshot {
+            identity: &snapshot,
+            xmin: 1,
+            xmax: lease.reload_id.0 + 2,
+        },
+        &[ExportRangePlan {
+            range_no: 0,
+            full_scan: true,
+            start_block: None,
+            end_block: None,
+        }],
+    )
+    .await
+    .unwrap();
+    reload::record_export_range(&mut *conn, lease, 0, 0, 0)
+        .await
+        .unwrap();
+    reload::seal_export(conn, lease, f, schema_version)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -287,13 +359,20 @@ async fn bootstrap_promotes_only_after_every_bound_child_completes() {
     reload::record_start_fence(&mut *tx, orders_id, first_f, orders_fence)
         .await
         .unwrap();
+    let orders_lease = reload::get(&mut *tx, orders_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .exporter_lease("bootstrap-sink")
+        .unwrap();
+    seal_empty_export(&mut tx, &orders_lease, first_f, SchemaVersionNo(1)).await;
     reload::record_end_marker(&mut *tx, orders_id, first_h, orders_fence)
         .await
         .unwrap();
-    reload::complete_export(&mut *tx, orders_id, first_h)
+    reload::complete_export(&mut *tx, &orders_lease, first_h)
         .await
         .unwrap();
-    reload::complete(&mut *tx, orders_id).await.unwrap();
+    publish_fenced(&mut tx, epoch, "orders", orders_id).await;
 
     let progress = read_bootstrap_progress(&mut *tx, epoch)
         .await
@@ -319,13 +398,20 @@ async fn bootstrap_promotes_only_after_every_bound_child_completes() {
     reload::record_start_fence(&mut *tx, customers_id, second_f, customers_fence)
         .await
         .unwrap();
+    let customers_lease = reload::get(&mut *tx, customers_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .exporter_lease("bootstrap-sink")
+        .unwrap();
+    seal_empty_export(&mut tx, &customers_lease, second_f, SchemaVersionNo(1)).await;
     reload::record_end_marker(&mut *tx, customers_id, second_h, customers_fence)
         .await
         .unwrap();
-    reload::complete_export(&mut *tx, customers_id, second_h)
+    reload::complete_export(&mut *tx, &customers_lease, second_h)
         .await
         .unwrap();
-    reload::complete(&mut *tx, customers_id).await.unwrap();
+    publish_fenced(&mut tx, epoch, "customers", customers_id).await;
 
     let ready = read_bootstrap_progress(&mut *tx, epoch)
         .await
@@ -445,13 +531,20 @@ async fn bootstrap_progress_uses_the_latest_ddl_restart_attempt_per_target() {
     reload::record_start_fence(&mut *tx, successor_id, f, successor_fence)
         .await
         .unwrap();
+    let successor_lease = reload::get(&mut *tx, successor_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .exporter_lease("bootstrap-sink")
+        .unwrap();
+    seal_empty_export(&mut tx, &successor_lease, f, SchemaVersionNo(2)).await;
     reload::record_end_marker(&mut *tx, successor_id, h, successor_fence)
         .await
         .unwrap();
-    reload::complete_export(&mut *tx, successor_id, h)
+    reload::complete_export(&mut *tx, &successor_lease, h)
         .await
         .unwrap();
-    reload::complete(&mut *tx, successor_id).await.unwrap();
+    publish_fenced(&mut tx, epoch, "orders", successor_id).await;
 
     let complete = read_bootstrap_progress(&mut *tx, epoch)
         .await

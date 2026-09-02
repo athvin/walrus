@@ -16,7 +16,7 @@
 use crate::{ControlError, parse::ParseEnumError};
 use common::string_enum;
 use common::{EpochNo, Lsn, ReloadId, SchemaVersionNo};
-use sqlx::{Connection, PgConnection, PgExecutor, Row};
+use sqlx::{Connection, PgConnection, PgExecutor, Row, postgres::PgRow};
 use uuid::Uuid;
 
 string_enum! {
@@ -108,8 +108,9 @@ pub struct ReloadFenceIdentity<'a> {
 }
 
 string_enum! {
-    /// `requested → exporting → export_complete → complete`; `failed` terminal from the middle. The
-    /// SQL CHECK carries the same five values — belt and braces, like `loader_checkpoint`'s CHECK.
+    /// `requested → exporting → export_complete → publishing → complete`; `failed` is terminal
+    /// from the middle. The SQL CHECK carries the same six values — belt and braces, like
+    /// `loader_checkpoint`'s CHECK.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
     #[sqlx(rename_all = "snake_case")]
     pub enum ReloadStatus {
@@ -118,13 +119,15 @@ string_enum! {
         Requested => "requested",
         Exporting => "exporting",
         ExportComplete => "export_complete",
+        Publishing => "publishing",
         Complete => "complete",
         Failed => "failed",
     }
 }
 
 /// One reload attempt. `lease_expiry`/timestamps stay out of the model — every time comparison
-/// happens in SQL (`now()`), like `table_ownership`, so the Rust side never holds a clock.
+/// happens against SQL's per-statement clock, like `table_ownership`, so the Rust side never holds
+/// a clock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReloadRow {
     /// This attempt's identity — the `bigserial` "latest wins" key described in the module docs.
@@ -163,54 +166,133 @@ pub struct ReloadRow {
     /// DDL restarts consumed so far; `reload_max_restarts` caps it.
     pub restart_count: i32,
     /// The instance currently holding the exporter lease; `None` when unclaimed. Compared only in
-    /// SQL against `now()`, so this side never decides whether the lease is live.
+    /// SQL against `statement_timestamp()`, so this side never decides whether the lease is live.
     pub lease_holder: Option<String>,
+    /// Monotonic fencing token minted on every claim/adoption. Export mutations must carry this
+    /// exact value; a holder name alone cannot distinguish a delayed process from its replacement.
+    pub exporter_generation: i64,
+    /// Whether this attempt already opened and durably recorded a source snapshot plan. The
+    /// snapshot itself is intentionally not exposed as resumable state.
+    pub has_export_plan: bool,
     /// Why the attempt reached `failed` — an operator-facing reason, set only on that transition.
     pub error: Option<String>,
 }
 
-/// Build a [`ReloadRow`] from one `table_reload` record.
-///
-/// A macro — not a function, a generic, or an `impl From<_> for ReloadRow` — for the one narrow
-/// reason that sanctions reaching for one: every `sqlx::query_file!` mints its OWN record struct
-/// inside its own expansion, so readers such as [`claim_requested`], [`adopt_resumable`],
-/// [`active_rebuilds`], [`ready_rebuild`], and [`get`] hand in distinct, unnameable types that
-/// merely happen to
-/// share a field set. Rust has no structural typing, so there is no bound to make a function
-/// generic over and no type to name in a `From` impl; the only alternative is this field mapping
-/// written out four times. Sibling modules ([`crate::manifest`], [`crate::ddl_manifest`])
-/// build their row struct inline precisely because each has a single reader.
-///
-/// `expr_2021` holds the capture to the 2021 expression grammar rather than edition 2024's wider
-/// `expr`, and the `let` binds the argument once so a caller's expression is never re-evaluated
-/// per field. That binding is hygienic, so the `|row| typed_reload_row!(row)` closures below pass
-/// their own `row` in without the macro's `row` capturing or shadowing it.
-macro_rules! typed_reload_row {
-    ($row:expr_2021) => {{
-        let row = $row;
-        // `$crate::reload::` — not a bare `ReloadRow` — so the struct resolves in its defining
-        // module rather than through whatever the expansion site happens to have imported.
-        $crate::reload::ReloadRow {
-            reload_id: row.reload_id.into(),
-            epoch: row.epoch.into(),
-            source_schema: row.source_schema,
-            source_table: row.source_table,
-            flavor: row.flavor,
-            source_request_id: row.source_request_id,
-            parent_request_id: row.parent_request_id,
-            scope: row.request_scope,
-            status: row.status,
-            chunk_no: row.chunk_no,
-            cursor_pk: row.cursor_pk,
-            start_lsn: row.start_lsn,
-            first_lsn: row.first_lsn,
-            final_lsn: row.final_lsn,
-            schema_version: row.schema_version.map(Into::into),
-            restart_count: row.restart_count,
-            lease_holder: row.lease_holder,
-            error: row.error,
+/// Immutable ownership proof carried by one exporter and all of its parallel COPY workers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExporterLease {
+    /// Attempt this token owns.
+    pub reload_id: ReloadId,
+    /// Pod/process identity recorded on the row.
+    pub holder: String,
+    /// Monotonic generation minted atomically by claim/adoption.
+    pub generation: i64,
+}
+
+impl ReloadRow {
+    /// Resolve the fencing token returned by the claim/adoption that produced this row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlError::ReloadTransition`] for an unowned row, a holder mismatch, or an
+    /// invalid generation.
+    pub fn exporter_lease(&self, expected_holder: &str) -> Result<ExporterLease, ControlError> {
+        if self.status != ReloadStatus::Exporting
+            || self.lease_holder.as_deref() != Some(expected_holder)
+            || self.exporter_generation <= 0
+        {
+            return Err(ControlError::ReloadTransition {
+                reload_id: self.reload_id,
+                expected: "exporting with this holder's positive exporter generation",
+            });
         }
-    }};
+        Ok(ExporterLease {
+            reload_id: self.reload_id,
+            holder: expected_holder.to_string(),
+            generation: self.exporter_generation,
+        })
+    }
+}
+
+/// One immutable physical range in a durable parallel snapshot plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExportRangePlan {
+    /// Stable zero-based ordinal assigned before any worker starts COPY.
+    pub range_no: i64,
+    /// A non-heap relation is exported as one full scan.
+    pub full_scan: bool,
+    /// Inclusive heap block lower bound; absent for a full scan.
+    pub start_block: Option<i64>,
+    /// Exclusive heap block upper bound; absent for the open-ended final range/full scan.
+    pub end_block: Option<i64>,
+}
+
+/// Immutable identity of the PostgreSQL snapshot shared by all COPY workers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportSnapshot<'a> {
+    /// Exact `pg_current_snapshot()::text` value seen by coordinator and importers.
+    pub identity: &'a str,
+    /// Snapshot xmin (`pg_snapshot_xmin`).
+    pub xmin: i64,
+    /// Snapshot xmax (`pg_snapshot_xmax`).
+    pub xmax: i64,
+}
+
+/// Durable receipt proving that every planned range and every reload manifest is present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExportSeal {
+    /// Number of ready reload objects included in the seal.
+    pub file_count: i64,
+    /// Total rows across the completed range plan/manifests.
+    pub row_count: i64,
+}
+
+/// A loader-owned publication attempt with immutable [F,H] boundaries and a stable crash-recovery
+/// nonce. The publisher identity is copied from `table_ownership` at every claim/adoption; every
+/// mutating publication API rechecks both that identity and the still-live ownership row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReloadPublication {
+    pub reload_id: ReloadId,
+    pub epoch: EpochNo,
+    pub source_schema: String,
+    pub source_table: String,
+    pub status: ReloadStatus,
+    pub start_lsn: Lsn,
+    pub final_lsn: Lsn,
+    pub schema_version: SchemaVersionNo,
+    pub publication_nonce: Uuid,
+    pub publisher_owner_pod: String,
+    pub publisher_fencing_token: i64,
+}
+
+/// Decode the common dynamic projection shared by every reload-row reader. These queries are
+/// intentionally runtime-checked because protocol migrations add fencing fields that must be
+/// deployed together rather than silently decoded through stale SQLx offline metadata.
+fn reload_from_row(row: &PgRow) -> Result<ReloadRow, ControlError> {
+    Ok(ReloadRow {
+        reload_id: ReloadId(row.try_get("reload_id")?),
+        epoch: EpochNo(row.try_get("epoch")?),
+        source_schema: row.try_get("source_schema")?,
+        source_table: row.try_get("source_table")?,
+        flavor: row.try_get::<String, _>("flavor")?.parse()?,
+        source_request_id: row.try_get("source_request_id")?,
+        parent_request_id: row.try_get("parent_request_id")?,
+        scope: row.try_get::<String, _>("request_scope")?.parse()?,
+        status: row.try_get::<String, _>("status")?.parse()?,
+        chunk_no: row.try_get("chunk_no")?,
+        cursor_pk: row.try_get("cursor_pk")?,
+        start_lsn: row.try_get("start_lsn")?,
+        first_lsn: row.try_get("first_lsn")?,
+        final_lsn: row.try_get("final_lsn")?,
+        schema_version: row
+            .try_get::<Option<i64>, _>("schema_version")?
+            .map(SchemaVersionNo),
+        restart_count: row.try_get("restart_count")?,
+        lease_holder: row.try_get("lease_holder")?,
+        exporter_generation: row.try_get("exporter_generation")?,
+        has_export_plan: row.try_get("has_export_plan")?,
+        error: row.try_get("error")?,
+    })
 }
 
 /// INSERT a reload request (`status='requested'`); returns the new `reload_id`.
@@ -219,6 +301,10 @@ macro_rules! typed_reload_row {
 /// partial unique index and maps to the typed [`ControlError::ReloadInProgress`] — matched by
 /// SQLSTATE + constraint *name*, never by message text. After `complete`/`failed` the row leaves
 /// the index and a new request succeeds.
+///
+/// Retired pre-v2 keyset-cursor compatibility entry point. Protocol-v2 claims always mint a
+/// positive exporter generation, and the guarded SQL rejects them so an accidental call cannot
+/// bypass the snapshot-plan/file-count protocol.
 ///
 /// # Errors
 ///
@@ -327,16 +413,14 @@ pub async fn claim_requested(
     lease_ttl_secs: i64,
     limit: i64,
 ) -> Result<Vec<ReloadRow>, ControlError> {
-    let rows = sqlx::query_file!(
-        "sql/postgres/queries/claim_requested.sql",
-        epoch.0,
-        holder,
-        lease_ttl_secs as f64,
-        limit,
-    )
-    .fetch_all(ex)
-    .await?;
-    Ok(rows.into_iter().map(|row| typed_reload_row!(row)).collect())
+    let rows = sqlx::query(include_str!("../sql/postgres/queries/claim_requested.sql"))
+        .bind(epoch.0)
+        .bind(holder)
+        .bind(lease_ttl_secs as f64)
+        .bind(limit)
+        .fetch_all(ex)
+        .await?;
+    rows.iter().map(reload_from_row).collect()
 }
 
 /// Return a claimed-but-never-started row to the queue: `exporting → requested`, lease cleared.
@@ -354,16 +438,14 @@ pub async fn claim_requested(
 /// Returns [`ControlError::Connect`] if the guarded release update cannot execute.
 pub async fn release_claim(
     ex: impl PgExecutor<'_>,
-    reload_id: ReloadId,
-    holder: &str,
+    lease: &ExporterLease,
 ) -> Result<bool, ControlError> {
-    let done = sqlx::query_file!(
-        "sql/postgres/queries/release_claim.sql",
-        reload_id.0,
-        holder,
-    )
-    .execute(ex)
-    .await?;
+    let done = sqlx::query(include_str!("../sql/postgres/queries/release_claim.sql"))
+        .bind(lease.reload_id.0)
+        .bind(&lease.holder)
+        .bind(lease.generation)
+        .execute(ex)
+        .await?;
     Ok(done.rows_affected() > 0)
 }
 
@@ -375,19 +457,269 @@ pub async fn release_claim(
 /// Returns [`ControlError::Connect`] if the guarded lease update cannot execute.
 pub async fn renew_lease(
     ex: impl PgExecutor<'_>,
-    reload_id: ReloadId,
-    holder: &str,
+    lease: &ExporterLease,
     lease_ttl_secs: i64,
 ) -> Result<bool, ControlError> {
-    let done = sqlx::query_file!(
-        "sql/postgres/queries/renew_lease.sql",
-        reload_id.0,
-        holder,
-        lease_ttl_secs as f64,
-    )
-    .execute(ex)
-    .await?;
+    let done = sqlx::query(include_str!("../sql/postgres/queries/renew_lease.sql"))
+        .bind(lease.reload_id.0)
+        .bind(&lease.holder)
+        .bind(lease_ttl_secs as f64)
+        .bind(lease.generation)
+        .execute(ex)
+        .await?;
     Ok(done.rows_affected() > 0)
+}
+
+const fn export_transition(reload_id: ReloadId) -> ControlError {
+    ControlError::ReloadTransition {
+        reload_id,
+        expected: "live exporter generation with one exact, unsealed source snapshot plan",
+    }
+}
+
+fn valid_export_ranges(ranges: &[ExportRangePlan]) -> bool {
+    if ranges.len() == 1 && ranges[0].full_scan {
+        return ranges[0].range_no == 0
+            && ranges[0].start_block.is_none()
+            && ranges[0].end_block.is_none();
+    }
+    if ranges.is_empty() || ranges.iter().any(|range| range.full_scan) {
+        return false;
+    }
+    let mut expected_start = 0;
+    for (index, range) in ranges.iter().enumerate() {
+        let is_final = index + 1 == ranges.len();
+        if range.range_no != i64::try_from(index).unwrap_or(-1)
+            || range.start_block != Some(expected_start)
+        {
+            return false;
+        }
+        match (is_final, range.end_block) {
+            (false, Some(end)) if end > expected_start => expected_start = end,
+            (true, None) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Durably freeze the exact source snapshot identity and complete physical range plan before any
+/// COPY worker starts reading. An exact retry by the same generation is idempotent. A new
+/// generation can never reuse the old plan: exported snapshot IDs cease to be importable when the
+/// exporting transaction ends, so adoption must recover a durable H or supersede the attempt.
+///
+/// # Errors
+///
+/// Returns [`ControlError::ReloadTransition`] for a malformed/different plan, a stale generation,
+/// an expired lease, or an attempt that already progressed/sealed.
+pub async fn begin_export_plan(
+    conn: &mut PgConnection,
+    lease: &ExporterLease,
+    start_lsn: Lsn,
+    schema_version: SchemaVersionNo,
+    snapshot: ExportSnapshot<'_>,
+    ranges: &[ExportRangePlan],
+) -> Result<(), ControlError> {
+    if snapshot.identity.is_empty()
+        || snapshot.xmin < 0
+        || snapshot.xmax < snapshot.xmin
+        || !valid_export_ranges(ranges)
+    {
+        return Err(export_transition(lease.reload_id));
+    }
+    let range_count =
+        i64::try_from(ranges.len()).map_err(|_| export_transition(lease.reload_id))?;
+    let mut tx = conn.begin().await?;
+    let row = sqlx::query(
+        "SELECT export_snapshot, export_snapshot_xmin, export_snapshot_xmax,
+                export_range_count,
+                status = 'exporting'
+                  AND lease_holder = $2
+                  AND exporter_generation = $3
+                  AND lease_expiry > statement_timestamp()
+                  AND start_lsn = $4
+                  AND schema_version = $5
+                  AND cursor_pk IS NULL
+                  AND export_sealed_at IS NULL AS owned
+         FROM walrus.table_reload
+         WHERE reload_id = $1
+         FOR UPDATE",
+    )
+    .bind(lease.reload_id.0)
+    .bind(&lease.holder)
+    .bind(lease.generation)
+    .bind(start_lsn)
+    .bind(schema_version.0)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| export_transition(lease.reload_id))?;
+    if !row.try_get::<bool, _>("owned")? {
+        return Err(export_transition(lease.reload_id));
+    }
+
+    let existing_snapshot = row.try_get::<Option<String>, _>("export_snapshot")?;
+    if let Some(existing_snapshot) = existing_snapshot {
+        let header_matches = existing_snapshot == snapshot.identity
+            && row.try_get::<Option<i64>, _>("export_snapshot_xmin")? == Some(snapshot.xmin)
+            && row.try_get::<Option<i64>, _>("export_snapshot_xmax")? == Some(snapshot.xmax)
+            && row.try_get::<Option<i64>, _>("export_range_count")? == Some(range_count);
+        let persisted = sqlx::query(
+            "SELECT exporter_generation, range_no, full_scan, start_block, end_block
+             FROM walrus.table_reload_export_range
+             WHERE reload_id = $1
+             ORDER BY range_no",
+        )
+        .bind(lease.reload_id.0)
+        .fetch_all(&mut *tx)
+        .await?;
+        let ranges_match = persisted.len() == ranges.len()
+            && persisted.iter().zip(ranges).all(|(row, expected)| {
+                row.try_get::<i64, _>("exporter_generation").ok() == Some(lease.generation)
+                    && row.try_get::<i64, _>("range_no").ok() == Some(expected.range_no)
+                    && row.try_get::<bool, _>("full_scan").ok() == Some(expected.full_scan)
+                    && row.try_get::<Option<i64>, _>("start_block").ok()
+                        == Some(expected.start_block)
+                    && row.try_get::<Option<i64>, _>("end_block").ok() == Some(expected.end_block)
+            });
+        if !header_matches || !ranges_match {
+            return Err(export_transition(lease.reload_id));
+        }
+        tx.commit().await?;
+        return Ok(());
+    }
+
+    let updated = sqlx::query(
+        "UPDATE walrus.table_reload
+         SET export_snapshot = $4,
+             export_snapshot_xmin = $5,
+             export_snapshot_xmax = $6,
+             export_range_count = $7,
+             updated_at = now()
+         WHERE reload_id = $1
+           AND status = 'exporting'
+           AND lease_holder = $2
+           AND exporter_generation = $3
+           AND lease_expiry > statement_timestamp()
+           AND export_snapshot IS NULL
+           AND export_snapshot_xmin IS NULL
+           AND export_snapshot_xmax IS NULL
+           AND export_range_count IS NULL",
+    )
+    .bind(lease.reload_id.0)
+    .bind(&lease.holder)
+    .bind(lease.generation)
+    .bind(snapshot.identity)
+    .bind(snapshot.xmin)
+    .bind(snapshot.xmax)
+    .bind(range_count)
+    .execute(&mut *tx)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(export_transition(lease.reload_id));
+    }
+    for range in ranges {
+        sqlx::query(
+            "INSERT INTO walrus.table_reload_export_range
+                (reload_id, exporter_generation, range_no, full_scan, start_block, end_block)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(lease.reload_id.0)
+        .bind(lease.generation)
+        .bind(range.range_no)
+        .bind(range.full_scan)
+        .bind(range.start_block)
+        .bind(range.end_block)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Mark one planned range complete only after all of its object manifests are durable.
+/// Exact replay is accepted; a changed count or stale generation is rejected.
+///
+/// # Errors
+///
+/// Returns [`ControlError::ReloadTransition`] for negative counts, an unknown/already-different
+/// range receipt, or a stale/expired exporter generation. Database failures retain their typed
+/// [`ControlError`] mapping.
+pub async fn record_export_range(
+    ex: impl PgExecutor<'_>,
+    lease: &ExporterLease,
+    range_no: i64,
+    file_count: i64,
+    row_count: i64,
+) -> Result<(), ControlError> {
+    if range_no < 0 || file_count < 0 || row_count < 0 {
+        return Err(export_transition(lease.reload_id));
+    }
+    let row = sqlx::query(include_str!(
+        "../sql/postgres/queries/record_export_range.sql"
+    ))
+    .bind(lease.reload_id.0)
+    .bind(&lease.holder)
+    .bind(lease.generation)
+    .bind(range_no)
+    .bind(file_count)
+    .bind(row_count)
+    .fetch_optional(ex)
+    .await?;
+    if row.is_none() {
+        return Err(export_transition(lease.reload_id));
+    }
+    Ok(())
+}
+
+/// Seal the snapshot baseline after validating every planned range, manifest count, and row count
+/// under the live exporter generation. H must be emitted only after this receipt is durable.
+///
+/// # Errors
+///
+/// Returns [`ControlError::ReloadTransition`] unless every range and reload manifest agrees with
+/// the live generation's immutable F/schema plan, or the underlying typed database error.
+pub async fn seal_export(
+    conn: &mut PgConnection,
+    lease: &ExporterLease,
+    start_lsn: Lsn,
+    schema_version: SchemaVersionNo,
+) -> Result<ExportSeal, ControlError> {
+    let mut tx = conn.begin().await?;
+    let owned = sqlx::query_scalar::<_, bool>(
+        "SELECT true FROM walrus.table_reload
+         WHERE reload_id = $1 AND status = 'exporting'
+           AND lease_holder = $2 AND exporter_generation = $3
+           AND lease_expiry > statement_timestamp()
+           AND start_lsn = $4 AND schema_version = $5
+           AND export_snapshot IS NOT NULL
+         FOR UPDATE",
+    )
+    .bind(lease.reload_id.0)
+    .bind(&lease.holder)
+    .bind(lease.generation)
+    .bind(start_lsn)
+    .bind(schema_version.0)
+    .fetch_optional(&mut *tx)
+    .await?
+    .unwrap_or(false);
+    if !owned {
+        return Err(export_transition(lease.reload_id));
+    }
+    let row = sqlx::query(include_str!("../sql/postgres/queries/seal_export.sql"))
+        .bind(lease.reload_id.0)
+        .bind(&lease.holder)
+        .bind(lease.generation)
+        .bind(start_lsn)
+        .bind(schema_version.0)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| export_transition(lease.reload_id))?;
+    let seal = ExportSeal {
+        file_count: row.try_get("file_count")?,
+        row_count: row.try_get("row_count")?,
+    };
+    tx.commit().await?;
+    Ok(seal)
 }
 
 /// Freeze the authoritative safe lower fence `F` and schema, and create its durable baseline
@@ -514,20 +846,18 @@ pub async fn advance_cursor(
     chunk_lsn: Lsn,
     schema_version: SchemaVersionNo,
 ) -> Result<(), ControlError> {
-    let done = sqlx::query_file!(
-        "sql/postgres/queries/advance_cursor.sql",
-        reload_id.0,
-        chunk_no,
-        cursor_pk,
-        chunk_lsn as Lsn,
-        schema_version.0,
-    )
-    .execute(ex)
-    .await?;
+    let done = sqlx::query(include_str!("../sql/postgres/queries/advance_cursor.sql"))
+        .bind(reload_id.0)
+        .bind(chunk_no)
+        .bind(cursor_pk)
+        .bind(chunk_lsn)
+        .bind(schema_version.0)
+        .execute(ex)
+        .await?;
     if done.rows_affected() == 0 {
         return Err(ControlError::ReloadTransition {
             reload_id,
-            expected: "exporting (in-order chunk_no, consistent schema_version)",
+            expected: "pre-v2 generation-zero exporting row with in-order keyset progress",
         });
     }
     Ok(())
@@ -553,25 +883,27 @@ pub async fn advance_cursor(
 /// become [`ControlError::Connect`] or [`ControlError::CheckViolation`].
 pub async fn record_exported_file(
     ex: impl PgExecutor<'_>,
-    reload_id: ReloadId,
+    lease: &ExporterLease,
     start_lsn: Lsn,
     schema_version: SchemaVersionNo,
 ) -> Result<i64, ControlError> {
-    let row = sqlx::query_file!(
-        "sql/postgres/queries/record_exported_file.sql",
-        reload_id.0,
-        start_lsn as Lsn,
-        schema_version.0,
-    )
+    let row = sqlx::query(include_str!(
+        "../sql/postgres/queries/record_exported_file.sql"
+    ))
+    .bind(lease.reload_id.0)
+    .bind(start_lsn)
+    .bind(schema_version.0)
+    .bind(&lease.holder)
+    .bind(lease.generation)
     .fetch_optional(ex)
     .await?;
     let Some(row) = row else {
         return Err(ControlError::ReloadTransition {
-            reload_id,
-            expected: "exporting (cursor-free, same start_lsn and schema_version)",
+            reload_id: lease.reload_id,
+            expected: "live exporter generation (unsealed, cursor-free, same F/schema)",
         });
     };
-    Ok(row.chunk_no)
+    Ok(row.try_get("chunk_no")?)
 }
 
 /// `exporting → export_complete`, recording the final watermark `H`. The sink's last act; from
@@ -585,47 +917,49 @@ pub async fn record_exported_file(
 /// [`ControlError::CheckViolation`].
 pub async fn complete_export(
     ex: impl PgExecutor<'_>,
-    reload_id: ReloadId,
+    lease: &ExporterLease,
     final_lsn: Lsn,
 ) -> Result<(), ControlError> {
-    let done = sqlx::query_file!(
-        "sql/postgres/queries/complete_export.sql",
-        reload_id.0,
-        final_lsn as Lsn,
-    )
-    .execute(ex)
-    .await?;
+    let done = sqlx::query(include_str!("../sql/postgres/queries/complete_export.sql"))
+        .bind(lease.reload_id.0)
+        .bind(final_lsn)
+        .bind(&lease.holder)
+        .bind(lease.generation)
+        .execute(ex)
+        .await?;
     if done.rows_affected() == 0 {
         return Err(ControlError::ReloadTransition {
-            reload_id,
-            expected: "exporting (with matching durable baseline/end markers)",
+            reload_id: lease.reload_id,
+            expected: "live exporter generation with matching sealed snapshot and F/H markers",
         });
     }
     Ok(())
 }
 
-/// `export_complete → complete` — the loader calls this once `transformed_lsn >= final_lsn`.
-/// Terminal: the row leaves the `table_reload_one_live` index, allowing the oldest queued source
-/// request to be claimed and direct/operator requests to be accepted again.
+/// Legacy `export_complete → complete` compatibility for pre-v2 rows only. A protocol-v2 attempt
+/// has `exporter_generation > 0`, so this function deliberately rejects it: only
+/// [`finish_publication`] may make that attempt terminal after the hidden Duck generation and
+/// canonical checkpoints are atomically published.
 ///
 /// # Errors
 ///
-/// Returns [`ControlError::ReloadTransition`] unless the attempt is `export_complete`, or
-/// [`ControlError::Connect`] if the guarded update fails.
+/// Returns [`ControlError::ReloadTransition`] unless the attempt is a generation-zero
+/// `export_complete` legacy row, or [`ControlError::Connect`] if the guarded update fails.
 pub async fn complete(ex: impl PgExecutor<'_>, reload_id: ReloadId) -> Result<(), ControlError> {
-    let done = sqlx::query_file!("sql/postgres/queries/complete.sql", reload_id.0,)
+    let done = sqlx::query(include_str!("../sql/postgres/queries/complete.sql"))
+        .bind(reload_id.0)
         .execute(ex)
         .await?;
     if done.rows_affected() == 0 {
         return Err(ControlError::ReloadTransition {
             reload_id,
-            expected: "export_complete",
+            expected: "legacy generation-zero export_complete",
         });
     }
     Ok(())
 }
 
-/// `exporting | export_complete → failed`, and — in the SAME transaction — delete this reload's
+/// `exporting → failed`, and — in the SAME transaction — delete this reload's
 /// staged manifest rows. A failed reload must leave nothing for the loader to claim (H9), and
 /// coupling the purge to the flip means no crash window can separate them.
 ///
@@ -645,19 +979,64 @@ pub async fn fail(
     reason: &str,
 ) -> Result<(), ControlError> {
     let mut tx = conn.begin().await?;
-    let done = sqlx::query_file!("sql/postgres/queries/fail.sql", reload_id.0, reason,)
+    let done = sqlx::query(include_str!("../sql/postgres/queries/fail.sql"))
+        .bind(reload_id.0)
+        .bind(reason)
         .execute(&mut *tx)
         .await?;
     if done.rows_affected() == 0 {
         // Dropping `tx` rolls the savepoint/transaction back.
         return Err(ControlError::ReloadTransition {
             reload_id,
-            expected: "exporting or export_complete",
+            expected: "exporting",
         });
     }
-    sqlx::query_file!("sql/postgres/queries/fail_purge_files.sql", reload_id.0,)
+    sqlx::query(include_str!("../sql/postgres/queries/fail_purge_files.sql"))
+        .bind(reload_id.0)
         .execute(&mut *tx)
         .await?;
+    crate::integrity::note_recovery_reload_failed(&mut *tx, reload_id, reason).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Fail an exporter-owned attempt only while its exact fencing generation still owns a live
+/// lease. This is the sink-facing failure path; [`fail`] remains the administrative/state-machine
+/// primitive used inside already-locked control transactions.
+///
+/// # Errors
+///
+/// Returns [`ControlError::ReloadTransition`] when the lease is stale, expired, or no longer owns
+/// an exporting attempt; otherwise returns the typed database failure from the atomic fail/purge.
+pub async fn fail_owned(
+    conn: &mut PgConnection,
+    lease: &ExporterLease,
+    reason: &str,
+) -> Result<(), ControlError> {
+    let mut tx = conn.begin().await?;
+    let owned = sqlx::query_scalar::<_, bool>(
+        "SELECT true
+         FROM walrus.table_reload
+         WHERE reload_id = $1
+           AND status = 'exporting'
+           AND lease_holder = $2
+           AND exporter_generation = $3
+           AND lease_expiry > statement_timestamp()
+         FOR UPDATE",
+    )
+    .bind(lease.reload_id.0)
+    .bind(&lease.holder)
+    .bind(lease.generation)
+    .fetch_optional(&mut *tx)
+    .await?
+    .unwrap_or(false);
+    if !owned {
+        return Err(ControlError::ReloadTransition {
+            reload_id: lease.reload_id,
+            expected: "exporting under the caller's live exporter generation",
+        });
+    }
+    fail(&mut tx, lease.reload_id, reason).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -732,6 +1111,28 @@ async fn restart_attempt(
     let reason = cause.reason(capped, max_restarts);
 
     let mut tx = conn.begin().await?;
+    let owns_attempt = sqlx::query_scalar::<_, bool>(
+        "SELECT true
+         FROM walrus.table_reload
+         WHERE reload_id = $1
+           AND status = 'exporting'
+           AND lease_holder = $2
+           AND exporter_generation = $3
+           AND lease_expiry > statement_timestamp()
+         FOR UPDATE",
+    )
+    .bind(old.reload_id.0)
+    .bind(&old.lease_holder)
+    .bind(old.exporter_generation)
+    .fetch_optional(&mut *tx)
+    .await?
+    .unwrap_or(false);
+    if !owns_attempt {
+        return Err(ControlError::ReloadTransition {
+            reload_id: old.reload_id,
+            expected: "exporting under the caller's live exporter generation",
+        });
+    }
     // Reuse fail() (a savepoint inside this tx): one place owns "terminal ⇒ no claimable files".
     // The Transaction auto-derefs to the PgConnection fail() wants; its inner begin() nests as a
     // savepoint under this transaction.
@@ -744,15 +1145,15 @@ async fn restart_attempt(
     // The successor: copy identity + lease from the (now failed) predecessor, reset the cursor and
     // schema_version, bump restart_count. Selecting only the carried columns leaves chunk_no/
     // cursor_pk/first_lsn/final_lsn/schema_version/error at their table defaults (fresh start).
-    let rec = sqlx::query_file!(
-        "sql/postgres/queries/restart_for_ddl.sql",
-        old.reload_id.0,
-        next_restart,
-    )
-    .fetch_one(&mut *tx)
-    .await?;
+    let rec = sqlx::query(include_str!("../sql/postgres/queries/restart_for_ddl.sql"))
+        .bind(old.reload_id.0)
+        .bind(next_restart)
+        .fetch_one(&mut *tx)
+        .await?;
+    let successor_id = ReloadId(rec.try_get("reload_id")?);
+    crate::integrity::relink_recovery_reload(&mut *tx, old.reload_id, successor_id).await?;
     tx.commit().await?;
-    Ok(Some(rec.reload_id.into()))
+    Ok(Some(successor_id))
 }
 
 /// H9 restart-on-DDL. The successor gets a fresh cursor, schema resolution, and F fence.
@@ -817,6 +1218,28 @@ pub async fn restart_pristine_adoption(
     old: &ReloadRow,
 ) -> Result<ReloadId, ControlError> {
     let mut tx = conn.begin().await?;
+    let owns_attempt = sqlx::query_scalar::<_, bool>(
+        "SELECT true
+         FROM walrus.table_reload
+         WHERE reload_id = $1
+           AND status = 'exporting'
+           AND lease_holder = $2
+           AND exporter_generation = $3
+           AND lease_expiry > statement_timestamp()
+         FOR UPDATE",
+    )
+    .bind(old.reload_id.0)
+    .bind(&old.lease_holder)
+    .bind(old.exporter_generation)
+    .fetch_optional(&mut *tx)
+    .await?
+    .unwrap_or(false);
+    if !owns_attempt {
+        return Err(ControlError::ReloadTransition {
+            reload_id: old.reload_id,
+            expected: "pristine attempt under the caller's live exporter generation",
+        });
+    }
     fail(
         &mut tx,
         old.reload_id,
@@ -826,9 +1249,10 @@ pub async fn restart_pristine_adoption(
     let successor = sqlx::query(
         "INSERT INTO walrus.table_reload
              (epoch, source_schema, source_table, flavor, status, restart_count,
-              lease_holder, lease_expiry, parent_request_id, request_scope)
+              lease_holder, lease_expiry, exporter_generation, parent_request_id, request_scope)
          SELECT epoch, source_schema, source_table, flavor, 'exporting', $2,
-                lease_holder, lease_expiry, COALESCE(source_request_id, parent_request_id),
+                lease_holder, lease_expiry, exporter_generation,
+                COALESCE(source_request_id, parent_request_id),
                 request_scope
          FROM walrus.table_reload
          WHERE reload_id = $1 AND chunk_no = 0 AND cursor_pk IS NULL
@@ -845,18 +1269,15 @@ pub async fn restart_pristine_adoption(
         });
     };
     let successor_id = ReloadId(successor.try_get("reload_id")?);
+    crate::integrity::relink_recovery_reload(&mut *tx, old.reload_id, successor_id).await?;
     tx.commit().await?;
     Ok(successor_id)
 }
 
-/// The loader's completion flip (H10): every `export_complete` reload for this table whose
-/// `final_lsn` (H) the mirror has now reached (`transformed_lsn >= H`) becomes `complete`. One
-/// guarded batch UPDATE that JOINs `loader_checkpoint` for the live `transformed_lsn` — no extra
-/// read, and a natural no-op (0 rows) on the vast majority of cycles that have no `export_complete`
-/// reload. Idempotent and at-least-once safe (a re-run flips nothing — the row is already terminal),
-/// so the loader can call it every cycle. Returns the reload_ids it completed (for the log). The
-/// LOADER owns this flip; the sink never writes `complete` (H10 — no service gets a write path into
-/// another's state row).
+/// Legacy checkpoint-based completion for generation-zero rows created before protocol v2. Every
+/// protocol-v2 attempt has `exporter_generation > 0`, so it is intentionally invisible here even
+/// after `transformed_lsn >= H`; its only completion path is [`finish_publication`]. Kept solely for
+/// rolling compatibility with durable pre-v2 attempts.
 ///
 /// # Errors
 ///
@@ -867,15 +1288,16 @@ pub async fn complete_reached(
     source_schema: &str,
     source_table: &str,
 ) -> Result<Vec<ReloadId>, ControlError> {
-    let rows = sqlx::query_file!(
-        "sql/postgres/queries/complete_reached.sql",
-        epoch.0,
-        source_schema,
-        source_table,
-    )
-    .fetch_all(ex)
-    .await?;
-    Ok(rows.into_iter().map(|row| row.reload_id.into()).collect())
+    let rows = sqlx::query(include_str!("../sql/postgres/queries/complete_reached.sql"))
+        .bind(epoch.0)
+        .bind(source_schema)
+        .bind(source_table)
+        .fetch_all(ex)
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|row| row.try_get::<i64, _>("reload_id").map(ReloadId))
+        .collect::<Result<Vec<_>, sqlx::Error>>()?)
 }
 
 /// The authoritative `start_lsn` (`F`) below which a pending **rebuild** supersedes this table's
@@ -900,22 +1322,22 @@ pub async fn reload_supersede_floor(
     source_schema: &str,
     source_table: &str,
 ) -> Result<Option<Lsn>, ControlError> {
-    let rec = sqlx::query_file!(
-        "sql/postgres/queries/reload_supersede_floor.sql",
-        epoch.0,
-        source_schema,
-        source_table,
-    )
+    let rec = sqlx::query_scalar::<_, Lsn>(include_str!(
+        "../sql/postgres/queries/reload_supersede_floor.sql"
+    ))
+    .bind(epoch.0)
+    .bind(source_schema)
+    .bind(source_table)
     .fetch_optional(ex)
     .await?;
-    Ok(rec.and_then(|r| r.first_lsn))
+    Ok(rec)
 }
 
 /// Crash recovery (H7): the `exporting` reloads this sink may resume — its OWN live lease when
 /// `include_own_live_lease` is enabled for startup, or an EXPIRED lease on any later scan. Re-acquires the
 /// lease in the SAME guarded `UPDATE … RETURNING` (with `FOR UPDATE SKIP LOCKED`) so two racing
 /// pods can never both adopt one row. A live FOREIGN lease (`lease_holder <> me AND lease_expiry >
-/// now()`) is deliberately excluded — never stolen. `requested` rows are excluded too: those go
+/// statement_timestamp()`) is deliberately excluded — never stolen. `requested` rows are excluded too: those go
 /// through ordinary pickup ([`claim_requested`]), keeping the two paths disjoint on status.
 ///
 /// Recovery reads from control-pg, NOT from WAL redelivery (H7): by restart time the signals' LSNs
@@ -934,17 +1356,15 @@ pub async fn adopt_resumable(
     limit: i64,
     include_own_live_lease: bool,
 ) -> Result<Vec<ReloadRow>, ControlError> {
-    let rows = sqlx::query_file!(
-        "sql/postgres/queries/adopt_resumable.sql",
-        epoch.0,
-        holder,
-        lease_ttl_secs as f64,
-        limit,
-        include_own_live_lease,
-    )
-    .fetch_all(ex)
-    .await?;
-    Ok(rows.into_iter().map(|row| typed_reload_row!(row)).collect())
+    let rows = sqlx::query(include_str!("../sql/postgres/queries/adopt_resumable.sql"))
+        .bind(epoch.0)
+        .bind(holder)
+        .bind(lease_ttl_secs as f64)
+        .bind(limit)
+        .bind(include_own_live_lease)
+        .fetch_all(ex)
+        .await?;
+    rows.iter().map(reload_from_row).collect()
 }
 
 /// Genuinely stuck exports: `exporting` rows whose lease has expired and which nobody is
@@ -959,21 +1379,27 @@ pub async fn stuck_exporting(
     ex: impl PgExecutor<'_>,
     epoch: EpochNo,
 ) -> Result<Vec<(ReloadId, Option<String>)>, ControlError> {
-    let rows = sqlx::query_file!("sql/postgres/queries/stuck_exporting.sql", epoch.0,)
+    let rows = sqlx::query(include_str!("../sql/postgres/queries/stuck_exporting.sql"))
+        .bind(epoch.0)
         .fetch_all(ex)
         .await?;
-    Ok(rows
-        .into_iter()
-        .map(|row| (row.reload_id.into(), row.lease_holder))
-        .collect())
+    rows.into_iter()
+        .map(|row| {
+            Ok((
+                ReloadId(row.try_get("reload_id")?),
+                row.try_get("lease_holder")?,
+            ))
+        })
+        .collect()
 }
 
 /// Tables mid-rebuild — the loader-pause predicate's input.
 ///
 /// This includes both persisted flavors because `resync` is a compatibility alias for the same
-/// rebuild. It deliberately includes `requested | exporting` only: the pause MUST lift at
-/// `export_complete`, because the rebuild is triggered by the loader claiming the chunk files;
-/// pausing through `export_complete` would deadlock the reload forever.
+/// rebuild. The generic live-table claim stays paused throughout
+/// `requested | exporting | export_complete | publishing`; once the export is marker-complete,
+/// only the fenced publication-specific claim may drain the frozen `[F,H]` set. The row leaves
+/// this result only after publication reaches a terminal status.
 ///
 /// # Errors
 ///
@@ -982,10 +1408,11 @@ pub async fn active_rebuilds(
     ex: impl PgExecutor<'_>,
     epoch: EpochNo,
 ) -> Result<Vec<ReloadRow>, ControlError> {
-    let rows = sqlx::query_file!("sql/postgres/queries/active_rebuilds.sql", epoch.0,)
+    let rows = sqlx::query(include_str!("../sql/postgres/queries/active_rebuilds.sql"))
+        .bind(epoch.0)
         .fetch_all(ex)
         .await?;
-    Ok(rows.into_iter().map(|row| typed_reload_row!(row)).collect())
+    rows.iter().map(reload_from_row).collect()
 }
 
 /// Return the marker-complete rebuild ready for this table's hidden-generation reconciliation.
@@ -1004,15 +1431,13 @@ pub async fn ready_rebuild(
     source_schema: &str,
     source_table: &str,
 ) -> Result<Option<ReloadRow>, ControlError> {
-    let row = sqlx::query_file!(
-        "sql/postgres/queries/ready_rebuild.sql",
-        epoch.0,
-        source_schema,
-        source_table,
-    )
-    .fetch_optional(ex)
-    .await?;
-    Ok(row.map(|row| typed_reload_row!(row)))
+    let row = sqlx::query(include_str!("../sql/postgres/queries/ready_rebuild.sql"))
+        .bind(epoch.0)
+        .bind(source_schema)
+        .bind(source_table)
+        .fetch_optional(ex)
+        .await?;
+    row.as_ref().map(reload_from_row).transpose()
 }
 
 /// Read one reload attempt, if it exists.
@@ -1024,10 +1449,312 @@ pub async fn get(
     ex: impl PgExecutor<'_>,
     reload_id: ReloadId,
 ) -> Result<Option<ReloadRow>, ControlError> {
-    let row = sqlx::query_file!("sql/postgres/queries/get.sql", reload_id.0,)
+    let row = sqlx::query(include_str!("../sql/postgres/queries/get.sql"))
+        .bind(reload_id.0)
         .fetch_optional(ex)
         .await?;
-    Ok(row.map(|row| typed_reload_row!(row)))
+    row.as_ref().map(reload_from_row).transpose()
+}
+
+fn publication_from_row(
+    row: &PgRow,
+    reload_id: ReloadId,
+) -> Result<ReloadPublication, ControlError> {
+    let missing = || ControlError::ReloadTransition {
+        reload_id,
+        expected: "marker-valid publishing receipt",
+    };
+    let value_reload_id = row
+        .try_get::<Option<i64>, _>("reload_id")?
+        .map(ReloadId)
+        .ok_or_else(missing)?;
+    let status = row
+        .try_get::<Option<String>, _>("status")?
+        .ok_or_else(missing)?
+        .parse()?;
+    Ok(ReloadPublication {
+        reload_id: value_reload_id,
+        epoch: EpochNo(
+            row.try_get::<Option<i64>, _>("epoch")?
+                .ok_or_else(missing)?,
+        ),
+        source_schema: row
+            .try_get::<Option<String>, _>("source_schema")?
+            .ok_or_else(missing)?,
+        source_table: row
+            .try_get::<Option<String>, _>("source_table")?
+            .ok_or_else(missing)?,
+        status,
+        start_lsn: row
+            .try_get::<Option<Lsn>, _>("start_lsn")?
+            .ok_or_else(missing)?,
+        final_lsn: row
+            .try_get::<Option<Lsn>, _>("final_lsn")?
+            .ok_or_else(missing)?,
+        schema_version: SchemaVersionNo(
+            row.try_get::<Option<i64>, _>("schema_version")?
+                .ok_or_else(missing)?,
+        ),
+        publication_nonce: row
+            .try_get::<Option<Uuid>, _>("publication_nonce")?
+            .ok_or_else(missing)?,
+        publisher_owner_pod: row
+            .try_get::<Option<String>, _>("publisher_owner_pod")?
+            .ok_or_else(missing)?,
+        publisher_fencing_token: row
+            .try_get::<Option<i64>, _>("publisher_fencing_token")?
+            .ok_or_else(missing)?,
+    })
+}
+
+/// Claim the marker-complete export for hidden-generation publication, or adopt its durable
+/// `publishing` state after a crash. The stable nonce is minted exactly once. The transition is
+/// rejected unless `owner_pod`/`fencing_token` still identify an unexpired table-ownership lease.
+///
+/// # Errors
+///
+/// Returns [`ControlError::ReloadTransition`] when ownership or boundary markers are invalid, or
+/// the underlying typed database/decode error when the atomic claim cannot be read or written.
+pub async fn claim_publication(
+    ex: impl PgExecutor<'_>,
+    epoch: EpochNo,
+    source_schema: &str,
+    source_table: &str,
+    owner_pod: &str,
+    fencing_token: i64,
+) -> Result<Option<ReloadPublication>, ControlError> {
+    let row = sqlx::query(include_str!(
+        "../sql/postgres/queries/claim_reload_publication.sql"
+    ))
+    .bind(epoch.0)
+    .bind(source_schema)
+    .bind(source_table)
+    .bind(owner_pod)
+    .bind(fencing_token)
+    .fetch_one(ex)
+    .await?;
+    let Some(candidate_id) = row.try_get::<Option<i64>, _>("candidate_reload_id")? else {
+        return Ok(None);
+    };
+    let reload_id = ReloadId(candidate_id);
+    if !row.try_get::<bool, _>("ownership_valid")? {
+        return Err(ControlError::ReloadTransition {
+            reload_id,
+            expected: "export_complete/publishing with the current live table-ownership fence",
+        });
+    }
+    if !row.try_get::<bool, _>("boundaries_valid")? {
+        return Err(ControlError::ReloadTransition {
+            reload_id,
+            expected: "export_complete/publishing with exactly matching baseline and end markers",
+        });
+    }
+    let publication = publication_from_row(&row, reload_id)?;
+    if publication.status != ReloadStatus::Publishing {
+        return Err(ControlError::ReloadTransition {
+            reload_id,
+            expected: "publishing",
+        });
+    }
+    Ok(Some(publication))
+}
+
+/// Read a durable `publishing` or `complete` publication receipt by attempt id. This intentionally
+/// does not require current ownership: a successor uses it to reconcile a Duck `published` receipt
+/// after the prior owner's crash.
+///
+/// # Errors
+///
+/// Returns the underlying typed database or decode error when the receipt cannot be read exactly.
+pub async fn read_publication(
+    ex: impl PgExecutor<'_>,
+    reload_id: ReloadId,
+) -> Result<Option<ReloadPublication>, ControlError> {
+    let row = sqlx::query(include_str!(
+        "../sql/postgres/queries/read_reload_publication.sql"
+    ))
+    .bind(reload_id.0)
+    .fetch_optional(ex)
+    .await?;
+    row.as_ref()
+        .map(|row| publication_from_row(row, reload_id))
+        .transpose()
+}
+
+/// Claim the next complete manifest units through this publication's H without consulting the
+/// ordinary reload pause predicate. A protocol-v2 stream group is indivisible: if its first child
+/// fits the file budget, every child is returned (so one large head group may exceed `limit`).
+///
+/// # Errors
+///
+/// Returns a typed database/decode error or [`ControlError::ManifestInvariant`] when a selected
+/// stream group is incomplete or inconsistent.
+pub async fn claim_publication_ready(
+    ex: impl PgExecutor<'_>,
+    publication: &ReloadPublication,
+    owner_pod: &str,
+    fencing_token: i64,
+    limit: i64,
+) -> Result<Vec<crate::manifest::ManifestRow>, ControlError> {
+    let rows = sqlx::query(include_str!(
+        "../sql/postgres/queries/claim_publication_ready.sql"
+    ))
+    .bind(publication.reload_id.0)
+    .bind(publication.publication_nonce)
+    .bind(owner_pod)
+    .bind(fencing_token)
+    .bind(limit)
+    .fetch_all(ex)
+    .await?;
+    let manifests = rows
+        .into_iter()
+        .map(|row| {
+            let kind: String = row.try_get("kind")?;
+            let status: String = row.try_get("status")?;
+            Ok(crate::manifest::ManifestRow {
+                id: common::ManifestId(row.try_get("id")?),
+                epoch: EpochNo(row.try_get("epoch")?),
+                source_schema: row.try_get("source_schema")?,
+                source_table: row.try_get("source_table")?,
+                s3_uri: row.try_get("s3_uri")?,
+                kind: kind.parse()?,
+                row_count: row.try_get("row_count")?,
+                object_size: row.try_get("object_size")?,
+                sha256: row.try_get("sha256")?,
+                lsn_start: row.try_get("lsn_start")?,
+                lsn_end: row.try_get("lsn_end")?,
+                schema_version: SchemaVersionNo(row.try_get("schema_version")?),
+                status: status.parse()?,
+                reload_id: row.try_get::<Option<i64>, _>("reload_id")?.map(ReloadId),
+                stream_group_id: row
+                    .try_get::<Option<i64>, _>("stream_group_id")?
+                    .map(crate::manifest::ManifestGroupId),
+                stream_group_ordinal: row.try_get("stream_group_ordinal")?,
+                stream_commit_ts: row.try_get("stream_commit_ts")?,
+                stream_top_xid: row.try_get("stream_top_xid")?,
+                stream_group_expected_files: row.try_get("stream_group_expected_files")?,
+                stream_group_row_count: row.try_get("stream_group_row_count")?,
+            })
+        })
+        .collect::<Result<Vec<_>, ControlError>>()?;
+    crate::manifest::validate_claimed_groups(&manifests)?;
+    Ok(manifests)
+}
+
+/// Return true only when *no manifest row in any status* remains through H. Failed/corrupt rows
+/// deliberately block publication; an invalid or expired ownership fence is an error, never an
+/// empty-queue answer.
+///
+/// # Errors
+///
+/// Returns [`ControlError::ReloadTransition`] for an invalid publication/ownership fence, or the
+/// underlying typed database error when the pending-row count cannot be read.
+pub async fn publication_drained(
+    ex: impl PgExecutor<'_>,
+    publication: &ReloadPublication,
+    owner_pod: &str,
+    fencing_token: i64,
+) -> Result<bool, ControlError> {
+    let pending = sqlx::query_scalar::<_, i64>(include_str!(
+        "../sql/postgres/queries/publication_pending_through.sql"
+    ))
+    .bind(publication.reload_id.0)
+    .bind(publication.publication_nonce)
+    .bind(owner_pod)
+    .bind(fencing_token)
+    .fetch_optional(ex)
+    .await?;
+    pending
+        .map(|count| count == 0)
+        .ok_or(ControlError::ReloadTransition {
+            reload_id: publication.reload_id,
+            expected: "publishing with the current live table-ownership fence",
+        })
+}
+
+/// Lock and verify the publication plus ownership rows. Call this inside the same control
+/// transaction that retires the appended manifest ids; the row locks prevent either fence from
+/// changing between authorization and deletion.
+///
+/// # Errors
+///
+/// Returns [`ControlError::ReloadTransition`] when the immutable receipt or live ownership fence
+/// differs, or the underlying typed database/decode error when the rows cannot be locked/read.
+pub async fn lock_publication(
+    ex: impl PgExecutor<'_>,
+    publication: &ReloadPublication,
+    owner_pod: &str,
+    fencing_token: i64,
+) -> Result<(), ControlError> {
+    let row = sqlx::query(include_str!(
+        "../sql/postgres/queries/lock_reload_publication.sql"
+    ))
+    .bind(publication.reload_id.0)
+    .bind(publication.publication_nonce)
+    .bind(owner_pod)
+    .bind(fencing_token)
+    .fetch_optional(ex)
+    .await?;
+    let exact = row.is_some_and(|row| {
+        row.try_get::<i64, _>("epoch").ok() == Some(publication.epoch.0)
+            && row.try_get::<String, _>("source_schema").ok().as_deref()
+                == Some(publication.source_schema.as_str())
+            && row.try_get::<String, _>("source_table").ok().as_deref()
+                == Some(publication.source_table.as_str())
+            && row.try_get::<Lsn, _>("start_lsn").ok() == Some(publication.start_lsn)
+            && row.try_get::<Lsn, _>("final_lsn").ok() == Some(publication.final_lsn)
+            && row.try_get::<i64, _>("schema_version").ok() == Some(publication.schema_version.0)
+            && row.try_get::<Uuid, _>("publication_nonce").ok()
+                == Some(publication.publication_nonce)
+            && row
+                .try_get::<String, _>("publisher_owner_pod")
+                .ok()
+                .as_deref()
+                == Some(publication.publisher_owner_pod.as_str())
+            && row.try_get::<i64, _>("publisher_fencing_token").ok()
+                == Some(publication.publisher_fencing_token)
+    });
+    if !exact {
+        return Err(ControlError::ReloadTransition {
+            reload_id: publication.reload_id,
+            expected: "the exact immutable publishing receipt with the current live ownership fence",
+        });
+    }
+    Ok(())
+}
+
+/// After the Duck shadow is durably `published`, atomically set both canonical checkpoints to H
+/// and transition `publishing → complete`. A retry after an ambiguous commit succeeds only when an
+/// exact complete receipt and exact-H checkpoints already exist.
+///
+/// # Errors
+///
+/// Returns [`ControlError::ReloadTransition`] when neither the fenced transition nor its exact
+/// committed replay is valid, or the underlying typed database/decode error.
+pub async fn finish_publication(
+    ex: impl PgExecutor<'_>,
+    publication: &ReloadPublication,
+    owner_pod: &str,
+    fencing_token: i64,
+) -> Result<bool, ControlError> {
+    let row = sqlx::query(include_str!(
+        "../sql/postgres/queries/finish_reload_publication.sql"
+    ))
+    .bind(publication.reload_id.0)
+    .bind(publication.publication_nonce)
+    .bind(owner_pod)
+    .bind(fencing_token)
+    .fetch_one(ex)
+    .await?;
+    let transitioned: bool = row.try_get("transitioned")?;
+    let already_complete: bool = row.try_get("already_complete")?;
+    if !transitioned && !already_complete {
+        return Err(ControlError::ReloadTransition {
+            reload_id: publication.reload_id,
+            expected: "published Duck receipt with publishing ownership and canonical checkpoint not past H",
+        });
+    }
+    Ok(transitioned)
 }
 
 #[cfg(test)]

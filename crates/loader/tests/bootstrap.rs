@@ -103,10 +103,8 @@ async fn seed(pool: &sqlx::PgPool, epoch: EpochNo) {
         "schema_registry",
         "replication_state",
     ] {
-        let _ = sqlx::query(&format!("DELETE FROM walrus.{tbl} WHERE epoch = $1"))
-            .bind(epoch)
-            .execute(pool)
-            .await;
+        let sql = cleanup_sql(tbl);
+        let _ = sqlx::query(&sql).bind(epoch).execute(pool).await;
     }
     control::insert_epoch(
         pool,
@@ -133,6 +131,16 @@ async fn seed(pool: &sqlx::PgPool, epoch: EpochNo) {
     )
     .await
     .unwrap();
+}
+
+fn cleanup_sql(table: &str) -> String {
+    if table == "file_manifest" {
+        format!(
+            "WITH authorized AS MATERIALIZED (SELECT set_config('walrus.manifest_delete_protocol','2',true) AS protocol) DELETE FROM walrus.{table} WHERE epoch = $1 AND (SELECT protocol = '2' FROM authorized)"
+        )
+    } else {
+        format!("DELETE FROM walrus.{table} WHERE epoch = $1")
+    }
 }
 
 async fn next_epoch(pool: &sqlx::PgPool) -> EpochNo {
@@ -257,9 +265,16 @@ async fn catalog_fence_blocks_a_successor_even_if_the_control_lease_is_released(
     )
     .await
     .unwrap();
-    control::release_lease(&pool, epoch, "public", "orders", "loader-a")
-        .await
-        .unwrap();
+    control::release_lease(
+        &pool,
+        epoch,
+        "public",
+        "orders",
+        "loader-a",
+        owned_a.tables[0].fencing_token,
+    )
+    .await
+    .unwrap();
 
     let error = bootstrap(
         &cfg("loader-b", Duration::from_secs(30)),

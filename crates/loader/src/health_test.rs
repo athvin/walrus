@@ -112,3 +112,48 @@ fn quarantine_degrades_ready_but_not_startup() {
     assert!(!s.is_quarantined(), "the rebuild clears the latch");
     assert!(s.is_ready(), "/ready recovers after the rebuild");
 }
+
+#[test]
+fn repairing_one_table_does_not_clear_another_tables_quarantine() {
+    let s = LoaderState::new();
+    s.mark_ready();
+    s.quarantine_table("public", "accounts");
+    s.quarantine_table("public", "orders");
+    s.quarantine_table("public", "orders");
+
+    s.clear_table_quarantine("public", "accounts");
+    assert!(s.is_quarantined());
+    assert!(!s.is_ready());
+
+    s.clear_table_quarantine("public", "orders");
+    assert!(!s.is_quarantined());
+    assert!(s.is_ready());
+}
+
+#[test]
+fn quoted_names_with_dots_are_distinct_quarantine_keys() {
+    let s = LoaderState::new();
+    s.mark_ready();
+    s.quarantine_table("a.b", "c");
+    s.quarantine_table("a", "b.c");
+
+    s.clear_table_quarantine("a.b", "c");
+    assert!(s.is_quarantined());
+
+    s.clear_table_quarantine("a", "b.c");
+    assert!(!s.is_quarantined());
+}
+
+#[test]
+fn bootstrap_ready_transition_cannot_override_a_durable_table_quarantine() {
+    let s = LoaderState::new();
+    s.quarantine_table("public", "orders");
+
+    s.mark_ready();
+    assert!(s.is_started());
+    assert!(s.is_quarantined());
+    assert!(!s.is_ready());
+
+    s.clear_table_quarantine("public", "orders");
+    assert!(s.is_ready());
+}

@@ -28,6 +28,9 @@ pub enum DecodeError {
     /// A Relation message carried a `relreplident` byte outside the documented set.
     #[error("invalid replica identity byte {byte:#04x}")]
     BadReplicaIdentity { byte: u8 },
+    /// A Stream Start first-segment flag must be encoded as the exact protocol byte `0` or `1`.
+    #[error("invalid Stream Start first-segment flag byte {byte:#04x}")]
+    BadStreamStartFlag { byte: u8 },
     /// A `String` field was not valid UTF-8. pgoutput strings are always text, so this is corruption
     /// rather than a supported encoding.
     #[error("invalid UTF-8 in String field")]

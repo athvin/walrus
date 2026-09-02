@@ -47,7 +47,7 @@ fn subscribe_then_resolve_delivers_commit_lsn() {
     // Buffered at Insert, resolved at Commit — the receiver gets the COMMIT LSN, not the
     // insert's message/frame LSN.
     let mut pending = PendingSignals::default();
-    let sig = PendingSignal::from_tuple(&signal_rel(), &tuple("42", "1", "0/100"), None)
+    let sig = PendingSignal::from_tuple(&signal_rel(), &tuple("42", "1", "0/100"), None, None)
         .expect("well-formed tuple");
     pending.push(sig);
     pending.on_commit(lsn("0/180"), &waiters);
@@ -211,7 +211,7 @@ fn non_insert_ops_on_signal_table_are_ignored() {
     ];
     // The error names the column that failed, so the consume loop's warning says which one drifted.
     assert_eq!(
-        PendingSignal::from_tuple(&rel, &delete_old_key, None),
+        PendingSignal::from_tuple(&rel, &delete_old_key, None, None),
         Err(SignalTupleError("wal_insert_lsn"))
     );
 }
@@ -222,13 +222,13 @@ fn non_insert_ops_on_signal_table_are_ignored() {
 #[test]
 fn reload_id_column_parses_as_the_typed_id_or_names_itself() {
     let rel = signal_rel();
-    let parsed = PendingSignal::from_tuple(&rel, &tuple("990042", "1", "0/100"), None)
+    let parsed = PendingSignal::from_tuple(&rel, &tuple("990042", "1", "0/100"), None, None)
         .expect("well-formed tuple");
     assert_eq!(parsed.reload_id, reload(990_042));
 
     for bad in ["", "nine", "9223372036854775808"] {
         assert_eq!(
-            PendingSignal::from_tuple(&rel, &tuple(bad, "1", "0/100"), None),
+            PendingSignal::from_tuple(&rel, &tuple(bad, "1", "0/100"), None, None),
             Err(SignalTupleError("reload_id")),
             "reload_id {bad:?}"
         );
@@ -246,14 +246,16 @@ fn subtransaction_aborted_signal_never_resolves_the_waiter() {
 
     let mut pending = PendingSignals::default();
     let rel = signal_rel();
-    let aborted = PendingSignal::from_tuple(&rel, &tuple("9", "1", "0/100"), Some(858)).unwrap();
-    let survivor = PendingSignal::from_tuple(&rel, &tuple("9", "2", "0/110"), Some(859)).unwrap();
+    let aborted =
+        PendingSignal::from_tuple(&rel, &tuple("9", "1", "0/100"), Some(858), Some(857)).unwrap();
+    let survivor =
+        PendingSignal::from_tuple(&rel, &tuple("9", "2", "0/110"), Some(859), Some(857)).unwrap();
     pending.push(aborted);
     pending.push(survivor);
 
     // The savepoint (sub 858 of top 857) rolls back; the top-level txn later commits.
     pending.on_stream_abort(857, 858);
-    pending.on_stream_commit(lsn("0/200"), &waiters);
+    pending.on_stream_commit(857, lsn("0/200"), &waiters);
 
     assert!(
         rx_aborted.try_recv().is_err(),
@@ -269,12 +271,51 @@ fn whole_txn_stream_abort_drops_every_buffered_signal() {
     let mut rx = waiters.subscribe(reload(9), 1);
     let mut pending = PendingSignals::default();
     pending.push(
-        PendingSignal::from_tuple(&signal_rel(), &tuple("9", "1", "0/100"), Some(866)).unwrap(),
+        PendingSignal::from_tuple(
+            &signal_rel(),
+            &tuple("9", "1", "0/100"),
+            Some(866),
+            Some(866),
+        )
+        .unwrap(),
     );
     pending.on_stream_abort(866, 866); // sub == top ⇒ whole-txn abort
     assert!(pending.is_empty());
-    pending.on_stream_commit(lsn("0/200"), &waiters); // nothing left to resolve
+    pending.on_stream_commit(866, lsn("0/200"), &waiters); // nothing left to resolve
     assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn streamed_commit_and_abort_are_isolated_by_top_xid() {
+    let waiters = WatermarkWaiters::default();
+    let mut top_a_rx = waiters.subscribe(reload(9), 1);
+    let mut top_b_rx = waiters.subscribe(reload(9), 2);
+    let rel = signal_rel();
+    let mut pending = PendingSignals::default();
+    pending.push(
+        PendingSignal::from_tuple(&rel, &tuple("9", "1", "0/100"), Some(858), Some(857)).unwrap(),
+    );
+    pending.push(
+        PendingSignal::from_tuple(&rel, &tuple("9", "2", "0/110"), Some(868), Some(867)).unwrap(),
+    );
+
+    pending.on_stream_abort(857, 857);
+    pending.on_stream_commit(867, lsn("0/220"), &waiters);
+
+    assert!(top_a_rx.try_recv().is_err());
+    assert_eq!(
+        top_b_rx.try_recv().expect("other top survives").commit_lsn,
+        lsn("0/220")
+    );
+    assert!(pending.is_empty());
+}
+
+#[test]
+fn tuple_rejects_half_streamed_scope() {
+    assert_eq!(
+        PendingSignal::from_tuple(&signal_rel(), &tuple("9", "1", "0/100"), Some(858), None,),
+        Err(SignalTupleError("xid/top_xid"))
+    );
 }
 
 #[test]

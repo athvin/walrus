@@ -47,6 +47,12 @@ pub enum LoaderError {
         #[source]
         source: Box<object_store::Error>,
     },
+    /// Bytes downloaded for a manifest did not match the control-plane immutable-object receipt.
+    #[error("staged object integrity failure for {uri}: {reason}")]
+    ObjectIntegrity { uri: String, reason: String },
+    /// A manifest unit or durable ingest receipt violated an atomicity/idempotency invariant.
+    #[error("manifest invariant: {message}")]
+    ManifestInvariant { message: String },
     /// A *live* owner already holds the lease — a second writer must NOT proceed.
     #[error("lease for {table} is held by a live owner ({owner})")]
     LeaseContended { table: String, owner: String },
@@ -141,6 +147,12 @@ impl From<&LoaderError> for common::Error {
             LoaderError::ObjectStore { op, source } => {
                 common::Error::ObjectStore(format!("{op}: {source}"))
             }
+            LoaderError::ObjectIntegrity { uri, reason } => common::Error::Internal(format!(
+                "staged object integrity failure for {uri}: {reason}"
+            )),
+            LoaderError::ManifestInvariant { message } => {
+                common::Error::Internal(format!("manifest invariant: {message}"))
+            }
             LoaderError::LeaseContended { table, owner } => {
                 common::Error::LeaseContended(format!("{table} held by {owner}"))
             }
@@ -191,6 +203,8 @@ impl FailureClass for LoaderError {
             | LoaderError::Duck { .. }
             | LoaderError::Catalog { .. }
             | LoaderError::ObjectStore { .. }
+            | LoaderError::ObjectIntegrity { .. }
+            | LoaderError::ManifestInvariant { .. }
             | LoaderError::LeaseContended { .. }
             | LoaderError::CorruptCheckpoint { .. }
             | LoaderError::Quarantine { .. }

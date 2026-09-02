@@ -80,7 +80,7 @@ pub async fn drain<C: Clock + Clone>(
 ) -> anyhow::Result<DrainOutcome> {
     // (2) Seal + flush the committed batches; open speculative buffers are dropped (they re-stream).
     let sealed = router
-        .drain_committed()
+        .drain_for_shutdown()
         .context("seal committed batches on drain")?;
     let mut drained_any = false;
     let mut max_durable = None;

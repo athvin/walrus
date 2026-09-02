@@ -443,7 +443,11 @@ fn parse_one(reader: &mut Reader<'_>, ctx: &mut StreamCtx) -> Result<Message, De
         }
         b'S' => {
             let start_xid = reader.int32()?;
-            let first_segment = reader.byte1()? != 0;
+            let first_segment = match reader.byte1()? {
+                0 => false,
+                1 => true,
+                byte => return Err(DecodeError::BadStreamStartFlag { byte }),
+            };
             ctx.in_stream = true; // opens the streamed block — the next change reads a sub-xid prefix
             Ok(Message::StreamStart {
                 xid: start_xid,

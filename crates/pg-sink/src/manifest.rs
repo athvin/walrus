@@ -47,7 +47,8 @@ pub async fn record_ready_with_reload(
 }
 
 /// `WrittenObject` → the `ready` row (`kind` from the object, `lsn_end` = commit LSN).
-fn to_ready_row(
+#[must_use]
+pub(crate) fn to_ready_row(
     epoch: EpochNo,
     obj: &WrittenObject,
     reload_id: Option<ReloadId>,
@@ -59,6 +60,8 @@ fn to_ready_row(
         s3_uri: obj.s3_uri.clone(),
         kind: obj.kind,
         row_count: i64::try_from(obj.row_count).unwrap_or(i64::MAX),
+        object_size: i64::try_from(obj.object_size).unwrap_or(i64::MAX),
+        sha256: obj.sha256.to_vec(),
         lsn_start: obj.lsn_start,
         lsn_end: obj.lsn_end,
         schema_version: obj.schema_version,
