@@ -282,6 +282,41 @@ impl<C: Clock> TableBatcher<C> {
         self.pending.push((meta, values.into()));
     }
 
+    /// Append a row whose commit metadata is already final directly to the Arrow builder.
+    ///
+    /// Reload COPY rows are synthesized behind a durable fence, so their `commit_lsn` and
+    /// `commit_ts` are known before conversion. Sending them through the ordinary open-transaction
+    /// `pending` buffer would retain a second owned copy of every value until `on_commit`; this path
+    /// makes them immediately flush-eligible and keeps the reload worker at router-sized memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BatchError::Arrow`] if a value or its provenance cannot be appended to the
+    /// relation's Arrow builders.
+    pub fn push_committed(
+        &mut self,
+        mut meta: SinkMeta,
+        values: &[TupleValue],
+    ) -> Result<(), BatchError> {
+        let batch_id = self.batch_id.get_or_insert_with(|| {
+            format!("{}.{}-{}", meta.source_schema, meta.source_table, meta.lsn)
+        });
+        meta.batch_id.clone_from(batch_id);
+
+        let mut unchanged_toast = Vec::new();
+        for (column, value) in self.rel.relation.columns.iter().zip(values) {
+            if matches!(value, TupleValue::UnchangedToast) {
+                unchanged_toast.push(column.name.clone());
+            }
+        }
+        meta.unchanged_toast = unchanged_toast.into_boxed_slice();
+
+        self.builder.append_row(values, &meta)?;
+        self.committed.record_row(meta.commit_lsn, self.clock.now());
+        self.committed.add_bytes(estimate_row_bytes(values));
+        Ok(())
+    }
+
     /// Whether an open transaction's rows are buffered (not a commit boundary).
     #[must_use]
     pub const fn has_open_txn(&self) -> bool {

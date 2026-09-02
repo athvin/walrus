@@ -94,6 +94,32 @@ pub async fn read_pending_ddl(
     rows.into_iter().map(decode_ddl_row).collect()
 }
 
+/// Highest structural schema version whose source transaction committed no later than
+/// `through_lsn`. Reload end-fence validation uses this boundary-aware read so DDL committed after
+/// an already-durable H cannot invalidate the completed F..H snapshot.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if control Postgres cannot execute or decode the query.
+pub async fn read_latest_ddl_version_through(
+    ex: impl PgExecutor<'_>,
+    epoch: EpochNo,
+    schema: &str,
+    table: &str,
+    through_lsn: Lsn,
+) -> Result<Option<SchemaVersionNo>, ControlError> {
+    let version = sqlx::query_scalar::<_, Option<i64>>(include_str!(
+        "../sql/postgres/queries/read_latest_ddl_version_through.sql"
+    ))
+    .bind(epoch.0)
+    .bind(schema)
+    .bind(table)
+    .bind(through_lsn)
+    .fetch_one(ex)
+    .await?;
+    Ok(version.map(SchemaVersionNo))
+}
+
 /// Read the epoch's complete DDL history. The sink hydrates source audit identities and committed
 /// schema versions from this on restart so replay is idempotent before the first repeated event arrives.
 ///

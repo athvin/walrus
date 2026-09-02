@@ -29,6 +29,11 @@ const DUCKLAKE_DATA: &str = "s3://walrus/ducklake/e2e/";
 const S3_ENDPOINT: &str = "http://localhost:9000";
 const BUCKET: &str = "walrus";
 const SLOT: &str = "walrus_e2e_slot";
+/// Most E2Es intentionally keep this tiny so their large open transactions exercise WAL spilling.
+const DEFAULT_E2E_MAX_INFLIGHT_BYTES: u64 = 64 * 1024;
+/// Reload-scale E2Es need room for their explicitly configured parallel COPY routes. This is the
+/// existing process-wide memory safety ceiling, not a fourth reload extraction control.
+const PARALLEL_RELOAD_E2E_MAX_INFLIGHT_BYTES: u64 = 512 * 1024 * 1024;
 const TABLE_NAMESPACE: uuid::Uuid =
     uuid::Uuid::from_u128(0x4f02_efc2_39b3_4d9d_a860_22af_7291_8cc8);
 /// The MinIO container name (`<compose project>-<service>-1`) — `docker pause`d to stall the sink's S3
@@ -49,14 +54,86 @@ pub struct Harness {
     sink_log: PathBuf,
     /// The `target/<profile>/` dir the binaries live in — kept so a crashed child can be respawned.
     bins: PathBuf,
+    /// User-facing reload extraction limits supplied to every sink process, including restarts.
+    reload_extraction: ReloadExtractionConfig,
+    /// Process-wide memory ceiling supplied to every sink process, including restarts.
+    max_inflight_bytes: u64,
     /// The epoch the sink established (always 1 after the clean reset).
     pub epoch: i64,
+}
+
+/// The three independent extraction controls exposed by the sink. Tests carry these explicitly so
+/// a restart cannot silently fall back to different table, worker, or object-size limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReloadExtractionConfig {
+    /// Maximum tables whose snapshot exports may overlap.
+    pub max_concurrent_reloads: u64,
+    /// Maximum COPY streams sharing one table's exported snapshot.
+    pub reload_workers_per_table: u64,
+    /// Records written to each completed remote object (apart from worker tails).
+    pub reload_chunk_rows: u64,
+}
+
+impl Default for ReloadExtractionConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_reloads: 2,
+            reload_workers_per_table: 4,
+            reload_chunk_rows: 10_000,
+        }
+    }
 }
 
 impl Harness {
     /// Reset control + source to a clean slate, then bring up both binaries and block until each reports
     /// `/ready`. Fails fast if either bootstrap errors.
     pub async fn start() -> Result<Self> {
+        Self::start_inner(
+            ReloadExtractionConfig::default(),
+            None,
+            DEFAULT_E2E_MAX_INFLIGHT_BYTES,
+        )
+        .await
+    }
+
+    /// Start the stack with explicit values for all three user-facing reload extraction controls.
+    pub async fn start_with_reload_extraction(
+        reload_extraction: ReloadExtractionConfig,
+    ) -> Result<Self> {
+        Self::start_inner(
+            reload_extraction,
+            None,
+            PARALLEL_RELOAD_E2E_MAX_INFLIGHT_BYTES,
+        )
+        .await
+    }
+
+    /// Start with rows committed before the slot and first reconciliation attempt exist. This is
+    /// the black-box path for proving that non-empty first startup uses the same extraction engine
+    /// and limits as a later repair.
+    pub async fn start_with_reload_extraction_and_source_seed(
+        reload_extraction: ReloadExtractionConfig,
+        source_seed: Option<&str>,
+    ) -> Result<Self> {
+        Self::start_inner(
+            reload_extraction,
+            source_seed,
+            PARALLEL_RELOAD_E2E_MAX_INFLIGHT_BYTES,
+        )
+        .await
+    }
+
+    async fn start_inner(
+        reload_extraction: ReloadExtractionConfig,
+        source_seed: Option<&str>,
+        max_inflight_bytes: u64,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            reload_extraction.max_concurrent_reloads > 0
+                && reload_extraction.reload_workers_per_table > 0
+                && reload_extraction.reload_chunk_rows > 0,
+            "reload extraction controls must all be non-zero"
+        );
         let control = control::connect(CONTROL_URL)
             .await
             .context("connect control PG")?;
@@ -155,6 +232,12 @@ impl Harness {
         .execute(&source)
         .await
         .context("reset source tables + slot")?;
+        if let Some(source_seed) = source_seed {
+            sqlx::raw_sql(source_seed)
+                .execute(&source)
+                .await
+                .context("seed source before first reconciliation")?;
+        }
 
         let bins = target_dir()?;
         build_bins(&bins).await?;
@@ -172,7 +255,7 @@ impl Harness {
         std::fs::create_dir_all(&runtime_dir)?;
         let sink_log = runtime_dir.join("sink.log");
 
-        let sink = spawn_sink(&bins, &sink_log)?;
+        let sink = spawn_sink(&bins, &sink_log, reload_extraction, max_inflight_bytes)?;
         wait_ready("http://127.0.0.1:8130", Duration::from_secs(45))
             .await
             .context("sink /ready")?;
@@ -189,6 +272,8 @@ impl Harness {
             runtime_dir,
             sink_log,
             bins,
+            reload_extraction,
+            max_inflight_bytes,
             epoch: 1,
         })
     }
@@ -392,7 +477,12 @@ impl Harness {
                     .context("reap stale sink before restart")?;
             }
         }
-        self.sink = spawn_sink(&self.bins, &self.sink_log)?;
+        self.sink = spawn_sink(
+            &self.bins,
+            &self.sink_log,
+            self.reload_extraction,
+            self.max_inflight_bytes,
+        )?;
         wait_ready("http://127.0.0.1:8130", Duration::from_secs(45))
             .await
             .context("sink /ready after restart")
@@ -851,7 +941,12 @@ fn ducklake_reader(table: &str) -> Result<duckdb::Connection> {
     Ok(conn)
 }
 
-fn spawn_sink(bins: &std::path::Path, log: &std::path::Path) -> Result<Child> {
+fn spawn_sink(
+    bins: &std::path::Path,
+    log: &std::path::Path,
+    reload_extraction: ReloadExtractionConfig,
+    max_inflight_bytes: u64,
+) -> Result<Child> {
     // The sink's `tracing` fmt layer writes to STDOUT (its spill/durability events live there); config
     // errors + panics go to STDERR. Capture BOTH into `sink.log` (two handles onto one file) so
     // [`Harness::sink_spill_count`] can scrape the spill events AND a startup failure is still visible.
@@ -870,11 +965,23 @@ fn spawn_sink(bins: &std::path::Path, log: &std::path::Path) -> Result<Child> {
         .env("WALRUS_MANAGE_PUBLICATION", "false")
         .env("WALRUS_MAX_FILL", "1s")
         .env("WALRUS_MAX_ROWS", "100000")
-        // A LOW aggregate ceiling (64 KiB) so a few thousand rows in one open txn spill —
-        // bounding memory — instead of buffering the whole txn. `max_bytes` (per-batch) must stay ≤ the
-        // ceiling (the sink validates `max_inflight_bytes >= max_bytes`).
+        // Ordinary E2Es use a 64-KiB aggregate ceiling so a few thousand rows in one open txn spill.
+        // Explicit reload-scale E2Es use an ample ceiling so their configured COPY routes can overlap.
+        // `max_bytes` (per-batch) must stay ≤ the aggregate ceiling.
         .env("WALRUS_MAX_BYTES", "32768")
-        .env("WALRUS_MAX_INFLIGHT_BYTES", "65536")
+        .env("WALRUS_MAX_INFLIGHT_BYTES", max_inflight_bytes.to_string())
+        .env(
+            "WALRUS_MAX_CONCURRENT_RELOADS",
+            reload_extraction.max_concurrent_reloads.to_string(),
+        )
+        .env(
+            "WALRUS_RELOAD_WORKERS_PER_TABLE",
+            reload_extraction.reload_workers_per_table.to_string(),
+        )
+        .env(
+            "WALRUS_RELOAD_CHUNK_ROWS",
+            reload_extraction.reload_chunk_rows.to_string(),
+        )
         .env("WALRUS_HEARTBEAT_IDLE_AFTER", "1s")
         .env("WALRUS_STARTUP_DEADLINE", "30s")
         .env("WALRUS_HEALTH_ADDR", "127.0.0.1:8130")

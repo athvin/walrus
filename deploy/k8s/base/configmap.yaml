@@ -26,11 +26,12 @@ data:
   WALRUS_HEARTBEAT_IDLE_AFTER: "10s"          # beat only after the publication is idle this long
   WALRUS_HEARTBEAT_ROUNDTRIP_DEADLINE: "30s"  # un-returned beat past this marks the sink degraded
   # --- fenced table reconciliation ---
-  # Each active table export owns one source REPEATABLE READ transaction across all of its chunks.
-  # Concurrency therefore caps simultaneous source snapshots; chunk_rows bounds each SELECT and its
-  # memory/file size, not the lifetime of that whole-table transaction.
-  WALRUS_MAX_CONCURRENT_RELOADS: "2"
-  WALRUS_RELOAD_CHUNK_ROWS: "10000"
+  # Each active table owns one exported REPEATABLE READ snapshot shared by ordinary SQL COPY workers.
+  # COPY and multipart upload are backpressured, so chunk_rows controls remote file row count rather
+  # than buffering an entire chunk in memory.
+  WALRUS_MAX_CONCURRENT_RELOADS: "2"     # tables exported concurrently
+  WALRUS_RELOAD_WORKERS_PER_TABLE: "4"  # COPY streams per table; 1 disables CTID fan-out
+  WALRUS_RELOAD_CHUNK_ROWS: "10000"     # records per remote object produced by each worker
   WALRUS_RELOAD_LEASE_TTL: "60s"       # renewed at TTL/3; validated at >=15s
   WALRUS_RELOAD_ECHO_TIMEOUT: "30s"    # fail loudly when an F/H event never returns through WAL
   WALRUS_RELOAD_MAX_RESTARTS: "3"      # bounded fresh attempts after DDL or lost snapshot ownership

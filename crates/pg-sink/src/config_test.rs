@@ -183,6 +183,7 @@ fn defaults_are_the_shipped_contract() {
     assert_eq!(cfg.startup_deadline, Duration::from_secs(60));
     assert_eq!(cfg.health_addr, SocketAddr::from(([0, 0, 0, 0], 8080)));
     assert_eq!(cfg.max_concurrent_reloads.get(), 2);
+    assert_eq!(cfg.reload_workers_per_table.get(), 4);
     assert_eq!(cfg.reload_lease_ttl, Duration::from_secs(60));
     assert_eq!(cfg.reload_chunk_rows.get(), 10_000);
     assert_eq!(cfg.reload_echo_timeout, Duration::from_secs(30));
@@ -388,12 +389,55 @@ fn worker_threads_above_the_ceiling_is_rejected_as_terminal_config() {
 fn zero_thresholds_are_rejected_during_deserialization() {
     use figment::providers::{Format, Toml};
 
-    for source in ["max_rows = 0", "max_concurrent_reloads = 0"] {
+    for source in [
+        "max_rows = 0",
+        "max_concurrent_reloads = 0",
+        "reload_workers_per_table = 0",
+        "reload_chunk_rows = 0",
+    ] {
         let result = figment::Figment::new()
             .merge(Toml::string(source))
             .extract::<SinkConfig>();
         assert!(result.is_err(), "zero parsed successfully from {source:?}");
     }
+}
+
+#[test]
+fn reload_table_worker_product_must_fit_the_connection_count() {
+    let mut cfg = valid();
+    let factor = nz(1_u64 << (usize::BITS / 2));
+    cfg.max_concurrent_reloads = factor;
+    cfg.reload_workers_per_table = factor;
+
+    let err = cfg.validate().unwrap_err();
+    assert!(matches!(
+        err,
+        ConfigError::OutOfBounds {
+            field: "reload_workers_per_table",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn reload_table_limit_cannot_panic_the_runtime_semaphore() {
+    let Some(too_many) = tokio::sync::Semaphore::MAX_PERMITS.checked_add(1) else {
+        return;
+    };
+    let Ok(too_many) = u64::try_from(too_many) else {
+        return;
+    };
+    let mut cfg = valid();
+    cfg.max_concurrent_reloads = nz(too_many);
+
+    let err = cfg.validate().unwrap_err();
+    assert!(matches!(
+        err,
+        ConfigError::OutOfBounds {
+            field: "max_concurrent_reloads",
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -446,6 +490,9 @@ fn numeric_wire_names_and_shapes_are_unchanged() {
             ("WALRUS_SLOT_NAME", "walrus_slot"),
             ("WALRUS_PUBLICATION_NAME", "walrus_pub"),
             ("WALRUS_MAX_ROWS", "250000"),
+            ("WALRUS_MAX_CONCURRENT_RELOADS", "3"),
+            ("WALRUS_RELOAD_WORKERS_PER_TABLE", "7"),
+            ("WALRUS_RELOAD_CHUNK_ROWS", "2048"),
             ("WALRUS_BACKPRESSURE_ACTIVATE_RATIO", "0.9"),
         ] {
             jail.set_env(key, value);
@@ -453,6 +500,9 @@ fn numeric_wire_names_and_shapes_are_unchanged() {
 
         let cfg = SinkConfig::load().expect("bare numeric environment values should parse");
         assert_eq!(cfg.max_rows.get(), 250_000);
+        assert_eq!(cfg.max_concurrent_reloads.get(), 3);
+        assert_eq!(cfg.reload_workers_per_table.get(), 7);
+        assert_eq!(cfg.reload_chunk_rows.get(), 2_048);
         assert_approx_eq(cfg.backpressure_activate_ratio.as_f64(), 0.9);
     });
 }

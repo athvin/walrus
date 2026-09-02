@@ -18,7 +18,10 @@ pub fn code_for(err: &anyhow::Error) -> ExitCode {
     }
     if let Some(e) = err.downcast_ref::<crate::sink::SinkError>() {
         return match e {
-            crate::sink::SinkError::Encode(_) => ExitCode::Internal,
+            crate::sink::SinkError::Encode(_)
+            | crate::sink::SinkError::SchemaMismatch
+            | crate::sink::SinkError::EmptyStream
+            | crate::sink::SinkError::ClosedStream => ExitCode::Internal,
             crate::sink::SinkError::Store(_) => ExitCode::ObjectStore,
         };
     }
@@ -38,6 +41,7 @@ pub fn code_for(err: &anyhow::Error) -> ExitCode {
             crate::preflight::PreflightError::WalLevel { .. }
             | crate::preflight::PreflightError::ServerTooOld { .. }
             | crate::preflight::PreflightError::NoHeadroom { .. }
+            | crate::preflight::PreflightError::SlotNameDrift { .. }
             | crate::preflight::PreflightError::PublicationMissing { .. }
             | crate::preflight::PreflightError::PublicationGap { .. }
             | crate::preflight::PreflightError::PublicationCoverage(_)

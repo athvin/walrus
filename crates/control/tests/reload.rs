@@ -19,6 +19,8 @@ use control::reload::{
 use control::{ControlError, NewManifestFile, claim_ready, connect, insert_ready, run_migrations};
 use sqlx::Connection;
 use sqlx::postgres::{PgConnection, PgPool};
+use std::fmt::Write as _;
+use std::time::Duration;
 use uuid::Uuid;
 
 fn control_dsn() -> String {
@@ -85,6 +87,205 @@ async fn finish_fenced(conn: &mut PgConnection, reload_id: ReloadId, h: Lsn) {
         .await
         .unwrap();
     reload::complete_export(&mut *conn, reload_id, h)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn parallel_file_progress_is_atomic_out_of_order_and_mode_safe() {
+    const FILES: i64 = 8;
+    let pool = pool().await;
+    // This test needs independent committed transactions to exercise concurrent row locking. A
+    // random positive epoch keeps parallel/rerun debris isolated; all owned rows are removed below.
+    let epoch_bytes: [u8; 8] = Uuid::new_v4().as_bytes()[..8].try_into().unwrap();
+    let epoch = EpochNo(i64::from_be_bytes(epoch_bytes) & i64::MAX);
+    let id = reload::request(
+        &pool,
+        epoch,
+        "public",
+        "parallel_files",
+        ReloadFlavor::Reload,
+    )
+    .await
+    .unwrap();
+    let claimed = reload::claim_requested(&pool, epoch, "sink-a", 60, 1)
+        .await
+        .unwrap();
+    let request_id = claimed[0].parent_request_id.unwrap();
+    let f: Lsn = "0/100".parse().unwrap();
+    let schema_version = SchemaVersionNo(1);
+    reload::record_start_fence(
+        &pool,
+        id,
+        f,
+        ReloadFenceIdentity {
+            request_id: Some(request_id),
+            source_schema: "public",
+            source_table: "parallel_files",
+            schema_version,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Model workers completing physical ranges in reverse order. Every worker commits its manifest
+    // and the shared file counter together, while Postgres assigns a unique count under the row lock.
+    let mut workers = Vec::new();
+    for worker in 0..FILES {
+        let pool = pool.clone();
+        workers.push(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(
+                u64::try_from(FILES - worker).unwrap(),
+            ))
+            .await;
+            let mut tx = pool.begin().await.unwrap();
+            let mut file = chunk_file(epoch, "parallel_files", id, "0/100");
+            write!(file.s3_uri, "-{worker}").unwrap();
+            insert_ready(&mut *tx, &file).await.unwrap();
+            let assigned = reload::record_exported_file(&mut *tx, id, f, schema_version)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            assigned
+        }));
+    }
+    let mut assigned = Vec::new();
+    for worker in workers {
+        assigned.push(worker.await.unwrap());
+    }
+    assigned.sort_unstable();
+    assert_eq!(assigned, (1..=FILES).collect::<Vec<_>>());
+
+    let row = reload::get(&pool, id).await.unwrap().unwrap();
+    assert_eq!(row.chunk_no, FILES);
+    assert_eq!(
+        row.cursor_pk, None,
+        "parallel progress never creates a PK cursor"
+    );
+    assert_eq!(row.first_lsn, Some(f));
+    let manifests: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM walrus.file_manifest WHERE reload_id = $1")
+            .bind(id.0)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(manifests, FILES);
+
+    for (wrong_f, wrong_schema) in [
+        ("0/200".parse().unwrap(), schema_version),
+        (f, SchemaVersionNo(2)),
+    ] {
+        let err = reload::record_exported_file(&pool, id, wrong_f, wrong_schema)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ControlError::ReloadTransition { .. }));
+    }
+    assert_eq!(
+        reload::get(&pool, id).await.unwrap().unwrap().chunk_no,
+        FILES
+    );
+
+    // A manifest and counter advance rolled back together leave neither half visible.
+    let mut rolled_back = pool.begin().await.unwrap();
+    let mut file = chunk_file(epoch, "parallel_files", id, "0/100");
+    file.s3_uri.push_str("-rollback");
+    insert_ready(&mut *rolled_back, &file).await.unwrap();
+    assert_eq!(
+        reload::record_exported_file(&mut *rolled_back, id, f, schema_version)
+            .await
+            .unwrap(),
+        FILES + 1
+    );
+    rolled_back.rollback().await.unwrap();
+    assert_eq!(
+        reload::get(&pool, id).await.unwrap().unwrap().chunk_no,
+        FILES
+    );
+    let manifests_after_rollback: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM walrus.file_manifest WHERE reload_id = $1")
+            .bind(id.0)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(manifests_after_rollback, FILES);
+
+    // Neither rolling direction may combine legacy keyset progress with file-count progress.
+    let err = reload::advance_cursor(
+        &pool,
+        id,
+        FILES + 1,
+        &serde_json::json!([42]),
+        f,
+        schema_version,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, ControlError::ReloadTransition { .. }));
+
+    let legacy_id = reload::request(
+        &pool,
+        epoch,
+        "public",
+        "legacy_cursor",
+        ReloadFlavor::Reload,
+    )
+    .await
+    .unwrap();
+    let legacy = reload::claim_requested(&pool, epoch, "sink-a", 60, 1)
+        .await
+        .unwrap();
+    let legacy_request_id = legacy[0].parent_request_id.unwrap();
+    reload::record_start_fence(
+        &pool,
+        legacy_id,
+        f,
+        ReloadFenceIdentity {
+            request_id: Some(legacy_request_id),
+            source_schema: "public",
+            source_table: "legacy_cursor",
+            schema_version,
+        },
+    )
+    .await
+    .unwrap();
+    reload::advance_cursor(
+        &pool,
+        legacy_id,
+        1,
+        &serde_json::json!([42]),
+        f,
+        schema_version,
+    )
+    .await
+    .unwrap();
+    let err = reload::record_exported_file(&pool, legacy_id, f, schema_version)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ControlError::ReloadTransition { .. }));
+
+    sqlx::query("DELETE FROM walrus.file_manifest WHERE reload_id = $1")
+        .bind(id.0)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM walrus.table_reload_marker WHERE reload_id = $1")
+        .bind(id.0)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM walrus.table_reload WHERE reload_id = $1")
+        .bind(id.0)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM walrus.table_reload_marker WHERE reload_id = $1")
+        .bind(legacy_id.0)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM walrus.table_reload WHERE reload_id = $1")
+        .bind(legacy_id.0)
+        .execute(&pool)
         .await
         .unwrap();
 }
@@ -873,6 +1074,10 @@ async fn wrong_state_transition_changes_zero_rows() {
     .await
     .unwrap_err();
     assert!(matches!(err, ControlError::ReloadTransition { .. }));
+    let err = reload::record_exported_file(&mut *tx, id, h, SchemaVersionNo(1))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ControlError::ReloadTransition { .. }));
     let err = reload::fail(&mut tx, id, "nope").await.unwrap_err();
     assert!(matches!(err, ControlError::ReloadTransition { .. }));
     let row = reload::get(&mut *tx, id).await.unwrap().unwrap();
@@ -907,6 +1112,10 @@ async fn wrong_state_transition_changes_zero_rows() {
     finish_fenced(&mut tx, id, h).await;
     reload::complete(&mut *tx, id).await.unwrap();
     let err = reload::fail(&mut tx, id, "too late").await.unwrap_err();
+    assert!(matches!(err, ControlError::ReloadTransition { .. }));
+    let err = reload::record_exported_file(&mut *tx, id, h, SchemaVersionNo(1))
+        .await
+        .unwrap_err();
     assert!(matches!(err, ControlError::ReloadTransition { .. }));
     let row = reload::get(&mut *tx, id).await.unwrap().unwrap();
     assert_eq!(row.status, ReloadStatus::Complete);

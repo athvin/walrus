@@ -8,3 +8,6 @@ WHERE reload_id = $1 AND status = 'exporting' AND chunk_no = $2::bigint - 1
   AND start_lsn IS NOT NULL
   AND start_lsn = $4
   AND schema_version = $5
+  -- A rolling legacy exporter may start only before the parallel file counter has advanced. Once
+  -- either mode records progress, cursor_pk distinguishes it and the other mode cannot mix in.
+  AND (cursor_pk IS NOT NULL OR chunk_no = 0)

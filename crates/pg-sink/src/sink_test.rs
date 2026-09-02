@@ -1,5 +1,10 @@
 use super::*;
+use arrow::array::{Int32Array, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
 use object_store::local::LocalFileSystem;
+use object_store::throttle::{ThrottleConfig, ThrottledStore};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use std::time::Duration;
 
 fn sink() -> ParquetSink {
     ParquetSink::new(
@@ -81,4 +86,265 @@ async fn a_store_failure_propagates_as_the_transient_store_class() {
     assert!(matches!(&error, SinkError::Store(_)));
     let classified = common::Error::from(error);
     assert!(matches!(classified, common::Error::ObjectStore(_)));
+}
+
+fn reload_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]))
+}
+
+fn reload_batch(schema: SchemaRef, values: Vec<i32>) -> RecordBatch {
+    RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values))]).unwrap()
+}
+
+#[tokio::test]
+async fn reload_stream_writes_incremental_row_groups_then_returns_a_durable_object() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let sink = ParquetSink::new(Arc::clone(&store), "walrus", common::EpochNo(5));
+    let schema = reload_schema();
+    let fence: Lsn = "0/2A0".parse().unwrap();
+    let mut writer = sink
+        .begin_reload_stream(
+            Arc::clone(&schema),
+            "public",
+            "orders",
+            fence,
+            SchemaVersionNo(7),
+        )
+        .unwrap();
+    let key = writer.key().clone();
+
+    writer
+        .write_batch(&reload_batch(Arc::clone(&schema), vec![1, 2]))
+        .await
+        .unwrap();
+    assert_eq!(writer.row_count(), 2);
+    assert_eq!(writer.writer.flushed_row_groups().len(), 1);
+    assert!(
+        store.head(&key).await.is_err(),
+        "a partial multipart object must not be visible"
+    );
+
+    writer
+        .write_batch(&reload_batch(schema, vec![3]))
+        .await
+        .unwrap();
+    assert_eq!(writer.writer.flushed_row_groups().len(), 2);
+    let written = writer.finish().await.unwrap();
+
+    assert_eq!(written.key, key);
+    assert_eq!(written.s3_uri, format!("s3://walrus/{key}"));
+    assert_eq!(written.source_schema, "public");
+    assert_eq!(written.source_table, "orders");
+    assert_eq!(written.lsn_start, fence);
+    assert_eq!(written.lsn_end, fence);
+    assert_eq!(written.row_count, 3);
+    assert_eq!(written.schema_version, SchemaVersionNo(7));
+    assert_eq!(written.kind, FileKind::Reload);
+
+    let bytes = store.get(&key).await.unwrap().bytes().await.unwrap();
+    let batches: Vec<_> = ParquetRecordBatchReaderBuilder::try_new(bytes)
+        .unwrap()
+        .build()
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+    let values: Vec<i32> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .iter()
+                .map(|value| value.unwrap())
+        })
+        .collect();
+    assert_eq!(values, [1, 2, 3]);
+}
+
+#[tokio::test]
+async fn reload_stream_bounds_large_string_statistics_in_every_incremental_row_group() {
+    const ROW_GROUPS: usize = 6;
+    const LARGE_VALUE_BYTES: usize = 256 * 1024;
+    const STATISTICS_BYTES_PER_BOUND: usize = 64;
+
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let sink = ParquetSink::new(Arc::clone(&store), "walrus", common::EpochNo(5));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "payload",
+        DataType::Utf8,
+        false,
+    )]));
+    let mut writer = sink
+        .begin_reload_stream(
+            Arc::clone(&schema),
+            "public",
+            "large_text",
+            "0/2A1".parse().unwrap(),
+            SchemaVersionNo(7),
+        )
+        .unwrap();
+
+    for row_group in 0..ROW_GROUPS {
+        let value = format!("{row_group:04}-{}", "x".repeat(LARGE_VALUE_BYTES));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec![value]))],
+        )
+        .unwrap();
+        writer.write_batch(&batch).await.unwrap();
+    }
+    assert_eq!(writer.writer.flushed_row_groups().len(), ROW_GROUPS);
+
+    let written = writer.finish().await.unwrap();
+    let bytes = store
+        .get(&written.key)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+    assert_eq!(reader.metadata().num_row_groups(), ROW_GROUPS);
+
+    let mut retained_statistics_bytes = 0;
+    for (row_group, metadata) in reader.metadata().row_groups().iter().enumerate() {
+        let statistics = metadata
+            .column(0)
+            .statistics()
+            .unwrap_or_else(|| panic!("row group {row_group} must have string statistics"));
+        let min = statistics
+            .min_bytes_opt()
+            .unwrap_or_else(|| panic!("row group {row_group} must have a minimum"));
+        let max = statistics
+            .max_bytes_opt()
+            .unwrap_or_else(|| panic!("row group {row_group} must have a maximum"));
+
+        assert!(
+            min.len() <= STATISTICS_BYTES_PER_BOUND,
+            "row group {row_group} retained a {}-byte minimum",
+            min.len()
+        );
+        assert!(
+            max.len() <= STATISTICS_BYTES_PER_BOUND,
+            "row group {row_group} retained a {}-byte maximum",
+            max.len()
+        );
+        retained_statistics_bytes += min.len() + max.len();
+    }
+    assert!(
+        retained_statistics_bytes <= ROW_GROUPS * 2 * STATISTICS_BYTES_PER_BOUND,
+        "footer statistics must be bounded per row group instead of retaining each {LARGE_VALUE_BYTES}-byte value"
+    );
+}
+
+#[tokio::test]
+async fn reload_stream_rejects_empty_finish_without_publishing_an_object() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let sink = ParquetSink::new(Arc::clone(&store), "walrus", common::EpochNo(5));
+    let writer = sink
+        .begin_reload_stream(
+            reload_schema(),
+            "public",
+            "empty",
+            "0/10".parse().unwrap(),
+            SchemaVersionNo(1),
+        )
+        .unwrap();
+    let key = writer.key().clone();
+
+    let error = writer.finish().await.unwrap_err();
+
+    assert!(matches!(error, SinkError::EmptyStream));
+    assert!(store.head(&key).await.is_err());
+}
+
+#[tokio::test]
+async fn reload_stream_abort_leaves_no_visible_object() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let sink = ParquetSink::new(Arc::clone(&store), "walrus", common::EpochNo(5));
+    let schema = reload_schema();
+    let mut writer = sink
+        .begin_reload_stream(
+            Arc::clone(&schema),
+            "public",
+            "cancelled",
+            "0/20".parse().unwrap(),
+            SchemaVersionNo(1),
+        )
+        .unwrap();
+    let key = writer.key().clone();
+    writer
+        .write_batch(&reload_batch(schema, vec![1]))
+        .await
+        .unwrap();
+
+    writer.abort().await.unwrap();
+
+    assert!(store.head(&key).await.is_err());
+}
+
+#[tokio::test]
+async fn reload_stream_schema_mismatch_aborts_and_closes_the_writer() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let sink = ParquetSink::new(Arc::clone(&store), "walrus", common::EpochNo(5));
+    let mut writer = sink
+        .begin_reload_stream(
+            reload_schema(),
+            "public",
+            "mismatch",
+            "0/30".parse().unwrap(),
+            SchemaVersionNo(1),
+        )
+        .unwrap();
+    let key = writer.key().clone();
+    let wrong = Arc::new(Schema::new(vec![Field::new(
+        "different",
+        DataType::Int32,
+        false,
+    )]));
+
+    let error = writer
+        .write_batch(&reload_batch(Arc::clone(&wrong), vec![1]))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, SinkError::SchemaMismatch));
+    let error = writer
+        .write_batch(&reload_batch(wrong, vec![2]))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, SinkError::ClosedStream));
+    assert!(store.head(&key).await.is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn reload_object_write_waits_for_the_remote_part_before_accepting_more() {
+    let store: Arc<dyn ObjectStore> = Arc::new(ThrottledStore::new(
+        object_store::memory::InMemory::new(),
+        ThrottleConfig {
+            wait_put_per_call: Duration::from_secs(10),
+            ..ThrottleConfig::default()
+        },
+    ));
+    let key = Path::from("reload-backpressure.parquet");
+    let buf_writer =
+        BufWriter::with_capacity(Arc::clone(&store), key.clone(), RELOAD_MULTIPART_PART_BYTES)
+            .with_max_concurrency(1);
+    let upload = AbortableObjectWriter::new(buf_writer);
+    let mut byte_sink = upload.clone();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        byte_sink.write(Bytes::from(vec![0; RELOAD_MULTIPART_PART_BYTES])),
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "write must remain pending while its only multipart part is remote"
+    );
+    upload.abort().await.unwrap();
+    assert!(store.head(&key).await.is_err());
 }

@@ -23,7 +23,7 @@
 //! advancing the slot or making data visible (the `ready` row).*
 
 use crate::batch::{BatchTriggers, Clock, SystemClock, TableBatcher};
-use crate::memory::{InflightMeter, TableId};
+use crate::memory::{InflightMeter, ProcessMemoryBudget, TableId};
 use crate::pgoutput::Message;
 use crate::relcache::RelationCache;
 use crate::sink::{FileKind, ParquetSink, WrittenObject};
@@ -171,6 +171,26 @@ impl<C: Clock + Clone> StreamDemux<C> {
         sink_instance: impl Into<String>,
         max_inflight_bytes: NonZeroU64,
     ) -> Self {
+        Self::with_process_memory_budget(
+            triggers,
+            clock,
+            epoch,
+            sink_instance,
+            max_inflight_bytes,
+            Arc::new(ProcessMemoryBudget::new(max_inflight_bytes)),
+        )
+    }
+
+    /// Build the production demux against the same process accounting reload workers reserve.
+    #[must_use]
+    pub(crate) fn with_process_memory_budget(
+        triggers: BatchTriggers,
+        clock: C,
+        epoch: EpochNo,
+        sink_instance: impl Into<String>,
+        max_inflight_bytes: NonZeroU64,
+        process_budget: Arc<ProcessMemoryBudget>,
+    ) -> Self {
         let sink_instance = sink_instance.into();
         StreamDemux {
             open: HashMap::new(),
@@ -181,7 +201,7 @@ impl<C: Clock + Clone> StreamDemux<C> {
             clock,
             epoch,
             sink_instance,
-            meter: InflightMeter::new(max_inflight_bytes),
+            meter: InflightMeter::with_process_budget(max_inflight_bytes, process_budget),
             spill_count: 0,
         }
     }
@@ -398,9 +418,10 @@ impl<C: Clock + Clone> StreamDemux<C> {
             return Ok(());
         }
 
-        // Build one snapshot per shed episode. Inside this loop priorities only ever fall: it calls
-        // `meter.release` through `forget_stream`, never `meter.add`. Each popped tuple is only a
-        // hint and its snapshot byte count is never treated as live accounting.
+        // Build one snapshot per shed episode. Inside this loop priorities only ever fall: each
+        // successfully uploaded candidate is released before the next condition check, and no new
+        // rows can enter while this awaited method owns the demux. Each popped tuple is only a hint
+        // and its snapshot byte count is never treated as live accounting.
         let mut candidates = self.meter.to_spill_order();
         while self.meter.is_over_ceiling() {
             let Some((_bytes, oid, sub_xid)) = candidates.pop() else {
@@ -425,7 +446,6 @@ impl<C: Clock + Clone> StreamDemux<C> {
                 };
                 (txn.begin_lsn, txn.take_stream(oid, sub_xid))
             };
-            self.forget_stream(key);
             let mut batchers = BTreeMap::new();
             for c in &rows {
                 let cached = cache
@@ -492,6 +512,11 @@ impl<C: Clock + Clone> StreamDemux<C> {
                 };
                 txn.staged.push(StagedSpill { sub_xid, written });
             }
+            // `rows` retains the original tuple allocations while Arrow/Parquet is built. Do not
+            // publish the meter reduction (which can wake a reload worker) until the remote write
+            // has drained and those originals are actually freed.
+            drop(rows);
+            self.forget_stream(key);
         }
         Ok(())
     }
@@ -509,8 +534,16 @@ impl<C: Clock + Clone> StreamDemux<C> {
             let Some(txn) = self.open.remove(&top_xid) else {
                 return; // never opened (or already aborted) — no buffer and no spills to delete
             };
-            self.release_txn_meter(&txn);
-            for s in &txn.staged {
+            let rows = txn.changes.len();
+            let meter_keys = txn.keys.iter().copied().collect::<Vec<_>>();
+            let staged = txn.staged;
+            // Free buffered tuples before publishing the lower shared-memory total. Remote staged
+            // objects contain no in-memory row payload and may be cleaned up afterward.
+            drop(txn.changes);
+            for key in meter_keys {
+                self.forget_stream(key);
+            }
+            for s in &staged {
                 if let Err(error) = sink.delete(&s.written.key).await {
                     tracing::warn!(
                         key = %s.written.key,
@@ -519,12 +552,7 @@ impl<C: Clock + Clone> StreamDemux<C> {
                     );
                 }
             }
-            tracing::info!(
-                top_xid,
-                rows = txn.changes.len(),
-                staged = txn.staged.len(),
-                "whole-txn abort"
-            );
+            tracing::info!(top_xid, rows, staged = staged.len(), "whole-txn abort");
             return;
         }
         let Some(txn) = self.open.get_mut(&top_xid) else {
@@ -583,7 +611,7 @@ impl<C: Clock + Clone> StreamDemux<C> {
             );
             return Ok(Vec::new());
         };
-        self.release_txn_meter(&txn);
+        let meter_keys = txn.keys.iter().copied().collect::<Vec<_>>();
         let mut out = Vec::new();
         // Publish speculative spills whose sub-xid did NOT abort, stamped with the real commit LSN.
         // `take` moves the spill vector out without moving `txn`, so `txn.iter_survivors()` remains usable.
@@ -662,6 +690,12 @@ impl<C: Clock + Clone> StreamDemux<C> {
                 );
             }
         }
+        // The original streamed tuples coexist with their Arrow/Parquet materialization until this
+        // point. Release shared process accounting only after those source allocations are gone.
+        drop(txn);
+        for key in meter_keys {
+            self.forget_stream(key);
+        }
         out.sort_by(|left, right| {
             (
                 &left.source_schema,
@@ -684,12 +718,6 @@ impl<C: Clock + Clone> StreamDemux<C> {
     #[must_use]
     pub fn open_floor(&self) -> Option<Lsn> {
         self.open.values().map(|t| t.begin_lsn).min()
-    }
-
-    fn release_txn_meter(&mut self, txn: &StreamedTxn) {
-        for &key in &txn.keys {
-            self.forget_stream(key);
-        }
     }
 
     #[cfg(test)]

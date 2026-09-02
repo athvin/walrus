@@ -533,6 +533,47 @@ pub async fn advance_cursor(
     Ok(())
 }
 
+/// Record one completely uploaded reload file without imposing worker completion order.
+///
+/// Parallel workers can finish remote objects in any order, so the persisted `chunk_no` is a
+/// completed-file count rather than a caller-assigned sequence number. The guarded increment is
+/// atomic and returns the unique count assigned by Postgres. Callers insert the file manifest and
+/// invoke this function in the **same control transaction**, after the remote object is complete;
+/// either both rows become visible or neither does.
+///
+/// `cursor_pk IS NULL` prevents a rolling deployment from mixing this mode with the legacy
+/// keyset-cursor exporter. `first_lsn` remains diagnostic compatibility data and is frozen to the
+/// attempt's already-durable start fence on the first successful file. The exact start fence and
+/// schema guards reject stale workers after a restart or DDL successor.
+///
+/// # Errors
+///
+/// Returns [`ControlError::ReloadTransition`] unless the attempt is still `exporting`, belongs to
+/// the supplied start fence and schema, and has never entered legacy cursor mode. Database failures
+/// become [`ControlError::Connect`] or [`ControlError::CheckViolation`].
+pub async fn record_exported_file(
+    ex: impl PgExecutor<'_>,
+    reload_id: ReloadId,
+    start_lsn: Lsn,
+    schema_version: SchemaVersionNo,
+) -> Result<i64, ControlError> {
+    let row = sqlx::query_file!(
+        "sql/postgres/queries/record_exported_file.sql",
+        reload_id.0,
+        start_lsn as Lsn,
+        schema_version.0,
+    )
+    .fetch_optional(ex)
+    .await?;
+    let Some(row) = row else {
+        return Err(ControlError::ReloadTransition {
+            reload_id,
+            expected: "exporting (cursor-free, same start_lsn and schema_version)",
+        });
+    };
+    Ok(row.chunk_no)
+}
+
 /// `exporting → export_complete`, recording the final watermark `H`. The sink's last act; from
 /// here the LOADER finishes the walk (`complete` once `transformed_lsn >= H`). Every request source
 /// and both persisted flavor spellings must already have matching durable baseline/end markers.

@@ -9,7 +9,7 @@
 //!
 //! - A "crashed" export (exporter dropped mid-flight) is ADOPTED from control-pg — not WAL
 //!   redelivery — then its lost-snapshot predecessor is failed/purged and a fresh fenced successor
-//!   re-exports from chunk zero. The loader (simulated by advancing the checkpoint) flips
+//!   re-exports from zero completed files. The loader (simulated by advancing the checkpoint) flips
 //!   `complete` once `transformed_lsn ≥ H`.
 //! - A crash after durable H but before `complete_export(H)` adopts the exact F/H boundary and
 //!   never scans a source row committed after H into an F-stamped baseline chunk.
@@ -59,18 +59,30 @@ async fn admin() -> tokio_postgres::Client {
     c
 }
 
+fn raw_store() -> object_store::aws::AmazonS3 {
+    object_store::aws::AmazonS3Builder::new()
+        .with_bucket_name("walrus")
+        .with_region("us-east-1")
+        .with_endpoint("http://localhost:9000")
+        .with_access_key_id("minioadmin")
+        .with_secret_access_key("minioadmin")
+        .with_allow_http(true)
+        .build()
+        .unwrap()
+}
+
 fn store() -> Arc<dyn object_store::ObjectStore> {
-    Arc::new(
-        object_store::aws::AmazonS3Builder::new()
-            .with_bucket_name("walrus")
-            .with_region("us-east-1")
-            .with_endpoint("http://localhost:9000")
-            .with_access_key_id("minioadmin")
-            .with_secret_access_key("minioadmin")
-            .with_allow_http(true)
-            .build()
-            .unwrap(),
-    )
+    Arc::new(raw_store())
+}
+
+fn delayed_store(delay: Duration) -> Arc<dyn object_store::ObjectStore> {
+    Arc::new(object_store::throttle::ThrottledStore::new(
+        raw_store(),
+        object_store::throttle::ThrottleConfig {
+            wait_put_per_call: delay,
+            ..object_store::throttle::ThrottleConfig::default()
+        },
+    ))
 }
 
 async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: EpochNo, n: i64) {
@@ -118,6 +130,11 @@ async fn scrub(pool: &sqlx::PgPool, epoch: EpochNo) {
 fn export_cfg(epoch: EpochNo, chunk_rows: u64) -> ChunkExportConfig {
     ChunkExportConfig {
         chunk_rows: std::num::NonZeroU64::new(chunk_rows).unwrap(),
+        router_batch_bytes: std::num::NonZeroU64::new(8 * 1024 * 1024).unwrap(),
+        worker_admission: pg_sink::reload_export::ReloadWorkerAdmission::new(
+            std::num::NonZeroUsize::new(4).unwrap(),
+        ),
+        workers_per_table: std::num::NonZeroUsize::new(4).unwrap(),
         echo_timeout: Duration::from_secs(20),
         instance: HOLDER.to_string(),
         epoch,
@@ -149,6 +166,23 @@ async fn reload_file_count(pool: &sqlx::PgPool, epoch: EpochNo, reload_id: Reloa
     .fetch_one(pool)
     .await
     .unwrap()
+}
+
+async fn wait_for_file_progress(pool: &sqlx::PgPool, reload_id: ReloadId) -> control::ReloadRow {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let row = control::reload::get(pool, reload_id)
+                .await
+                .unwrap()
+                .expect("reload remains present while its exporter runs");
+            if row.chunk_no > 0 {
+                return row;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("parallel reload records its first completed file")
 }
 
 /// Simulate the loader reaching a watermark: seed the checkpoint and advance both frontiers (the
@@ -186,7 +220,7 @@ async fn kill_mid_export_starts_fresh_successor_and_completes() {
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     scrub(&pool, epoch).await;
-    seed(&admin, &pool, epoch, 5).await;
+    seed(&admin, &pool, epoch, 1000).await;
 
     let waiters = Arc::new(FenceWaiters::default());
     let token = CancellationToken::new();
@@ -204,7 +238,8 @@ async fn kill_mid_export_starts_fresh_successor_and_completes() {
         .expect("fence resolver ready sender remains live");
     let resolver = resolver.handle;
 
-    // requested → exporting, chunk 1 (2 of 5 rows), then "crash": drop the exporter mid-flight.
+    // requested → exporting, at least one independently durable worker file, then "crash": abort
+    // the task while the delayed remote sink keeps the shared snapshot genuinely in flight.
     let req = request_and_claim(&pool, epoch, HOLDER).await;
     let reload_id = req.reload_id;
     assert_eq!(status(&pool, reload_id).await, ReloadStatus::Exporting);
@@ -212,29 +247,48 @@ async fn kill_mid_export_starts_fresh_successor_and_completes() {
         &source_url(),
         pool.clone(),
         Arc::clone(&waiters),
-        ParquetSink::new(store(), "walrus", epoch),
-        export_cfg(epoch, 2),
+        ParquetSink::new(delayed_store(Duration::from_millis(50)), "walrus", epoch),
+        export_cfg(epoch, 50),
         &req,
     )
     .await
     .unwrap();
-    crashed.export_next_chunk().await.unwrap();
-    drop(crashed);
+    let crashed = tokio::spawn(async move { crashed.run(false).await });
+    let progress = wait_for_file_progress(&pool, reload_id).await;
+    assert!(
+        !crashed.is_finished(),
+        "the simulated crash is genuinely mid-export"
+    );
+    crashed.abort();
+    assert!(crashed.await.unwrap_err().is_cancelled());
     let mid = control::reload::get(&pool, reload_id)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(mid.chunk_no, 1, "one chunk done before the crash");
+    assert!(mid.chunk_no >= progress.chunk_no && mid.chunk_no > 0);
+    assert_eq!(
+        mid.cursor_pk, None,
+        "physical file progress has no PK cursor"
+    );
 
-    // "Restart": adoption cannot resurrect the connection-local snapshot, so the cursor is
-    // evidence to purge rather than a safe resume point.
+    // "Restart": adoption cannot resurrect the connection-local snapshot, so durable file
+    // progress is evidence to purge rather than a safe resume point.
     let mut adopted = control::reload::adopt_resumable(&pool, epoch, HOLDER, 60, 5, true)
         .await
         .unwrap();
     assert_eq!(adopted.len(), 1, "our orphaned export is adopted");
     let row = adopted.pop().unwrap();
     assert_eq!(row.reload_id, reload_id);
-    assert_eq!(row.chunk_no, 1, "adopted at the cursor, not chunk zero");
+    assert!(
+        row.chunk_no >= mid.chunk_no && row.chunk_no > 0,
+        "adoption observes every file durable before the crash task stopped"
+    );
+    assert_eq!(
+        reload_file_count(&pool, epoch, reload_id).await,
+        row.chunk_no,
+        "the completed-file counter and manifest advance atomically"
+    );
+    assert_eq!(row.cursor_pk, None);
 
     let mut adopted_exporter = ChunkExporter::connect(
         &source_url(),
@@ -263,7 +317,7 @@ async fn kill_mid_export_starts_fresh_successor_and_completes() {
     assert_eq!(
         reload_file_count(&pool, epoch, reload_id).await,
         0,
-        "the lost-snapshot predecessor's chunk is purged"
+        "the lost-snapshot predecessor's files are purged"
     );
 
     let successor = control::reload::get(&pool, new_id).await.unwrap().unwrap();
@@ -276,7 +330,7 @@ async fn kill_mid_export_starts_fresh_successor_and_completes() {
         pool.clone(),
         Arc::clone(&waiters),
         ParquetSink::new(store(), "walrus", epoch),
-        export_cfg(epoch, 2),
+        export_cfg(epoch, 50),
         &successor,
     )
     .await
@@ -296,12 +350,12 @@ async fn kill_mid_export_starts_fresh_successor_and_completes() {
     let done = control::reload::get(&pool, new_id).await.unwrap().unwrap();
     assert_eq!(done.status, ReloadStatus::ExportComplete);
     assert_eq!(done.final_lsn, Some(h), "H recorded");
-    assert_eq!(done.chunk_no, 3, "5 rows at chunk_rows=2 ⇒ 3 chunks");
-    assert_eq!(
-        reload_file_count(&pool, epoch, new_id).await,
-        3,
-        "the successor re-exports one internally consistent snapshot from chunk zero"
+    let successor_files = reload_file_count(&pool, epoch, new_id).await;
+    assert!(
+        (20..=23).contains(&successor_files),
+        "1000 rows / 50 plus at most three parallel worker tails: {successor_files} files"
     );
+    assert_eq!(done.chunk_no, successor_files);
     assert!(
         matches!((done.start_lsn, row.start_lsn), (Some(new_f), Some(old_f)) if new_f > old_f),
         "the successor establishes a fresh F instead of reusing the lost snapshot's fence"
@@ -391,8 +445,9 @@ async fn crash_after_h_before_complete_does_not_export_post_h_rows() {
         .unwrap()
         .unwrap();
     assert_eq!(before.status, ReloadStatus::Exporting);
-    assert_eq!(before.chunk_no, 1);
-    assert_eq!(reload_file_count(&pool, epoch, reload_id).await, 1);
+    let files_before = reload_file_count(&pool, epoch, reload_id).await;
+    assert!(files_before > 0);
+    assert_eq!(before.chunk_no, files_before);
     assert_eq!(
         control::reload::read_markers(&pool, reload_id)
             .await
@@ -404,8 +459,8 @@ async fn crash_after_h_before_complete_does_not_export_post_h_rows() {
     );
     drop(crashed); // crash after durable H, before complete_export(H)
 
-    // This commit is strictly after H and sorts past the saved cursor. A buggy adopter resumes its
-    // SELECT, exports id=4 as another F-stamped baseline chunk, and contaminates the H rebuild.
+    // This commit is strictly after H. A buggy adopter that starts another source snapshot would
+    // export id=4 as an F-stamped baseline row and contaminate the already fenced H rebuild.
     admin
         .execute(
             &format!("INSERT INTO public.{TABLE} (id, val) VALUES (4, 'after-h')"),
@@ -453,11 +508,17 @@ async fn crash_after_h_before_complete_does_not_export_post_h_rows() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(after.chunk_no, before.chunk_no, "no post-H chunk SELECT");
-    assert_eq!(after.cursor_pk, before.cursor_pk, "the cursor did not move");
+    assert_eq!(
+        after.chunk_no, before.chunk_no,
+        "no post-H COPY or file commit"
+    );
+    assert_eq!(
+        after.cursor_pk, None,
+        "parallel reloads never create a resume cursor"
+    );
     assert_eq!(
         reload_file_count(&pool, epoch, reload_id).await,
-        1,
+        files_before,
         "the post-H row was not copied into an F-stamped reload file"
     );
     control::reload::complete_export(&pool, reload_id, recovered_h)

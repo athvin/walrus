@@ -7,9 +7,9 @@
 //! Restart-on-DDL against compose (`#[ignore]` — needs source PG + control PG + MinIO). A schema
 //! change queued while the consistent dump snapshot is open lands before the end fence and
 //! invalidates the attempt: the exporter returns `SchemaChanged`, and the controller
-//! fails-and-reissues in one transaction — the old row
-//! turns `failed`, its chunk files are purged, and a successor `exporting` at `restart_count+1`
-//! starts with a fresh cursor. The successor then re-exports from chunk zero at the NEW schema.
+//! fails-and-reissues in one transaction — the old row turns `failed`, its worker files are purged,
+//! and a successor `exporting` at `restart_count+1` starts with zero file progress. The successor
+//! then re-exports a fresh shared snapshot at the NEW schema.
 //! Past `reload_max_restarts` the reload fails outright with the cap named and no successor. Both
 //! paths bump their metric.
 //!
@@ -70,18 +70,30 @@ async fn admin() -> tokio_postgres::Client {
     c
 }
 
+fn raw_store() -> object_store::aws::AmazonS3 {
+    object_store::aws::AmazonS3Builder::new()
+        .with_bucket_name("walrus")
+        .with_region("us-east-1")
+        .with_endpoint("http://localhost:9000")
+        .with_access_key_id("minioadmin")
+        .with_secret_access_key("minioadmin")
+        .with_allow_http(true)
+        .build()
+        .unwrap()
+}
+
 fn store() -> Arc<dyn ObjectStore> {
-    Arc::new(
-        object_store::aws::AmazonS3Builder::new()
-            .with_bucket_name("walrus")
-            .with_region("us-east-1")
-            .with_endpoint("http://localhost:9000")
-            .with_access_key_id("minioadmin")
-            .with_secret_access_key("minioadmin")
-            .with_allow_http(true)
-            .build()
-            .unwrap(),
-    )
+    Arc::new(raw_store())
+}
+
+fn delayed_store(delay: Duration) -> Arc<dyn ObjectStore> {
+    Arc::new(object_store::throttle::ThrottledStore::new(
+        raw_store(),
+        object_store::throttle::ThrottleConfig {
+            wait_put_per_call: delay,
+            ..object_store::throttle::ThrottleConfig::default()
+        },
+    ))
 }
 
 /// Seed the target table (a plain 2-column table) with `n` rows and register its shape at v1.
@@ -182,6 +194,11 @@ async fn scrub(pool: &sqlx::PgPool, epoch: EpochNo) {
 fn export_cfg(epoch: EpochNo, chunk_rows: u64) -> ChunkExportConfig {
     ChunkExportConfig {
         chunk_rows: std::num::NonZeroU64::new(chunk_rows).unwrap(),
+        router_batch_bytes: std::num::NonZeroU64::new(8 * 1024 * 1024).unwrap(),
+        worker_admission: pg_sink::reload_export::ReloadWorkerAdmission::new(
+            std::num::NonZeroUsize::new(4).unwrap(),
+        ),
+        workers_per_table: std::num::NonZeroUsize::new(4).unwrap(),
         echo_timeout: Duration::from_secs(20),
         instance: "walrus-sink-test".to_string(),
         epoch,
@@ -237,6 +254,23 @@ async fn manifest_count(pool: &sqlx::PgPool, epoch: EpochNo, reload_id: ReloadId
     .fetch_one(pool)
     .await
     .unwrap()
+}
+
+async fn wait_for_file_progress(pool: &sqlx::PgPool, reload_id: ReloadId) -> control::ReloadRow {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let row = control::reload::get(pool, reload_id)
+                .await
+                .unwrap()
+                .expect("reload remains present while its exporter runs");
+            if row.chunk_no > 0 {
+                return row;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("parallel reload records its first completed file")
 }
 
 /// The (uri, schema_version) of a reload's chunk files, in claim order.
@@ -311,7 +345,7 @@ async fn mid_export_ddl_restarts_fresh_attempt_at_new_schema() {
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     scrub(&pool, epoch).await;
-    seed(&admin, &pool, epoch, 5).await;
+    seed(&admin, &pool, epoch, 1000).await;
 
     let waiters = Arc::new(FenceWaiters::default());
     let token = CancellationToken::new();
@@ -329,27 +363,31 @@ async fn mid_export_ddl_restarts_fresh_attempt_at_new_schema() {
         .expect("fence resolver ready sender remains live");
     let resolver = resolver.handle;
 
-    // Chunk 1 opens the one v1 snapshot. Queue DDL behind that transaction; it will land after the
-    // snapshot drains but before H acquires its fence lock.
+    // Run the shared v1 snapshot in the background. The first durable worker file proves COPY is
+    // underway; delayed remote writes keep the coordinator's ACCESS SHARE lock open while the DDL
+    // queues for ACCESS EXCLUSIVE. It will land after S commits and before H wins a new lock.
     let req = request_and_claim(&pool, epoch).await;
     let old_id = req.reload_id;
     let mut exporter = ChunkExporter::connect(
         &source_url(),
         pool.clone(),
         Arc::clone(&waiters),
-        ParquetSink::new(store(), "walrus", epoch),
-        export_cfg(epoch, 2),
+        ParquetSink::new(delayed_store(Duration::from_millis(50)), "walrus", epoch),
+        export_cfg(epoch, 50),
         &req,
     )
     .await
     .unwrap();
-    exporter.export_next_chunk().await.unwrap();
+    let export = tokio::spawn(async move { exporter.run(false).await });
+    let progress = wait_for_file_progress(&pool, old_id).await;
+    assert_eq!(progress.cursor_pk, None);
+    assert!(!export.is_finished(), "DDL is queued while S remains open");
     let ddl = queue_priority_ddl(&admin, &pool, epoch).await;
 
     // The old snapshot stays internally consistent. Its queued DDL wins before H, whose live-shape
     // check returns SchemaChanged instead of publishing the obsolete baseline.
     let restarts_before = counter_value(common::metrics::names::RELOAD_RESTARTS_TOTAL);
-    let outcome = exporter.run(false).await.unwrap();
+    let outcome = export.await.unwrap().unwrap();
     ddl.await.unwrap();
     assert_eq!(
         outcome,
@@ -359,8 +397,8 @@ async fn mid_export_ddl_restarts_fresh_attempt_at_new_schema() {
     );
 
     // The controller fails-and-reissues in one transaction.
-    let old_after_chunk1 = control::reload::get(&pool, old_id).await.unwrap().unwrap();
-    let decision = handle_ddl_restart(&pool, &old_after_chunk1, SchemaVersionNo(2), 3)
+    let old_after_export = control::reload::get(&pool, old_id).await.unwrap().unwrap();
+    let decision = handle_ddl_restart(&pool, &old_after_export, SchemaVersionNo(2), 3)
         .await
         .unwrap();
     let new_id = match decision {
@@ -372,7 +410,7 @@ async fn mid_export_ddl_restarts_fresh_attempt_at_new_schema() {
         1.0,
     );
 
-    // Old: failed + superseded reason + zero chunk files. New: exporting, restart_count 1, fresh.
+    // Old: failed + superseded reason + zero files. New: exporting, restart_count 1, fresh.
     let old = control::reload::get(&pool, old_id).await.unwrap().unwrap();
     assert_eq!(old.status, control::reload::ReloadStatus::Failed);
     assert!(
@@ -386,16 +424,19 @@ async fn mid_export_ddl_restarts_fresh_attempt_at_new_schema() {
     assert_eq!(
         manifest_count(&pool, epoch, old_id).await,
         0,
-        "the old attempt's chunk files are purged (fail()'s coupling)"
+        "the old attempt's worker files are purged (fail()'s coupling)"
     );
     let new = control::reload::get(&pool, new_id).await.unwrap().unwrap();
     assert_eq!(new.status, control::reload::ReloadStatus::Exporting);
     assert_eq!(new.restart_count, 1);
-    assert_eq!(new.chunk_no, 0, "successor starts from chunk zero");
+    assert_eq!(
+        new.chunk_no, 0,
+        "successor starts with zero completed files"
+    );
     assert_eq!(new.cursor_pk, None);
     assert_eq!(
         new.schema_version, None,
-        "re-freezes at the new version on chunk 1"
+        "re-freezes at the new version before COPY"
     );
     assert_eq!(
         new.lease_holder.as_deref(),
@@ -409,7 +450,7 @@ async fn mid_export_ddl_restarts_fresh_attempt_at_new_schema() {
         pool.clone(),
         Arc::clone(&waiters),
         ParquetSink::new(store(), "walrus", epoch),
-        export_cfg(epoch, 2),
+        export_cfg(epoch, 50),
         &new,
     )
     .await
@@ -426,7 +467,11 @@ async fn mid_export_ddl_restarts_fresh_attempt_at_new_schema() {
         "the attempt froze at v2"
     );
     let files = reload_files(&pool, epoch, new_id).await;
-    assert_eq!(files.len(), 3, "5 rows at chunk_rows=2 ⇒ 3 files");
+    assert!(
+        (20..=23).contains(&files.len()),
+        "1000 rows / 50 per object plus at most three worker tails: {} files",
+        files.len()
+    );
     assert!(
         files.iter().all(|f| f.1 == SchemaVersionNo(2)),
         "every successor file stamped v2"
@@ -434,7 +479,7 @@ async fn mid_export_ddl_restarts_fresh_attempt_at_new_schema() {
     let cols = chunk_columns(&files[0].0).await;
     assert!(
         cols.iter().any(|c| c == "priority"),
-        "the new column is present in the successor's chunk files: {cols:?}"
+        "the new column is present in the successor's worker files: {cols:?}"
     );
 
     token.cancel();
@@ -459,7 +504,7 @@ async fn restart_cap_exhaustion_fails_loudly() {
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     scrub(&pool, epoch).await;
-    seed(&admin, &pool, epoch, 5).await;
+    seed(&admin, &pool, epoch, 1000).await;
 
     let waiters = Arc::new(FenceWaiters::default());
     let token = CancellationToken::new();
@@ -483,16 +528,19 @@ async fn restart_cap_exhaustion_fails_loudly() {
         &source_url(),
         pool.clone(),
         Arc::clone(&waiters),
-        ParquetSink::new(store(), "walrus", epoch),
-        export_cfg(epoch, 2),
+        ParquetSink::new(delayed_store(Duration::from_millis(50)), "walrus", epoch),
+        export_cfg(epoch, 50),
         &req,
     )
     .await
     .unwrap();
-    exporter.export_next_chunk().await.unwrap();
+    let export = tokio::spawn(async move { exporter.run(false).await });
+    let progress = wait_for_file_progress(&pool, old_id).await;
+    assert_eq!(progress.cursor_pk, None);
+    assert!(!export.is_finished(), "DDL is queued while S remains open");
     let ddl = queue_priority_ddl(&admin, &pool, epoch).await;
     assert_eq!(
-        exporter.run(false).await.unwrap(),
+        export.await.unwrap().unwrap(),
         RunOutcome::SchemaChanged {
             new_version: SchemaVersionNo(2)
         }
@@ -501,8 +549,8 @@ async fn restart_cap_exhaustion_fails_loudly() {
 
     // Cap 0: the first mid-export DDL fails the reload outright — no successor.
     let cap_before = counter_value(common::metrics::names::RELOAD_RESTART_CAP_EXHAUSTED_TOTAL);
-    let old_after_chunk1 = control::reload::get(&pool, old_id).await.unwrap().unwrap();
-    let decision = handle_ddl_restart(&pool, &old_after_chunk1, SchemaVersionNo(2), 0)
+    let old_after_export = control::reload::get(&pool, old_id).await.unwrap().unwrap();
+    let decision = handle_ddl_restart(&pool, &old_after_export, SchemaVersionNo(2), 0)
         .await
         .unwrap();
     assert!(
@@ -529,8 +577,8 @@ async fn restart_cap_exhaustion_fails_loudly() {
         "the failed reload's chunk files are purged"
     );
 
-    // Sanity: the frozen L_1 that chunk 1 recorded is a real LSN (the attempt did run).
-    let _l1: Lsn = rows[0].first_lsn.expect("chunk 1 froze L_1");
+    // Sanity: the frozen F recorded before COPY is a real LSN (the attempt did run).
+    let _f: Lsn = rows[0].first_lsn.expect("the parallel attempt froze F");
 
     token.cancel();
     resolver.await.unwrap();

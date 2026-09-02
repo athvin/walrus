@@ -73,6 +73,11 @@ fn controller_cfg(epoch: EpochNo, cap: NonZeroUsize) -> ReloadControllerConfig {
     ReloadControllerConfig {
         poll_interval: Duration::from_millis(200), // fast cadence for the test
         max_concurrent_reloads: cap,
+        workers_per_table: NonZeroUsize::new(4).unwrap(),
+        router_batch_bytes: std::num::NonZeroU64::new(8 * 1024 * 1024).unwrap(),
+        worker_admission: pg_sink::reload_export::ReloadWorkerAdmission::new(
+            NonZeroUsize::new(8).unwrap(),
+        ),
         lease_ttl: Duration::from_secs(6), // renewal at 2s — observable within one test
         instance: "walrus-sink-test".to_string(),
         publication_name: "walrus_pub".to_string(),

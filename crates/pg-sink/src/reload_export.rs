@@ -1,11 +1,16 @@
-//! The chunk export engine (reload H1/H2, §5 step 3).
+//! The streaming, parallel reload export engine (reload H1/H2, §5 step 3).
 //!
-//! Each attempt first appends a start event and waits for its decoded commit `F`. It then walks the
-//! table in PK order inside one read-only `REPEATABLE READ` transaction, writing every baseline row
-//! with `commit_lsn = lsn = F`. After committing that source snapshot it appends an end event `H`;
-//! decode force-flushes this table's WAL and persists the end marker before resolving the exporter.
-//! A PostgreSQL snapshot is connection-local: an adopted attempt without durable H is superseded by
-//! a fresh attempt/F rather than resuming its cursor against a different snapshot.
+//! Each attempt first appends a start event and waits for its decoded commit `F`. One ordinary SQL
+//! connection then exports a read-only `REPEATABLE READ` snapshot `S`; up to the configured number
+//! of ordinary SQL workers import that exact snapshot and drain disjoint CTID page ranges. These
+//! workers are not replication connections and never create replication slots. Rows flow from
+//! PostgreSQL binary `COPY` into small Arrow batches and directly into multipart Parquet uploads,
+//! with the remote write awaited before `COPY` is polled again.
+//!
+//! After every remote object and its manifest are durable, the coordinator commits the snapshot and
+//! appends an end event `H`; decode force-flushes this table's WAL and persists the end marker before
+//! resolving the exporter. A PostgreSQL snapshot is connection-local: an adopted attempt without
+//! durable H is superseded by a fresh attempt/F rather than trying to resume physical ranges.
 //!
 //! **Why the early stamp converges (the whole proof):** one consistent snapshot `S`, with
 //! `F < S < H`, supplies a complete row anchor. WAL changes in `(F, H]` outrank the F-stamped
@@ -13,44 +18,53 @@
 //! after `H` stay queued for the normal live path after the atomic shadow cutover. TRUNCATE is a
 //! table-level WAL boundary, so the overlay cannot leave ghosts.
 //!
-//! **Cursor-vs-manifest ordering:** the manifest `insert_ready` and the cursor advance share ONE
-//! control-pg transaction. A crash between "file durable in S3" and that commit re-exports one
-//! chunk — a duplicate the dedup algebra eats. The reverse order (cursor first) would build a gap
-//! nothing can heal. Duplicates are safe; gaps are not.
-//!
-//! For very large tables, a future CTID-range fan-out (deferred goal §3) would parallelise
-//! *within* a chunk — the composition point is `export_next_chunk`'s SELECT; nothing else changes.
+//! **Object-vs-manifest ordering:** each remote object's manifest insert and the attempt's completed
+//! object count share ONE control-pg transaction. A crash between object durability and that commit
+//! re-exports rows — duplicates the loader algebra removes. Recording progress first would create a
+//! gap nothing could heal. Duplicates are safe; gaps are not.
 
 use crate::reload_event::{
     FenceEmission, FencePhase, FenceSpec, FenceTarget, FenceTimeouts, FenceWaiters,
 };
-use crate::sink::{FileKind, ParquetSink};
+use crate::sink::ParquetSink;
 use anyhow::Context;
 use common::sql::{SqlIdent, SqlStrExt};
 use common::{
-    EpochNo, Kind, Lsn, Op, PgRelation, ReloadId, SchemaVersionNo, SinkMeta, TupleValue,
+    EpochNo, Kind, Lsn, Op, PgRelation, Redacted, ReloadId, SchemaVersionNo, SinkMeta, TupleValue,
     UtcTimestamp,
 };
-use std::fmt::Write as _;
-use std::num::NonZeroU64;
+use futures_util::StreamExt as _;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinSet;
 use tokio_postgres::NoTls;
+use tokio_postgres::binary_copy::BinaryCopyOutStream;
+use tokio_postgres::types::Type;
 use tracing::Instrument as _;
 use uuid::Uuid;
 
 /// Bound how long one queued schema-fence lock may wait behind structural DDL before it retries.
 const FENCE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+/// Canonicalize every Postgres type-output function that feeds the Arrow text parsers. Transaction
+/// scope prevents reloads from changing the connection's unrelated fence behavior.
+const CANONICAL_COPY_GUCS_SQL: &str = "SET LOCAL DateStyle = 'ISO, YMD'; \
+    SET LOCAL IntervalStyle = 'postgres'; \
+    SET LOCAL bytea_output = 'hex'; \
+    SET LOCAL extra_float_digits = 3; \
+    SET LOCAL TimeZone = 'UTC';";
 
-/// What one chunk did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChunkOutcome {
-    /// A full chunk exported; more rows may remain.
-    Exported { rows: u64 },
-    /// The table is drained: this chunk came back short (possibly empty). A short-but-non-empty
-    /// chunk still produced a file; an empty one produced nothing. Lifecycle progress comes from
-    /// explicit baseline/end markers, never from the presence of this file.
-    Drained { rows: u64 },
+fn coordinator_snapshot_setup_sql() -> String {
+    format!(
+        "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; \
+         {CANONICAL_COPY_GUCS_SQL} \
+         SET LOCAL row_security = off; \
+         SET LOCAL statement_timeout = 0; \
+         SET LOCAL idle_in_transaction_session_timeout = 0; \
+         SET LOCAL lock_timeout = '5s'"
+    )
 }
 
 /// How a whole [`ChunkExporter::run`] ended.
@@ -65,7 +79,7 @@ pub enum RunOutcome {
     /// attempt is invalid and the controller must restart it at `new_version` (reload H9).
     SchemaChanged { new_version: SchemaVersionNo },
     /// This exporter was adopted after losing ownership of its connection-local source snapshot.
-    /// Even a zero-chunk cursor cannot safely reuse the attempt: the expired prior exporter may
+    /// Even an attempt with zero completed files cannot safely be reused: the expired prior exporter may
     /// still emit H from an older snapshot. The controller atomically fails/purges this attempt and
     /// creates a fresh lease-carrying successor with a fresh F.
     SnapshotLost,
@@ -111,8 +125,18 @@ fn version_changed(
 /// Everything the exporter needs beyond the reload row itself.
 #[derive(Clone, Debug)]
 pub struct ChunkExportConfig {
-    /// Rows per chunk SELECT. Non-zero, or the export would make no progress.
+    /// Maximum rows per completed remote reload object. Non-zero, or no object could complete.
     pub chunk_rows: NonZeroU64,
+    /// Maximum estimated Arrow bytes retained by one worker before it must flush. This is derived
+    /// from the process-wide in-flight ceiling and the configured table/worker product; it is not
+    /// a fourth operator-facing reload control.
+    pub router_batch_bytes: NonZeroU64,
+    /// Process-wide admission for memory-heavy COPY -> Parquet pipelines. Workers still establish
+    /// and import their ordinary SQL snapshots together, but only this many may allocate Arrow and
+    /// multipart buffers at once across every table reload.
+    pub worker_admission: ReloadWorkerAdmission,
+    /// Maximum ordinary SQL COPY workers used for this table, including the snapshot coordinator.
+    pub workers_per_table: NonZeroUsize,
     /// How long a start/end fence waits to return through the decode loop.
     pub echo_timeout: Duration,
     /// This pod's identity, written as the reload's `lease_holder`.
@@ -123,11 +147,82 @@ pub struct ChunkExportConfig {
     pub publication_name: String,
 }
 
+/// Shared admission gate for the memory-heavy portion of reload workers.
+///
+/// This is deliberately an internal policy object rather than an operator-facing fourth reload
+/// knob. The permit count is derived from `max_inflight_bytes` and the configured table/worker
+/// ceiling; callers clone the same value into every exporter.
+#[derive(Clone, Debug)]
+pub struct ReloadWorkerAdmission {
+    permits: Arc<Semaphore>,
+    process_budget: Arc<crate::memory::ProcessMemoryBudget>,
+}
+
+impl ReloadWorkerAdmission {
+    /// Build one process-wide reload worker gate.
+    #[must_use]
+    pub fn new(limit: NonZeroUsize) -> Self {
+        let allowance = u64::try_from(limit.get())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(RELOAD_WORKER_MEMORY_RESERVATION_BYTES);
+        let allowance = NonZeroU64::new(allowance).unwrap_or(NonZeroU64::MAX);
+        Self::with_process_budget(
+            limit,
+            Arc::new(crate::memory::ProcessMemoryBudget::new(allowance)),
+        )
+    }
+
+    pub(crate) fn with_process_budget(
+        limit: NonZeroUsize,
+        process_budget: Arc<crate::memory::ProcessMemoryBudget>,
+    ) -> Self {
+        // Keep the constructor safe independently of the production config derivation. Tokio
+        // panics when `Semaphore::new` is handed more than `MAX_PERMITS`; callers constructing
+        // this reusable policy object directly must not be able to turn an extreme, otherwise
+        // well-typed count into a process abort.
+        let permits = limit.get().min(Semaphore::MAX_PERMITS);
+        Self {
+            permits: Arc::new(Semaphore::new(permits)),
+            process_budget,
+        }
+    }
+
+    async fn acquire(&self) -> anyhow::Result<ReloadWorkerPermit> {
+        let route = Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .context("reload worker memory-admission gate closed")?;
+        let memory = self
+            .process_budget
+            .reserve_reload(
+                NonZeroU64::new(RELOAD_WORKER_MEMORY_RESERVATION_BYTES).unwrap_or(NonZeroU64::MIN),
+            )
+            .await;
+        Ok(ReloadWorkerPermit {
+            _route: route,
+            _memory: memory,
+        })
+    }
+
+    #[cfg(test)]
+    fn available_permits(&self) -> usize {
+        self.permits.available_permits()
+    }
+}
+
+#[derive(Debug)]
+struct ReloadWorkerPermit {
+    _route: OwnedSemaphorePermit,
+    _memory: crate::memory::ReloadMemoryReservation,
+}
+
 /// One table's chunked export (reload §5.3). Owns a side SQL connection; talks to the consume
 /// loop only through [`FenceWaiters`]; never touches the replication connection.
 #[derive(Debug)]
 pub struct ChunkExporter {
-    client: tokio_postgres::Client,
+    /// The coordinator is temporarily moved into the worker set while COPY runs and restored for H.
+    client: Option<tokio_postgres::Client>,
+    source_db_url: Redacted<String>,
     fence_waiters: Arc<FenceWaiters>,
     pool: sqlx::PgPool,
     sink: ParquetSink,
@@ -137,22 +232,12 @@ pub struct ChunkExporter {
     rel: PgRelation,
     /// The `table` metric label (`"<schema>.<table>"`) for this export, precomputed from `rel`.
     series: String,
-    /// PK columns in PK-INDEX order (pg_index.indkey position) — the pagination total order.
-    pk_cols: Vec<String>,
     schema_version: SchemaVersionNo,
     reload_id: ReloadId,
-    /// Last COMPLETED chunk (from `table_reload`; 0 = fresh start).
-    chunk_no: i64,
-    /// Last exported PK bound as a JSON array of text values in PK-column order; `None` = start.
-    cursor: Option<serde_json::Value>,
     /// One safe lower fence shared by every chunk in the consistent baseline snapshot.
     start_lsn: Lsn,
     /// Stable source request correlation; synthesized deterministically for legacy callers.
     request_id: Uuid,
-    /// Whether this connection currently owns the one repeatable-read dump transaction. Public
-    /// one-chunk test/diagnostic calls share this state with [`Self::run`], so no caller can
-    /// accidentally build one attempt from multiple source snapshots.
-    snapshot_open: bool,
 }
 
 impl ChunkExporter {
@@ -163,7 +248,7 @@ impl ChunkExporter {
     /// # Errors
     ///
     /// Returns [`anyhow::Error`] if the source SQL connection, relation description, registry lookup,
-    /// frozen schema resolution, or primary-key discovery fails.
+    /// frozen schema resolution, or start fence fails.
     pub async fn connect(
         source_db_url: &str,
         pool: sqlx::PgPool,
@@ -186,12 +271,11 @@ impl ChunkExporter {
             }
         };
         tokio::spawn(driver.in_current_span());
-        // The registry chain (control-pg) and the PK-index read (the SOURCE catalog) hit different
-        // servers and neither consumes the other's output, so this dial-up costs the slower of the
-        // two instead of their sum — `main::establish_stream`'s argument, paid on every attempt and
-        // again on every DDL restart. Both branches are terminal-on-error and fail fast: whichever
-        // resolves first drops the other, and either way the exporter never connects.
-        let ((rel, schema_version), (live_relation, pk_cols)) = tokio::try_join!(
+        // The registry chain (control-pg) and the live SOURCE catalog hit different servers and
+        // neither consumes the other's output, so startup costs the slower branch rather than their
+        // sum. Range planning deliberately does not depend on a primary-key index: every plain
+        // heap table accepted by preflight can be divided by physical CTID pages.
+        let ((rel, schema_version), live_relation) = tokio::try_join!(
             async {
                 // A resumed attempt exports at its FROZEN version; a fresh one at the
                 // registry's latest.
@@ -238,27 +322,14 @@ impl ChunkExporter {
                     .context("registry columns snapshot is not a PgRelation")?;
                 anyhow::Ok((rel, schema_version))
             },
-            // Pagination order comes from the PRIMARY KEY INDEX (pg_index.indkey position) — not
-            // the relation's attnum order, and never the PK∪replica-identity union — so the
-            // row-comparison WHERE and the ORDER BY are served by the PK btree instead of a
-            // per-chunk top-N sort.
             async {
-                tokio::try_join!(
-                    async {
-                        crate::source_catalog::describe_source_relation(
-                            &client,
-                            &req.source_schema,
-                            &req.source_table,
-                        )
-                        .await
-                        .context("describe live relation for reload")
-                    },
-                    async {
-                        pk_columns_in_index_order(&client, &req.source_schema, &req.source_table)
-                            .await
-                            .context("read PK index column order")
-                    },
+                crate::source_catalog::describe_source_relation(
+                    &client,
+                    &req.source_schema,
+                    &req.source_table,
                 )
+                .await
+                .context("describe live relation for reload")
             },
         )?;
         if live_relation != rel {
@@ -276,8 +347,6 @@ impl ChunkExporter {
             }
             .into());
         }
-        validate_export_keys(&rel, &pk_cols)
-            .with_context(|| format!("validate reload {} export keys", req.reload_id))?;
         let request_id = req
             .source_request_id
             .or(req.parent_request_id)
@@ -304,53 +373,42 @@ impl ChunkExporter {
             }
         };
         Ok(ChunkExporter {
-            client,
+            client: Some(client),
+            source_db_url: source_db_url.into(),
             fence_waiters,
             pool,
             sink,
             cfg,
             series: format!("{}.{}", rel.schema, rel.name),
             rel,
-            pk_cols,
             schema_version,
             reload_id: req.reload_id,
-            chunk_no: req.chunk_no,
-            cursor: req.cursor_pk.clone(),
             start_lsn,
             request_id,
-            snapshot_open: false,
         })
     }
 
-    /// Walk one fresh, connection-owned snapshot until a short chunk says drained. The row then
-    /// stays `exporting`, fully drained with its cursor at the end, until the controller records
-    /// `export_complete` and the final watermark `H`. An adopted call may recover durable H, but
-    /// otherwise returns [`RunOutcome::SnapshotLost`] before opening or scanning a new snapshot.
+    /// Drain one fresh exported snapshot through all ordinary SQL workers, then establish H. The
+    /// reload row stays `exporting` until the controller records `export_complete(H)`. An adopted
+    /// call may recover durable H, but otherwise returns [`RunOutcome::SnapshotLost`] before
+    /// opening or scanning a new snapshot.
     ///
-    /// Before each chunk, re-check the table's structural version (H9): a DDL that bumped
-    /// it past this attempt's frozen version returns [`RunOutcome::SchemaChanged`] so the
-    /// controller restarts the attempt at the new shape. Every attempt is single-schema by
-    /// construction; the loader therefore never reconciles a version change *inside* a rebuild.
+    /// The coordinator's ACCESS SHARE lock freezes the table shape while every COPY runs. A
+    /// structural version observed before snapshot commit or at H returns
+    /// [`RunOutcome::SchemaChanged`], so every attempt and every output file remains single-schema.
     ///
     /// The tradeoff (H9): restart-on-DDL trades *wasted export work* (bounded by
     /// `reload_max_restarts`, counted by `walrus_reload_restarts_total`) for the loader never
-    /// facing a half-populated table at a version boundary. Per-chunk version *tolerance* — letting
-    /// chunks straddle versions and reconciling in the rebuild — was rejected: its failure mode is
-    /// silent mis-reconciliation, not visible waste. Revisit only if restart churn on DDL-heavy
-    /// tables becomes a *measured* problem (`single-table-reload.md` H9).
+    /// facing a half-populated table at a version boundary. Letting one baseline straddle versions
+    /// was rejected because its failure mode is silent mis-reconciliation rather than visible work.
     ///
     /// ## Cancel safety
     ///
-    /// **Not cancel-safe within a chunk; safe to drop between them.** The controller deliberately
-    /// races this future in [`lease_guarded_export`](crate::reload::lease_guarded_export), so a drop
-    /// mid-[`Self::export_next_chunk`] is a normal shutdown/lost-lease outcome rather than a bug: the
-    /// chunk's manifest row and its cursor advance share ONE control-pg transaction, so an
-    /// uncommitted chunk simply never happened and the row stays `exporting`; adoption terminally
-    /// supersedes/purges that attempt and starts a fresh fenced successor. A drop between that
-    /// chunk's S3 PUT and the commit orphans the object exactly as
-    /// [`crate::consume::flush_batch_kind`] does, and the successor regenerates it.
-    /// What a drop can never recover is partial progress *inside* one chunk — those rows live in this
-    /// future's batcher — which is why the cursor only ever moves at a committed chunk boundary.
+    /// The controller deliberately races this future in
+    /// [`lease_guarded_export`](crate::reload::lease_guarded_export). Dropping it aborts worker
+    /// transactions and incomplete multipart uploads. A remote object completed just before its
+    /// control transaction becomes an orphan; a manifest already committed is purged when adoption
+    /// supersedes this snapshot-lost attempt. No physical range is persisted as resumable progress.
     ///
     /// # Errors
     ///
@@ -364,9 +422,9 @@ impl ChunkExporter {
         // incorrectly pulling future state into the H rebuild.
         //
         // Validate the whole persisted fence identity before trusting H, then repeat the same
-        // post-H registry check used by the normal drain path. Neither operation reads table data.
+        // boundary-scoped DDL check used by the normal drain path. Neither operation reads table data.
         if let Some(final_lsn) = self.recover_durable_end().await? {
-            if let Some(new_version) = self.check_schema_still_current().await? {
+            if let Some(new_version) = self.check_schema_changed_through(final_lsn).await? {
                 return Ok(RunOutcome::SchemaChanged { new_version });
             }
             tracing::info!(
@@ -377,42 +435,23 @@ impl ChunkExporter {
             return Ok(RunOutcome::Drained { final_lsn });
         }
 
-        // A PostgreSQL snapshot belongs to one backend transaction; neither the PK cursor nor the
-        // lease can resurrect it after adoption. This applies even at chunk zero: the expired old
+        // A PostgreSQL snapshot belongs to one backend transaction; neither a file count nor the
+        // lease can resurrect it after adoption. This applies even before the first file: the old
         // exporter could still finish an empty/short snapshot and emit H while this adopter starts
         // a later one. Durable H above is the only safe same-attempt recovery fact.
         if lost_snapshot_ownership {
             return Ok(RunOutcome::SnapshotLost);
         }
 
-        if !self.snapshot_open {
-            self.begin_dump_snapshot().await?;
-        }
-        let snapshot_outcome = match self.export_snapshot().await {
-            Ok(outcome) => outcome,
-            Err(export_error) => {
-                if let Err(rollback_error) = self.rollback_dump_snapshot().await {
-                    return Err(export_error.context(format!(
-                        "rolling back the failed reload snapshot also failed: {rollback_error:#}"
-                    )));
-                }
-                return Err(export_error);
-            }
-        };
+        let snapshot_outcome = self.export_parallel_snapshot().await?;
         match snapshot_outcome {
             SnapshotExportOutcome::SchemaChanged { new_version } => {
-                self.rollback_dump_snapshot().await?;
                 Ok(RunOutcome::SchemaChanged { new_version })
             }
             SnapshotExportOutcome::Drained { rows } => {
-                // H must follow the snapshot commit. Releasing the source transaction first also
-                // lets queued DDL win its table lock; H's live-shape fence will then reject this
-                // attempt instead of publishing a boundary for an obsolete shape.
-                self.client
-                    .batch_execute("COMMIT")
-                    .await
-                    .context("commit repeatable-read reload snapshot before H")?;
-                self.snapshot_open = false;
+                // The parallel exporter commits every imported transaction and the coordinator
+                // (last) before returning. Releasing those locks lets queued DDL win; H's
+                // live-shape fence then rejects an obsolete attempt rather than publishing it.
                 let final_lsn = match self.establish_end_fence().await? {
                     EndFenceOutcome::Durable(lsn) => lsn,
                     EndFenceOutcome::SchemaChanged(new_version) => {
@@ -423,14 +462,13 @@ impl ChunkExporter {
                 // topology-only ALTER TABLE (for example ATTACH/DETACH PARTITION) can leave
                 // that shape byte-for-byte identical while changing which rows a published
                 // root contains. Its ddl_audit row precedes H in the same WAL stream, so once
-                // H's echo resolves the committed registry version is authoritative. Reject
-                // the attempt if that boundary crossed any structural DDL.
-                if let Some(new_version) = self.check_schema_still_current().await? {
+                // H's echo resolves, the committed DDL history through H is authoritative. Reject
+                // the attempt if that boundary crossed structural DDL, while ignoring DDL after H.
+                if let Some(new_version) = self.check_schema_changed_through(final_lsn).await? {
                     return Ok(RunOutcome::SchemaChanged { new_version });
                 }
                 tracing::info!(
                     reload_id = %self.reload_id,
-                    chunk_no = self.chunk_no,
                     rows,
                     final_lsn = %final_lsn,
                     "reload export drained (controller flips export_complete)"
@@ -440,70 +478,254 @@ impl ChunkExporter {
         }
     }
 
-    /// Walk all keyset chunks under the source transaction opened by
-    /// [`Self::begin_dump_snapshot`]. This method never commits H; its caller owns rollback/commit.
-    async fn export_snapshot(&mut self) -> anyhow::Result<SnapshotExportOutcome> {
-        loop {
-            if let Some(new_version) = self.check_schema_still_current().await? {
-                tracing::info!(
-                    reload_id = %self.reload_id,
-                    frozen = %self.schema_version,
-                    new_version = %new_version,
-                    "reload interrupted: DDL bumped schema_version between chunks — restarting (H9)"
-                );
+    /// Freeze one source snapshot, import it into ordinary SQL workers, stream all physical ranges,
+    /// then commit child transactions followed by the coordinator. No replication connection or
+    /// slot is created anywhere on this path.
+    async fn export_parallel_snapshot(&mut self) -> anyhow::Result<SnapshotExportOutcome> {
+        let plan = match self.begin_parallel_snapshot().await? {
+            SnapshotPlanOutcome::Ready(plan) => plan,
+            SnapshotPlanOutcome::SchemaChanged(new_version) => {
                 return Ok(SnapshotExportOutcome::SchemaChanged { new_version });
             }
-            match self.export_next_chunk().await? {
-                ChunkOutcome::Exported { rows } => {
-                    tracing::info!(
-                        reload_id = %self.reload_id,
-                        chunk_no = self.chunk_no,
-                        rows,
-                        "reload chunk exported"
-                    );
-                }
-                ChunkOutcome::Drained { rows } => {
-                    if let Some(new_version) = self.check_schema_still_current().await? {
-                        return Ok(SnapshotExportOutcome::SchemaChanged { new_version });
+        };
+        let cached = crate::relcache::RelationCache::default()
+            .upsert_from_relation(self.rel.clone(), self.schema_version)
+            .context("build Arrow schema for streamed reload COPY")?;
+
+        // Initialize every child before any worker begins COPY. If a queued ACCESS EXCLUSIVE DDL
+        // makes a child's NOWAIT lock fail, abandon the whole shared snapshot.
+        let mut clients = Vec::with_capacity(plan.worker_count);
+        for worker_index in 1..plan.worker_count {
+            match connect_snapshot_worker(
+                self.source_db_url.expose(),
+                &plan.snapshot_id,
+                &self.rel,
+                worker_index,
+            )
+            .await
+            {
+                Ok(client) => clients.push((worker_index, client)),
+                Err(error) => {
+                    for (_, client) in &clients {
+                        rollback_source_client(client, "prepared COPY worker setup failure").await;
                     }
-                    return Ok(SnapshotExportOutcome::Drained { rows });
+                    if let Err(rollback_error) = self.rollback_dump_snapshot().await {
+                        return Err(error.context(format!(
+                            "rolling back snapshot after worker setup failure also failed: {rollback_error:#}"
+                        )));
+                    }
+                    return Err(error);
                 }
             }
         }
-    }
-
-    /// Open the one consistent source snapshot used by every chunk in this attempt. Turning row
-    /// security off is deliberate: for a role subject to an RLS policy PostgreSQL errors instead
-    /// of silently exporting a policy-filtered partial table.
-    async fn begin_dump_snapshot(&mut self) -> anyhow::Result<()> {
-        let begin = self
+        let coordinator = self
             .client
-            .batch_execute(
-                "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; \
-                 SET LOCAL row_security = off",
-            )
-            .await;
-        if let Err(begin_error) = begin {
-            let rollback_error = self.client.batch_execute("ROLLBACK").await.err();
-            let error = anyhow::Error::new(begin_error)
-                .context("begin read-only repeatable-read reload snapshot with RLS disabled");
-            if let Some(rollback_error) = rollback_error {
-                return Err(error.context(format!(
-                    "rolling back the failed snapshot setup also failed: {rollback_error}"
-                )));
+            .take()
+            .context("reload snapshot coordinator connection is missing")?;
+        clients.push((0, coordinator));
+        let ctx = CopyWorkerContext {
+            ranges: Arc::new(RangeQueue::new(plan.ranges)),
+            cached,
+            pool: self.pool.clone(),
+            sink: self.sink.clone(),
+            chunk_rows: self.cfg.chunk_rows,
+            router_batch_bytes: self.cfg.router_batch_bytes,
+            worker_admission: self.cfg.worker_admission.clone(),
+            start_lsn: self.start_lsn,
+            schema_version: self.schema_version,
+            reload_id: self.reload_id,
+            epoch: self.cfg.epoch,
+            instance: self.cfg.instance.clone(),
+            series: self.series.clone(),
+        };
+
+        let mut workers = JoinSet::new();
+        for (worker_index, client) in clients {
+            let worker_ctx = ctx.clone();
+            workers.spawn(
+                async move { run_copy_worker(worker_index, client, worker_ctx).await }
+                    .in_current_span(),
+            );
+        }
+
+        let mut completed = Vec::with_capacity(plan.worker_count);
+        let mut failure = None;
+        while let Some(result) = workers.join_next().await {
+            match result {
+                Ok(Ok(worker)) => completed.push(worker),
+                Ok(Err(error)) => {
+                    failure = Some(error);
+                    break;
+                }
+                Err(error) => {
+                    failure = Some(anyhow::Error::new(error).context("reload COPY worker task"));
+                    break;
+                }
+            }
+        }
+        if let Some(error) = failure {
+            workers.abort_all();
+            while workers.join_next().await.is_some() {}
+            for worker in &completed {
+                rollback_source_client(&worker.client, "sibling COPY worker failure").await;
             }
             return Err(error);
         }
-        self.snapshot_open = true;
-        Ok(())
+
+        // A DDL can have committed just before ACCESS SHARE and only now have reached the registry.
+        // Even if its final catalog shape compares equal, do not stamp files at an older version.
+        if let Some(new_version) = self.check_schema_still_current().await? {
+            let mut coordinator = None;
+            for worker in completed {
+                rollback_source_client(&worker.client, "reload schema version changed").await;
+                if worker.worker_index == 0 {
+                    coordinator = Some(worker.client);
+                }
+            }
+            self.client = coordinator;
+            return Ok(SnapshotExportOutcome::SchemaChanged { new_version });
+        }
+
+        let rows = completed
+            .iter()
+            .fold(0u64, |total, worker| total.saturating_add(worker.rows));
+        let coordinator_pos = completed
+            .iter()
+            .position(|worker| worker.worker_index == 0)
+            .context("parallel reload lost its snapshot coordinator worker")?;
+        let coordinator = completed.swap_remove(coordinator_pos);
+
+        // Children release first. The coordinator owns the exported snapshot and the table lock
+        // that made every range's shape stable, so it commits last.
+        for worker in &completed {
+            if let Err(error) = worker.client.batch_execute("COMMIT").await {
+                rollback_source_client(&coordinator.client, "child snapshot commit failure").await;
+                return Err(
+                    anyhow::Error::new(error).context("commit imported reload worker snapshot")
+                );
+            }
+        }
+        coordinator
+            .client
+            .batch_execute("COMMIT")
+            .await
+            .context("commit exported reload coordinator snapshot")?;
+        self.client = Some(coordinator.client);
+        Ok(SnapshotExportOutcome::Drained { rows })
     }
 
-    async fn rollback_dump_snapshot(&mut self) -> anyhow::Result<()> {
-        self.client
-            .batch_execute("ROLLBACK")
+    /// Open the coordinator transaction, lock the frozen relation shape, export its snapshot, and
+    /// plan a bounded number of heap-page ranges. Turning RLS off makes a policy-bound role error
+    /// instead of silently producing a partial baseline.
+    async fn begin_parallel_snapshot(&mut self) -> anyhow::Result<SnapshotPlanOutcome> {
+        let schema = SqlIdent::new(&self.rel.schema).context("validate reload lock schema")?;
+        let table = SqlIdent::new(&self.rel.name).context("validate reload lock table")?;
+        let lock_sql = format!("LOCK TABLE {schema}.{table} IN ACCESS SHARE MODE");
+        let client = self
+            .client
+            .as_mut()
+            .context("reload snapshot coordinator connection is missing")?;
+        let setup_sql = coordinator_snapshot_setup_sql();
+        if let Err(error) = client.batch_execute(&setup_sql).await {
+            rollback_source_client(client, "coordinator snapshot setup failure").await;
+            return Err(anyhow::Error::new(error)
+                .context("begin read-only repeatable-read reload coordinator snapshot"));
+        }
+        if let Err(error) = client.batch_execute(&lock_sql).await {
+            let rollback_error = self.rollback_dump_snapshot().await.err();
+            let error = anyhow::Error::new(error).context("lock reload table for snapshot export");
+            return Err(match rollback_error {
+                Some(rollback_error) => error.context(format!(
+                    "rolling back failed table lock also failed: {rollback_error:#}"
+                )),
+                None => error,
+            });
+        }
+
+        let live_relation = crate::source_catalog::describe_source_relation(
+            self.client.as_ref().context("coordinator disappeared")?,
+            &self.rel.schema,
+            &self.rel.name,
+        )
+        .await
+        .context("describe locked live relation for reload")?;
+        if live_relation != self.rel {
+            self.rollback_dump_snapshot().await?;
+            let new_version = await_schema_change(
+                &self.pool,
+                self.cfg.epoch,
+                &self.rel.schema,
+                &self.rel.name,
+                self.schema_version,
+                self.reload_id,
+                self.cfg.echo_timeout,
+            )
+            .await?;
+            return Ok(SnapshotPlanOutcome::SchemaChanged(new_version));
+        }
+
+        let client = self.client.as_ref().context("coordinator disappeared")?;
+        let snapshot_id: String = client
+            .query_one("SELECT pg_catalog.pg_export_snapshot()", &[])
             .await
-            .context("roll back repeatable-read reload snapshot")?;
-        self.snapshot_open = false;
+            .context("export reload coordinator snapshot")?
+            .get(0);
+        let storage = client
+            .query_one(
+                "SELECT am.amname,
+                        pg_catalog.pg_relation_size(c.oid, 'main')::bigint,
+                        pg_catalog.current_setting('block_size')::bigint
+                 FROM pg_catalog.pg_class c
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                 LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam
+                 WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'r'",
+                &[&self.rel.schema, &self.rel.name],
+            )
+            .await
+            .context("read locked reload relation storage")?;
+        let access_method: Option<String> = storage.get(0);
+        let relation_bytes: i64 = storage.get(1);
+        let block_bytes: i64 = storage.get(2);
+        anyhow::ensure!(
+            relation_bytes >= 0 && block_bytes > 0,
+            "invalid relation storage size {relation_bytes}/{block_bytes} for {}.{}",
+            self.rel.schema,
+            self.rel.name
+        );
+        let relation_bytes =
+            u64::try_from(relation_bytes).context("relation size does not fit u64")?;
+        let block_bytes = u64::try_from(block_bytes).context("block size does not fit u64")?;
+        let blocks = relation_bytes.div_ceil(block_bytes);
+        let ranges = if access_method.as_deref() == Some("heap") && blocks > 0 {
+            plan_ctid_ranges(blocks, self.cfg.workers_per_table)
+        } else {
+            // Non-heap access methods are still streamed, but physical CTID ordering is not
+            // assumed to be splittable. One worker drains the complete table safely.
+            vec![ScanRange::Full]
+        };
+        let worker_count = self.cfg.workers_per_table.get().min(ranges.len()).max(1);
+        tracing::info!(
+            reload_id = %self.reload_id,
+            workers = worker_count,
+            ranges = ranges.len(),
+            blocks,
+            access_method = access_method.as_deref().unwrap_or("none"),
+            "reload snapshot exported; starting ordinary SQL COPY workers"
+        );
+        Ok(SnapshotPlanOutcome::Ready(SourceSnapshotPlan {
+            snapshot_id,
+            ranges,
+            worker_count,
+        }))
+    }
+
+    async fn rollback_dump_snapshot(&self) -> anyhow::Result<()> {
+        if let Some(client) = &self.client {
+            client
+                .batch_execute("ROLLBACK")
+                .await
+                .context("roll back repeatable-read reload snapshot")?;
+        }
         Ok(())
     }
 
@@ -541,16 +763,10 @@ impl ChunkExporter {
         )
     }
 
-    /// The per-chunk staleness check: is the table still at this attempt's frozen
-    /// `schema_version`? Reads the REGISTRY's latest version (control-pg, a cheap indexed MAX) —
-    /// the sink's own structural-version source of truth, bumped only when a Relation message
-    /// decodes — never a per-chunk catalog query against the source. Returns the new version if a
-    /// structural bump landed, else `None`.
-    ///
-    /// A window remains between this check and the chunk's own SELECT where DDL can still slip in;
-    /// that chunk exports at the old shape, but the NEXT chunk's check catches the bump and the
-    /// restart throws that file away with the rest — harmless only because the restart's purge is
-    /// total (H9).
+    /// Is the table still at this attempt's frozen `schema_version`? Reads the registry's latest
+    /// version (control-pg, a cheap indexed MAX), the sink's structural source of truth. The source
+    /// ACCESS SHARE locks close the scan-time DDL window; this check covers DDL decoded just before
+    /// those locks or while H is being established.
     async fn check_schema_still_current(&self) -> anyhow::Result<Option<SchemaVersionNo>> {
         let latest = control::read_latest_version(
             &self.pool,
@@ -563,11 +779,35 @@ impl ChunkExporter {
         Ok(version_changed(self.schema_version, latest))
     }
 
+    /// Did structural DDL commit inside this attempt's closed source boundary? The end fence's
+    /// source lock validates the live shape at H; this LSN-bounded history read catches
+    /// topology-only changes that preserve that shape. DDL strictly after H belongs to normal live
+    /// processing and must not waste or fail an already-valid F..H snapshot.
+    async fn check_schema_changed_through(
+        &self,
+        through_lsn: Lsn,
+    ) -> anyhow::Result<Option<SchemaVersionNo>> {
+        let latest = control::read_latest_ddl_version_through(
+            &self.pool,
+            self.cfg.epoch,
+            &self.rel.schema,
+            &self.rel.name,
+            through_lsn,
+        )
+        .await
+        .context("read boundary-scoped DDL version for reload staleness check")?;
+        Ok(version_changed(self.schema_version, latest))
+    }
+
     /// Emit the terminal source event and return only after decode has force-flushed the target and
     /// persisted its durable end marker.
     async fn establish_end_fence(&mut self) -> anyhow::Result<EndFenceOutcome> {
+        let client = self
+            .client
+            .as_mut()
+            .context("reload source connection is missing before end fence")?;
         match crate::reload_event::emit_fence(
-            &mut self.client,
+            client,
             &self.fence_waiters,
             FenceSpec {
                 publication: &self.cfg.publication_name,
@@ -630,142 +870,445 @@ impl ChunkExporter {
             )),
         }
     }
+}
 
-    /// One chunk: ensure the attempt's single repeatable-read transaction is open, SELECT the next
-    /// PK slice, write Parquet stamped at the fixed `F`, then commit one control-pg transaction
-    /// containing the manifest row and cursor advance. The source transaction remains open for the
-    /// next call or [`Self::run`]. A chunk shorter than `chunk_rows` means the table is drained.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`anyhow::Error`] when the source slice cannot be read,
-    /// Arrow/Parquet/S3 export fails, or the manifest-plus-cursor control transaction cannot commit.
-    pub async fn export_next_chunk(&mut self) -> anyhow::Result<ChunkOutcome> {
-        // Keep the public one-chunk seam honest: integration tests and diagnostics may step an
-        // exporter manually, but every such step must still belong to the exact snapshot that a
-        // later `run()` continues. Production `run()` has already opened it, making this a no-op.
-        if !self.snapshot_open {
-            self.begin_dump_snapshot().await?;
+/// More ranges than workers smooth out dead-page and row-width skew without creating more source
+/// sessions. This is an implementation detail, not a fourth operator control.
+const RANGE_TASKS_PER_WORKER: usize = 4;
+/// The largest Arrow micro-batch by row count. Remote object size remains operator-controlled by
+/// `reload_chunk_rows`; this smaller threshold exists solely to bound router memory.
+const ROUTER_BATCH_ROWS: u64 = 1_024;
+/// Never let one worker claim more than this much of the process-wide Arrow-buffer allowance.
+const ROUTER_BATCH_BYTES_MAX: u64 = 8 * 1024 * 1024;
+/// Conservative allowance for one active COPY -> Arrow -> Parquet -> multipart route: one Arrow
+/// micro-batch, one 8 MiB multipart part, Parquet's encoded row-group scratch, and bookkeeping.
+/// The estimate is intentionally larger than the two fixed 8 MiB buffers. As with every row-based
+/// memory guard, a single source value larger than the allowance must still be admitted so the
+/// export can make progress.
+const RELOAD_WORKER_MEMORY_RESERVATION_BYTES: u64 = 32 * 1024 * 1024;
+/// Parquet retains metadata for every row-group/column pair until it writes the footer. Bounding
+/// these pairs keeps an arbitrarily large `chunk_rows` value from turning metadata into an
+/// object-sized memory buffer. Reaching the bound closes the object early; `chunk_rows` remains the
+/// strict row-count maximum.
+const MAX_PARQUET_COLUMN_CHUNKS_PER_OBJECT: usize = 4_096;
+
+/// Split the existing process-wide in-flight allowance across the maximum configured COPY streams.
+/// A single over-sized source value can exceed an estimate by its own size, but ordinary aggregate
+/// Arrow buffering remains within the configured ceiling.
+#[must_use]
+pub(crate) fn router_batch_bytes(
+    max_inflight_bytes: NonZeroU64,
+    max_copy_streams: NonZeroUsize,
+) -> NonZeroU64 {
+    let streams = u64::try_from(max_copy_streams.get()).unwrap_or(u64::MAX);
+    let per_worker = max_inflight_bytes.get() / streams;
+    NonZeroU64::new(per_worker.clamp(1, ROUTER_BATCH_BYTES_MAX)).unwrap_or(NonZeroU64::MIN)
+}
+
+/// Bound the number of concurrently active memory-heavy reload routes. Configured workers remain
+/// the source-session ceiling; excess workers wait after importing the common snapshot. At least
+/// one route is always admitted so a diagnostic memory setting cannot deadlock reloads.
+#[must_use]
+pub(crate) fn reload_memory_worker_limit(
+    max_inflight_bytes: NonZeroU64,
+    max_copy_streams: NonZeroUsize,
+) -> NonZeroUsize {
+    let budget_workers = max_inflight_bytes.get() / RELOAD_WORKER_MEMORY_RESERVATION_BYTES;
+    let budget_workers = usize::try_from(budget_workers).unwrap_or(usize::MAX).max(1);
+    let limit = max_copy_streams
+        .get()
+        .min(budget_workers)
+        .min(Semaphore::MAX_PERMITS);
+    NonZeroUsize::new(limit).unwrap_or(NonZeroUsize::MIN)
+}
+
+fn max_row_groups_per_object(parquet_columns: usize) -> usize {
+    MAX_PARQUET_COLUMN_CHUNKS_PER_OBJECT
+        .checked_div(parquet_columns)
+        .unwrap_or(1)
+        .max(1)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScanRange {
+    Full,
+    Blocks { start: u64, end: Option<u64> },
+}
+
+#[derive(Debug)]
+struct SourceSnapshotPlan {
+    snapshot_id: String,
+    ranges: Vec<ScanRange>,
+    worker_count: usize,
+}
+
+#[derive(Debug)]
+enum SnapshotPlanOutcome {
+    Ready(SourceSnapshotPlan),
+    SchemaChanged(SchemaVersionNo),
+}
+
+#[derive(Debug)]
+struct RangeQueue {
+    ranges: Vec<ScanRange>,
+    next: AtomicUsize,
+}
+
+impl RangeQueue {
+    const fn new(ranges: Vec<ScanRange>) -> Self {
+        Self {
+            ranges,
+            next: AtomicUsize::new(0),
         }
-        let chunk_no = self.chunk_no + 1;
-        let watermark = self.start_lsn;
+    }
 
-        // The chunk read stays inside this attempt's one repeatable-read snapshot, established
-        // strictly after the start-fence echo was observed.
-        let chunk_sql = self.chunk_sql()?;
-        let rows = self
-            .client
-            .query(&chunk_sql, &[])
+    fn claim(&self) -> Option<ScanRange> {
+        self.ranges
+            .get(self.next.fetch_add(1, Ordering::Relaxed))
+            .copied()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CopyWorkerContext {
+    ranges: Arc<RangeQueue>,
+    cached: Arc<crate::relcache::CachedRelation>,
+    pool: sqlx::PgPool,
+    sink: ParquetSink,
+    chunk_rows: NonZeroU64,
+    router_batch_bytes: NonZeroU64,
+    worker_admission: ReloadWorkerAdmission,
+    start_lsn: Lsn,
+    schema_version: SchemaVersionNo,
+    reload_id: ReloadId,
+    epoch: EpochNo,
+    instance: String,
+    series: String,
+}
+
+#[derive(Debug)]
+struct CopyWorkerResult {
+    worker_index: usize,
+    client: tokio_postgres::Client,
+    rows: u64,
+}
+
+/// Divide a heap into contiguous, disjoint CTID page intervals. The final range is intentionally
+/// open-ended: it covers every block visible in S even if the physical relation grew between the
+/// size estimate and COPY (newer tuples are still invisible to S).
+fn plan_ctid_ranges(blocks: u64, workers: NonZeroUsize) -> Vec<ScanRange> {
+    debug_assert!(blocks > 0);
+    let max_tasks = workers.get().saturating_mul(RANGE_TASKS_PER_WORKER);
+    let max_tasks_u64 = u64::try_from(max_tasks).unwrap_or(u64::MAX);
+    let task_count = usize::try_from(blocks.min(max_tasks_u64))
+        .unwrap_or(max_tasks)
+        .max(1);
+    let step = blocks.div_ceil(u64::try_from(task_count).unwrap_or(u64::MAX));
+    let mut ranges = Vec::with_capacity(task_count);
+    let mut start = 0;
+    while start < blocks {
+        let next = start.saturating_add(step).min(blocks);
+        ranges.push(ScanRange::Blocks {
+            start,
+            end: (next < blocks).then_some(next),
+        });
+        start = next;
+    }
+    ranges
+}
+
+fn copy_sql(rel: &PgRelation, range: ScanRange) -> anyhow::Result<String> {
+    let columns = rel
+        .columns
+        .iter()
+        .map(|column| {
+            SqlIdent::new(&column.name)
+                .map(|column| format!("_src.{column}::text"))
+                .context("validate reload COPY column")
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    anyhow::ensure!(
+        !columns.is_empty(),
+        "reload COPY relation {}.{} has no columns",
+        rel.schema,
+        rel.name
+    );
+    let schema = SqlIdent::new(&rel.schema).context("validate reload COPY schema")?;
+    let table = SqlIdent::new(&rel.name).context("validate reload COPY table")?;
+    let predicate = match range {
+        ScanRange::Full => String::new(),
+        ScanRange::Blocks { start, end } => match end {
+            Some(end) => {
+                format!(" WHERE _src.ctid >= '({start},0)'::tid AND _src.ctid < '({end},0)'::tid")
+            }
+            None => format!(" WHERE _src.ctid >= '({start},0)'::tid"),
+        },
+    };
+    Ok(format!(
+        "COPY (SELECT {} FROM ONLY {schema}.{table} AS _src{predicate}) \
+         TO STDOUT WITH (FORMAT BINARY)",
+        columns.join(", ")
+    ))
+}
+
+async fn rollback_source_client(client: &tokio_postgres::Client, reason: &'static str) {
+    if let Err(error) = client.batch_execute("ROLLBACK").await {
+        tracing::warn!(%error, reason, "failed to roll back reload source transaction");
+    }
+}
+
+fn snapshot_worker_setup_sql(snapshot_id: &str, rel: &PgRelation) -> anyhow::Result<String> {
+    let schema = SqlIdent::new(&rel.schema).context("validate reload worker lock schema")?;
+    let table = SqlIdent::new(&rel.name).context("validate reload worker lock table")?;
+    let snapshot = snapshot_id.to_quoted_literal();
+    Ok(format!(
+        "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; \
+         SET TRANSACTION SNAPSHOT {snapshot}; \
+         {CANONICAL_COPY_GUCS_SQL} \
+         SET LOCAL row_security = off; \
+         SET LOCAL statement_timeout = 0; \
+         SET LOCAL idle_in_transaction_session_timeout = 0; \
+         LOCK TABLE {schema}.{table} IN ACCESS SHARE MODE NOWAIT"
+    ))
+}
+
+async fn connect_snapshot_worker(
+    source_db_url: &str,
+    snapshot_id: &str,
+    rel: &PgRelation,
+    worker_index: usize,
+) -> anyhow::Result<tokio_postgres::Client> {
+    let (client, connection) = tokio_postgres::connect(source_db_url, NoTls)
+        .await
+        .with_context(|| format!("open reload COPY worker {worker_index} SQL connection"))?;
+    let driver = async move {
+        if let Err(error) = connection.await {
+            tracing::warn!(worker_index, %error, "reload COPY worker SQL connection closed");
+        }
+    };
+    tokio::spawn(driver.in_current_span());
+
+    let setup = snapshot_worker_setup_sql(snapshot_id, rel)?;
+    if let Err(error) = client.batch_execute(&setup).await {
+        rollback_source_client(&client, "COPY worker snapshot import failure").await;
+        return Err(anyhow::Error::new(error).context(format!(
+            "import shared snapshot in reload COPY worker {worker_index}"
+        )));
+    }
+    Ok(client)
+}
+
+async fn run_copy_worker(
+    worker_index: usize,
+    client: tokio_postgres::Client,
+    ctx: CopyWorkerContext,
+) -> anyhow::Result<CopyWorkerResult> {
+    // Acquire before constructing the router: this permit accounts for the Arrow builder, Parquet
+    // encoder scratch, and multipart buffer. Holding it through `finish` makes remote backpressure
+    // release memory capacity before another table's worker can begin polling COPY.
+    let _memory_permit = ctx.worker_admission.acquire().await?;
+    let mut router = ReloadRouter::new(ctx.clone())?;
+    let column_types = vec![Type::TEXT; ctx.cached.relation.columns.len()];
+    let mut tuple = Vec::with_capacity(ctx.cached.relation.columns.len());
+    let mut rows = 0u64;
+    while let Some(range) = ctx.ranges.claim() {
+        let sql = copy_sql(&ctx.cached.relation, range)?;
+        let copy = client
+            .copy_out(&sql)
             .await
-            .context("reload chunk SELECT")?;
-        // The chunk's last row is its next cursor (built once the file is written, below), and its
-        // absence is the drain: nothing at all past the cursor, so no file (the signal row for this
-        // empty probe is harmless; its echo resolved above).
-        let Some(last) = rows.last() else {
-            return Ok(ChunkOutcome::Drained { rows: 0 });
-        };
+            .with_context(|| format!("start reload binary COPY range {range:?}"))?;
+        let mut stream = Box::pin(BinaryCopyOutStream::new(copy, &column_types));
+        while let Some(row) = stream.next().await {
+            let row = row.with_context(|| format!("read reload binary COPY range {range:?}"))?;
+            tuple.clear();
+            for index in 0..ctx.cached.relation.columns.len() {
+                let value = row
+                    .try_get::<Option<String>>(index)
+                    .with_context(|| format!("decode reload COPY column {index}"))?;
+                tuple.push(value.map_or(TupleValue::Null, TupleValue::Text));
+            }
+            router.push(&tuple).await?;
+            rows = rows.saturating_add(1);
+        }
+    }
+    router.finish().await?;
+    tracing::debug!(worker_index, rows, "reload COPY worker drained");
+    Ok(CopyWorkerResult {
+        worker_index,
+        client,
+        rows,
+    })
+}
 
-        // Stamp + write: every row `commit_lsn = lsn = F` (see the module doc for the proof).
-        let cached = crate::relcache::RelationCache::default()
-            .upsert_from_relation(self.rel.clone(), self.schema_version)
-            .context("build Arrow schema for reload chunk")?;
-        let mut batcher = crate::batch::TableBatcher::new(
-            cached,
+struct ReloadRouter {
+    ctx: CopyWorkerContext,
+    batcher: crate::batch::TableBatcher<crate::batch::SystemClock>,
+    writer: Option<crate::sink::ReloadParquetWriter>,
+    buffered_rows: u64,
+    object_row_groups: usize,
+    max_object_row_groups: usize,
+}
+
+impl ReloadRouter {
+    fn new(ctx: CopyWorkerContext) -> anyhow::Result<Self> {
+        let micro_rows = NonZeroU64::new(ctx.chunk_rows.get().min(ROUTER_BATCH_ROWS))
+            .context("reload router row limit became zero")?;
+        let max_bytes = ctx.router_batch_bytes;
+        let max_object_row_groups =
+            max_row_groups_per_object(ctx.cached.arrow_schema.fields().len());
+        let batcher = crate::batch::TableBatcher::new(
+            Arc::clone(&ctx.cached),
             crate::batch::BatchTriggers {
-                max_rows: NonZeroU64::MAX, // one file per chunk; chunk_rows bounds the SELECT
-                max_bytes: NonZeroU64::MAX,
+                max_rows: micro_rows,
+                max_bytes,
                 max_fill: Duration::from_secs(3600),
             },
-            Arc::new(crate::batch::SystemClock),
+            crate::batch::SystemClock,
         )
-        .context("create reload chunk batcher")?;
-        // One tuple buffer for the whole chunk: `push` copies the row into the batcher, so refilling
-        // this scratch keeps its capacity instead of allocating (and dropping) a `Vec` per row.
-        let mut tuple: Vec<TupleValue> = Vec::with_capacity(self.rel.columns.len());
-        for row in &rows {
-            read_row_into(row, &self.rel, &mut tuple);
-            batcher.push(self.chunk_meta(watermark), &tuple);
+        .context("create streaming reload Arrow router")?;
+        Ok(Self {
+            ctx,
+            batcher,
+            writer: None,
+            buffered_rows: 0,
+            object_row_groups: 0,
+            max_object_row_groups,
+        })
+    }
+
+    async fn push(&mut self, tuple: &[TupleValue]) -> anyhow::Result<()> {
+        self.batcher
+            .push_committed(reload_meta(&self.ctx), tuple)
+            .context("append reload COPY row to Arrow micro-batch")?;
+        self.buffered_rows = self.buffered_rows.saturating_add(1);
+        let object_rows = self
+            .writer
+            .as_ref()
+            .map_or(0, crate::sink::ReloadParquetWriter::row_count);
+        if self.batcher.should_flush()
+            || object_rows.saturating_add(self.buffered_rows) >= self.ctx.chunk_rows.get()
+        {
+            self.flush_micro_batch().await?;
         }
-        batcher
-            .on_commit(watermark, UtcTimestamp::now())
-            .context("promote reload chunk rows at the baseline fence")?;
-        let sealed = batcher.seal().context("seal reload chunk")?;
-        let obj = self
-            .sink
-            .put_with_kind(sealed, FileKind::Reload)
+        Ok(())
+    }
+
+    async fn flush_micro_batch(&mut self) -> anyhow::Result<()> {
+        if self.buffered_rows == 0 {
+            return Ok(());
+        }
+        let sealed = self
+            .batcher
+            .seal()
+            .context("seal reload Arrow micro-batch")?;
+        let writer = match self.writer.as_mut() {
+            Some(writer) => writer,
+            None => self.writer.insert(
+                self.ctx
+                    .sink
+                    .begin_reload_stream(
+                        Arc::clone(&self.ctx.cached.arrow_schema),
+                        self.ctx.cached.relation.schema.clone(),
+                        self.ctx.cached.relation.name.clone(),
+                        self.ctx.start_lsn,
+                        self.ctx.schema_version,
+                    )
+                    .context("begin streamed reload Parquet object")?,
+            ),
+        };
+        writer
+            .write_batch(&sealed.record_batch)
             .await
-            .context("PUT reload chunk Parquet")?;
+            .context("flush reload Arrow micro-batch to remote Parquet object")?;
+        self.buffered_rows = 0;
+        self.object_row_groups = self.object_row_groups.saturating_add(1);
+        if writer.row_count() >= self.ctx.chunk_rows.get()
+            || self.object_row_groups >= self.max_object_row_groups
+        {
+            self.finish_object().await?;
+        }
+        Ok(())
+    }
 
-        // The cursor comes from the LAST ROW of the chunk just written — never a separate MAX()
-        // query (racy). Values stay in their text output form (precision-safe for bigint PKs).
-        let cursor = cursor_from_row(&self.rel, &self.pk_cols, last)
-            .context("build reload cursor from last chunk row")?;
-
-        // ONE control-pg transaction: manifest row + cursor advance (see the module doc).
-        let mut tx = self.pool.begin().await.context("begin chunk commit txn")?;
+    async fn finish_object(&mut self) -> anyhow::Result<()> {
+        let writer = self
+            .writer
+            .take()
+            .context("reload router has no object to finish")?;
+        self.object_row_groups = 0;
+        let object = writer
+            .finish()
+            .await
+            .context("finish streamed reload Parquet object")?;
+        anyhow::ensure!(
+            object.row_count <= self.ctx.chunk_rows.get(),
+            "reload object exceeded configured row limit: {} > {}",
+            object.row_count,
+            self.ctx.chunk_rows
+        );
+        let mut tx = self
+            .ctx
+            .pool
+            .begin()
+            .await
+            .context("begin reload object manifest transaction")?;
         crate::manifest::record_ready_with_reload(
             &mut *tx,
-            self.cfg.epoch,
-            &obj,
-            Some(self.reload_id),
+            self.ctx.epoch,
+            &object,
+            Some(self.ctx.reload_id),
         )
         .await
-        .context("record reload chunk manifest row")?;
-        control::reload::advance_cursor(
+        .context("record streamed reload object manifest")?;
+        let file_no = control::reload::record_exported_file(
             &mut *tx,
-            self.reload_id,
-            chunk_no,
-            &cursor,
-            watermark,
-            self.schema_version,
+            self.ctx.reload_id,
+            self.ctx.start_lsn,
+            self.ctx.schema_version,
         )
         .await
-        .context("advance reload cursor")?;
-        tx.commit().await.context("commit chunk manifest+cursor")?;
-
-        self.chunk_no = chunk_no;
-        self.cursor = Some(cursor);
-        let n = u64::try_from(rows.len()).unwrap_or(u64::MAX);
-        // One chunk file exported: bump the per-table chunk + row counters.
-        common::metrics::record_reload_chunk(&self.series, n);
-        if n < self.cfg.chunk_rows.get() {
-            Ok(ChunkOutcome::Drained { rows: n })
-        } else {
-            Ok(ChunkOutcome::Exported { rows: n })
-        }
+        .context("record completed parallel reload file")?;
+        tx.commit()
+            .await
+            .context("commit reload object manifest and completed-file count")?;
+        common::metrics::record_reload_chunk(&self.ctx.series, object.row_count);
+        tracing::debug!(
+            reload_id = %self.ctx.reload_id,
+            file_no,
+            rows = object.row_count,
+            key = %object.key,
+            "streamed reload object committed"
+        );
+        Ok(())
     }
 
-    /// `SELECT "c1"::text, … FROM t [WHERE (pk…) > (cursor…)] ORDER BY pk… LIMIT n` — keyset
-    /// pagination via row comparison over the PK-INDEX column order: index-friendly and
-    /// composite-safe (never OFFSET).
-    fn chunk_sql(&self) -> anyhow::Result<String> {
-        continuation_sql(
-            &self.rel,
-            &self.pk_cols,
-            self.cursor.as_ref(),
-            self.cfg.chunk_rows.get(),
-        )
-    }
-
-    fn chunk_meta(&self, watermark: Lsn) -> SinkMeta {
-        SinkMeta {
-            op: Op::Insert,
-            // The stamp: every chunk row carries the attempt's lower fence as BOTH LSNs, so any
-            // overlapping stream event (commit LSN > F) wins the loader's dedup.
-            lsn: watermark,
-            commit_lsn: Lsn::ZERO, // patched to F by the batcher's on_commit
-            commit_ts: UtcTimestamp::now(),
-            xid: 0,
-            epoch: self.cfg.epoch,
-            batch_id: String::new(),
-            schema_version: self.schema_version,
-            source_schema: self.rel.schema.clone(),
-            source_table: self.rel.name.clone(),
-            kind: Kind::Reload,
-            unchanged_toast: Box::default(),
-            sink_instance: self.cfg.instance.clone(),
-            sink_processed_at: UtcTimestamp::now(),
+    async fn finish(mut self) -> anyhow::Result<()> {
+        self.flush_micro_batch().await?;
+        if self.writer.is_some() {
+            self.finish_object().await?;
         }
+        Ok(())
+    }
+}
+
+fn reload_meta(ctx: &CopyWorkerContext) -> SinkMeta {
+    let now = UtcTimestamp::now();
+    SinkMeta {
+        op: Op::Insert,
+        // Every baseline row carries F as both LSNs; any overlapping WAL event in (F,H] wins.
+        lsn: ctx.start_lsn,
+        commit_lsn: ctx.start_lsn,
+        commit_ts: now,
+        xid: 0,
+        epoch: ctx.epoch,
+        batch_id: String::new(),
+        schema_version: ctx.schema_version,
+        source_schema: ctx.cached.relation.schema.clone(),
+        source_table: ctx.cached.relation.name.clone(),
+        kind: Kind::Reload,
+        unchanged_toast: Box::default(),
+        sink_instance: ctx.instance.clone(),
+        sink_processed_at: now,
     }
 }
 
@@ -961,24 +1504,6 @@ async fn await_schema_change(
     }
 }
 
-fn validate_export_keys(rel: &PgRelation, pk_cols: &[String]) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        !rel.to_key_columns().is_empty(),
-        "{}.{} has no replica-identity key",
-        rel.schema,
-        rel.name
-    );
-    for pk in pk_cols {
-        anyhow::ensure!(
-            rel.columns.iter().any(|column| &column.name == pk),
-            "PRIMARY KEY column {pk:?} is absent from frozen relation {}.{}",
-            rel.schema,
-            rel.name
-        );
-    }
-    Ok(())
-}
-
 async fn wait_for_marker(
     pool: &sqlx::PgPool,
     reload_id: ReloadId,
@@ -1000,134 +1525,6 @@ async fn wait_for_marker(
     })
     .await
     .with_context(|| format!("timed out waiting for {kind:?} marker on reload {reload_id}"))?
-}
-
-/// The PRIMARY KEY's columns in INDEX order (`pg_index.indkey` position) — the order the PK
-/// btree can actually serve for keyset pagination. Deliberately PK-only: the relation shape's
-/// `is_key` union (PK ∪ replica identity) matches no single index.
-async fn pk_columns_in_index_order(
-    client: &tokio_postgres::Client,
-    schema: &str,
-    table: &str,
-) -> anyhow::Result<Vec<String>> {
-    let rows = client
-        .query(
-            "SELECT a.attname
-             FROM pg_index i
-             JOIN pg_class c ON c.oid = i.indrelid
-             JOIN pg_namespace n ON n.oid = c.relnamespace
-             JOIN unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON true
-             JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum
-             WHERE n.nspname = $1 AND c.relname = $2 AND i.indisprimary
-               AND k.ord <= i.indnkeyatts
-             ORDER BY k.ord",
-            &[&schema, &table],
-        )
-        .await
-        .context("read pg_index PK column order")?;
-    anyhow::ensure!(!rows.is_empty(), "{schema}.{table} has no primary key");
-    Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
-}
-
-/// The keyset-pagination SELECT. The cursor is a JSON array of text values in PK-column order;
-/// its literals are left untyped (`'…'`) so Postgres coerces them to the PK column types in the
-/// row comparison — no per-type casting table needed. PK columns and their order come from the
-/// relation shape — never hardcoded.
-///
-/// The key columns are TABLE-QUALIFIED (`_src."id"`) everywhere: the SELECT list's `::text` casts
-/// keep the original output names, and a bare `ORDER BY "id"` would bind to that TEXT output
-/// column (Postgres resolves output names first) — text-ordered pages with int-compared
-/// continuation silently skip and truncate. The qualifier pins both the WHERE and the ORDER BY to
-/// the native-typed table column.
-fn continuation_sql(
-    rel: &PgRelation,
-    pk_cols: &[String],
-    cursor: Option<&serde_json::Value>,
-    limit: u64,
-) -> anyhow::Result<String> {
-    let cols: Vec<String> = rel
-        .columns
-        .iter()
-        .map(|column| {
-            SqlIdent::new(&column.name)
-                .map(|ident| format!("{ident}::text"))
-                .context("validate reload SELECT column")
-        })
-        .collect::<anyhow::Result<_>>()?;
-    let key_cols: Vec<String> = pk_cols
-        .iter()
-        .map(|column| {
-            SqlIdent::new(column)
-                .map(|ident| format!("_src.{ident}"))
-                .context("validate reload PRIMARY KEY column")
-        })
-        .collect::<anyhow::Result<_>>()?;
-    let schema = SqlIdent::new(&rel.schema).context("validate reload SELECT schema")?;
-    let table = SqlIdent::new(&rel.name).context("validate reload SELECT table")?;
-    let mut sql = format!(
-        "SELECT {} FROM {}.{} AS _src",
-        cols.join(", "),
-        schema,
-        table
-    );
-    if let Some(serde_json::Value::Array(values)) = cursor {
-        let literals: Vec<String> = values
-            .iter()
-            .map(|v| match v {
-                serde_json::Value::String(s) => s.to_quoted_literal(),
-                other => other.to_string().to_quoted_literal(),
-            })
-            .collect();
-        let _write_result = write!(
-            &mut sql,
-            " WHERE ({}) > ({})",
-            key_cols.join(", "),
-            literals.join(", ")
-        );
-    }
-    let _write_result = write!(&mut sql, " ORDER BY {} LIMIT {limit}", key_cols.join(", "));
-    Ok(sql)
-}
-
-/// The last row's PK values, in PK-INDEX order, as their text output form.
-fn cursor_from_row(
-    rel: &PgRelation,
-    pk_cols: &[String],
-    row: &tokio_postgres::Row,
-) -> anyhow::Result<serde_json::Value> {
-    let values: Vec<serde_json::Value> = pk_cols
-        .iter()
-        .map(|key| {
-            let idx = rel
-                .columns
-                .iter()
-                .position(|c| &c.name == key)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "PK column {key:?} not found in relation {}.{}",
-                        rel.schema,
-                        rel.name
-                    )
-                })?;
-            Ok(match row.get::<_, Option<String>>(idx) {
-                Some(s) => serde_json::Value::String(s),
-                None => serde_json::Value::Null, // PK columns are NOT NULL; defensive only
-            })
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    Ok(serde_json::Value::Array(values))
-}
-
-/// Refill `out` with one row's text values. Takes the buffer rather than returning a fresh `Vec` so
-/// the chunk loop reuses one allocation across every row it exports.
-fn read_row_into(row: &tokio_postgres::Row, rel: &PgRelation, out: &mut Vec<TupleValue>) {
-    out.clear();
-    out.extend(
-        (0..rel.columns.len()).map(|i| match row.get::<_, Option<String>>(i) {
-            Some(s) => TupleValue::Text(s),
-            None => TupleValue::Null,
-        }),
-    );
 }
 
 #[cfg(test)]

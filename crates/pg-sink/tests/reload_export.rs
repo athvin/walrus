@@ -4,11 +4,12 @@
     clippy::let_underscore_must_use,
     reason = "integration test — unwrap/expect fine in setup + helpers"
 )]
-//! Chunk export engine against compose (`#[ignore]` — needs source PG + control PG + MinIO).
-//! 2,500 seeded rows at `chunk_rows=1000` become exactly 3 `kind='reload'` files whose union is
-//! the table exactly, every row stamped `commit_lsn = lsn = F`; a crashed snapshot is purged and
-//! replaced by a fresh fenced successor; and a missing decoder cannot let an exporter query before
-//! F is durable. The SQL/stamp shapes are unit-tested in `src/reload_export.rs`.
+//! Parallel export engine against compose (`#[ignore]` — needs source PG + control PG + MinIO).
+//! The remote files' union is the table exactly, every row is stamped `commit_lsn = lsn = F`, a
+//! crashed shared snapshot is purged and replaced by a fresh fenced successor, and a missing
+//! decoder cannot let an exporter query before F is durable. Per-worker tails may add files beyond
+//! `ceil(total_rows/chunk_rows)`; `chunk_no` is the durable completed-file count, never a keyset
+//! cursor. The SQL/stamp shapes are unit-tested in `src/reload_export.rs`.
 //!
 //! Each test spins a mini fence resolver: a real slot commit-gates `reload_event`, durably records
 //! baseline `F` / terminal `H`, and only then resolves the shared `FenceWaiters`.
@@ -22,7 +23,7 @@ use object_store::path::Path;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use pg_sink::reload::{RestartDecision, handle_lost_snapshot_restart};
 use pg_sink::reload_event::FenceWaiters;
-use pg_sink::reload_export::{ChunkExportConfig, ChunkExporter, ChunkOutcome, RunOutcome};
+use pg_sink::reload_export::{ChunkExportConfig, ChunkExporter, RunOutcome};
 use pg_sink::sink::ParquetSink;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -43,6 +44,18 @@ fn source_url() -> String {
     std::env::var("WALRUS_SOURCE_DB_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/walrus".to_string())
 }
+
+/// Give new source sessions deliberately incompatible text defaults. The exporter must override
+/// these transaction-locally before any `::text` COPY projection reaches pg-to-arrow.
+fn hostile_text_source_url() -> String {
+    let base = source_url();
+    let separator = if base.contains('?') { '&' } else { '?' };
+    format!(
+        "{base}{separator}options=-c%20DateStyle%3DSQL%2CDMY%20-c%20IntervalStyle%3Diso_8601\
+         %20-c%20bytea_output%3Descape%20-c%20extra_float_digits%3D0\
+         %20-c%20TimeZone%3DAmerica%2FNew_York"
+    )
+}
 fn control_url() -> String {
     std::env::var("WALRUS_CONTROL_DB_URL").unwrap_or_else(|_| {
         "postgres://postgres:postgres@localhost:5433/walrus_control".to_string()
@@ -57,18 +70,31 @@ async fn admin() -> tokio_postgres::Client {
     c
 }
 
+fn raw_store() -> object_store::aws::AmazonS3 {
+    object_store::aws::AmazonS3Builder::new()
+        .with_bucket_name("walrus")
+        .with_region("us-east-1")
+        .with_endpoint("http://localhost:9000")
+        .with_access_key_id("minioadmin")
+        .with_secret_access_key("minioadmin")
+        .with_allow_http(true)
+        .build()
+        .unwrap()
+}
+
 fn store() -> Arc<dyn ObjectStore> {
-    Arc::new(
-        object_store::aws::AmazonS3Builder::new()
-            .with_bucket_name("walrus")
-            .with_region("us-east-1")
-            .with_endpoint("http://localhost:9000")
-            .with_access_key_id("minioadmin")
-            .with_secret_access_key("minioadmin")
-            .with_allow_http(true)
-            .build()
-            .unwrap(),
-    )
+    Arc::new(raw_store())
+}
+
+/// Keep enough remote completions in flight to make the crash/mid-export observation deterministic.
+fn delayed_store(delay: Duration) -> Arc<dyn ObjectStore> {
+    Arc::new(object_store::throttle::ThrottledStore::new(
+        raw_store(),
+        object_store::throttle::ThrottleConfig {
+            wait_put_per_call: delay,
+            ..object_store::throttle::ThrottleConfig::default()
+        },
+    ))
 }
 
 /// Seed the target table with `n` rows and register its shape at the test epoch.
@@ -78,6 +104,53 @@ async fn seed(admin: &tokio_postgres::Client, pool: &sqlx::PgPool, epoch: EpochN
             "DROP TABLE IF EXISTS public.{TABLE};
              CREATE TABLE public.{TABLE} (id int PRIMARY KEY, val text NOT NULL);
              INSERT INTO public.{TABLE} SELECT g, 'v' || g FROM generate_series(1, {n}) g;"
+        ))
+        .await
+        .unwrap();
+    let rel = pg_sink::source_catalog::describe_source_relation(admin, "public", TABLE)
+        .await
+        .unwrap();
+    control::upsert_registry(
+        pool,
+        &control::RegistryRow {
+            epoch,
+            source_schema: "public".to_string(),
+            source_table: TABLE.to_string(),
+            schema_version: SchemaVersionNo(1),
+            descriptors: pg_to_arrow::describe_relation(&rel).unwrap(),
+            columns: serde_json::to_value(&rel).unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+}
+
+async fn seed_guc_sensitive_types(
+    admin: &tokio_postgres::Client,
+    pool: &sqlx::PgPool,
+    epoch: EpochNo,
+) {
+    admin
+        .batch_execute(&format!(
+            "DROP TABLE IF EXISTS public.{TABLE};
+             CREATE TABLE public.{TABLE} (
+                 id int PRIMARY KEY,
+                 d date NOT NULL,
+                 ts timestamp NOT NULL,
+                 tstz timestamptz NOT NULL,
+                 span interval NOT NULL,
+                 payload bytea NOT NULL,
+                 measurement double precision NOT NULL
+             );
+             INSERT INTO public.{TABLE} VALUES (
+                 1,
+                 DATE '2024-02-03',
+                 TIMESTAMP '2024-02-03 04:05:06.123456',
+                 TIMESTAMPTZ '2024-02-03 04:05:06.123456+05:30',
+                 INTERVAL '1 year 2 mons 3 days 04:05:06.5',
+                 decode('00ff5c', 'hex'),
+                 1.2345678901234567
+             );"
         ))
         .await
         .unwrap();
@@ -113,6 +186,11 @@ async fn scrub(pool: &sqlx::PgPool, epoch: EpochNo) {
 fn export_cfg(epoch: EpochNo, chunk_rows: u64, echo_timeout: Duration) -> ChunkExportConfig {
     ChunkExportConfig {
         chunk_rows: std::num::NonZeroU64::new(chunk_rows).unwrap(),
+        router_batch_bytes: std::num::NonZeroU64::new(8 * 1024 * 1024).unwrap(),
+        worker_admission: pg_sink::reload_export::ReloadWorkerAdmission::new(
+            std::num::NonZeroUsize::new(4).unwrap(),
+        ),
+        workers_per_table: std::num::NonZeroUsize::new(4).unwrap(),
         echo_timeout,
         instance: "walrus-sink-test".to_string(),
         epoch,
@@ -156,6 +234,24 @@ async fn reload_manifest_rows(
     rows.into_iter()
         .map(|(uri, count, lsn, reload_id)| (uri, count, lsn, ReloadId(reload_id)))
         .collect()
+}
+
+/// Wait until at least one independently completed worker object is durable in control-pg.
+async fn wait_for_file_progress(pool: &sqlx::PgPool, reload_id: ReloadId) -> control::ReloadRow {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let row = control::reload::get(pool, reload_id)
+                .await
+                .unwrap()
+                .expect("reload remains present while its exporter runs");
+            if row.chunk_no > 0 {
+                return row;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("parallel reload records its first completed file")
 }
 
 /// Read a reload chunk file back: (ids, every-row (commit_lsn, lsn) from the meta JSON).
@@ -242,22 +338,36 @@ async fn chunks_cover_the_table_exactly_with_shared_baseline_stamp() {
         &source_url(),
         pool.clone(),
         Arc::clone(&waiters),
-        ParquetSink::new(store(), "walrus", epoch),
-        export_cfg(epoch, 1000, Duration::from_secs(20)),
+        ParquetSink::new(delayed_store(Duration::from_millis(50)), "walrus", epoch),
+        export_cfg(epoch, 250, Duration::from_secs(20)),
         &req,
     )
     .await
     .unwrap();
 
-    // Chunk 1 first, then a concurrent write MID-EXPORT to a PK chunk 1 already covered: the
-    // stream event's commit LSN must outrank the chunk stamp (so it wins Phase B's dedup), and
-    // its prompt decode is the no-stall proof — both while the export is genuinely in flight.
-    exporter.export_next_chunk().await.unwrap();
+    // Run the whole parallel snapshot in the background. A durable file proves at least one COPY
+    // worker has made progress; the delayed object store and remaining files keep S open while the
+    // overlapping WAL transaction commits and is decoded on the single replication stream. Its
+    // update/delete/insert mix also proves every range imported the same S: the baseline must still
+    // contain deleted id=2 and must not contain newly inserted id=2501.
+    let export = tokio::spawn(async move { exporter.run(false).await });
+    let progress = wait_for_file_progress(&pool, reload_id).await;
+    assert!(
+        !export.is_finished(),
+        "the overlap transaction lands before the snapshot drains"
+    );
+    assert_eq!(
+        progress.cursor_pk, None,
+        "parallel progress is not a PK cursor"
+    );
     admin
-        .execute(
-            &format!("UPDATE public.{TABLE} SET val = 'overlap' WHERE id = 1"),
-            &[],
-        )
+        .batch_execute(&format!(
+            "BEGIN;
+             UPDATE public.{TABLE} SET val = 'overlap' WHERE id = 1;
+             DELETE FROM public.{TABLE} WHERE id = 2;
+             INSERT INTO public.{TABLE} (id, val) VALUES (2501, 'after-snapshot');
+             COMMIT;"
+        ))
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(10), watch_rx.changed())
@@ -280,7 +390,7 @@ async fn chunks_cover_the_table_exactly_with_shared_baseline_stamp() {
          it wins the loader's dedup for that PK"
     );
 
-    let final_h = match exporter.run(false).await.unwrap() {
+    let final_h = match export.await.unwrap().unwrap() {
         RunOutcome::Drained { final_lsn } => final_lsn,
         RunOutcome::SchemaChanged { new_version } => {
             panic!("unexpected schema change to {new_version}")
@@ -306,13 +416,16 @@ async fn chunks_cover_the_table_exactly_with_shared_baseline_stamp() {
         "the decoder persisted F then H before resolving each waiter"
     );
 
-    // Exactly 3 chunk files: 1000 + 1000 + 500, all sharing safe baseline F.
+    // Ten full-size equivalents cover 2,500 rows. Independent worker tails may add up to one
+    // partial object per four workers, so file order/count is deliberately not keyset-deterministic.
     let files = reload_manifest_rows(&pool, epoch).await;
-    assert_eq!(files.len(), 3, "2500 rows at chunk_rows=1000 ⇒ 3 files");
-    assert_eq!(
-        files.iter().map(|f| f.1).collect::<Vec<_>>(),
-        vec![1000, 1000, 500]
+    assert!(
+        (10..=13).contains(&files.len()),
+        "2500 rows / 250 per object plus at most three extra worker tails: {} files",
+        files.len()
     );
+    assert_eq!(files.iter().map(|file| file.1).sum::<i64>(), 2500);
+    assert!(files.iter().all(|file| (1..=250).contains(&file.1)));
     let ends: Vec<Lsn> = files.iter().map(|f| f.2.parse().unwrap()).collect();
     assert!(
         ends.iter().all(|end| *end == baseline_f),
@@ -320,13 +433,14 @@ async fn chunks_cover_the_table_exactly_with_shared_baseline_stamp() {
     );
     assert!(files.iter().all(|f| f.3 == reload_id));
 
-    // Cursor/freeze bookkeeping: chunk_no 3, cursor at the last PK, and one immutable F.
+    // Durable bookkeeping is the completed-file count plus one immutable F; physical ranges have
+    // no resumable logical cursor because the shared PostgreSQL snapshot is connection-local.
     let row = control::reload::get(&pool, reload_id)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(row.chunk_no, 3);
-    assert_eq!(row.cursor_pk, Some(serde_json::json!(["2500"])));
+    assert_eq!(usize::try_from(row.chunk_no).unwrap(), files.len());
+    assert_eq!(row.cursor_pk, None);
     assert_eq!(row.start_lsn, Some(baseline_f), "start_lsn is baseline F");
     assert_eq!(
         row.first_lsn,
@@ -339,7 +453,7 @@ async fn chunks_cover_the_table_exactly_with_shared_baseline_stamp() {
         "the controller records export_complete after the exporter drains"
     );
 
-    // Read the 3 files back: the union is the table exactly, and EVERY row's meta carries
+    // Read every worker file back: the union is the table exactly, and EVERY row's meta carries
     // commit_lsn = lsn = shared F, which is every file's lsn_end.
     let mut all_ids = Vec::new();
     // `ends` was parsed out of `files` above, so zipping pairs each file with its own stamp — the
@@ -361,6 +475,11 @@ async fn chunks_cover_the_table_exactly_with_shared_baseline_stamp() {
     assert_eq!(unique.len(), 2500, "no misses");
     assert_eq!(*unique.first().unwrap(), 1);
     assert_eq!(*unique.last().unwrap(), 2500);
+    assert!(unique.contains(&2), "all workers retain S-visible deletes");
+    assert!(
+        !unique.contains(&2501),
+        "all workers exclude rows committed after S"
+    );
     token.cancel();
     resolver.await.unwrap();
     scrub(&pool, epoch).await;
@@ -372,7 +491,7 @@ async fn chunks_cover_the_table_exactly_with_shared_baseline_stamp() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires docker compose up --wait (source + control PG + MinIO)"]
-async fn adopted_cursor_is_purged_and_successor_reexports_one_snapshot() {
+async fn adopted_file_progress_is_purged_and_successor_reexports_one_snapshot() {
     let _g = SOURCE_LOCK.lock().await;
     let epoch = EpochNo(650_002);
     let admin = admin().await;
@@ -404,27 +523,34 @@ async fn adopted_cursor_is_purged_and_successor_reexports_one_snapshot() {
     let reload_id = req.reload_id;
     let sink = ParquetSink::new(store(), "walrus", epoch);
 
-    // Chunk 1, then "crash" (drop the exporter).
+    // Start the complete shared snapshot, wait for one durable worker file, then abort the owner to
+    // model process death while other ranges and multipart objects are still in flight.
     let mut first = ChunkExporter::connect(
         &source_url(),
         pool.clone(),
         Arc::clone(&waiters),
-        sink.clone(),
-        export_cfg(epoch, 1000, Duration::from_secs(20)),
+        ParquetSink::new(delayed_store(Duration::from_millis(50)), "walrus", epoch),
+        export_cfg(epoch, 250, Duration::from_secs(20)),
         &req,
     )
     .await
     .unwrap();
-    let outcome = first.export_next_chunk().await.unwrap();
-    assert!(matches!(outcome, ChunkOutcome::Exported { rows: 1000 }));
-    drop(first);
+    let crashed = tokio::spawn(async move { first.run(false).await });
+    let progress = wait_for_file_progress(&pool, reload_id).await;
+    assert!(
+        !crashed.is_finished(),
+        "the simulated crash is genuinely mid-export"
+    );
+    crashed.abort();
+    assert!(crashed.await.unwrap_err().is_cancelled());
 
     let mid = control::reload::get(&pool, reload_id)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(mid.chunk_no, 1);
-    let baseline_f = mid.start_lsn.expect("F persisted before chunk 1");
+    assert!(mid.chunk_no >= progress.chunk_no && mid.chunk_no > 0);
+    assert_eq!(mid.cursor_pk, None);
+    let baseline_f = mid.start_lsn.expect("F persisted before the first file");
 
     // Adoption cannot resurrect the connection-local repeatable-read snapshot, so it returns a
     // control-flow outcome without another source-table SELECT.
@@ -446,10 +572,10 @@ async fn adopted_cursor_is_purged_and_successor_reexports_one_snapshot() {
     assert_eq!(
         reload_manifest_rows(&pool, epoch).await.len(),
         0,
-        "the predecessor's chunk is purged with its terminal transition"
+        "the predecessor's files are purged with its terminal transition"
     );
 
-    // A lease-expired predecessor that wakes late cannot commit another chunk after the atomic
+    // A lease-expired predecessor that wakes late cannot commit another file after the atomic
     // terminal+successor transaction. Its duplicate object is an orphan; no manifest gap forms.
     let mut stale = ChunkExporter::connect(
         &source_url(),
@@ -461,14 +587,13 @@ async fn adopted_cursor_is_purged_and_successor_reexports_one_snapshot() {
     )
     .await
     .unwrap();
-    let stale_err = stale.export_next_chunk().await.unwrap_err();
+    let stale_err = stale.run(false).await.unwrap_err();
     assert!(
         format!("{stale_err:#}").contains("illegal reload transition"),
-        "the failed predecessor rejects a late cursor commit: {stale_err:#}"
+        "the failed predecessor rejects a late file-progress commit: {stale_err:#}"
     );
-    // The rejected chunk leaves this diagnostic exporter's repeatable-read transaction open so
-    // production `run()` could roll it back. This test called the one-chunk seam directly, so
-    // release the connection now; otherwise its final fixture DROP waits forever on our own lock.
+    // The rejected file leaves this diagnostic exporter's repeatable-read transaction open so
+    // production `run()` could roll it back. Release it before the final fixture DROP.
     drop(stale);
 
     let successor = control::reload::get(&pool, successor_id)
@@ -491,7 +616,11 @@ async fn adopted_cursor_is_purged_and_successor_reexports_one_snapshot() {
     ));
 
     let files = reload_manifest_rows(&pool, epoch).await;
-    assert_eq!(files.len(), 3, "the successor exports 1000+1000+500");
+    assert!(
+        (3..=6).contains(&files.len()),
+        "the successor writes three full-size equivalents plus worker tails: {} files",
+        files.len()
+    );
     assert!(files.iter().all(|file| file.3 == successor_id));
     let mut total = 0usize;
     let mut unique = BTreeSet::new();
@@ -507,7 +636,7 @@ async fn adopted_cursor_is_purged_and_successor_reexports_one_snapshot() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(done.chunk_no, 3);
+    assert_eq!(usize::try_from(done.chunk_no).unwrap(), files.len());
     assert!(
         matches!(done.start_lsn, Some(new_f) if new_f > baseline_f),
         "the successor must establish a fresh F"
@@ -563,6 +692,65 @@ async fn start_fence_timeout_leaves_the_reload_resumable() {
     assert_eq!(row.start_lsn, None, "no decoded F was persisted");
     assert_eq!(reload_manifest_rows(&pool, epoch).await.len(), 0);
 
+    scrub(&pool, epoch).await;
+    admin
+        .batch_execute(&format!("DROP TABLE IF EXISTS public.{TABLE}"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose up --wait (source + control PG + MinIO)"]
+async fn reload_overrides_hostile_postgres_text_output_defaults() {
+    let _g = SOURCE_LOCK.lock().await;
+    let epoch = EpochNo(650_004);
+    let admin = admin().await;
+    admin.batch_execute(SOURCE_0001).await.unwrap();
+    admin.batch_execute(SOURCE_0003).await.unwrap();
+    admin.batch_execute(SOURCE_0004).await.unwrap();
+    let pool = control::connect(&control_url()).await.unwrap();
+    control::run_migrations(&pool).await.unwrap();
+    scrub(&pool, epoch).await;
+    seed_guc_sensitive_types(&admin, &pool, epoch).await;
+
+    let hostile_url = hostile_text_source_url();
+    let waiters = Arc::new(FenceWaiters::default());
+    let token = CancellationToken::new();
+    let resolver = reload_fence_support::spawn(
+        hostile_url.clone(),
+        "walrus_re_gucs",
+        pool.clone(),
+        Arc::clone(&waiters),
+        Some(TABLE),
+        token.clone(),
+    );
+    tokio::time::timeout(Duration::from_secs(10), resolver.ready)
+        .await
+        .expect("fence resolver starts")
+        .expect("fence resolver ready sender remains live");
+    let resolver = resolver.handle;
+
+    let req = request_and_claim(&pool, epoch).await;
+    let mut exporter = ChunkExporter::connect(
+        &hostile_url,
+        pool.clone(),
+        waiters,
+        ParquetSink::new(store(), "walrus", epoch),
+        export_cfg(epoch, 100, Duration::from_secs(20)),
+        &req,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        exporter.run(false).await.unwrap(),
+        RunOutcome::Drained { .. }
+    ));
+    let files = reload_manifest_rows(&pool, epoch).await;
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].1, 1);
+
+    token.cancel();
+    resolver.await.unwrap();
     scrub(&pool, epoch).await;
     admin
         .batch_execute(&format!("DROP TABLE IF EXISTS public.{TABLE}"))

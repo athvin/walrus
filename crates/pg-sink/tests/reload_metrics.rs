@@ -119,6 +119,13 @@ async fn scrub(pool: &sqlx::PgPool, epoch: EpochNo) {
 fn export_cfg(epoch: EpochNo, chunk_rows: u64, echo_timeout: Duration) -> ChunkExportConfig {
     ChunkExportConfig {
         chunk_rows: std::num::NonZeroU64::new(chunk_rows).unwrap(),
+        router_batch_bytes: std::num::NonZeroU64::new(8 * 1024 * 1024).unwrap(),
+        worker_admission: pg_sink::reload_export::ReloadWorkerAdmission::new(
+            std::num::NonZeroUsize::new(4).unwrap(),
+        ),
+        // Metrics assertions count files exactly; parallel worker-tail behavior is covered by the
+        // reload export/recovery suites rather than folded into this focused counter test.
+        workers_per_table: std::num::NonZeroUsize::new(1).unwrap(),
         echo_timeout,
         instance: "walrus-sink-test".to_string(),
         epoch,
@@ -191,7 +198,7 @@ async fn chunk_export_moves_chunk_row_and_echo_metrics() {
     let echo_before = metric_sum("walrus_reload_echo_wait_seconds_count");
     let crosscheck_before = metric_sum(common::metrics::names::RELOAD_CROSSCHECK_VIOLATIONS);
 
-    // 5 rows at chunk_rows=2 ⇒ 3 chunks (2+2+1), bracketed by F/H echo round-trips.
+    // One worker exports 5 rows at chunk_rows=2 ⇒ 3 files (2+2+1), bracketed by F/H echoes.
     let req = request_and_claim(&pool, epoch).await;
     let mut exporter = ChunkExporter::connect(
         &source_url(),
@@ -304,6 +311,11 @@ async fn active_gauge_rises_and_returns_to_zero() {
         ReloadControllerConfig {
             poll_interval: Duration::from_millis(200),
             max_concurrent_reloads: std::num::NonZeroUsize::new(2).unwrap(),
+            workers_per_table: std::num::NonZeroUsize::new(4).unwrap(),
+            router_batch_bytes: std::num::NonZeroU64::new(8 * 1024 * 1024).unwrap(),
+            worker_admission: pg_sink::reload_export::ReloadWorkerAdmission::new(
+                std::num::NonZeroUsize::new(8).unwrap(),
+            ),
             lease_ttl: Duration::from_secs(6),
             instance: "walrus-sink-test".to_string(),
             publication_name: "walrus_pub".to_string(),

@@ -111,13 +111,17 @@ async fn pipeline(
     let clock = Arc::new(crate::batch::SystemClock);
     let mut router = consume::BatchRouter::new(triggers, Arc::clone(&clock), epoch, &cfg.instance);
     let mut checkpoint = crate::checkpoint::DurabilityCheckpoint::new(start_lsn);
+    let process_memory_budget = Arc::new(crate::memory::ProcessMemoryBudget::new(
+        cfg.max_inflight_bytes,
+    ));
     // Large-transaction demux (§1.6): a txn over logical_decoding_work_mem streams before its commit.
-    let mut demux = crate::stream_txn::StreamDemux::new(
+    let mut demux = crate::stream_txn::StreamDemux::with_process_memory_budget(
         triggers,
         clock,
         epoch,
         &cfg.instance,
         cfg.max_inflight_bytes,
+        Arc::clone(&process_memory_budget),
     );
 
     // The idle heartbeat rides a SEPARATE ordinary SQL connection (distinct from replication); its
@@ -138,6 +142,37 @@ async fn pipeline(
 
     // The reload controller: a side task off the decode path — own connections, polls
     // table_reload on the heartbeat cadence, schedules exporters under max_concurrent_reloads.
+    let max_concurrent_reloads = NonZeroUsize::try_from(cfg.max_concurrent_reloads)
+        .context("max_concurrent_reloads does not fit usize")?;
+    let reload_workers_per_table = NonZeroUsize::try_from(cfg.reload_workers_per_table)
+        .context("reload_workers_per_table does not fit usize")?;
+    let max_reload_copy_streams = max_concurrent_reloads
+        .get()
+        .checked_mul(reload_workers_per_table.get())
+        .context("configured reload table/worker product does not fit usize")?;
+    let max_reload_copy_streams_nonzero = NonZeroUsize::new(max_reload_copy_streams)
+        .context("configured reload COPY-stream limit became zero")?;
+    let reload_memory_worker_limit = crate::reload_export::reload_memory_worker_limit(
+        cfg.max_inflight_bytes,
+        max_reload_copy_streams_nonzero,
+    );
+    let reload_router_batch_bytes = crate::reload_export::router_batch_bytes(
+        cfg.max_inflight_bytes,
+        reload_memory_worker_limit,
+    );
+    let reload_worker_admission = crate::reload_export::ReloadWorkerAdmission::with_process_budget(
+        reload_memory_worker_limit,
+        process_memory_budget,
+    );
+    tracing::info!(
+        max_concurrent_reloads = max_concurrent_reloads.get(),
+        reload_workers_per_table = reload_workers_per_table.get(),
+        reload_chunk_rows = cfg.reload_chunk_rows.get(),
+        max_reload_copy_streams,
+        reload_memory_worker_limit = reload_memory_worker_limit.get(),
+        reload_router_batch_bytes = reload_router_batch_bytes.get(),
+        "reload extraction limits configured"
+    );
     let reload_controller = crate::reload::ReloadController::spawn(
         ctx.control_pool.clone(),
         cfg.source_db_url.expose(),
@@ -147,8 +182,10 @@ async fn pipeline(
             poll_interval: cfg.heartbeat_idle_after,
             // Narrowing stays inside the non-zero domain: only the 64-bit magnitude can fail to fit
             // a `usize`, never the "at least one exporter" invariant the config already proved.
-            max_concurrent_reloads: NonZeroUsize::try_from(cfg.max_concurrent_reloads)
-                .context("max_concurrent_reloads does not fit usize")?,
+            max_concurrent_reloads,
+            workers_per_table: reload_workers_per_table,
+            router_batch_bytes: reload_router_batch_bytes,
+            worker_admission: reload_worker_admission,
             lease_ttl: cfg.reload_lease_ttl,
             instance: cfg.instance.clone(),
             publication_name: cfg.publication_name.clone(),
@@ -266,6 +303,19 @@ fn generation_can_resume(
     status: control::ReplicationStatus,
 ) -> bool {
     configured_slot == recorded_slot && status != control::ReplicationStatus::TotalRestart
+}
+
+fn assert_generation_slot_name(
+    configured_slot: &str,
+    recorded_slot: &str,
+) -> Result<(), crate::preflight::PreflightError> {
+    if configured_slot != recorded_slot {
+        return Err(crate::preflight::PreflightError::SlotNameDrift {
+            configured: configured_slot.to_owned(),
+            recorded: recorded_slot.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -387,6 +437,8 @@ async fn establish_stream(
                 )
                 .await;
             };
+            assert_generation_slot_name(slot.as_str(), &state.slot_name)
+                .context("configured slot differs from durable generation")?;
             if !generation_can_resume(slot.as_str(), &state.slot_name, state.status) {
                 if state.status == control::ReplicationStatus::TotalRestart {
                     tracing::error!(
@@ -540,6 +592,22 @@ async fn establish_stream(
     let prior = control::read_current_epoch(&ctx.control_pool)
         .await
         .context("read current epoch before replacing the source slot")?;
+    if let Some(state) = &prior {
+        assert_generation_slot_name(slot.as_str(), &state.slot_name)
+            .context("configured slot differs from durable generation")?;
+    }
+
+    let recovery = slot_loss_recovery(status).with_context(|| {
+        format!(
+            "fresh-slot action requires authoritative absent/invalidated status, found {status:?}"
+        )
+    })?;
+    if recovery == SlotLossRecovery::CreateIfAbsent {
+        crate::preflight::SourcePreflight::new(&ctx.source_client, cfg)
+            .assert_slot_creation_headroom()
+            .await
+            .context("check capacity for absent configured replication slot")?;
+    }
     if let Some(state) = &prior
         && !control::mark_total_restart(&ctx.control_pool, state.epoch)
             .await
@@ -554,11 +622,6 @@ async fn establish_stream(
     // No usable slot: establish WAL retention first. The full baseline is deliberately not copied
     // here; it is requested through the published event stream below, exactly like an operator's
     // later all-table reconciliation.
-    let recovery = slot_loss_recovery(status).with_context(|| {
-        format!(
-            "fresh-slot action requires authoritative absent/invalidated status, found {status:?}"
-        )
-    })?;
     let created = match recovery {
         SlotLossRecovery::CreateIfAbsent => {
             crate::slot::verify_or_create_slot(&ctx.source_client, slot.as_str())
@@ -714,13 +777,14 @@ mod tests {
 
     #[test]
     fn slot_loss_recovery_distinguishes_absence_from_invalidation() {
-        assert_eq!(
-            slot_loss_recovery(crate::epoch::SlotStatus::Absent),
-            Some(SlotLossRecovery::CreateIfAbsent)
-        );
-        assert_eq!(
-            slot_loss_recovery(crate::epoch::SlotStatus::Invalidated),
-            Some(SlotLossRecovery::ReplaceInvalidated)
+        let absent = slot_loss_recovery(crate::epoch::SlotStatus::Absent);
+        assert_eq!(absent, Some(SlotLossRecovery::CreateIfAbsent));
+        let invalidated = slot_loss_recovery(crate::epoch::SlotStatus::Invalidated);
+        assert_eq!(invalidated, Some(SlotLossRecovery::ReplaceInvalidated));
+        assert_ne!(
+            invalidated,
+            Some(SlotLossRecovery::CreateIfAbsent),
+            "same-name invalidation replaces its occupied slot net-zero and must not require spare capacity"
         );
         assert_eq!(
             slot_loss_recovery(crate::epoch::SlotStatus::Unreachable),
@@ -745,6 +809,15 @@ mod tests {
             "walrus_a",
             "walrus_a",
             control::ReplicationStatus::TotalRestart
+        ));
+
+        let drift = assert_generation_slot_name("walrus_b", "walrus_a").unwrap_err();
+        assert!(matches!(
+            drift,
+            crate::preflight::PreflightError::SlotNameDrift {
+                configured,
+                recorded,
+            } if configured == "walrus_b" && recorded == "walrus_a"
         ));
     }
 
