@@ -536,10 +536,31 @@ impl Harness {
     /// PostgreSQL drops the old session's advisory locks on `SIGKILL`. Resume is from the two
     /// persisted watermarks.
     pub async fn restart_loader(&mut self) -> Result<()> {
-        self.loader = spawn_loader(&self.bins)?;
-        wait_ready("http://127.0.0.1:8131", Duration::from_secs(90))
+        self.restart_loader_with_deadline(Duration::from_secs(90))
             .await
-            .context("loader /ready after restart")
+    }
+
+    /// Respawn the loader with a caller-selected readiness deadline. Scale tests use this without
+    /// weakening the ordinary 90-second startup bound for every other scenario.
+    pub async fn restart_loader_with_deadline(&mut self, deadline: Duration) -> Result<()> {
+        self.loader = spawn_loader(&self.bins)?;
+        let Err(source) = wait_ready("http://127.0.0.1:8131", deadline).await else {
+            return Ok(());
+        };
+        let child_status = match self.loader.try_wait() {
+            Ok(None) => "running".to_string(),
+            Ok(Some(status)) => format!("exited ({status})"),
+            Err(error) => format!("unknown ({error})"),
+        };
+        let ready_probe = match http_get("http://127.0.0.1:8131/ready").await {
+            Ok((ok, body)) => format!("http_200={ok}, body={body}"),
+            Err(error) => format!("failed: {error:#}"),
+        };
+        Err(source).with_context(|| {
+            format!(
+                "loader /ready after restart; child={child_status}; final /ready probe: {ready_probe}"
+            )
+        })
     }
 
     /// Whether the loader child is still running (`try_wait() == Ok(None)`). A lossy-cast QUARANTINE

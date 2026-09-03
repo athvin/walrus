@@ -498,7 +498,10 @@ async fn sink_crash_mid_reload_starts_a_correct_successor_on_one_slot() {
     h.await_loader_exited(Duration::from_secs(60))
         .await
         .expect("epoch-1 loader exits after observing the successor");
-    h.restart_loader()
+    // This fixture deliberately produces 400 tiny reload objects. A healthy CI loader consumes
+    // them in several bounded claim cycles, so give this scale-only reconciliation more time than
+    // the harness's ordinary 90-second startup contract.
+    h.restart_loader_with_deadline(Duration::from_secs(300))
         .await
         .expect("loader rebuilds under the successor generation");
     let successor_status: String =
