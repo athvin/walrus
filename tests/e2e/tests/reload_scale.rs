@@ -439,7 +439,13 @@ async fn sink_crash_mid_reload_starts_a_correct_successor_on_one_slot() {
     assert_eq!(new_epoch, old_epoch + 1);
     h.refresh_epoch().await.unwrap();
 
+    // The epoch-1 loader deliberately retires as soon as it observes the bump. It therefore cannot
+    // publish an epoch-2 reload: `complete` is a loader-owned transition, while `export_complete`
+    // is the sink's durable hand-off boundary. Wait for that hand-off before starting the successor
+    // loader. Waiting for `complete` here would deadlock the test against the process it has not yet
+    // started.
     let recovery_deadline = tokio::time::Instant::now() + Duration::from_secs(240);
+    let mut last_observed = None;
     let successor_id = loop {
         let row: Option<(i64, String)> = sqlx::query_as(
             "SELECT tr.reload_id, tr.status \
@@ -458,7 +464,8 @@ async fn sink_crash_mid_reload_starts_a_correct_successor_on_one_slot() {
         .await
         .unwrap();
         if let Some((reload_id, status)) = row {
-            if status == "complete" {
+            last_observed = Some((reload_id, status.clone()));
+            if matches!(status.as_str(), "export_complete" | "complete") {
                 break reload_id;
             }
             assert!(
@@ -469,7 +476,8 @@ async fn sink_crash_mid_reload_starts_a_correct_successor_on_one_slot() {
         assert_one_slot_and_at_most_one_walsender(&h).await;
         assert!(
             tokio::time::Instant::now() < recovery_deadline,
-            "no successor-generation bootstrap reload completed after the process crash"
+            "successor-generation bootstrap export did not reach its durable loader hand-off \
+             after the process crash; last observed row: {last_observed:?}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
@@ -484,12 +492,27 @@ async fn sink_crash_mid_reload_starts_a_correct_successor_on_one_slot() {
     assert_range_chunking(&successor_ranges, 50, 20_001, successor_files);
     assert_one_slot_and_at_most_one_walsender(&h).await;
 
-    // The old loader is fenced out by the epoch bump. Start its replacement only after the full
-    // successor snapshot is durable, then cross a post-snapshot WAL watermark before comparing.
-    h.stop_loader().await.unwrap();
+    // The old loader is fenced out by the epoch bump. Reap that expected exit, then start its
+    // replacement after the full successor snapshot is durable. Readiness proves that replacement
+    // published every frozen bootstrap reload, including this one.
+    h.await_loader_exited(Duration::from_secs(60))
+        .await
+        .expect("epoch-1 loader exits after observing the successor");
     h.restart_loader()
         .await
         .expect("loader rebuilds under the successor generation");
+    let successor_status: String =
+        sqlx::query_scalar("SELECT status FROM walrus.table_reload WHERE reload_id = $1")
+            .bind(successor_id)
+            .fetch_one(h.control_pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        successor_status, "complete",
+        "successor loader readiness requires the rl1 bootstrap publication to complete"
+    );
+
+    // Cross a post-snapshot WAL watermark before comparing.
     let before = h.source_wal_lsn().await.unwrap();
     h.source_exec("UPDATE public.rl1 SET status = 'after-restart' WHERE id = 20001")
         .await

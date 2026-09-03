@@ -181,6 +181,16 @@ async fn quarantined_table_recovers_via_reload_without_stalling_others() {
         .find(|column| column.name == "n")
         .expect("q_target v1 contains n")
         .type_oid = 21; // int2
+    // This fixture pre-registers the same v2 row the real ALTER below will later replay. Registry
+    // history is semantically immutable, so an empty synthetic descriptor list is not a harmless
+    // placeholder: when logical decoding derives the real descriptors for this same key, the
+    // conflict correctly terminates the sink. Derive through the sink's production relation-cache
+    // path so the fixture is byte-for-byte idempotent with the decoded Relation message.
+    let v2_descriptors = pg_sink::relcache::RelationCache::default()
+        .upsert_from_relation(v2_relation.clone(), common::SchemaVersionNo(2))
+        .unwrap()
+        .descriptors
+        .clone();
     control::upsert_registry(
         &pool,
         &control::RegistryRow {
@@ -188,7 +198,7 @@ async fn quarantined_table_recovers_via_reload_without_stalling_others() {
             source_schema: "public".into(),
             source_table: "q_target".into(),
             schema_version: common::SchemaVersionNo(2),
-            descriptors: Vec::new(),
+            descriptors: v2_descriptors,
             columns: serde_json::to_value(v2_relation).unwrap(),
         },
     )
@@ -289,6 +299,14 @@ async fn quarantined_table_recovers_via_reload_without_stalling_others() {
         ) {
             break;
         }
+        let sink_running = h.is_sink_running();
+        assert!(
+            sink_running,
+            "sink exited before reload export completed; status={:?}, error={:?}; sink log tail:\n{}",
+            row.status,
+            row.error,
+            h.sink_log_tail(20)
+        );
         assert!(
             row.status != control::reload::ReloadStatus::Failed,
             "reload failed: {:?}",
@@ -296,7 +314,10 @@ async fn quarantined_table_recovers_via_reload_without_stalling_others() {
         );
         assert!(
             tokio::time::Instant::now() < deadline,
-            "export never completed"
+            "export never completed; status={:?}, error={:?}; sink log tail:\n{}",
+            row.status,
+            row.error,
+            h.sink_log_tail(20)
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }

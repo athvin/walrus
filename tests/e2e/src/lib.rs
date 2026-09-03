@@ -778,6 +778,21 @@ impl Harness {
         self.grep_sink_log(needle) > 0
     }
 
+    /// Return the newest `max_lines` from the sink log in chronological order. Long-running E2Es
+    /// use this in failure messages so a child-process exit reports its classified cause instead
+    /// of timing out later on the control-plane symptom.
+    pub fn sink_log_tail(&self, max_lines: usize) -> String {
+        let mut tail = std::fs::read_to_string(&self.sink_log)
+            .unwrap_or_else(|error| format!("<cannot read sink log: {error}>"))
+            .lines()
+            .rev()
+            .take(max_lines)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        tail.reverse();
+        tail.join("\n")
+    }
+
     /// Poll [`Harness::heartbeat_roundtrips`] until it reaches `min`, or the deadline elapses.
     pub async fn await_heartbeat_roundtrip(&self, min: usize, deadline: Duration) -> Result<usize> {
         let start = Instant::now();

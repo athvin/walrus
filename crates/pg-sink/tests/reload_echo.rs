@@ -303,6 +303,10 @@ fn cleanup_sql(table: &str) -> String {
         format!(
             "WITH authorized AS MATERIALIZED (SELECT set_config('walrus.manifest_delete_protocol','2',true) AS protocol) DELETE FROM walrus.{table} WHERE epoch = $1 AND (SELECT protocol = '2' FROM authorized)"
         )
+    } else if table == "schema_registry" {
+        format!(
+            "WITH authorized AS MATERIALIZED (SELECT set_config('walrus.schema_registry_maintenance','1-delete',true) AS protocol) DELETE FROM walrus.{table} WHERE epoch = $1 AND (SELECT protocol = '1-delete' FROM authorized)"
+        )
     } else {
         format!("DELETE FROM walrus.{table} WHERE epoch = $1")
     }
