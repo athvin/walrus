@@ -119,11 +119,26 @@ async fn scrub(pool: &sqlx::PgPool, epoch: EpochNo) {
         "schema_registry",
         "loader_checkpoint",
     ] {
-        sqlx::query(&format!("DELETE FROM walrus.{tbl} WHERE epoch = $1"))
-            .bind(epoch)
-            .execute(pool)
-            .await
-            .unwrap();
+        let sql = cleanup_sql(tbl);
+        sqlx::query(&sql).bind(epoch).execute(pool).await.unwrap();
+    }
+}
+
+fn cleanup_sql(table: &str) -> String {
+    if table == "file_manifest" {
+        format!(
+            "WITH authorized AS MATERIALIZED (SELECT set_config('walrus.manifest_delete_protocol','2',true) AS protocol) DELETE FROM walrus.{table} WHERE epoch = $1 AND (SELECT protocol = '2' FROM authorized)"
+        )
+    } else if table == "table_reload" {
+        format!(
+            "WITH authorized AS MATERIALIZED (SELECT set_config('walrus.manifest_fence_maintenance','2-delete',true) AS protocol) DELETE FROM walrus.{table} WHERE epoch = $1 AND (SELECT protocol = '2-delete' FROM authorized)"
+        )
+    } else if table == "schema_registry" {
+        format!(
+            "WITH authorized AS MATERIALIZED (SELECT set_config('walrus.schema_registry_maintenance','1-delete',true) AS protocol) DELETE FROM walrus.{table} WHERE epoch = $1 AND (SELECT protocol = '1-delete' FROM authorized)"
+        )
+    } else {
+        format!("DELETE FROM walrus.{table} WHERE epoch = $1")
     }
 }
 
@@ -210,7 +225,7 @@ async fn status(pool: &sqlx::PgPool, reload_id: ReloadId) -> ReloadStatus {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires docker compose up --wait (source + control PG + MinIO)"]
-async fn kill_mid_export_starts_fresh_successor_and_completes() {
+async fn kill_mid_export_starts_fresh_successor_and_reaches_export_complete() {
     let _g = SOURCE_LOCK.lock().await;
     let epoch = EpochNo(690_001);
     let admin = admin().await;
@@ -344,7 +359,8 @@ async fn kill_mid_export_starts_fresh_successor_and_completes() {
     };
 
     // The sink's last act applies to the fresh successor, never the snapshot-lost predecessor.
-    control::reload::complete_export(&pool, new_id, h)
+    let successor_lease = successor.exporter_lease(HOLDER).unwrap();
+    control::reload::complete_export(&pool, &successor_lease, h)
         .await
         .unwrap();
     let done = control::reload::get(&pool, new_id).await.unwrap().unwrap();
@@ -372,14 +388,16 @@ async fn kill_mid_export_starts_fresh_successor_and_completes() {
     );
     assert_eq!(status(&pool, new_id).await, ReloadStatus::ExportComplete);
 
-    // Caught up to H: the loader flips complete. The full walk is requested→exporting→
-    // export_complete→complete, in order, none skipped.
+    // Even at H, the retired checkpoint-only API cannot bypass protocol-v2 publication. The real
+    // loader must build and publish the hidden Duck generation before it can flip complete.
     set_transformed(&pool, epoch, h).await;
-    let completed = control::reload::complete_reached(&pool, epoch, "public", TABLE)
-        .await
-        .unwrap();
-    assert_eq!(completed, vec![new_id]);
-    assert_eq!(status(&pool, new_id).await, ReloadStatus::Complete);
+    assert!(
+        control::reload::complete_reached(&pool, epoch, "public", TABLE)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(status(&pool, new_id).await, ReloadStatus::ExportComplete);
 
     token.cancel();
     resolver.await.unwrap();
@@ -521,7 +539,8 @@ async fn crash_after_h_before_complete_does_not_export_post_h_rows() {
         files_before,
         "the post-H row was not copied into an F-stamped reload file"
     );
-    control::reload::complete_export(&pool, reload_id, recovered_h)
+    let recovered_lease = after.exporter_lease(HOLDER).unwrap();
+    control::reload::complete_export(&pool, &recovered_lease, recovered_h)
         .await
         .unwrap();
     assert_eq!(status(&pool, reload_id).await, ReloadStatus::ExportComplete);
@@ -537,7 +556,7 @@ async fn crash_after_h_before_complete_does_not_export_post_h_rows() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires docker compose up --wait (source + control PG + MinIO)"]
-async fn complete_waits_for_transformed_lsn_to_reach_h() {
+async fn legacy_checkpoint_completion_cannot_bypass_v2_publication() {
     let _g = SOURCE_LOCK.lock().await;
     let epoch = EpochNo(690_002);
     let admin = admin().await;
@@ -585,7 +604,8 @@ async fn complete_waits_for_transformed_lsn_to_reach_h() {
         }
         RunOutcome::SnapshotLost => panic!("a freshly claimed exporter owns its snapshot"),
     };
-    control::reload::complete_export(&pool, reload_id, h)
+    let lease = req.exporter_lease(HOLDER).unwrap();
+    control::reload::complete_export(&pool, &lease, h)
         .await
         .unwrap();
 
@@ -601,21 +621,21 @@ async fn complete_waits_for_transformed_lsn_to_reach_h() {
     );
     assert_eq!(status(&pool, reload_id).await, ReloadStatus::ExportComplete);
 
-    // Loader catches up to H: complete fires, exactly once (a second call is a no-op).
+    // Loader catches up to H: generation>0 still cannot complete through the legacy shortcut.
     set_transformed(&pool, epoch, h).await;
-    assert_eq!(
+    assert!(
         control::reload::complete_reached(&pool, epoch, "public", TABLE)
             .await
-            .unwrap(),
-        vec![reload_id]
+            .unwrap()
+            .is_empty()
     );
-    assert_eq!(status(&pool, reload_id).await, ReloadStatus::Complete);
+    assert_eq!(status(&pool, reload_id).await, ReloadStatus::ExportComplete);
     assert!(
         control::reload::complete_reached(&pool, epoch, "public", TABLE)
             .await
             .unwrap()
             .is_empty(),
-        "already complete — idempotent, flips nothing twice"
+        "checkpoint-only completion remains a stable no-op for protocol-v2 attempts"
     );
 
     token.cancel();

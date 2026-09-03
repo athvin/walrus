@@ -147,6 +147,8 @@ fn adopted_row(
         schema_version: Some(common::SchemaVersionNo(1)),
         restart_count: 0,
         lease_holder: Some("sink-a".to_string()),
+        exporter_generation: 1,
+        has_export_plan: false,
         error: None,
     }
 }
@@ -165,6 +167,14 @@ fn adoption_progress_decides_whether_fresh_identity_spends_restart_budget() {
         adopted_snapshot_ownership(&fenced_pre_chunk),
         SnapshotOwnership::AdoptedPristine,
         "F alone is not durable baseline material, but its marker identity still cannot be reused"
+    );
+
+    let mut planned_empty_snapshot = fenced_pre_chunk;
+    planned_empty_snapshot.has_export_plan = true;
+    assert_eq!(
+        adopted_snapshot_ownership(&planned_empty_snapshot),
+        SnapshotOwnership::AdoptedWithProgress,
+        "even a zero-file snapshot plan is connection-local work and can never be resumed"
     );
 
     let durable_chunk = adopted_row(

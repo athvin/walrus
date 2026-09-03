@@ -12,9 +12,9 @@
 //!
 //! Scope note: series computable at an
 //! existing call site are populated there via the helpers below; the few that would need a **new**
-//! query — replication-lag / retained-WAL (a `pg_current_wal_lsn` / `pg_replication_slots` poll),
-//! files-ready / ddl-pending backlog counts, dead-letter failed-file counts, and the not-yet-wired
-//! pause-poll counter — are registered (so the dashboard/alerts have a target) but left at zero here.
+//! query — files-ready / ddl-pending backlog counts, dead-letter failed-file counts, and the
+//! not-yet-wired pause-poll counter — are registered (so the dashboard/alerts have a target) but
+//! left at zero here.
 
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::sync::OnceLock;
@@ -27,8 +27,23 @@ pub mod names {
     pub const SINK_REPLICATION_LAG_BYTES: &str = "walrus_sink_replication_lag_bytes";
     /// WAL bytes the replication slot pins on the source's disk.
     pub const SINK_SLOT_RETAINED_WAL_BYTES: &str = "walrus_sink_slot_retained_wal_bytes";
+    /// Bytes PostgreSQL reports can still be written before `max_slot_wal_keep_size` is exhausted.
+    pub const SINK_SLOT_SAFE_WAL_BYTES: &str = "walrus_sink_slot_safe_wal_bytes";
+    /// Whether the configured replication slot was present at the last successful catalog poll.
+    pub const SINK_SLOT_PRESENT: &str = "walrus_sink_slot_present";
+    /// Whether this PostgreSQL exposes `pg_replication_slots.wal_status`.
+    pub const SINK_SLOT_WAL_STATUS_SUPPORTED: &str = "walrus_sink_slot_wal_status_supported";
+    /// Whether this PostgreSQL exposes `pg_replication_slots.safe_wal_size`.
+    pub const SINK_SLOT_SAFE_WAL_SIZE_SUPPORTED: &str = "walrus_sink_slot_safe_wal_size_supported";
+    /// Whether the last replication-slot catalog poll completed successfully.
+    pub const SINK_SLOT_GUARD_POLL_OK: &str = "walrus_sink_slot_guard_poll_ok";
     /// Categorical gauge: 0 reserved · 1 unreserved · 2 lost (alert on ≥ 1).
     pub const SINK_WAL_STATUS: &str = "walrus_sink_wal_status";
+    /// Protocol-v2 transactions currently open in the in-process streamed-transaction demux.
+    pub const SINK_OPEN_STREAM_TXNS: &str = "walrus_sink_open_stream_txns";
+    /// Age of the oldest open protocol-v2 transaction observed by the demux.
+    pub const SINK_OLDEST_OPEN_STREAM_TXN_AGE_SECONDS: &str =
+        "walrus_sink_oldest_open_stream_txn_age_seconds";
     /// Seconds since the last heartbeat round-trip confirmed.
     pub const SINK_HEARTBEAT_CONFIRMED_AGE_SECONDS: &str =
         "walrus_sink_heartbeat_confirmed_age_seconds";
@@ -110,7 +125,14 @@ pub mod names {
     pub const SINK_ALL: &[&str] = &[
         SINK_REPLICATION_LAG_BYTES,
         SINK_SLOT_RETAINED_WAL_BYTES,
+        SINK_SLOT_SAFE_WAL_BYTES,
+        SINK_SLOT_PRESENT,
+        SINK_SLOT_WAL_STATUS_SUPPORTED,
+        SINK_SLOT_SAFE_WAL_SIZE_SUPPORTED,
+        SINK_SLOT_GUARD_POLL_OK,
         SINK_WAL_STATUS,
+        SINK_OPEN_STREAM_TXNS,
+        SINK_OLDEST_OPEN_STREAM_TXN_AGE_SECONDS,
         SINK_HEARTBEAT_CONFIRMED_AGE_SECONDS,
         SINK_HEARTBEAT_ROUNDTRIP_AGE_SECONDS,
         SINK_BEAT_SEQ_GAP,
@@ -230,8 +252,38 @@ fn describe_all() {
         "WAL bytes the slot pins on disk"
     );
     describe_gauge!(
+        names::SINK_SLOT_SAFE_WAL_BYTES,
+        Unit::Bytes,
+        "bytes PostgreSQL reports can still be written before max_slot_wal_keep_size is exhausted"
+    );
+    describe_gauge!(
+        names::SINK_SLOT_PRESENT,
+        "configured replication slot present at the last successful catalog poll (1 present, 0 absent)"
+    );
+    describe_gauge!(
+        names::SINK_SLOT_WAL_STATUS_SUPPORTED,
+        "source catalog exposes pg_replication_slots.wal_status (1 supported, 0 unsupported)"
+    );
+    describe_gauge!(
+        names::SINK_SLOT_SAFE_WAL_SIZE_SUPPORTED,
+        "source catalog exposes pg_replication_slots.safe_wal_size (1 supported, 0 unsupported)"
+    );
+    describe_gauge!(
+        names::SINK_SLOT_GUARD_POLL_OK,
+        "last replication-slot catalog poll completed successfully (1 success, 0 unavailable)"
+    );
+    describe_gauge!(
         names::SINK_WAL_STATUS,
         "slot wal_status: 0 reserved, 1 unreserved, 2 lost"
+    );
+    describe_gauge!(
+        names::SINK_OPEN_STREAM_TXNS,
+        "protocol-v2 transactions currently open in the streamed-transaction demux"
+    );
+    describe_gauge!(
+        names::SINK_OLDEST_OPEN_STREAM_TXN_AGE_SECONDS,
+        Unit::Seconds,
+        "age of the oldest open protocol-v2 transaction observed by the demux"
     );
     describe_gauge!(
         names::SINK_HEARTBEAT_CONFIRMED_AGE_SECONDS,
@@ -383,6 +435,57 @@ fn zero_init_global() {
 /// Slot `wal_status` as the categorical gauge (0 reserved / 1 unreserved / 2 lost).
 pub fn set_wal_status(code: u8) {
     metrics::gauge!(names::SINK_WAL_STATUS).set(f64::from(code));
+}
+
+/// Refresh the replication-slot guard gauges from one read-only source-catalog sample.
+pub fn set_slot_guard(
+    replication_lag_bytes: u64,
+    retained_wal_bytes: u64,
+    safe_wal_bytes: Option<u64>,
+    present: bool,
+    wal_status_supported: bool,
+    safe_wal_size_supported: bool,
+    wal_status_code: Option<u8>,
+) {
+    metrics::gauge!(names::SINK_REPLICATION_LAG_BYTES).set(replication_lag_bytes as f64);
+    metrics::gauge!(names::SINK_SLOT_RETAINED_WAL_BYTES).set(retained_wal_bytes as f64);
+    metrics::gauge!(names::SINK_SLOT_SAFE_WAL_BYTES)
+        .set(safe_wal_bytes.map_or(f64::NAN, |bytes| bytes as f64));
+    metrics::gauge!(names::SINK_SLOT_PRESENT).set(if present { 1.0 } else { 0.0 });
+    metrics::gauge!(names::SINK_SLOT_WAL_STATUS_SUPPORTED).set(if wal_status_supported {
+        1.0
+    } else {
+        0.0
+    });
+    metrics::gauge!(names::SINK_SLOT_SAFE_WAL_SIZE_SUPPORTED).set(if safe_wal_size_supported {
+        1.0
+    } else {
+        0.0
+    });
+    metrics::gauge!(names::SINK_WAL_STATUS).set(wal_status_code.map_or(f64::NAN, f64::from));
+    metrics::gauge!(names::SINK_SLOT_GUARD_POLL_OK).set(1.0);
+}
+
+/// A failed/unstarted poll must not leave the previous healthy sample looking current.
+pub fn set_slot_guard_unknown() {
+    for name in [
+        names::SINK_REPLICATION_LAG_BYTES,
+        names::SINK_SLOT_RETAINED_WAL_BYTES,
+        names::SINK_SLOT_SAFE_WAL_BYTES,
+        names::SINK_SLOT_PRESENT,
+        names::SINK_SLOT_WAL_STATUS_SUPPORTED,
+        names::SINK_SLOT_SAFE_WAL_SIZE_SUPPORTED,
+        names::SINK_WAL_STATUS,
+    ] {
+        metrics::gauge!(name).set(f64::NAN);
+    }
+    metrics::gauge!(names::SINK_SLOT_GUARD_POLL_OK).set(0.0);
+}
+
+/// Refresh the in-process protocol-v2 open-transaction guard gauges.
+pub fn set_open_stream_txns(count: usize, oldest_age_seconds: f64) {
+    metrics::gauge!(names::SINK_OPEN_STREAM_TXNS).set(count as f64);
+    metrics::gauge!(names::SINK_OLDEST_OPEN_STREAM_TXN_AGE_SECONDS).set(oldest_age_seconds);
 }
 
 /// One reload echo cross-check violation (`embedded >= commit`) — the watermark model is

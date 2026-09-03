@@ -1,8 +1,7 @@
 //! Additive / lossless DDL apply (loader §5.7, architecture "per-change-type handling") — the loader's
-//! schema-evolution half. **Schema-DIFF, never `c_ddl_text` replay:** each additive change is derived
-//! from the `new − old` column sets in `schema_registry`, and columns are matched by **position
-//! (attnum)**, never by name — a `RENAME a → b` followed by `ADD COLUMN a` must read as "position 0
-//! renamed, a new column appended", which name-matching would silently corrupt.
+//! schema-evolution half. **Schema-DIFF, never `c_ddl_text` replay:** each change is derived from the
+//! `new − old` column sets in `schema_registry`. A common ordinal is not durable attnum lineage, so
+//! production reconciliation rejects name substitutions that could be either RENAME or DROP+ADD.
 //!
 //! The **homogeneous-file rule** (one `schema_version` per Parquet file) lets the loader gate cleanly:
 //! before it appends/transforms any file at version V it reconciles both DuckDB tables *up to* V, so no
@@ -10,20 +9,26 @@
 //! source shape; `<table>_raw` is an **additive superset** (columns only ever added / widened / renamed —
 //! never dropped here), so old verbatim rows stay valid (a new column reads NULL for them).
 //!
-//! **Additive / lossless**: `ADD COLUMN`, `RENAME COLUMN` / `RENAME TABLE`, a lossless/widening
-//! `ALTER COLUMN TYPE`, and `COMMENT` (metadata — mirror only, does **not** cut a `schema_version`
-//! boundary). **Destructive**, where mirror and raw diverge most: `DROP COLUMN` (physical on
+//! **Additive / lossless**: `ADD COLUMN`, `RENAME TABLE`, and a lossless/widening
+//! `ALTER COLUMN TYPE`. `COMMENT` is audit-only in the source protocol: the structured durable
+//! payload has no target/text, so registry reconciliation neither parses SQL nor applies comments.
+//! **Destructive**, where mirror and raw diverge most: `DROP COLUMN` (physical on
 //! the mirror, retained-nullable on raw), a **lossy** `ALTER COLUMN TYPE` (attempt the in-place mirror
 //! cast → on failure **quarantine + alert + stop**, an accepted terminal v1 outcome; raw is widened to
 //! `VARCHAR`, never re-cast), and `DROP TABLE` (retire both tables + file). Raw is an additive superset:
 //! it only ever adds / widens — it never destructively drops or re-casts history.
+//! A common-position source-name substitution is classified as a possible `RENAME COLUMN`, but
+//! production reconciliation quarantines it: the current registry omits stable attnum lineage, so a
+//! genuine rename and one same-statement `DROP old, ADD new` are indistinguishable.
 
 use crate::duck::{TableDb, duck_type, user_view_sql};
 use crate::duck_ext::DuckResultExt;
 use crate::error::LoaderError;
+use crate::plan::TablePlan;
 use common::oids::{FLOAT4, FLOAT8, INT2, INT4, INT8};
 use common::sql::SqlStrExt;
 use common::{EpochNo, PgColumn, PgRelation, SchemaVersionNo};
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 /// One `schema_version` of a table's shape — the `schema_registry` `columns` snapshot for that version.
@@ -35,7 +40,8 @@ pub struct SchemaVersion {
     pub relation: PgRelation,
 }
 
-/// What a `COMMENT` targets. `COMMENT` is metadata: mirror only, never a data gate.
+/// What an explicitly supplied local `COMMENT` helper targets. Registry reconciliation never
+/// constructs this from the source audit text, which is not a structured replay contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommentTarget {
     /// `COMMENT ON TABLE`.
@@ -44,7 +50,8 @@ pub enum CommentTarget {
     Column(String),
 }
 
-/// One additive/lossless structural (or metadata) change, derived by [`diff_additive`].
+/// One additive/lossless structural change. The explicit comment variant is a local helper only;
+/// [`diff_additive`] cannot derive it from a registry shape.
 ///
 /// A classification result is pure data — every payload is a `String`, a `usize`, or a [`PgColumn`],
 /// all of which are already `Clone`/`Eq` — so a caller can compare a derived change against an
@@ -68,7 +75,7 @@ pub enum AdditiveChange {
         name: String,
         new: PgColumn,
     },
-    /// A `COMMENT ON` — a metadata revision mirrored onto `<table>` only; it does not gate data.
+    /// An explicitly supplied `COMMENT ON` helper. Never derived from source `c_ddl_text`.
     Comment {
         target: CommentTarget,
         text: Option<String>,
@@ -115,15 +122,16 @@ pub struct SchemaDiff {
     pub destructive: Vec<DestructiveChange>,
 }
 
-/// Diff `old → new` by POSITION (attnum), classifying each change as additive or **destructive**.
-/// The homogeneous-file rule means one DDL per version, so a length change is unambiguous:
-/// a drop shrinks the column count (never a rename, which keeps it), and an empty new column set is a
-/// `DROP TABLE`. A type change is a lossless widen (additive) or a lossy/narrowing one (destructive).
+/// Diff `old → new` by common ordinal, classifying each change as additive or **destructive**.
+/// A shorter shape is accepted only when every survivor is an unchanged ordered subsequence; an
+/// empty new column set is a `DROP TABLE`. A type change is a lossless widen (additive) or a
+/// lossy/narrowing one (destructive). Production preflight rejects ambiguous name substitutions.
 ///
 /// # Errors
 ///
-/// This classifier currently produces no [`LoaderError`] variant: every pair of relation shapes has
-/// a deterministic [`SchemaDiff`]. The `Result` keeps the version-step API aligned with its appliers.
+/// Returns [`LoaderError::ManifestInvariant`] when a shrinking relation does not leave an exactly
+/// unchanged ordered subsequence. That means the source combined DROP with another structural
+/// operation the registry snapshots cannot replay safely as one step.
 pub fn diff(old: &SchemaVersion, new: &SchemaVersion) -> Result<SchemaDiff, LoaderError> {
     let mut d = SchemaDiff::default();
 
@@ -144,8 +152,33 @@ pub fn diff(old: &SchemaVersion, new: &SchemaVersion) -> Result<SchemaDiff, Load
 
     let (oc, nc) = (&old.relation.columns, &new.relation.columns);
     if nc.len() < oc.len() {
-        // DROP COLUMN(s): a length decrease is a drop (a rename keeps the count). Identify the dropped
-        // columns by name-set difference — the surviving columns keep their names.
+        // DROP COLUMN(s): every survivor must be an exactly unchanged, ordered subsequence. A
+        // concurrent rename/type/identity change in the same step is deliberately rejected instead
+        // of being mistaken for another dropped column after attnums shift.
+        let mut old_floor = 0;
+        for survivor in nc {
+            let Some(relative) = oc[old_floor..]
+                .iter()
+                .position(|column| column.name == survivor.name)
+            else {
+                return Err(LoaderError::ManifestInvariant {
+                    message: format!(
+                        "schema step {}->{} shrinks columns but survivor {:?} is not an ordered old column",
+                        old.version, new.version, survivor.name
+                    ),
+                });
+            };
+            let old_position = old_floor + relative;
+            if oc[old_position] != *survivor {
+                return Err(LoaderError::ManifestInvariant {
+                    message: format!(
+                        "schema step {}->{} changes surviving column {:?} while dropping columns",
+                        old.version, new.version, survivor.name
+                    ),
+                });
+            }
+            old_floor = old_position + 1;
+        }
         let kept: std::collections::HashSet<&str> = nc.iter().map(|c| c.name.as_str()).collect();
         let dropped = oc.iter().filter(|o| !kept.contains(o.name.as_str()));
         d.destructive
@@ -205,9 +238,10 @@ pub fn diff_additive(
     Ok(d.additive)
 }
 
-/// Apply the derived changes to the DuckDB tables per the taxonomy: mirror = exact shape, `<table>_raw`
-/// = additive superset (nullable adds), `COMMENT` = mirror only. A `SELECT *` view binds its columns at
-/// creation, so the user view is recreated after any structural change.
+/// Apply explicitly supplied changes to the DuckDB tables per the taxonomy: mirror = exact shape,
+/// `<table>_raw` = additive superset (nullable adds). An explicit local `COMMENT` changes only the
+/// mirror; source registry reconciliation does not derive comments. A `SELECT *` view binds its
+/// columns at creation, so the user view is recreated after any structural change.
 ///
 /// # Errors
 ///
@@ -217,6 +251,28 @@ pub fn apply_additive(
     table: &str,
     changes: &[AdditiveChange],
 ) -> Result<(), LoaderError> {
+    apply_additive_inner(conn, table, changes, None)
+}
+
+/// Registry-aware additive apply used by [`reconcile_to_version`]. Unlike the public scalar helper,
+/// this preserves the physical boundary of each logical source column, so Tier-2 ADD/RENAME changes
+/// update every emitted raw and mirror sibling instead of assuming a one-to-one column shape.
+fn apply_additive_registry(
+    conn: &duckdb::Connection,
+    table: &str,
+    changes: &[AdditiveChange],
+    old: &RegistryVersion,
+    new: &RegistryVersion,
+) -> Result<(), LoaderError> {
+    apply_additive_inner(conn, table, changes, Some((old, new)))
+}
+
+fn apply_additive_inner(
+    conn: &duckdb::Connection,
+    table: &str,
+    changes: &[AdditiveChange],
+    registry: Option<(&RegistryVersion, &RegistryVersion)>,
+) -> Result<(), LoaderError> {
     // Each change emits a mirror + a _raw statement, roughly 120 bytes together.
     let mut sql = String::with_capacity(changes.len() * 128);
     let mut cur = table.to_string();
@@ -224,32 +280,97 @@ pub fn apply_additive(
     for ch in changes {
         match ch {
             AdditiveChange::AddColumn(c) => {
-                let ty = duck_type(c.type_oid);
-                let name = &c.name;
-                // Nullable on both (no NOT NULL): pre-change rows read NULL; old raw rows stay valid.
-                // `String`'s `fmt::Write` implementation is infallible.
-                let _write_result = write!(
-                    &mut sql,
-                    "ALTER TABLE \"{cur}\" ADD COLUMN IF NOT EXISTS \"{name}\" {ty}; \
-                     ALTER TABLE \"{cur}_raw\" ADD COLUMN IF NOT EXISTS \"{name}\" {ty};"
-                );
+                if let Some((_, new)) = registry {
+                    let position = new
+                        .shape
+                        .relation
+                        .columns
+                        .iter()
+                        .position(|column| column == c)
+                        .ok_or_else(|| LoaderError::ManifestInvariant {
+                            message: format!(
+                                "schema {} ADD COLUMN {:?} is absent from its registry relation",
+                                new.shape.version, c.name
+                            ),
+                        })?;
+                    let plan = registry_column_plan(new, position)?;
+                    for column in &plan.mirror_cols {
+                        let name = &column.name;
+                        let ty = &column.duckdb_type;
+                        let _write_result = write!(
+                            &mut sql,
+                            "ALTER TABLE \"{cur}\" ADD COLUMN IF NOT EXISTS \"{name}\" {ty};"
+                        );
+                    }
+                    for column in &plan.raw_cols {
+                        let name = &column.name;
+                        let ty = &column.duckdb_type;
+                        let _write_result = write!(
+                            &mut sql,
+                            "ALTER TABLE \"{cur}_raw\" ADD COLUMN IF NOT EXISTS \"{name}\" {ty};"
+                        );
+                    }
+                } else {
+                    let ty = duck_type(c.type_oid);
+                    let name = &c.name;
+                    // Nullable on both (no NOT NULL): pre-change rows read NULL; old raw rows stay valid.
+                    // `String`'s `fmt::Write` implementation is infallible.
+                    let _write_result = write!(
+                        &mut sql,
+                        "ALTER TABLE \"{cur}\" ADD COLUMN IF NOT EXISTS \"{name}\" {ty}; \
+                         ALTER TABLE \"{cur}_raw\" ADD COLUMN IF NOT EXISTS \"{name}\" {ty};"
+                    );
+                }
                 structural = true;
             }
-            AdditiveChange::RenameColumn { from, to, .. } => {
-                let _write_result = write!(
-                    &mut sql,
-                    "ALTER TABLE \"{cur}\" RENAME COLUMN \"{from}\" TO \"{to}\"; \
-                     ALTER TABLE \"{cur}_raw\" RENAME COLUMN \"{from}\" TO \"{to}\";"
-                );
+            AdditiveChange::RenameColumn { position, from, to } => {
+                if let Some((old, new)) = registry {
+                    let old_plan = registry_column_plan(old, *position)?;
+                    let new_plan = registry_column_plan(new, *position)?;
+                    append_physical_renames(
+                        &mut sql,
+                        &cur,
+                        from,
+                        to,
+                        &old_plan,
+                        &new_plan,
+                        old.shape.version,
+                        new.shape.version,
+                    )?;
+                } else {
+                    let _write_result = write!(
+                        &mut sql,
+                        "ALTER TABLE \"{cur}\" RENAME COLUMN \"{from}\" TO \"{to}\"; \
+                         ALTER TABLE \"{cur}_raw\" RENAME COLUMN \"{from}\" TO \"{to}\";"
+                    );
+                }
                 structural = true;
             }
-            AdditiveChange::WidenColumn { name, new, .. } => {
-                let ty = duck_type(new.type_oid);
-                let _write_result = write!(
-                    &mut sql,
-                    "ALTER TABLE \"{cur}\" ALTER COLUMN \"{name}\" TYPE {ty}; \
-                     ALTER TABLE \"{cur}_raw\" ALTER COLUMN \"{name}\" TYPE {ty};"
-                );
+            AdditiveChange::WidenColumn {
+                position,
+                name,
+                new: widened,
+            } => {
+                if let Some((old, new)) = registry {
+                    let old_plan = registry_column_plan(old, *position)?;
+                    let new_plan = registry_column_plan(new, *position)?;
+                    append_physical_widen(
+                        &mut sql,
+                        &cur,
+                        name,
+                        &old_plan,
+                        &new_plan,
+                        old.shape.version,
+                        new.shape.version,
+                    )?;
+                } else {
+                    let ty = duck_type(widened.type_oid);
+                    let _write_result = write!(
+                        &mut sql,
+                        "ALTER TABLE \"{cur}\" ALTER COLUMN \"{name}\" TYPE {ty}; \
+                         ALTER TABLE \"{cur}_raw\" ALTER COLUMN \"{name}\" TYPE {ty};"
+                    );
+                }
                 structural = true;
             }
             AdditiveChange::RenameTable { from, to } => {
@@ -292,6 +413,115 @@ pub fn apply_additive(
         .duck_with(|| format!("apply additive DDL to {table}"))
 }
 
+fn registry_column_plan(
+    version: &RegistryVersion,
+    position: usize,
+) -> Result<TablePlan, LoaderError> {
+    let column = version
+        .shape
+        .relation
+        .columns
+        .get(position)
+        .ok_or_else(|| LoaderError::ManifestInvariant {
+            message: format!(
+                "schema {} has no logical column at position {position}",
+                version.shape.version
+            ),
+        })?;
+    let descriptor = version
+        .descriptor_positions
+        .get(&column.name)
+        .map(|position| &version.descriptors[*position]);
+    Ok(TablePlan::for_registry_column(
+        &version.shape.relation,
+        column,
+        descriptor,
+    ))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "both logical and version labels make failures actionable"
+)]
+fn append_physical_renames(
+    sql: &mut String,
+    table: &str,
+    from: &str,
+    to: &str,
+    old: &TablePlan,
+    new: &TablePlan,
+    old_version: SchemaVersionNo,
+    new_version: SchemaVersionNo,
+) -> Result<(), LoaderError> {
+    if old.raw_cols.len() != new.raw_cols.len() || old.mirror_cols.len() != new.mirror_cols.len() {
+        return Err(LoaderError::Quarantine {
+            table: table.to_string(),
+            reason: format!(
+                "schema step {old_version}->{new_version} rename {from:?}->{to:?} changes physical emit arity"
+            ),
+        });
+    }
+    for (old_column, new_column) in old.mirror_cols.iter().zip(&new.mirror_cols) {
+        if old_column.name != new_column.name {
+            let old_name = &old_column.name;
+            let new_name = &new_column.name;
+            let _write_result = write!(
+                sql,
+                "ALTER TABLE \"{table}\" RENAME COLUMN \"{old_name}\" TO \"{new_name}\";"
+            );
+        }
+    }
+    for (old_column, new_column) in old.raw_cols.iter().zip(&new.raw_cols) {
+        if old_column.name != new_column.name {
+            let old_name = &old_column.name;
+            let new_name = &new_column.name;
+            let _write_result = write!(
+                sql,
+                "ALTER TABLE \"{table}_raw\" RENAME COLUMN \"{old_name}\" TO \"{new_name}\";"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "both logical and version labels make failures actionable"
+)]
+fn append_physical_widen(
+    sql: &mut String,
+    table: &str,
+    name: &str,
+    old: &TablePlan,
+    new: &TablePlan,
+    old_version: SchemaVersionNo,
+    new_version: SchemaVersionNo,
+) -> Result<(), LoaderError> {
+    let one_to_one = old.raw_cols.len() == 1
+        && new.raw_cols.len() == 1
+        && old.mirror_cols.len() == 1
+        && new.mirror_cols.len() == 1
+        && old.raw_cols[0].name == new.raw_cols[0].name
+        && old.mirror_cols[0].name == new.mirror_cols[0].name;
+    if !one_to_one {
+        return Err(LoaderError::Quarantine {
+            table: table.to_string(),
+            reason: format!(
+                "schema step {old_version}->{new_version} widening {name:?} changes a non-1:1 physical shape"
+            ),
+        });
+    }
+    let mirror = &new.mirror_cols[0];
+    let raw = &new.raw_cols[0];
+    let _write_result = write!(
+        sql,
+        "ALTER TABLE \"{table}\" ALTER COLUMN \"{}\" TYPE {}; \
+         ALTER TABLE \"{table}_raw\" ALTER COLUMN \"{}\" TYPE {};",
+        mirror.name, mirror.duckdb_type, raw.name, raw.duckdb_type
+    );
+    Ok(())
+}
+
 /// Apply destructive changes — the mirror-vs-raw asymmetry is the whole point: the mirror
 /// takes the exact current shape (physical drop / in-place cast), the raw log preserves history
 /// (retain / widen-to-VARCHAR, **never** a re-cast that could fail on stored values). A lossy cast that
@@ -308,20 +538,67 @@ pub fn apply_destructive(
     table: &str,
     changes: &[DestructiveChange],
 ) -> Result<(), LoaderError> {
+    apply_destructive_inner(db, table, changes, None)
+}
+
+fn apply_destructive_registry(
+    db: &TableDb,
+    table: &str,
+    changes: &[DestructiveChange],
+    old: &RegistryVersion,
+    new: &RegistryVersion,
+) -> Result<(), LoaderError> {
+    apply_destructive_inner(db, table, changes, Some((old, new)))
+}
+
+fn apply_destructive_inner(
+    db: &TableDb,
+    table: &str,
+    changes: &[DestructiveChange],
+    registry: Option<(&RegistryVersion, &RegistryVersion)>,
+) -> Result<(), LoaderError> {
     let conn = db.conn();
     for ch in changes {
         match ch {
             DestructiveChange::DropColumn { name } => {
                 // Mirror: physical drop. Raw: RETAIN the column (already nullable) — verbatim history; a
                 // post-drop file simply NULL-fills it (name-explicit append). Recreate the view.
-                let sql = format!(
-                    "ALTER TABLE \"{table}\" DROP COLUMN IF EXISTS \"{name}\"; {}",
-                    user_view_sql(table)
-                );
+                let mut sql = String::new();
+                if let Some((old, _)) = registry {
+                    let position = old
+                        .shape
+                        .relation
+                        .columns
+                        .iter()
+                        .position(|column| column.name == *name)
+                        .ok_or_else(|| LoaderError::ManifestInvariant {
+                            message: format!(
+                                "schema {} DROP COLUMN {name:?} is absent from its registry relation",
+                                old.shape.version
+                            ),
+                        })?;
+                    let plan = registry_column_plan(old, position)?;
+                    for column in &plan.mirror_cols {
+                        let physical_name = &column.name;
+                        let _write_result = write!(
+                            &mut sql,
+                            "ALTER TABLE \"{table}\" DROP COLUMN IF EXISTS \"{physical_name}\";"
+                        );
+                    }
+                    sql.push_str(&user_view_sql(table));
+                } else {
+                    sql = format!(
+                        "ALTER TABLE \"{table}\" DROP COLUMN IF EXISTS \"{name}\"; {}",
+                        user_view_sql(table)
+                    );
+                }
                 conn.execute_batch(&sql)
                     .duck_with(|| format!("drop column {name} on {table}"))?;
             }
             DestructiveChange::LossyType { name, new } => {
+                if let Some((old_version, new_version)) = registry {
+                    validate_lossy_registry_shape(old_version, new_version, name, table)?;
+                }
                 let ty = duck_type(new.type_oid);
                 // Raw FIRST: widen to VARCHAR so rows of BOTH schema_versions coexist in one column;
                 // never narrow historical values. Native DuckDB can do that in-place. DuckLake only
@@ -348,6 +625,42 @@ pub fn apply_destructive(
                 .duck_with(|| format!("drop table {name}"))?;
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_lossy_registry_shape(
+    old: &RegistryVersion,
+    new: &RegistryVersion,
+    name: &str,
+    table: &str,
+) -> Result<(), LoaderError> {
+    let position = new
+        .shape
+        .relation
+        .columns
+        .iter()
+        .position(|column| column.name == name)
+        .ok_or_else(|| LoaderError::ManifestInvariant {
+            message: format!(
+                "schema {} lossy column {name:?} is absent from its registry relation",
+                new.shape.version
+            ),
+        })?;
+    let old_plan = registry_column_plan(old, position)?;
+    let new_plan = registry_column_plan(new, position)?;
+    let one_to_one = old_plan.raw_cols.len() == 1
+        && new_plan.raw_cols.len() == 1
+        && old_plan.mirror_cols.len() == 1
+        && new_plan.mirror_cols.len() == 1;
+    if !one_to_one {
+        return Err(LoaderError::Quarantine {
+            table: table.to_string(),
+            reason: format!(
+                "schema step {}->{} changes lossy column {name:?} across a non-1:1 physical shape",
+                old.shape.version, new.shape.version
+            ),
+        });
     }
     Ok(())
 }
@@ -428,7 +741,11 @@ pub async fn reconcile_to_version(
 ) -> Result<(), LoaderError> {
     let mut cur = db.schema_version()?;
     while cur < target {
-        let next = SchemaVersionNo(cur.0 + 1);
+        let next = SchemaVersionNo(cur.0.checked_add(1).ok_or_else(|| {
+            LoaderError::ManifestInvariant {
+                message: format!("schema reconciliation overflows after version {cur}"),
+            }
+        })?);
         // Both rows are read unconditionally and neither consumes the other's output, so one step
         // costs the slower round trip instead of their sum — and a reconcile can walk many steps.
         // Same caveat as `phase_a::read_lag_inputs`: each read may hold one pool connection while the
@@ -437,24 +754,47 @@ pub async fn reconcile_to_version(
             load_version(pool, epoch, schema, table, cur),
             load_version(pool, epoch, schema, table, next),
         )?;
-        // A version with no registry pair to diff (e.g. a metadata-only revision that did not persist a
-        // new `columns` snapshot) applies nothing structural — we still advance the watermark below.
-        if let (Some(old), Some(new)) = (old, new) {
-            let d = diff(&old, &new)?;
-            apply_additive(db.conn(), table, &d.additive)?;
-            // Destructive changes apply after additive ones; a lossy cast failure short-circuits
-            // with `Quarantine` and the watermark is NOT advanced (re-run re-quarantines idempotently).
-            let drops_table = d
-                .destructive
-                .iter()
-                .any(|change| matches!(change, DestructiveChange::DropTable { .. }));
-            if drops_table {
-                db.unpublish_current_view()?;
-            }
-            apply_destructive(db, table, &d.destructive)?;
-            if !drops_table {
-                db.publish_current_view()?;
-            }
+        let (old, new) = require_registry_pair(cur, next, old, new)?;
+        let d = diff(&old.shape, &new.shape)?;
+        validate_registry_step(db, table, &d, &old, &new)?;
+
+        let drops_table = d
+            .destructive
+            .iter()
+            .any(|change| matches!(change, DestructiveChange::DropTable { .. }));
+        let has_lossy_type = d
+            .destructive
+            .iter()
+            .any(|change| matches!(change, DestructiveChange::LossyType { .. }));
+
+        // Every step except a lossy type rewrite (whose DuckLake path owns a nested replacement
+        // transaction) commits its complete physical DDL and reconcile watermark atomically.
+        // This closes both the rename replay gap and partial multi-sibling Tier-2 ADD/DROP.
+        if !has_lossy_type {
+            db.in_txn("apply schema version", |conn| {
+                apply_additive_registry(conn, table, &d.additive, &old, &new)?;
+                if drops_table {
+                    db.unpublish_current_view()?;
+                }
+                apply_destructive_registry(db, table, &d.destructive, &old, &new)?;
+                if !drops_table {
+                    db.publish_current_view()?;
+                }
+                db.set_schema_version(next)
+            })?;
+            cur = next;
+            continue;
+        }
+
+        apply_additive_registry(db.conn(), table, &d.additive, &old, &new)?;
+        // Destructive changes apply after additive ones; a lossy cast failure short-circuits
+        // with `Quarantine` and the watermark is NOT advanced (re-run re-quarantines idempotently).
+        if drops_table {
+            db.unpublish_current_view()?;
+        }
+        apply_destructive_registry(db, table, &d.destructive, &old, &new)?;
+        if !drops_table {
+            db.publish_current_view()?;
         }
         db.set_schema_version(next)?;
         cur = next;
@@ -462,14 +802,287 @@ pub async fn reconcile_to_version(
     Ok(())
 }
 
-/// Load one `schema_version`'s relation from `schema_registry` (`None` if that version has no row).
+fn require_registry_pair(
+    current: SchemaVersionNo,
+    next: SchemaVersionNo,
+    old: Option<RegistryVersion>,
+    new: Option<RegistryVersion>,
+) -> Result<(RegistryVersion, RegistryVersion), LoaderError> {
+    let old = old.ok_or_else(|| LoaderError::ManifestInvariant {
+        message: format!(
+            "cannot reconcile schema {current}->{next}: registry is missing source version {current}"
+        ),
+    })?;
+    let new = new.ok_or_else(|| LoaderError::ManifestInvariant {
+        message: format!(
+            "cannot reconcile schema {current}->{next}: registry is missing destination version {next}"
+        ),
+    })?;
+    Ok((old, new))
+}
+
+struct RegistryVersion {
+    shape: SchemaVersion,
+    descriptors: Vec<common::TypeDescriptor>,
+    descriptor_positions: HashMap<String, usize>,
+}
+
+impl RegistryVersion {
+    fn new(
+        shape: SchemaVersion,
+        descriptors: Vec<common::TypeDescriptor>,
+    ) -> Result<Self, LoaderError> {
+        // The shared constructor is the single validation boundary used by bootstrap, Phase A,
+        // Phase B, and DDL reconciliation. Build once here to reject malformed descriptor identity
+        // and physical-name collisions before this version can participate in a diff.
+        TablePlan::from_registry(&shape.relation, &descriptors)?;
+        let descriptor_positions = descriptors
+            .iter()
+            .enumerate()
+            .map(|(position, descriptor)| (descriptor.column.clone(), position))
+            .collect();
+        Ok(Self {
+            shape,
+            descriptors,
+            descriptor_positions,
+        })
+    }
+}
+
+fn validate_registry_step(
+    db: &TableDb,
+    table: &str,
+    diff: &SchemaDiff,
+    old: &RegistryVersion,
+    new: &RegistryVersion,
+) -> Result<(), LoaderError> {
+    if let Some((position, old_column, new_column)) = old
+        .shape
+        .relation
+        .columns
+        .iter()
+        .zip(&new.shape.relation.columns)
+        .enumerate()
+        .find_map(|(position, (old, new))| (old.name != new.name).then_some((position, old, new)))
+    {
+        return Err(LoaderError::Quarantine {
+            table: table.to_string(),
+            reason: format!(
+                "schema step {}->{} substitutes common position {position} {:?}->{:?}; a genuine RENAME and same-statement DROP+ADD are intentionally indistinguishable until stable column-lineage evidence is persisted",
+                old.shape.version, new.shape.version, old_column.name, new_column.name
+            ),
+        });
+    }
+    if !diff.additive.is_empty() && !diff.destructive.is_empty() {
+        return Err(LoaderError::Quarantine {
+            table: table.to_string(),
+            reason: format!(
+                "schema step {}->{} mixes additive and destructive changes; refusing a partially replayable mutation",
+                old.shape.version, new.shape.version
+            ),
+        });
+    }
+    validate_registry_physical_drift(table, diff, old, new)?;
+    for change in &diff.destructive {
+        if let DestructiveChange::LossyType { name, .. } = change {
+            validate_lossy_registry_shape(old, new, name, table)?;
+        }
+    }
+    validate_retained_raw_names(db, table, old, new)
+}
+
+fn validate_registry_physical_drift(
+    table: &str,
+    diff: &SchemaDiff,
+    old: &RegistryVersion,
+    new: &RegistryVersion,
+) -> Result<(), LoaderError> {
+    let mut changed_positions = HashSet::new();
+    for change in &diff.additive {
+        match change {
+            AdditiveChange::RenameColumn { position, .. }
+            | AdditiveChange::WidenColumn { position, .. } => {
+                changed_positions.insert(*position);
+            }
+            AdditiveChange::AddColumn(_)
+            | AdditiveChange::RenameTable { .. }
+            | AdditiveChange::Comment { .. } => {}
+        }
+    }
+    for change in &diff.destructive {
+        if let DestructiveChange::LossyType { name, .. } = change
+            && let Some(position) = new
+                .shape
+                .relation
+                .columns
+                .iter()
+                .position(|column| column.name == *name)
+        {
+            changed_positions.insert(position);
+        }
+    }
+
+    if new.shape.relation.columns.len() < old.shape.relation.columns.len() {
+        let old_positions = old
+            .shape
+            .relation
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(position, column)| (column.name.as_str(), position))
+            .collect::<HashMap<_, _>>();
+        for (new_position, new_column) in new.shape.relation.columns.iter().enumerate() {
+            let old_position = old_positions
+                .get(new_column.name.as_str())
+                .copied()
+                .ok_or_else(|| LoaderError::ManifestInvariant {
+                    message: format!(
+                        "schema {} drop survivor {:?} is absent from schema {}",
+                        new.shape.version, new_column.name, old.shape.version
+                    ),
+                })?;
+            if !registry_column_plans_match(
+                &registry_column_plan(old, old_position)?,
+                &registry_column_plan(new, new_position)?,
+            ) {
+                return Err(LoaderError::Quarantine {
+                    table: table.to_string(),
+                    reason: format!(
+                        "schema step {}->{} changes physical emit plan for surviving column {:?} while dropping columns",
+                        old.shape.version, new.shape.version, new_column.name
+                    ),
+                });
+            }
+        }
+        return Ok(());
+    }
+
+    for position in 0..old.shape.relation.columns.len() {
+        if changed_positions.contains(&position) {
+            continue;
+        }
+        let old_plan = registry_column_plan(old, position)?;
+        let new_plan = registry_column_plan(new, position)?;
+        if !registry_column_plans_match(&old_plan, &new_plan) {
+            return Err(LoaderError::Quarantine {
+                table: table.to_string(),
+                reason: format!(
+                    "schema step {}->{} changes physical emit plan at unchanged position {position}",
+                    old.shape.version, new.shape.version
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn registry_column_plans_match(old: &TablePlan, new: &TablePlan) -> bool {
+    old.raw_cols.len() == new.raw_cols.len()
+        && old
+            .raw_cols
+            .iter()
+            .zip(&new.raw_cols)
+            .all(|(old, new)| old.name == new.name && old.duckdb_type == new.duckdb_type)
+        && old.mirror_cols.len() == new.mirror_cols.len()
+        && old
+            .mirror_cols
+            .iter()
+            .zip(&new.mirror_cols)
+            .all(|(old, new)| {
+                old.name == new.name
+                    && old.duckdb_type == new.duckdb_type
+                    && old.is_key == new.is_key
+                    && old.toast_source == new.toast_source
+                    && match (&old.value, &new.value) {
+                        (
+                            crate::plan::MirrorValue::Passthrough,
+                            crate::plan::MirrorValue::Passthrough,
+                        ) => true,
+                        (
+                            crate::plan::MirrorValue::Recombine(old),
+                            crate::plan::MirrorValue::Recombine(new),
+                        ) => old == new,
+                        (
+                            crate::plan::MirrorValue::Passthrough,
+                            crate::plan::MirrorValue::Recombine(_),
+                        )
+                        | (
+                            crate::plan::MirrorValue::Recombine(_),
+                            crate::plan::MirrorValue::Passthrough,
+                        ) => false,
+                    }
+            })
+}
+
+/// Reject a new live physical name that aliases a column retained only for raw history. PostgreSQL
+/// permits `DROP x` followed by `ADD x` (or renaming another column to `x`), but Walrus deliberately
+/// does not drop the first `x` from `_raw`. Treating both source lineages as one DuckDB column would
+/// silently merge unrelated values, so this remains a loud quarantine until raw columns carry
+/// stable lineage identities independent of source names.
+fn validate_retained_raw_names(
+    db: &TableDb,
+    table: &str,
+    old: &RegistryVersion,
+    new: &RegistryVersion,
+) -> Result<(), LoaderError> {
+    let old_plan = TablePlan::from_registry(&old.shape.relation, &old.descriptors)?;
+    let new_plan = TablePlan::from_registry(&new.shape.relation, &new.descriptors)?;
+    let old_current = old_plan
+        .raw_cols
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect::<HashSet<_>>();
+    const INTERNAL: [&str; 5] = [
+        "walrus_pg_sink_meta",
+        "_walrus_op",
+        "_walrus_commit_lsn",
+        "_walrus_lsn",
+        "_walrus_sink_processed_at",
+    ];
+    let raw_table = format!("{table}_raw");
+    let mut stmt = db
+        .conn()
+        .prepare(&format!("DESCRIBE SELECT * FROM \"{raw_table}\""))
+        .duck_with(|| format!("inspect retained raw columns on {raw_table}"))?;
+    let actual = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .duck_with(|| format!("inspect retained raw columns on {raw_table}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .duck_with(|| format!("inspect retained raw columns on {raw_table}"))?;
+    let retained = actual
+        .iter()
+        .map(String::as_str)
+        .filter(|name| !old_current.contains(name) && !INTERNAL.contains(name))
+        .collect::<HashSet<_>>();
+    let collisions = new_plan
+        .raw_cols
+        .iter()
+        .map(|column| column.name.as_str())
+        .filter(|name| retained.contains(name))
+        .collect::<Vec<_>>();
+    if collisions.is_empty() {
+        return Ok(());
+    }
+    Err(LoaderError::Quarantine {
+        table: table.to_string(),
+        reason: format!(
+            "schema step {}->{} reuses retained raw column name(s) {}; stable physical lineage is required",
+            old.shape.version,
+            new.shape.version,
+            collisions.join(", ")
+        ),
+    })
+}
+
+/// Load one `schema_version`'s complete physical-planning input from `schema_registry` (`None` if
+/// that version has no row).
 async fn load_version(
     pool: &sqlx::PgPool,
     epoch: EpochNo,
     schema: &str,
     table: &str,
     version: SchemaVersionNo,
-) -> Result<Option<SchemaVersion>, LoaderError> {
+) -> Result<Option<RegistryVersion>, LoaderError> {
     let Some(row) = control::read_registry(pool, epoch, schema, table, version).await? else {
         return Ok(None);
     };
@@ -481,5 +1094,9 @@ async fn load_version(
             version: version.0,
             source,
         })?;
-    Ok(Some(SchemaVersion { version, relation }))
+    RegistryVersion::new(SchemaVersion { version, relation }, row.descriptors).map(Some)
 }
+
+#[cfg(test)]
+#[path = "ddl_test.rs"]
+mod tests;

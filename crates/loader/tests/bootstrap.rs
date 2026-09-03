@@ -97,25 +97,35 @@ fn s3() -> S3Access {
 
 /// Seed a fresh epoch as the current one + register `orders`, cleaning any prior control state.
 async fn seed(pool: &sqlx::PgPool, epoch: EpochNo) {
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SELECT set_config('walrus.schema_registry_maintenance', '1-delete', true)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("SELECT set_config('walrus.replication_state_maintenance', '1-delete', true)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     for tbl in [
         "table_ownership",
         "loader_checkpoint",
         "schema_registry",
         "replication_state",
     ] {
-        let _ = sqlx::query(&format!("DELETE FROM walrus.{tbl} WHERE epoch = $1"))
-            .bind(epoch)
-            .execute(pool)
-            .await;
+        let sql = format!("DELETE FROM walrus.{tbl} WHERE epoch = $1");
+        sqlx::query(&sql)
+            .bind(epoch.0)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
     }
+    tx.commit().await.unwrap();
     control::insert_epoch(
         pool,
-        &control::ReplicationState {
-            epoch,
-            slot_name: "walrus_slot".into(),
-            created_lsn: "0/0".parse().unwrap(),
-            status: control::ReplicationStatus::Streaming,
-        },
+        epoch,
+        "walrus_slot",
+        "0/0".parse().unwrap(),
+        control::ReplicationStatus::Streaming,
     )
     .await
     .unwrap();
@@ -257,9 +267,16 @@ async fn catalog_fence_blocks_a_successor_even_if_the_control_lease_is_released(
     )
     .await
     .unwrap();
-    control::release_lease(&pool, epoch, "public", "orders", "loader-a")
-        .await
-        .unwrap();
+    control::release_lease(
+        &pool,
+        epoch,
+        "public",
+        "orders",
+        "loader-a",
+        owned_a.tables[0].fencing_token,
+    )
+    .await
+    .unwrap();
 
     let error = bootstrap(
         &cfg("loader-b", Duration::from_secs(30)),

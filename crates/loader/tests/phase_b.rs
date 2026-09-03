@@ -4,6 +4,7 @@
     clippy::let_underscore_must_use,
     reason = "integration test — unwrap/expect fine in setup + helpers"
 )]
+
 //! Phase B against compose (`#[ignore]` — needs control PG + MinIO). Append a seeded Parquet with
 //! intra-batch PK churn, then transform: the mirror `<table>` ends equal to the **current** source
 //! (one row per PK, latest values, deletes absent), `transformed_lsn` advances to `max(commit_lsn)`
@@ -11,7 +12,9 @@
 //!
 //!   cargo test -p loader --test phase_b -- --ignored
 
-use common::{EpochNo, Lsn, PgColumn, PgRelation, ReplicaIdentity};
+mod support;
+
+use common::{EpochNo, Kind, Lsn, PgColumn, PgRelation, ReplicaIdentity, SchemaVersionNo};
 use loader::duck::{S3Access, TableDb};
 use loader::health::LoaderState;
 use loader::phase_a::{TableCtx, run_phase_a};
@@ -59,12 +62,20 @@ fn tmpdir(name: &str) -> tempfile::TempDir {
     tempfile::Builder::new().prefix(&prefix).tempdir().unwrap()
 }
 
-fn meta(op: &str, l: u64) -> String {
-    format!(
-        "{{\"op\":\"{op}\",\"commit_lsn\":\"0000000000000064\",\"lsn\":\"{:016X}\",\"sink_processed_at\":\"2026-07-07T12:00:{:02}Z\"}}",
-        l,
-        l % 60
-    )
+fn meta(epoch: EpochNo, batch_id: &str, op: &str, l: u64) -> String {
+    let lsn = Lsn::new(l).to_string();
+    serde_json::to_string(&support::sink_meta(
+        epoch,
+        batch_id,
+        SchemaVersionNo(1),
+        "public",
+        "orders",
+        Kind::Stream,
+        op,
+        "0/64",
+        &lsn,
+    ))
+    .unwrap()
 }
 
 /// Fixture with intra-batch churn: key 1 (i→i final), key 2 (lone i), key 3 (i→d, deleted).
@@ -85,6 +96,7 @@ fn write_fixture(epoch: EpochNo) -> String {
         "CREATE TABLE fixture (id INTEGER, status VARCHAR, walrus_pg_sink_meta VARCHAR);",
     )
     .unwrap();
+    let batch_id = format!("phase-b-{epoch}");
     for (id, status, op, l) in [
         (1, "v1", "i", 1u64),
         (1, "final1", "i", 2),
@@ -94,7 +106,7 @@ fn write_fixture(epoch: EpochNo) -> String {
     ] {
         w.execute(
             "INSERT INTO fixture VALUES (?, ?, ?)",
-            duckdb::params![id, status, meta(op, l)],
+            duckdb::params![id, status, meta(epoch, &batch_id, op, l)],
         )
         .unwrap();
     }
@@ -107,20 +119,13 @@ fn write_fixture(epoch: EpochNo) -> String {
 async fn setup(epoch: EpochNo) -> (TableCtx, tempfile::TempDir) {
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
-    for tbl in ["file_manifest", "loader_checkpoint", "replication_state"] {
-        let _ = sqlx::query(&format!("DELETE FROM walrus.{tbl} WHERE epoch = $1"))
-            .bind(epoch)
-            .execute(&pool)
-            .await;
-    }
+    support::cleanup_epoch(&pool, epoch).await;
     control::insert_epoch(
         &pool,
-        &control::ReplicationState {
-            epoch,
-            slot_name: "walrus_slot".into(),
-            created_lsn: "0/0".parse().unwrap(),
-            status: control::ReplicationStatus::Streaming,
-        },
+        epoch,
+        "walrus_slot",
+        "0/0".parse().unwrap(),
+        control::ReplicationStatus::Streaming,
     )
     .await
     .unwrap();
@@ -128,6 +133,7 @@ async fn setup(epoch: EpochNo) -> (TableCtx, tempfile::TempDir) {
         .await
         .unwrap();
     let uri = write_fixture(epoch);
+    let (object_size, sha256) = support::fingerprint(&uri).await;
     control::insert_ready(
         &pool,
         &control::NewManifestFile {
@@ -137,7 +143,9 @@ async fn setup(epoch: EpochNo) -> (TableCtx, tempfile::TempDir) {
             s3_uri: uri,
             kind: control::ManifestKind::Stream,
             row_count: 5,
-            lsn_start: "0/64".parse().unwrap(),
+            object_size,
+            sha256,
+            lsn_start: "0/1".parse().unwrap(),
             lsn_end: "0/64".parse().unwrap(),
             schema_version: common::SchemaVersionNo(1),
             reload_id: None,
@@ -150,10 +158,15 @@ async fn setup(epoch: EpochNo) -> (TableCtx, tempfile::TempDir) {
     db.ensure_tables(&orders(), common::SchemaVersionNo(1))
         .unwrap();
     db.configure_s3(&s3()).unwrap();
+    let (owner_pod, fencing_token) = support::acquire_table(&pool, epoch, "public", "orders").await;
     let ctx = TableCtx {
         pool,
         epoch,
         epoch_rx: loader::epoch::fixed_epoch_watch(epoch),
+        owner_pod,
+        fencing_token,
+        store: support::store(),
+        staging_bucket: "walrus".into(),
         schema: "public".into(),
         table: "orders".into(),
         series: "public.orders".into(),
@@ -161,6 +174,7 @@ async fn setup(epoch: EpochNo) -> (TableCtx, tempfile::TempDir) {
         db,
         state: LoaderState::new(),
         max_files: std::num::NonZeroI64::new(100).unwrap(),
+        max_integrity_resnapshots: 1,
         poll_interval: Duration::from_secs(5),
         compaction_interval: Duration::from_secs(3600),
         retention_lsn_lag: 16 << 20,

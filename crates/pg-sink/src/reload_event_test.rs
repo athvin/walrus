@@ -127,6 +127,11 @@ fn abort_drops_only_the_matching_streamed_event() {
         });
     }
     pending.on_stream_abort(10, 11);
+    assert_eq!(
+        pending.stream_effect_count(10),
+        1,
+        "the mixed-DDL guard counts only surviving subtransactions"
+    );
     let committed = pending.on_stream_commit(10, "0/30".parse().unwrap());
     assert_eq!(committed.len(), 1);
     assert_eq!(committed[0].event.xid, Some(10));
@@ -156,6 +161,10 @@ fn stream_commit_promotes_only_its_top_level_transaction() {
         });
     }
 
+    assert_eq!(pending.stream_effect_count(10), 1);
+    assert_eq!(pending.stream_effect_count(20), 1);
+    assert_eq!(pending.ordinary_effect_count(), 0);
+
     let first = pending.on_stream_commit(10, "0/30".parse().unwrap());
     assert_eq!(first.len(), 1);
     assert_eq!(first[0].event.top_xid, Some(10));
@@ -176,6 +185,44 @@ async fn fence_waiter_resolves_by_phase() {
     };
     waiters.resolve(reload_id, FencePhase::End, echo);
     assert_eq!(waiter.await.unwrap(), echo);
+}
+
+#[tokio::test]
+async fn fence_waiter_resolves_every_subscriber_for_the_same_phase() {
+    let waiters = FenceWaiters::default();
+    let reload_id = ReloadId(9);
+    let first = waiters.subscribe(reload_id, FencePhase::End);
+    let second = waiters.subscribe(reload_id, FencePhase::End);
+    assert_eq!(waiters.waiter_count(), 2);
+
+    let echo = FenceEcho {
+        commit_lsn: "0/40".parse().unwrap(),
+        embedded_lsn: "0/30".parse().unwrap(),
+    };
+    waiters.resolve(reload_id, FencePhase::End, echo);
+
+    assert_eq!(first.await.unwrap(), echo);
+    assert_eq!(second.await.unwrap(), echo);
+    assert_eq!(waiters.waiter_count(), 0);
+}
+
+#[tokio::test]
+async fn dropping_one_fence_subscriber_preserves_the_others() {
+    let waiters = FenceWaiters::default();
+    let reload_id = ReloadId(10);
+    let dropped = waiters.subscribe(reload_id, FencePhase::Start);
+    let live = waiters.subscribe(reload_id, FencePhase::Start);
+    drop(dropped);
+    assert_eq!(waiters.waiter_count(), 1);
+
+    let echo = FenceEcho {
+        commit_lsn: "0/40".parse().unwrap(),
+        embedded_lsn: "0/30".parse().unwrap(),
+    };
+    waiters.resolve(reload_id, FencePhase::Start, echo);
+
+    assert_eq!(live.await.unwrap(), echo);
+    assert_eq!(waiters.waiter_count(), 0);
 }
 
 #[tokio::test]

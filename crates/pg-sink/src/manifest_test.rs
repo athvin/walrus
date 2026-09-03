@@ -12,6 +12,8 @@ fn maps_written_object_to_a_stream_ready_row() {
         lsn_start: "0/100".parse().unwrap(),
         lsn_end: "0/A100".parse().unwrap(),
         row_count: 42,
+        object_size: 128,
+        sha256: [7; 32],
         schema_version: common::SchemaVersionNo(3),
         kind: FileKind::Stream,
     };
@@ -26,6 +28,8 @@ fn maps_written_object_to_a_stream_ready_row() {
             s3_uri: "s3://walrus/7/public/orders/000000000000A100-uuid.parquet".to_string(),
             kind: FileKind::Stream,
             row_count: 42,
+            object_size: 128,
+            sha256: vec![7; 32],
             lsn_start: "0/100".parse().unwrap(),
             lsn_end: "0/A100".parse().unwrap(),
             schema_version: common::SchemaVersionNo(3),

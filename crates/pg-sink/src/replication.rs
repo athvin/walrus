@@ -158,13 +158,37 @@ impl ReplicationStream<Idle> {
     /// Returns [`anyhow::Error`] if PostgreSQL rejects the replication command or the CopyBoth
     /// response cannot be written, read, or decoded.
     pub async fn into_streaming(
-        mut self,
+        self,
         slot: &str,
         start_lsn: Lsn,
         publication: &str,
     ) -> anyhow::Result<ReplicationStream<Streaming>> {
+        self.into_streaming_with_feedback_floor(slot, start_lsn, start_lsn, publication)
+            .await
+    }
+
+    /// Issue `START_REPLICATION` at `start_lsn` while keeping feedback's durable floor at an older
+    /// retained position. New-generation bootstrap uses this to claim the source slot before its
+    /// control-plane compare-and-set: keepalives may prove liveness, but cannot release WAL through
+    /// the new boundary until that generation is durable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `feedback_floor` exceeds `start_lsn`, or for the same connection and
+    /// replication-protocol failures as [`Self::into_streaming`].
+    pub async fn into_streaming_with_feedback_floor(
+        mut self,
+        slot: &str,
+        start_lsn: Lsn,
+        feedback_floor: Lsn,
+        publication: &str,
+    ) -> anyhow::Result<ReplicationStream<Streaming>> {
+        anyhow::ensure!(
+            feedback_floor <= start_lsn,
+            "replication feedback floor {feedback_floor} exceeds start LSN {start_lsn}"
+        );
         self.last_received = start_lsn;
-        self.durable = start_lsn;
+        self.durable = feedback_floor;
         self.feedback_deadline = Instant::now() + self.feedback_interval;
         self.try_acquire_publication_ddl_guard().await?;
         self.begin_replication(slot, start_lsn, publication).await?;
@@ -198,6 +222,25 @@ impl ReplicationStream<Streaming> {
         ReplicationStream::<Idle>::connect(dsn)
             .await?
             .into_streaming(slot, start_lsn, publication)
+            .await
+    }
+
+    /// Claim a slot at `start_lsn` without acknowledging beyond `feedback_floor` until the caller
+    /// explicitly advances durability with [`Self::set_durable`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`ReplicationStream::<Idle>::into_streaming_with_feedback_floor`].
+    pub async fn start_with_feedback_floor(
+        dsn: &str,
+        slot: &str,
+        start_lsn: Lsn,
+        feedback_floor: Lsn,
+        publication: &str,
+    ) -> anyhow::Result<Self> {
+        ReplicationStream::<Idle>::connect(dsn)
+            .await?
+            .into_streaming_with_feedback_floor(slot, start_lsn, feedback_floor, publication)
             .await
     }
 

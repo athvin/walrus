@@ -156,7 +156,7 @@ fn tier2_recombine_resolves_the_source_sentinel_in_incremental_and_rebuild_paths
             "elapsed_micros:INT64",
         ],
     );
-    let plan = crate::plan::TablePlan::from_registry(&rel, &[elapsed]);
+    let plan = crate::plan::TablePlan::from_registry(&rel, &[elapsed]).unwrap();
     let transform = TransformSql::from_plan(&plan);
 
     for path in [TransformPath::Incremental, TransformPath::Rebuild] {
@@ -209,7 +209,7 @@ fn timetz_recombine_backscan_uses_the_original_source_name_in_both_paths() {
         "TIME WITH TIME ZONE",
         &["at_micros:INT64", "at_offset:INT32"],
     );
-    let plan = crate::plan::TablePlan::from_registry(&rel, &[at]);
+    let plan = crate::plan::TablePlan::from_registry(&rel, &[at]).unwrap();
     let transform = TransformSql::from_plan(&plan);
     let prior = r#"list_value(make_timetz(r."at_micros", r."at_offset"))"#;
 
@@ -238,7 +238,7 @@ fn tier2_flat_siblings_resolve_the_source_sentinel_in_incremental_and_rebuild_pa
             "span_empty:BOOLEAN",
         ],
     );
-    let plan = crate::plan::TablePlan::from_registry(&rel, &[span]);
+    let plan = crate::plan::TablePlan::from_registry(&rel, &[span]).unwrap();
     let transform = TransformSql::from_plan(&plan);
 
     for path in [TransformPath::Incremental, TransformPath::Rebuild] {
@@ -567,7 +567,7 @@ fn a_recombined_identity_partitions_incremental_raw_rows_by_its_emit_expression(
             "elapsed_micros:INT64",
         ],
     );
-    let plan = crate::plan::TablePlan::from_registry(&rel, &[elapsed]);
+    let plan = crate::plan::TablePlan::from_registry(&rel, &[elapsed]).unwrap();
     let transform = TransformSql::from_plan(&plan);
 
     for sql in [

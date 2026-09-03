@@ -20,6 +20,11 @@ use e2e::Harness;
 use std::time::Duration;
 use uuid::Uuid;
 
+// Compose runs with logical_decoding_work_mem=64 KiB and the harness gives the sink the same
+// in-flight ceiling. This is large enough to force protocol-v2 streaming and a speculative spill.
+const LONG_TXN_FIRST_ID: i64 = 100_000;
+const LONG_TXN_ROWS: i64 = 12_000;
+
 async fn await_baseline(h: &Harness, request_id: Uuid, deadline: Duration) -> (ReloadId, Lsn) {
     let started = tokio::time::Instant::now();
     loop {
@@ -78,9 +83,38 @@ async fn await_complete(
     }
 }
 
+async fn await_stream_publication(h: &Harness, top_xid: u32, deadline: Duration) -> Lsn {
+    let started = tokio::time::Instant::now();
+    loop {
+        let commit_lsns = sqlx::query_scalar::<_, String>(
+            "SELECT commit_lsn::text
+             FROM walrus.stream_txn_publication
+             WHERE epoch = $1 AND top_xid = $2
+             ORDER BY id",
+        )
+        .bind(h.epoch)
+        .bind(i64::from(top_xid))
+        .fetch_all(h.control_pool())
+        .await
+        .unwrap();
+        assert!(
+            commit_lsns.len() <= 1,
+            "top xid {top_xid} produced duplicate durable stream publications: {commit_lsns:?}"
+        );
+        if let Some(commit_lsn) = commit_lsns.first() {
+            return commit_lsn.parse().unwrap();
+        }
+        assert!(
+            started.elapsed() < deadline,
+            "streamed top xid {top_xid} was not durably published within {deadline:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires docker compose up --wait (source PG + control PG + MinIO)"]
-async fn source_wal_request_reconciles_dml_between_f_and_h() {
+async fn source_wal_request_reconciles_f_h_and_pre_f_open_transaction() {
     let mut h = Harness::start().await.unwrap();
 
     // Establish a non-empty, fully mirrored steady state before asking for a post-start rebuild.
@@ -98,6 +132,52 @@ async fn source_wal_request_reconciles_dml_between_f_and_h() {
     h.await_transformed_past("orders", seed_floor, Duration::from_secs(120))
         .await
         .unwrap();
+
+    // Transaction A begins and writes before F, but remains open across the entire reload. A
+    // committed neighbour flushes its WAL and forces pgoutput to stream A while it is still open.
+    // Waiting for the sink's spill probe (and then for the neighbour to transform) proves every
+    // pre-F segment reached the sink before object storage is deliberately paused below.
+    let spill_floor = h.sink_spill_count();
+    let mut long_txn = h.source_pool().acquire().await.unwrap();
+    sqlx::raw_sql("BEGIN")
+        .execute(&mut *long_txn)
+        .await
+        .unwrap();
+    let top_xid_raw: i64 = sqlx::query_scalar("SELECT txid_current()::bigint")
+        .fetch_one(&mut *long_txn)
+        .await
+        .unwrap();
+    let top_xid = u32::try_from(top_xid_raw).expect("test source xid remains below wrap");
+    sqlx::raw_sql(&format!(
+        "INSERT INTO public.orders (id, status)
+         SELECT g, 'long-after-h'
+         FROM generate_series({}, {}) g",
+        LONG_TXN_FIRST_ID,
+        LONG_TXN_FIRST_ID + LONG_TXN_ROWS - 1
+    ))
+    .execute(&mut *long_txn)
+    .await
+    .unwrap();
+    let neighbour_floor = h.source_wal_lsn().await.unwrap();
+    h.source_batch(
+        "BEGIN;
+         INSERT INTO public.orders (id, status) VALUES (40001, 'stream-neighbour');
+         COMMIT;",
+    )
+    .await
+    .unwrap();
+    let spills = h
+        .await_spill(spill_floor + 1, Duration::from_secs(60))
+        .await
+        .expect("the pre-F transaction streams and spills while it remains open");
+    assert!(
+        spills > spill_floor,
+        "the open pre-F transaction added a spill: {spill_floor} -> {spills}"
+    );
+    h.await_transformed_past("orders", neighbour_floor, Duration::from_secs(120))
+        .await
+        .expect("the committed neighbour lands after all open-transaction segments are decoded");
+    let before_f = h.source_wal_lsn().await.unwrap();
 
     // With object storage paused, the request and F event still decode into control PG, but the
     // first non-empty baseline chunk cannot become durable. The exporter therefore cannot append H.
@@ -122,6 +202,10 @@ async fn source_wal_request_reconciles_dml_between_f_and_h() {
     assert_eq!(source_request.4, serde_json::json!([]));
 
     let (reload_id, f) = await_baseline(&h, request_id, Duration::from_secs(60)).await;
+    assert!(
+        before_f < f,
+        "the long transaction and its committed neighbour precede F: {before_f} < {f}"
+    );
     let row = control::reload::get(h.control_pool(), reload_id)
         .await
         .unwrap()
@@ -190,6 +274,45 @@ async fn source_wal_request_reconciles_dml_between_f_and_h() {
     assert_eq!(completed.start_lsn, Some(f));
     assert_eq!(completed.final_lsn, Some(h_lsn));
 
+    // Completion is observed while A is demonstrably still open: its own session sees all rows,
+    // other source sessions see none, and StreamCommit has not atomically published a receipt.
+    let visible_inside_a: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM public.orders
+         WHERE id BETWEEN $1 AND $2 AND status = 'long-after-h'",
+    )
+    .bind(LONG_TXN_FIRST_ID)
+    .bind(LONG_TXN_FIRST_ID + LONG_TXN_ROWS - 1)
+    .fetch_one(&mut *long_txn)
+    .await
+    .unwrap();
+    assert_eq!(visible_inside_a, LONG_TXN_ROWS);
+    let visible_outside_a: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM public.orders
+         WHERE id BETWEEN $1 AND $2 AND status = 'long-after-h'",
+    )
+    .bind(LONG_TXN_FIRST_ID)
+    .bind(LONG_TXN_FIRST_ID + LONG_TXN_ROWS - 1)
+    .fetch_one(h.source_pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        visible_outside_a, 0,
+        "the pre-F transaction remains uncommitted through H and reload completion"
+    );
+    let publications_before_commit: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM walrus.stream_txn_publication
+         WHERE epoch = $1 AND top_xid = $2",
+    )
+    .bind(h.epoch)
+    .bind(i64::from(top_xid))
+    .fetch_one(h.control_pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        publications_before_commit, 0,
+        "speculative spills are not visible as a durable stream publication before StreamCommit"
+    );
+
     let source_protocol_rows: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM walrus.reload_event
          WHERE request_id = $1
@@ -205,10 +328,47 @@ async fn source_wal_request_reconciles_dml_between_f_and_h() {
         "the source protocol log retains request plus F/H fence events"
     );
 
+    // A commits only after the persisted H and completed cutover. The protocol-v2 publication
+    // receipt carries the authoritative commit LSN; it must therefore sort strictly after H.
+    sqlx::raw_sql("COMMIT")
+        .execute(&mut *long_txn)
+        .await
+        .unwrap();
+    let long_commit_lsn = await_stream_publication(&h, top_xid, Duration::from_secs(180)).await;
+    assert!(
+        long_commit_lsn > h_lsn,
+        "long transaction commit {long_commit_lsn} must follow reload H {h_lsn}"
+    );
+
+    // A final committed sentinel gives the loader an unambiguous watermark beyond A. Once it is
+    // transformed, the complete streamed transaction and every earlier reload-window change must
+    // already be present.
+    let convergence_floor = h.source_wal_lsn().await.unwrap();
+    h.source_exec("INSERT INTO public.orders (id, status) VALUES (40002, 'post-long-sentinel')")
+        .await
+        .unwrap();
+    h.await_transformed_past("orders", convergence_floor, Duration::from_secs(180))
+        .await
+        .expect("loader converges beyond the post-H streamed transaction");
+
     // `complete` is written only after the loader publishes its hidden rebuild. Release its DuckDB
     // lock, then require exact source equality and explicitly check the four in-window mutations.
     h.stop_loader().await.unwrap();
     h.assert_mirror_equals_source("orders").await.unwrap();
+    assert_eq!(
+        h.duckdb_scalar(
+            "orders",
+            &format!(
+                "SELECT count(*) FROM orders_current
+                 WHERE id BETWEEN {} AND {} AND status = 'long-after-h'",
+                LONG_TXN_FIRST_ID,
+                LONG_TXN_FIRST_ID + LONG_TXN_ROWS - 1
+            )
+        )
+        .unwrap(),
+        LONG_TXN_ROWS,
+        "all rows from the pre-F, post-H-committing transaction survive the cutover"
+    );
     assert_eq!(
         h.duckdb_scalar(
             "orders",

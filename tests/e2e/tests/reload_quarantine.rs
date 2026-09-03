@@ -26,6 +26,8 @@
 
 use common::{Lsn, PgRelation};
 use e2e::Harness;
+use object_store::ObjectStore as _;
+use sha2::{Digest as _, Sha256};
 use std::time::Duration;
 
 // Harness-owned fixtures created before bootstrap so the loader owns them.
@@ -33,22 +35,57 @@ const OTHERS: [&str; 2] = ["rl1", "rl2"];
 
 /// Write a one-row `(id, status, n)` v2 Parquet to MinIO (the reconcile trigger's file — its data is
 /// never appended, the quarantine fires on the reconcile before the append). DuckDB writes it.
-fn write_v2_file(epoch: i64, uri_key: &str) -> String {
+fn write_v2_file(epoch: i64, uri_key: &str, commit_lsn: Lsn) -> String {
     let w = duckdb::Connection::open_in_memory().unwrap();
     w.execute_batch(
         "INSTALL httpfs; LOAD httpfs; SET s3_region='us-east-1'; SET s3_endpoint='localhost:9000'; \
          SET s3_url_style='path'; SET s3_use_ssl=false; \
          SET s3_access_key_id='minioadmin'; SET s3_secret_access_key='minioadmin'; \
-         CREATE TABLE fixture (id INTEGER, status VARCHAR, n VARCHAR, walrus_pg_sink_meta VARCHAR); \
-         INSERT INTO fixture VALUES (2, 'x', '5', \
-           '{\"op\":\"Insert\",\"commit_lsn\":\"00000000000000C8\",\"lsn\":\"00000000000000C8\",\
-             \"sink_processed_at\":\"2026-07-16T00:00:00Z\"}');",
+         CREATE TABLE fixture (id INTEGER, status VARCHAR, n VARCHAR, walrus_pg_sink_meta VARCHAR);",
+    )
+    .unwrap();
+    let meta = serde_json::json!({
+        "op": "Insert",
+        "commit_lsn": commit_lsn,
+        "lsn": commit_lsn,
+        "sink_processed_at": "2026-07-16T00:00:00Z",
+    })
+    .to_string();
+    w.execute(
+        "INSERT INTO fixture VALUES (2, 'x', '5', ?)",
+        duckdb::params![meta],
     )
     .unwrap();
     let uri = format!("s3://walrus/{epoch}/public/q_target/{uri_key}.parquet");
     w.execute_batch(&format!("COPY fixture TO '{uri}' (FORMAT PARQUET);"))
         .unwrap();
     uri
+}
+
+async fn fingerprint(uri: &str) -> (i64, Vec<u8>) {
+    let key = uri
+        .strip_prefix("s3://walrus/")
+        .expect("quarantine fixture URI is in the walrus bucket");
+    let store = object_store::aws::AmazonS3Builder::new()
+        .with_bucket_name("walrus")
+        .with_region("us-east-1")
+        .with_endpoint("http://localhost:9000")
+        .with_access_key_id("minioadmin")
+        .with_secret_access_key("minioadmin")
+        .with_allow_http(true)
+        .build()
+        .unwrap();
+    let bytes = store
+        .get(&object_store::path::Path::from(key))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    (
+        i64::try_from(bytes.len()).unwrap(),
+        Sha256::digest(&bytes).to_vec(),
+    )
 }
 
 async fn transformed(h: &Harness, table: &str) -> Lsn {
@@ -144,6 +181,16 @@ async fn quarantined_table_recovers_via_reload_without_stalling_others() {
         .find(|column| column.name == "n")
         .expect("q_target v1 contains n")
         .type_oid = 21; // int2
+    // This fixture pre-registers the same v2 row the real ALTER below will later replay. Registry
+    // history is semantically immutable, so an empty synthetic descriptor list is not a harmless
+    // placeholder: when logical decoding derives the real descriptors for this same key, the
+    // conflict correctly terminates the sink. Derive through the sink's production relation-cache
+    // path so the fixture is byte-for-byte idempotent with the decoded Relation message.
+    let v2_descriptors = pg_sink::relcache::RelationCache::default()
+        .upsert_from_relation(v2_relation.clone(), common::SchemaVersionNo(2))
+        .unwrap()
+        .descriptors
+        .clone();
     control::upsert_registry(
         &pool,
         &control::RegistryRow {
@@ -151,14 +198,18 @@ async fn quarantined_table_recovers_via_reload_without_stalling_others() {
             source_schema: "public".into(),
             source_table: "q_target".into(),
             schema_version: common::SchemaVersionNo(2),
-            descriptors: Vec::new(),
+            descriptors: v2_descriptors,
             columns: serde_json::to_value(v2_relation).unwrap(),
         },
     )
     .await
     .unwrap();
-    let uri = write_v2_file(epoch, "inject-v2");
-    control::insert_ready(
+    // The bootstrap reload permanently sealed q_target through H. Synthetic work must therefore
+    // use a fresh position above that cutover, just as a real post-reload source commit would.
+    let injection_lsn = h.source_wal_lsn().await.unwrap();
+    let uri = write_v2_file(epoch, "inject-v2", injection_lsn);
+    let (object_size, sha256) = fingerprint(&uri).await;
+    let outcome = control::publish_ready_manifest(
         &pool,
         &control::NewManifestFile {
             epoch: epoch.into(),
@@ -167,14 +218,20 @@ async fn quarantined_table_recovers_via_reload_without_stalling_others() {
             s3_uri: uri,
             kind: control::ManifestKind::Stream,
             row_count: 1,
-            lsn_start: "0/C8".parse().unwrap(),
-            lsn_end: "0/C8".parse().unwrap(),
+            object_size,
+            sha256,
+            lsn_start: injection_lsn,
+            lsn_end: injection_lsn,
             schema_version: common::SchemaVersionNo(2),
             reload_id: None,
         },
     )
     .await
     .unwrap();
+    assert!(
+        matches!(outcome, control::PublishManifestOutcome::Published(_)),
+        "the post-seal synthetic commit must become live queue work"
+    );
 
     let loader_status = h
         .await_loader_exited(Duration::from_secs(60))
@@ -242,6 +299,14 @@ async fn quarantined_table_recovers_via_reload_without_stalling_others() {
         ) {
             break;
         }
+        let sink_running = h.is_sink_running();
+        assert!(
+            sink_running,
+            "sink exited before reload export completed; status={:?}, error={:?}; sink log tail:\n{}",
+            row.status,
+            row.error,
+            h.sink_log_tail(20)
+        );
         assert!(
             row.status != control::reload::ReloadStatus::Failed,
             "reload failed: {:?}",
@@ -249,7 +314,10 @@ async fn quarantined_table_recovers_via_reload_without_stalling_others() {
         );
         assert!(
             tokio::time::Instant::now() < deadline,
-            "export never completed"
+            "export never completed; status={:?}, error={:?}; sink log tail:\n{}",
+            row.status,
+            row.error,
+            h.sink_log_tail(20)
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }

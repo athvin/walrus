@@ -2,52 +2,78 @@
 //! `ready` row — the loader's work-queue entry (§1.5).
 //!
 //! This is a thin adapter: map a [`WrittenObject`] → [`control::NewManifestFile`] and delegate to
-//! [`control::insert_ready`], so the `WHERE status='ready'` partial index and the
-//! `ORDER BY lsn_end, id` claim contract stay in one place. **`lsn_end` is the commit LSN** carried
-//! from the [`SealedBatch`](crate::batch::SealedBatch) — never `max(row.lsn)`, which would silently
-//! drop a late-committing large txn.
+//! the control plane's table-fenced ordinary publisher. **`lsn_end` is the commit LSN** carried from
+//! the [`SealedBatch`](crate::batch::SealedBatch) — never `max(row.lsn)`, which would silently drop a
+//! late-committing large txn.
 //!
 //! **Ordering & at-least-once:** the row is committed *only after* the PUT returns durable. A crash
 //! *between* the PUT and this commit leaves no `ready` row, so the batch re-streams and re-writes — no
-//! loss. A duplicated INSERT after such a retry just produces a second `ready` row for the same object;
-//! the loader's row-level `ON CONFLICT` (append idempotency) absorbs it.
+//! loss. Before a reload cutover, a duplicated INSERT after such a retry just produces a second
+//! `ready` row. Once a durable reload seal covers the replayed commit, the control plane instead
+//! returns [`control::PublishManifestOutcome::CoveredBySeal`] and the sink discards the redundant
+//! object without recreating work below the cutover.
 
 use crate::sink::WrittenObject;
 use common::{EpochNo, ReloadId};
 
-/// Record a durable object as a `ready` work-queue row. **Call ONLY after the PUT is durable.** Returns
-/// the manifest `id`.
+/// Publish a durable ordinary object against its table's reload seal. **Call ONLY after the PUT is
+/// durable.** This compatibility spelling delegates to [`publish_ordinary`]; callers must inspect
+/// [`control::PublishManifestOutcome::CoveredBySeal`] if they own object cleanup.
 ///
 /// # Errors
 ///
 /// Returns [`ManifestError::Control`] if control Postgres cannot insert the ready manifest row.
-pub async fn record_ready(
-    ex: impl sqlx::PgExecutor<'_>,
+pub async fn record_ready<'a>(
+    acquire: impl sqlx::Acquire<'a, Database = sqlx::Postgres>,
     epoch: EpochNo,
     obj: &WrittenObject,
-) -> Result<common::ManifestId, ManifestError> {
-    record_ready_with_reload(ex, epoch, obj, None).await
+) -> Result<control::PublishManifestOutcome, ManifestError> {
+    publish_ordinary(acquire, epoch, obj).await
 }
 
-/// As [`record_ready`], carrying the `reload_id` a `kind='reload'` chunk file belongs to
-/// — the loader's routing/purge key. Stream/spill objects pass `None`; legacy snapshot manifests
-/// likewise carry no reload id.
+/// Publish one durable ordinary object, returning coverage instead of recreating queue work when a
+/// committed reload seal already owns its source prefix.
+///
+/// # Errors
+///
+/// Returns [`ManifestError::Control`] if the transactional table fence/manifest operation fails.
+pub async fn publish_ordinary<'a>(
+    acquire: impl sqlx::Acquire<'a, Database = sqlx::Postgres>,
+    epoch: EpochNo,
+    obj: &WrittenObject,
+) -> Result<control::PublishManifestOutcome, ManifestError> {
+    Ok(control::publish_ready_manifest(acquire, &to_ready_row(epoch, obj, None)).await?)
+}
+
+/// Record one reload object with the exact reload attempt that owns it. This strict insert is kept
+/// crate-private so ordinary Stream/Snapshot callers cannot bypass [`publish_ordinary`].
 ///
 /// # Errors
 ///
 /// Returns [`ManifestError::Control`] if the ready row violates a control-plane invariant or cannot
 /// be committed.
-pub async fn record_ready_with_reload(
+pub(crate) async fn record_reload_ready(
     ex: impl sqlx::PgExecutor<'_>,
     epoch: EpochNo,
     obj: &WrittenObject,
-    reload_id: Option<ReloadId>,
+    reload_id: ReloadId,
 ) -> Result<common::ManifestId, ManifestError> {
-    Ok(control::insert_ready(ex, &to_ready_row(epoch, obj, reload_id)).await?)
+    if obj.kind != control::ManifestKind::Reload {
+        return Err(control::ControlError::ManifestInvariant {
+            message: format!(
+                "reload manifest {} has non-reload kind {}",
+                obj.s3_uri,
+                obj.kind.as_str()
+            ),
+        }
+        .into());
+    }
+    Ok(control::insert_ready(ex, &to_ready_row(epoch, obj, Some(reload_id))).await?)
 }
 
 /// `WrittenObject` → the `ready` row (`kind` from the object, `lsn_end` = commit LSN).
-fn to_ready_row(
+#[must_use]
+pub(crate) fn to_ready_row(
     epoch: EpochNo,
     obj: &WrittenObject,
     reload_id: Option<ReloadId>,
@@ -59,6 +85,8 @@ fn to_ready_row(
         s3_uri: obj.s3_uri.clone(),
         kind: obj.kind,
         row_count: i64::try_from(obj.row_count).unwrap_or(i64::MAX),
+        object_size: i64::try_from(obj.object_size).unwrap_or(i64::MAX),
+        sha256: obj.sha256.to_vec(),
         lsn_start: obj.lsn_start,
         lsn_end: obj.lsn_end,
         schema_version: obj.schema_version,

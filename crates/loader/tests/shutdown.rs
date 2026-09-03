@@ -4,11 +4,14 @@
     clippy::let_underscore_must_use,
     reason = "integration test — unwrap/expect fine in setup + helpers"
 )]
+
 //! Graceful SIGTERM drain (loader §8.5) — compose (`#[ignore]`). On cancel each worker finishes the
 //! in-flight Phase A + Phase B (both watermarks committed), the lease is released and the file is
 //! checkpointed + closed (no stale lock), and an in-flight full-rebuild is aborted (rolled back).
 //!
 //!   cargo test -p loader --test shutdown -- --ignored
+
+mod support;
 
 use common::{EpochNo, Lsn, PgColumn, PgRelation, ReplicaIdentity};
 use loader::apply_loop::apply_loop;
@@ -61,25 +64,20 @@ fn tmpdir(name: &str) -> tempfile::TempDir {
     tempfile::Builder::new().prefix(&prefix).tempdir().unwrap()
 }
 
-fn meta(op: &str, commit_hex: &str, l: u64) -> String {
-    format!(
-        "{{\"op\":\"{op}\",\"commit_lsn\":\"{commit_hex}\",\"lsn\":\"{:016X}\",\"sink_processed_at\":\"2026-07-08T12:00:{:02}Z\"}}",
-        l,
-        l % 60
-    )
-}
-
 fn write_row(
     epoch: EpochNo,
     tag: &str,
+    batch_no: u64,
     id: i64,
     status: &str,
     op: &str,
-    commit_hex: &str,
-    l: u64,
+    commit_lsn: &str,
 ) -> String {
     let w = duckdb::Connection::open_in_memory().unwrap();
     let a = s3();
+    let epoch_bits = u64::try_from(epoch.0).unwrap();
+    let batch_id =
+        uuid::Uuid::from_u128((u128::from(epoch_bits) << 64) | u128::from(batch_no)).to_string();
     w.execute_batch(&format!(
         "INSTALL httpfs; LOAD httpfs; SET s3_region='{}'; SET s3_endpoint='{}'; \
          SET s3_url_style='path'; SET s3_use_ssl=false; \
@@ -94,9 +92,21 @@ fn write_row(
         "CREATE TABLE fixture (id INTEGER, status VARCHAR, walrus_pg_sink_meta VARCHAR);",
     )
     .unwrap();
+    let metadata = serde_json::to_string(&support::sink_meta(
+        epoch,
+        &batch_id,
+        common::SchemaVersionNo(1),
+        "public",
+        "orders",
+        common::Kind::Stream,
+        op,
+        commit_lsn,
+        commit_lsn,
+    ))
+    .unwrap();
     w.execute(
         "INSERT INTO fixture VALUES (?, ?, ?)",
-        duckdb::params![id, status, meta(op, commit_hex, l)],
+        duckdb::params![id, status, metadata],
     )
     .unwrap();
     let uri = format!("s3://walrus/{epoch}/public/orders/{tag}-{epoch}.parquet");
@@ -106,25 +116,13 @@ fn write_row(
 }
 
 async fn clean(pool: &sqlx::PgPool, epoch: EpochNo) {
-    for tbl in [
-        "file_manifest",
-        "loader_checkpoint",
-        "replication_state",
-        "table_ownership",
-    ] {
-        let _ = sqlx::query(&format!("DELETE FROM walrus.{tbl} WHERE epoch = $1"))
-            .bind(epoch)
-            .execute(pool)
-            .await;
-    }
+    support::cleanup_epoch(pool, epoch).await;
     control::insert_epoch(
         pool,
-        &control::ReplicationState {
-            epoch,
-            slot_name: "walrus_slot".into(),
-            created_lsn: "0/0".parse().unwrap(),
-            status: control::ReplicationStatus::Streaming,
-        },
+        epoch,
+        "walrus_slot",
+        "0/0".parse().unwrap(),
+        control::ReplicationStatus::Streaming,
     )
     .await
     .unwrap();
@@ -133,7 +131,7 @@ async fn clean(pool: &sqlx::PgPool, epoch: EpochNo) {
         .unwrap();
 }
 
-fn ctx_on(
+async fn ctx_on(
     pool: sqlx::PgPool,
     epoch: EpochNo,
     path: &std::path::Path,
@@ -144,10 +142,15 @@ fn ctx_on(
     db.ensure_tables(&orders(), common::SchemaVersionNo(1))
         .unwrap();
     db.configure_s3(&s3()).unwrap();
+    let (owner_pod, fencing_token) = support::acquire_table(&pool, epoch, "public", "orders").await;
     TableCtx {
         pool,
         epoch,
         epoch_rx: loader::epoch::fixed_epoch_watch(epoch),
+        owner_pod,
+        fencing_token,
+        store: support::store(),
+        staging_bucket: "walrus".into(),
         schema: "public".into(),
         table: "orders".into(),
         series: "public.orders".into(),
@@ -155,6 +158,7 @@ fn ctx_on(
         db,
         state: LoaderState::new(),
         max_files: std::num::NonZeroI64::new(100).unwrap(),
+        max_integrity_resnapshots: 1,
         poll_interval: poll,
         compaction_interval: compaction,
         retention_lsn_lag: 16 << 20,
@@ -199,7 +203,8 @@ async fn sigterm_mid_apply_commits_both_watermarks_and_releases_lease() {
     control::run_migrations(&pool).await.unwrap();
     clean(&pool, epoch).await;
 
-    let uri = write_row(epoch, "f1", 1, "v1", "i", "0000000000000064", 1);
+    let uri = write_row(epoch, "f1", 1, 1, "v1", "i", "0/64");
+    let (object_size, sha256) = support::fingerprint(&uri).await;
     control::insert_ready(
         &pool,
         &control::NewManifestFile {
@@ -209,6 +214,8 @@ async fn sigterm_mid_apply_commits_both_watermarks_and_releases_lease() {
             s3_uri: uri,
             kind: control::ManifestKind::Stream,
             row_count: 1,
+            object_size,
+            sha256,
             lsn_start: "0/64".parse().unwrap(),
             lsn_end: "0/64".parse().unwrap(),
             schema_version: common::SchemaVersionNo(1),
@@ -217,12 +224,6 @@ async fn sigterm_mid_apply_commits_both_watermarks_and_releases_lease() {
     )
     .await
     .unwrap();
-    // The worker owns the table (as bootstrap would).
-    control::acquire_lease(&pool, epoch, "public", "orders", "loader-test", 30)
-        .await
-        .unwrap()
-        .expect("free lease acquired");
-
     let dir = tmpdir(&epoch.to_string());
     let path = dir.path().join("orders.duckdb");
     // Long poll so exactly ONE cycle runs (first tick fires immediately), then the drain returns.
@@ -232,7 +233,10 @@ async fn sigterm_mid_apply_commits_both_watermarks_and_releases_lease() {
         &path,
         Duration::from_secs(60),
         Duration::from_secs(3600),
-    );
+    )
+    .await;
+    let owner_pod = ctx.owner_pod.clone();
+    let fencing_token = ctx.fencing_token;
     run_until_drain(ctx, Duration::from_millis(400)).await;
 
     // Both watermarks committed by the finished in-flight cycle.
@@ -245,7 +249,7 @@ async fn sigterm_mid_apply_commits_both_watermarks_and_releases_lease() {
     assert_eq!(cp.transformed_lsn, point, "Phase B watermark committed");
 
     // The lease is released on drain (as `main` does after the worker drains).
-    control::release_lease(&pool, epoch, "public", "orders", "loader-test")
+    control::release_lease(&pool, epoch, "public", "orders", &owner_pod, fencing_token)
         .await
         .unwrap();
     assert!(
@@ -339,7 +343,8 @@ async fn a_replacement_loader_resumes_from_the_two_watermarks() {
     let path = dir.path().join("orders.duckdb");
 
     // File 1 processed by the first worker, then SIGTERM drains it.
-    let f1 = write_row(epoch, "f1", 1, "v1", "i", "0000000000000064", 1);
+    let f1 = write_row(epoch, "f1", 1, 1, "v1", "i", "0/64");
+    let (f1_object_size, f1_sha256) = support::fingerprint(&f1).await;
     control::insert_ready(
         &pool,
         &control::NewManifestFile {
@@ -349,6 +354,8 @@ async fn a_replacement_loader_resumes_from_the_two_watermarks() {
             s3_uri: f1,
             kind: control::ManifestKind::Stream,
             row_count: 1,
+            object_size: f1_object_size,
+            sha256: f1_sha256,
             lsn_start: "0/64".parse().unwrap(),
             lsn_end: "0/64".parse().unwrap(),
             schema_version: common::SchemaVersionNo(1),
@@ -363,11 +370,13 @@ async fn a_replacement_loader_resumes_from_the_two_watermarks() {
         &path,
         Duration::from_secs(60),
         Duration::from_secs(3600),
-    );
+    )
+    .await;
     run_until_drain(ctx1, Duration::from_millis(400)).await;
 
     // A NEW file arrives after the drain; the REPLACEMENT worker re-opens the same .duckdb and resumes.
-    let f2 = write_row(epoch, "f2", 1, "v2", "u", "00000000000000C8", 5);
+    let f2 = write_row(epoch, "f2", 2, 1, "v2", "u", "0/C8");
+    let (f2_object_size, f2_sha256) = support::fingerprint(&f2).await;
     control::insert_ready(
         &pool,
         &control::NewManifestFile {
@@ -377,6 +386,8 @@ async fn a_replacement_loader_resumes_from_the_two_watermarks() {
             s3_uri: f2,
             kind: control::ManifestKind::Stream,
             row_count: 1,
+            object_size: f2_object_size,
+            sha256: f2_sha256,
             lsn_start: "0/C8".parse().unwrap(),
             lsn_end: "0/C8".parse().unwrap(),
             schema_version: common::SchemaVersionNo(1),
@@ -391,7 +402,8 @@ async fn a_replacement_loader_resumes_from_the_two_watermarks() {
         &path,
         Duration::from_secs(60),
         Duration::from_secs(3600),
-    );
+    )
+    .await;
     run_until_drain(ctx2, Duration::from_millis(400)).await;
 
     // Resume from the watermarks: the mirror is at v2, exactly one row — file 1 was NOT reprocessed

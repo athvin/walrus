@@ -13,6 +13,7 @@ use pg_sink::reload_event::{
 };
 use pg_sink::replication::ReplicationStream;
 use pg_sink::slot::verify_or_create_slot;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio_postgres::NoTls;
 use tokio_util::sync::CancellationToken;
@@ -26,6 +27,11 @@ pub struct Resolver {
         reason = "only the overlap test asks the shared resolver for target commit observations"
     )]
     pub watched_commit: tokio::sync::watch::Receiver<Option<Lsn>>,
+    #[allow(
+        dead_code,
+        reason = "only the long-transaction export test asks whether a watched commit used proto v2"
+    )]
+    pub watched_stream_commit: tokio::sync::watch::Receiver<Option<Lsn>>,
 }
 
 pub fn spawn(
@@ -38,6 +44,7 @@ pub fn spawn(
 ) -> Resolver {
     let (ready_tx, ready) = tokio::sync::oneshot::channel();
     let (watched_tx, watched_commit) = tokio::sync::watch::channel(None);
+    let (watched_stream_tx, watched_stream_commit) = tokio::sync::watch::channel(None);
     let handle = tokio::spawn(async move {
         let (admin, connection) = tokio_postgres::connect(&source_db_url, NoTls)
             .await
@@ -60,7 +67,8 @@ pub fn spawn(
         let mut pending = PendingReloadEvents::default();
         let mut current_top_xid = None;
         let mut watch_oid = None;
-        let mut txn_touched_watch = false;
+        let mut ordinary_touched_watch = false;
+        let mut streamed_watch_subxids: HashMap<u32, HashSet<u32>> = HashMap::new();
         loop {
             let frame = tokio::select! {
                 _ = token.cancelled() => break,
@@ -98,11 +106,24 @@ pub fn spawn(
                 | Message::Delete { relation_oid, .. }
                     if watch_oid == Some(*relation_oid) =>
                 {
-                    txn_touched_watch = true;
+                    match &message {
+                        Message::Insert { xid: Some(sub), .. }
+                        | Message::Update { xid: Some(sub), .. }
+                        | Message::Delete { xid: Some(sub), .. } => {
+                            streamed_watch_subxids
+                                .entry(
+                                    current_top_xid
+                                        .expect("streamed watched change outside StreamStart"),
+                                )
+                                .or_default()
+                                .insert(*sub);
+                        }
+                        _ => ordinary_touched_watch = true,
+                    }
                 }
                 Message::Commit { commit_lsn, .. } => {
                     resolve_committed(pending.on_commit(*commit_lsn), &pool, &waiters).await;
-                    if std::mem::take(&mut txn_touched_watch) {
+                    if std::mem::take(&mut ordinary_touched_watch) {
                         watched_tx.send_replace(Some(*commit_lsn));
                     }
                 }
@@ -111,12 +132,21 @@ pub fn spawn(
                 } => {
                     resolve_committed(pending.on_stream_commit(*xid, *commit_lsn), &pool, &waiters)
                         .await;
-                    if std::mem::take(&mut txn_touched_watch) {
+                    if streamed_watch_subxids.remove(xid).is_some() {
                         watched_tx.send_replace(Some(*commit_lsn));
+                        watched_stream_tx.send_replace(Some(*commit_lsn));
                     }
                 }
                 Message::StreamAbort { top_xid, sub_xid } => {
                     pending.on_stream_abort(*top_xid, *sub_xid);
+                    if top_xid == sub_xid {
+                        streamed_watch_subxids.remove(top_xid);
+                    } else if let Some(subxids) = streamed_watch_subxids.get_mut(top_xid) {
+                        subxids.remove(sub_xid);
+                        if subxids.is_empty() {
+                            streamed_watch_subxids.remove(top_xid);
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -128,6 +158,7 @@ pub fn spawn(
         handle,
         ready,
         watched_commit,
+        watched_stream_commit,
     }
 }
 

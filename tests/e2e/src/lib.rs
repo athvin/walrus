@@ -447,7 +447,7 @@ impl Harness {
             .await?;
             let cp =
                 control::read_checkpoint(&self.control, self.epoch.into(), "public", table).await?;
-            if let Some(cp) = cp
+            if let Some(cp) = cp.as_ref()
                 && pending == 0
                 && cp.transformed_lsn > target
                 && cp.transformed_lsn == cp.raw_appended_lsn
@@ -455,8 +455,18 @@ impl Harness {
                 return Ok(());
             }
             if start.elapsed() > deadline {
+                let mut sink_tail = std::fs::read_to_string(&self.sink_log)
+                    .unwrap_or_else(|error| format!("<cannot read sink log: {error}>"))
+                    .lines()
+                    .rev()
+                    .take(20)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                sink_tail.reverse();
                 anyhow::bail!(
-                    "transformed_lsn for {table} never passed {target} within {deadline:?}"
+                    "transformed_lsn for {table} never passed {target} within {deadline:?}; \
+                     pending={pending}, checkpoint={cp:?}; sink log tail:\n{}",
+                    sink_tail.join("\n")
                 );
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -481,10 +491,11 @@ impl Harness {
     }
 
     /// Respawn the sink fresh and block until `/ready`. After a `SIGKILL` the source still marks the
-    /// replication slot **active** until it notices the dropped connection, and the sink's resume path
+    /// replication slot **active** until it notices the dropped connection, and the replacement sink
     /// issues `START_REPLICATION` with no retry — so wait for the slot to go inactive first (what a real
     /// orchestrator's backoff-restart achieves), then reap the old process so its health listener is
-    /// definitely released before spawning. Resume is from `confirmed_flush_lsn`.
+    /// definitely released before spawning. A healthy retained slot supplies the durable WAL floor for
+    /// the new process's reconciled successor generation.
     pub async fn restart_sink(&mut self) -> Result<()> {
         self.await_slot_inactive(Duration::from_secs(30)).await?;
         match tokio::time::timeout(Duration::from_secs(10), self.sink.wait()).await {
@@ -525,10 +536,31 @@ impl Harness {
     /// PostgreSQL drops the old session's advisory locks on `SIGKILL`. Resume is from the two
     /// persisted watermarks.
     pub async fn restart_loader(&mut self) -> Result<()> {
-        self.loader = spawn_loader(&self.bins)?;
-        wait_ready("http://127.0.0.1:8131", Duration::from_secs(90))
+        self.restart_loader_with_deadline(Duration::from_secs(90))
             .await
-            .context("loader /ready after restart")
+    }
+
+    /// Respawn the loader with a caller-selected readiness deadline. Scale tests use this without
+    /// weakening the ordinary 90-second startup bound for every other scenario.
+    pub async fn restart_loader_with_deadline(&mut self, deadline: Duration) -> Result<()> {
+        self.loader = spawn_loader(&self.bins)?;
+        let Err(source) = wait_ready("http://127.0.0.1:8131", deadline).await else {
+            return Ok(());
+        };
+        let child_status = match self.loader.try_wait() {
+            Ok(None) => "running".to_string(),
+            Ok(Some(status)) => format!("exited ({status})"),
+            Err(error) => format!("unknown ({error})"),
+        };
+        let ready_probe = match http_get("http://127.0.0.1:8131/ready").await {
+            Ok((ok, body)) => format!("http_200={ok}, body={body}"),
+            Err(error) => format!("failed: {error:#}"),
+        };
+        Err(source).with_context(|| {
+            format!(
+                "loader /ready after restart; child={child_status}; final /ready probe: {ready_probe}"
+            )
+        })
     }
 
     /// Whether the loader child is still running (`try_wait() == Ok(None)`). A lossy-cast QUARANTINE
@@ -767,6 +799,21 @@ impl Harness {
         self.grep_sink_log(needle) > 0
     }
 
+    /// Return the newest `max_lines` from the sink log in chronological order. Long-running E2Es
+    /// use this in failure messages so a child-process exit reports its classified cause instead
+    /// of timing out later on the control-plane symptom.
+    pub fn sink_log_tail(&self, max_lines: usize) -> String {
+        let mut tail = std::fs::read_to_string(&self.sink_log)
+            .unwrap_or_else(|error| format!("<cannot read sink log: {error}>"))
+            .lines()
+            .rev()
+            .take(max_lines)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        tail.reverse();
+        tail.join("\n")
+    }
+
     /// Poll [`Harness::heartbeat_roundtrips`] until it reaches `min`, or the deadline elapses.
     pub async fn await_heartbeat_roundtrip(&self, min: usize, deadline: Duration) -> Result<usize> {
         let start = Instant::now();
@@ -798,9 +845,11 @@ impl Harness {
         matches!(self.sink.try_wait(), Ok(None))
     }
 
-    // ---- total-restart (epoch bump on slot loss) ----------------------------------------
+    // ---- successor generations and destructive slot recovery ----------------------------
 
-    /// The current (highest) epoch in `replication_state`, or 1 if none yet — bumps on a total-restart.
+    /// The current (highest) epoch in `replication_state`, or 1 if none yet. A new sink process opens
+    /// a reconciled successor even when it retains a healthy slot; slot loss additionally makes that
+    /// successor a destructive total restart.
     pub async fn current_epoch(&self) -> Result<i64> {
         Ok(control::read_current_epoch(&self.control)
             .await?
@@ -808,14 +857,14 @@ impl Harness {
             .unwrap_or(1))
     }
 
-    /// Re-read the current epoch into `self.epoch` after a total-restart, so the epoch-namespaced reads
+    /// Re-read the current epoch into `self.epoch` after a successor opens, so epoch-namespaced reads
     /// (`s3_list`, `await_transformed_past`, …) target the NEW generation.
     pub async fn refresh_epoch(&mut self) -> Result<i64> {
         self.epoch = self.current_epoch().await?;
         Ok(self.epoch)
     }
 
-    /// Poll `current_epoch` until it exceeds `from`, or the deadline elapses (a total-restart bumped it).
+    /// Poll `current_epoch` until it exceeds `from`, or the deadline elapses.
     pub async fn await_epoch_past(&self, from: i64, deadline: Duration) -> Result<i64> {
         let start = Instant::now();
         loop {
@@ -850,9 +899,9 @@ impl Harness {
         Ok(())
     }
 
-    /// Terminate the sink's walsender backend WITHOUT dropping the slot — a transient disconnect (a
-    /// network blip). The slot survives, so a restart must RESUME from `confirmed_flush` and NOT bump the
-    /// epoch (the false-positive guard, §1.8).
+    /// Terminate the sink's walsender backend WITHOUT dropping the slot. The slot survives, so a new
+    /// sink process retains its WAL floor and opens a reconciled successor without destructive slot
+    /// replacement or a `total_restart` intent.
     pub async fn terminate_walsender(&self) -> Result<()> {
         sqlx::raw_sql(&format!(
             "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots \

@@ -60,8 +60,9 @@ impl RelationCache {
         self.by_key.get(&(oid, schema_version)).cloned()
     }
 
-    /// The cached shape for `oid` at its **highest** `schema_version` — used to stamp streamed changes
-    /// after a DDL bump, so a change always lands in the latest-shape file.
+    /// The cached shape for `oid` at its **highest** `schema_version`. DDL identity checks use this
+    /// current view; change routing must instead use an explicit relation binding because replayed
+    /// WAL may describe an older hydrated version.
     #[must_use]
     pub fn latest_for(&self, oid: u32) -> Option<Arc<CachedRelation>> {
         self.by_key

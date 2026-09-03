@@ -58,6 +58,7 @@ tokio-postgres = { workspace = true, features = ["runtime"] }
 axum = { workspace = true }
 object_store = { workspace = true, features = ["aws"] }
 bytes = { workspace = true }
+sha2 = { workspace = true }
 futures-util = { workspace = true }
 byteorder = { workspace = true }
 tracing = { workspace = true }

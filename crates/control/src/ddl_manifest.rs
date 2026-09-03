@@ -43,14 +43,16 @@ pub struct DdlRow {
     pub c_ddl_text: Option<String>,
 }
 
-/// Record a decoded schema-change event from the sink. `c_rel_oid` + `c_columns` are the structured
-/// schema-diff payload (the source's post-change column snapshot) the loader applies — schema-DIFF,
-/// not a replay of the DDL text. Returns the assigned `id`.
+/// Record an immutable decoded schema-change event from the sink. `c_rel_oid` + `c_columns` are the
+/// structured schema-diff payload (the source's post-change column snapshot) the loader applies —
+/// schema-DIFF, not a replay of the DDL text. An exact source-audit replay returns the original id;
+/// changed content under that identity is rejected. Returns the assigned `id`.
 ///
 /// # Errors
 ///
-/// Returns [`ControlError::Connect`] if the event cannot be inserted, or
-/// [`ControlError::CheckViolation`] if its values violate a control-plane invariant.
+/// Returns [`ControlError::ImmutableHistoryConflict`] for changed replay content,
+/// [`ControlError::Connect`] if the event cannot be inserted, or [`ControlError::CheckViolation`]
+/// if its values violate a control-plane invariant.
 pub async fn insert_ddl(ex: impl PgExecutor<'_>, row: &DdlRow) -> Result<DdlId, ControlError> {
     let c_rel_oid = row.c_rel_oid.map(sqlx::postgres::types::Oid);
     let rec = sqlx::query(include_str!("../sql/postgres/queries/insert_ddl.sql"))
@@ -66,8 +68,15 @@ pub async fn insert_ddl(ex: impl PgExecutor<'_>, row: &DdlRow) -> Result<DdlId, 
         .bind(&row.c_columns)
         .bind(&row.c_dropped)
         .bind(&row.c_ddl_text)
-        .fetch_one(ex)
+        .fetch_optional(ex)
         .await?;
+    let rec = rec.ok_or_else(|| ControlError::ImmutableHistoryConflict {
+        entity: "ddl_manifest",
+        key: format!(
+            "epoch={} source_audit_id={}",
+            row.epoch, row.source_audit_id
+        ),
+    })?;
     Ok(DdlId(rec.try_get("id")?))
 }
 

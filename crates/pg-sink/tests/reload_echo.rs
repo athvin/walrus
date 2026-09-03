@@ -91,11 +91,8 @@ async fn signal_insert_resolves_waiter_and_never_reaches_parquet() {
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     for tbl in ["file_manifest", "schema_registry"] {
-        sqlx::query(&format!("DELETE FROM walrus.{tbl} WHERE epoch = $1"))
-            .bind(epoch)
-            .execute(&pool)
-            .await
-            .unwrap();
+        let sql = cleanup_sql(tbl);
+        sqlx::query(&sql).bind(epoch).execute(&pool).await.unwrap();
     }
 
     let resume = verify_or_create_slot(&admin, slot).await.unwrap();
@@ -146,7 +143,7 @@ async fn signal_insert_resolves_waiter_and_never_reaches_parquet() {
     let mut sealed: Vec<SealedBatch> = Vec::new();
     let mut signal_seen = false;
     let mut signal_insert_frame_lsn = Lsn::ZERO;
-    let commit_lsn = tokio::time::timeout(Duration::from_secs(20), async {
+    let (commit_lsn, end_lsn) = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let frame = stream.next().await.unwrap().unwrap();
             let frame_lsn = match &frame {
@@ -178,11 +175,15 @@ async fn signal_insert_resolves_waiter_and_never_reaches_parquet() {
                     xid,
                 } if internal.is_reload_signal(*relation_oid) => {
                     let rel = internal.reload_signal_rel().expect("noted relation");
-                    pending.push(PendingSignal::from_tuple(rel, new, *xid).expect("parses"));
+                    pending.push(PendingSignal::from_tuple(rel, new, *xid, None).expect("parses"));
                     signal_seen = true;
                     signal_insert_frame_lsn = frame_lsn;
                 }
-                Message::Commit { commit_lsn, .. } => {
+                Message::Commit {
+                    commit_lsn,
+                    end_lsn,
+                    ..
+                } => {
                     sealed.extend(
                         router
                             .route(&cache, &msg, frame_lsn, SchemaVersionNo(1))
@@ -190,7 +191,7 @@ async fn signal_insert_resolves_waiter_and_never_reaches_parquet() {
                     );
                     pending.on_commit(*commit_lsn, &waiters);
                     if signal_seen {
-                        return *commit_lsn;
+                        return (*commit_lsn, *end_lsn);
                     }
                 }
                 other => {
@@ -249,9 +250,11 @@ async fn signal_insert_resolves_waiter_and_never_reaches_parquet() {
         "no Parquet/manifest row for the signal table, ever"
     );
 
-    // Signals need no special retention: standby feedback advances confirmed_flush past the
-    // signal txn like any consumed record, and the server accepts it.
-    checkpoint.on_batch_durable(commit_lsn);
+    // Signals need no special retention: once the echo is handled, standby feedback advances
+    // confirmed_flush to the transaction's end_lsn like any consumed record, and the server accepts
+    // it without leaving the commit record at the resume boundary.
+    checkpoint.observe_commit(commit_lsn, end_lsn).unwrap();
+    checkpoint.on_commit_durable(commit_lsn).unwrap();
     checkpoint.send(&mut stream, false).await.unwrap();
     let confirmed = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -264,7 +267,7 @@ async fn signal_insert_resolves_waiter_and_never_reaches_parquet() {
                 .await
                 .unwrap();
             let lsn: Lsn = row.get::<_, String>(0).parse().unwrap();
-            if lsn >= commit_lsn {
+            if lsn >= end_lsn {
                 return lsn;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -272,7 +275,8 @@ async fn signal_insert_resolves_waiter_and_never_reaches_parquet() {
     })
     .await
     .expect("confirmed_flush advances past the signal txn");
-    assert!(confirmed >= commit_lsn);
+    assert!(end_lsn > commit_lsn);
+    assert!(confirmed >= end_lsn);
 
     // Cleanup: slot, source rows, and this epoch's control rows (registry writes from on_relation).
     drop(stream);
@@ -289,10 +293,21 @@ async fn signal_insert_resolves_waiter_and_never_reaches_parquet() {
         .await
         .unwrap();
     for tbl in ["file_manifest", "schema_registry"] {
-        sqlx::query(&format!("DELETE FROM walrus.{tbl} WHERE epoch = $1"))
-            .bind(epoch)
-            .execute(&pool)
-            .await
-            .unwrap();
+        let sql = cleanup_sql(tbl);
+        sqlx::query(&sql).bind(epoch).execute(&pool).await.unwrap();
+    }
+}
+
+fn cleanup_sql(table: &str) -> String {
+    if table == "file_manifest" {
+        format!(
+            "WITH authorized AS MATERIALIZED (SELECT set_config('walrus.manifest_delete_protocol','2',true) AS protocol) DELETE FROM walrus.{table} WHERE epoch = $1 AND (SELECT protocol = '2' FROM authorized)"
+        )
+    } else if table == "schema_registry" {
+        format!(
+            "WITH authorized AS MATERIALIZED (SELECT set_config('walrus.schema_registry_maintenance','1-delete',true) AS protocol) DELETE FROM walrus.{table} WHERE epoch = $1 AND (SELECT protocol = '1-delete' FROM authorized)"
+        )
+    } else {
+        format!("DELETE FROM walrus.{table} WHERE epoch = $1")
     }
 }

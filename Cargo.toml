@@ -433,6 +433,7 @@ tokio = "1"
 sqlx = "0.8"
 anyhow = "1"
 hex = "0.4"
+sha2 = "0.10"
 # Non-poisoning mutex: `.lock()` returns the guard directly, so there is no `unwrap`/`expect`
 # on the lock — the clean fit for the `clippy::unwrap_used`/`expect_used` deny. Already in the
 # lock file (transitive), MIT/Apache: a zero-cost direct-dep promotion.

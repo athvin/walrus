@@ -20,6 +20,7 @@ use object_store::buffered::BufWriter;
 use object_store::path::Path;
 use parquet::arrow::AsyncArrowWriter;
 use parquet::arrow::async_writer::AsyncFileWriter;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
@@ -60,6 +61,10 @@ pub struct WrittenObject {
     pub lsn_end: Lsn,
     /// Rows written.
     pub row_count: u64,
+    /// Exact number of Parquet bytes uploaded.
+    pub object_size: u64,
+    /// SHA-256 of the exact Parquet byte stream sent to object storage.
+    pub sha256: [u8; 32],
     /// The shape the rows were encoded against.
     pub schema_version: SchemaVersionNo,
     /// Which producer wrote it, which is how the loader routes the file.
@@ -123,6 +128,10 @@ struct UploadState {
     /// `BufWriter` cannot abort once shutdown has started. Retain that fact if completion fails so
     /// cleanup never calls its documented panic path.
     completing: bool,
+    /// Updated at the same choke point that hands bytes to `BufWriter`, so every producer path
+    /// receives the same end-to-end fingerprint.
+    hasher: Sha256,
+    bytes_written: u64,
 }
 
 impl AbortableObjectWriter {
@@ -131,8 +140,21 @@ impl AbortableObjectWriter {
             state: Arc::new(Mutex::new(UploadState {
                 writer: Some(writer),
                 completing: false,
+                hasher: Sha256::new(),
+                bytes_written: 0,
             })),
         }
+    }
+
+    async fn fingerprint(&self) -> Result<(u64, [u8; 32]), SinkError> {
+        let state = self.state.lock().await;
+        if state.writer.is_some() || !state.completing {
+            return Err(SinkError::ClosedStream);
+        }
+        let digest = state.hasher.clone().finalize();
+        let mut sha256 = [0_u8; 32];
+        sha256.copy_from_slice(&digest);
+        Ok((state.bytes_written, sha256))
     }
 
     async fn abort(&self) -> Result<(), object_store::Error> {
@@ -166,6 +188,10 @@ impl AsyncFileWriter for AbortableObjectWriter {
                     "reload object upload is already completing".into(),
                 ));
             }
+            state.hasher.update(&bytes);
+            state.bytes_written = state
+                .bytes_written
+                .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
             let writer = state.writer.as_mut().ok_or_else(|| {
                 parquet::errors::ParquetError::General(
                     "reload object upload is already closed".into(),
@@ -342,12 +368,14 @@ impl ParquetSink {
         // `write` and `close` compress the whole batch before they await — the `async` in that name is
         // the upload, not the compression. This remains on the task because no profile identifies
         // compression as a scheduler bottleneck; move it to the blocking pool if measurements do.
+        let upload = AbortableObjectWriter::new(buf_writer);
         let mut writer =
-            AsyncArrowWriter::try_new(buf_writer, batch.record_batch.schema(), Some(props))?;
+            AsyncArrowWriter::try_new(upload.clone(), batch.record_batch.schema(), Some(props))?;
         writer.write(&batch.record_batch).await?;
         // close() finalises the Parquet footer AND completes the multipart upload — the durability
         // point. Nothing downstream may observe this batch before this returns Ok.
         writer.close().await?;
+        let (object_size, sha256) = upload.fingerprint().await?;
         common::metrics::record_batch_flush(flush_start.elapsed().as_secs_f64(), rows);
 
         Ok(WrittenObject {
@@ -358,6 +386,8 @@ impl ParquetSink {
             lsn_start: batch.lsn_start,
             lsn_end: batch.lsn_end,
             row_count: batch.row_count,
+            object_size,
+            sha256,
             schema_version: batch.schema_version,
             kind,
         })
@@ -455,6 +485,7 @@ impl ReloadParquetWriter {
             }
             return Err(SinkError::Encode(error));
         }
+        let (object_size, sha256) = self.upload.fingerprint().await?;
         self.write_duration = self.write_duration.saturating_add(finish_started.elapsed());
         self.terminal = true;
         common::metrics::record_batch_flush(self.write_duration.as_secs_f64(), self.row_count);
@@ -467,6 +498,8 @@ impl ReloadParquetWriter {
             lsn_start: self.fence_lsn,
             lsn_end: self.fence_lsn,
             row_count: self.row_count,
+            object_size,
+            sha256,
             schema_version: self.schema_version,
             kind: FileKind::Reload,
         })

@@ -123,12 +123,18 @@ fn an_emit_entry_splits_on_its_last_colon_so_a_colon_in_the_name_survives() {
 }
 
 #[test]
-fn an_emit_entry_without_a_type_suffix_is_dropped_rather_than_guessed() {
-    let entries = vec!["no_colon_here".to_string(), "id:INT64".to_string()];
+fn a_registry_plan_rejects_malformed_emit_entries() {
+    let rel = relation(vec![text("id")]);
+    for entry in ["no_colon_here", ":INT64", "id:"] {
+        let mut descriptor = descriptor("id");
+        descriptor.emit = vec![entry.to_string()];
 
-    let pairs = parse_emit(&entries);
-
-    assert_eq!(pairs, vec![("id", "BIGINT")]);
+        assert!(matches!(
+            TablePlan::from_registry(&rel, &[descriptor]),
+            Err(LoaderError::ManifestInvariant { message })
+                if message.contains("malformed emit entry")
+        ));
+    }
 }
 
 #[test]
@@ -179,7 +185,7 @@ fn a_column_with_no_descriptor_keeps_the_tier1_shape() {
         ..descriptor("body")
     };
 
-    let plan = TablePlan::from_registry(&rel, &[body]);
+    let plan = TablePlan::from_registry(&rel, &[body]).unwrap();
 
     // `id` has no registry row, so it falls back to `duck::duck_type`.
     assert_eq!(
@@ -191,7 +197,7 @@ fn a_column_with_no_descriptor_keeps_the_tier1_shape() {
 
 #[test]
 fn a_tier2_interval_collapses_its_emit_columns_into_one_mirror_column() {
-    let rel = relation(vec![key("id"), text("elapsed")]);
+    let rel = relation(vec![key("id"), col("elapsed", INTERVAL, false)]);
     let elapsed = TypeDescriptor {
         pg_type_oid: INTERVAL,
         tier: Tier::Two,
@@ -200,7 +206,7 @@ fn a_tier2_interval_collapses_its_emit_columns_into_one_mirror_column() {
         ..descriptor("elapsed")
     };
 
-    let plan = TablePlan::from_registry(&rel, &[elapsed]);
+    let plan = TablePlan::from_registry(&rel, &[elapsed]).unwrap();
 
     // Three raw columns in, one mirror column out — named for the SOURCE column, not the emits.
     assert_eq!(raw_names(&plan), vec!["id", "e_mo", "e_d", "e_us"]);
@@ -237,7 +243,7 @@ fn tier2_replica_identity_columns_propagate_to_every_mirror_component() {
         ..descriptor("span")
     };
 
-    let plan = TablePlan::from_registry(&rel, &[elapsed, span]);
+    let plan = TablePlan::from_registry(&rel, &[elapsed, span]).unwrap();
 
     let elapsed = plan
         .mirror_cols
@@ -262,7 +268,7 @@ fn a_tier2_range_fans_out_to_flat_mirror_columns() {
     // column. They are not independent scalar sentinels: every sibling resolves against the
     // original source-column name recorded in metadata. The descriptor's `duckdb` is never read on
     // this path — the emit types are.
-    let rel = relation(vec![key("id"), text("span")]);
+    let rel = relation(vec![key("id"), col("span", oids::INT4RANGE, false)]);
     let span = TypeDescriptor {
         pg_type_oid: oids::INT4RANGE,
         tier: Tier::Two,
@@ -271,7 +277,7 @@ fn a_tier2_range_fans_out_to_flat_mirror_columns() {
         ..descriptor("span")
     };
 
-    let plan = TablePlan::from_registry(&rel, &[span]);
+    let plan = TablePlan::from_registry(&rel, &[span]).unwrap();
 
     assert_eq!(raw_names(&plan), mirror_names(&plan));
     assert_eq!(mirror_names(&plan).len(), 6);
@@ -289,7 +295,7 @@ fn the_dispatch_reads_the_emit_shape_not_the_declared_tier() {
     // A Tier-2 `point` stays NESTED — one struct emit column — so it must take the single-column
     // arm beside Tier-1 and Tier-3 rather than fan out. Dispatching on `d.tier` would split it
     // into siblings the sink never wrote to the Parquet file.
-    let rel = relation(vec![key("id"), text("loc")]);
+    let rel = relation(vec![key("id"), col("loc", oids::POINT, false)]);
     let loc = TypeDescriptor {
         pg_type_oid: oids::POINT,
         tier: Tier::Two,
@@ -298,7 +304,7 @@ fn the_dispatch_reads_the_emit_shape_not_the_declared_tier() {
         ..descriptor("loc")
     };
 
-    let plan = TablePlan::from_registry(&rel, &[loc]);
+    let plan = TablePlan::from_registry(&rel, &[loc]).unwrap();
 
     assert_eq!(mirror_names(&plan), vec!["id", "loc"]);
     assert_eq!(plan.raw_cols[1].duckdb_type, "STRUCT(x DOUBLE, y DOUBLE)");
@@ -308,7 +314,7 @@ fn the_dispatch_reads_the_emit_shape_not_the_declared_tier() {
 fn a_numerics_precise_decimal_comes_from_the_emit_type_not_the_descriptor() {
     // The descriptor's `duckdb` for a numeric is the bare `DECIMAL`; the precision and scale live
     // only in the emit type, and dropping them would silently round every stored amount.
-    let rel = relation(vec![key("id"), text("amount")]);
+    let rel = relation(vec![key("id"), col("amount", oids::NUMERIC, false)]);
     let amount = TypeDescriptor {
         pg_type_oid: oids::NUMERIC,
         duckdb: "DECIMAL".into(),
@@ -316,8 +322,69 @@ fn a_numerics_precise_decimal_comes_from_the_emit_type_not_the_descriptor() {
         ..descriptor("amount")
     };
 
-    let plan = TablePlan::from_registry(&rel, &[amount]);
+    let plan = TablePlan::from_registry(&rel, &[amount]).unwrap();
 
     assert_eq!(plan.raw_cols[1].duckdb_type, "DECIMAL(10,2)");
     assert_eq!(plan.mirror_cols[1].duckdb_type, "DECIMAL(10,2)");
+}
+
+#[test]
+fn registry_plan_rejects_reserved_and_duplicate_physical_names() {
+    let reserved = relation(vec![key("id"), text("_walrus_op")]);
+    assert!(matches!(
+        TablePlan::from_registry(&reserved, &[]),
+        Err(LoaderError::ManifestInvariant { message })
+            if message.contains("reserved raw physical column")
+    ));
+
+    let duplicate_raw = relation(vec![
+        key("id"),
+        col("first", oids::INT4RANGE, false),
+        col("second", oids::INT4RANGE, false),
+    ]);
+    let first = TypeDescriptor {
+        column: "first".into(),
+        pg_type_oid: oids::INT4RANGE,
+        tier: Tier::Two,
+        emit: emit(&["shared_lower:INT32", "first_upper:INT32"]),
+        ..descriptor("first")
+    };
+    let second = TypeDescriptor {
+        column: "second".into(),
+        pg_type_oid: oids::INT4RANGE,
+        tier: Tier::Two,
+        emit: emit(&["shared_lower:INT32", "second_upper:INT32"]),
+        ..descriptor("second")
+    };
+    assert!(matches!(
+        TablePlan::from_registry(&duplicate_raw, &[first, second]),
+        Err(LoaderError::ManifestInvariant { message })
+            if message.contains("duplicate, empty, or reserved raw physical column")
+    ));
+
+    let duplicate_mirror = relation(vec![
+        key("id"),
+        col("elapsed", INTERVAL, false),
+        col("span", oids::INT4RANGE, false),
+    ]);
+    let elapsed = TypeDescriptor {
+        column: "elapsed".into(),
+        pg_type_oid: INTERVAL,
+        tier: Tier::Two,
+        duckdb: "INTERVAL".into(),
+        emit: emit(&INTERVAL_EMIT),
+        ..descriptor("elapsed")
+    };
+    let span = TypeDescriptor {
+        column: "span".into(),
+        pg_type_oid: oids::INT4RANGE,
+        tier: Tier::Two,
+        emit: emit(&["elapsed:INT32", "span_upper:INT32"]),
+        ..descriptor("span")
+    };
+    assert!(matches!(
+        TablePlan::from_registry(&duplicate_mirror, &[elapsed, span]),
+        Err(LoaderError::ManifestInvariant { message })
+            if message.contains("duplicate, empty, or reserved mirror physical column")
+    ));
 }

@@ -45,9 +45,10 @@ AS $$
       'type_oid', a.atttypid::int8,
       'type_modifier', a.atttypmod,
       'is_key', c.relreplident = 'f' OR EXISTS (
-        SELECT 1
-        FROM pg_index i
-        WHERE i.indrelid = a.attrelid
+          SELECT 1
+          FROM pg_index i
+          WHERE i.indrelid = a.attrelid
+          AND i.indisvalid AND i.indisready AND i.indislive
           AND (i.indisreplident OR (c.relreplident = 'd' AND i.indisprimary))
           AND EXISTS (
             SELECT 1
@@ -61,8 +62,10 @@ AS $$
     '[]'::jsonb)
   FROM pg_attribute a
   JOIN pg_class c ON c.oid = a.attrelid
-  -- pgoutput omits generated columns from Relation and tuple messages. The audit snapshot feeds the
-  -- same registry shape, so it must use that exact published column set too.
+  -- On supported PostgreSQL 14-17, pgoutput omits generated columns from Relation and tuple
+  -- messages. The audit snapshot feeds the same registry shape, so it must use that exact published
+  -- column set too. Sink preflight rejects PostgreSQL 18+ until its configurable generated-column
+  -- publication semantics are attested explicitly.
   WHERE a.attrelid = relid AND a.attnum > 0 AND NOT a.attisdropped
     AND a.attgenerated = '';
 $$;
@@ -74,6 +77,12 @@ $$;
 CREATE OR REPLACE FUNCTION walrus.intercept_ddl() RETURNS event_trigger
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
+-- This custom function setting is durable catalog metadata tied to this exact function definition.
+-- Source preflight requires protocol 3 before trusting the topology and key guards below. In
+-- particular, an installation made from an older 0002 cannot prove that it rejects every unsafe
+-- online transition, and CREATE OR REPLACE clears this setting together with replacing the guarded
+-- implementation instead of leaving a false-positive version behind.
+SET walrus.ddl_capture_protocol = '3'
 AS $$
 DECLARE
   r               record;
@@ -106,11 +115,100 @@ BEGIN
         END IF;
         CONTINUE;
       END IF;
+      -- Preflight accepts only topology-independent targets. Preserve that condition online for
+      -- every command that can add an inheritance/partition edge. In particular, CREATE TABLE
+      -- ... INHERITS can turn an already-published plain table into a parent without executing
+      -- ALTER PUBLICATION; checking only ALTER TABLE leaves that transition unguarded. Run this
+      -- before filtering the command object to ordinary tables so CREATE/ALTER FOREIGN TABLE ...
+      -- INHERITS cannot create the same forbidden edge through an otherwise-unpublished child.
+      -- DETACH/NO INHERIT can only start from a state preflight already rejects, and every online
+      -- edge-creating form is rejected here, so no valid guarded session can reach that state.
+      IF r.command_tag IN (
+           'CREATE TABLE', 'ALTER TABLE', 'CREATE FOREIGN TABLE', 'ALTER FOREIGN TABLE'
+         )
+         AND r.classid = 'pg_class'::regclass
+         AND EXISTS (
+           SELECT 1
+           FROM pg_inherits i
+           WHERE (i.inhrelid = r.objid OR i.inhparent = r.objid)
+             AND EXISTS (
+               SELECT 1
+               FROM pg_class c
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+               JOIN pg_publication_tables pt
+                 ON pt.schemaname = n.nspname AND pt.tablename = c.relname
+               WHERE c.oid IN (i.inhrelid, i.inhparent)
+             )
+         )
+         AND NOT pg_try_advisory_xact_lock(8602276002106929250)
+      THEN
+        RAISE EXCEPTION
+          'published table topology change rejected while Walrus replication is online'
+          USING ERRCODE = '55P03',
+                HINT = 'stop the Walrus sink before changing partition/inheritance topology';
+      END IF;
       SELECT n.nspname, c.relname INTO v_schema, v_table
       FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
       WHERE c.oid = r.objid AND c.relkind IN ('r', 'p');
       CONTINUE WHEN v_table IS NULL;       -- not a surviving plain/partitioned table
       CONTINUE WHEN v_schema = 'walrus';  -- internal control tables are never audited
+      -- Logical decoding is not filtered by row-security policies, while the SQL COPY used for a
+      -- baseline is. Startup/reload preflight therefore rejects every published user target with
+      -- RLS enabled (even for a BYPASSRLS role). Preserve that invariant online: ENABLE/FORCE is
+      -- visible in pg_class at command end, and raising here rolls the catalog change back. An
+      -- already-invalid installation is repaired with the sink stopped, when the exclusive
+      -- transaction lock succeeds and lets DISABLE/NO FORCE commit.
+      IF r.command_tag = 'ALTER TABLE'
+         AND EXISTS (
+           SELECT 1
+           FROM pg_class c
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+           JOIN pg_publication_tables pt
+             ON pt.schemaname = n.nspname AND pt.tablename = c.relname
+           WHERE c.oid = r.objid
+             AND (c.relrowsecurity OR c.relforcerowsecurity)
+         )
+         AND NOT pg_try_advisory_xact_lock(8602276002106929250)
+      THEN
+        RAISE EXCEPTION
+          'row-level security change rejected for published table while Walrus replication is online'
+          USING ERRCODE = '55P03',
+                HINT = 'stop the Walrus sink before enabling or forcing row-level security';
+      END IF;
+      -- The parallel snapshot exporter needs a real primary key for its stable keyset cursor, and
+      -- WAL UPDATE/DELETE needs a usable replica identity. Startup checks both before and after
+      -- acquiring the shared session guard. Preserve that predicate for the guard's full lifetime:
+      -- if an ALTER leaves a published table without either property, fail at command end and roll
+      -- the catalog change back. A compound ALTER that replaces one valid key with another remains
+      -- allowed because this checks the final catalog state, not the command text.
+      IF r.command_tag = 'ALTER TABLE'
+         AND EXISTS (
+           SELECT 1
+           FROM pg_class c
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+           JOIN pg_publication_tables pt
+             ON pt.schemaname = n.nspname AND pt.tablename = c.relname
+           WHERE c.oid = r.objid
+             AND (
+               c.relreplident = 'n'
+               OR NOT EXISTS (
+                 SELECT 1
+                 FROM pg_index i
+                 WHERE i.indrelid = c.oid
+                   AND i.indisprimary
+                   AND i.indisvalid
+                   AND i.indisready
+                   AND i.indislive
+               )
+             )
+         )
+         AND NOT pg_try_advisory_xact_lock(8602276002106929250)
+      THEN
+        RAISE EXCEPTION
+          'published table key or replica identity change rejected while Walrus replication is online'
+          USING ERRCODE = '55P03',
+                HINT = 'stop the Walrus sink before removing a published table primary key or replica identity';
+      END IF;
       -- A FOR ALL TABLES or schema publication can acquire a brand-new target without executing
       -- ALTER PUBLICATION. At command end the catalog/view already exposes that effective
       -- membership inside this transaction. Reject only those automatically-published creations
@@ -128,45 +226,6 @@ BEGIN
           'automatically published table creation rejected while Walrus replication is online'
           USING ERRCODE = '55P03',
                 HINT = 'stop the Walrus sink or use an explicit table-list publication';
-      END IF;
-      -- Preflight accepts only topology-independent targets. Preserve that condition online: an
-      -- ALTER TABLE that attaches a published table as a partition/inheritance child (or makes a
-      -- published relation a parent) would otherwise change its effective row/WAL coverage without
-      -- ALTER PUBLICATION. DETACH/NO INHERIT can only start from a state preflight already rejects.
-      IF r.command_tag = 'ALTER TABLE'
-         AND EXISTS (
-           SELECT 1
-           FROM pg_class c
-           JOIN pg_namespace n ON n.oid = c.relnamespace
-           WHERE (
-               c.oid = r.objid
-               OR c.oid IN (
-                 SELECT i.inhrelid FROM pg_inherits i WHERE i.inhparent = r.objid
-               )
-               OR c.oid IN (
-                 SELECT i.inhparent FROM pg_inherits i WHERE i.inhrelid = r.objid
-               )
-             )
-             AND (
-               c.relkind = 'p'
-               OR c.relispartition
-               OR EXISTS (
-                 SELECT 1 FROM pg_inherits i
-                 WHERE i.inhrelid = c.oid OR i.inhparent = c.oid
-               )
-             )
-             AND EXISTS (
-               SELECT 1
-               FROM pg_publication_tables pt
-               WHERE pt.schemaname = n.nspname AND pt.tablename = c.relname
-             )
-         )
-         AND NOT pg_try_advisory_xact_lock(8602276002106929250)
-      THEN
-        RAISE EXCEPTION
-          'published table topology change rejected while Walrus replication is online'
-          USING ERRCODE = '55P03',
-                HINT = 'stop the Walrus sink before changing partition/inheritance topology';
       END IF;
       INSERT INTO walrus.ddl_audit
         (c_lsn, c_event, c_tag, c_schema, c_table, c_rel_oid, c_replica_identity,
@@ -209,6 +268,9 @@ $$;
 CREATE OR REPLACE FUNCTION walrus.guard_publication_ddl() RETURNS event_trigger
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
+-- Attest both halves of the DDL guard. CREATE OR REPLACE without this SET resets proconfig, so the
+-- protocol cannot remain current if an older migration body replaces either function later.
+SET walrus.ddl_capture_protocol = '3'
 AS $$
 BEGIN
   IF TG_TAG IN (

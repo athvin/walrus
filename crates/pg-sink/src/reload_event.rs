@@ -786,6 +786,26 @@ impl PendingReloadEvents {
         self.pending.push(event);
     }
 
+    /// Number of control effects owned by the currently committing ordinary transaction. This is a
+    /// read-only preflight so a mixed DDL/effect commit can fail before consuming replay state.
+    #[must_use]
+    pub fn ordinary_effect_count(&self) -> usize {
+        self.pending
+            .iter()
+            .filter(|event| event.xid.is_none())
+            .count()
+    }
+
+    /// Number of surviving control effects owned by one streamed top-level transaction. Savepoint
+    /// abort handling removes doomed entries before this preflight is queried at StreamCommit.
+    #[must_use]
+    pub fn stream_effect_count(&self, top_xid: u32) -> usize {
+        self.pending
+            .iter()
+            .filter(|event| event.top_xid == Some(top_xid))
+            .count()
+    }
+
     /// Promote ordinary-transaction events at commit.
     pub fn on_commit(&mut self, commit_lsn: Lsn) -> Vec<CommittedReloadEvent> {
         promote(&mut self.pending, commit_lsn, |event| event.xid.is_none())
@@ -829,12 +849,16 @@ fn extract<T>(values: &mut Vec<T>, mut predicate: impl FnMut(&T) -> bool) -> Vec
 
 type WaiterKey = (ReloadId, FencePhase);
 type WaiterEntry = (u64, oneshot::Sender<FenceEcho>);
+type WaiterEntries = Vec<WaiterEntry>;
 
 /// Subscribe-before-insert registry shared by exporters and the decoder.
+///
+/// Every key retains all active subscribers so concurrent observers of the same deterministic
+/// fence receive the one committed echo together.
 #[derive(Debug, Default)]
 pub struct FenceWaiters {
     // LOCK-CHOICE: every access mutates one map entry, so an RwLock provides no read concurrency.
-    waiters: Mutex<HashMap<WaiterKey, WaiterEntry>>,
+    waiters: Mutex<HashMap<WaiterKey, WaiterEntries>>,
     next_generation: AtomicU64,
     crosscheck_violations: AtomicU64,
 }
@@ -845,7 +869,11 @@ impl FenceWaiters {
         let (tx, rx) = oneshot::channel();
         let key = (reload_id, phase);
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-        self.waiters.lock().insert(key, (generation, tx));
+        self.waiters
+            .lock()
+            .entry(key)
+            .or_default()
+            .push((generation, tx));
         FenceSubscribeGuard {
             waiters: self,
             key,
@@ -867,27 +895,36 @@ impl FenceWaiters {
                 "reload fence WAL cross-check violated"
             );
         }
-        let waiter = self.waiters.lock().remove(&(reload_id, phase));
-        if let Some((_, tx)) = waiter
-            && tx.send(echo).is_err()
-        {
-            tracing::debug!(%reload_id, ?phase, "reload fence resolved after waiter dropped");
+        let waiters = self.waiters.lock().remove(&(reload_id, phase));
+        if let Some(waiters) = waiters {
+            for (_, tx) in waiters {
+                if tx.send(echo).is_err() {
+                    tracing::debug!(%reload_id, ?phase, "reload fence resolved after waiter dropped");
+                }
+            }
         }
     }
 
     fn unsubscribe(&self, key: WaiterKey, generation: u64) {
         let mut waiters = self.waiters.lock();
-        if let Entry::Occupied(entry) = waiters.entry(key)
-            && entry.get().0 == generation
-        {
-            entry.remove();
+        if let Entry::Occupied(mut entry) = waiters.entry(key) {
+            let subscribers = entry.get_mut();
+            if let Some(index) = subscribers
+                .iter()
+                .position(|(candidate, _)| *candidate == generation)
+            {
+                subscribers.swap_remove(index);
+            }
+            if subscribers.is_empty() {
+                entry.remove();
+            }
         }
     }
 
     /// Current subscriber count, exposed for health/tests.
     #[must_use]
     pub fn waiter_count(&self) -> usize {
-        self.waiters.lock().len()
+        self.waiters.lock().values().map(Vec::len).sum()
     }
 
     /// Number of diagnostic `embedded_lsn >= commit_lsn` violations observed locally.

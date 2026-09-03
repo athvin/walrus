@@ -211,8 +211,8 @@ async fn one_worker_honors_the_configured_record_chunk_size() {
     h.await_transformed_past("rl1", floor, Duration::from_secs(90))
         .await
         .unwrap();
-    let initial: (String, i64) = sqlx::query_as(
-        "SELECT status, chunk_no FROM walrus.table_reload \
+    let initial: (i64, String, i64) = sqlx::query_as(
+        "SELECT reload_id, status, chunk_no FROM walrus.table_reload \
          WHERE epoch = $1 AND source_schema = 'public' AND source_table = 'rl1' \
          ORDER BY reload_id DESC LIMIT 1",
     )
@@ -221,13 +221,11 @@ async fn one_worker_honors_the_configured_record_chunk_size() {
     .await
     .unwrap();
     assert_eq!(
-        initial.0, "complete",
+        initial.1, "complete",
         "non-empty first startup reached cutover"
     );
-    assert_eq!(
-        initial.1, 28,
-        "first startup honored the same 37-record object size"
-    );
+    let initial_ranges = completed_export_ranges(&h, initial.0).await;
+    assert_range_chunking(&initial_ranges, 37, 1001, initial.2);
 
     // Hold the loader so exported manifests remain inspectable instead of being claimed/deleted.
     // This lets the test assert the record-count contract on every remote object, not merely the
@@ -287,10 +285,8 @@ async fn one_worker_honors_the_configured_record_chunk_size() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    assert_eq!(
-        completed.1, 28,
-        "1001 rows must produce 27 full objects plus one tail"
-    );
+    let completed_ranges = completed_export_ranges(&h, completed.0).await;
+    let mut expected_tail_rows = assert_range_chunking(&completed_ranges, 37, 1001, completed.1);
     let object_rows: Vec<i64> = sqlx::query_scalar(
         "SELECT row_count FROM walrus.file_manifest \
          WHERE reload_id = $1 AND kind = 'reload' ORDER BY id",
@@ -299,9 +295,27 @@ async fn one_worker_honors_the_configured_record_chunk_size() {
     .fetch_all(h.control_pool())
     .await
     .unwrap();
-    assert_eq!(object_rows.len(), 28);
-    assert_eq!(object_rows.iter().filter(|rows| **rows == 37).count(), 27);
-    assert_eq!(object_rows.iter().filter(|rows| **rows == 2).count(), 1);
+    assert_eq!(
+        i64::try_from(object_rows.len()).unwrap(),
+        completed.1,
+        "every recorded reload object has one manifest"
+    );
+    assert_eq!(object_rows.iter().sum::<i64>(), 1001);
+    assert!(
+        object_rows.iter().all(|rows| (1..=37).contains(rows)),
+        "37 is a strict per-object row maximum: {object_rows:?}"
+    );
+    let mut actual_tail_rows: Vec<i64> = object_rows
+        .iter()
+        .copied()
+        .filter(|rows| *rows < 37)
+        .collect();
+    expected_tail_rows.sort_unstable();
+    actual_tail_rows.sort_unstable();
+    assert_eq!(
+        actual_tail_rows, expected_tail_rows,
+        "each independently receipted physical range has exactly one final partial object"
+    );
 
     h.restart_loader().await.unwrap();
     let cutover_deadline = tokio::time::Instant::now() + Duration::from_secs(90);
@@ -324,8 +338,9 @@ async fn one_worker_honors_the_configured_record_chunk_size() {
 }
 
 /// A process crash loses every PostgreSQL exported snapshot, even though some baseline objects may
-/// already be durable. Restart must therefore fail/purge the abandoned attempt, open a successor
-/// with a fresh snapshot, and converge without creating a second replication slot or walsender.
+/// already be durable. A replacement process must therefore epoch-isolate the abandoned attempt,
+/// open a newly fenced all-table reconciliation, and converge without creating a second replication
+/// slot or walsender.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires docker compose up --wait (source PG + control PG + MinIO)"]
 async fn sink_crash_mid_reload_starts_a_correct_successor_on_one_slot() {
@@ -338,6 +353,7 @@ async fn sink_crash_mid_reload_starts_a_correct_successor_on_one_slot() {
     })
     .await
     .expect("bring up sink + loader");
+    let old_epoch = h.epoch;
 
     // Do not race the source-backed request against the empty bootstrap reconciliation for rl1.
     let bootstrap_deadline = tokio::time::Instant::now() + Duration::from_secs(90);
@@ -415,70 +431,98 @@ async fn sink_crash_mid_reload_starts_a_correct_successor_on_one_slot() {
     .unwrap();
     h.restart_sink()
         .await
-        .expect("sink restarts and adopts the abandoned reload");
+        .expect("sink restarts into a newly fenced generation");
+    let new_epoch = h
+        .await_epoch_past(old_epoch, Duration::from_secs(60))
+        .await
+        .expect("replacement sink opens a successor generation");
+    assert_eq!(new_epoch, old_epoch + 1);
+    h.refresh_epoch().await.unwrap();
 
+    // The epoch-1 loader deliberately retires as soon as it observes the bump. It therefore cannot
+    // publish an epoch-2 reload: `complete` is a loader-owned transition, while `export_complete`
+    // is the sink's durable hand-off boundary. Wait for that hand-off before starting the successor
+    // loader. Waiting for `complete` here would deadlock the test against the process it has not yet
+    // started.
     let recovery_deadline = tokio::time::Instant::now() + Duration::from_secs(240);
+    let mut last_observed = None;
     let successor_id = loop {
         let row: Option<(i64, String)> = sqlx::query_as(
-            "SELECT reload_id, status FROM walrus.table_reload \
-             WHERE epoch = $1 \
-               AND (source_request_id = $2 OR parent_request_id = $2) \
-             ORDER BY reload_id DESC LIMIT 1",
+            "SELECT tr.reload_id, tr.status \
+             FROM walrus.table_reload tr \
+             JOIN walrus.replication_state rs \
+               ON rs.epoch = tr.epoch \
+              AND rs.bootstrap_request_id = tr.parent_request_id \
+             WHERE tr.epoch = $1 \
+               AND tr.source_schema = 'public' \
+               AND tr.source_table = 'rl1' \
+               AND tr.request_scope = 'all_published' \
+             ORDER BY tr.reload_id DESC LIMIT 1",
         )
         .bind(h.epoch)
-        .bind(request_id)
         .fetch_optional(h.control_pool())
         .await
         .unwrap();
         if let Some((reload_id, status)) = row {
-            if reload_id != predecessor_id && status == "complete" {
+            last_observed = Some((reload_id, status.clone()));
+            if matches!(status.as_str(), "export_complete" | "complete") {
                 break reload_id;
             }
             assert!(
-                reload_id == predecessor_id || status != "failed",
-                "successor reload {reload_id} failed"
+                status != "failed",
+                "successor bootstrap reload {reload_id} failed"
             );
         }
         assert_one_slot_and_at_most_one_walsender(&h).await;
         assert!(
             tokio::time::Instant::now() < recovery_deadline,
-            "no successor reload completed after the process crash"
+            "successor-generation bootstrap export did not reach its durable loader hand-off \
+             after the process crash; last observed row: {last_observed:?}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     assert!(successor_id > predecessor_id);
-    let predecessor_status: String =
-        sqlx::query_scalar("SELECT status FROM walrus.table_reload WHERE reload_id = $1")
-            .bind(predecessor_id)
-            .fetch_one(h.control_pool())
-            .await
-            .unwrap();
-    assert_eq!(
-        predecessor_status, "failed",
-        "the lost-snapshot attempt must be made terminal"
-    );
-    let predecessor_files: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM walrus.file_manifest WHERE reload_id = $1")
-            .bind(predecessor_id)
-            .fetch_one(h.control_pool())
-            .await
-            .unwrap();
-    assert_eq!(
-        predecessor_files, 0,
-        "every durable object manifest from the lost snapshot must be purged"
-    );
     let successor_files: i64 =
         sqlx::query_scalar("SELECT chunk_no FROM walrus.table_reload WHERE reload_id = $1")
             .bind(successor_id)
             .fetch_one(h.control_pool())
             .await
             .unwrap();
-    assert!(
-        (401..=402).contains(&successor_files),
-        "20,001 rows at 50 rows/object must produce the 401-object minimum plus at most one extra worker tail (got {successor_files})"
-    );
+    let successor_ranges = completed_export_ranges(&h, successor_id).await;
+    assert_range_chunking(&successor_ranges, 50, 20_001, successor_files);
     assert_one_slot_and_at_most_one_walsender(&h).await;
 
+    // The old loader is fenced out by the epoch bump. Reap that expected exit, then start its
+    // replacement after the full successor snapshot is durable. Readiness proves that replacement
+    // published every frozen bootstrap reload, including this one.
+    h.await_loader_exited(Duration::from_secs(60))
+        .await
+        .expect("epoch-1 loader exits after observing the successor");
+    // This fixture deliberately produces 400 tiny reload objects. A healthy CI loader consumes
+    // them in several bounded claim cycles, so give this scale-only reconciliation more time than
+    // the harness's ordinary 90-second startup contract.
+    h.restart_loader_with_deadline(Duration::from_secs(300))
+        .await
+        .expect("loader rebuilds under the successor generation");
+    let successor_status: String =
+        sqlx::query_scalar("SELECT status FROM walrus.table_reload WHERE reload_id = $1")
+            .bind(successor_id)
+            .fetch_one(h.control_pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        successor_status, "complete",
+        "successor loader readiness requires the rl1 bootstrap publication to complete"
+    );
+
+    // Cross a post-snapshot WAL watermark before comparing.
+    let before = h.source_wal_lsn().await.unwrap();
+    h.source_exec("UPDATE public.rl1 SET status = 'after-restart' WHERE id = 20001")
+        .await
+        .unwrap();
+    h.await_transformed_past("rl1", before, Duration::from_secs(240))
+        .await
+        .expect("successor generation converges after the process crash");
     h.stop_loader().await.unwrap();
     h.assert_mirror_equals_source("rl1").await.unwrap();
 }
@@ -497,4 +541,78 @@ async fn assert_one_slot_and_at_most_one_walsender(h: &Harness) {
         walsenders <= 1,
         "reload recovery opened {walsenders} walsenders"
     );
+}
+
+async fn completed_export_ranges(h: &Harness, reload_id: i64) -> Vec<(i64, i64, i64)> {
+    let ranges: Vec<(i64, String, Option<i64>, Option<i64>)> = sqlx::query_as(
+        "SELECT range_no, status, file_count, row_count \
+         FROM walrus.table_reload_export_range \
+         WHERE reload_id = $1 ORDER BY range_no",
+    )
+    .bind(reload_id)
+    .fetch_all(h.control_pool())
+    .await
+    .unwrap();
+    assert!(!ranges.is_empty(), "reload {reload_id} has no range plan");
+    ranges
+        .into_iter()
+        .enumerate()
+        .map(
+            |(expected_range_no, (range_no, status, file_count, row_count))| {
+                assert_eq!(
+                    range_no,
+                    i64::try_from(expected_range_no).unwrap(),
+                    "reload {reload_id} range plan is not contiguous"
+                );
+                assert_eq!(
+                    status, "complete",
+                    "reload {reload_id} range {range_no} is not complete"
+                );
+                (
+                    range_no,
+                    file_count.expect("complete range has a file count"),
+                    row_count.expect("complete range has a row count"),
+                )
+            },
+        )
+        .collect()
+}
+
+/// A reload object never crosses a physical range boundary: sealing the range's final object before
+/// recording its durable receipt is what makes the range plan auditable after a crash. Consequently,
+/// the configured row count is a strict object maximum and each non-divisible range has its own
+/// partial tail; it is not a global or per-worker chunking promise.
+fn assert_range_chunking(
+    ranges: &[(i64, i64, i64)],
+    chunk_rows: i64,
+    expected_rows: i64,
+    expected_files: i64,
+) -> Vec<i64> {
+    assert!(chunk_rows > 0);
+    let mut total_files = 0_i64;
+    let mut total_rows = 0_i64;
+    let mut tail_rows = Vec::new();
+    for &(range_no, file_count, row_count) in ranges {
+        assert!(row_count >= 0, "range {range_no} has a negative row count");
+        let remainder = row_count % chunk_rows;
+        let range_files = row_count / chunk_rows + i64::from(remainder != 0);
+        assert_eq!(
+            file_count, range_files,
+            "range {range_no} did not use the configured {chunk_rows}-row object maximum"
+        );
+        if remainder != 0 {
+            tail_rows.push(remainder);
+        }
+        total_files += file_count;
+        total_rows += row_count;
+    }
+    assert_eq!(
+        total_rows, expected_rows,
+        "range receipts lost or added rows"
+    );
+    assert_eq!(
+        total_files, expected_files,
+        "range receipts disagree with the reload's durable file count"
+    );
+    tail_rows
 }

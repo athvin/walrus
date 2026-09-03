@@ -11,8 +11,8 @@
 
 use common::{EpochNo, FailureClass, Lsn};
 use control::{
-    ControlError, ReplicationState, ReplicationStatus, advance_raw_appended, advance_transformed,
-    connect, ensure_checkpoint, insert_epoch, read_checkpoint, read_current_epoch, run_migrations,
+    ControlError, ReplicationStatus, advance_raw_appended, advance_transformed, connect,
+    ensure_checkpoint, insert_epoch, read_checkpoint, read_current_epoch, run_migrations,
 };
 use sqlx::postgres::PgPool;
 
@@ -130,23 +130,19 @@ async fn read_current_epoch_returns_highest_generation() {
     // read within the (rolled-back) txn sees only these two inserts.
     insert_epoch(
         &mut *tx,
-        &ReplicationState {
-            epoch: EpochNo(700_010),
-            slot_name: "walrus_slot".to_string(),
-            created_lsn: lsn("0/10"),
-            status: ReplicationStatus::Bootstrapping,
-        },
+        EpochNo(700_010),
+        "walrus_slot",
+        lsn("0/10"),
+        ReplicationStatus::Bootstrapping,
     )
     .await
     .unwrap();
     insert_epoch(
         &mut *tx,
-        &ReplicationState {
-            epoch: EpochNo(700_011),
-            slot_name: "walrus_slot".to_string(),
-            created_lsn: lsn("0/20"),
-            status: ReplicationStatus::Streaming,
-        },
+        EpochNo(700_011),
+        "walrus_slot",
+        lsn("0/20"),
+        ReplicationStatus::Streaming,
     )
     .await
     .unwrap();
@@ -159,6 +155,10 @@ async fn read_current_epoch_returns_highest_generation() {
     );
     assert_eq!(current.status, ReplicationStatus::Streaming);
     assert_eq!(current.created_lsn, lsn("0/20"));
+    assert_eq!(
+        current.catalog_fence_version, 0,
+        "the generic insertion helper cannot manufacture resumable catalog provenance"
+    );
 
     tx.rollback().await.unwrap();
 }

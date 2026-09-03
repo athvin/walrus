@@ -61,11 +61,17 @@ async fn pool_for(epoch: EpochNo) -> sqlx::PgPool {
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     // Leftover non-terminal rows from a crashed prior run would trip the one_live index.
-    sqlx::query("DELETE FROM walrus.table_reload WHERE epoch = $1")
-        .bind(epoch)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "WITH authorized AS MATERIALIZED (
+           SELECT set_config('walrus.manifest_fence_maintenance','2-delete',true) AS protocol
+         )
+         DELETE FROM walrus.table_reload
+         WHERE epoch = $1 AND (SELECT protocol = '2-delete' FROM authorized)",
+    )
+    .bind(epoch)
+    .execute(&pool)
+    .await
+    .unwrap();
     pool
 }
 
@@ -289,11 +295,17 @@ async fn pickup_flips_to_exporting_with_a_live_advancing_lease() {
 
     token.cancel();
     handle.await.unwrap();
-    sqlx::query("DELETE FROM walrus.table_reload WHERE epoch = $1")
-        .bind(epoch)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "WITH authorized AS MATERIALIZED (
+           SELECT set_config('walrus.manifest_fence_maintenance','2-delete',true) AS protocol
+         )
+         DELETE FROM walrus.table_reload
+         WHERE epoch = $1 AND (SELECT protocol = '2-delete' FROM authorized)",
+    )
+    .bind(epoch)
+    .execute(&pool)
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -370,11 +382,17 @@ async fn preflight_failures_land_in_failed_with_reasons() {
         .batch_execute("DROP TABLE IF EXISTS public._walrus_rl_keyless")
         .await
         .unwrap();
-    sqlx::query("DELETE FROM walrus.table_reload WHERE epoch = $1")
-        .bind(epoch)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "WITH authorized AS MATERIALIZED (
+           SELECT set_config('walrus.manifest_fence_maintenance','2-delete',true) AS protocol
+         )
+         DELETE FROM walrus.table_reload
+         WHERE epoch = $1 AND (SELECT protocol = '2-delete' FROM authorized)",
+    )
+    .bind(epoch)
+    .execute(&pool)
+    .await
+    .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -438,10 +456,15 @@ async fn cap_of_two_holds_and_the_stream_keeps_flowing() {
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
     if status_of(&pool, c).await.0 == ReloadStatus::Requested {
-        // Free a permit through the shipped lost-lease path. If an earlier exporter already
-        // released a permit naturally, `c` is exporting and this branch is unnecessary.
+        // Free a permit through the shipped lost-lease path. Model a legitimate successor claim:
+        // changing the holder must also advance the fencing generation, exactly as adoption does.
+        // If an earlier exporter already released a permit naturally, `c` is exporting and this
+        // branch is unnecessary.
         sqlx::query(
-            "UPDATE walrus.table_reload SET lease_holder = 'lease-thief' WHERE reload_id = $1",
+            "UPDATE walrus.table_reload
+             SET lease_holder = 'lease-thief',
+                 exporter_generation = exporter_generation + 1
+             WHERE reload_id = $1",
         )
         .bind(a.0)
         .execute(&pool)
@@ -527,9 +550,15 @@ async fn cap_of_two_holds_and_the_stream_keeps_flowing() {
         )
         .await
         .unwrap();
-    sqlx::query("DELETE FROM walrus.table_reload WHERE epoch = $1")
-        .bind(epoch)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "WITH authorized AS MATERIALIZED (
+           SELECT set_config('walrus.manifest_fence_maintenance','2-delete',true) AS protocol
+         )
+         DELETE FROM walrus.table_reload
+         WHERE epoch = $1 AND (SELECT protocol = '2-delete' FROM authorized)",
+    )
+    .bind(epoch)
+    .execute(&pool)
+    .await
+    .unwrap();
 }

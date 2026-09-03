@@ -1,10 +1,10 @@
 SELECT reload_id, epoch, source_schema, source_table,
-       flavor AS "flavor: ReloadFlavor", status AS "status: ReloadStatus",
+       flavor, status,
        source_request_id, parent_request_id,
-       request_scope AS "request_scope: ReloadScope",
+       request_scope,
        chunk_no, cursor_pk,
-       start_lsn AS "start_lsn: Lsn",
-       first_lsn AS "first_lsn: Lsn", final_lsn AS "final_lsn: Lsn",
-       schema_version, restart_count, lease_holder, error
+       start_lsn, first_lsn, final_lsn,
+       schema_version, restart_count, lease_holder, exporter_generation,
+       export_snapshot IS NOT NULL AS has_export_plan, error
 FROM walrus.table_reload
 WHERE reload_id = $1

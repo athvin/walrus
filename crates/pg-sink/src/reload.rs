@@ -73,7 +73,7 @@ impl SnapshotOwnership {
 }
 
 const fn adopted_snapshot_ownership(req: &control::ReloadRow) -> SnapshotOwnership {
-    if req.chunk_no > 0 || req.cursor_pk.is_some() {
+    if req.has_export_plan || req.chunk_no > 0 || req.cursor_pk.is_some() {
         SnapshotOwnership::AdoptedWithProgress
     } else {
         SnapshotOwnership::AdoptedPristine
@@ -467,7 +467,10 @@ async fn export_with_restarts(
             RunOutcome::Drained { final_lsn } => {
                 // The sink's last act (H10): flip export_complete carrying H. The LOADER
                 // then flips `complete` once transformed_lsn >= H — the sink never writes `complete`.
-                control::reload::complete_export(&pool, req.reload_id, final_lsn)
+                let lease = req
+                    .exporter_lease(&deps.export_cfg.instance)
+                    .context("resolve exporter generation for export completion")?;
+                control::reload::complete_export(&pool, &lease, final_lsn)
                     .await
                     .with_context(|| format!("mark reload {} export complete", req.reload_id))?;
                 tracing::info!(
@@ -820,7 +823,7 @@ impl ReloadController {
                         "{}.{}",
                         req.source_schema, req.source_table
                     ));
-                    if let Err(e) = self.fail_row(req.reload_id, &rejection.to_string()).await {
+                    if let Err(e) = self.fail_row(&req, &rejection.to_string()).await {
                         tracing::error!(
                             reload_id = %req.reload_id,
                             error = %format_args!("{e:#}"),
@@ -906,6 +909,7 @@ impl ReloadController {
             // The lease-renewal target: the export loop repoints this on every DDL-restart, so
             // renewal follows the lease onto each successor row.
             let current_reload_id = Arc::new(AtomicI64::new(req.reload_id.0));
+            let exporter_generation = req.exporter_generation;
             let renew_pool = pool.clone();
             let renew_id = Arc::clone(&current_reload_id);
             // The chunk engine under bounded restart: dial the side connection and export one
@@ -935,7 +939,12 @@ impl ReloadController {
                 async move || {
                     // Acquire pairs with the DDL-restart Release that repoints lease renewal.
                     let reload_id = common::ReloadId(renew_id.load(Ordering::Acquire));
-                    control::reload::renew_lease(&renew_pool, reload_id, &holder, ttl_secs(ttl))
+                    let lease = control::ExporterLease {
+                        reload_id,
+                        holder: holder.clone(),
+                        generation: exporter_generation,
+                    };
+                    control::reload::renew_lease(&renew_pool, &lease, ttl_secs(ttl))
                         .await
                         .with_context(|| format!("renew lease for reload {reload_id}"))
                 },
@@ -1084,11 +1093,15 @@ impl ReloadController {
     }
 
     /// Record a typed rejection on the row (its reason IS the operator UX).
-    async fn fail_row(&self, reload_id: common::ReloadId, reason: &str) -> anyhow::Result<()> {
+    async fn fail_row(&self, req: &control::ReloadRow, reason: &str) -> anyhow::Result<()> {
+        let reload_id = req.reload_id;
+        let lease = req
+            .exporter_lease(&self.cfg.instance)
+            .context("resolve exporter generation for rejected reload")?;
         let mut conn = self.pool.acquire().await.with_context(|| {
             format!("acquire a control-pg connection to fail reload {reload_id}")
         })?;
-        control::reload::fail(&mut conn, reload_id, reason)
+        control::reload::fail_owned(&mut conn, &lease, reason)
             .await
             .with_context(|| format!("mark reload {reload_id} failed"))?;
         Ok(())
@@ -1098,7 +1111,14 @@ impl ReloadController {
     /// release fails, the row stays `exporting` with a dying lease — lease expiration plus startup adoption
     /// is the recovery net, and the error log is the operator breadcrumb.
     async fn release_row(&self, req: &control::ReloadRow) {
-        match control::reload::release_claim(&self.pool, req.reload_id, &self.cfg.instance).await {
+        let lease = match req.exporter_lease(&self.cfg.instance) {
+            Ok(lease) => lease,
+            Err(error) => {
+                tracing::warn!(reload_id = %req.reload_id, %error, "claim row has no valid exporter generation; leaving it for adoption");
+                return;
+            }
+        };
+        match control::reload::release_claim(&self.pool, &lease).await {
             Ok(true) => tracing::info!(
                 reload_id = %req.reload_id,
                 "claim released → requested (retried next tick)"

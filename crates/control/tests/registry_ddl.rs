@@ -11,10 +11,11 @@
 
 use common::{DdlId, EpochNo, Lsn, SchemaVersionNo, Tier, TypeDescriptor, TypeMeta};
 use control::{
-    DdlRow, RegistryRow, connect, insert_ddl, read_all_ddl, read_latest_ddl_version_through,
-    read_latest_version, read_pending_ddl, read_registry, run_migrations, upsert_registry,
+    DdlRow, RegistryRow, connect, insert_ddl, read_all_ddl, read_all_registry,
+    read_latest_ddl_version_through, read_latest_version, read_pending_ddl, read_registry,
+    run_migrations, upsert_registry,
 };
-use sqlx::postgres::PgPool;
+use sqlx::{Connection, postgres::PgPool};
 
 fn control_dsn() -> String {
     std::env::var("WALRUS_CONTROL_DB_URL").unwrap_or_else(|_| {
@@ -149,6 +150,16 @@ async fn upsert_registry_is_idempotent_per_version() {
     upsert_registry(&mut *tx, &registry_row(epoch, SchemaVersionNo(5)))
         .await
         .unwrap();
+    assert_eq!(
+        read_all_registry(&mut *tx, epoch)
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.schema_version)
+            .collect::<Vec<_>>(),
+        vec![SchemaVersionNo(1), SchemaVersionNo(5)],
+        "restart hydration retains every historical relation shape"
+    );
     let latest = read_latest_version(&mut *tx, epoch, "public", "orders")
         .await
         .unwrap();
@@ -209,6 +220,16 @@ async fn source_audit_identity_makes_ddl_replay_idempotent() {
     let second_id = insert_ddl(&mut *tx, &original).await.unwrap();
     assert_eq!(second_id, first_id, "WAL replay must reuse the history row");
 
+    let mut changed = original.clone();
+    changed.c_tag = "CREATE TABLE".into();
+    assert!(matches!(
+        insert_ddl(&mut *tx, &changed).await,
+        Err(control::ControlError::ImmutableHistoryConflict {
+            entity: "ddl_manifest",
+            ..
+        })
+    ));
+
     let history = read_all_ddl(&mut *tx, epoch).await.unwrap();
     assert_eq!(
         history,
@@ -227,6 +248,130 @@ async fn source_audit_identity_makes_ddl_replay_idempotent() {
     .await
     .unwrap();
     assert_eq!(count, 1);
+
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn ddl_history_is_immutable_and_removal_requires_explicit_maintenance() {
+    let pool = pool().await;
+    let mut tx = pool.begin().await.unwrap();
+    let epoch = EpochNo(800_007);
+    let original = ddl(epoch, "0/700", SchemaVersionNo(7));
+    let id = insert_ddl(&mut *tx, &original).await.unwrap();
+
+    let exact_no_op = sqlx::query(
+        "UPDATE walrus.ddl_manifest
+         SET source_audit_id = source_audit_id
+         WHERE id = $1",
+    )
+    .bind(id.0)
+    .execute(&mut *tx)
+    .await
+    .expect("the replay upsert's exact no-op UPDATE shape must remain valid");
+    assert_eq!(exact_no_op.rows_affected(), 1);
+
+    for (case_name, mutation, expected_constraint) in [
+        (
+            "semantic-update",
+            "UPDATE walrus.ddl_manifest SET c_tag = 'CREATE TABLE' WHERE id = $1",
+            "ddl_manifest_semantics_immutable",
+        ),
+        (
+            "creation-timestamp-update",
+            "UPDATE walrus.ddl_manifest SET created_at = created_at + interval '1 second' WHERE id = $1",
+            "ddl_manifest_semantics_immutable",
+        ),
+        (
+            "delete",
+            "DELETE FROM walrus.ddl_manifest WHERE id = $1",
+            "ddl_manifest_removal_guard",
+        ),
+    ] {
+        let mut savepoint = Connection::begin(&mut *tx).await.unwrap();
+        let error = sqlx::query(mutation)
+            .bind(id.0)
+            .execute(&mut *savepoint)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::constraint),
+            Some(expected_constraint),
+            "DDL history mutation case {case_name} must be rejected"
+        );
+        savepoint.rollback().await.unwrap();
+    }
+
+    let mut savepoint = Connection::begin(&mut *tx).await.unwrap();
+    let truncate = sqlx::query("TRUNCATE TABLE walrus.ddl_manifest")
+        .execute(&mut *savepoint)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        truncate
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::constraint),
+        Some("ddl_manifest_removal_guard")
+    );
+    savepoint.rollback().await.unwrap();
+
+    sqlx::query("SELECT set_config('walrus.manifest_fence_maintenance', '2-delete', true)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query("DELETE FROM walrus.ddl_manifest WHERE id = $1")
+            .bind(id.0)
+            .execute(&mut *tx)
+            .await
+            .unwrap()
+            .rows_affected(),
+        1,
+        "explicit maintenance may remove a selected DDL history row"
+    );
+
+    insert_ddl(&mut *tx, &ddl(epoch, "0/710", SchemaVersionNo(8)))
+        .await
+        .unwrap();
+    sqlx::query("TRUNCATE TABLE walrus.ddl_manifest")
+        .execute(&mut *tx)
+        .await
+        .expect("explicit maintenance may truncate DDL history");
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM walrus.ddl_manifest")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0);
+
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn registry_replay_cannot_rewrite_an_existing_version() {
+    let pool = pool().await;
+    let mut tx = pool.begin().await.unwrap();
+    let epoch = EpochNo(800_006);
+    let original = registry_row(epoch, SchemaVersionNo(2));
+    upsert_registry(&mut *tx, &original).await.unwrap();
+
+    let mut changed = original.clone();
+    changed.columns = serde_json::json!([{"name": "different"}]);
+    assert!(matches!(
+        upsert_registry(&mut *tx, &changed).await,
+        Err(control::ControlError::ImmutableHistoryConflict {
+            entity: "schema_registry",
+            ..
+        })
+    ));
+    assert_eq!(
+        read_registry(&mut *tx, epoch, "public", "orders", SchemaVersionNo(2))
+            .await
+            .unwrap(),
+        Some(original),
+        "the conflicting replay must leave durable history unchanged"
+    );
 
     tx.rollback().await.unwrap();
 }

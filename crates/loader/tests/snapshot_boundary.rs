@@ -4,6 +4,7 @@
     clippy::let_underscore_must_use,
     reason = "integration test — unwrap/expect fine in setup + helpers"
 )]
+
 //! Snapshot/stream boundary through the transform (loader §7, architecture §1.7) — compose (`#[ignore]`).
 //! The loader has **no special snapshot mode**: `kind='snapshot'` files append into `<table>_raw` like
 //! any `ready` file, and the transform collapses the overlap by `(commit_lsn, lsn)`. Two edges proven
@@ -15,7 +16,9 @@
 //!
 //!   cargo test -p loader --test snapshot_boundary -- --ignored
 
-use common::{EpochNo, PgColumn, PgRelation, ReplicaIdentity};
+mod support;
+
+use common::{EpochNo, Kind, PgColumn, PgRelation, ReplicaIdentity, SchemaVersionNo};
 use loader::duck::{S3Access, TableDb};
 use loader::health::LoaderState;
 use loader::phase_a::{TableCtx, run_phase_a};
@@ -63,23 +66,15 @@ fn tmpdir(name: &str) -> tempfile::TempDir {
     tempfile::Builder::new().prefix(&prefix).tempdir().unwrap()
 }
 
-fn meta(op: &str, commit_hex: &str, l: u64) -> String {
-    format!(
-        "{{\"op\":\"{op}\",\"commit_lsn\":\"{commit_hex}\",\"lsn\":\"{:016X}\",\"sink_processed_at\":\"2026-07-07T12:00:{:02}Z\"}}",
-        l,
-        l % 60
-    )
-}
-
 /// Write a single-row (id, status, walrus_pg_sink_meta) Parquet fixture to S3.
 fn write_row(
     epoch: EpochNo,
     tag: &str,
     id: i64,
     status: &str,
+    kind: Kind,
     op: &str,
-    commit_hex: &str,
-    l: u64,
+    lsn: &str,
 ) -> String {
     let w = duckdb::Connection::open_in_memory().unwrap();
     let a = s3();
@@ -97,9 +92,22 @@ fn write_row(
         "CREATE TABLE fixture (id INTEGER, status VARCHAR, walrus_pg_sink_meta VARCHAR);",
     )
     .unwrap();
+    let batch_id = format!("snapshot-boundary-{tag}-{epoch}");
+    let meta = serde_json::to_string(&support::sink_meta(
+        epoch,
+        &batch_id,
+        SchemaVersionNo(1),
+        "public",
+        "orders",
+        kind,
+        op,
+        lsn,
+        lsn,
+    ))
+    .unwrap();
     w.execute(
         "INSERT INTO fixture VALUES (?, ?, ?)",
-        duckdb::params![id, status, meta(op, commit_hex, l)],
+        duckdb::params![id, status, meta],
     )
     .unwrap();
     let uri = format!("s3://walrus/{epoch}/public/orders/{tag}-{epoch}.parquet");
@@ -109,6 +117,7 @@ fn write_row(
 }
 
 async fn insert_file(pool: &sqlx::PgPool, epoch: EpochNo, uri: String, kind: &str, lsn_end: &str) {
+    let (object_size, sha256) = support::fingerprint(&uri).await;
     control::insert_ready(
         pool,
         &control::NewManifestFile {
@@ -118,6 +127,8 @@ async fn insert_file(pool: &sqlx::PgPool, epoch: EpochNo, uri: String, kind: &st
             s3_uri: uri,
             kind: kind.parse::<control::ManifestKind>().unwrap(),
             row_count: 1,
+            object_size,
+            sha256,
             lsn_start: lsn_end.parse().unwrap(),
             lsn_end: lsn_end.parse().unwrap(),
             schema_version: common::SchemaVersionNo(1),
@@ -131,20 +142,13 @@ async fn insert_file(pool: &sqlx::PgPool, epoch: EpochNo, uri: String, kind: &st
 async fn setup(epoch: EpochNo, max_files: i64) -> (TableCtx, tempfile::TempDir) {
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
-    for tbl in ["file_manifest", "loader_checkpoint", "replication_state"] {
-        let _ = sqlx::query(&format!("DELETE FROM walrus.{tbl} WHERE epoch = $1"))
-            .bind(epoch)
-            .execute(&pool)
-            .await;
-    }
+    support::cleanup_epoch(&pool, epoch).await;
     control::insert_epoch(
         &pool,
-        &control::ReplicationState {
-            epoch,
-            slot_name: "walrus_slot".into(),
-            created_lsn: "0/64".parse().unwrap(), // consistent_point
-            status: control::ReplicationStatus::Streaming,
-        },
+        epoch,
+        "walrus_slot",
+        "0/64".parse().unwrap(), // consistent_point
+        control::ReplicationStatus::Streaming,
     )
     .await
     .unwrap();
@@ -157,10 +161,15 @@ async fn setup(epoch: EpochNo, max_files: i64) -> (TableCtx, tempfile::TempDir) 
     db.ensure_tables(&orders(), common::SchemaVersionNo(1))
         .unwrap();
     db.configure_s3(&s3()).unwrap();
+    let (owner_pod, fencing_token) = support::acquire_table(&pool, epoch, "public", "orders").await;
     let ctx = TableCtx {
         pool,
         epoch,
         epoch_rx: loader::epoch::fixed_epoch_watch(epoch),
+        owner_pod,
+        fencing_token,
+        store: support::store(),
+        staging_bucket: "walrus".into(),
         schema: "public".into(),
         table: "orders".into(),
         series: "public.orders".into(),
@@ -168,6 +177,7 @@ async fn setup(epoch: EpochNo, max_files: i64) -> (TableCtx, tempfile::TempDir) 
         db,
         state: LoaderState::new(),
         max_files: std::num::NonZeroI64::new(max_files).unwrap(),
+        max_integrity_resnapshots: 1,
         poll_interval: Duration::from_secs(5),
         compaction_interval: Duration::from_secs(3600),
         retention_lsn_lag: 16 << 20,
@@ -195,9 +205,9 @@ async fn snapshot_then_overlapping_stream_yields_stream_value() {
     let (ctx, _dir) = setup(epoch, 100).await;
 
     // Snapshot file (commit_lsn = consistent_point 0x64) then an overlapping stream update (0xC8).
-    let snap = write_row(epoch, "snap", 1, "snap", "i", "0000000000000064", 1);
+    let snap = write_row(epoch, "snap", 1, "snap", Kind::Snapshot, "i", "0/64");
     insert_file(&ctx.pool, epoch, snap, "snapshot", "0/64").await;
-    let stream = write_row(epoch, "stream", 1, "streamed", "u", "00000000000000C8", 5);
+    let stream = write_row(epoch, "stream", 1, "streamed", Kind::Stream, "u", "0/C8");
     insert_file(&ctx.pool, epoch, stream, "stream", "0/C8").await;
 
     run_phase_a(&ctx).await.unwrap();
@@ -221,9 +231,9 @@ async fn equal_lsn_end_snapshot_files_split_across_batches_all_applied() {
     let (ctx, _dir) = setup(epoch, 1).await; // max_files=1 forces the split across batches
 
     // Two snapshot files at the SAME lsn_end (= consistent_point 0/64), distinct keys.
-    let f1 = write_row(epoch, "snapA", 1, "A", "i", "0000000000000064", 1);
+    let f1 = write_row(epoch, "snapA", 1, "A", Kind::Snapshot, "i", "0/64");
     insert_file(&ctx.pool, epoch, f1, "snapshot", "0/64").await;
-    let f2 = write_row(epoch, "snapB", 2, "B", "i", "0000000000000064", 2);
+    let f2 = write_row(epoch, "snapB", 2, "B", Kind::Snapshot, "i", "0/64");
     insert_file(&ctx.pool, epoch, f2, "snapshot", "0/64").await;
 
     // Cycle 1: claims + applies file 1 (key A), transformed_lsn reaches the consistent_point.

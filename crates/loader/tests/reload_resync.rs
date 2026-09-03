@@ -4,6 +4,7 @@
     clippy::let_underscore_must_use,
     reason = "integration test — unwrap/expect fine in setup + helpers"
 )]
+
 //! Compatibility coverage for the persisted `resync` flavor against compose (`#[ignore]` — needs
 //! control PG + MinIO). `resync` now aliases `reload`: it pauses claims, builds a hidden full-table
 //! generation, removes phantoms, publishes at H, and then resumes post-H WAL. The enum/database
@@ -11,7 +12,9 @@
 //!
 //!   cargo test -p loader --test reload_resync -- --ignored --test-threads=1
 
-use common::{EpochNo, Lsn, PgColumn, PgRelation, ReplicaIdentity};
+mod support;
+
+use common::{EpochNo, Kind, Lsn, PgColumn, PgRelation, ReplicaIdentity, SchemaVersionNo};
 use control::reload::{self, ReloadFenceIdentity, ReloadFlavor};
 use loader::duck::{S3Access, TableDb};
 use loader::health::LoaderState;
@@ -60,7 +63,12 @@ fn tmpdir(name: &str) -> tempfile::TempDir {
     tempfile::Builder::new().prefix(&prefix).tempdir().unwrap()
 }
 
-fn write_rows(epoch: EpochNo, name: &str, rows: &[(i32, &str, &str, &str, &str)]) -> String {
+fn write_rows(
+    epoch: EpochNo,
+    name: &str,
+    kind: Kind,
+    rows: &[(i32, &str, &str, &str, &str)],
+) -> String {
     let w = duckdb::Connection::open_in_memory().unwrap();
     let a = s3();
     w.execute_batch(&format!(
@@ -74,12 +82,24 @@ fn write_rows(epoch: EpochNo, name: &str, rows: &[(i32, &str, &str, &str, &str)]
         a.secret_access_key.expose()
     ))
     .unwrap();
+    let batch_id = format!("reload-resync-{name}-{epoch}");
     for (id, status, op, commit, lsn) in rows {
-        w.execute_batch(&format!(
-            "INSERT INTO fixture VALUES ({id}, '{status}', \
-             '{{\"op\":\"{op}\",\"commit_lsn\":\"{commit}\",\"lsn\":\"{lsn}\",\
-               \"sink_processed_at\":\"2026-07-15T12:00:00.{lsn}Z\"}}');"
+        let meta = serde_json::to_string(&support::sink_meta(
+            epoch,
+            &batch_id,
+            SchemaVersionNo(1),
+            "public",
+            "orders",
+            kind,
+            op,
+            commit,
+            lsn,
         ))
+        .unwrap();
+        w.execute(
+            "INSERT INTO fixture VALUES (?, ?, ?)",
+            duckdb::params![id, status, meta],
+        )
         .unwrap();
     }
     let uri = format!("s3://walrus/{epoch}/public/orders/{name}.parquet");
@@ -96,6 +116,8 @@ async fn seed_file(
     lsn_end: &str,
     reload_id: Option<common::ReloadId>,
 ) -> i64 {
+    let (object_size, sha256) = support::fingerprint(uri).await;
+    let row_count = support::parquet_row_count(uri);
     control::insert_ready(
         pool,
         &control::NewManifestFile {
@@ -104,7 +126,9 @@ async fn seed_file(
             source_table: "orders".into(),
             s3_uri: uri.into(),
             kind: kind.parse::<control::ManifestKind>().unwrap(),
-            row_count: 1,
+            row_count,
+            object_size,
+            sha256,
             lsn_start: lsn_end.parse().unwrap(),
             lsn_end: lsn_end.parse().unwrap(),
             schema_version: common::SchemaVersionNo(1),
@@ -119,25 +143,13 @@ async fn seed_file(
 async fn setup(epoch: EpochNo) -> (TableCtx, tempfile::TempDir) {
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
-    for tbl in [
-        "file_manifest",
-        "loader_checkpoint",
-        "replication_state",
-        "table_reload",
-    ] {
-        let _ = sqlx::query(&format!("DELETE FROM walrus.{tbl} WHERE epoch = $1"))
-            .bind(epoch)
-            .execute(&pool)
-            .await;
-    }
+    support::cleanup_epoch(&pool, epoch).await;
     control::insert_epoch(
         &pool,
-        &control::ReplicationState {
-            epoch,
-            slot_name: "walrus_slot".into(),
-            created_lsn: "0/0".parse().unwrap(),
-            status: control::ReplicationStatus::Streaming,
-        },
+        epoch,
+        "walrus_slot",
+        "0/0".parse().unwrap(),
+        control::ReplicationStatus::Streaming,
     )
     .await
     .unwrap();
@@ -149,10 +161,15 @@ async fn setup(epoch: EpochNo) -> (TableCtx, tempfile::TempDir) {
     db.ensure_tables(&orders(), common::SchemaVersionNo(1))
         .unwrap();
     db.configure_s3(&s3()).unwrap();
+    let (owner_pod, fencing_token) = support::acquire_table(&pool, epoch, "public", "orders").await;
     let ctx = TableCtx {
         pool,
         epoch,
         epoch_rx: loader::epoch::fixed_epoch_watch(epoch),
+        owner_pod,
+        fencing_token,
+        store: support::store(),
+        staging_bucket: "walrus".into(),
         schema: "public".into(),
         table: "orders".into(),
         series: "public.orders".into(),
@@ -160,6 +177,7 @@ async fn setup(epoch: EpochNo) -> (TableCtx, tempfile::TempDir) {
         db,
         state: LoaderState::new(),
         max_files: std::num::NonZeroI64::new(100).unwrap(),
+        max_integrity_resnapshots: 1,
         poll_interval: Duration::from_secs(5),
         compaction_interval: Duration::from_secs(3600),
         retention_lsn_lag: 16 << 20,
@@ -168,13 +186,16 @@ async fn setup(epoch: EpochNo) -> (TableCtx, tempfile::TempDir) {
     (ctx, dir)
 }
 
-/// Walk a `resync`-spelled rebuild through the real transitions to `export_complete`.
-async fn drained_resync(
-    pool: &sqlx::PgPool,
-    epoch: EpochNo,
-    l1: &str,
-    h: &str,
-) -> common::ReloadId {
+#[derive(Debug)]
+struct PlannedResync {
+    reload_id: common::ReloadId,
+    lease: control::ExporterLease,
+    request_id: uuid::Uuid,
+    start_lsn: Lsn,
+    final_lsn: Lsn,
+}
+
+async fn planned_resync(pool: &sqlx::PgPool, epoch: EpochNo, l1: &str, h: &str) -> PlannedResync {
     let id = reload::request(pool, epoch, "public", "orders", ReloadFlavor::Resync)
         .await
         .unwrap();
@@ -198,21 +219,80 @@ async fn drained_resync(
     reload::record_start_fence(pool, id, start_lsn, fence)
         .await
         .unwrap();
-    reload::advance_cursor(
-        pool,
-        id,
-        1,
-        &serde_json::json!(["999"]),
+    let row = reload::get(pool, id).await.unwrap().unwrap();
+    let lease = row.exporter_lease("sink-t").unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    reload::begin_export_plan(
+        &mut conn,
+        &lease,
         start_lsn,
+        common::SchemaVersionNo(1),
+        control::ExportSnapshot {
+            identity: &format!("{}:{}:", id.0, id.0 + 1),
+            xmin: id.0,
+            xmax: id.0 + 1,
+        },
+        &[control::ExportRangePlan {
+            range_no: 0,
+            full_scan: true,
+            start_block: None,
+            end_block: None,
+        }],
+    )
+    .await
+    .unwrap();
+    PlannedResync {
+        reload_id: id,
+        lease,
+        request_id,
+        start_lsn,
+        final_lsn,
+    }
+}
+
+async fn finish_resync(pool: &sqlx::PgPool, export: &PlannedResync) {
+    let (file_count, row_count): (i64, i64) = sqlx::query_as(
+        "SELECT count(*)::bigint, COALESCE(sum(row_count), 0)::bigint
+         FROM walrus.file_manifest WHERE reload_id = $1",
+    )
+    .bind(export.reload_id.0)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    for _ in 0..file_count {
+        reload::record_exported_file(
+            pool,
+            &export.lease,
+            export.start_lsn,
+            common::SchemaVersionNo(1),
+        )
+        .await
+        .unwrap();
+    }
+    reload::record_export_range(pool, &export.lease, 0, file_count, row_count)
+        .await
+        .unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    reload::seal_export(
+        &mut conn,
+        &export.lease,
+        export.start_lsn,
         common::SchemaVersionNo(1),
     )
     .await
     .unwrap();
-    reload::record_end_marker(pool, id, final_lsn, fence)
+    let fence = ReloadFenceIdentity {
+        request_id: Some(export.request_id),
+        source_schema: "public",
+        source_table: "orders",
+        schema_version: common::SchemaVersionNo(1),
+    };
+    reload::record_end_marker(pool, export.reload_id, export.final_lsn, fence)
         .await
         .unwrap();
-    reload::complete_export(pool, id, final_lsn).await.unwrap();
-    id
+    reload::complete_export(pool, &export.lease, export.final_lsn)
+        .await
+        .unwrap();
 }
 
 fn mirror_status(ctx: &TableCtx, id: i32) -> Option<String> {
@@ -249,10 +329,11 @@ async fn seed_live_mirror(ctx: &TableCtx, epoch: EpochNo) {
     let live = write_rows(
         epoch,
         "live",
+        Kind::Stream,
         &[
             (1, "v1", "i", "0000000000000050", "0000000000000050"),
-            (2, "v2", "i", "0000000000000050", "0000000000000051"),
-            (3, "v3", "i", "0000000000000050", "0000000000000052"),
+            (2, "v2", "i", "0000000000000050", "0000000000000050"),
+            (3, "v3", "i", "0000000000000050", "0000000000000050"),
         ],
     );
     seed_file(&ctx.pool, epoch, &live, "stream", "0/50", None).await;
@@ -282,10 +363,12 @@ async fn resync_alias_rebuilds_removes_phantoms_and_then_replays_post_h() {
     // The full dump at H=0/100 carries source truth {1,2,3}; a later stream event at 0/200 updates
     // id 2. The first pass must stop at H and publish the replacement before a second pass applies
     // the post-H event.
-    let resync_id = drained_resync(&ctx.pool, epoch, "0/100", "0/100").await;
+    let export = planned_resync(&ctx.pool, epoch, "0/100", "0/100").await;
+    let resync_id = export.reload_id;
     let chunk = write_rows(
         epoch,
         "chunk1",
+        Kind::Reload,
         &[
             (1, "v1", "i", "0000000000000100", "0000000000000100"),
             (2, "v2", "i", "0000000000000100", "0000000000000100"),
@@ -296,9 +379,11 @@ async fn resync_alias_rebuilds_removes_phantoms_and_then_replays_post_h() {
     let post = write_rows(
         epoch,
         "post",
+        Kind::Stream,
         &[(2, "newest", "u", "0000000000000200", "0000000000000200")],
     );
     seed_file(&ctx.pool, epoch, &post, "stream", "0/200", None).await;
+    finish_resync(&ctx.pool, &export).await;
 
     run_phase_a(&ctx).await.unwrap();
     run_phase_b(&ctx).await.unwrap();
@@ -354,10 +439,12 @@ async fn resync_alias_pauses_the_table() {
         .await
         .unwrap();
 
-    // A stream file arrives while the export is live. It must remain ready until export_complete.
+    // A stream file arrives while the reload is active. The generic claim path must leave it ready;
+    // only the fenced publication claim may drain through H before publication completes.
     let post = write_rows(
         epoch,
         "post",
+        Kind::Stream,
         &[(5, "streamed", "i", "0000000000000200", "0000000000000200")],
     );
     seed_file(&ctx.pool, epoch, &post, "stream", "0/200", None).await;
@@ -373,7 +460,7 @@ async fn resync_alias_pauses_the_table() {
     assert_eq!(
         cp.raw_appended_lsn,
         "0/50".parse().unwrap(),
-        "the frontier remains frozen until export_complete"
+        "the generic frontier remains frozen while the reload is active"
     );
 }
 
@@ -386,13 +473,16 @@ async fn resync_chunks_build_a_hidden_generation_before_cutover() {
     seed_live_mirror(&ctx, epoch).await;
 
     // The resync-spelled dump goes to a hidden generation while the old mirror remains public.
-    let resync_id = drained_resync(&ctx.pool, epoch, "0/100", "0/100").await;
+    let export = planned_resync(&ctx.pool, epoch, "0/100", "0/100").await;
+    let resync_id = export.reload_id;
     let chunk = write_rows(
         epoch,
         "chunk1",
+        Kind::Reload,
         &[(7, "from-chunk", "i", "0000000000000100", "0000000000000100")],
     );
     seed_file(&ctx.pool, epoch, &chunk, "reload", "0/100", Some(resync_id)).await;
+    finish_resync(&ctx.pool, &export).await;
 
     run_phase_a(&ctx).await.unwrap();
     assert_eq!(
@@ -424,7 +514,7 @@ async fn resync_ddl_restart_preserves_the_resync_flavor() {
     let (ctx, _dir) = setup(epoch).await;
 
     // A DDL restart preserves the stored compatibility spelling even though both values now select
-    // the same rebuild behavior. Driven at the control layer: request → claim → chunk 1 → restart.
+    // the same rebuild behavior. Driven at the control layer: request → claim → fence → restart.
     let old = reload::request(&ctx.pool, epoch, "public", "orders", ReloadFlavor::Resync)
         .await
         .unwrap();
@@ -451,16 +541,6 @@ async fn resync_ddl_restart_preserves_the_resync_flavor() {
     )
     .await
     .unwrap();
-    reload::advance_cursor(
-        &ctx.pool,
-        old,
-        1,
-        &serde_json::json!(["10"]),
-        start_lsn,
-        common::SchemaVersionNo(1),
-    )
-    .await
-    .unwrap();
     let old_row = reload::get(&ctx.pool, old).await.unwrap().unwrap();
 
     let mut conn = ctx.pool.acquire().await.unwrap();
@@ -483,9 +563,15 @@ async fn resync_ddl_restart_preserves_the_resync_flavor() {
         "the predecessor turned terminal"
     );
 
-    sqlx::query("DELETE FROM walrus.table_reload WHERE epoch = $1")
-        .bind(epoch)
-        .execute(&ctx.pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "WITH authorized AS MATERIALIZED (
+           SELECT set_config('walrus.manifest_fence_maintenance','2-delete',true) AS protocol
+         )
+         DELETE FROM walrus.table_reload
+         WHERE epoch = $1 AND (SELECT protocol = '2-delete' FROM authorized)",
+    )
+    .bind(epoch)
+    .execute(&ctx.pool)
+    .await
+    .unwrap();
 }

@@ -457,7 +457,7 @@ fn drain_seals_committed_rows_and_drops_the_open_txn() {
     b.push(meta("0/30"), &row("2")); // open, uncommitted
     assert!(b.has_open_txn());
     let sealed = b
-        .drain_committed()
+        .drain_for_shutdown()
         .unwrap()
         .expect("committed rows seal on drain");
     assert_eq!(sealed.row_count, 1, "only the committed row is sealed");
@@ -479,10 +479,41 @@ fn drain_with_nothing_committed_is_a_noop() {
     .unwrap();
     b.push(meta("0/10"), &row("1")); // open only, never committed
     assert!(
-        b.drain_committed().unwrap().is_none(),
+        b.drain_for_shutdown().unwrap().is_none(),
         "no committed rows → nothing to seal"
     );
     assert!(!b.has_open_txn(), "the open buffer is still dropped");
+}
+
+#[test]
+fn stream_commit_boundary_seals_committed_rows_and_preserves_open_txn() {
+    let mut b = TableBatcher::new(
+        cached(),
+        triggers(u64::MAX, u64::MAX, Duration::from_secs(3600)),
+        Arc::new(SystemClock),
+    )
+    .unwrap();
+    b.push(meta("0/10"), &row("1"));
+    b.on_commit("0/20".parse().unwrap(), UtcTimestamp::now())
+        .unwrap();
+    b.push(meta("0/30"), &row("2"));
+
+    let sealed = b
+        .seal_committed_boundary()
+        .unwrap()
+        .expect("committed prefix is sealed");
+    assert_eq!(sealed.row_count, 1);
+    assert_eq!(sealed.lsn_end, "0/20".parse().unwrap());
+    assert!(b.has_open_txn(), "ordinary speculative row must survive");
+
+    b.on_commit("0/40".parse().unwrap(), UtcTimestamp::now())
+        .unwrap();
+    let survivor = b
+        .force_seal_committed()
+        .unwrap()
+        .expect("preserved row later commits");
+    assert_eq!(survivor.row_count, 1);
+    assert_eq!(survivor.lsn_end, "0/40".parse().unwrap());
 }
 
 #[test]

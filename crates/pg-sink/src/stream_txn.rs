@@ -33,6 +33,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroU64;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// One streamed change, tagged with **its** sub-transaction xid (proto §7).
 ///
@@ -69,11 +70,21 @@ struct StagedSpill {
     written: WrittenObject,
 }
 
+/// One transaction-local Relation binding. Keeping the sub-xid provenance lets a savepoint abort
+/// restore the prior parent/nested-savepoint shape even when the next segment omits Relation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RelationBinding {
+    sub_xid: u32,
+    version: common::SchemaVersionNo,
+}
+
 /// Per top-level xid buffer for an in-progress streamed transaction.
 #[derive(Debug)]
 struct StreamedTxn {
     /// The floor `confirmed_flush` must not pass while this txn is open (its first-segment LSN).
     begin_lsn: Lsn,
+    /// Monotonic instant at which the first streamed segment was observed.
+    opened_at: Instant,
     /// Buffered (not-yet-spilled) changes in commit order, each tagged with its sub-xid.
     changes: Vec<StreamedChange>,
     /// Exactly the distinct `(oid, sub_xid)` streams currently represented in `changes`.
@@ -84,10 +95,50 @@ struct StreamedTxn {
     aborted: HashSet<u32>,
 }
 
+/// A semantic violation of pgoutput's streamed-transaction state machine.
+///
+/// Wire-shape failures remain [`crate::pgoutput::DecodeError`]. These errors mean a well-formed
+/// `StreamStart`/`Stop`/`Commit`/`Abort` sequence cannot be reconciled with the transaction state we
+/// have retained, so acknowledging past it would risk loss. Every variant is therefore terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum StreamProtocolError {
+    /// A second segment began before the active one stopped.
+    #[error(
+        "stream start for top xid {incoming_top} while top xid {active_top} already has an active segment"
+    )]
+    SegmentAlreadyActive { active_top: u32, incoming_top: u32 },
+    /// `first_segment=true` was repeated for an already-open transaction.
+    #[error("first StreamStart repeated for already-open top xid {top_xid}")]
+    DuplicateFirstSegment { top_xid: u32 },
+    /// A continuation cannot be reconstructed without its first segment.
+    #[error("continuation StreamStart for unknown top xid {top_xid}")]
+    UnknownContinuation { top_xid: u32 },
+    /// A stop has no segment to close.
+    #[error("stream stop arrived without an active segment")]
+    StopWithoutStart,
+    /// Transaction outcome messages are top-level and must follow `StreamStop`.
+    #[error(
+        "{outcome} for top xid {outcome_top} arrived while top xid {active_top} has an active segment"
+    )]
+    OutcomeDuringSegment {
+        outcome: &'static str,
+        outcome_top: u32,
+        active_top: u32,
+    },
+    /// A commit for an unknown xid must never be treated as an empty transaction.
+    #[error("stream commit for unknown top xid {top_xid}")]
+    UnknownCommit { top_xid: u32 },
+    /// An abort for an unknown xid cannot safely alter any other open transaction.
+    #[error("stream abort for unknown top xid {top_xid} (sub xid {sub_xid})")]
+    UnknownAbort { top_xid: u32, sub_xid: u32 },
+}
+
 impl StreamedTxn {
-    fn new(begin_lsn: Lsn) -> Self {
+    fn new(begin_lsn: Lsn, opened_at: Instant) -> Self {
         StreamedTxn {
             begin_lsn,
+            opened_at,
             changes: Vec::new(),
             keys: HashSet::new(),
             staged: Vec::new(),
@@ -117,8 +168,24 @@ impl StreamedTxn {
         rows
     }
 
-    fn abort_subtxn(&mut self, sub_xid: u32) {
+    /// Drop an aborted savepoint's still-buffered rows immediately and return the stream keys whose
+    /// shared-memory accounting the caller must release after this borrow ends. Keeping the xid in
+    /// `aborted` still excludes malformed late frames and any already-staged spill entries.
+    fn abort_subtxn(&mut self, sub_xid: u32) -> (usize, Vec<(TableId, u32)>) {
         self.aborted.insert(sub_xid);
+        let before = self.changes.len();
+        self.changes.retain(|change| change.sub_xid != sub_xid);
+        let dropped = before.saturating_sub(self.changes.len());
+        let keys = self
+            .keys
+            .iter()
+            .copied()
+            .filter(|(_, xid)| *xid == sub_xid)
+            .collect::<Vec<_>>();
+        for key in &keys {
+            self.keys.remove(key);
+        }
+        (dropped, keys)
     }
 
     /// The buffered (in-memory) rows that survive to commit: every change **except** aborted sub-xids.
@@ -139,7 +206,8 @@ impl StreamedTxn {
 }
 
 /// Demultiplexes interleaved streamed transactions, commit-gates visibility, and spills under memory
-/// pressure. **DB-free** — `on_stream_commit` returns the objects to `record_ready`.
+/// pressure. **DB-free** — `on_stream_commit` returns the complete object set for one atomic
+/// control-plane publication.
 #[derive(Debug)]
 pub struct StreamDemux<C = std::sync::Arc<SystemClock>> {
     open: HashMap<u32, StreamedTxn>,
@@ -150,14 +218,27 @@ pub struct StreamDemux<C = std::sync::Arc<SystemClock>> {
     owner: HashMap<(TableId, u32), u32>,
     /// The top-level xid of the currently-open `Stream Start … Stream Stop` block; changes route here.
     current_top: Option<u32>,
-    /// Exact Relation-message binding per open top-level transaction and relation OID.
-    bindings: HashMap<(u32, TableId), common::SchemaVersionNo>,
+    /// Relation-message history per open top-level transaction and relation OID. The last surviving
+    /// binding is current; a subtransaction abort removes only entries introduced by that sub-xid.
+    bindings: HashMap<(u32, TableId), Vec<RelationBinding>>,
     triggers: BatchTriggers,
     clock: C,
     epoch: EpochNo,
     sink_instance: String,
     meter: InflightMeter,
     spill_count: u64,
+}
+
+/// Read-only protocol-v2 guard state. The LSN floor is the ACK clamp; the age makes a transaction
+/// that began before or during a reload observable even if its next segment is temporarily idle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenStreamStats {
+    /// Number of top-level streamed transactions that have not committed or aborted.
+    pub count: usize,
+    /// First-segment LSN of the numerically oldest open transaction.
+    pub oldest_floor: Option<Lsn>,
+    /// Monotonic age of the earliest-opened transaction.
+    pub oldest_age: Option<Duration>,
 }
 
 impl<C: Clock + Clone> StreamDemux<C> {
@@ -212,17 +293,52 @@ impl<C: Clock + Clone> StreamDemux<C> {
         self.spill_count
     }
 
-    /// `Stream Start`: open (first segment) or resume (later segment) the top-level xid's buffer.
-    pub fn on_stream_start(&mut self, top_xid: u32, _first_segment: bool, lsn: Lsn) {
-        self.open
-            .entry(top_xid)
-            .or_insert_with(|| StreamedTxn::new(lsn));
+    /// `Stream Start`: open the first segment or resume an already-open transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StreamProtocolError`] for a nested segment or when `first_segment` disagrees with
+    /// whether `top_xid` is already open. State is unchanged on error.
+    pub fn on_stream_start(
+        &mut self,
+        top_xid: u32,
+        first_segment: bool,
+        lsn: Lsn,
+    ) -> Result<(), StreamProtocolError> {
+        if let Some(active_top) = self.current_top {
+            return Err(StreamProtocolError::SegmentAlreadyActive {
+                active_top,
+                incoming_top: top_xid,
+            });
+        }
+        match (self.open.contains_key(&top_xid), first_segment) {
+            (true, true) => {
+                return Err(StreamProtocolError::DuplicateFirstSegment { top_xid });
+            }
+            (false, false) => {
+                return Err(StreamProtocolError::UnknownContinuation { top_xid });
+            }
+            (false, true) => {
+                self.open
+                    .insert(top_xid, StreamedTxn::new(lsn, self.clock.now()));
+            }
+            (true, false) => {}
+        }
         self.current_top = Some(top_xid);
+        Ok(())
     }
 
     /// `Stream Stop`: the block ended (the txn may resume with a later segment).
-    pub const fn on_stream_stop(&mut self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StreamProtocolError::StopWithoutStart`] if no segment is active.
+    pub const fn on_stream_stop(&mut self) -> Result<(), StreamProtocolError> {
+        if self.current_top.is_none() {
+            return Err(StreamProtocolError::StopWithoutStart);
+        }
         self.current_top = None;
+        Ok(())
     }
 
     /// Top-level xid of the currently open StreamStart..Stop block.
@@ -235,11 +351,18 @@ impl<C: Clock + Clone> StreamDemux<C> {
     pub fn bind_relation(
         &mut self,
         top_xid: u32,
+        sub_xid: u32,
         relation_oid: u32,
         version: common::SchemaVersionNo,
     ) {
-        self.bindings
-            .insert((top_xid, TableId(relation_oid)), version);
+        let history = self
+            .bindings
+            .entry((top_xid, TableId(relation_oid)))
+            .or_default();
+        let binding = RelationBinding { sub_xid, version };
+        if history.last() != Some(&binding) {
+            history.push(binding);
+        }
     }
 
     /// Claim one buffered row's bytes and record or confirm the stream's unique owner.
@@ -395,16 +518,26 @@ impl<C: Clock + Clone> StreamDemux<C> {
         top: u32,
         oid: TableId,
     ) -> anyhow::Result<Arc<crate::relcache::CachedRelation>> {
-        self.bindings
+        // pgoutput deliberately sends a Relation before the first change for each relation in each
+        // streamed top-level transaction. Do not fall back to the cache's highest hydrated version:
+        // after a lost ACK, that maximum may belong to a later transaction whose control history was
+        // already durable, while this replayed change still belongs to an older schema version.
+        let binding = self
+            .bindings
             .get(&(top, oid))
-            .and_then(|version| cache.get(oid.0, *version))
-            .or_else(|| cache.latest_for(oid.0))
+            .and_then(|history| history.last())
             .with_context(|| {
                 format!(
-                    "streamed change relation version is not cached: oid={} top_xid={top}",
+                    "streamed change arrived before its Relation binding: oid={} top_xid={top}",
                     oid.0
                 )
-            })
+            })?;
+        cache.get(oid.0, binding.version).with_context(|| {
+            format!(
+                "streamed change relation version is not cached: oid={} top_xid={top} version={}",
+                oid.0, binding.version
+            )
+        })
     }
 
     /// While over the aggregate ceiling, spill the largest open `(table, sub-xid)` buffer to a
@@ -524,15 +657,33 @@ impl<C: Clock + Clone> StreamDemux<C> {
     /// `Stream Abort {top, sub}`. **sub == top** (whole-txn): drop the buffer AND delete its speculative
     /// files. **sub != top** (rolled-back savepoint): mark the sub-xid dead and delete only ITS
     /// speculative files; the top-level txn stays open and commits its survivors.
-    pub async fn on_stream_abort(&mut self, top_xid: u32, sub_xid: u32, sink: &ParquetSink) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StreamProtocolError::OutcomeDuringSegment`] if the active segment has not stopped,
+    /// or [`StreamProtocolError::UnknownAbort`] when `top_xid` is not open. State is unchanged for
+    /// either protocol error; speculative object deletion remains best-effort after a valid abort.
+    pub async fn on_stream_abort(
+        &mut self,
+        top_xid: u32,
+        sub_xid: u32,
+        sink: &ParquetSink,
+    ) -> Result<(), StreamProtocolError> {
+        if let Some(active_top) = self.current_top {
+            return Err(StreamProtocolError::OutcomeDuringSegment {
+                outcome: "StreamAbort",
+                outcome_top: top_xid,
+                active_top,
+            });
+        }
+        if !self.open.contains_key(&top_xid) {
+            return Err(StreamProtocolError::UnknownAbort { top_xid, sub_xid });
+        }
         if top_xid == sub_xid {
             common::metrics::inc_aborted_txn(); // whole-txn abort
-            if self.current_top == Some(top_xid) {
-                self.current_top = None;
-            }
             self.bindings.retain(|(owner, _), _| *owner != top_xid);
             let Some(txn) = self.open.remove(&top_xid) else {
-                return; // never opened (or already aborted) — no buffer and no spills to delete
+                return Err(StreamProtocolError::UnknownAbort { top_xid, sub_xid });
             };
             let rows = txn.changes.len();
             let meter_keys = txn.keys.iter().copied().collect::<Vec<_>>();
@@ -553,21 +704,31 @@ impl<C: Clock + Clone> StreamDemux<C> {
                 }
             }
             tracing::info!(top_xid, rows, staged = staged.len(), "whole-txn abort");
-            return;
+            return Ok(());
         }
-        let Some(txn) = self.open.get_mut(&top_xid) else {
-            return; // the top-level txn is not open here — nothing of its savepoint to drop
+        self.bindings.retain(|(owner, _), history| {
+            if *owner != top_xid {
+                return true;
+            }
+            history.retain(|binding| binding.sub_xid != sub_xid);
+            !history.is_empty()
+        });
+        // Compact both in-memory rows and staged objects before publishing the lower shared-memory
+        // total. The doomed spills move out so no transaction borrow crosses the awaited deletes.
+        let (dropped_rows, meter_keys, doomed) = {
+            let Some(txn) = self.open.get_mut(&top_xid) else {
+                return Err(StreamProtocolError::UnknownAbort { top_xid, sub_xid });
+            };
+            let (dropped_rows, meter_keys) = txn.abort_subtxn(sub_xid);
+            let doomed = txn
+                .staged
+                .extract_if(.., |s| s.sub_xid == sub_xid)
+                .collect::<Vec<_>>();
+            (dropped_rows, meter_keys, doomed)
         };
-        txn.abort_subtxn(sub_xid);
-        self.bindings.retain(|(owner, _), _| *owner != top_xid);
-        // One predicate pass both removes the rolled-back spills and hands them over: the
-        // survivors compact inside `staged`'s allocation (the txn stays open and keeps
-        // spilling), and the doomed entries move out instead of their keys being cloned
-        // to outlive the borrow the awaited deletes cannot hold.
-        let doomed = txn
-            .staged
-            .extract_if(.., |s| s.sub_xid == sub_xid)
-            .collect::<Vec<_>>();
+        for key in meter_keys {
+            self.forget_stream(key);
+        }
         for spill in &doomed {
             if let Err(error) = sink.delete(&spill.written.key).await {
                 tracing::warn!(
@@ -580,18 +741,46 @@ impl<C: Clock + Clone> StreamDemux<C> {
         tracing::info!(
             top_xid,
             sub_xid,
+            dropped_rows,
             dropped_spills = doomed.len(),
             "sub-txn abort: savepoint rows excluded"
         );
+        Ok(())
     }
 
-    /// `Stream Commit`: publish the (non-aborted) speculative spills stamped with the real `commit_lsn`,
-    /// and materialise the in-memory survivors, returning every object for the caller to `record_ready`.
+    /// Validate a `StreamCommit` before the caller performs its commit-order durability fence.
+    ///
+    /// The consume loop must seal older ordinary batches before publishing the streamed transaction,
+    /// but a malformed outcome must be rejected before that seal mutates those batches. The commit
+    /// path calls this again at its own boundary so direct callers receive the same guarantee.
     ///
     /// # Errors
     ///
-    /// Returns [`anyhow::Error`] if survivor batching, commit timestamp propagation, or durable
-    /// Parquet publication of an in-memory group fails.
+    /// Returns [`StreamProtocolError::OutcomeDuringSegment`] when a stream segment has not stopped,
+    /// or [`StreamProtocolError::UnknownCommit`] when `top_xid` was never opened (or already ended).
+    pub fn validate_stream_commit(&self, top_xid: u32) -> Result<(), StreamProtocolError> {
+        if let Some(active_top) = self.current_top {
+            return Err(StreamProtocolError::OutcomeDuringSegment {
+                outcome: "StreamCommit",
+                outcome_top: top_xid,
+                active_top,
+            });
+        }
+        if !self.open.contains_key(&top_xid) {
+            return Err(StreamProtocolError::UnknownCommit { top_xid });
+        }
+        Ok(())
+    }
+
+    /// `Stream Commit`: publish the (non-aborted) speculative spills stamped with the real `commit_lsn`,
+    /// and materialise the in-memory survivors, returning every object for the caller's atomic
+    /// streamed-transaction publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`anyhow::Error`] wrapping [`StreamProtocolError`] for an invalid outcome, or when
+    /// survivor batching, commit timestamp propagation, or durable Parquet publication of an
+    /// in-memory group fails.
     pub async fn on_stream_commit(
         &mut self,
         top_xid: u32,
@@ -600,16 +789,10 @@ impl<C: Clock + Clone> StreamDemux<C> {
         cache: &RelationCache,
         sink: &ParquetSink,
     ) -> anyhow::Result<Vec<WrittenObject>> {
-        if self.current_top == Some(top_xid) {
-            self.current_top = None;
-        }
+        self.validate_stream_commit(top_xid)?;
         self.bindings.retain(|(owner, _), _| *owner != top_xid);
         let Some(mut txn) = self.open.remove(&top_xid) else {
-            tracing::warn!(
-                top_xid,
-                "Stream Commit for an unknown xid; nothing to materialise"
-            );
-            return Ok(Vec::new());
+            return Err(StreamProtocolError::UnknownCommit { top_xid }.into());
         };
         let meter_keys = txn.keys.iter().copied().collect::<Vec<_>>();
         let mut out = Vec::new();
@@ -718,6 +901,22 @@ impl<C: Clock + Clone> StreamDemux<C> {
     #[must_use]
     pub fn open_floor(&self) -> Option<Lsn> {
         self.open.values().map(|t| t.begin_lsn).min()
+    }
+
+    /// Count, oldest first-segment LSN and monotonic age for open protocol-v2 transactions.
+    /// Reading this state has no effect on the checkpoint or feedback socket.
+    #[must_use]
+    pub fn open_stats(&self) -> OpenStreamStats {
+        let now = self.clock.now();
+        OpenStreamStats {
+            count: self.open.len(),
+            oldest_floor: self.open_floor(),
+            oldest_age: self
+                .open
+                .values()
+                .map(|txn| now.saturating_duration_since(txn.opened_at))
+                .max(),
+        }
     }
 
     #[cfg(test)]

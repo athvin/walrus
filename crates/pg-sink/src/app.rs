@@ -15,9 +15,11 @@ use crate::{bootstrap, consume, health, shutdown};
 use anyhow::Context;
 use common::EpochNo;
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use tokio::time::Instant;
+use std::time::Duration;
+use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
 /// The lifecycle: install signals, bind health (so probes see 503 during the slow bootstrap), run
@@ -47,7 +49,7 @@ pub async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
         token.clone(),
     ));
 
-    let result = shutdown::cancel_on_exit(&token, pipeline(&cfg, &token, &state)).await;
+    let result = shutdown::cancel_on_exit(&token, Box::pin(pipeline(&cfg, &token, &state))).await;
     tracing::info!("draining health server");
     server
         .await
@@ -66,7 +68,7 @@ async fn pipeline(
     // Shared bootstrap steps 2–4. The enclosing drop guard tears down token-driven tasks before a
     // classified error reaches `main`.
     let deadline = Instant::now() + cfg.startup_deadline;
-    let ctx = bootstrap::run_shared(cfg, deadline).await?;
+    let mut ctx = bootstrap::run_shared(cfg, deadline).await?;
     acquire_pipeline_publication_guard(cfg, &ctx.source_client)
         .await
         .context("acquire continuous publication-DDL guard")?;
@@ -79,19 +81,19 @@ async fn pipeline(
     };
     let mut cache = crate::relcache::RelationCache::default();
 
-    // Bootstrap decision (§1.7 / §1.8): a **pre-existing slot** means resume from `confirmed_flush_lsn`
-    // (hydrate the cache from schema_registry). **No slot** means first bootstrap: create it with an
-    // establish the stream first; a fresh generation rebuilds every table through the same in-band
-    // F/dump/H reconciliation used for an operator-triggered reload.
+    // Bootstrap decision (§1.7 / §1.8): a **pre-existing slot** retains WAL, but a new process has
+    // lost the continuous publication-DDL guard and therefore opens a reconciled successor at the
+    // retained floor. **No slot** means first bootstrap: establish the stream first, then rebuild
+    // every table through the same in-band F/dump/H reconciliation used for an operator reload.
     let Bootstrapped {
         mut stream,
         epoch,
         start_lsn,
         sink,
-    } = establish_stream(cfg, &ctx, &mut cache, SCHEMA_VERSION).await?;
-    // DDL state is restartable: hydrate both the latest registered shapes and every processed source
-    // audit identity before reading another WAL frame. A replayed audit row then reuses its committed
-    // version instead of manufacturing version N+1.
+    } = establish_stream(cfg, &mut ctx, &mut cache, SCHEMA_VERSION).await?;
+    // DDL state is restartable: hydrate every historical registered shape and processed source
+    // audit identity before reading another WAL frame. A replayed transaction then reconstructs
+    // its exact old version instead of manufacturing N+1 or falling forward to the latest shape.
     let mut ddl = crate::ddl::DdlConsumer::new(epoch);
     ddl.hydrate_versions(&cache);
     ddl.hydrate_history(
@@ -100,7 +102,7 @@ async fn pipeline(
             .context("hydrate DDL history")?,
     );
     // The shared dependency checks are only the first half of bootstrap. Do not advertise ready
-    // until slot classification plus fresh-slot epoch registration (or resume hydration) has completed:
+    // until slot classification plus generation registration has completed:
     // the loader is allowed to start as soon as this endpoint flips, and it needs the epoch to exist.
     state.mark_ready();
     tracing::info!("bootstrap complete; ready");
@@ -196,6 +198,12 @@ async fn pipeline(
         },
         token.clone(),
     );
+    let slot_guard = crate::guard_monitor::spawn(
+        cfg.source_db_url.expose().clone(),
+        cfg.slot_name.clone(),
+        cfg.heartbeat_idle_after,
+        token.clone(),
+    );
 
     let result = consume::DecodeLoop::builder()
         .stream(&mut stream)
@@ -220,9 +228,13 @@ async fn pipeline(
     // Whatever ended the loop (SIGTERM, stream end, or a decode error), drain the side tasks.
     state.mark_terminating();
     token.cancel();
+    let slot_guard_result = slot_guard
+        .await
+        .context("replication-slot guard task join")?;
     reload_controller
         .await
         .context("reload controller task join")?;
+    slot_guard_result?;
     result
 }
 
@@ -270,7 +282,20 @@ async fn acquire_pipeline_publication_guard(
         ("walrus".to_string(), "reload_signal".to_string()),
         ("walrus".to_string(), "reload_event".to_string()),
     ]);
-    validate_publication_targets(client, &cfg.publication_name, targets.iter()).await
+    validate_publication_targets(client, &cfg.publication_name, targets.iter()).await?;
+    crate::preflight::SourcePreflight::new(client, cfg)
+        .assert_table_lock_privileges()
+        .await
+        .context("revalidate source-table lock privileges under the publication guard")?;
+    // The first PK check precedes this session lock. Repeat it here so a key can neither disappear
+    // in that seam nor enter the frozen catalog inventory without a real downstream row identity.
+    // SinkConfig rejects diagnostic-only lenient mode, but spelling Strict here also keeps this
+    // safety boundary closed for programmatically constructed configurations.
+    crate::preflight::SourcePreflight::new(client, cfg)
+        .assert_tables_have_pk(crate::preflight::PkMode::Strict)
+        .await
+        .context("revalidate source-table keys under the publication guard")?;
+    Ok(())
 }
 
 async fn validate_publication_targets<'a>(
@@ -301,8 +326,31 @@ fn generation_can_resume(
     configured_slot: &str,
     recorded_slot: &str,
     status: control::ReplicationStatus,
+    publication_guard_continuity_proven: bool,
 ) -> bool {
-    configured_slot == recorded_slot && status != control::ReplicationStatus::TotalRestart
+    publication_guard_continuity_proven
+        && configured_slot == recorded_slot
+        && status != control::ReplicationStatus::TotalRestart
+}
+
+/// A session advisory lock proves publication semantics only for that source connection's
+/// lifetime. Until the source exposes a durable monotonic semantics token, every process startup
+/// must assume there was an offline publication interval and rebuild from a new catalog fence.
+#[must_use]
+const fn publication_guard_continuity_proven_on_startup() -> bool {
+    false
+}
+
+#[must_use]
+const fn resumed_generation_start(
+    confirmed_flush: common::Lsn,
+    created_lsn: common::Lsn,
+) -> common::Lsn {
+    if confirmed_flush.as_u64() >= created_lsn.as_u64() {
+        confirmed_flush
+    } else {
+        created_lsn
+    }
 }
 
 fn assert_generation_slot_name(
@@ -376,11 +424,23 @@ fn inventory_resume_decision(
     }
 }
 
+fn ensure_catalog_fence_version_supported(state: &control::ReplicationState) -> anyhow::Result<()> {
+    if state.catalog_fence_version > control::CURRENT_CATALOG_FENCE_VERSION {
+        anyhow::bail!(
+            "generation {} uses source catalog-fence protocol {}, but this sink supports only {}; refusing an unsafe binary downgrade",
+            state.epoch,
+            state.catalog_fence_version,
+            control::CURRENT_CATALOG_FENCE_VERSION
+        );
+    }
+    Ok(())
+}
+
 /// Resume a pre-existing slot, or open a new generation whose initial state is built by the same
 /// source-WAL-triggered reconciliation protocol as an ordinary all-table reload.
 async fn establish_stream(
     cfg: &SinkConfig,
-    ctx: &bootstrap::BootstrapCtx,
+    ctx: &mut bootstrap::BootstrapCtx,
     cache: &mut crate::relcache::RelationCache,
     schema_version: common::SchemaVersionNo,
 ) -> anyhow::Result<Bootstrapped> {
@@ -439,8 +499,41 @@ async fn establish_stream(
             };
             assert_generation_slot_name(slot.as_str(), &state.slot_name)
                 .context("configured slot differs from durable generation")?;
-            if !generation_can_resume(slot.as_str(), &state.slot_name, state.status) {
-                if state.status == control::ReplicationStatus::TotalRestart {
+            ensure_catalog_fence_version_supported(&state)?;
+            if state.catalog_fence_version < control::CURRENT_CATALOG_FENCE_VERSION {
+                tracing::error!(
+                    old_epoch = %state.epoch,
+                    recorded_catalog_fence_version = state.catalog_fence_version,
+                    required_catalog_fence_version = control::CURRENT_CATALOG_FENCE_VERSION,
+                    "current generation predates atomic source catalog fencing; opening a reconciled successor"
+                );
+                return establish_bootstrap_generation(
+                    cfg,
+                    ctx,
+                    cache,
+                    slot.as_str(),
+                    confirmed_flush,
+                    Some(state),
+                    status,
+                    schema_version,
+                )
+                .await;
+            }
+            let guard_continuity_proven = publication_guard_continuity_proven_on_startup();
+            if !generation_can_resume(
+                slot.as_str(),
+                &state.slot_name,
+                state.status,
+                guard_continuity_proven,
+            ) {
+                if !guard_continuity_proven {
+                    tracing::error!(
+                        configured_slot = %slot,
+                        old_epoch = %state.epoch,
+                        start_lsn = %confirmed_flush,
+                        "continuous publication guard ended with the prior process; opening a reconciled successor so transient offline publication changes cannot omit rows"
+                    );
+                } else if state.status == control::ReplicationStatus::TotalRestart {
                     tracing::error!(
                         configured_slot = %slot,
                         generation_slot = %state.slot_name,
@@ -468,9 +561,9 @@ async fn establish_stream(
                 .await;
             }
             let epoch = state.epoch;
-            let rows = control::read_all_latest_registry(&ctx.control_pool, epoch)
+            let rows = control::read_all_registry(&ctx.control_pool, epoch)
                 .await
-                .context("read schema_registry for hydration")?;
+                .context("read complete schema_registry history for hydration")?;
             let registered_targets = rows
                 .iter()
                 .map(|row| (row.source_schema.clone(), row.source_table.clone()))
@@ -560,14 +653,28 @@ async fn establish_stream(
                 .context("re-emit unfinished bootstrap request")?;
             }
             cache.hydrate(rows).context("hydrate relation cache")?;
-            let stream = ReplicationStream::start(
+            let resume_lsn = resumed_generation_start(confirmed_flush, state.created_lsn);
+            // Claim the configured slot before deleting anything. PostgreSQL permits only one active
+            // consumer per slot, so a rolling replacement fails here while the prior pod can still own
+            // unmanifested speculative spills. The sweep then runs while this CopyBoth connection is
+            // the source-enforced singleton; no decoder, exporter, or other local writer exists yet.
+            let mut stream = ReplicationStream::start(
                 cfg.source_db_url.expose(),
                 slot.as_str(),
-                confirmed_flush,
+                resume_lsn,
                 &cfg.publication_name,
             )
             .await
             .context("START_REPLICATION (resume)")?;
+            cleanup_epoch_orphans_while_holding_slot(
+                &mut stream,
+                ctx.object_store.as_ref(),
+                &cfg.object_store.bucket,
+                &ctx.control_pool,
+                epoch,
+            )
+            .await
+            .context("collect abandoned epoch objects after claiming resumed slot")?;
             tracing::info!(
                 epoch = %epoch,
                 cached_relations = cache.len(),
@@ -576,7 +683,7 @@ async fn establish_stream(
             return Ok(Bootstrapped {
                 stream,
                 epoch,
-                start_lsn: confirmed_flush,
+                start_lsn: resume_lsn,
                 sink: make_sink(epoch),
             });
         }
@@ -595,6 +702,7 @@ async fn establish_stream(
     if let Some(state) = &prior {
         assert_generation_slot_name(slot.as_str(), &state.slot_name)
             .context("configured slot differs from durable generation")?;
+        ensure_catalog_fence_version_supported(state)?;
     }
 
     let recovery = slot_loss_recovery(status).with_context(|| {
@@ -663,29 +771,36 @@ async fn establish_stream(
 )]
 async fn establish_bootstrap_generation(
     cfg: &SinkConfig,
-    ctx: &bootstrap::BootstrapCtx,
+    ctx: &mut bootstrap::BootstrapCtx,
     cache: &mut crate::relcache::RelationCache,
     slot: &str,
-    start_lsn: common::Lsn,
+    retained_floor: common::Lsn,
     prior: Option<control::ReplicationState>,
     slot_status: crate::epoch::SlotStatus,
     schema_version: common::SchemaVersionNo,
 ) -> anyhow::Result<Bootstrapped> {
-    let tables =
-        crate::source_catalog::published_user_tables(&ctx.source_client, &cfg.publication_name)
-            .await
-            .context("freeze published user-table inventory")?;
-    let mut relations = Vec::with_capacity(tables.len());
-    for (schema, table) in &tables {
-        relations.push(
-            crate::source_catalog::describe_source_relation(&ctx.source_client, schema, table)
-                .await
-                .with_context(|| format!("describe {schema}.{table} for reconciliation"))?,
-        );
-    }
-    let targets = tables
-        .into_iter()
-        .map(|(schema, table)| crate::reload_event::ReloadTarget { schema, table })
+    const CATALOG_FENCE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+    let fence = crate::source_catalog::capture_catalog_fence(
+        &mut ctx.source_client,
+        &cfg.publication_name,
+        CATALOG_FENCE_LOCK_TIMEOUT,
+    )
+    .await
+    .context("capture writer-drained bootstrap catalog fence")?;
+    anyhow::ensure!(
+        fence.start_lsn >= retained_floor,
+        "source catalog-fence LSN {} precedes retained slot floor {}",
+        fence.start_lsn,
+        retained_floor
+    );
+    let start_lsn = fence.start_lsn;
+    let targets = fence
+        .relations
+        .iter()
+        .map(|relation| crate::reload_event::ReloadTarget {
+            schema: relation.schema.clone(),
+            table: relation.name.clone(),
+        })
         .collect::<Vec<_>>();
     let expected_tables =
         i64::try_from(targets.len()).context("bootstrap target count does not fit i64")?;
@@ -693,65 +808,102 @@ async fn establish_bootstrap_generation(
         serde_json::to_value(&targets).context("encode bootstrap target inventory")?;
     let request_id = Uuid::new_v4();
 
-    // The epoch row and every registry shape commit together. A restart can therefore see either no
-    // generation or a complete inventory plus the exact request payload; never a partial fanout.
-    let mut tx = ctx
-        .control_pool
-        .begin()
-        .await
-        .context("begin bootstrap generation registration")?;
-    let opened = control::bump_bootstrap_epoch(
-        &mut *tx,
-        prior.as_ref().map(|state| state.epoch),
+    // PostgreSQL is the singleton authority for a slot. Claim it before the control CAS or source
+    // request can become visible. Until that CAS commits, periodic feedback keeps flush/apply at
+    // the previously durable floor, so a failed contender cannot release WAL through its proposed
+    // generation boundary.
+    let mut stream = ReplicationStream::start_with_feedback_floor(
+        cfg.source_db_url.expose(),
         slot,
         start_lsn,
-        request_id,
-        expected_tables,
-        &targets_json,
+        retained_floor,
+        &cfg.publication_name,
     )
     .await
-    .context("open bootstrapping epoch")?;
-    let Some(epoch) = opened else {
-        tx.rollback()
-            .await
-            .context("rollback lost bootstrap-generation compare-and-set")?;
-        anyhow::bail!(
-            "another sink opened the successor to {:?}; retry startup to resume the winning bootstrapping generation",
-            prior.as_ref().map(|state| state.epoch)
-        );
-    };
-    for relation in relations {
-        let row = consume::cache_relation(cache, epoch, relation, schema_version)?
-            .context("published user relation classified as internal")?;
-        consume::persist_registry(&mut *tx, &row)
-            .await
-            .context("persist bootstrap relation inventory")?;
-    }
-    tx.commit()
-        .await
-        .context("commit atomic bootstrap generation inventory")?;
+    .context("START_REPLICATION before bootstrap generation registration")?;
 
+    // The epoch row and every registry shape commit together. A restart can therefore see either no
+    // generation or a complete inventory plus the exact request payload; never a partial fanout.
+    let register = async {
+        let mut tx = ctx
+            .control_pool
+            .begin()
+            .await
+            .context("begin bootstrap generation registration")?;
+        let opened = control::bump_bootstrap_epoch(
+            &mut *tx,
+            prior.as_ref().map(|state| state.epoch),
+            slot,
+            start_lsn,
+            request_id,
+            expected_tables,
+            &targets_json,
+        )
+        .await
+        .context("open bootstrapping epoch")?;
+        let Some(epoch) = opened else {
+            tx.rollback()
+                .await
+                .context("rollback lost bootstrap-generation compare-and-set")?;
+            anyhow::bail!(
+                "another sink changed the successor to {:?}; aborting this contender so a later startup can classify the new current generation",
+                prior.as_ref().map(|state| state.epoch)
+            );
+        };
+        for relation in fence.relations {
+            let row = consume::cache_relation(cache, epoch, relation, schema_version)?
+                .context("published user relation classified as internal")?;
+            consume::persist_registry(&mut *tx, &row)
+                .await
+                .context("persist bootstrap relation inventory")?;
+        }
+        tx.commit()
+            .await
+            .context("commit atomic bootstrap generation inventory")?;
+        Ok(epoch)
+    };
+    let epoch =
+        await_while_holding_slot(&mut stream, "bootstrap control registration", register).await?;
+    stream.set_durable(start_lsn);
+
+    // `total_restart` can survive the exact crash seam after the old slot was replaced but before
+    // its successor was registered. In that case the newly-created slot now classifies healthy,
+    // while the durable predecessor status still proves this is destructive recovery.
+    let destructive_restart = prior.as_ref().is_some_and(|predecessor| {
+        predecessor.status == control::ReplicationStatus::TotalRestart
+            || slot_loss_recovery(slot_status).is_some()
+    });
     match &prior {
-        Some(p) => tracing::error!(
+        Some(p) if destructive_restart => tracing::error!(
             old_epoch = %p.epoch,
             new_epoch = %epoch,
             slot,
             ?slot_status,
             "TOTAL-RESTART: opening a new epoch and reconciling every frozen publication target; old-epoch S3 is left to its lifecycle TTL"
         ),
+        Some(p) => tracing::warn!(
+            old_epoch = %p.epoch,
+            new_epoch = %epoch,
+            slot,
+            ?slot_status,
+            "RECONCILED-SUCCESSOR: retaining the healthy replication slot while rebuilding every frozen publication target under a new epoch"
+        ),
         None => tracing::info!(epoch = %epoch, "first bootstrap: created slot + established epoch"),
     }
-    crate::reload_event::request_all_targets(&ctx.source_client, request_id, &targets)
+    let request =
+        crate::reload_event::request_all_targets(&ctx.source_client, request_id, &targets);
+    await_while_holding_slot(&mut stream, "bootstrap source request", request)
         .await
         .context("append initial all-table request to source WAL")?;
-    let stream = ReplicationStream::start(
-        cfg.source_db_url.expose(),
-        slot,
-        start_lsn,
-        &cfg.publication_name,
+    cleanup_epoch_orphans_while_holding_slot(
+        &mut stream,
+        ctx.object_store.as_ref(),
+        &cfg.object_store.bucket,
+        &ctx.control_pool,
+        epoch,
     )
     .await
-    .context("START_REPLICATION (bootstrap reconciliation)")?;
+    .context("collect abandoned bootstrap-epoch objects after claiming slot")?;
     tracing::info!(
         epoch = %epoch,
         tables = targets.len(),
@@ -771,9 +923,75 @@ async fn establish_bootstrap_generation(
     })
 }
 
+/// Await a bootstrap dependency while retaining the slot and periodically sending liveness
+/// feedback. Before the control CAS, the stream's durable position remains the predecessor floor;
+/// the caller advances it after that commit and reuses this helper for the source request.
+async fn await_while_holding_slot<T>(
+    stream: &mut ReplicationStream,
+    operation: &'static str,
+    work: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    tokio::pin!(work);
+    loop {
+        let budget = stream.feedback_budget();
+        tokio::select! {
+            biased;
+            result = &mut work => return result,
+            _ = sleep(budget) => stream
+                .send_received_feedback(false)
+                .await
+                .with_context(|| format!("send replication feedback during {operation}"))?,
+        }
+    }
+}
+
+/// Sweep only while PostgreSQL has granted this process the configured replication slot. Entering
+/// CopyBoth is the race-free singleton test: a prior/competing pod either still owns the slot (so
+/// `START_REPLICATION` failed before this function was reachable) or cannot begin decoding until this
+/// connection releases it. Pump feedback while object listing/deletion is in flight so the ownership
+/// connection itself cannot time out during a large sweep.
+async fn cleanup_epoch_orphans_while_holding_slot(
+    stream: &mut ReplicationStream,
+    store: &dyn object_store::ObjectStore,
+    bucket: &str,
+    pool: &sqlx::PgPool,
+    epoch: EpochNo,
+) -> anyhow::Result<crate::orphan::OrphanCleanupStats> {
+    let cleanup = crate::orphan::cleanup_epoch_orphans(store, bucket, pool, epoch);
+    tokio::pin!(cleanup);
+    loop {
+        let budget = stream.feedback_budget();
+        tokio::select! {
+            biased;
+            result = &mut cleanup => return result,
+            _ = sleep(budget) => stream
+                .send_received_feedback(false)
+                .await
+                .context("send replication feedback while sweeping epoch orphans")?,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn orphan_sweep_is_reachable_only_through_the_active_slot_guard() {
+        let source = include_str!("app.rs");
+        let cleanup_call = ["crate::orphan::", "cleanup_epoch_orphans("].concat();
+        assert_eq!(
+            source.matches(&cleanup_call).count(),
+            1,
+            "startup must never call the destructive sweep outside the helper that requires an active ReplicationStream"
+        );
+        let guarded_signature = [
+            "async fn cleanup_epoch_orphans_while_holding_slot(\n",
+            "    stream: &mut ReplicationStream,",
+        ]
+        .concat();
+        assert!(source.contains(&guarded_signature));
+    }
 
     #[test]
     fn slot_loss_recovery_distinguishes_absence_from_invalidation() {
@@ -798,17 +1016,26 @@ mod tests {
         assert!(generation_can_resume(
             "walrus_a",
             "walrus_a",
-            control::ReplicationStatus::Streaming
+            control::ReplicationStatus::Streaming,
+            true,
         ));
         assert!(!generation_can_resume(
             "walrus_b",
             "walrus_a",
-            control::ReplicationStatus::Streaming
+            control::ReplicationStatus::Streaming,
+            true,
         ));
         assert!(!generation_can_resume(
             "walrus_a",
             "walrus_a",
-            control::ReplicationStatus::TotalRestart
+            control::ReplicationStatus::TotalRestart,
+            true,
+        ));
+        assert!(!generation_can_resume(
+            "walrus_a",
+            "walrus_a",
+            control::ReplicationStatus::Streaming,
+            publication_guard_continuity_proven_on_startup(),
         ));
 
         let drift = assert_generation_slot_name("walrus_b", "walrus_a").unwrap_err();
@@ -819,6 +1046,46 @@ mod tests {
                 recorded,
             } if configured == "walrus_b" && recorded == "walrus_a"
         ));
+    }
+
+    #[test]
+    fn resume_never_starts_before_the_generation_catalog_fence() {
+        let confirmed = common::Lsn::new(0x100);
+        let created = common::Lsn::new(0x200);
+        assert_eq!(resumed_generation_start(confirmed, created), created);
+        assert_eq!(
+            resumed_generation_start(common::Lsn::new(0x300), created),
+            common::Lsn::new(0x300)
+        );
+    }
+
+    #[test]
+    fn future_catalog_fence_versions_block_both_absent_and_invalidated_slot_recovery() {
+        let future = control::ReplicationState {
+            epoch: EpochNo(7),
+            slot_name: "walrus_slot".to_owned(),
+            created_lsn: common::Lsn::new(0x100),
+            catalog_fence_version: control::CURRENT_CATALOG_FENCE_VERSION + 1,
+            status: control::ReplicationStatus::Streaming,
+        };
+        for status in [
+            crate::epoch::SlotStatus::Absent,
+            crate::epoch::SlotStatus::Invalidated,
+        ] {
+            assert!(
+                slot_loss_recovery(status).is_some(),
+                "fixture must exercise a destructive FreshSlot branch"
+            );
+            let error = ensure_catalog_fence_version_supported(&future).unwrap_err();
+            assert!(error.to_string().contains("unsafe binary downgrade"));
+        }
+
+        let mut supported = future;
+        supported.catalog_fence_version = control::CURRENT_CATALOG_FENCE_VERSION;
+        ensure_catalog_fence_version_supported(&supported).unwrap();
+        supported.catalog_fence_version = 0;
+        ensure_catalog_fence_version_supported(&supported)
+            .expect("legacy provenance opens a successor instead of rejecting the binary");
     }
 
     #[test]

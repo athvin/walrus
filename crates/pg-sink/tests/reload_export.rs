@@ -6,10 +6,11 @@
 )]
 //! Parallel export engine against compose (`#[ignore]` — needs source PG + control PG + MinIO).
 //! The remote files' union is the table exactly, every row is stamped `commit_lsn = lsn = F`, a
-//! crashed shared snapshot is purged and replaced by a fresh fenced successor, and a missing
-//! decoder cannot let an exporter query before F is durable. Per-worker tails may add files beyond
-//! `ceil(total_rows/chunk_rows)`; `chunk_no` is the durable completed-file count, never a keyset
-//! cursor. The SQL/stamp shapes are unit-tested in `src/reload_export.rs`.
+//! crashed shared snapshot is purged and replaced by a fresh fenced successor, a protocol-v2
+//! transaction opened before F and committed after H remains a later WAL event, and a missing decoder
+//! cannot let an exporter query before F is durable. Per-range tails may add files beyond
+//! `ceil(total_rows/chunk_rows)`; `chunk_no` is the durable completed-file count, never a keyset cursor.
+//! The SQL/stamp shapes are unit-tested in `src/reload_export.rs`.
 //!
 //! Each test spins a mini fence resolver: a real slot commit-gates `reload_event`, durably records
 //! baseline `F` / terminal `H`, and only then resolves the shared `FenceWaiters`.
@@ -63,6 +64,10 @@ fn control_url() -> String {
 }
 
 async fn admin() -> tokio_postgres::Client {
+    source_client().await
+}
+
+async fn source_client() -> tokio_postgres::Client {
     let (c, conn) = tokio_postgres::connect(&source_url(), NoTls).await.unwrap();
     tokio::spawn(async move {
         let _ = conn.await;
@@ -175,11 +180,26 @@ async fn seed_guc_sensitive_types(
 /// Control-side hygiene for a test epoch (safe to run before and after).
 async fn scrub(pool: &sqlx::PgPool, epoch: EpochNo) {
     for tbl in ["file_manifest", "table_reload", "schema_registry"] {
-        sqlx::query(&format!("DELETE FROM walrus.{tbl} WHERE epoch = $1"))
-            .bind(epoch)
-            .execute(pool)
-            .await
-            .unwrap();
+        let sql = cleanup_sql(tbl);
+        sqlx::query(&sql).bind(epoch).execute(pool).await.unwrap();
+    }
+}
+
+fn cleanup_sql(table: &str) -> String {
+    if table == "file_manifest" {
+        format!(
+            "WITH authorized AS MATERIALIZED (SELECT set_config('walrus.manifest_delete_protocol','2',true) AS protocol) DELETE FROM walrus.{table} WHERE epoch = $1 AND (SELECT protocol = '2' FROM authorized)"
+        )
+    } else if table == "table_reload" {
+        format!(
+            "WITH authorized AS MATERIALIZED (SELECT set_config('walrus.manifest_fence_maintenance','2-delete',true) AS protocol) DELETE FROM walrus.{table} WHERE epoch = $1 AND (SELECT protocol = '2-delete' FROM authorized)"
+        )
+    } else if table == "schema_registry" {
+        format!(
+            "WITH authorized AS MATERIALIZED (SELECT set_config('walrus.schema_registry_maintenance','1-delete',true) AS protocol) DELETE FROM walrus.{table} WHERE epoch = $1 AND (SELECT protocol = '1-delete' FROM authorized)"
+        )
+    } else {
+        format!("DELETE FROM walrus.{table} WHERE epoch = $1")
     }
 }
 
@@ -234,6 +254,72 @@ async fn reload_manifest_rows(
     rows.into_iter()
         .map(|(uri, count, lsn, reload_id)| (uri, count, lsn, ReloadId(reload_id)))
         .collect()
+}
+
+/// Durable receipts for every physical range in one immutable snapshot plan.
+async fn reload_export_range_receipts(
+    pool: &sqlx::PgPool,
+    reload_id: ReloadId,
+) -> Vec<(i64, String, Option<i64>, Option<i64>)> {
+    sqlx::query_as(
+        "SELECT range_no, status, file_count, row_count
+         FROM walrus.table_reload_export_range
+         WHERE reload_id = $1
+         ORDER BY range_no",
+    )
+    .bind(reload_id.0)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// Check file accounting at the same range boundary where the exporter records crash-safe
+/// completion. These fixtures are far below the byte/Parquet-metadata limits, so each range emits
+/// exactly `ceil(range_rows/chunk_rows)` objects (zero for an empty range).
+fn assert_completed_range_receipts(
+    receipts: &[(i64, String, Option<i64>, Option<i64>)],
+    manifest_count: usize,
+    expected_rows: i64,
+    chunk_rows: i64,
+) {
+    assert!(
+        !receipts.is_empty(),
+        "the snapshot has a durable range plan"
+    );
+    assert!(
+        chunk_rows > 0,
+        "the configured object row limit is positive"
+    );
+    let mut receipt_files = 0i64;
+    let mut receipt_rows = 0i64;
+    for (expected_range_no, (range_no, status, file_count, row_count)) in
+        receipts.iter().enumerate()
+    {
+        assert_eq!(
+            *range_no,
+            i64::try_from(expected_range_no).unwrap(),
+            "range receipts retain their contiguous plan ordinals"
+        );
+        assert_eq!(status, "complete", "every planned range is sealed");
+        let file_count = file_count.expect("a completed range records its file count");
+        let row_count = row_count.expect("a completed range records its row count");
+        let expected_file_count = row_count / chunk_rows + i64::from(row_count % chunk_rows != 0);
+        assert_eq!(
+            file_count, expected_file_count,
+            "one independently receipted range has only row-limit objects plus its tail"
+        );
+        receipt_files += file_count;
+        receipt_rows += row_count;
+    }
+    assert_eq!(
+        receipt_files,
+        i64::try_from(manifest_count).unwrap(),
+        "range receipts account for every reload manifest"
+    );
+    assert_eq!(
+        receipt_rows, expected_rows,
+        "range receipts account for the complete snapshot"
+    );
 }
 
 /// Wait until at least one independently completed worker object is durable in control-pg.
@@ -330,7 +416,23 @@ async fn chunks_cover_the_table_exactly_with_shared_baseline_stamp() {
         .expect("fence resolver starts")
         .expect("fence resolver ready sender remains live");
     let mut watch_rx = resolver.watched_commit;
+    let mut streamed_watch_rx = resolver.watched_stream_commit;
     let resolver = resolver.handle;
+
+    // Open a transaction before F, make it large enough to force protocol-v2 segments, and leave it
+    // uncommitted through the entire export. Its rows are absent from PostgreSQL's exported snapshot;
+    // logical decoding must retain the open transaction and surface it only at its later commit LSN.
+    let long_tx = source_client().await;
+    long_tx
+        .batch_execute(&format!(
+            "BEGIN;
+             SET LOCAL logical_decoding_work_mem = '64kB';
+             INSERT INTO public.{TABLE} (id, val)
+             SELECT g, repeat('long-open-', 32) || g
+               FROM generate_series(2502, 10501) g;"
+        ))
+        .await
+        .unwrap();
 
     let req = request_and_claim(&pool, epoch).await;
     let reload_id = req.reload_id;
@@ -401,6 +503,17 @@ async fn chunks_cover_the_table_exactly_with_shared_baseline_stamp() {
         final_h > overlap_commit,
         "terminal H ({final_h}) follows the overlapping WAL commit ({overlap_commit})"
     );
+    long_tx.batch_execute("COMMIT").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(20), streamed_watch_rx.changed())
+        .await
+        .expect("the pre-F large transaction eventually reaches StreamCommit")
+        .expect("the resolver holds the streamed watcher until cancellation");
+    let long_commit = (*streamed_watch_rx.borrow_and_update())
+        .expect("a protocol-v2 watched transaction has a commit LSN");
+    assert!(
+        long_commit > final_h,
+        "a transaction begun before F but committed after H must remain a later WAL event: {long_commit} > {final_h}"
+    );
     let markers = control::reload::read_markers(&pool, reload_id)
         .await
         .unwrap();
@@ -416,14 +529,11 @@ async fn chunks_cover_the_table_exactly_with_shared_baseline_stamp() {
         "the decoder persisted F then H before resolving each waiter"
     );
 
-    // Ten full-size equivalents cover 2,500 rows. Independent worker tails may add up to one
-    // partial object per four workers, so file order/count is deliberately not keyset-deterministic.
+    // Each physical range is independently receipted, so every non-empty range may contribute a
+    // partial tail. Validate the persisted range accounting instead of assuming one tail per worker.
     let files = reload_manifest_rows(&pool, epoch).await;
-    assert!(
-        (10..=13).contains(&files.len()),
-        "2500 rows / 250 per object plus at most three extra worker tails: {} files",
-        files.len()
-    );
+    let receipts = reload_export_range_receipts(&pool, reload_id).await;
+    assert_completed_range_receipts(&receipts, files.len(), 2500, 250);
     assert_eq!(files.iter().map(|file| file.1).sum::<i64>(), 2500);
     assert!(files.iter().all(|file| (1..=250).contains(&file.1)));
     let ends: Vec<Lsn> = files.iter().map(|f| f.2.parse().unwrap()).collect();
@@ -479,6 +589,10 @@ async fn chunks_cover_the_table_exactly_with_shared_baseline_stamp() {
     assert!(
         !unique.contains(&2501),
         "all workers exclude rows committed after S"
+    );
+    assert!(
+        !unique.contains(&2502) && !unique.contains(&10501),
+        "all workers exclude the long transaction that was open in S"
     );
     token.cancel();
     resolver.await.unwrap();
@@ -616,16 +730,20 @@ async fn adopted_file_progress_is_purged_and_successor_reexports_one_snapshot() 
     ));
 
     let files = reload_manifest_rows(&pool, epoch).await;
-    assert!(
-        (3..=6).contains(&files.len()),
-        "the successor writes three full-size equivalents plus worker tails: {} files",
-        files.len()
-    );
+    let receipts = reload_export_range_receipts(&pool, successor_id).await;
+    assert_completed_range_receipts(&receipts, files.len(), 2500, 1000);
     assert!(files.iter().all(|file| file.3 == successor_id));
+    assert_eq!(files.iter().map(|file| file.1).sum::<i64>(), 2500);
+    assert!(files.iter().all(|file| (1..=1000).contains(&file.1)));
     let mut total = 0usize;
     let mut unique = BTreeSet::new();
-    for (uri, _, _, _) in &files {
+    for (uri, row_count, _, _) in &files {
         let (ids, _) = read_chunk_file(uri).await;
+        assert_eq!(
+            i64::try_from(ids.len()).unwrap(),
+            *row_count,
+            "manifest row count matches the Parquet object"
+        );
         total += ids.len();
         unique.extend(ids);
     }

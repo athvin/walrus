@@ -13,7 +13,7 @@
 //!
 //!   cargo test -p pg-sink --test ddl_capture -- --ignored
 
-use common::{EpochNo, Lsn};
+use common::{EpochNo, Lsn, UtcTimestamp};
 use pg_sink::batch::{BatchTriggers, SystemClock};
 use pg_sink::consume::{BatchRouter, cache_relation, flush_batch, on_frame, persist_registry};
 use pg_sink::ddl::{DdlConsumer, DdlEvent, TransactionScope};
@@ -73,6 +73,38 @@ async fn drop_slot(admin: &tokio_postgres::Client, slot: &str) {
         .await;
 }
 
+async fn clear_control_epoch(pool: &sqlx::PgPool, epoch: EpochNo) {
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SELECT set_config('walrus.manifest_delete_protocol','2',true)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("SELECT set_config('walrus.manifest_fence_maintenance','2-delete',true)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("SELECT set_config('walrus.schema_registry_maintenance','1-delete',true)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    for table in [
+        "file_manifest",
+        "stream_manifest_group",
+        "stream_txn_publication",
+        "manifest_publication_fence",
+        "ddl_manifest",
+        "schema_registry",
+    ] {
+        let statement = format!("DELETE FROM walrus.{table} WHERE epoch = $1");
+        sqlx::query(&statement)
+            .bind(epoch)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+}
+
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (source + MinIO + control PG)"]
 async fn alter_add_column_bumps_version_and_cuts_file() {
@@ -107,13 +139,7 @@ async fn alter_add_column_bumps_version_and_cuts_file() {
     let sink = ParquetSink::new(minio(), "walrus", epoch);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
-    for tbl in ["file_manifest", "ddl_manifest", "schema_registry"] {
-        sqlx::query(&format!("DELETE FROM walrus.{tbl} WHERE epoch = $1"))
-            .bind(epoch)
-            .execute(&pool)
-            .await
-            .unwrap();
-    }
+    clear_control_epoch(&pool, epoch).await;
     let mut stream =
         ReplicationStream::start(&source_url(), slot, resume.start_lsn(), "walrus_pub")
             .await
@@ -133,6 +159,8 @@ async fn alter_add_column_bumps_version_and_cuts_file() {
     let mut internal = InternalTables::default();
     let mut cache = RelationCache::default();
     let mut ctx = StreamCtx::default();
+    let mut ordinary_xid = None;
+    let mut ordinary_has_routed_data = false;
 
     // v1 row · ALTER ADD COLUMN · v2 rows · COMMENT (metadata) · a final v2 row to give a stop marker.
     admin
@@ -178,6 +206,16 @@ async fn alter_add_column_bumps_version_and_cuts_file() {
                 continue;
             };
             match &msg {
+                Message::Begin { xid, .. } => {
+                    assert!(
+                        ordinary_xid.replace(*xid).is_none(),
+                        "ordinary transactions cannot overlap"
+                    );
+                    ordinary_has_routed_data = false;
+                    router
+                        .route(&cache, &msg, frame_lsn, common::SchemaVersionNo(1))
+                        .unwrap();
+                }
                 Message::Relation { relation, .. } => {
                     internal.note_relation(relation);
                     let v = ddl.version_for(
@@ -235,6 +273,7 @@ async fn alter_add_column_bumps_version_and_cuts_file() {
                     }
                 }
                 Message::Insert { new, .. } => {
+                    ordinary_has_routed_data = true;
                     router
                         .route(&cache, &msg, frame_lsn, common::SchemaVersionNo(1))
                         .unwrap();
@@ -243,11 +282,26 @@ async fn alter_add_column_bumps_version_and_cuts_file() {
                         end_pending = true;
                     }
                 }
-                Message::Commit { commit_lsn, .. } => {
+                Message::Commit {
+                    commit_lsn,
+                    commit_ts,
+                    ..
+                } => {
+                    let xid = ordinary_xid.take().expect("Commit has a matching Begin");
+                    let has_routed_data = std::mem::take(&mut ordinary_has_routed_data);
                     let sealed = router
                         .route(&cache, &msg, frame_lsn, common::SchemaVersionNo(1))
                         .unwrap();
-                    ddl.on_commit(&pool, *commit_lsn).await.unwrap();
+                    ddl.on_commit(
+                        &pool,
+                        xid,
+                        *commit_lsn,
+                        UtcTimestamp::from_pg_micros(*commit_ts).unwrap(),
+                        has_routed_data,
+                        0,
+                    )
+                    .await
+                    .unwrap();
                     for sealed in sealed {
                         flush_batch(&sink, &pool, epoch, sealed).await.unwrap();
                     }
@@ -263,7 +317,7 @@ async fn alter_add_column_bumps_version_and_cuts_file() {
     .expect("the DDL + rows stream within 30s");
 
     // Final drain: force-seal the buffered v2 rows into a v2 file.
-    for sealed in router.drain_committed().unwrap() {
+    for sealed in router.drain_for_shutdown().unwrap() {
         flush_batch(&sink, &pool, epoch, sealed).await.unwrap();
     }
 
@@ -311,6 +365,23 @@ async fn alter_add_column_bumps_version_and_cuts_file() {
         "COMMENT is metadata-only — no version bump beyond the structural 2"
     );
 
+    // The ordinary ALTER has a durable, ordered zero-child group. Its real Begin xid, Commit LSN,
+    // and final schema version make it indistinguishable from a streamed schema-only barrier to the
+    // loader. COMMENT remains audit-only and therefore creates no second group.
+    let barriers: Vec<(i64, i64, String, i64)> = sqlx::query_as(
+        "SELECT expected_files, final_schema_version, commit_lsn::text, top_xid \
+         FROM walrus.stream_manifest_group WHERE epoch = $1 ORDER BY id",
+    )
+    .bind(epoch)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(barriers.len(), 1, "only structural DDL creates a barrier");
+    assert_eq!(barriers[0].0, 0, "ordinary DDL barrier has no dummy files");
+    assert_eq!(barriers[0].1, 2);
+    assert_eq!(barriers[0].2, alter.2);
+    assert!(barriers[0].3 > 0, "receipt retains the real source xid");
+
     // Internal tables are NEVER materialised.
     let internal_files: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM walrus.file_manifest WHERE epoch = $1 AND source_table IN ('ddl_audit', 'heartbeat')",
@@ -337,12 +408,7 @@ async fn alter_add_column_bumps_version_and_cuts_file() {
             let _ = store.delete(&object_store::path::Path::from(key)).await;
         }
     }
-    for tbl in ["file_manifest", "ddl_manifest", "schema_registry"] {
-        let _ = sqlx::query(&format!("DELETE FROM walrus.{tbl} WHERE epoch = $1"))
-            .bind(epoch)
-            .execute(&pool)
-            .await;
-    }
+    clear_control_epoch(&pool, epoch).await;
     let _ = admin
         .execute(
             "ALTER TABLE public.orders DROP COLUMN IF EXISTS ddl_extra",

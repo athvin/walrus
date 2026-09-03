@@ -3,12 +3,13 @@
     clippy::expect_used,
     reason = "integration test — unwrap/expect fine in setup + helpers"
 )]
-//! End-to-end total-restart (`architecture.md` "Slot loss / total-restart" + §1.8): when the single
-//! lifelong slot is **lost** on a successful connection, the sink bumps the epoch, opens a new slot,
-//! and requests fenced reconciliation for every table under the new generation; the loaders detect
-//! the new epoch and rebuild every `.duckdb` (raw re-appended, mirror re-derived), resetting **both**
-//! watermarks. And the load-bearing guard: a **transient disconnect is NOT slot loss** — it resumes from
-//! `confirmed_flush` and must never bump the epoch.
+//! End-to-end generation recovery. When the replication slot is **lost** on a successful connection,
+//! the sink performs a destructive total restart: it opens a replacement slot and a reconciled
+//! successor epoch. When the slot remains healthy across a process restart, the sink retains its WAL
+//! but still opens a reconciled successor because the process cannot prove that its publication-DDL
+//! guard remained continuous while it was offline. Only the destructive path is a `TOTAL-RESTART`.
+//! In both cases the running loader detects the new epoch, exits, and rebuilds every `.duckdb` under
+//! the successor (raw re-appended, mirror re-derived), resetting **both** watermarks.
 //!
 //! The self-heal model is crash-and-restart (§ startup/bootstrap): dropping the slot terminates the
 //! sink's walsender, so the sink exits; on restart it classifies the slot and total-restarts. The loader
@@ -67,10 +68,27 @@ async fn dropping_the_slot_triggers_epoch_bump_and_full_rebuild() {
         h.sink_log_contains("TOTAL-RESTART"),
         "the sink logged a loud total-restart"
     );
+    assert!(
+        !h.sink_log_contains("RECONCILED-SUCCESSOR"),
+        "destructive slot replacement must not be reported as retained-slot recovery"
+    );
+    let predecessor_status: String =
+        sqlx::query_scalar("SELECT status FROM walrus.replication_state WHERE epoch = $1")
+            .bind(1_i64)
+            .fetch_one(h.control_pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        predecessor_status, "total_restart",
+        "slot loss durably arms destructive recovery before replacement"
+    );
 
-    // The loader must rebuild every .duckdb under the new epoch. It self-exits on the detected bump; kill
-    // it (tolerant of an already-exited process) and restart so bootstrap wipes + rebuilds under epoch 2.
-    h.stop_loader().await.unwrap();
+    // The loader must observe the generation retirement and exit before its replacement rebuilds every
+    // .duckdb under epoch 2. Waiting for the actual exit makes this guard observable instead of masking a
+    // broken epoch watcher with a test-driven kill.
+    h.await_loader_exited(Duration::from_secs(60))
+        .await
+        .expect("epoch-1 loader exits after destructive generation retirement");
     h.restart_loader()
         .await
         .expect("loader restarts → rebuild under epoch 2");
@@ -114,11 +132,11 @@ async fn dropping_the_slot_triggers_epoch_bump_and_full_rebuild() {
     );
 }
 
-/// A transient disconnect (walsender terminated, slot intact) must NOT total-restart: the sink resumes
-/// from `confirmed_flush` under the SAME epoch — the false-positive guard (§1.8).
+/// A retained healthy slot avoids destructive replacement, but every new sink process opens a fenced,
+/// fully reconciled successor because publication-guard continuity cannot span the process boundary.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires docker compose up --wait (source PG + control PG + MinIO)"]
-async fn transient_disconnect_does_not_trigger_total_restart() {
+async fn retained_slot_restart_opens_a_reconciled_successor_without_total_restart() {
     let mut h = Harness::start().await.expect("bring up sink + loader");
     for i in 0..100 {
         h.source_exec(&format!(
@@ -137,41 +155,117 @@ async fn transient_disconnect_does_not_trigger_total_restart() {
     assert_eq!(
         h.current_epoch().await.unwrap(),
         1,
-        "epoch 1 before the blip"
+        "epoch 1 before the process restart"
     );
+    let retained_floor = h
+        .slot_confirmed_flush()
+        .await
+        .expect("read the healthy slot's durable floor before restart");
 
-    // A TRANSIENT disconnect: terminate the sink's walsender WITHOUT dropping the slot (the slot survives).
-    // The sink exits on the dropped connection; restart it — it classifies the slot HEALTHY (present) and
-    // RESUMES from confirmed_flush. This must NOT bump the epoch or request a full reconciliation.
+    // Terminate the walsender WITHOUT dropping the slot. The replacement process cannot inherit the old
+    // session's publication guard, so it retains the slot/WAL floor but opens a fully reconciled epoch 2.
+    // This is deliberately distinct from the absent-slot path: no total-restart intent is armed and no
+    // source slot is replaced.
     h.terminate_walsender()
         .await
         .expect("bounce the sink's replication connection");
-    h.restart_sink().await.expect("sink restarts → resume");
+    h.restart_sink()
+        .await
+        .expect("sink restarts with the healthy slot retained");
+    let new_epoch = h
+        .await_epoch_past(1, Duration::from_secs(60))
+        .await
+        .expect("the new process opens a reconciled successor");
+    assert_eq!(new_epoch, 2, "one successor generation was opened");
+    h.refresh_epoch().await.unwrap();
 
-    // A fresh write converges under the SAME epoch.
+    let successor = control::read_current_epoch(h.control_pool())
+        .await
+        .unwrap()
+        .expect("successor generation exists");
+    assert!(
+        successor.created_lsn >= retained_floor,
+        "the successor fence must not precede the retained slot floor"
+    );
+    let predecessor_status: String =
+        sqlx::query_scalar("SELECT status FROM walrus.replication_state WHERE epoch = $1")
+            .bind(1_i64)
+            .fetch_one(h.control_pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        predecessor_status, "streaming",
+        "retaining a healthy slot must not arm destructive total-restart intent"
+    );
+    assert!(
+        h.sink_log_contains("RECONCILED-SUCCESSOR"),
+        "the restart is reported as a retained-slot reconciled successor"
+    );
+    assert!(
+        !h.sink_log_contains("TOTAL-RESTART"),
+        "a healthy retained slot must not be reported as destructive replacement"
+    );
+
+    // The epoch-1 loader must retire itself. Its replacement stays unready until the sink's complete
+    // frozen target set has reconciled, then rebuilds the local DuckLake state under epoch 2.
+    h.await_loader_exited(Duration::from_secs(60))
+        .await
+        .expect("epoch-1 loader exits after observing the successor");
+    h.restart_loader()
+        .await
+        .expect("loader restarts and rebuilds under epoch 2");
+    let reconciled: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+           SELECT 1
+           FROM walrus.table_reload tr
+           JOIN walrus.replication_state rs
+             ON rs.epoch = tr.epoch
+            AND rs.bootstrap_request_id = tr.parent_request_id
+           WHERE tr.epoch = $1
+             AND tr.source_schema = 'public'
+             AND tr.source_table = 'orders'
+             AND tr.request_scope = 'all_published'
+             AND tr.status = 'complete'
+         )",
+    )
+    .bind(new_epoch)
+    .fetch_one(h.control_pool())
+    .await
+    .unwrap();
+    assert!(
+        reconciled,
+        "epoch-2 readiness requires the frozen orders baseline to publish completely"
+    );
+    assert_eq!(
+        control::read_current_epoch(h.control_pool())
+            .await
+            .unwrap()
+            .expect("current generation")
+            .status,
+        control::ReplicationStatus::Streaming,
+        "the successor is promoted only after its full reconciliation"
+    );
+
+    // A fresh write now converges after the reconciled epoch-2 baseline.
     let before2 = h.source_wal_lsn().await.unwrap();
     h.source_exec("UPDATE public.orders SET status = 'sentinel2' WHERE id = 999999")
         .await
         .unwrap();
     h.await_transformed_past("orders", before2, Duration::from_secs(180))
         .await
-        .expect("resume converges");
+        .expect("successor converges");
     h.stop_loader().await.unwrap();
 
     assert_eq!(
         h.current_epoch().await.unwrap(),
-        1,
-        "a transient disconnect must NOT bump the epoch (no total-restart)"
-    );
-    assert!(
-        !h.sink_log_contains("TOTAL-RESTART"),
-        "the restarted sink resumed — it did NOT total-restart on a transient blip"
+        2,
+        "the retained-slot restart remains on its single reconciled successor"
     );
     h.assert_mirror_equals_source("orders").await.unwrap();
     let n = h
         .duckdb_scalar("orders", "SELECT count(*) FROM orders_current")
         .unwrap();
-    assert_eq!(n, 101, "100 rows + sentinel, resumed intact");
+    assert_eq!(n, 101, "100 rows + sentinel, rebuilt intact");
 }
 
 /// A crash after creating a replacement slot but before opening its successor generation leaves a
@@ -207,4 +301,8 @@ async fn healthy_slot_with_restart_intent_opens_a_reconciled_successor() {
         .expect("restart intent opens a successor generation");
     assert_eq!(new_epoch, 2);
     assert!(h.sink_log_contains("TOTAL-RESTART"));
+    assert!(
+        !h.sink_log_contains("RECONCILED-SUCCESSOR"),
+        "a healthy replacement slot with durable restart intent still belongs to the destructive path"
+    );
 }

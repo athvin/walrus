@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO walrus.replication_state\n  (epoch, slot_name, created_lsn, status, catalog_fence_version)\nVALUES ($1, $2, $3, $4, 0)\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        {
+          "Custom": {
+            "name": "pg_lsn",
+            "kind": "Simple"
+          }
+        },
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "74c80405720173a5ec13388c0ecc78f36abb99354c290ff429622464ee64b518"
+}

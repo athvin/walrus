@@ -672,6 +672,30 @@ fn commit_decodes() {
 }
 
 #[test]
+fn commit_vectors_keep_order_lsn_distinct_from_feedback_end_lsn() {
+    for name in ["commit", "stream_commit"] {
+        let message = decode(lookup(name).hex, lookup(name).streaming);
+        let (commit_lsn, end_lsn) = match message {
+            Message::Commit {
+                commit_lsn,
+                end_lsn,
+                ..
+            }
+            | Message::StreamCommit {
+                commit_lsn,
+                end_lsn,
+                ..
+            } => (commit_lsn, end_lsn),
+            other => panic!("expected commit boundary for {name}, got {other:?}"),
+        };
+        assert!(
+            end_lsn > commit_lsn,
+            "{name}: feedback must advance beyond the commit record's identity LSN"
+        );
+    }
+}
+
+#[test]
 fn parse_stream_skips_newline_separators() {
     // begin \n commit \n → [Begin, Commit]; the 0x0a bytes are separators, not data.
     let mut raw = hex::decode(lookup("begin").hex).unwrap();

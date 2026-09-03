@@ -7,9 +7,10 @@
 //! the loader mid-MERGE, restart both, and prove the pipeline reaches the **same** state it would have
 //! without the crash — **effectively-once, no loss, no dupes, no resurrected deletes**. This is the payoff
 //! of the durability rules built earlier: the sink advances `confirmed_flush_lsn` only after the S3 PUT +
-//! manifest are durable, so an ungraceful kill re-streams a few already-durable changes; the loader's raw
-//! `APPEND … ON CONFLICT DO NOTHING` + the guarded `MERGE` collapse that at-least-once replay into an
-//! effectively-once result.
+//! manifest are durable. A replacement sink retains that slot floor but opens a newly fenced generation,
+//! and its full snapshot/WAL overlay includes changes committed while the process was down. The loader's
+//! raw `APPEND … ON CONFLICT DO NOTHING` + guarded `MERGE` collapse any overlap into an effectively-once
+//! result.
 //!
 //!   docker compose -f deploy/docker/docker-compose.yml up --wait
 //!   cargo test -p e2e --features it -- --ignored
@@ -19,12 +20,13 @@ use e2e::Harness;
 use std::time::Duration;
 
 /// SIGKILL the sink after a batch's Parquet PUT (mid-batch — between the durable S3 object and the standby
-/// update that would advance the slot), keep writing while it is down, restart it, and converge: the
-/// mirror equals the source with no loss (the un-acked batch re-streams) and no dupes (append dedup).
+/// update that would advance the slot), keep writing while it is down, restart it into a reconciled
+/// successor generation, and converge: the mirror equals the source with no loss or duplicates.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires docker compose up --wait (source PG + control PG + MinIO)"]
 async fn sink_killed_mid_batch_loses_nothing() {
     let mut h = Harness::start().await.expect("bring up sink + loader");
+    let old_epoch = h.epoch;
 
     // Batch 1: a steady stream of committed rows. Each small txn is a fresh commit the sink must PUT.
     for i in 0..400 {
@@ -46,8 +48,8 @@ async fn sink_killed_mid_batch_loses_nothing() {
     }
     h.kill_sink().await.unwrap();
 
-    // Batch 2: committed WHILE the sink is dead — buffered in the slot's retained WAL. A correct resume
-    // re-streams from `confirmed_flush_lsn` and loses none of these.
+    // Batch 2: committed WHILE the sink is dead — buffered above the slot's retained floor. A correct
+    // successor fences a fresh snapshot at or after that floor and loses none of these.
     for i in 400..800 {
         h.source_exec(&format!(
             "INSERT INTO public.orders (id, status) VALUES ({i}, 'batch2')"
@@ -55,7 +57,22 @@ async fn sink_killed_mid_batch_loses_nothing() {
         .await
         .unwrap();
     }
-    h.restart_sink().await.expect("sink restarts and resumes");
+    h.restart_sink()
+        .await
+        .expect("sink restarts into a reconciled successor");
+    let new_epoch = h
+        .await_epoch_past(old_epoch, Duration::from_secs(60))
+        .await
+        .expect("replacement sink opens a successor generation");
+    assert_eq!(new_epoch, old_epoch + 1);
+    h.refresh_epoch().await.unwrap();
+
+    // The old loader exits when it observes the generation bump. Reap it (or stop it if the watch
+    // has not fired yet), then bootstrap a writer fenced to the successor's registry/checkpoints.
+    h.stop_loader().await.unwrap();
+    h.restart_loader()
+        .await
+        .expect("loader rebuilds under the successor generation");
 
     // Converge: capture a post-write watermark, drop a sentinel that lands last, await the loader past it.
     let before = h.source_wal_lsn().await.unwrap();
@@ -64,7 +81,7 @@ async fn sink_killed_mid_batch_loses_nothing() {
         .unwrap();
     h.await_transformed_past("orders", before, Duration::from_secs(180))
         .await
-        .expect("pipeline converges after sink restart");
+        .expect("successor generation converges after sink restart");
     h.stop_loader().await.unwrap();
 
     // Effectively-once: the mirror equals the source exactly — every committed row present once, no dupes.

@@ -1,7 +1,7 @@
 //! Control-DB connection pool and migration runner.
 
 use crate::parse::ParseEnumError;
-use common::{FailureClass, ReloadId};
+use common::{EpochNo, FailureClass, Lsn, ReloadId};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use uuid::Uuid;
 
@@ -59,6 +59,40 @@ pub enum ControlError {
         expected: &'static str,
     },
 
+    /// A replay of a streamed commit found a durable publication receipt with a conflicting
+    /// identity. A publication is one control transaction, so partial/mismatched state is never a
+    /// retryable condition.
+    #[error("stream publication conflict for epoch {epoch}, xid {top_xid}, commit {commit_lsn}")]
+    StreamPublicationConflict {
+        epoch: EpochNo,
+        top_xid: u32,
+        commit_lsn: Lsn,
+    },
+
+    /// An append-only DDL or schema-registry key was replayed with different content. Rewriting
+    /// schema history would make already-published files mean something different, so this is a
+    /// terminal source/protocol conflict rather than an upsert.
+    #[error("immutable {entity} history conflict at {key}")]
+    ImmutableHistoryConflict {
+        /// Durable history relation whose key collided.
+        entity: &'static str,
+        /// Human-readable immutable primary key.
+        key: String,
+    },
+
+    /// A manifest or group failed a Rust-side invariant before SQL was allowed to mutate state.
+    #[error("manifest invariant violated: {message}")]
+    ManifestInvariant { message: String },
+
+    /// A loader tried to mutate table-scoped recovery/publication state after its ownership lease
+    /// expired or its monotonic fencing token was replaced.
+    #[error("table ownership fence lost for epoch {epoch} table {schema}.{table}")]
+    TableOwnershipFenceLost {
+        epoch: EpochNo,
+        schema: String,
+        table: String,
+    },
+
     /// A text column held a value outside its enum's known set (e.g. an unrecognised `file_manifest`
     /// `kind`/`status`). The DB CHECK and the sink's `as_str()` writer should make this impossible,
     /// so it is a data-integrity bug — terminal, never transient.
@@ -76,6 +110,10 @@ impl FailureClass for ControlError {
             | ControlError::ReloadInProgress { .. }
             | ControlError::SourceRequestConflict { .. }
             | ControlError::ReloadTransition { .. }
+            | ControlError::StreamPublicationConflict { .. }
+            | ControlError::ImmutableHistoryConflict { .. }
+            | ControlError::ManifestInvariant { .. }
+            | ControlError::TableOwnershipFenceLost { .. }
             | ControlError::Decode(_) => true,
             ControlError::Connect(_) => false,
         }

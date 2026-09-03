@@ -110,7 +110,7 @@ async fn idle_publication_beats_and_advances_confirmed_flush() {
     let mut internal = InternalTables::default();
     let mut ctx = StreamCtx::default();
     let mut saw_beat = false;
-    let mut hb_commit: Option<Lsn> = None;
+    let mut hb_commit: Option<(Lsn, Lsn)> = None;
     tokio::time::timeout(Duration::from_secs(15), async {
         while hb_commit.is_none() {
             let frame = stream.next().await.unwrap().unwrap();
@@ -134,7 +134,11 @@ async fn idle_publication_beats_and_advances_confirmed_flush() {
                         heartbeat.observe_return(got, Instant::now());
                         saw_beat = true;
                     }
-                    Message::Commit { commit_lsn, .. } if saw_beat => hb_commit = Some(*commit_lsn),
+                    Message::Commit {
+                        commit_lsn,
+                        end_lsn,
+                        ..
+                    } if saw_beat => hb_commit = Some((*commit_lsn, *end_lsn)),
                     _ => {}
                 }
             }
@@ -144,12 +148,14 @@ async fn idle_publication_beats_and_advances_confirmed_flush() {
     .expect("the beat returns through the stream within 15s");
 
     // Idle → no un-durable user data → the beat's commit advances confirmed_flush.
-    let hb = hb_commit.unwrap();
-    checkpoint.on_batch_durable(hb);
+    let (hb, hb_end) = hb_commit.unwrap();
+    assert!(hb_end > hb, "Commit end_lsn must follow its commit_lsn");
+    checkpoint.observe_commit(hb, hb_end).unwrap();
+    checkpoint.on_commit_durable(hb).unwrap();
     checkpoint.send(&mut stream, false).await.unwrap();
     let mut reached = false;
     for _ in 0..40 {
-        if confirmed_flush(&admin, slot).await >= hb {
+        if confirmed_flush(&admin, slot).await >= hb_end {
             reached = true;
             break;
         }
@@ -157,7 +163,7 @@ async fn idle_publication_beats_and_advances_confirmed_flush() {
     }
     assert!(
         reached,
-        "the idle beat advanced confirmed_flush_lsn to its commit"
+        "the idle beat advanced confirmed_flush_lsn through its commit record"
     );
 
     // The heartbeat change is NEVER staged: no manifest row was written for walrus.heartbeat.

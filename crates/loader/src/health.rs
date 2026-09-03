@@ -12,6 +12,7 @@ use axum::{
     Router, extract::State, http::StatusCode, http::header, response::IntoResponse, routing::get,
 };
 use parking_lot::Mutex;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Instant;
@@ -120,6 +121,12 @@ impl AtomicPhase {
 #[derive(Debug, Default)]
 pub struct LoaderState {
     phase: AtomicPhase,
+    /// Idempotent table identities currently requiring a replacement generation. A set (rather
+    /// than a boolean/counter) prevents one table's successful reload from clearing another
+    /// table's independent quarantine and makes repeated polls harmless.
+    // Mutations are brief, synchronous set operations.
+    // LOCK-CHOICE: parking_lot::Mutex — the guard is never held across an await.
+    quarantined_tables: Mutex<HashSet<(String, String)>>,
     /// Fresh all-table reconciliation gates external readiness independently of local startup.
     /// Keeping this separate from quarantine means a repaired table cannot accidentally advertise
     /// ready before the rest of its bootstrap group has published.
@@ -142,16 +149,36 @@ impl LoaderState {
 
     /// Local bootstrap finished for an already-published generation: leases held + files open →
     /// `/startup` and `/ready` answer 200.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the quarantine lock fences phase publication against a concurrent table quarantine"
+    )]
     pub fn mark_ready(&self) {
         self.generation_ready.store(true, Ordering::Release);
-        self.phase.store(LoaderPhase::Ready);
+        let quarantined = self.quarantined_tables.lock();
+        let phase = if quarantined.is_empty() {
+            LoaderPhase::Ready
+        } else {
+            LoaderPhase::Quarantined
+        };
+        self.phase.store(phase);
     }
 
     /// Local bootstrap finished, but the control generation is still reconciling its frozen table
     /// group. `/startup` succeeds and liveness runs; `/ready` remains gated.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the quarantine lock fences phase publication against a concurrent table quarantine"
+    )]
     pub fn mark_reconciling(&self) {
         self.generation_ready.store(false, Ordering::Release);
-        self.phase.store(LoaderPhase::Ready);
+        let quarantined = self.quarantined_tables.lock();
+        let phase = if quarantined.is_empty() {
+            LoaderPhase::Ready
+        } else {
+            LoaderPhase::Quarantined
+        };
+        self.phase.store(phase);
     }
 
     /// The sink promoted this generation after every table shadow was published.
@@ -192,6 +219,18 @@ impl LoaderState {
     /// exit: a single-table-reload rebuild, which REPLACES the data instead of
     /// retrying the cast on it ([`LoaderState::clear_quarantine`]).
     pub fn quarantine(&self) {
+        self.quarantine_table("__walrus_internal", "legacy_process_quarantine");
+    }
+
+    /// Degrade readiness for one table. Repeating the same table identity is idempotent. Schema and
+    /// table stay separate because joining legal quoted identifiers with `.` is not injective.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the quarantine lock must cover both set insertion and phase publication"
+    )]
+    pub fn quarantine_table(&self, schema: &str, table: &str) {
+        let mut quarantined = self.quarantined_tables.lock();
+        quarantined.insert((schema.to_string(), table.to_string()));
         self.phase.store(LoaderPhase::Quarantined);
     }
 
@@ -199,9 +238,23 @@ impl LoaderState {
     /// the attempt's schema_version, so the lossy cast the latch recorded no longer applies to
     /// anything — `/ready` recovers.
     pub fn clear_quarantine(&self) {
-        let _transitioned = self
-            .phase
-            .transition(LoaderPhase::Quarantined, LoaderPhase::Ready);
+        self.clear_table_quarantine("__walrus_internal", "legacy_process_quarantine");
+    }
+
+    /// Clear one table's quarantine only. Readiness recovers after the final table is repaired.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the quarantine lock prevents a concurrent insertion from being cleared by this phase transition"
+    )]
+    pub fn clear_table_quarantine(&self, schema: &str, table: &str) {
+        let mut quarantined = self.quarantined_tables.lock();
+        quarantined.remove(&(schema.to_string(), table.to_string()));
+        let empty = quarantined.is_empty();
+        if empty {
+            let _transitioned = self
+                .phase
+                .transition(LoaderPhase::Quarantined, LoaderPhase::Ready);
+        }
     }
 
     /// Whether the quarantine latch is set — the state `/ready` reports 503 for while `/startup`

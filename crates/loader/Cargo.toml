@@ -33,10 +33,14 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 figment = { workspace = true, features = ["env", "toml", "yaml"] }
 humantime-serde = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "net", "time", "fs", "sync"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "net", "time", "fs", "sync", "io-util"] }
 tokio-util = { workspace = true }
 axum = { workspace = true }
 object_store = { workspace = true, features = ["aws"] }
+futures-util = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+tempfile = { workspace = true }
 tracing = { workspace = true }
 # Stable UUID-v5 names isolate each source table's internal DuckLake objects without leaking or
 # truncating PostgreSQL identifiers into the shared catalog namespace.
@@ -54,10 +58,6 @@ tokio = { workspace = true, features = ["io-util"] }
 criterion = { workspace = true }
 # The append bench generates a local Parquet fixture with the sink's own writer (Arrow → Parquet).
 pg-to-arrow = { workspace = true }
-# RAII scratch fixtures: the bench's Parquet file and every test that needs a real `.duckdb` file.
-# The guard deletes the directory on drop, so a panicking assertion cannot leak it.
-tempfile = { workspace = true }
-
 # `harness = false` hands the bench binary to criterion_main! instead of the libtest bench harness.
 [[bench]]
 name = "transform"

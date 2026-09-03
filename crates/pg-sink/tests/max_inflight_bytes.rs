@@ -26,6 +26,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_postgres::NoTls;
 
+#[path = "support/stream_commit.rs"]
+mod stream_commit_support;
+
 static SOURCE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const SOURCE_MIGRATION: &str = include_str!("../../../migrations/source/0001_publication.sql");
 
@@ -71,6 +74,32 @@ async fn drop_slot(admin: &tokio_postgres::Client, slot: &str) {
         .await;
 }
 
+async fn clear_control_epoch(pool: &sqlx::PgPool, epoch: EpochNo) {
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SELECT set_config('walrus.manifest_delete_protocol','2',true)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("SELECT set_config('walrus.manifest_fence_maintenance','2-delete',true)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    for table in [
+        "file_manifest",
+        "stream_manifest_group",
+        "stream_txn_publication",
+        "manifest_publication_fence",
+    ] {
+        let statement = format!("DELETE FROM walrus.{table} WHERE epoch = $1");
+        sqlx::query(&statement)
+            .bind(epoch)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+}
+
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (logical_decoding_work_mem=64kB)"]
 async fn large_txn_low_ceiling_spills_and_stays_bounded() {
@@ -91,11 +120,7 @@ async fn large_txn_low_ceiling_spills_and_stays_bounded() {
     let sink = ParquetSink::new(minio(), "walrus", epoch);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
-    sqlx::query("DELETE FROM walrus.file_manifest WHERE epoch = $1")
-        .bind(epoch)
-        .execute(&pool)
-        .await
-        .unwrap();
+    clear_control_epoch(&pool, epoch).await;
     // A deliberately LOW aggregate ceiling (64 KiB) — a large open txn must spill, not buffer it all.
     let ceiling: u64 = 64 * 1024;
     let mut demux = StreamDemux::new(
@@ -143,16 +168,29 @@ async fn large_txn_low_ceiling_spills_and_stays_bounded() {
                 continue;
             };
             match &msg {
-                Message::Relation { relation, .. } => {
+                Message::Relation { relation, xid } => {
                     cache
                         .upsert_from_relation(relation.clone(), common::SchemaVersionNo(1))
                         .unwrap();
+                    if let (Some(sub_xid), Some(top_xid)) = (*xid, demux.current_top()) {
+                        demux.bind_relation(
+                            top_xid,
+                            sub_xid,
+                            relation.oid,
+                            common::SchemaVersionNo(1),
+                        );
+                    }
                 }
                 Message::StreamStart { xid, first_segment } => {
-                    demux.on_stream_start(*xid, *first_segment, frame_lsn);
-                    checkpoint.set_open_txn_floor(demux.open_floor());
+                    let pre_start_ceiling = checkpoint.capture_pre_stream_start_ceiling();
+                    demux
+                        .on_stream_start(*xid, *first_segment, frame_lsn)
+                        .unwrap();
+                    if *first_segment {
+                        checkpoint.on_stream_start(*xid, pre_start_ceiling).unwrap();
+                    }
                 }
-                Message::StreamStop => demux.on_stream_stop(),
+                Message::StreamStop => demux.on_stream_stop().unwrap(),
                 m @ (Message::Insert { xid: Some(_), .. }
                 | Message::Update { xid: Some(_), .. }
                 | Message::Delete { xid: Some(_), .. }) => {
@@ -174,26 +212,32 @@ async fn large_txn_low_ceiling_spills_and_stays_bounded() {
                 Message::StreamCommit {
                     xid,
                     commit_lsn,
+                    end_lsn,
                     commit_ts,
                     ..
                 } => {
+                    checkpoint.observe_commit(*commit_lsn, *end_lsn).unwrap();
+                    let commit_timestamp =
+                        common::UtcTimestamp::from_pg_micros(*commit_ts).unwrap();
                     let objs = demux
-                        .on_stream_commit(
-                            *xid,
-                            *commit_lsn,
-                            common::UtcTimestamp::from_pg_micros(*commit_ts).unwrap(),
-                            &cache,
-                            &sink,
-                        )
+                        .on_stream_commit(*xid, *commit_lsn, commit_timestamp, &cache, &sink)
                         .await
                         .unwrap();
-                    for obj in &objs {
-                        pg_sink::manifest::record_ready(&pool, epoch, obj)
-                            .await
-                            .unwrap();
-                    }
-                    checkpoint.set_open_txn_floor(demux.open_floor());
-                    checkpoint.on_batch_durable(*commit_lsn);
+                    assert_eq!(
+                        stream_commit_support::publish(
+                            &pool,
+                            epoch,
+                            *xid,
+                            *commit_lsn,
+                            commit_timestamp,
+                            &objs,
+                        )
+                        .await
+                        .unwrap(),
+                        control::PublishStreamOutcome::Published,
+                    );
+                    checkpoint.on_stream_end(*xid).unwrap();
+                    checkpoint.on_commit_durable(*commit_lsn).unwrap();
                     committed = true;
                 }
                 _ => {}
@@ -238,10 +282,7 @@ async fn large_txn_low_ceiling_spills_and_stays_bounded() {
             let _ = store.delete(&object_store::path::Path::from(key)).await;
         }
     }
-    let _ = sqlx::query("DELETE FROM walrus.file_manifest WHERE epoch = $1")
-        .bind(epoch)
-        .execute(&pool)
-        .await;
+    clear_control_epoch(&pool, epoch).await;
     let _ = admin
         .execute(
             "DELETE FROM public.orders WHERE id BETWEEN 840000 AND 849999",

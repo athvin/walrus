@@ -29,29 +29,63 @@ pub struct RegistryRow {
     pub columns: serde_json::Value,
 }
 
-/// Write the descriptor set for one `schema_version`, idempotently: a repeated write of the same
-/// version updates in place rather than duplicating (the `(epoch, schema, table, version)` PK).
+/// Write the immutable descriptor set for one `schema_version`. An exact replay reuses the existing
+/// key; a replay with different descriptors or relation columns is rejected rather than rewriting
+/// history already referenced by manifest files.
 ///
 /// # Errors
 ///
-/// Returns [`ControlError::Connect`] when the upsert fails, or [`ControlError::CheckViolation`] if
-/// the registry row violates a database invariant.
+/// Returns [`ControlError::ImmutableHistoryConflict`] when an existing key has different content,
+/// [`ControlError::Connect`] when persistence fails, or [`ControlError::CheckViolation`] if the row
+/// violates a database invariant.
 pub async fn upsert_registry(
     ex: impl PgExecutor<'_>,
     row: &RegistryRow,
 ) -> Result<(), ControlError> {
-    sqlx::query_file!(
-        "sql/postgres/queries/upsert_registry.sql",
-        row.epoch.0,
-        row.source_schema,
-        row.source_table,
-        row.schema_version.0,
-        Json(&row.descriptors) as _,
-        row.columns,
-    )
-    .execute(ex)
-    .await?;
+    let persisted = sqlx::query(include_str!("../sql/postgres/queries/upsert_registry.sql"))
+        .bind(row.epoch.0)
+        .bind(&row.source_schema)
+        .bind(&row.source_table)
+        .bind(row.schema_version.0)
+        .bind(Json(&row.descriptors))
+        .bind(&row.columns)
+        .fetch_optional(ex)
+        .await?;
+    if persisted.is_none() {
+        return Err(ControlError::ImmutableHistoryConflict {
+            entity: "schema_registry",
+            key: format!(
+                "epoch={} table={}.{} version={}",
+                row.epoch, row.source_schema, row.source_table, row.schema_version
+            ),
+        });
+    }
     Ok(())
+}
+
+/// Read every historical registry row for an epoch in stable table/version order. The sink uses
+/// this complete history on restart so replayed WAL can bind an old `Relation` message to the exact
+/// schema version it originally described rather than falling forward to the latest version.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the history cannot be queried or decoded.
+pub async fn read_all_registry(
+    ex: impl PgExecutor<'_>,
+    epoch: EpochNo,
+) -> Result<Vec<RegistryRow>, ControlError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT epoch, source_schema, source_table, schema_version, descriptors, columns
+        FROM walrus.schema_registry
+        WHERE epoch = $1
+        ORDER BY source_schema, source_table, schema_version
+        "#,
+    )
+    .bind(epoch)
+    .fetch_all(ex)
+    .await?;
+    rows.into_iter().map(registry_from_row).collect()
 }
 
 /// Read the descriptors for an **exact** `schema_version` — the loader rebuilds types from this.
@@ -84,6 +118,42 @@ pub async fn read_registry(
         descriptors: r.descriptors.0,
         columns: r.columns,
     }))
+}
+
+/// Read one table's immutable registry history across an inclusive version range in version order.
+/// The primary-key prefix `(epoch, source_schema, source_table)` keeps this a single bounded index
+/// scan; callers can validate contiguity without issuing one query per claimed version number.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the range query fails or a row cannot be decoded.
+pub async fn read_registry_range(
+    ex: impl PgExecutor<'_>,
+    epoch: EpochNo,
+    schema: &str,
+    table: &str,
+    first: SchemaVersionNo,
+    last: SchemaVersionNo,
+) -> Result<Vec<RegistryRow>, ControlError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT epoch, source_schema, source_table, schema_version, descriptors, columns
+        FROM walrus.schema_registry
+        WHERE epoch = $1
+          AND source_schema = $2
+          AND source_table = $3
+          AND schema_version BETWEEN $4 AND $5
+        ORDER BY schema_version
+        "#,
+    )
+    .bind(epoch.0)
+    .bind(schema)
+    .bind(table)
+    .bind(first.0)
+    .bind(last.0)
+    .fetch_all(ex)
+    .await?;
+    rows.into_iter().map(registry_from_row).collect()
 }
 
 /// The current (max) `schema_version` for a table, or `None` if it has no registry rows yet.
@@ -141,18 +211,18 @@ pub async fn read_all_latest_registry(
     .fetch_all(ex)
     .await?;
 
-    rows.into_iter()
-        .map(|row| {
-            Ok(RegistryRow {
-                epoch: row.try_get::<i64, _>("epoch")?.into(),
-                source_schema: row.try_get("source_schema")?,
-                source_table: row.try_get("source_table")?,
-                schema_version: row.try_get::<i64, _>("schema_version")?.into(),
-                descriptors: row
-                    .try_get::<Json<Vec<TypeDescriptor>>, _>("descriptors")?
-                    .0,
-                columns: row.try_get("columns")?,
-            })
-        })
-        .collect()
+    rows.into_iter().map(registry_from_row).collect()
+}
+
+fn registry_from_row(row: sqlx::postgres::PgRow) -> Result<RegistryRow, ControlError> {
+    Ok(RegistryRow {
+        epoch: row.try_get::<i64, _>("epoch")?.into(),
+        source_schema: row.try_get("source_schema")?,
+        source_table: row.try_get("source_table")?,
+        schema_version: row.try_get::<i64, _>("schema_version")?.into(),
+        descriptors: row
+            .try_get::<Json<Vec<TypeDescriptor>>, _>("descriptors")?
+            .0,
+        columns: row.try_get("columns")?,
+    })
 }

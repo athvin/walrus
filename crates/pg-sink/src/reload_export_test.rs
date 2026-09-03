@@ -276,6 +276,8 @@ fn durable_end_recovery_requires_exact_f_h_schema_and_request_identity() {
         schema_version: Some(schema_version),
         restart_count: 0,
         lease_holder: Some("sink-a".to_string()),
+        exporter_generation: 1,
+        has_export_plan: true,
         error: None,
     };
     let markers = vec![

@@ -103,6 +103,23 @@ fn add_v2(cache: &mut RelationCache) {
         .unwrap();
 }
 
+fn add_v3(cache: &mut RelationCache) {
+    let mut relation = cache
+        .get(42, common::SchemaVersionNo(2))
+        .unwrap()
+        .relation
+        .clone();
+    relation.columns.push(PgColumn {
+        name: "future".into(),
+        type_oid: oids::TEXT,
+        type_modifier: -1,
+        is_key: false,
+    });
+    cache
+        .upsert_from_relation(relation, common::SchemaVersionNo(3))
+        .unwrap();
+}
+
 fn demux(ceiling: u64) -> StreamDemux {
     StreamDemux::new(
         BatchTriggers {
@@ -163,7 +180,8 @@ async fn spill_resolves_the_owning_txn_without_scanning_buffered_changes() {
     let mut d = demux(105_000);
 
     for (top, rows) in [(100_u32, 500_u32), (200, 550), (300, 500)] {
-        d.on_stream_start(top, true, Lsn::new(u64::from(top)));
+        d.on_stream_start(top, true, Lsn::new(u64::from(top)))
+            .unwrap();
         for row in 0..rows {
             let values = vec![
                 TupleValue::Text((top * 10_000 + row).to_string()),
@@ -179,6 +197,7 @@ async fn spill_resolves_the_owning_txn_without_scanning_buffered_changes() {
                 schema_version: common::SchemaVersionNo(1),
             });
         }
+        d.on_stream_stop().unwrap();
     }
 
     assert_eq!(d.owner_len(), 3);
@@ -202,13 +221,15 @@ async fn spill_resolves_the_owning_txn_without_scanning_buffered_changes() {
 async fn owner_index_is_emptied_by_stream_commit() {
     let (cache, sink) = (cache(), mem_sink());
     let mut d = demux(u64::MAX);
-    d.on_stream_start(100, true, Lsn::new(100));
+    d.on_stream_start(100, true, Lsn::new(100)).unwrap();
+    d.bind_relation(100, 100, 42, common::SchemaVersionNo(1));
     for (id, sub_xid, lsn) in [(1, 100, Lsn::new(1)), (2, 101, Lsn::new(2))] {
         d.on_change(&cache, &insert_id(id, sub_xid), &sink, lsn)
             .await
             .unwrap();
     }
     assert_eq!(d.owner_len(), 2);
+    d.on_stream_stop().unwrap();
 
     d.on_stream_commit(100, Lsn::new(900), UtcTimestamp::now(), &cache, &sink)
         .await
@@ -221,24 +242,27 @@ async fn owner_index_is_emptied_by_stream_commit() {
 async fn owner_index_is_emptied_by_a_whole_txn_abort() {
     let (cache, sink) = (cache(), mem_sink());
     let mut d = demux(u64::MAX);
-    d.on_stream_start(100, true, Lsn::new(100));
+    d.on_stream_start(100, true, Lsn::new(100)).unwrap();
+    d.bind_relation(100, 100, 42, common::SchemaVersionNo(1));
     for (id, sub_xid, lsn) in [(1, 100, Lsn::new(1)), (2, 101, Lsn::new(2))] {
         d.on_change(&cache, &insert_id(id, sub_xid), &sink, lsn)
             .await
             .unwrap();
     }
     assert_eq!(d.owner_len(), 2);
+    d.on_stream_stop().unwrap();
 
-    d.on_stream_abort(100, 100, &sink).await;
+    d.on_stream_abort(100, 100, &sink).await.unwrap();
 
     assert_eq!(d.owner_len(), 0);
 }
 
 #[tokio::test]
-async fn a_subtxn_abort_leaves_the_index_and_the_buffer_alone() {
+async fn a_subtxn_abort_releases_its_index_and_buffer_immediately() {
     let (cache, sink) = (cache(), mem_sink());
     let mut d = demux(u64::MAX);
-    d.on_stream_start(100, true, Lsn::new(100));
+    d.on_stream_start(100, true, Lsn::new(100)).unwrap();
+    d.bind_relation(100, 100, 42, common::SchemaVersionNo(1));
     for (id, sub_xid, lsn) in [(1, 101, Lsn::new(1)), (2, 102, Lsn::new(2))] {
         d.on_change(&cache, &insert_id(id, sub_xid), &sink, lsn)
             .await
@@ -246,11 +270,12 @@ async fn a_subtxn_abort_leaves_the_index_and_the_buffer_alone() {
     }
     let owner_len = d.owner_len();
     let buffered_len = d.open[&100].changes.len();
+    d.on_stream_stop().unwrap();
 
-    d.on_stream_abort(100, 101, &sink).await;
+    d.on_stream_abort(100, 101, &sink).await.unwrap();
 
-    assert_eq!(d.owner_len(), owner_len);
-    assert_eq!(d.open[&100].changes.len(), buffered_len);
+    assert_eq!(d.owner_len(), owner_len - 1);
+    assert_eq!(d.open[&100].changes.len(), buffered_len - 1);
     assert_eq!(d.survivor_count(100), 1);
     let files = d
         .on_stream_commit(100, Lsn::new(900), UtcTimestamp::now(), &cache, &sink)
@@ -264,20 +289,25 @@ async fn a_subtxn_abort_leaves_the_index_and_the_buffer_alone() {
 async fn demux_routes_interleaved_xids_to_their_buffers() {
     let (cache, sink) = (cache(), mem_sink());
     let mut d = demux(u64::MAX); // no spill
-    d.on_stream_start(100, true, "0/100".parse().unwrap());
+    d.on_stream_start(100, true, "0/100".parse().unwrap())
+        .unwrap();
+    d.bind_relation(100, 100, 42, common::SchemaVersionNo(1));
     d.on_change(&cache, &insert_id(1, 100), &sink, "0/101".parse().unwrap())
         .await
         .unwrap();
-    d.on_stream_stop();
-    d.on_stream_start(200, true, "0/200".parse().unwrap());
+    d.on_stream_stop().unwrap();
+    d.on_stream_start(200, true, "0/200".parse().unwrap())
+        .unwrap();
+    d.bind_relation(200, 200, 42, common::SchemaVersionNo(1));
     d.on_change(&cache, &insert_id(2, 200), &sink, "0/201".parse().unwrap())
         .await
         .unwrap();
     d.on_change(&cache, &insert_id(3, 200), &sink, "0/202".parse().unwrap())
         .await
         .unwrap();
-    d.on_stream_stop();
-    d.on_stream_start(100, false, "0/300".parse().unwrap());
+    d.on_stream_stop().unwrap();
+    d.on_stream_start(100, false, "0/300".parse().unwrap())
+        .unwrap();
     d.on_change(&cache, &insert_id(4, 100), &sink, "0/301".parse().unwrap())
         .await
         .unwrap();
@@ -289,8 +319,8 @@ async fn demux_routes_interleaved_xids_to_their_buffers() {
 async fn streamed_key_change_buffers_old_delete_and_new_update() {
     let (cache, sink) = (cache(), mem_sink());
     let mut d = demux(u64::MAX);
-    d.on_stream_start(100, true, Lsn::new(100));
-    d.bind_relation(100, 42, common::SchemaVersionNo(1));
+    d.on_stream_start(100, true, Lsn::new(100)).unwrap();
+    d.bind_relation(100, 100, 42, common::SchemaVersionNo(1));
 
     d.on_change(&cache, &move_id(1, 2, 101), &sink, Lsn::new(110))
         .await
@@ -309,11 +339,12 @@ async fn streamed_key_change_buffers_old_delete_and_new_update() {
 async fn streamed_materialize_normalizes_key_toast_and_records_non_key_toast() {
     let (cache, (store, sink)) = (cache(), mem_sink_with_store());
     let mut d = demux(u64::MAX);
-    d.on_stream_start(100, true, Lsn::new(100));
-    d.bind_relation(100, 42, common::SchemaVersionNo(1));
+    d.on_stream_start(100, true, Lsn::new(100)).unwrap();
+    d.bind_relation(100, 100, 42, common::SchemaVersionNo(1));
     d.on_change(&cache, &toast_update(101), &sink, Lsn::new(110))
         .await
         .unwrap();
+    d.on_stream_stop().unwrap();
 
     let files = d
         .on_stream_commit(100, Lsn::new(120), UtcTimestamp::now(), &cache, &sink)
@@ -337,12 +368,13 @@ async fn streamed_materialize_normalizes_key_toast_and_records_non_key_toast() {
 async fn speculative_spill_records_unchanged_toast_metadata() {
     let (cache, (store, sink)) = (cache(), mem_sink_with_store());
     let mut d = demux(1);
-    d.on_stream_start(100, true, Lsn::new(100));
-    d.bind_relation(100, 42, common::SchemaVersionNo(1));
+    d.on_stream_start(100, true, Lsn::new(100)).unwrap();
+    d.bind_relation(100, 100, 42, common::SchemaVersionNo(1));
     d.on_change(&cache, &toast_update(101), &sink, Lsn::new(110))
         .await
         .unwrap();
     assert_eq!(d.spill_count(), 1, "the one-row ceiling forces a spill");
+    d.on_stream_stop().unwrap();
 
     let files = d
         .on_stream_commit(100, Lsn::new(120), UtcTimestamp::now(), &cache, &sink)
@@ -361,8 +393,8 @@ async fn speculative_spill_records_unchanged_toast_metadata() {
 async fn streamed_truncate_buffers_a_data_free_boundary() {
     let (cache, sink) = (cache(), mem_sink());
     let mut d = demux(u64::MAX);
-    d.on_stream_start(100, true, Lsn::new(100));
-    d.bind_relation(100, 42, common::SchemaVersionNo(1));
+    d.on_stream_start(100, true, Lsn::new(100)).unwrap();
+    d.bind_relation(100, 100, 42, common::SchemaVersionNo(1));
     let truncate = Message::Truncate {
         xid: Some(101),
         cascade: false,
@@ -388,22 +420,157 @@ async fn streamed_truncate_buffers_a_data_free_boundary() {
 fn open_floor_is_oldest_open_txn_begin_lsn() {
     let mut d = demux(u64::MAX);
     assert_eq!(d.open_floor(), None);
-    d.on_stream_start(100, true, "0/500".parse().unwrap());
-    d.on_stream_start(200, true, "0/900".parse().unwrap());
+    d.on_stream_start(100, true, "0/500".parse().unwrap())
+        .unwrap();
+    d.on_stream_stop().unwrap();
+    d.on_stream_start(200, true, "0/900".parse().unwrap())
+        .unwrap();
     assert_eq!(d.open_floor(), Some("0/500".parse().unwrap()));
+    assert_eq!(d.open_stats().count, 2);
+    assert_eq!(d.open_stats().oldest_floor, Some("0/500".parse().unwrap()));
+}
+
+#[test]
+fn open_stats_exposes_count_floor_and_oldest_age() {
+    let mut d = demux(u64::MAX);
+    d.on_stream_start(100, true, Lsn::new(100)).unwrap();
+    d.on_stream_stop().unwrap();
+    d.on_stream_start(200, true, Lsn::new(200)).unwrap();
+    d.on_stream_stop().unwrap();
+    let now = d.clock.now();
+    d.open.get_mut(&100).unwrap().opened_at = now - Duration::from_secs(12);
+    d.open.get_mut(&200).unwrap().opened_at = now - Duration::from_secs(3);
+
+    let stats = d.open_stats();
+    assert_eq!(stats.count, 2);
+    assert_eq!(stats.oldest_floor, Some(Lsn::new(100)));
+    assert!(stats.oldest_age.unwrap() >= Duration::from_secs(12));
+}
+
+#[test]
+fn stream_start_enforces_exact_first_segment_semantics_without_mutating_on_error() {
+    let mut d = demux(u64::MAX);
+
+    assert_eq!(
+        d.on_stream_start(100, false, Lsn::new(10)),
+        Err(StreamProtocolError::UnknownContinuation { top_xid: 100 })
+    );
+    assert_eq!(d.current_top(), None);
+    assert_eq!(d.open_floor(), None);
+
+    d.on_stream_start(100, true, Lsn::new(10)).unwrap();
+    assert_eq!(
+        d.on_stream_start(200, true, Lsn::new(20)),
+        Err(StreamProtocolError::SegmentAlreadyActive {
+            active_top: 100,
+            incoming_top: 200,
+        })
+    );
+    assert_eq!(d.current_top(), Some(100));
+    assert_eq!(d.open_floor(), Some(Lsn::new(10)));
+
+    d.on_stream_stop().unwrap();
+    assert_eq!(
+        d.on_stream_start(100, true, Lsn::new(30)),
+        Err(StreamProtocolError::DuplicateFirstSegment { top_xid: 100 })
+    );
+    assert_eq!(d.current_top(), None);
+    assert_eq!(d.open_floor(), Some(Lsn::new(10)));
+
+    d.on_stream_start(100, false, Lsn::new(40)).unwrap();
+    d.on_stream_stop().unwrap();
+    assert_eq!(
+        d.on_stream_stop(),
+        Err(StreamProtocolError::StopWithoutStart)
+    );
+}
+
+#[tokio::test]
+async fn stream_outcomes_require_a_stopped_known_top_xid() {
+    let (cache, sink) = (cache(), mem_sink());
+    let mut d = demux(u64::MAX);
+
+    let unknown_commit = d
+        .on_stream_commit(100, Lsn::new(90), UtcTimestamp::now(), &cache, &sink)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        unknown_commit.downcast_ref::<StreamProtocolError>(),
+        Some(&StreamProtocolError::UnknownCommit { top_xid: 100 })
+    );
+    assert_eq!(
+        d.on_stream_abort(100, 100, &sink).await,
+        Err(StreamProtocolError::UnknownAbort {
+            top_xid: 100,
+            sub_xid: 100,
+        })
+    );
+
+    d.on_stream_start(100, true, Lsn::new(10)).unwrap();
+    assert_eq!(
+        d.validate_stream_commit(100),
+        Err(StreamProtocolError::OutcomeDuringSegment {
+            outcome: "StreamCommit",
+            outcome_top: 100,
+            active_top: 100,
+        })
+    );
+    assert_eq!(
+        d.on_stream_abort(100, 100, &sink).await,
+        Err(StreamProtocolError::OutcomeDuringSegment {
+            outcome: "StreamAbort",
+            outcome_top: 100,
+            active_top: 100,
+        })
+    );
+    assert_eq!(d.current_top(), Some(100));
+    assert_eq!(d.open_floor(), Some(Lsn::new(10)));
+
+    d.on_stream_stop().unwrap();
+    let files = d
+        .on_stream_commit(100, Lsn::new(100), UtcTimestamp::now(), &cache, &sink)
+        .await
+        .unwrap();
+    assert!(files.is_empty());
+    assert_eq!(d.open_floor(), None);
+}
+
+#[tokio::test]
+async fn streamed_change_without_relation_binding_never_uses_a_future_hydrated_version() {
+    let (mut cache, sink) = (cache(), mem_sink());
+    add_v2(&mut cache);
+    add_v3(&mut cache);
+    let mut d = demux(u64::MAX);
+    d.on_stream_start(100, true, Lsn::new(100)).unwrap();
+
+    let error = d
+        .on_change(&cache, &insert_id_v2(1, 100), &sink, Lsn::new(110))
+        .await
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("streamed change arrived before its Relation binding: oid=42 top_xid=100"),
+        "missing protocol state must fail rather than bind replayed v2 data to hydrated v3: {error:#}"
+    );
+    assert_eq!(d.survivor_count(100), 0);
 }
 
 #[tokio::test]
 async fn stream_commit_materialises_survivors_stamped_with_commit_lsn() {
     let (cache, sink) = (cache(), mem_sink());
     let mut d = demux(u64::MAX);
-    d.on_stream_start(100, true, "0/100".parse().unwrap());
+    d.on_stream_start(100, true, "0/100".parse().unwrap())
+        .unwrap();
+    d.bind_relation(100, 100, 42, common::SchemaVersionNo(1));
     d.on_change(&cache, &insert_id(1, 100), &sink, "0/101".parse().unwrap())
         .await
         .unwrap();
     d.on_change(&cache, &insert_id(2, 100), &sink, "0/102".parse().unwrap())
         .await
         .unwrap();
+    d.on_stream_stop().unwrap();
     let commit: Lsn = "0/900".parse().unwrap();
     let files = d
         .on_stream_commit(100, commit, UtcTimestamp::now(), &cache, &sink)
@@ -415,21 +582,106 @@ async fn stream_commit_materialises_survivors_stamped_with_commit_lsn() {
 }
 
 #[tokio::test]
+async fn txn_open_before_f_commits_as_one_post_h_manifest_group() {
+    let (cache, sink) = (cache(), mem_sink());
+    let begin = Lsn::new(50);
+    let f = Lsn::new(100);
+    let h = Lsn::new(200);
+    let commit = Lsn::new(300);
+    let mut d = demux(1);
+
+    d.on_stream_start(857, true, begin).unwrap();
+    d.bind_relation(857, 857, 42, common::SchemaVersionNo(1));
+    for id in 1_i32..=8 {
+        d.on_change(
+            &cache,
+            &insert_id(id, 857),
+            &sink,
+            Lsn::new(59 + u64::try_from(id).unwrap()),
+        )
+        .await
+        .unwrap();
+    }
+    d.on_stream_stop().unwrap();
+    assert!(
+        d.open_floor().unwrap() < f,
+        "the adversarial transaction genuinely predates the export's F"
+    );
+    assert_eq!(d.open_stats().count, 1);
+
+    // F and H may both pass on the source while protocol-v2 retains this uncommitted transaction.
+    // Its rows become visible only at StreamCommit, stamped as one commit group strictly after H.
+    assert!(h > f);
+    let files = d
+        .on_stream_commit(857, commit, UtcTimestamp::now(), &cache, &sink)
+        .await
+        .unwrap();
+    assert!(files.len() > 1, "the pre-F transaction genuinely spilled");
+    assert_eq!(files.iter().map(|file| file.row_count).sum::<u64>(), 8);
+    assert!(files.iter().all(|file| file.kind == FileKind::Spill));
+    assert!(files.iter().all(|file| file.lsn_end == commit));
+    assert!(
+        files.iter().all(|file| file.lsn_end > h),
+        "the pre-F transaction cannot be folded into or retired by the [F,H] publication"
+    );
+    assert_eq!(d.open_stats().count, 0);
+}
+
+#[tokio::test]
+async fn txn_open_during_export_commits_as_one_overlay_group_before_h() {
+    let (cache, sink) = (cache(), mem_sink());
+    let f = Lsn::new(100);
+    let begin = Lsn::new(120);
+    let commit = Lsn::new(180);
+    let h = Lsn::new(200);
+    let mut d = demux(1);
+
+    d.on_stream_start(858, true, begin).unwrap();
+    d.bind_relation(858, 858, 42, common::SchemaVersionNo(1));
+    for id in 1_i32..=8 {
+        let change_lsn = Lsn::new(120 + u64::try_from(id).unwrap());
+        d.on_change(&cache, &insert_id(id, 858), &sink, change_lsn)
+            .await
+            .unwrap();
+    }
+    d.on_stream_stop().unwrap();
+    assert!(begin > f && commit <= h);
+
+    let files = d
+        .on_stream_commit(858, commit, UtcTimestamp::now(), &cache, &sink)
+        .await
+        .unwrap();
+    assert!(
+        files.len() > 1,
+        "the tiny segment budget exercises proto-v2 spill grouping"
+    );
+    assert_eq!(files.iter().map(|file| file.row_count).sum::<u64>(), 8);
+    assert!(files.iter().all(|file| file.lsn_end == commit));
+    assert!(
+        files
+            .iter()
+            .all(|file| file.lsn_end > f && file.lsn_end <= h),
+        "the whole committed transaction belongs to the reload's (F,H] overlay"
+    );
+}
+
+#[tokio::test]
 async fn stream_commit_separates_rows_bound_to_pre_and_post_ddl_versions() {
     let (mut cache, sink) = (cache(), mem_sink());
     let mut d = demux(u64::MAX);
     let top = 100;
-    d.on_stream_start(top, true, Lsn::new(100));
-    d.bind_relation(top, 42, common::SchemaVersionNo(1));
+    d.on_stream_start(top, true, Lsn::new(100)).unwrap();
+    d.bind_relation(top, top, 42, common::SchemaVersionNo(1));
     d.on_change(&cache, &insert_id(1, top), &sink, Lsn::new(101))
         .await
         .unwrap();
 
     add_v2(&mut cache);
-    d.bind_relation(top, 42, common::SchemaVersionNo(2));
+    d.bind_relation(top, top, 42, common::SchemaVersionNo(2));
     d.on_change(&cache, &insert_id_v2(2, top), &sink, Lsn::new(102))
         .await
         .unwrap();
+    d.on_stream_stop().unwrap();
 
     let commit_lsn = Lsn::new(900);
     let files = d
@@ -450,23 +702,188 @@ async fn stream_commit_separates_rows_bound_to_pre_and_post_ddl_versions() {
 }
 
 #[tokio::test]
+async fn lost_ack_replay_routes_streamed_ddl_dml_at_v2_even_after_v3_was_hydrated() {
+    let (mut cache, sink) = (cache(), mem_sink());
+    add_v2(&mut cache);
+    let relation_v2 = cache
+        .get(42, common::SchemaVersionNo(2))
+        .unwrap()
+        .relation
+        .clone();
+    add_v3(&mut cache); // Later transaction B was durable before the crash.
+
+    let epoch = common::EpochNo(1);
+    let commit_lsn = Lsn::new(900);
+    let ddl_event = crate::ddl::DdlEvent {
+        source_audit_id: 55,
+        capture_lsn: Lsn::new(850),
+        c_event: "ddl_command_end".into(),
+        c_tag: "ALTER TABLE".into(),
+        source_schema: "public".into(),
+        source_table: "orders".into(),
+        c_rel_oid: Some(42),
+        c_replica_identity: Some(ReplicaIdentity::Default),
+        c_columns: Some(serde_json::json!([
+            {"name":"id", "type_oid":23, "type_modifier":-1, "is_key":true},
+            {"name":"note", "type_oid":25, "type_modifier":-1, "is_key":false},
+            {"name":"extra", "type_oid":25, "type_modifier":-1, "is_key":false}
+        ])),
+        c_dropped: None,
+        c_ddl_text: Some("ALTER TABLE public.orders ADD COLUMN extra text".into()),
+    };
+    let durable_v2 = control::DdlRow {
+        id: common::DdlId(1),
+        epoch,
+        source_audit_id: ddl_event.source_audit_id,
+        source_schema: ddl_event.source_schema.clone(),
+        source_table: ddl_event.source_table.clone(),
+        c_lsn: commit_lsn,
+        c_event: ddl_event.c_event.clone(),
+        c_tag: ddl_event.c_tag.clone(),
+        schema_version: common::SchemaVersionNo(2),
+        c_rel_oid: ddl_event.c_rel_oid,
+        c_columns: ddl_event.c_columns.clone(),
+        c_dropped: ddl_event.c_dropped.clone(),
+        c_ddl_text: ddl_event.c_ddl_text.clone(),
+    };
+    let durable_v3 = control::DdlRow {
+        id: common::DdlId(2),
+        source_audit_id: 56,
+        c_lsn: Lsn::new(1_000),
+        schema_version: common::SchemaVersionNo(3),
+        ..durable_v2.clone()
+    };
+    let mut ddl = crate::ddl::DdlConsumer::new(epoch);
+    ddl.hydrate_versions(&cache);
+    ddl.hydrate_history(vec![durable_v2.clone(), durable_v3]);
+
+    // Crash replay restarts before A. Its processed audit id must still become scoped pending
+    // state, overriding hydrated committed max v3 for A's Relation and DML.
+    let (top_xid, sub_xid) = (857, 858);
+    let scope = crate::ddl::TransactionScope::Streamed { top_xid, sub_xid };
+    let observation = ddl.observe(scope, ddl_event, Some(&relation_v2));
+    assert!(observation.replay);
+    let version = ddl
+        .relation_version_for(scope, &relation_v2, Lsn::new(875), &cache)
+        .unwrap();
+    assert_eq!(version, common::SchemaVersionNo(2));
+    let cached_v2 = cache.get(42, version).unwrap();
+    ddl.stage_registry(
+        scope,
+        control::RegistryRow {
+            epoch,
+            source_schema: "public".into(),
+            source_table: "orders".into(),
+            schema_version: version,
+            descriptors: cached_v2.descriptors.clone(),
+            columns: serde_json::to_value(&cached_v2.relation).unwrap(),
+        },
+    );
+
+    let mut d = demux(u64::MAX);
+    d.on_stream_start(top_xid, true, Lsn::new(800)).unwrap();
+    d.bind_relation(top_xid, sub_xid, 42, version);
+    d.on_change(&cache, &insert_id_v2(1, sub_xid), &sink, Lsn::new(875))
+        .await
+        .unwrap();
+    d.on_stream_stop().unwrap();
+
+    let prepared = ddl.prepare_stream_commit(top_xid, commit_lsn).unwrap();
+    assert_eq!(prepared.ddl_rows().len(), 1);
+    assert_eq!(prepared.ddl_rows()[0].source_audit_id, 55);
+    assert_eq!(
+        prepared.ddl_rows()[0].schema_version,
+        common::SchemaVersionNo(2)
+    );
+    assert_eq!(prepared.registry_rows().len(), 1);
+    assert_eq!(
+        prepared.registry_rows()[0].schema_version,
+        common::SchemaVersionNo(2)
+    );
+    let files = d
+        .on_stream_commit(top_xid, commit_lsn, UtcTimestamp::now(), &cache, &sink)
+        .await
+        .unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].schema_version, common::SchemaVersionNo(2));
+
+    // AlreadyPublished finalization is idempotent and must not lower B's durable v3 state.
+    ddl.finalize_stream_commit(prepared);
+    assert_eq!(
+        ddl.committed_version_of("public", "orders"),
+        common::SchemaVersionNo(3)
+    );
+}
+
+#[tokio::test]
+async fn subabort_restores_parent_relation_binding_for_a_later_segment_without_relation() {
+    let (mut cache, sink) = (cache(), mem_sink());
+    let mut d = demux(u64::MAX);
+    let (top, savepoint) = (100, 101);
+
+    d.on_stream_start(top, true, Lsn::new(100)).unwrap();
+    d.bind_relation(top, top, 42, common::SchemaVersionNo(1));
+    d.on_change(&cache, &insert_id(1, top), &sink, Lsn::new(101))
+        .await
+        .unwrap();
+
+    // The savepoint changes the relation and writes at v2, then rolls back. Its binding must be
+    // removed while the parent's earlier v1 binding survives.
+    add_v2(&mut cache);
+    d.bind_relation(top, savepoint, 42, common::SchemaVersionNo(2));
+    d.on_change(&cache, &insert_id_v2(2, savepoint), &sink, Lsn::new(102))
+        .await
+        .unwrap();
+    d.on_stream_stop().unwrap();
+    d.on_stream_abort(top, savepoint, &sink).await.unwrap();
+    assert_eq!(
+        d.bindings
+            .get(&(top, TableId(42)))
+            .and_then(|history| history.last()),
+        Some(&RelationBinding {
+            sub_xid: top,
+            version: common::SchemaVersionNo(1),
+        })
+    );
+    // This is the cache cleanup returned by DdlConsumer::on_stream_abort.
+    cache.remove_version("public", "orders", common::SchemaVersionNo(2));
+
+    // A valid continuation need not repeat Relation. The surviving parent binding must therefore
+    // decode this row at v1 rather than depending on a shared-cache latest fallback.
+    d.on_stream_start(top, false, Lsn::new(200)).unwrap();
+    d.on_change(&cache, &insert_id(3, top), &sink, Lsn::new(201))
+        .await
+        .unwrap();
+    d.on_stream_stop().unwrap();
+    let files = d
+        .on_stream_commit(top, Lsn::new(900), UtcTimestamp::now(), &cache, &sink)
+        .await
+        .unwrap();
+
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].schema_version, common::SchemaVersionNo(1));
+    assert_eq!(files[0].row_count, 2);
+}
+
+#[tokio::test]
 async fn speculative_spill_partitions_one_subtransaction_by_schema_version() {
     let (mut cache, sink) = (cache(), mem_sink());
     // The v1 row stays below this ceiling; adding the v2 row crosses it, so one spill candidate
     // contains both tuple widths and must be partitioned before Arrow conversion.
     let mut d = demux(150);
     let top = 100;
-    d.on_stream_start(top, true, Lsn::new(100));
-    d.bind_relation(top, 42, common::SchemaVersionNo(1));
+    d.on_stream_start(top, true, Lsn::new(100)).unwrap();
+    d.bind_relation(top, top, 42, common::SchemaVersionNo(1));
     d.on_change(&cache, &insert_id(1, top), &sink, Lsn::new(101))
         .await
         .unwrap();
 
     add_v2(&mut cache);
-    d.bind_relation(top, 42, common::SchemaVersionNo(2));
+    d.bind_relation(top, top, 42, common::SchemaVersionNo(2));
     d.on_change(&cache, &insert_id_v2(2, top), &sink, Lsn::new(102))
         .await
         .unwrap();
+    d.on_stream_stop().unwrap();
 
     let files = d
         .on_stream_commit(top, Lsn::new(900), UtcTimestamp::now(), &cache, &sink)
@@ -487,11 +904,12 @@ async fn speculative_spill_partitions_one_subtransaction_by_schema_version() {
 async fn stream_commit_fails_instead_of_dropping_a_row_if_its_version_was_evicted() {
     let (cache, sink) = (cache(), mem_sink());
     let mut d = demux(u64::MAX);
-    d.on_stream_start(100, true, Lsn::new(100));
-    d.bind_relation(100, 42, common::SchemaVersionNo(1));
+    d.on_stream_start(100, true, Lsn::new(100)).unwrap();
+    d.bind_relation(100, 100, 42, common::SchemaVersionNo(1));
     d.on_change(&cache, &insert_id(1, 100), &sink, Lsn::new(101))
         .await
         .unwrap();
+    d.on_stream_stop().unwrap();
 
     let empty_cache = RelationCache::default();
     let error = d
@@ -510,7 +928,9 @@ async fn commit_materialises_exactly_what_survivors_reports() {
     let (cache, sink) = (cache(), mem_sink());
     let mut d = demux(u64::MAX);
     let top_xid = 857;
-    d.on_stream_start(top_xid, true, "0/100".parse().unwrap());
+    d.on_stream_start(top_xid, true, "0/100".parse().unwrap())
+        .unwrap();
+    d.bind_relation(top_xid, top_xid, 42, common::SchemaVersionNo(1));
     for (id, sub_xid, lsn) in [
         (1, top_xid, "0/101"),
         (2, 858, "0/102"),
@@ -520,7 +940,8 @@ async fn commit_materialises_exactly_what_survivors_reports() {
             .await
             .unwrap();
     }
-    d.on_stream_abort(top_xid, 858, &sink).await;
+    d.on_stream_stop().unwrap();
+    d.on_stream_abort(top_xid, 858, &sink).await.unwrap();
     let expected = d.survivor_count(top_xid);
 
     let files = d
@@ -544,7 +965,7 @@ async fn commit_materialises_exactly_what_survivors_reports() {
 fn survivors_borrows_only_the_aborted_set() {
     assert!(include_str!("stream_txn.rs").contains("let aborted = &self.aborted;"));
 
-    let mut txn = StreamedTxn::new("0/100".parse().unwrap());
+    let mut txn = StreamedTxn::new("0/100".parse().unwrap(), std::time::Instant::now());
     txn.push_change(StreamedChange {
         sub_xid: 857,
         oid: TableId(42),
@@ -566,11 +987,14 @@ fn survivors_borrows_only_the_aborted_set() {
 async fn whole_txn_stream_abort_drops_the_buffer() {
     let (cache, sink) = (cache(), mem_sink());
     let mut d = demux(u64::MAX);
-    d.on_stream_start(100, true, "0/100".parse().unwrap());
+    d.on_stream_start(100, true, "0/100".parse().unwrap())
+        .unwrap();
+    d.bind_relation(100, 100, 42, common::SchemaVersionNo(1));
     d.on_change(&cache, &insert_id(1, 100), &sink, "0/101".parse().unwrap())
         .await
         .unwrap();
-    d.on_stream_abort(100, 100, &sink).await; // sub == top
+    d.on_stream_stop().unwrap();
+    d.on_stream_abort(100, 100, &sink).await.unwrap(); // sub == top
     assert_eq!(d.open_floor(), None);
 }
 
@@ -580,7 +1004,8 @@ async fn subtxn_abort_excludes_only_the_aborted_subxid() {
     let (cache, sink) = (cache(), mem_sink());
     let mut d = demux(u64::MAX); // no spill: pure in-memory exclusion
     let begin: Lsn = "0/1000".parse().unwrap();
-    d.on_stream_start(857, true, begin);
+    d.on_stream_start(857, true, begin).unwrap();
+    d.bind_relation(857, 857, 42, common::SchemaVersionNo(1));
     for i in 0..3000 {
         d.on_change(&cache, &insert_id(10_000 + i, 857), &sink, begin)
             .await
@@ -591,13 +1016,16 @@ async fn subtxn_abort_excludes_only_the_aborted_subxid() {
             .await
             .unwrap();
     }
-    d.on_stream_abort(857, 858, &sink).await; // sub != top
+    d.on_stream_stop().unwrap();
+    d.on_stream_abort(857, 858, &sink).await.unwrap(); // sub != top
+    d.on_stream_start(857, false, begin).unwrap();
     for i in 0..3000 {
         d.on_change(&cache, &insert_id(30_000 + i, 859), &sink, begin)
             .await
             .unwrap();
     }
     assert_eq!(d.survivor_count(857), 6000);
+    d.on_stream_stop().unwrap();
     let files = d
         .on_stream_commit(
             857,
@@ -621,7 +1049,8 @@ async fn low_ceiling_spills_yet_still_excludes_the_aborted_subxid() {
     let (cache, sink) = (cache(), mem_sink());
     let mut d = demux(500); // tiny ceiling → spill early and often
     let begin: Lsn = "0/1000".parse().unwrap();
-    d.on_stream_start(857, true, begin);
+    d.on_stream_start(857, true, begin).unwrap();
+    d.bind_relation(857, 857, 42, common::SchemaVersionNo(1));
     for i in 0..200 {
         d.on_change(&cache, &insert_id(10_000 + i, 857), &sink, begin)
             .await
@@ -636,12 +1065,15 @@ async fn low_ceiling_spills_yet_still_excludes_the_aborted_subxid() {
         d.spill_count() > 0,
         "the low ceiling forced speculative spills"
     );
-    d.on_stream_abort(857, 858, &sink).await;
+    d.on_stream_stop().unwrap();
+    d.on_stream_abort(857, 858, &sink).await.unwrap();
+    d.on_stream_start(857, false, begin).unwrap();
     for i in 0..200 {
         d.on_change(&cache, &insert_id(30_000 + i, 859), &sink, begin)
             .await
             .unwrap(); // kept
     }
+    d.on_stream_stop().unwrap();
     let commit: Lsn = "0/9000".parse().unwrap();
     let files = d
         .on_stream_commit(857, commit, UtcTimestamp::now(), &cache, &sink)
@@ -676,7 +1108,8 @@ async fn spill_preserves_commit_order_of_the_surviving_rows() {
     let (cache, sink) = (cache(), mem_sink());
     let mut d = demux(250);
     let top = 857;
-    d.on_stream_start(top, true, "0/100".parse().unwrap());
+    d.on_stream_start(top, true, "0/100".parse().unwrap())
+        .unwrap();
 
     for (id, sub_xid, lsn) in [
         (1, 858, "0/101"),
@@ -715,7 +1148,7 @@ async fn spill_preserves_commit_order_of_the_surviving_rows() {
 #[test]
 fn take_stream_drains_in_place_and_keeps_both_relative_orders() {
     let lsn = |raw: &str| raw.parse::<Lsn>().unwrap();
-    let mut txn = StreamedTxn::new(lsn("0/100"));
+    let mut txn = StreamedTxn::new(lsn("0/100"), std::time::Instant::now());
     txn.changes.reserve(64);
     for (sub_xid, at) in [
         (857, "0/101"),

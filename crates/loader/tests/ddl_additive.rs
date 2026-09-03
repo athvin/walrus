@@ -4,6 +4,7 @@
     clippy::let_underscore_must_use,
     reason = "integration test — unwrap/expect fine in setup + helpers"
 )]
+
 //! Additive/lossless DDL apply (loader §5.7, architecture per-change-type). The four hermetic tests
 //! (`Connection::open_in_memory()` via `TableDb`) prove the schema-DIFF + DuckDB `ALTER`s per taxonomy
 //! row; the `#[ignore]` compose test proves both tables evolve at the correct LSN relative to data.
@@ -11,7 +12,9 @@
 //!   cargo test -p loader --test ddl_additive              # hermetic
 //!   cargo test -p loader --test ddl_additive -- --ignored # + compose
 
-use common::{EpochNo, PgColumn, PgRelation, ReplicaIdentity};
+mod support;
+
+use common::{DdlId, EpochNo, Lsn, PgColumn, PgRelation, ReplicaIdentity, SchemaVersionNo};
 use loader::ddl::{AdditiveChange, CommentTarget, SchemaVersion, apply_additive, diff_additive};
 use loader::duck::{S3Access, TableDb};
 use loader::health::LoaderState;
@@ -356,6 +359,66 @@ fn orders_v2() -> PgRelation {
     )
 }
 
+fn orders_v3() -> PgRelation {
+    rel(
+        "orders",
+        vec![
+            col("id", 23, true),
+            col("status", 25, false),
+            col("note", 25, false),
+            col("extra", 25, false),
+        ],
+    )
+}
+
+async fn publish_additive_schema_barrier(
+    pool: &sqlx::PgPool,
+    epoch: EpochNo,
+    top_xid: u32,
+    source_audit_id: i64,
+    commit_lsn: Lsn,
+    version: SchemaVersionNo,
+    relation: &PgRelation,
+) {
+    let columns = serde_json::to_value(relation).unwrap();
+    let outcome = control::publish_stream_commit(
+        pool,
+        &control::NewStreamCommitPublication {
+            epoch,
+            top_xid,
+            commit_lsn,
+            commit_ts: "2026-09-02T12:00:00Z".parse().unwrap(),
+            ddl_rows: vec![control::DdlRow {
+                id: DdlId(0),
+                epoch,
+                source_audit_id,
+                source_schema: "public".into(),
+                source_table: "orders".into(),
+                c_lsn: commit_lsn,
+                c_event: "ddl_command_end".into(),
+                c_tag: "ALTER TABLE".into(),
+                schema_version: version,
+                c_rel_oid: Some(relation.oid),
+                c_columns: Some(columns.clone()),
+                c_dropped: None,
+                c_ddl_text: Some("ALTER TABLE orders ADD COLUMN ...".into()),
+            }],
+            registry_rows: vec![control::RegistryRow {
+                epoch,
+                source_schema: "public".into(),
+                source_table: "orders".into(),
+                schema_version: version,
+                descriptors: Vec::new(),
+                columns,
+            }],
+            files: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, control::PublishStreamOutcome::Published);
+}
+
 /// A scratch directory for one test's `.duckdb` file. The returned guard deletes it on drop — even
 /// when an assertion panics, which a trailing `remove_dir_all` would skip.
 fn tmpdir(name: &str) -> tempfile::TempDir {
@@ -363,23 +426,21 @@ fn tmpdir(name: &str) -> tempfile::TempDir {
     tempfile::Builder::new().prefix(&prefix).tempdir().unwrap()
 }
 
-fn meta(op: &str, commit_hex: &str, l: u64) -> String {
-    format!(
-        "{{\"op\":\"{op}\",\"commit_lsn\":\"{commit_hex}\",\"lsn\":\"{:016X}\",\"sink_processed_at\":\"2026-07-07T12:00:{:02}Z\"}}",
-        l,
-        l % 60
-    )
-}
-
 /// Write a homogeneous Parquet fixture to S3. `with_note` = the v2 shape (adds the `note` column).
 fn write_fixture(
     epoch: EpochNo,
     tag: &str,
+    batch_no: u64,
+    schema_version: common::SchemaVersionNo,
     with_note: bool,
-    rows: &[(i64, &str, &str, &str, u64)],
+    commit_lsn: &str,
+    rows: &[(i64, &str, &str, &str)],
 ) -> String {
     let w = duckdb::Connection::open_in_memory().unwrap();
     let a = s3();
+    let epoch_bits = u64::try_from(epoch.0).unwrap();
+    let batch_id =
+        uuid::Uuid::from_u128((u128::from(epoch_bits) << 64) | u128::from(batch_no)).to_string();
     w.execute_batch(&format!(
         "INSTALL httpfs; LOAD httpfs; SET s3_region='{}'; SET s3_endpoint='{}'; \
          SET s3_url_style='path'; SET s3_use_ssl=false; \
@@ -395,10 +456,22 @@ fn write_fixture(
             "CREATE TABLE fixture (id INTEGER, status VARCHAR, note VARCHAR, walrus_pg_sink_meta VARCHAR);",
         )
         .unwrap();
-        for (id, status, note, op, l) in rows {
+        for (id, status, note, op) in rows {
+            let metadata = serde_json::to_string(&support::sink_meta(
+                epoch,
+                &batch_id,
+                schema_version,
+                "public",
+                "orders",
+                common::Kind::Stream,
+                op,
+                commit_lsn,
+                commit_lsn,
+            ))
+            .unwrap();
             w.execute(
                 "INSERT INTO fixture VALUES (?, ?, ?, ?)",
-                duckdb::params![id, status, note, meta(op, "00000000000000C8", *l)],
+                duckdb::params![id, status, note, metadata],
             )
             .unwrap();
         }
@@ -407,10 +480,22 @@ fn write_fixture(
             "CREATE TABLE fixture (id INTEGER, status VARCHAR, walrus_pg_sink_meta VARCHAR);",
         )
         .unwrap();
-        for (id, status, _note, op, l) in rows {
+        for (id, status, _note, op) in rows {
+            let metadata = serde_json::to_string(&support::sink_meta(
+                epoch,
+                &batch_id,
+                schema_version,
+                "public",
+                "orders",
+                common::Kind::Stream,
+                op,
+                commit_lsn,
+                commit_lsn,
+            ))
+            .unwrap();
             w.execute(
                 "INSERT INTO fixture VALUES (?, ?, ?)",
-                duckdb::params![id, status, meta(op, "0000000000000064", *l)],
+                duckdb::params![id, status, metadata],
             )
             .unwrap();
         }
@@ -439,25 +524,26 @@ async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
     let epoch = EpochNo(3_800_001);
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
-    for tbl in [
-        "file_manifest",
-        "loader_checkpoint",
-        "schema_registry",
-        "replication_state",
-    ] {
-        let _ = sqlx::query(&format!("DELETE FROM walrus.{tbl} WHERE epoch = $1"))
-            .bind(epoch)
-            .execute(&pool)
-            .await;
-    }
+    support::cleanup_epoch(&pool, epoch).await;
+    sqlx::query(
+        "WITH authorized AS MATERIALIZED (
+           SELECT pg_catalog.set_config(
+             'walrus.schema_registry_maintenance', '1-delete', true
+           ) AS protocol
+         )
+         DELETE FROM walrus.schema_registry
+         WHERE epoch = $1 AND (SELECT protocol = '1-delete' FROM authorized)",
+    )
+    .bind(epoch.0)
+    .execute(&pool)
+    .await
+    .unwrap();
     control::insert_epoch(
         &pool,
-        &control::ReplicationState {
-            epoch,
-            slot_name: "walrus_slot".into(),
-            created_lsn: "0/0".parse().unwrap(),
-            status: control::ReplicationStatus::Streaming,
-        },
+        epoch,
+        "walrus_slot",
+        "0/0".parse().unwrap(),
+        control::ReplicationStatus::Streaming,
     )
     .await
     .unwrap();
@@ -487,16 +573,23 @@ async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
     let v1 = write_fixture(
         epoch,
         "v1",
+        1,
+        common::SchemaVersionNo(1),
         false,
-        &[(1, "a1", "", "i", 1), (2, "b1", "", "i", 2)],
+        "0/64",
+        &[(1, "a1", "", "i"), (2, "b1", "", "i")],
     );
     let v2 = write_fixture(
         epoch,
         "v2",
+        2,
+        common::SchemaVersionNo(2),
         true,
-        &[(2, "b2", "N2", "u", 10), (3, "c2", "N3", "i", 11)],
+        "0/C8",
+        &[(2, "b2", "N2", "u"), (3, "c2", "N3", "i")],
     );
     for (uri, ver, lsn) in [(v1, 1, "0/64"), (v2, 2, "0/C8")] {
+        let (object_size, sha256) = support::fingerprint(&uri).await;
         control::insert_ready(
             &pool,
             &control::NewManifestFile {
@@ -506,6 +599,8 @@ async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
                 s3_uri: uri,
                 kind: control::ManifestKind::Stream,
                 row_count: 2,
+                object_size,
+                sha256,
                 lsn_start: lsn.parse().unwrap(),
                 lsn_end: lsn.parse().unwrap(),
                 schema_version: common::SchemaVersionNo(ver),
@@ -522,10 +617,15 @@ async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
     db.ensure_tables(&orders_v1(), common::SchemaVersionNo(1))
         .unwrap();
     db.configure_s3(&s3()).unwrap();
+    let (owner_pod, fencing_token) = support::acquire_table(&pool, epoch, "public", "orders").await;
     let ctx = TableCtx {
         pool,
         epoch,
         epoch_rx: loader::epoch::fixed_epoch_watch(epoch),
+        owner_pod,
+        fencing_token,
+        store: support::store(),
+        staging_bucket: "walrus".into(),
         schema: "public".into(),
         table: "orders".into(),
         series: "public.orders".into(),
@@ -533,6 +633,7 @@ async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
         db,
         state: LoaderState::new(),
         max_files: std::num::NonZeroI64::new(100).unwrap(),
+        max_integrity_resnapshots: 1,
         poll_interval: Duration::from_secs(5),
         compaction_interval: Duration::from_secs(3600),
         retention_lsn_lag: 16 << 20,
@@ -561,5 +662,167 @@ async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
     assert!(
         view.iter().any(|c| c == "note") && !view.iter().any(|c| c.starts_with("_applied")),
         "view evolved with the mirror, guard cols still hidden: {view:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose up --wait (control PG)"]
+async fn schema_only_barrier_reconciles_and_duck_ahead_retry_retires_without_checkpoint_drift() {
+    let _g = LOCK.lock().await;
+    let epoch = EpochNo(3_800_002);
+    let pool = control::connect(&control_url()).await.unwrap();
+    control::run_migrations(&pool).await.unwrap();
+    support::cleanup_epoch(&pool, epoch).await;
+    let mut cleanup = pool.begin().await.unwrap();
+    sqlx::query("SELECT set_config('walrus.manifest_fence_maintenance', '2-delete', true)")
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("SELECT set_config('walrus.schema_registry_maintenance', '1-delete', true)")
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    for table in ["ddl_manifest", "schema_registry"] {
+        sqlx::query(&format!("DELETE FROM walrus.{table} WHERE epoch = $1"))
+            .bind(epoch.0)
+            .execute(&mut *cleanup)
+            .await
+            .unwrap();
+    }
+    cleanup.commit().await.unwrap();
+    control::insert_epoch(
+        &pool,
+        epoch,
+        "walrus_slot",
+        Lsn::ZERO,
+        control::ReplicationStatus::Streaming,
+    )
+    .await
+    .unwrap();
+    control::ensure_checkpoint(&pool, epoch, "public", "orders")
+        .await
+        .unwrap();
+
+    let v1 = orders_v1();
+    control::upsert_registry(
+        &pool,
+        &control::RegistryRow {
+            epoch,
+            source_schema: "public".into(),
+            source_table: "orders".into(),
+            schema_version: SchemaVersionNo(1),
+            descriptors: Vec::new(),
+            columns: serde_json::to_value(&v1).unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    publish_additive_schema_barrier(
+        &pool,
+        epoch,
+        8_201,
+        38_002_001,
+        Lsn::new(0x100),
+        SchemaVersionNo(2),
+        &orders_v2(),
+    )
+    .await;
+
+    let dir = tmpdir("schema-barrier");
+    let db = TableDb::open(dir.path().join("orders.duckdb")).unwrap();
+    db.ensure_tables(&v1, SchemaVersionNo(1)).unwrap();
+    let state = LoaderState::new();
+    let (owner_pod, fencing_token) = support::acquire_table(&pool, epoch, "public", "orders").await;
+    let ctx = TableCtx {
+        pool,
+        epoch,
+        epoch_rx: loader::epoch::fixed_epoch_watch(epoch),
+        owner_pod,
+        fencing_token,
+        store: support::store(),
+        staging_bucket: "walrus".into(),
+        schema: "public".into(),
+        table: "orders".into(),
+        series: "public.orders".into(),
+        rel: v1,
+        db,
+        state,
+        max_files: std::num::NonZeroI64::new(100).unwrap(),
+        max_integrity_resnapshots: 1,
+        poll_interval: Duration::from_secs(5),
+        compaction_interval: Duration::from_secs(3600),
+        retention_lsn_lag: 16 << 20,
+        pause_logged: Default::default(),
+    };
+
+    run_phase_a(&ctx).await.unwrap();
+    assert_eq!(ctx.db.schema_version().unwrap(), SchemaVersionNo(2));
+    for table in ["orders", "orders_raw"] {
+        assert!(columns_of(ctx.db.conn(), table).contains(&"note".to_string()));
+    }
+    assert!(
+        control::claim_ready_units(&ctx.pool, epoch, "public", "orders", 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the schema barrier retires only after Duck reaches v2"
+    );
+    let checkpoint = control::read_checkpoint(&ctx.pool, epoch, "public", "orders")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (checkpoint.raw_appended_lsn, checkpoint.transformed_lsn),
+        (Lsn::ZERO, Lsn::ZERO)
+    );
+
+    // Simulate the cross-database crash window for the next barrier: Duck commits v3, then the
+    // process dies before the control parent becomes applied. Phase A must reclaim and retire it
+    // without replaying a mutation or pretending a zero-file commit created raw data.
+    publish_additive_schema_barrier(
+        &ctx.pool,
+        epoch,
+        8_202,
+        38_002_002,
+        Lsn::new(0x200),
+        SchemaVersionNo(3),
+        &orders_v3(),
+    )
+    .await;
+    loader::ddl::reconcile_to_version(
+        &ctx.db,
+        &ctx.pool,
+        epoch,
+        "public",
+        "orders",
+        SchemaVersionNo(3),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ctx.db.schema_version().unwrap(), SchemaVersionNo(3));
+    assert_eq!(
+        control::claim_ready_units(&ctx.pool, epoch, "public", "orders", 10)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "the durable barrier remains ready in the simulated crash window"
+    );
+
+    run_phase_a(&ctx).await.unwrap();
+    assert!(
+        control::claim_ready_units(&ctx.pool, epoch, "public", "orders", 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(columns_of(ctx.db.conn(), "orders").contains(&"extra".to_string()));
+    let checkpoint = control::read_checkpoint(&ctx.pool, epoch, "public", "orders")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (checkpoint.raw_appended_lsn, checkpoint.transformed_lsn),
+        (Lsn::ZERO, Lsn::ZERO)
     );
 }

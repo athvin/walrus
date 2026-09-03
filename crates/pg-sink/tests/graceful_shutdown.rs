@@ -7,9 +7,11 @@
 //! Graceful SIGTERM drain against compose (`#[ignore]` — needs source PG + MinIO + control PG). A
 //! committed-but-unflushed batch, on drain, is flushed to S3 + manifested, `confirmed_flush_lsn`
 //! advances via a final standby update, `CopyDone` closes the connection, and the **slot is never
-//! dropped** — so a restarted sink resumes from `confirmed_flush_lsn` with **no data loss** (the
-//! boundary txn may re-stream; the loader de-duplicates: at-least-once → effectively-once). The drain
-//! ordering itself is unit-tested in `src/batch.rs`.
+//! dropped**. The next physical stream starts from that retained floor; the replacement service then
+//! opens a reconciled successor epoch and rebuilds its frozen targets because publication-guard
+//! continuity cannot be proven across processes. A boundary transaction may re-stream, but neither
+//! the WAL tail nor its table state is lost. The drain ordering itself is unit-tested in
+//! `src/batch.rs`.
 //!
 //!   cargo test -p pg-sink --test graceful_shutdown -- --ignored
 
@@ -160,6 +162,7 @@ async fn sigterm_mid_stream_drains_commits_and_resumes() {
         .unwrap();
 
     let mut orders_oid: Option<u32> = None;
+    let mut commit_boundary: Option<(Lsn, Lsn)> = None;
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let frame = stream.next().await.unwrap().unwrap();
@@ -178,6 +181,15 @@ async fn sigterm_mid_stream_drains_commits_and_resumes() {
                             .unwrap();
                     }
                     other => {
+                        if let Message::Commit {
+                            commit_lsn,
+                            end_lsn,
+                            ..
+                        } = other
+                        {
+                            checkpoint.observe_commit(*commit_lsn, *end_lsn).unwrap();
+                            commit_boundary = Some((*commit_lsn, *end_lsn));
+                        }
                         router
                             .route(&cache, other, frame_lsn, common::SchemaVersionNo(1))
                             .unwrap();
@@ -220,6 +232,12 @@ async fn sigterm_mid_stream_drains_commits_and_resumes() {
         drained_lsn > resume.start_lsn(),
         "the drain advanced confirmed_flush past the resume point"
     );
+    let (commit_lsn, end_lsn) = commit_boundary.expect("drained transaction commit boundary");
+    assert!(end_lsn > commit_lsn);
+    assert_eq!(
+        drained_lsn, end_lsn,
+        "drain manifests at commit_lsn but acknowledges the matching end_lsn"
+    );
 
     // The committed batch is now durable: a manifest row exists for this epoch.
     let manifested: i64 =
@@ -254,9 +272,8 @@ async fn sigterm_mid_stream_drains_commits_and_resumes() {
     );
     drop(stream);
 
-    // --- Resume: a replacement pod streams from confirmed_flush and loses nothing. The boundary txn
-    // may re-stream (at-least-once → the loader de-duplicates); the load-bearing property is that the
-    // NEW change (980002) is delivered after resume — no data is lost across the graceful shutdown.
+    // --- Resume: end_lsn feedback places the cursor beyond the complete boundary commit record, so
+    // the drained row must not replay. A fresh change must still be delivered after that exact cursor.
     let resume2 = verify_or_create_slot(&admin, slot).await.unwrap();
     let mut stream2 =
         ReplicationStream::start(&source_url(), slot, resume2.start_lsn(), "walrus_pub")
@@ -270,24 +287,28 @@ async fn sigterm_mid_stream_drains_commits_and_resumes() {
         )
         .await
         .unwrap();
-    let saw_new = tokio::time::timeout(Duration::from_secs(15), async {
+    let boundary_replayed = tokio::time::timeout(Duration::from_secs(15), async {
+        let mut replayed = false;
         loop {
             let frame = stream2.next().await.unwrap().unwrap();
             if let Some(Message::Insert {
                 relation_oid, new, ..
             }) = on_frame(&mut ctx2, frame).unwrap()
                 && orders_oid == Some(relation_oid)
-                && orders_id(&new) == Some(980002)
             {
-                return true;
+                match orders_id(&new) {
+                    Some(980001) => replayed = true,
+                    Some(980002) => return replayed,
+                    _ => {}
+                }
             }
         }
     })
     .await
     .expect("the resumed stream delivers the post-shutdown insert within 15s");
     assert!(
-        saw_new,
-        "the sink resumed from confirmed_flush and lost no data"
+        !boundary_replayed,
+        "confirmed_flush=end_lsn must resume after the drained boundary transaction"
     );
 
     // --- Cleanup: delete the staged S3 object(s), manifest rows, slot, and test data.
@@ -303,11 +324,26 @@ async fn sigterm_mid_stream_drains_commits_and_resumes() {
             let _ = store.delete(&Path::from(key)).await;
         }
     }
-    sqlx::query("DELETE FROM walrus.file_manifest WHERE epoch = $1")
-        .bind(epoch)
-        .execute(&pool)
+    let mut cleanup = pool.begin().await.unwrap();
+    sqlx::query("SELECT set_config('walrus.manifest_delete_protocol','2',true)")
+        .execute(&mut *cleanup)
         .await
         .unwrap();
+    sqlx::query("SELECT set_config('walrus.manifest_fence_maintenance','2-delete',true)")
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM walrus.file_manifest WHERE epoch = $1")
+        .bind(epoch)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM walrus.manifest_publication_fence WHERE epoch = $1")
+        .bind(epoch)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    cleanup.commit().await.unwrap();
     admin
         .execute(
             "DELETE FROM public.orders WHERE id IN (980001, 980002)",
