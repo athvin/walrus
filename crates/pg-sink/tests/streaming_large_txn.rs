@@ -105,6 +105,32 @@ async fn ready_count(pool: &sqlx::PgPool, epoch: EpochNo) -> i64 {
     .unwrap()
 }
 
+async fn clear_control_epoch(pool: &sqlx::PgPool, epoch: EpochNo) {
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SELECT set_config('walrus.manifest_delete_protocol','2',true)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("SELECT set_config('walrus.manifest_fence_maintenance','2-delete',true)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    for table in [
+        "file_manifest",
+        "stream_manifest_group",
+        "stream_txn_publication",
+        "manifest_publication_fence",
+    ] {
+        let statement = format!("DELETE FROM walrus.{table} WHERE epoch = $1");
+        sqlx::query(&statement)
+            .bind(epoch)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+}
+
 async fn cleanup(pool: &sqlx::PgPool, admin: &tokio_postgres::Client, epoch: EpochNo, slot: &str) {
     let uris: Vec<String> =
         sqlx::query_scalar("SELECT s3_uri FROM walrus.file_manifest WHERE epoch = $1")
@@ -118,10 +144,7 @@ async fn cleanup(pool: &sqlx::PgPool, admin: &tokio_postgres::Client, epoch: Epo
             let _ = store.delete(&object_store::path::Path::from(key)).await;
         }
     }
-    let _ = sqlx::query("WITH authorized AS MATERIALIZED (SELECT set_config('walrus.manifest_delete_protocol','2',true) AS protocol) DELETE FROM walrus.file_manifest WHERE epoch = $1 AND (SELECT protocol='2' FROM authorized)")
-        .bind(epoch)
-        .execute(pool)
-        .await;
+    clear_control_epoch(pool, epoch).await;
     let _ = admin
         .execute(
             "DELETE FROM public.orders WHERE id BETWEEN 800000 AND 809000",

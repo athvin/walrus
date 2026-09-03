@@ -53,6 +53,7 @@ async fn migrations_create_all_tables() {
         "table_reload_export_range",
         "stream_txn_publication",
         "stream_manifest_group",
+        "manifest_publication_fence",
         "table_integrity_recovery",
     ] {
         let exists: bool = sqlx::query_scalar(
@@ -191,25 +192,40 @@ async fn protocol_v2_migration_installs_export_publication_and_integrity_fences(
         assert!(exists, "walrus.file_manifest.{column} must exist");
     }
 
-    let file_shape_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM information_schema.columns
-         WHERE table_schema = 'walrus' AND table_name = 'stream_manifest_group'
-           AND column_name = 'file_shape')",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert!(
-        file_shape_exists,
-        "stream group replay shape must be durable"
-    );
+    for column in ["file_shape", "final_schema_version"] {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns
+             WHERE table_schema = 'walrus' AND table_name = 'stream_manifest_group'
+               AND column_name = $1)",
+        )
+        .bind(column)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(exists, "stream group replay field {column} must be durable");
+    }
 
     for trigger in [
         "table_reload_exporter_protocol_v2",
         "table_reload_exporter_acquisition_v2",
+        "table_reload_status_transition",
         "table_reload_v2_completion_guard",
+        "table_reload_publication_identity_immutable",
         "file_manifest_reload_attempt_guard",
         "file_manifest_delete_protocol_v2",
+        "file_manifest_truncate_protocol_v2",
+        "file_manifest_semantics_immutable",
+        "file_manifest_publication_fence",
+        "manifest_publication_fence_monotonic",
+        "manifest_publication_fence_delete_guard",
+        "manifest_publication_fence_truncate_guard",
+        "stream_txn_publication_semantics_immutable",
+        "stream_manifest_group_semantics_immutable",
+        "stream_manifest_group_publication_fence",
+        "stream_manifest_group_delete_guard",
+        "stream_manifest_group_truncate_guard",
+        "stream_txn_publication_delete_guard",
+        "stream_txn_publication_truncate_guard",
     ] {
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS (
@@ -225,6 +241,43 @@ async fn protocol_v2_migration_installs_export_publication_and_integrity_fences(
         .unwrap();
         assert!(exists, "rollout/integrity trigger {trigger} must exist");
     }
+
+    let composite_receipt_fk: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+           SELECT 1
+           FROM pg_constraint constraint_row
+           JOIN pg_class relation ON relation.oid = constraint_row.conrelid
+           JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+           WHERE namespace.nspname = 'walrus'
+             AND relation.relname = 'stream_manifest_group'
+             AND constraint_row.conname = 'stream_manifest_group_publication_identity_fk'
+             AND constraint_row.contype = 'f'
+         )",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        composite_receipt_fk,
+        "stream groups must bind all duplicated commit identity fields to their publication receipt"
+    );
+
+    let reload_seal_fk: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+           SELECT 1
+           FROM pg_constraint constraint_row
+           JOIN pg_class relation ON relation.oid = constraint_row.conrelid
+           JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+           WHERE namespace.nspname = 'walrus'
+             AND relation.relname = 'manifest_publication_fence'
+             AND constraint_row.conname = 'manifest_publication_fence_reload_identity_fk'
+             AND constraint_row.contype = 'f'
+         )",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(reload_seal_fk, "a seal must bind the exact reload identity");
 
     let live_index: String = sqlx::query_scalar(
         "SELECT indexdef FROM pg_indexes
@@ -335,6 +388,34 @@ async fn protocol_v2_rollout_tripwires_reject_embedded_pre_v2_sql() {
     savepoint.rollback().await.unwrap();
 
     let lsn: Lsn = "0/100".parse().unwrap();
+    let mut savepoint = Connection::begin(&mut *tx).await.unwrap();
+    let ungrouped_spill = insert_ready(
+        &mut *savepoint,
+        &NewManifestFile {
+            epoch,
+            source_schema: "public".to_string(),
+            source_table: "old_loader_guard".to_string(),
+            s3_uri: format!("s3://walrus/ungrouped-spill-{}.parquet", Uuid::new_v4()),
+            kind: ManifestKind::Spill,
+            row_count: 1,
+            object_size: 1,
+            sha256: vec![7; 32],
+            lsn_start: lsn,
+            lsn_end: lsn,
+            schema_version: SchemaVersionNo(1),
+            reload_id: None,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        ungrouped_spill,
+        control::ControlError::CheckViolation { ref source, .. }
+            if source.as_database_error().and_then(sqlx::error::DatabaseError::constraint)
+                == Some("file_manifest_stream_group_shape_check")
+    ));
+    savepoint.rollback().await.unwrap();
+
     let manifest_id = insert_ready(
         &mut *tx,
         &NewManifestFile {
@@ -355,6 +436,26 @@ async fn protocol_v2_rollout_tripwires_reject_embedded_pre_v2_sql() {
     .await
     .unwrap();
 
+    // A claim identifies an immutable object attestation. Updating its URI (or any field other
+    // than queue status) after a loader has read it must fail; integrity state transitions remain
+    // the only permitted mutation.
+    let mut savepoint = Connection::begin(&mut *tx).await.unwrap();
+    let semantic_update = sqlx::query(
+        "UPDATE walrus.file_manifest
+         SET s3_uri = s3_uri || '.replacement'
+         WHERE id = $1",
+    )
+    .bind(manifest_id.0)
+    .execute(&mut *savepoint)
+    .await
+    .unwrap_err();
+    assert!(
+        semantic_update
+            .as_database_error()
+            .is_some_and(|error| error.message().contains("semantics are immutable"))
+    );
+    savepoint.rollback().await.unwrap();
+
     // The old loader's unconditional DELETE must fail closed. The modern grouped deletion path
     // opts into the v2 protocol transaction-locally and remains usable.
     let mut savepoint = Connection::begin(&mut *tx).await.unwrap();
@@ -371,11 +472,360 @@ async fn protocol_v2_rollout_tripwires_reject_embedded_pre_v2_sql() {
     );
     savepoint.rollback().await.unwrap();
 
+    let mut savepoint = Connection::begin(&mut *tx).await.unwrap();
+    let old_truncate = sqlx::query("TRUNCATE walrus.file_manifest")
+        .execute(&mut *savepoint)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        old_truncate
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::constraint),
+        Some("file_manifest_delete_protocol_v2")
+    );
+    savepoint.rollback().await.unwrap();
+
     let ready = claim_ready(&mut *tx, epoch, "public", "old_loader_guard", 1)
         .await
         .unwrap();
     assert_eq!(ready.len(), 1);
     assert_eq!(delete_claimed(&mut *tx, &[manifest_id]).await.unwrap(), 1);
+
+    let failed_file = NewManifestFile {
+        epoch,
+        source_schema: "public".to_string(),
+        source_table: "old_loader_guard".to_string(),
+        s3_uri: format!("s3://walrus/rollout-failed-{}.parquet", Uuid::new_v4()),
+        kind: ManifestKind::Stream,
+        row_count: 1,
+        object_size: 1,
+        sha256: vec![7; 32],
+        lsn_start: lsn,
+        lsn_end: lsn,
+        schema_version: SchemaVersionNo(1),
+        reload_id: None,
+    };
+    let failed_id = insert_ready(&mut *tx, &failed_file).await.unwrap();
+    sqlx::query("UPDATE walrus.file_manifest SET status = 'failed' WHERE id = $1")
+        .bind(failed_id.0)
+        .execute(&mut *tx)
+        .await
+        .expect("integrity handling may mark an immutable manifest failed");
+    let mut savepoint = Connection::begin(&mut *tx).await.unwrap();
+    let reactivated = sqlx::query("UPDATE walrus.file_manifest SET status = 'ready' WHERE id = $1")
+        .bind(failed_id.0)
+        .execute(&mut *savepoint)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        reactivated
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::constraint),
+        Some("file_manifest_status_transition")
+    );
+    savepoint.rollback().await.unwrap();
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn publication_seal_and_completion_are_database_attested() {
+    let pool = migrated_pool().await;
+    let mut tx = pool.begin().await.unwrap();
+    let epoch_bytes: [u8; 8] = Uuid::new_v4().as_bytes()[..8].try_into().unwrap();
+    let epoch = EpochNo(i64::from_be_bytes(epoch_bytes) & i64::MAX);
+    let nonce = Uuid::new_v4();
+    let h: Lsn = "0/100".parse().unwrap();
+    let reload_id: i64 = sqlx::query_scalar(
+        "INSERT INTO walrus.table_reload (
+           epoch, source_schema, source_table, flavor, status,
+           start_lsn, final_lsn, schema_version, exporter_generation,
+           export_snapshot, export_snapshot_xmin, export_snapshot_xmax,
+           export_range_count, export_sealed_at, export_file_count, export_row_count,
+           publication_nonce, publisher_owner_pod, publisher_fencing_token, publishing_at
+         ) VALUES (
+           $1, 'public', 'db_attested_seal', 'reload', 'publishing',
+           $2, $2, 1, 1,
+           '1:2:', 1, 2, 1, now(), 0, 0,
+           $3, 'loader-attestation', 7, now()
+         ) RETURNING reload_id",
+    )
+    .bind(epoch.0)
+    .bind(h)
+    .bind(nonce)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    let mut savepoint = Connection::begin(&mut *tx).await.unwrap();
+    let direct_complete_insert = sqlx::query(
+        "INSERT INTO walrus.table_reload (
+           epoch, source_schema, source_table, flavor, status,
+           start_lsn, final_lsn, schema_version, exporter_generation,
+           export_snapshot, export_snapshot_xmin, export_snapshot_xmax,
+           export_range_count, export_sealed_at, export_file_count, export_row_count,
+           publication_nonce, publisher_owner_pod, publisher_fencing_token, publishing_at
+         ) VALUES (
+           $1, 'public', 'direct_complete_insert', 'reload', 'complete',
+           $2, $2, 1, 1,
+           '1:2:', 1, 2, 1, now(), 0, 0,
+           $3, 'loader-attestation', 7, now()
+         )",
+    )
+    .bind(epoch.0)
+    .bind(h)
+    .bind(Uuid::new_v4())
+    .execute(&mut *savepoint)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        direct_complete_insert
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::constraint),
+        Some("table_reload_v2_completion_guard")
+    );
+    savepoint.rollback().await.unwrap();
+
+    sqlx::query(
+        "INSERT INTO walrus.manifest_publication_fence
+           (epoch, source_schema, source_table)
+         VALUES ($1, 'public', 'db_attested_seal')",
+    )
+    .bind(epoch.0)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    let mut savepoint = Connection::begin(&mut *tx).await.unwrap();
+    let unauthorized_seal = sqlx::query(
+        "UPDATE walrus.manifest_publication_fence
+         SET sealed_through_lsn=$2, sealed_reload_id=$3, sealed_publication_nonce=$4
+         WHERE epoch=$1 AND source_schema='public' AND source_table='db_attested_seal'",
+    )
+    .bind(epoch.0)
+    .bind(h)
+    .bind(reload_id)
+    .bind(nonce)
+    .execute(&mut *savepoint)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        unauthorized_seal
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::constraint),
+        Some("manifest_publication_seal_protocol_v2")
+    );
+    savepoint.rollback().await.unwrap();
+
+    sqlx::query("SELECT set_config('walrus.manifest_seal_protocol','2',true)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE walrus.manifest_publication_fence
+         SET sealed_through_lsn=$2, sealed_reload_id=$3, sealed_publication_nonce=$4
+         WHERE epoch=$1 AND source_schema='public' AND source_table='db_attested_seal'",
+    )
+    .bind(epoch.0)
+    .bind(h)
+    .bind(reload_id)
+    .bind(nonce)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    let mut savepoint = Connection::begin(&mut *tx).await.unwrap();
+    let no_checkpoint =
+        sqlx::query("UPDATE walrus.table_reload SET status='complete' WHERE reload_id=$1")
+            .bind(reload_id)
+            .execute(&mut *savepoint)
+            .await
+            .unwrap_err();
+    assert_eq!(
+        no_checkpoint
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::constraint),
+        Some("table_reload_v2_completion_guard")
+    );
+    savepoint.rollback().await.unwrap();
+
+    let mut savepoint = Connection::begin(&mut *tx).await.unwrap();
+    let delete_seal = sqlx::query(
+        "DELETE FROM walrus.manifest_publication_fence
+         WHERE epoch=$1 AND source_schema='public' AND source_table='db_attested_seal'",
+    )
+    .bind(epoch.0)
+    .execute(&mut *savepoint)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        delete_seal
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::constraint),
+        Some("manifest_publication_fence_removal")
+    );
+    savepoint.rollback().await.unwrap();
+
+    let mut savepoint = Connection::begin(&mut *tx).await.unwrap();
+    let truncate_seals = sqlx::query("TRUNCATE walrus.manifest_publication_fence")
+        .execute(&mut *savepoint)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        truncate_seals
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::constraint),
+        Some("manifest_publication_fence_removal")
+    );
+    savepoint.rollback().await.unwrap();
+
+    control::ensure_checkpoint(&mut *tx, epoch, "public", "db_attested_seal")
+        .await
+        .unwrap();
+    control::advance_raw_appended(&mut *tx, epoch, "public", "db_attested_seal", h)
+        .await
+        .unwrap();
+    control::advance_transformed(&mut *tx, epoch, "public", "db_attested_seal", h)
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query("UPDATE walrus.table_reload SET status='complete' WHERE reload_id=$1")
+            .bind(reload_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap()
+            .rows_affected(),
+        1
+    );
+
+    let mut savepoint = Connection::begin(&mut *tx).await.unwrap();
+    let resurrect =
+        sqlx::query("UPDATE walrus.table_reload SET status='publishing' WHERE reload_id=$1")
+            .bind(reload_id)
+            .execute(&mut *savepoint)
+            .await
+            .unwrap_err();
+    assert_eq!(
+        resurrect
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::constraint),
+        Some("table_reload_status_transition")
+    );
+    savepoint.rollback().await.unwrap();
+
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn protocol_v2_upgrade_backfills_the_greatest_completed_legacy_h() {
+    let pool = connect(&control_dsn())
+        .await
+        .expect("connect to control PG for isolated legacy upgrade fixture");
+    let mut tx = pool.begin().await.unwrap();
+    let schema = format!("walrus_legacy_{}", Uuid::new_v4().simple());
+    let qualify = |sql: &str| {
+        sql.replace(
+            "CREATE SCHEMA IF NOT EXISTS walrus;",
+            &format!("CREATE SCHEMA {schema};"),
+        )
+        .replace("walrus.", &format!("{schema}."))
+    };
+    for migration in [
+        include_str!("../../../migrations/control/0001_control_schema.sql"),
+        include_str!("../../../migrations/control/0002_registry_ddl.sql"),
+        include_str!("../../../migrations/control/0003_table_ownership.sql"),
+        include_str!("../../../migrations/control/0004_table_reload.sql"),
+        include_str!("../../../migrations/control/0005_transactional_ddl.sql"),
+        include_str!("../../../migrations/control/0006_unified_reconcile.sql"),
+        include_str!("../../../migrations/control/0007_bootstrap_reconcile.sql"),
+        include_str!("../../../migrations/control/0008_retire_markerless_reload.sql"),
+    ] {
+        sqlx::raw_sql(&qualify(migration))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+    }
+
+    let epoch = 9_910_009_i64;
+    let first_h: Lsn = "0/100".parse().unwrap();
+    let greatest_h: Lsn = "0/200".parse().unwrap();
+    let first: i64 = sqlx::query_scalar(&format!(
+        "INSERT INTO {schema}.table_reload
+           (epoch, source_schema, source_table, flavor, status,
+            first_lsn, final_lsn, schema_version)
+         VALUES ($1, 'public', 'legacy_orders', 'reload', 'complete', $2, $2, 1)
+         RETURNING reload_id"
+    ))
+    .bind(epoch)
+    .bind(first_h)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    let greatest: i64 = sqlx::query_scalar(&format!(
+        "INSERT INTO {schema}.table_reload
+           (epoch, source_schema, source_table, flavor, status,
+            first_lsn, final_lsn, schema_version)
+         VALUES ($1, 'public', 'legacy_orders', 'reload', 'complete', $2, $2, 1)
+         RETURNING reload_id"
+    ))
+    .bind(epoch)
+    .bind(greatest_h)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert!(greatest > first);
+    sqlx::query(&format!(
+        "INSERT INTO {schema}.loader_checkpoint
+           (epoch, source_schema, source_table, raw_appended_lsn, transformed_lsn)
+         VALUES ($1, 'public', 'legacy_orders', '0/300', '0/300')"
+    ))
+    .bind(epoch)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    sqlx::raw_sql(&qualify(include_str!(
+        "../../../migrations/control/0009_reload_protocol_v2_hardening.sql"
+    )))
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    let identities: Vec<(i64, Uuid, String, i64)> = sqlx::query_as(&format!(
+        "SELECT reload_id, publication_nonce, publisher_owner_pod,
+                publisher_fencing_token
+         FROM {schema}.table_reload ORDER BY reload_id"
+    ))
+    .fetch_all(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(identities.len(), 2);
+    assert!(
+        identities
+            .iter()
+            .all(|(_, nonce, owner, token)| *nonce != Uuid::nil()
+                && owner == "protocol-v2-migration"
+                && *token == 0)
+    );
+
+    let seal: (i64, Lsn, Uuid) = sqlx::query_as(&format!(
+        "SELECT sealed_reload_id, sealed_through_lsn, sealed_publication_nonce
+         FROM {schema}.manifest_publication_fence
+         WHERE epoch=$1 AND source_schema='public' AND source_table='legacy_orders'"
+    ))
+    .bind(epoch)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(seal.0, greatest);
+    assert_eq!(seal.1, greatest_h);
+    assert_eq!(
+        seal.2,
+        identities
+            .iter()
+            .find(|(reload_id, _, _, _)| *reload_id == greatest)
+            .unwrap()
+            .1
+    );
+
     tx.rollback().await.unwrap();
 }
 

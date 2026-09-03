@@ -615,6 +615,7 @@ fn attested_parquet_metadata_and_row_count_are_checked_before_receipt_commit() {
         stream_group_id: None,
         schema_version: common::SchemaVersionNo(1),
         commit_lsn_override: None,
+        destination_columns: None,
         expectation: Some(manifest_expectation(1)),
     };
     assert_eq!(db.append_manifest_unit("orders", &[file]).unwrap(), 1);
@@ -660,6 +661,7 @@ fn attested_row_count_mismatch_rolls_back_the_atomic_append() {
         stream_group_id: None,
         schema_version: common::SchemaVersionNo(1),
         commit_lsn_override: None,
+        destination_columns: None,
         expectation: Some(manifest_expectation(2)),
     };
     assert!(matches!(
@@ -722,6 +724,50 @@ fn unchanged_toast_is_limited_to_distinct_non_key_source_columns_on_updates() {
             "invalid unchanged_toast column",
         );
     }
+}
+
+#[test]
+fn unchanged_toast_is_validated_against_the_manifest_versions_source_relation() {
+    let dir = tempfile::tempdir().unwrap();
+    let v1 = orders();
+    let mut v2 = v1.clone();
+    v2.columns.push(PgColumn {
+        name: "note".to_string(),
+        type_oid: 25,
+        type_modifier: -1,
+        is_key: false,
+    });
+    let mut meta = attested_meta("orders");
+    meta.op = common::Op::Update;
+    meta.schema_version = common::SchemaVersionNo(2);
+    meta.unchanged_toast = vec!["note".to_string()].into_boxed_slice();
+
+    let v2_expectation = ManifestExpectation {
+        source_columns: &v2.columns,
+        schema_version: common::SchemaVersionNo(2),
+        ..manifest_expectation(1)
+    };
+    validate_attested_fixture(
+        dir.path(),
+        "toast-v2-valid.parquet",
+        &[meta.clone()],
+        v2_expectation,
+    )
+    .unwrap();
+
+    let incorrectly_bound_to_v1 = ManifestExpectation {
+        source_columns: &v1.columns,
+        ..v2_expectation
+    };
+    assert_integrity_reason(
+        validate_attested_fixture(
+            dir.path(),
+            "toast-v2-against-v1.parquet",
+            &[meta],
+            incorrectly_bound_to_v1,
+        ),
+        "invalid unchanged_toast column",
+    );
 }
 
 #[test]
@@ -929,6 +975,7 @@ fn complete_stream_group_appends_rows_and_receipts_atomically() {
             stream_group_id: Some(77),
             schema_version: common::SchemaVersionNo(1),
             commit_lsn_override: None,
+            destination_columns: None,
             expectation: None,
         },
         ManifestAppend {
@@ -940,6 +987,7 @@ fn complete_stream_group_appends_rows_and_receipts_atomically() {
             stream_group_id: Some(77),
             schema_version: common::SchemaVersionNo(1),
             commit_lsn_override: None,
+            destination_columns: None,
             expectation: None,
         },
     ];
@@ -973,6 +1021,7 @@ fn second_stream_group_file_failure_rolls_back_first_file_and_receipt() {
             stream_group_id: Some(88),
             schema_version: common::SchemaVersionNo(1),
             commit_lsn_override: None,
+            destination_columns: None,
             expectation: None,
         },
         ManifestAppend {
@@ -984,6 +1033,7 @@ fn second_stream_group_file_failure_rolls_back_first_file_and_receipt() {
             stream_group_id: Some(88),
             schema_version: common::SchemaVersionNo(1),
             commit_lsn_override: None,
+            destination_columns: None,
             expectation: None,
         },
     ];
@@ -1009,6 +1059,7 @@ fn replay_metadata_mismatch_never_reuses_an_ingest_receipt() {
         stream_group_id: None,
         schema_version: common::SchemaVersionNo(1),
         commit_lsn_override: None,
+        destination_columns: None,
         expectation: None,
     };
     db.append_manifest_unit("orders", &[file]).unwrap();
@@ -1215,6 +1266,183 @@ fn expected_schema_is_cached_but_every_parquet_is_still_verified() {
         ),
         Err(crate::error::LoaderError::ObjectIntegrity { .. })
     ));
+}
+
+#[test]
+fn registry_schemas_validate_a_mixed_version_group_against_an_additive_raw_superset() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = TableDb::open(dir.path().join("additive.duckdb")).unwrap();
+    let v1 = orders();
+    let mut v2 = v1.clone();
+    v2.columns.push(PgColumn {
+        name: "note".to_string(),
+        type_oid: 25,
+        type_modifier: -1,
+        is_key: false,
+    });
+    db.ensure_tables(&v1, common::SchemaVersionNo(1)).unwrap();
+
+    // Reproduce the post-reconcile/restart shape: DuckDB appends an additive source column after
+    // Walrus's promoted raw columns, while no historical schema expectation is cached yet.
+    db.conn
+        .execute_batch("ALTER TABLE orders_raw ADD COLUMN note VARCHAR;")
+        .unwrap();
+    db.cache_staged_schema(
+        common::SchemaVersionNo(1),
+        &crate::plan::TablePlan::tier1(&v1),
+    )
+    .unwrap();
+    db.cache_staged_schema(
+        common::SchemaVersionNo(2),
+        &crate::plan::TablePlan::tier1(&v2),
+    )
+    .unwrap();
+
+    let before = dir.path().join("before.parquet");
+    let before_uri = before.to_string_lossy().replace('\'', "''");
+    let after = dir.path().join("after.parquet");
+    let after_uri = after.to_string_lossy().replace('\'', "''");
+    let writer = duckdb::Connection::open_in_memory().unwrap();
+    writer
+        .execute_batch(&format!(
+            "CREATE TABLE before (id INTEGER, status VARCHAR, walrus_pg_sink_meta VARCHAR); \
+             INSERT INTO before VALUES (1, 'before-ddl', '{{}}'); \
+             COPY before TO '{before_uri}' (FORMAT PARQUET); \
+             CREATE TABLE after (id INTEGER, status VARCHAR, note VARCHAR, \
+             walrus_pg_sink_meta VARCHAR); \
+             INSERT INTO after VALUES (2, 'after-ddl', 'present', '{{}}'); \
+             COPY after TO '{after_uri}' (FORMAT PARQUET);"
+        ))
+        .unwrap();
+
+    let (before_size, before_sha) = fixture_fingerprint(&before_uri);
+    let (after_size, after_sha) = fixture_fingerprint(&after_uri);
+    let files = [
+        ManifestAppend {
+            manifest_id: common::ManifestId(701),
+            original_uri: &before_uri,
+            verified_uri: Some(&before_uri),
+            object_size: before_size,
+            sha256: &before_sha,
+            stream_group_id: Some(77),
+            schema_version: common::SchemaVersionNo(1),
+            commit_lsn_override: None,
+            destination_columns: None,
+            expectation: None,
+        },
+        ManifestAppend {
+            manifest_id: common::ManifestId(702),
+            original_uri: &after_uri,
+            verified_uri: Some(&after_uri),
+            object_size: after_size,
+            sha256: &after_sha,
+            stream_group_id: Some(77),
+            schema_version: common::SchemaVersionNo(2),
+            commit_lsn_override: None,
+            destination_columns: None,
+            expectation: None,
+        },
+    ];
+    assert_eq!(db.append_manifest_unit("orders", &files).unwrap(), 2);
+    let rows = db
+        .conn
+        .prepare("SELECT id, note FROM orders_raw ORDER BY id")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get::<_, i32>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![(1, None), (2, Some("present".to_string()))],
+        "the historical child NULL-fills the additive raw column and the newer child preserves it"
+    );
+    assert_eq!(db.cached_schema_versions(), 2);
+}
+
+#[test]
+fn explicit_destination_mapping_can_atomically_append_differently_named_file_schemas() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = TableDb::open(dir.path().join("rename.duckdb")).unwrap();
+    let v1 = orders();
+    let mut v2 = v1.clone();
+    v2.columns[1].name = "state".to_string();
+    db.ensure_tables(&v1, common::SchemaVersionNo(1)).unwrap();
+    db.conn
+        .execute_batch("ALTER TABLE orders_raw RENAME COLUMN status TO state;")
+        .unwrap();
+    db.cache_staged_schema(
+        common::SchemaVersionNo(1),
+        &crate::plan::TablePlan::tier1(&v1),
+    )
+    .unwrap();
+    db.cache_staged_schema(
+        common::SchemaVersionNo(2),
+        &crate::plan::TablePlan::tier1(&v2),
+    )
+    .unwrap();
+
+    let before = dir.path().join("rename-before.parquet");
+    let before_uri = before.to_string_lossy().replace('\'', "''");
+    let after = dir.path().join("rename-after.parquet");
+    let after_uri = after.to_string_lossy().replace('\'', "''");
+    let writer = duckdb::Connection::open_in_memory().unwrap();
+    writer
+        .execute_batch(&format!(
+            "CREATE TABLE before (id INTEGER, status VARCHAR, walrus_pg_sink_meta VARCHAR); \
+             INSERT INTO before VALUES (1, 'old-name', '{{}}'); \
+             COPY before TO '{before_uri}' (FORMAT PARQUET); \
+             CREATE TABLE after (id INTEGER, state VARCHAR, walrus_pg_sink_meta VARCHAR); \
+             INSERT INTO after VALUES (2, 'new-name', '{{}}'); \
+             COPY after TO '{after_uri}' (FORMAT PARQUET);"
+        ))
+        .unwrap();
+    let (before_size, before_sha) = fixture_fingerprint(&before_uri);
+    let (after_size, after_sha) = fixture_fingerprint(&after_uri);
+    let v1_destinations = vec![
+        "id".to_string(),
+        "state".to_string(),
+        "walrus_pg_sink_meta".to_string(),
+    ];
+    let v2_destinations = v1_destinations.clone();
+    let files = [
+        ManifestAppend {
+            manifest_id: common::ManifestId(711),
+            original_uri: &before_uri,
+            verified_uri: Some(&before_uri),
+            object_size: before_size,
+            sha256: &before_sha,
+            stream_group_id: Some(78),
+            schema_version: common::SchemaVersionNo(1),
+            commit_lsn_override: None,
+            destination_columns: Some(&v1_destinations),
+            expectation: None,
+        },
+        ManifestAppend {
+            manifest_id: common::ManifestId(712),
+            original_uri: &after_uri,
+            verified_uri: Some(&after_uri),
+            object_size: after_size,
+            sha256: &after_sha,
+            stream_group_id: Some(78),
+            schema_version: common::SchemaVersionNo(2),
+            commit_lsn_override: None,
+            destination_columns: Some(&v2_destinations),
+            expectation: None,
+        },
+    ];
+    assert_eq!(db.append_manifest_unit("orders", &files).unwrap(), 2);
+    let states = db
+        .conn
+        .prepare("SELECT state FROM orders_raw ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(states, ["old-name", "new-name"]);
 }
 
 #[test]

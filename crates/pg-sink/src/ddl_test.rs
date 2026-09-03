@@ -93,6 +93,7 @@ fn tracked_orders() -> PgRelation {
 
 fn disconnected_pool() -> sqlx::PgPool {
     sqlx::postgres::PgPoolOptions::new()
+        .acquire_timeout(std::time::Duration::from_millis(100))
         .connect_lazy("postgres://walrus@127.0.0.1:1/unused")
         .expect("a lazy pool parses its DSN without connecting")
 }
@@ -164,6 +165,18 @@ fn comment_is_metadata_only_and_does_not_advance_projected_version() {
     );
     assert_eq!(observation.structural_version, None);
     assert_eq!(consumer.version_of("public", "orders"), SchemaVersionNo(1));
+    assert!(
+        !consumer.is_provisional("public", "orders", SchemaVersionNo(1)),
+        "COMMENT audit state must not commit-gate an unchanged relation snapshot"
+    );
+    consumer.stage_registry(TransactionScope::Ordinary, registry("orders", 1));
+    let prepared = consumer.prepare_ordinary_commit(Lsn::new(200)).unwrap();
+    assert!(!prepared.has_structural_ddl());
+    assert_eq!(prepared.ddl_rows()[0].c_tag, "COMMENT");
+    assert!(
+        prepared.registry_rows().is_empty(),
+        "COMMENT cannot own a registry row even through the direct staging API"
+    );
 }
 
 #[test]
@@ -235,6 +248,68 @@ fn streamed_prepare_is_read_only_and_durable_replay_finalization_is_idempotent()
         "AlreadyPublished replay finalization must be idempotent"
     );
     assert_eq!(consumer.processed.get(&7), Some(&prepared.ddl_rows()[0]));
+}
+
+#[test]
+fn ordinary_prepare_is_read_only_and_lost_ack_finalization_is_idempotent() {
+    let mut consumer = DdlConsumer::new(EpochNo(1));
+    consumer.observe(
+        TransactionScope::Ordinary,
+        event(8, "public", "orders", "ALTER TABLE"),
+        None,
+    );
+    consumer.stage_registry(TransactionScope::Ordinary, registry("orders", 2));
+
+    let prepared = consumer.prepare_ordinary_commit(Lsn::new(901)).unwrap();
+    assert!(prepared.has_structural_ddl());
+    assert_eq!(prepared.ddl_rows().len(), 1);
+    assert_eq!(prepared.ddl_rows()[0].source_audit_id, 8);
+    assert_eq!(prepared.ddl_rows()[0].c_lsn, Lsn::new(901));
+    assert_eq!(prepared.registry_rows(), &[registry("orders", 2)]);
+    assert_eq!(
+        consumer.committed_version_of("public", "orders"),
+        SchemaVersionNo(1),
+        "a failed or ambiguously acknowledged publication must remain retryable"
+    );
+    assert_eq!(
+        consumer.prepare_ordinary_commit(Lsn::new(901)).unwrap(),
+        prepared,
+        "WAL replay must rebuild the exact same ordinary publication payload"
+    );
+
+    consumer.finalize_ordinary_commit(prepared.clone());
+    assert_eq!(
+        consumer.committed_version_of("public", "orders"),
+        SchemaVersionNo(2)
+    );
+    assert!(consumer.pending.is_empty());
+    assert!(consumer.pending_registry.is_empty());
+    assert_eq!(consumer.processed.get(&8), Some(&prepared.ddl_rows()[0]));
+
+    consumer.finalize_ordinary_commit(prepared.clone());
+    assert_eq!(
+        consumer.committed_version_of("public", "orders"),
+        SchemaVersionNo(2),
+        "AlreadyPublished ordinary replay finalization must be idempotent"
+    );
+    assert_eq!(consumer.processed.get(&8), Some(&prepared.ddl_rows()[0]));
+}
+
+#[test]
+fn ordinary_structural_prepare_requires_publication_even_without_registry() {
+    let mut consumer = DdlConsumer::new(EpochNo(1));
+    consumer.observe(
+        TransactionScope::Ordinary,
+        event(9, "public", "orders", "ALTER TABLE"),
+        None,
+    );
+
+    let prepared = consumer.prepare_ordinary_commit(Lsn::new(902)).unwrap();
+    assert!(
+        prepared.has_structural_ddl(),
+        "selection is driven by structural DDL, so control can reject the missing registry"
+    );
+    assert!(prepared.registry_rows().is_empty());
 }
 
 #[test]
@@ -480,6 +555,123 @@ fn relation_binding_uses_exact_historical_shape_and_rejects_future_fallback() {
 }
 
 #[tokio::test]
+async fn ordinary_structural_ddl_with_routed_data_fails_before_control_publication() {
+    let mut consumer = DdlConsumer::new(EpochNo(1));
+    consumer.observe(
+        TransactionScope::Ordinary,
+        event(8, "public", "orders", "ALTER TABLE"),
+        None,
+    );
+    consumer.stage_registry(TransactionScope::Ordinary, registry("orders", 2));
+
+    let err = consumer
+        .on_commit(
+            &disconnected_pool(),
+            77,
+            Lsn::new(901),
+            UtcTimestamp::now(),
+            true,
+            0,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        DdlError::MixedOrdinaryDataAndStructuralDdl {
+            top_xid: 77,
+            commit_lsn,
+        } if commit_lsn == Lsn::new(901)
+    ));
+    assert_eq!(
+        consumer.committed_version_of("public", "orders"),
+        SchemaVersionNo(1),
+        "the rejected source commit must not become visible"
+    );
+    assert_eq!(
+        consumer
+            .prepare_ordinary_commit(Lsn::new(901))
+            .unwrap()
+            .registry_rows(),
+        &[registry("orders", 2)],
+        "the rejected publication must remain exactly replayable"
+    );
+}
+
+#[tokio::test]
+async fn ordinary_structural_ddl_with_reload_effects_fails_before_control_publication() {
+    let mut consumer = DdlConsumer::new(EpochNo(1));
+    consumer.observe(
+        TransactionScope::Ordinary,
+        event(8, "public", "orders", "ALTER TABLE"),
+        None,
+    );
+    consumer.stage_registry(TransactionScope::Ordinary, registry("orders", 2));
+
+    let err = consumer
+        .on_commit(
+            &disconnected_pool(),
+            77,
+            Lsn::new(901),
+            UtcTimestamp::now(),
+            false,
+            2,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        DdlError::MixedOrdinaryReloadEffectsAndStructuralDdl {
+            top_xid: 77,
+            commit_lsn,
+            committed_reload_effects: 2,
+        } if commit_lsn == Lsn::new(901)
+    ));
+    assert_eq!(
+        consumer.committed_version_of("public", "orders"),
+        SchemaVersionNo(1)
+    );
+    assert_eq!(
+        consumer
+            .prepare_ordinary_commit(Lsn::new(901))
+            .unwrap()
+            .registry_rows(),
+        &[registry("orders", 2)],
+        "the rejected source commit must remain exactly replayable"
+    );
+}
+
+#[tokio::test]
+async fn ordinary_structural_publication_failure_keeps_commit_provisional() {
+    let mut consumer = DdlConsumer::new(EpochNo(1));
+    consumer.observe(
+        TransactionScope::Ordinary,
+        event(8, "public", "orders", "ALTER TABLE"),
+        None,
+    );
+    consumer.stage_registry(TransactionScope::Ordinary, registry("orders", 2));
+
+    let err = consumer
+        .on_commit(
+            &disconnected_pool(),
+            77,
+            Lsn::new(901),
+            UtcTimestamp::now(),
+            false,
+            0,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DdlError::Control(_)));
+    assert_eq!(
+        consumer.committed_version_of("public", "orders"),
+        SchemaVersionNo(1)
+    );
+    let retry = consumer.prepare_ordinary_commit(Lsn::new(901)).unwrap();
+    assert_eq!(retry.ddl_rows().len(), 1);
+    assert_eq!(retry.registry_rows(), &[registry("orders", 2)]);
+}
+
+#[tokio::test]
 async fn committed_tracked_table_rename_fails_before_control_persistence() {
     let mut consumer = DdlConsumer::new(EpochNo(1));
     let previous = tracked_orders();
@@ -489,7 +681,14 @@ async fn committed_tracked_table_rename_fails_before_control_persistence() {
     assert_eq!(observation.structural_version, Some(SchemaVersionNo(2)));
 
     let err = consumer
-        .on_commit(&disconnected_pool(), Lsn::new(10))
+        .on_commit(
+            &disconnected_pool(),
+            10,
+            Lsn::new(10),
+            UtcTimestamp::now(),
+            false,
+            0,
+        )
         .await
         .unwrap_err();
     let DdlError::TrackedTableIdentityChange(change) = err else {
@@ -514,7 +713,14 @@ async fn committed_tracked_table_schema_move_fails_loudly() {
     );
 
     let err = consumer
-        .on_commit(&disconnected_pool(), Lsn::new(10))
+        .on_commit(
+            &disconnected_pool(),
+            10,
+            Lsn::new(10),
+            UtcTimestamp::now(),
+            false,
+            0,
+        )
         .await
         .unwrap_err();
     assert!(matches!(

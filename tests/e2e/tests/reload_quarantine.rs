@@ -26,6 +26,8 @@
 
 use common::{Lsn, PgRelation};
 use e2e::Harness;
+use object_store::ObjectStore as _;
+use sha2::{Digest as _, Sha256};
 use std::time::Duration;
 
 // Harness-owned fixtures created before bootstrap so the loader owns them.
@@ -49,6 +51,32 @@ fn write_v2_file(epoch: i64, uri_key: &str) -> String {
     w.execute_batch(&format!("COPY fixture TO '{uri}' (FORMAT PARQUET);"))
         .unwrap();
     uri
+}
+
+async fn fingerprint(uri: &str) -> (i64, Vec<u8>) {
+    let key = uri
+        .strip_prefix("s3://walrus/")
+        .expect("quarantine fixture URI is in the walrus bucket");
+    let store = object_store::aws::AmazonS3Builder::new()
+        .with_bucket_name("walrus")
+        .with_region("us-east-1")
+        .with_endpoint("http://localhost:9000")
+        .with_access_key_id("minioadmin")
+        .with_secret_access_key("minioadmin")
+        .with_allow_http(true)
+        .build()
+        .unwrap();
+    let bytes = store
+        .get(&object_store::path::Path::from(key))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    (
+        i64::try_from(bytes.len()).unwrap(),
+        Sha256::digest(&bytes).to_vec(),
+    )
 }
 
 async fn transformed(h: &Harness, table: &str) -> Lsn {
@@ -158,6 +186,7 @@ async fn quarantined_table_recovers_via_reload_without_stalling_others() {
     .await
     .unwrap();
     let uri = write_v2_file(epoch, "inject-v2");
+    let (object_size, sha256) = fingerprint(&uri).await;
     control::insert_ready(
         &pool,
         &control::NewManifestFile {
@@ -167,6 +196,8 @@ async fn quarantined_table_recovers_via_reload_without_stalling_others() {
             s3_uri: uri,
             kind: control::ManifestKind::Stream,
             row_count: 1,
+            object_size,
+            sha256,
             lsn_start: "0/C8".parse().unwrap(),
             lsn_end: "0/C8".parse().unwrap(),
             schema_version: common::SchemaVersionNo(2),

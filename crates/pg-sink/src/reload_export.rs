@@ -1373,14 +1373,9 @@ impl ReloadRouter {
             .begin()
             .await
             .context("begin reload object manifest transaction")?;
-        crate::manifest::record_ready_with_reload(
-            &mut *tx,
-            self.ctx.epoch,
-            &object,
-            Some(self.ctx.reload_id),
-        )
-        .await
-        .context("record streamed reload object manifest")?;
+        crate::manifest::record_reload_ready(&mut *tx, self.ctx.epoch, &object, self.ctx.reload_id)
+            .await
+            .context("record streamed reload object manifest")?;
         let file_no = control::reload::record_exported_file(
             &mut *tx,
             &self.ctx.lease,

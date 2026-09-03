@@ -8,7 +8,7 @@
 //! The remote files' union is the table exactly, every row is stamped `commit_lsn = lsn = F`, a
 //! crashed shared snapshot is purged and replaced by a fresh fenced successor, a protocol-v2
 //! transaction opened before F and committed after H remains a later WAL event, and a missing decoder
-//! cannot let an exporter query before F is durable. Per-worker tails may add files beyond
+//! cannot let an exporter query before F is durable. Per-range tails may add files beyond
 //! `ceil(total_rows/chunk_rows)`; `chunk_no` is the durable completed-file count, never a keyset cursor.
 //! The SQL/stamp shapes are unit-tested in `src/reload_export.rs`.
 //!
@@ -248,6 +248,72 @@ async fn reload_manifest_rows(
         .collect()
 }
 
+/// Durable receipts for every physical range in one immutable snapshot plan.
+async fn reload_export_range_receipts(
+    pool: &sqlx::PgPool,
+    reload_id: ReloadId,
+) -> Vec<(i64, String, Option<i64>, Option<i64>)> {
+    sqlx::query_as(
+        "SELECT range_no, status, file_count, row_count
+         FROM walrus.table_reload_export_range
+         WHERE reload_id = $1
+         ORDER BY range_no",
+    )
+    .bind(reload_id.0)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// Check file accounting at the same range boundary where the exporter records crash-safe
+/// completion. These fixtures are far below the byte/Parquet-metadata limits, so each range emits
+/// exactly `ceil(range_rows/chunk_rows)` objects (zero for an empty range).
+fn assert_completed_range_receipts(
+    receipts: &[(i64, String, Option<i64>, Option<i64>)],
+    manifest_count: usize,
+    expected_rows: i64,
+    chunk_rows: i64,
+) {
+    assert!(
+        !receipts.is_empty(),
+        "the snapshot has a durable range plan"
+    );
+    assert!(
+        chunk_rows > 0,
+        "the configured object row limit is positive"
+    );
+    let mut receipt_files = 0i64;
+    let mut receipt_rows = 0i64;
+    for (expected_range_no, (range_no, status, file_count, row_count)) in
+        receipts.iter().enumerate()
+    {
+        assert_eq!(
+            *range_no,
+            i64::try_from(expected_range_no).unwrap(),
+            "range receipts retain their contiguous plan ordinals"
+        );
+        assert_eq!(status, "complete", "every planned range is sealed");
+        let file_count = file_count.expect("a completed range records its file count");
+        let row_count = row_count.expect("a completed range records its row count");
+        let expected_file_count = row_count / chunk_rows + i64::from(row_count % chunk_rows != 0);
+        assert_eq!(
+            file_count, expected_file_count,
+            "one independently receipted range has only row-limit objects plus its tail"
+        );
+        receipt_files += file_count;
+        receipt_rows += row_count;
+    }
+    assert_eq!(
+        receipt_files,
+        i64::try_from(manifest_count).unwrap(),
+        "range receipts account for every reload manifest"
+    );
+    assert_eq!(
+        receipt_rows, expected_rows,
+        "range receipts account for the complete snapshot"
+    );
+}
+
 /// Wait until at least one independently completed worker object is durable in control-pg.
 async fn wait_for_file_progress(pool: &sqlx::PgPool, reload_id: ReloadId) -> control::ReloadRow {
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -455,14 +521,11 @@ async fn chunks_cover_the_table_exactly_with_shared_baseline_stamp() {
         "the decoder persisted F then H before resolving each waiter"
     );
 
-    // Ten full-size equivalents cover 2,500 rows. Independent worker tails may add up to one
-    // partial object per four workers, so file order/count is deliberately not keyset-deterministic.
+    // Each physical range is independently receipted, so every non-empty range may contribute a
+    // partial tail. Validate the persisted range accounting instead of assuming one tail per worker.
     let files = reload_manifest_rows(&pool, epoch).await;
-    assert!(
-        (10..=13).contains(&files.len()),
-        "2500 rows / 250 per object plus at most three extra worker tails: {} files",
-        files.len()
-    );
+    let receipts = reload_export_range_receipts(&pool, reload_id).await;
+    assert_completed_range_receipts(&receipts, files.len(), 2500, 250);
     assert_eq!(files.iter().map(|file| file.1).sum::<i64>(), 2500);
     assert!(files.iter().all(|file| (1..=250).contains(&file.1)));
     let ends: Vec<Lsn> = files.iter().map(|f| f.2.parse().unwrap()).collect();
@@ -659,16 +722,20 @@ async fn adopted_file_progress_is_purged_and_successor_reexports_one_snapshot() 
     ));
 
     let files = reload_manifest_rows(&pool, epoch).await;
-    assert!(
-        (3..=6).contains(&files.len()),
-        "the successor writes three full-size equivalents plus worker tails: {} files",
-        files.len()
-    );
+    let receipts = reload_export_range_receipts(&pool, successor_id).await;
+    assert_completed_range_receipts(&receipts, files.len(), 2500, 1000);
     assert!(files.iter().all(|file| file.3 == successor_id));
+    assert_eq!(files.iter().map(|file| file.1).sum::<i64>(), 2500);
+    assert!(files.iter().all(|file| (1..=1000).contains(&file.1)));
     let mut total = 0usize;
     let mut unique = BTreeSet::new();
-    for (uri, _, _, _) in &files {
+    for (uri, row_count, _, _) in &files {
         let (ids, _) = read_chunk_file(uri).await;
+        assert_eq!(
+            i64::try_from(ids.len()).unwrap(),
+            *row_count,
+            "manifest row count matches the Parquet object"
+        );
         total += ids.len();
         unique.extend(ids);
     }

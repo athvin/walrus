@@ -1,7 +1,8 @@
-//! Phase A — the loader's ingest half (loader §4). **Claim** the next `ready` manifest files in
-//! `(lsn_end, id)` order, **append every row verbatim** into `<table>_raw` with DuckDB, then — in **one
-//! control-DB transaction** — advance `raw_appended_lsn = max(claimed lsn_end)` **and** delete the
-//! claimed queue rows. No transform: this ends with a faithful, idempotent CDC log.
+//! Phase A — the loader's ingest half (loader §4). **Claim** the next `ready` file groups and
+//! schema-only stream barriers in commit order, append every file row verbatim into `<table>_raw`,
+//! and reconcile every barrier before retiring it. In **one control-DB transaction**, file work
+//! advances `raw_appended_lsn` and is deleted while schema-only barriers are marked applied. No
+//! transform: this ends with a faithful, idempotent CDC log and an ordered structural frontier.
 //!
 //! **Two guards, both load-bearing (§4 crash-window):** (1) the queue *deletion* is what advances the
 //! frontier (not the watermark alone); (2) the per-file DuckDB ingest ledger commits atomically with
@@ -17,7 +18,7 @@ use common::{EpochNo, Kind, Lsn, PgRelation, ReloadId, SchemaVersionNo};
 use futures_util::StreamExt as _;
 use sha2::{Digest as _, Sha256};
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::NonZeroI64;
 use std::sync::Arc;
 use std::time::Duration;
@@ -143,14 +144,23 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     // large backlog cannot keep the first reload chunk outside every bounded claim forever.
     let mut reload_build = prepare_ready_reload(ctx).await?;
 
-    // 1. Claim in (lsn_end, id) order — NEVER `lsn_end > raw_appended_lsn` (that skips equal-lsn_end
-    //    snapshot files forever).
+    // 1. Claim complete work units in commit order — NEVER filter on
+    //    `lsn_end > raw_appended_lsn` (that skips equal-lsn_end snapshot files forever). A reload
+    //    publication re-runs its fenced pre-F purge before every claim so a late zero-file stream
+    //    group is superseded rather than incorrectly applied to the replacement generation.
     let claimed = if let Some(build) = &reload_build {
         if build.phase == crate::duck::ReloadPhase::Published {
             Vec::new()
         } else {
             let publication = publication_for_build(ctx, build).await?;
-            control::reload::claim_publication_ready(
+            control::delete_publication_superseded(
+                &ctx.pool,
+                &publication,
+                &ctx.owner_pod,
+                ctx.fencing_token,
+            )
+            .await?;
+            control::reload::claim_publication_ready_units(
                 &ctx.pool,
                 &publication,
                 &ctx.owner_pod,
@@ -160,7 +170,7 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
             .await?
         }
     } else {
-        control::claim_ready(
+        control::claim_ready_units(
             &ctx.pool,
             ctx.epoch,
             &ctx.schema,
@@ -205,7 +215,8 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
         // empty. Only then can we prove there is no old-version crash-window append lacking a file
         // marker. New files arriving after this observation have not been appended and are safe.
         if reload_build.is_none()
-            && max_ready.is_none()
+            && ctx.db.has_legacy_replay_fence()
+            && !control::manifest_work_exists(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table).await?
             && ctx.db.migrate_legacy_replay_fence(&ctx.table)?
         {
             tracing::info!(
@@ -236,22 +247,74 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
         .as_ref()
         .map_or(raw_appended, |build| build.raw_appended_lsn);
     let mut ids = Vec::with_capacity(claimed.len());
+    let mut barriers = Vec::with_capacity(claimed.len());
     let mut appended = 0u64;
-    for unit in manifest_units(&claimed) {
+    let mut version_schemas = BTreeMap::<SchemaVersionNo, VersionSchema>::new();
+    for work in &claimed {
+        let work_lsn = match work {
+            control::ReadyManifestUnit::Files(files) => {
+                files
+                    .first()
+                    .ok_or_else(|| LoaderError::ManifestInvariant {
+                        message: "claim produced an empty manifest unit".to_string(),
+                    })?
+                    .lsn_end
+            }
+            control::ReadyManifestUnit::SchemaBarrier(barrier) => barrier.commit_lsn,
+        };
+        // H is a unit boundary. Protocol-v2 group children share lsn_end, and no part of a group is
+        // routed or retired when the entire unit belongs after the active publication barrier.
+        if reload_build
+            .as_ref()
+            .is_some_and(|build| work_lsn > build.final_lsn)
+        {
+            break;
+        }
+
+        let files = match work {
+            control::ReadyManifestUnit::Files(files) => files,
+            control::ReadyManifestUnit::SchemaBarrier(barrier) => {
+                validate_schema_barrier(ctx, barrier)?;
+                if let Some(build) = &reload_build {
+                    if barrier.commit_lsn <= build.start_lsn {
+                        // A publication can race one late pre-F control-plane insert after the purge
+                        // immediately preceding its SELECT claim. Re-run the fenced purge and do not
+                        // acknowledge that structural receipt as applied: the baseline supersedes it.
+                        let publication = publication_for_build(ctx, build).await?;
+                        control::delete_publication_superseded(
+                            &ctx.pool,
+                            &publication,
+                            &ctx.owner_pod,
+                            ctx.fencing_token,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    if barrier.final_schema_version != build.schema_version {
+                        return Err(LoaderError::ManifestInvariant {
+                            message: format!(
+                                "schema-only stream group {} reaches schema {} across frozen reload {} schema {}; shadow schema evolution inside (F,H] is not yet supported",
+                                barrier.id.0,
+                                barrier.final_schema_version,
+                                build.reload_id,
+                                build.schema_version,
+                            ),
+                        });
+                    }
+                } else {
+                    reconcile_schema_barrier(ctx, barrier, &mut version_schemas).await?;
+                }
+                barriers.push(barrier.clone());
+                continue;
+            }
+        };
+        let unit = files.iter().collect::<Vec<_>>();
         let first = unit
             .first()
             .copied()
             .ok_or_else(|| LoaderError::ManifestInvariant {
                 message: "claim produced an empty manifest unit".to_string(),
             })?;
-        // H is a unit boundary. Protocol-v2 group children share lsn_end, and no part of a group is
-        // routed or retired when the entire unit belongs after the active publication barrier.
-        if reload_build
-            .as_ref()
-            .is_some_and(|build| first.lsn_end > build.final_lsn)
-        {
-            break;
-        }
 
         let mut route = None;
         for f in &unit {
@@ -267,7 +330,7 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
                 file_route
             } else if let Some(build) = &reload_build {
                 if f.lsn_end <= build.start_lsn {
-                    FileRoute::Retire
+                    FileRoute::Superseded
                 } else {
                     FileRoute::Shadow(build.shadow_table.clone())
                 }
@@ -295,11 +358,28 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
             ids.extend(unit.iter().map(|file| file.id));
             continue;
         }
+        if route == FileRoute::Superseded {
+            let build = reload_build
+                .as_ref()
+                .ok_or_else(|| LoaderError::ManifestInvariant {
+                    message: "superseded manifest unit has no reload build".to_string(),
+                })?;
+            let publication = publication_for_build(ctx, build).await?;
+            control::delete_publication_superseded(
+                &ctx.pool,
+                &publication,
+                &ctx.owner_pod,
+                ctx.fencing_token,
+            )
+            .await?;
+            continue;
+        }
         let current_schema = ctx.db.schema_version()?;
+        let target = manifest_unit_target(&unit)?;
         if route == FileRoute::Live
+            && target > current_schema
             && unit.iter().any(|f| {
                 f.kind != control::ManifestKind::Reload
-                    && f.schema_version > current_schema
                     && supersede_floor.is_some_and(|floor| f.lsn_end <= floor)
             })
         {
@@ -311,47 +391,103 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
                 .ok_or_else(|| LoaderError::ManifestInvariant {
                     message: "shadow-routed manifest unit has no reload build".to_string(),
                 })?;
-            if unit
-                .iter()
-                .any(|file| file.schema_version != build.schema_version)
+            if target != build.schema_version
+                || unit
+                    .iter()
+                    .any(|file| file.schema_version != build.schema_version)
             {
                 return Err(LoaderError::ManifestInvariant {
                     message: format!(
-                        "stream group {:?} crosses frozen reload {} schema {}; shadow schema evolution inside [F,H] is not yet supported",
-                        first.stream_group_id, build.reload_id, build.schema_version
+                        "stream group {:?} reaches schema {target} across frozen reload {} schema {}; shadow schema evolution inside [F,H] is not yet supported",
+                        first.stream_group_id, build.reload_id, build.schema_version,
                     ),
                 });
             }
         }
 
-        if route == FileRoute::Live {
-            let target = unit
-                .iter()
-                .map(|file| file.schema_version)
-                .max()
-                .ok_or_else(|| LoaderError::ManifestInvariant {
-                    message: "manifest unit has no schema version".to_string(),
-                })?;
-            if target > ctx.db.schema_version()?
-                && let Err(error) = crate::ddl::reconcile_to_version(
-                    &ctx.db,
-                    &ctx.pool,
-                    ctx.epoch,
-                    &ctx.schema,
-                    &ctx.table,
-                    target,
-                )
-                .await
-            {
-                if matches!(error, LoaderError::Quarantine { .. }) {
-                    ctx.state.quarantine_table(&ctx.schema, &ctx.table);
-                    tracing::error!(
-                        table = %format_args!("{}.{}", ctx.schema, ctx.table),
-                        "QUARANTINE: schema change could not be applied before atomic stream-group append"
-                    );
-                }
-                return Err(error);
+        // One protocol-v2 transaction group can contain children from several structural schema
+        // versions. The append is atomic, so the raw destination must be reconciled to the group's
+        // final schema barrier before any child is inserted; that barrier can be newer than every
+        // child when DDL follows the last data row. Preserve exact validation for every older child
+        // by binding its immutable registry plan now; the final raw-table superset is not an
+        // authoritative description of historical Parquet shape. Load every intervening registry
+        // version too: composing only the endpoints would lose rename chains and would position-zip
+        // survivors across a DROP-induced attnum shift.
+        let source_floor = unit
+            .iter()
+            .map(|file| file.schema_version)
+            .min()
+            .ok_or_else(|| LoaderError::ManifestInvariant {
+                message: "manifest unit has no schema version".to_string(),
+            })?;
+        let destination_version = match &route {
+            FileRoute::Live => current_schema.max(target),
+            FileRoute::Shadow(_) => target,
+            FileRoute::Retire => {
+                return Err(LoaderError::ManifestInvariant {
+                    message: "retired manifest unit reached schema binding".to_string(),
+                });
             }
+            FileRoute::Superseded => {
+                return Err(LoaderError::ManifestInvariant {
+                    message: "superseded manifest unit reached schema binding".to_string(),
+                });
+            }
+        };
+        let expected_count = destination_version
+            .0
+            .checked_sub(source_floor.0)
+            .and_then(|distance| distance.checked_add(1))
+            .ok_or_else(|| LoaderError::ManifestInvariant {
+                message: format!(
+                    "invalid schema lineage range {source_floor}..={destination_version}"
+                ),
+            })?;
+        let cached_count = i64::try_from(
+            version_schemas
+                .range(source_floor..=destination_version)
+                .count(),
+        )
+        .unwrap_or(i64::MAX);
+        if cached_count != expected_count {
+            for (version, schema) in schema_lineage(ctx, source_floor, destination_version).await? {
+                version_schemas.insert(version, schema);
+            }
+        }
+        let source_versions = unit
+            .iter()
+            .map(|file| file.schema_version)
+            .collect::<BTreeSet<_>>();
+        let mut destination_columns = BTreeMap::<SchemaVersionNo, Vec<String>>::new();
+        for version in source_versions {
+            let schema = version_schema(&version_schemas, version)?;
+            ctx.db.cache_staged_schema(version, &schema.plan)?;
+            destination_columns.insert(
+                version,
+                destination_columns_between(version, destination_version, &version_schemas)?,
+            );
+        }
+
+        if route == FileRoute::Live
+            && target > current_schema
+            && let Err(error) = crate::ddl::reconcile_to_version(
+                &ctx.db,
+                &ctx.pool,
+                ctx.epoch,
+                &ctx.schema,
+                &ctx.table,
+                target,
+            )
+            .await
+        {
+            if matches!(error, LoaderError::Quarantine { .. }) {
+                ctx.state.quarantine_table(&ctx.schema, &ctx.table);
+                tracing::error!(
+                    table = %format_args!("{}.{}", ctx.schema, ctx.table),
+                    "QUARANTINE: schema change could not be applied before atomic stream-group append"
+                );
+            }
+            return Err(error);
         }
 
         let destination = match &route {
@@ -360,6 +496,11 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
             FileRoute::Retire => {
                 return Err(LoaderError::ManifestInvariant {
                     message: "retired manifest unit reached append preparation".to_string(),
+                });
+            }
+            FileRoute::Superseded => {
+                return Err(LoaderError::ManifestInvariant {
+                    message: "superseded manifest unit reached append preparation".to_string(),
                 });
             }
         };
@@ -372,18 +513,30 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
         let probes: Vec<crate::duck::ManifestAppend<'_>> = unit
             .iter()
             .zip(&overrides)
-            .map(|(file, lsn_override)| crate::duck::ManifestAppend {
-                manifest_id: file.id,
-                original_uri: &file.s3_uri,
-                verified_uri: None,
-                object_size: file.object_size,
-                sha256: &file.sha256,
-                stream_group_id: file.stream_group_id.map(|id| id.0),
-                schema_version: file.schema_version,
-                commit_lsn_override: lsn_override.as_deref(),
-                expectation: Some(manifest_expectation(file, &ctx.rel)),
+            .map(|(file, lsn_override)| {
+                let schema = version_schema(&version_schemas, file.schema_version)?;
+                let mapped = destination_columns
+                    .get(&file.schema_version)
+                    .ok_or_else(|| LoaderError::ManifestInvariant {
+                        message: format!(
+                            "manifest {} has no destination mapping for schema {}",
+                            file.id, file.schema_version
+                        ),
+                    })?;
+                Ok(crate::duck::ManifestAppend {
+                    manifest_id: file.id,
+                    original_uri: &file.s3_uri,
+                    verified_uri: None,
+                    object_size: file.object_size,
+                    sha256: &file.sha256,
+                    stream_group_id: file.stream_group_id.map(|id| id.0),
+                    schema_version: file.schema_version,
+                    commit_lsn_override: lsn_override.as_deref(),
+                    destination_columns: Some(mapped),
+                    expectation: Some(manifest_expectation(file, &schema.relation)),
+                })
             })
-            .collect();
+            .collect::<Result<_, LoaderError>>()?;
         let mut states = Vec::with_capacity(probes.len());
         for (file, probe) in unit.iter().zip(&probes) {
             match ctx.db.ingest_receipt_state(probe) {
@@ -435,6 +588,15 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
             .zip(&overrides)
             .enumerate()
             .map(|(index, (file, lsn_override))| {
+                let schema = version_schema(&version_schemas, file.schema_version)?;
+                let mapped = destination_columns
+                    .get(&file.schema_version)
+                    .ok_or_else(|| LoaderError::ManifestInvariant {
+                        message: format!(
+                            "manifest {} has no destination mapping for schema {}",
+                            file.id, file.schema_version
+                        ),
+                    })?;
                 let verified_uri = verified
                     .get(index)
                     .map(|object| object.uri(&file.s3_uri))
@@ -448,7 +610,8 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
                     stream_group_id: file.stream_group_id.map(|id| id.0),
                     schema_version: file.schema_version,
                     commit_lsn_override: lsn_override.as_deref(),
-                    expectation: Some(manifest_expectation(file, &ctx.rel)),
+                    destination_columns: Some(mapped),
+                    expectation: Some(manifest_expectation(file, &schema.relation)),
                 })
             })
             .collect::<Result<_, LoaderError>>()?;
@@ -473,15 +636,18 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
         ids.extend(unit.iter().map(|file| file.id));
     }
 
-    // 3. ONE control-DB txn: advance the watermark to the batch max AND delete the claimed queue rows.
-    //    (The append is already durable in DuckDB — step 2 committed.)
-    if ids.is_empty() {
+    // 3. ONE control-DB txn: advance/delete file work and retire schema-only barriers together.
+    //    Duck append and schema reconciliation are already durable. A zero-file barrier does not
+    //    advance a data checkpoint: no raw row exists at its commit LSN for Phase B to transform.
+    if ids.is_empty() && barriers.is_empty() {
         return Ok(None);
     }
     let publication = match &reload_build {
         Some(build) => {
-            ctx.db
-                .advance_reload_raw(build.reload_id, build.publication_nonce, max_lsn)?;
+            if !ids.is_empty() {
+                ctx.db
+                    .advance_reload_raw(build.reload_id, build.publication_nonce, max_lsn)?;
+            }
             Some(publication_for_build(ctx, build).await?)
         }
         None => None,
@@ -497,16 +663,31 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     if let Some(publication) = &publication {
         control::reload::lock_publication(&mut *tx, publication, &ctx.owner_pod, ctx.fencing_token)
             .await?;
-    } else {
+    } else if !ids.is_empty() {
         control::advance_raw_appended(&mut *tx, ctx.epoch, &ctx.schema, &ctx.table, max_lsn)
             .await?;
     }
-    let deleted = control::delete_claimed(&mut *tx, &ids).await?;
-    if deleted != ids.len() as u64 {
-        return Err(LoaderError::Internal(format!(
-            "claimed manifest retirement removed {deleted} rows, expected {}",
-            ids.len()
-        )));
+    // Both retirement statements lock stream-group parents. Resolve their union first and acquire
+    // one global ascending lock order, otherwise a mixed file+barrier batch can deadlock another
+    // integrity/publication transaction that touches the same parents in the opposite subset order.
+    control::lock_manifest_work_groups(&mut *tx, &ids, &barriers).await?;
+    if !ids.is_empty() {
+        let deleted = control::delete_claimed(&mut *tx, &ids).await?;
+        if deleted != ids.len() as u64 {
+            return Err(LoaderError::Internal(format!(
+                "claimed manifest retirement removed {deleted} rows, expected {}",
+                ids.len()
+            )));
+        }
+    }
+    if !barriers.is_empty() {
+        let completed = control::complete_schema_barriers(&mut *tx, &barriers).await?;
+        if completed != barriers.len() as u64 {
+            return Err(LoaderError::Internal(format!(
+                "schema barrier retirement completed {completed} rows, expected {}",
+                barriers.len()
+            )));
+        }
     }
     tx.commit()
         .await
@@ -520,9 +701,7 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     // then crashed before deleting them; migrating after merely one batch would duplicate the rest.
     if reload_build.is_none()
         && ctx.db.has_legacy_replay_fence()
-        && control::max_ready_lsn_end(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table)
-            .await?
-            .is_none()
+        && !control::manifest_work_exists(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table).await?
         && ctx.db.migrate_legacy_replay_fence(&ctx.table)?
     {
         tracing::info!(
@@ -534,6 +713,7 @@ pub async fn run_phase_a(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     tracing::info!(
         table = %format_args!("{}.{}", ctx.schema, ctx.table),
         files = ids.len(),
+        schema_barriers = barriers.len(),
         rows = appended,
         raw_appended = %max_lsn,
         "Phase A: appended to <table>_raw, watermark advanced, queue drained"
@@ -546,6 +726,7 @@ enum FileRoute {
     Live,
     Shadow(String),
     Retire,
+    Superseded,
 }
 
 #[derive(Debug)]
@@ -564,26 +745,114 @@ impl VerifiedObject {
     }
 }
 
-fn manifest_units(rows: &[control::ManifestRow]) -> Vec<Vec<&control::ManifestRow>> {
-    let mut units = Vec::<Vec<&control::ManifestRow>>::new();
-    let mut groups = BTreeMap::<control::ManifestGroupId, usize>::new();
-    for row in rows {
-        if let Some(group_id) = row.stream_group_id {
-            let index = match groups.get(&group_id).copied() {
-                Some(index) => index,
-                None => {
-                    let index = units.len();
-                    units.push(Vec::new());
-                    groups.insert(group_id, index);
-                    index
-                }
-            };
-            units[index].push(row);
-        } else {
-            units.push(vec![row]);
-        }
+fn validate_schema_barrier(
+    ctx: &TableCtx,
+    barrier: &control::StreamSchemaBarrier,
+) -> Result<(), LoaderError> {
+    if barrier.epoch != ctx.epoch
+        || barrier.source_schema != ctx.schema
+        || barrier.source_table != ctx.table
+        || barrier.final_schema_version.0 <= 0
+    {
+        return Err(LoaderError::ManifestInvariant {
+            message: format!(
+                "schema barrier {} identity/version does not match worker epoch {} table {}.{}",
+                barrier.id.0, ctx.epoch, ctx.schema, ctx.table
+            ),
+        });
     }
-    units
+    Ok(())
+}
+
+/// Reconcile a zero-file structural commit before its durable control receipt is retired. Loading
+/// the complete range up front bounds the older stepwise reconciler even if a corrupt barrier names
+/// `i64::MAX`; a missing version fails before that loop starts. A crash after Duck commits but before
+/// control retirement reclaims the barrier and takes the `target <= current` idempotent path.
+async fn reconcile_schema_barrier(
+    ctx: &TableCtx,
+    barrier: &control::StreamSchemaBarrier,
+    version_schemas: &mut BTreeMap<SchemaVersionNo, VersionSchema>,
+) -> Result<(), LoaderError> {
+    let current = ctx.db.schema_version()?;
+    if barrier.final_schema_version <= current {
+        return Ok(());
+    }
+    for (version, schema) in schema_lineage(ctx, current, barrier.final_schema_version).await? {
+        version_schemas.insert(version, schema);
+    }
+    if let Err(error) = crate::ddl::reconcile_to_version(
+        &ctx.db,
+        &ctx.pool,
+        ctx.epoch,
+        &ctx.schema,
+        &ctx.table,
+        barrier.final_schema_version,
+    )
+    .await
+    {
+        if matches!(error, LoaderError::Quarantine { .. }) {
+            ctx.state.quarantine_table(&ctx.schema, &ctx.table);
+            tracing::error!(
+                table = %ctx.series,
+                stream_group_id = barrier.id.0,
+                target_schema = %barrier.final_schema_version,
+                "QUARANTINE: schema-only streamed commit could not be reconciled"
+            );
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// The structural barrier an atomic append must reach before inserting any child. Protocol-v2
+/// groups carry their table's final schema at `StreamCommit`; it can be newer than every Parquet
+/// child when the transaction performs DDL after its last data row. Singleton files have no group
+/// barrier and retain their own homogeneous schema version.
+fn manifest_unit_target(unit: &[&control::ManifestRow]) -> Result<SchemaVersionNo, LoaderError> {
+    let first = unit
+        .first()
+        .copied()
+        .ok_or_else(|| LoaderError::ManifestInvariant {
+            message: "manifest unit has no schema version".to_string(),
+        })?;
+    let child_target = unit
+        .iter()
+        .map(|file| file.schema_version)
+        .max()
+        .ok_or_else(|| LoaderError::ManifestInvariant {
+            message: "manifest unit has no schema version".to_string(),
+        })?;
+    let Some(group_id) = first.stream_group_id else {
+        if first.stream_group_final_schema_version.is_some() {
+            return Err(LoaderError::ManifestInvariant {
+                message: format!(
+                    "ungrouped manifest {} carries a final stream schema barrier",
+                    first.id
+                ),
+            });
+        }
+        return Ok(child_target);
+    };
+    let final_schema_version =
+        first
+            .stream_group_final_schema_version
+            .ok_or_else(|| LoaderError::ManifestInvariant {
+                message: format!("stream group {} has no final schema version", group_id.0),
+            })?;
+    if final_schema_version < child_target
+        || unit.iter().any(|file| {
+            file.stream_group_id != Some(group_id)
+                || file.stream_group_final_schema_version != Some(final_schema_version)
+        })
+    {
+        return Err(LoaderError::ManifestInvariant {
+            message: format!(
+                "stream group {} has an inconsistent final schema version {final_schema_version} below child target {child_target}",
+                group_id.0
+            ),
+        });
+    }
+    Ok(final_schema_version)
 }
 
 fn manifest_expectation<'a>(
@@ -1123,28 +1392,281 @@ async fn route_reload_file(
     Ok(FileRoute::Shadow(build.shadow_table))
 }
 
-/// The registry shape at `version` as a [`crate::plan::TablePlan`] (the Tier-2 emit/recombine
-/// path), falling back to the bootstrap relation's scalar shape for hermetic
-/// single-version setups — `phase_b::current_transform`'s exact precedent.
+struct VersionSchema {
+    relation: PgRelation,
+    plan: crate::plan::TablePlan,
+    emit_groups: Vec<Vec<VersionEmitColumn>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VersionEmitColumn {
+    name: String,
+    duckdb_type: String,
+}
+
+impl VersionSchema {
+    fn from_registry_parts(
+        relation: PgRelation,
+        descriptors: &[common::TypeDescriptor],
+    ) -> Result<Self, LoaderError> {
+        // Re-plan one logical source column at a time through the same TablePlan implementation.
+        // The resulting groups retain the attnum boundary that the flat full-table plan omits, so
+        // rename lineage can map every Tier-2 sibling without guessing from name prefixes.
+        let plan = crate::plan::TablePlan::from_registry(&relation, descriptors)?;
+        let descriptors_by_column = descriptors
+            .iter()
+            .map(|descriptor| (descriptor.column.as_str(), descriptor))
+            .collect::<HashMap<_, _>>();
+        let emit_groups = relation
+            .columns
+            .iter()
+            .map(|column| {
+                let descriptor = descriptors_by_column.get(column.name.as_str()).copied();
+                crate::plan::TablePlan::for_registry_column(&relation, column, descriptor)
+                    .raw_cols
+                    .iter()
+                    .map(|raw| VersionEmitColumn {
+                        name: raw.name.clone(),
+                        duckdb_type: raw.duckdb_type.clone(),
+                    })
+                    .collect()
+            })
+            .collect();
+        Ok(Self {
+            relation,
+            plan,
+            emit_groups,
+        })
+    }
+}
+
+fn version_schema(
+    schemas: &BTreeMap<SchemaVersionNo, VersionSchema>,
+    version: SchemaVersionNo,
+) -> Result<&VersionSchema, LoaderError> {
+    schemas
+        .get(&version)
+        .ok_or_else(|| LoaderError::ManifestInvariant {
+            message: format!("schema lineage is missing version {version}"),
+        })
+}
+
+/// Map one historical Parquet's physical emit columns onto the raw table at `destination_version`.
+/// Every immutable registry step is inspected. ADD does not touch older mappings; DROP deliberately
+/// leaves the removed column's raw destination frozen because raw is a historical superset even
+/// though later source positions shift. A common-position name substitution fails closed because
+/// the persisted protocol cannot prove whether it was RENAME or DROP+ADD.
+fn destination_columns_between(
+    source_version: SchemaVersionNo,
+    destination_version: SchemaVersionNo,
+    schemas: &BTreeMap<SchemaVersionNo, VersionSchema>,
+) -> Result<Vec<String>, LoaderError> {
+    if source_version > destination_version {
+        return Err(LoaderError::ManifestInvariant {
+            message: format!(
+                "cannot map future schema {source_version} into older raw schema {destination_version}"
+            ),
+        });
+    }
+    let source = version_schema(schemas, source_version)?;
+    let mut destinations = source
+        .plan
+        .raw_cols
+        .iter()
+        .map(|column| column.name.clone())
+        .collect::<Vec<_>>();
+    let mut current = source_version;
+    while current < destination_version {
+        let next = SchemaVersionNo(current.0.checked_add(1).ok_or_else(|| {
+            LoaderError::ManifestInvariant {
+                message: format!("schema lineage overflows after version {current}"),
+            }
+        })?);
+        compose_schema_step(
+            version_schema(schemas, current)?,
+            version_schema(schemas, next)?,
+            current,
+            next,
+        )?;
+        current = next;
+    }
+    destinations.push("walrus_pg_sink_meta".to_string());
+    let mut seen = std::collections::HashSet::with_capacity(destinations.len());
+    if destinations
+        .iter()
+        .any(|column| !seen.insert(column.as_str()))
+    {
+        return Err(LoaderError::ManifestInvariant {
+            message: format!(
+                "schema {source_version} maps duplicate columns into raw schema {destination_version}"
+            ),
+        });
+    }
+    Ok(destinations)
+}
+
+fn compose_schema_step(
+    old: &VersionSchema,
+    new: &VersionSchema,
+    old_version: SchemaVersionNo,
+    new_version: SchemaVersionNo,
+) -> Result<(), LoaderError> {
+    let old_shape = crate::ddl::SchemaVersion {
+        version: old_version,
+        relation: old.relation.clone(),
+    };
+    let new_shape = crate::ddl::SchemaVersion {
+        version: new_version,
+        relation: new.relation.clone(),
+    };
+    let diff = crate::ddl::diff(&old_shape, &new_shape)?;
+
+    if new.relation.columns.len() < old.relation.columns.len() {
+        // A drop shifts later attnums, but raw retains the dropped physical column. Match surviving
+        // logical columns by name solely to prove their emit names did not also change in this
+        // drop step; never zip the shifted positions.
+        for (old_index, old_column) in old.relation.columns.iter().enumerate() {
+            let Some(new_index) = new
+                .relation
+                .columns
+                .iter()
+                .position(|column| column.name == old_column.name)
+            else {
+                continue;
+            };
+            if old.emit_groups.get(old_index) != new.emit_groups.get(new_index) {
+                return Err(LoaderError::ManifestInvariant {
+                    message: format!(
+                        "schema step {old_version}->{new_version} changes emit shape while dropping columns"
+                    ),
+                });
+            }
+        }
+        return Ok(());
+    }
+
+    for change in diff.additive {
+        let crate::ddl::AdditiveChange::RenameColumn { position, from, to } = change else {
+            continue;
+        };
+        return Err(LoaderError::ManifestInvariant {
+            message: format!(
+                "schema step {old_version}->{new_version} substitutes common position {position} {from:?}->{to:?}; a genuine RENAME and same-statement DROP+ADD are intentionally indistinguishable until stable column-lineage evidence is persisted"
+            ),
+        });
+    }
+
+    // With source names unchanged, emitted names must also stay unchanged. This rejects descriptor
+    // drift instead of silently position-zipping an unsupported physical-shape change.
+    for position in 0..old.relation.columns.len() {
+        let old_emit = old.emit_groups.get(position);
+        let new_emit = new.emit_groups.get(position);
+        let emit_names_match = old_emit.zip(new_emit).is_some_and(|(old, new)| {
+            old.iter()
+                .map(|column| column.name.as_str())
+                .eq(new.iter().map(|column| column.name.as_str()))
+        });
+        if old.relation.columns[position].name == new.relation.columns[position].name
+            && !emit_names_match
+        {
+            return Err(LoaderError::ManifestInvariant {
+                message: format!(
+                    "schema step {old_version}->{new_version} changes emit shape without a column rename at position {position}"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The exact registry relation and physical emit plan at `version`, falling back to the bootstrap
+/// relation's scalar shape for hermetic single-version setups —
+/// `phase_b::current_transform`'s precedent. Keeping both views together prevents file-schema
+/// validation and `unchanged_toast` validation from accidentally binding different versions.
+async fn schema_at_version(
+    ctx: &TableCtx,
+    version: SchemaVersionNo,
+) -> Result<VersionSchema, LoaderError> {
+    match control::read_registry(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table, version).await? {
+        Some(row) => decode_version_schema(ctx, row),
+        None => VersionSchema::from_registry_parts(ctx.rel.clone(), &[]),
+    }
+}
+
+fn decode_version_schema(
+    ctx: &TableCtx,
+    row: control::RegistryRow,
+) -> Result<VersionSchema, LoaderError> {
+    let version = row.schema_version;
+    // Label built inside the closure (`current_transform`'s precedent): only a decode failure pays
+    // for it.
+    let relation: PgRelation =
+        serde_json::from_value(row.columns).map_err(|source| LoaderError::RegistryDecode {
+            table: format!("{}.{}", ctx.schema, ctx.table),
+            version: version.0,
+            source,
+        })?;
+    VersionSchema::from_registry_parts(relation, &row.descriptors)
+}
+
+/// Load and validate an inclusive contiguous registry range with one indexed query. A malicious
+/// manifest version near `i64::MAX` therefore causes one missing-lineage error instead of billions
+/// of sequential point reads. The one-version empty fallback preserves hermetic Phase-A fixtures
+/// that intentionally omit a control registry; production history is immutable and contiguous.
+async fn schema_lineage(
+    ctx: &TableCtx,
+    first: SchemaVersionNo,
+    last: SchemaVersionNo,
+) -> Result<Vec<(SchemaVersionNo, VersionSchema)>, LoaderError> {
+    if first > last {
+        return Err(LoaderError::ManifestInvariant {
+            message: format!("invalid schema lineage range {first}..={last}"),
+        });
+    }
+    let rows =
+        control::read_registry_range(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table, first, last)
+            .await?;
+    // Bare-relation fixtures have no registry, but they are only allowed to describe the schema the
+    // local DuckDB has already bootstrapped. Without this equality guard, a fabricated one-file
+    // manifest at i64::MAX would take the fixture fallback and then pin `reconcile_to_version` in an
+    // effectively unbounded integer walk.
+    if rows.is_empty() && first == last && first == ctx.db.schema_version()? {
+        return Ok(vec![(
+            first,
+            VersionSchema::from_registry_parts(ctx.rel.clone(), &[])?,
+        )]);
+    }
+
+    let mut expected = first;
+    let mut lineage = Vec::with_capacity(rows.len());
+    for row in rows {
+        if row.schema_version != expected {
+            return Err(LoaderError::ManifestInvariant {
+                message: format!("schema lineage {first}..={last} is missing version {expected}"),
+            });
+        }
+        let version = row.schema_version;
+        lineage.push((version, decode_version_schema(ctx, row)?));
+        if version == last {
+            return Ok(lineage);
+        }
+        expected = SchemaVersionNo(version.0.checked_add(1).ok_or_else(|| {
+            LoaderError::ManifestInvariant {
+                message: format!("schema lineage overflows after version {version}"),
+            }
+        })?);
+    }
+    Err(LoaderError::ManifestInvariant {
+        message: format!("schema lineage {first}..={last} is missing version {expected}"),
+    })
+}
+
+/// The registry shape at `version` as a [`crate::plan::TablePlan`] (the Tier-2 emit/recombine path).
 async fn plan_at_version(
     ctx: &TableCtx,
     version: SchemaVersionNo,
 ) -> Result<crate::plan::TablePlan, LoaderError> {
-    match control::read_registry(&ctx.pool, ctx.epoch, &ctx.schema, &ctx.table, version).await? {
-        Some(r) => {
-            // Label built inside the closure (`current_transform`'s precedent): only a decode
-            // failure pays for it.
-            let rel: PgRelation = serde_json::from_value(r.columns).map_err(|source| {
-                LoaderError::RegistryDecode {
-                    table: format!("{}.{}", ctx.schema, ctx.table),
-                    version: version.0,
-                    source,
-                }
-            })?;
-            Ok(crate::plan::TablePlan::from_registry(&rel, &r.descriptors))
-        }
-        None => Ok(crate::plan::TablePlan::tier1(&ctx.rel)),
-    }
+    Ok(schema_at_version(ctx, version).await?.plan)
 }
 
 /// The raw-append backlog in LSN-bytes: how far the newest ready file's commit LSN leads the Phase-A

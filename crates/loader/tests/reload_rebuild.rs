@@ -727,7 +727,7 @@ async fn rebuild_clears_the_lossy_cast_quarantine() {
 
     // The quarantine state: a lossy ALTER COLUMN TYPE cast failed; /ready is degraded. (The
     // entry path is ddl_destructive.rs's covered ground; the EXIT is under test here.)
-    ctx.state.quarantine();
+    ctx.state.quarantine_table("public", "orders");
     assert!(!ctx.state.is_ready() || !ctx.state.is_started());
 
     let export = planned_reload(&ctx.pool, epoch, "0/100", "0/100", ReloadFlavor::Reload).await;
@@ -774,7 +774,7 @@ async fn resync_alias_uses_the_same_full_rebuild_path() {
     run_phase_a(&ctx).await.unwrap();
     run_phase_b(&ctx).await.unwrap();
     assert_eq!(mirror_count(&ctx), 2);
-    ctx.state.quarantine();
+    ctx.state.quarantine_table("public", "orders");
 
     // The legacy `resync` spelling is retained, but it now selects the same rebuild protocol.
     let export = planned_reload(&ctx.pool, epoch, "0/100", "0/100", ReloadFlavor::Resync).await;

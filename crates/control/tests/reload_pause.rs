@@ -17,12 +17,13 @@ use control::reload::{
     self, ExportRangePlan, ExportSnapshot, ReloadFenceIdentity, ReloadFlavor, ReloadScope,
     SourceReloadRequest,
 };
-use control::{ManifestRow, NewManifestFile};
 use control::{
-    acquire_lease, claim_ready, connect, delete_claimed, ensure_checkpoint, insert_ready,
-    max_ready_lsn_end, run_migrations,
+    ControlError, acquire_lease, claim_ready, connect, delete_claimed, ensure_checkpoint,
+    insert_ready, max_ready_lsn_end, run_migrations,
 };
+use control::{ManifestRow, NewManifestFile};
 use sqlx::postgres::{PgConnection, PgPool};
+use std::time::Duration;
 use uuid::Uuid;
 
 fn control_dsn() -> String {
@@ -271,7 +272,7 @@ async fn publication_claim_drains_through_h_before_complete_lifts_the_generic_pa
     );
     assert_eq!(delete_claimed(&mut *tx, &ids(&through_h)).await.unwrap(), 3);
     assert!(
-        reload::publication_drained(&mut *tx, &publication, owner, lease.fencing_token)
+        reload::seal_publication_if_drained(&mut tx, &publication, owner, lease.fencing_token,)
             .await
             .unwrap()
     );
@@ -315,6 +316,368 @@ async fn publication_claim_drains_through_h_before_complete_lifts_the_generic_pa
     );
 
     tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn ungrouped_publish_racing_the_reload_seal_is_observed_before_cutover() {
+    let pool = pool().await;
+    let epoch_bytes: [u8; 8] = Uuid::new_v4().as_bytes()[..8].try_into().unwrap();
+    let epoch = EpochNo(i64::from_be_bytes(epoch_bytes) & i64::MAX);
+    let table = "ungrouped_seal_race";
+    let h: Lsn = "0/100".parse().unwrap();
+
+    let reload_id = reload::request(&pool, epoch, "public", table, ReloadFlavor::Reload)
+        .await
+        .unwrap();
+    reload::claim_requested(&pool, epoch, "sink-seal-race", 60, 1)
+        .await
+        .unwrap();
+    let mut setup = pool.acquire().await.unwrap();
+    finish_fenced(&mut setup, reload_id, h).await;
+    drop(setup);
+
+    let owner = "loader-seal-race";
+    let lease = acquire_lease(&pool, epoch, "public", table, owner, 60)
+        .await
+        .unwrap()
+        .unwrap();
+    let fencing_token = lease.fencing_token;
+    ensure_checkpoint(&pool, epoch, "public", table)
+        .await
+        .unwrap();
+    let publication =
+        reload::claim_publication(&pool, epoch, "public", table, owner, fencing_token)
+            .await
+            .unwrap()
+            .unwrap();
+
+    let mut bypass = pool.begin().await.unwrap();
+    let direct_complete =
+        sqlx::query("UPDATE walrus.table_reload SET status='complete' WHERE reload_id=$1")
+            .bind(publication.reload_id.0)
+            .execute(&mut *bypass)
+            .await
+            .unwrap_err();
+    assert_eq!(
+        direct_complete
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::constraint),
+        Some("table_reload_v2_completion_guard")
+    );
+    bypass.rollback().await.unwrap();
+
+    // The uncommitted INSERT holds the same fence row that sealing needs. Once it commits, the
+    // seal's later statement snapshot must see the new manifest and return false.
+    let mut publisher_tx = pool.begin().await.unwrap();
+    let pending = insert_ready(&mut *publisher_tx, &stream_file(epoch, table, "0/80"))
+        .await
+        .unwrap();
+    let seal_pool = pool.clone();
+    let seal_publication = publication.clone();
+    let seal_task = tokio::spawn(async move {
+        let mut tx = seal_pool.begin().await.unwrap();
+        let result =
+            reload::seal_publication_if_drained(&mut tx, &seal_publication, owner, fencing_token)
+                .await;
+        tx.commit().await.unwrap();
+        result
+    });
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !seal_task.is_finished(),
+        "seal must wait for the publisher fence"
+    );
+    publisher_tx.commit().await.unwrap();
+    assert!(!seal_task.await.unwrap().unwrap());
+
+    assert!(matches!(
+        reload::finish_publication(&pool, &publication, owner, fencing_token).await,
+        Err(ControlError::ReloadTransition { .. })
+    ));
+
+    // Even an exact seal written with the explicit protocol tripwire must not let an idempotent
+    // seal retry skip the fresh pending-work check.
+    let mut forged = pool.begin().await.unwrap();
+    sqlx::query("SELECT set_config('walrus.manifest_seal_protocol','2',true)")
+        .execute(&mut *forged)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE walrus.manifest_publication_fence
+         SET sealed_through_lsn=$4, sealed_reload_id=$5,
+             sealed_publication_nonce=$6, updated_at=now()
+         WHERE epoch=$1 AND source_schema=$2 AND source_table=$3",
+    )
+    .bind(epoch.0)
+    .bind("public")
+    .bind(table)
+    .bind(h)
+    .bind(publication.reload_id.0)
+    .bind(publication.publication_nonce)
+    .execute(&mut *forged)
+    .await
+    .unwrap();
+    forged.commit().await.unwrap();
+    let mut retry = pool.begin().await.unwrap();
+    assert!(matches!(
+        reload::seal_publication_if_drained(&mut retry, &publication, owner, fencing_token).await,
+        Err(ControlError::ManifestInvariant { .. })
+    ));
+    retry.rollback().await.unwrap();
+
+    let claimed = reload::claim_publication_ready(&pool, &publication, owner, fencing_token, 10)
+        .await
+        .unwrap();
+    assert_eq!(ids(&claimed), vec![pending]);
+    assert_eq!(delete_claimed(&pool, &[pending]).await.unwrap(), 1);
+
+    let mut seal_tx = pool.begin().await.unwrap();
+    assert!(
+        reload::seal_publication_if_drained(&mut seal_tx, &publication, owner, fencing_token,)
+            .await
+            .unwrap()
+    );
+    seal_tx.commit().await.unwrap();
+
+    let mut late = stream_file(epoch, table, "0/90");
+    late.s3_uri.push_str("-after-seal");
+    assert!(matches!(
+        insert_ready(&pool, &late).await,
+        Err(ControlError::CheckViolation { .. })
+    ));
+
+    // The losing finisher begins while the winner's outer transaction still holds its locks.
+    // Once that winner commits, the loser's later READ COMMITTED replay statement must see the
+    // completed receipt and return Ok(false), not a transient ReloadTransition.
+    let mut winner = pool.begin().await.unwrap();
+    assert!(
+        reload::finish_publication(&mut winner, &publication, owner, fencing_token)
+            .await
+            .unwrap()
+    );
+    let loser_pool = pool.clone();
+    let loser_publication = publication.clone();
+    let loser = tokio::spawn(async move {
+        reload::finish_publication(&loser_pool, &loser_publication, owner, fencing_token).await
+    });
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !loser.is_finished(),
+        "the losing finish must wait on the winner"
+    );
+    winner.commit().await.unwrap();
+    assert!(
+        !loser.await.unwrap().unwrap(),
+        "the post-wait fresh snapshot recognizes the exact completed receipt"
+    );
+
+    let later: Lsn = "0/120".parse().unwrap();
+    control::advance_raw_appended(&pool, epoch, "public", table, later)
+        .await
+        .unwrap();
+    control::advance_transformed(&pool, epoch, "public", table, later)
+        .await
+        .unwrap();
+    assert!(
+        !reload::finish_publication(&pool, &publication, owner, fencing_token)
+            .await
+            .unwrap(),
+        "the immutable completed receipt remains idempotent after normal checkpoint progress"
+    );
+    let mut wrong = publication.clone();
+    wrong.final_lsn = "0/101".parse().unwrap();
+    assert!(matches!(
+        reload::finish_publication(&pool, &wrong, owner, fencing_token).await,
+        Err(ControlError::ReloadTransition { .. })
+    ));
+
+    let mut cleanup = pool.begin().await.unwrap();
+    sqlx::query("SELECT set_config('walrus.manifest_fence_maintenance','2-delete',true)")
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM walrus.manifest_publication_fence WHERE epoch=$1")
+        .bind(epoch.0)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM walrus.loader_checkpoint WHERE epoch=$1")
+        .bind(epoch.0)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM walrus.table_reload WHERE epoch=$1")
+        .bind(epoch.0)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM walrus.table_ownership WHERE epoch=$1")
+        .bind(epoch.0)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    cleanup.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn publishing_reload_can_be_fenced_and_adopted_after_owner_loss() {
+    let pool = pool().await;
+    let epoch_bytes: [u8; 8] = Uuid::new_v4().as_bytes()[..8].try_into().unwrap();
+    let epoch = EpochNo(i64::from_be_bytes(epoch_bytes) & i64::MAX);
+    let table = "publication_takeover";
+    let h: Lsn = "0/300".parse().unwrap();
+
+    let reload_id = reload::request(&pool, epoch, "public", table, ReloadFlavor::Reload)
+        .await
+        .unwrap();
+    reload::claim_requested(&pool, epoch, "sink-takeover", 60, 1)
+        .await
+        .unwrap();
+    let mut setup = pool.acquire().await.unwrap();
+    finish_fenced(&mut setup, reload_id, h).await;
+    drop(setup);
+    ensure_checkpoint(&pool, epoch, "public", table)
+        .await
+        .unwrap();
+
+    let first_lease = acquire_lease(&pool, epoch, "public", table, "loader-a", 60)
+        .await
+        .unwrap()
+        .unwrap();
+    let first = reload::claim_publication(
+        &pool,
+        epoch,
+        "public",
+        table,
+        "loader-a",
+        first_lease.fencing_token,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let mut arbitrary = pool.begin().await.unwrap();
+    let rewrite = sqlx::query(
+        "UPDATE walrus.table_reload
+         SET publisher_owner_pod='intruder', publisher_fencing_token=999
+         WHERE reload_id=$1",
+    )
+    .bind(reload_id.0)
+    .execute(&mut *arbitrary)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        rewrite
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::constraint),
+        Some("table_reload_publication_owner_transition")
+    );
+    arbitrary.rollback().await.unwrap();
+
+    sqlx::query(
+        "UPDATE walrus.table_ownership
+         SET lease_expiry=statement_timestamp()-interval '1 second'
+         WHERE epoch=$1 AND source_schema='public' AND source_table=$2",
+    )
+    .bind(epoch.0)
+    .bind(table)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let second_lease = acquire_lease(&pool, epoch, "public", table, "loader-b", 60)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(second_lease.fencing_token > first_lease.fencing_token);
+    let adopted = reload::claim_publication(
+        &pool,
+        epoch,
+        "public",
+        table,
+        "loader-b",
+        second_lease.fencing_token,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(adopted.publication_nonce, first.publication_nonce);
+    assert_eq!(adopted.publisher_owner_pod, "loader-b");
+    assert_eq!(adopted.publisher_fencing_token, second_lease.fencing_token);
+
+    let mut unsealed_failure = pool.begin().await.unwrap();
+    assert_eq!(
+        sqlx::query("UPDATE walrus.table_reload SET status='failed' WHERE reload_id=$1")
+            .bind(reload_id.0)
+            .execute(&mut *unsealed_failure)
+            .await
+            .unwrap()
+            .rows_affected(),
+        1,
+        "an unsealed publishing attempt may still fail for integrity recovery"
+    );
+    unsealed_failure.rollback().await.unwrap();
+
+    let mut seal = pool.begin().await.unwrap();
+    assert!(
+        reload::seal_publication_if_drained(
+            &mut seal,
+            &adopted,
+            "loader-b",
+            second_lease.fencing_token,
+        )
+        .await
+        .unwrap()
+    );
+    seal.commit().await.unwrap();
+
+    let mut sealed_failure = pool.begin().await.unwrap();
+    let error = sqlx::query("UPDATE walrus.table_reload SET status='failed' WHERE reload_id=$1")
+        .bind(reload_id.0)
+        .execute(&mut *sealed_failure)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::constraint),
+        Some("table_reload_status_transition")
+    );
+    sealed_failure.rollback().await.unwrap();
+
+    assert!(
+        reload::finish_publication(&pool, &adopted, "loader-b", second_lease.fencing_token,)
+            .await
+            .unwrap()
+    );
+
+    let mut cleanup = pool.begin().await.unwrap();
+    sqlx::query("SELECT set_config('walrus.manifest_fence_maintenance','2-delete',true)")
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM walrus.manifest_publication_fence WHERE epoch=$1")
+        .bind(epoch.0)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM walrus.loader_checkpoint WHERE epoch=$1")
+        .bind(epoch.0)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM walrus.table_reload WHERE epoch=$1")
+        .bind(epoch.0)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM walrus.table_ownership WHERE epoch=$1")
+        .bind(epoch.0)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    cleanup.commit().await.unwrap();
 }
 
 #[tokio::test]
@@ -434,7 +797,7 @@ async fn completed_resync_can_drain_before_a_queued_source_reload_starts() {
     assert_eq!(ids(&claimed), vec![manifest]);
     assert_eq!(delete_claimed(&mut *tx, &ids(&claimed)).await.unwrap(), 1);
     assert!(
-        reload::publication_drained(&mut *tx, &publication, owner, lease.fencing_token)
+        reload::seal_publication_if_drained(&mut tx, &publication, owner, lease.fencing_token,)
             .await
             .unwrap()
     );

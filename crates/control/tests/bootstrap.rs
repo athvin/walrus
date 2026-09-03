@@ -34,17 +34,22 @@ async fn pool() -> PgPool {
     pool
 }
 
-async fn publish_fenced(conn: &mut PgConnection, epoch: EpochNo, table: &str, reload_id: ReloadId) {
+async fn publish_fenced(
+    conn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    epoch: EpochNo,
+    table: &str,
+    reload_id: ReloadId,
+) {
     let owner = "bootstrap-loader";
-    let lease = acquire_lease(&mut *conn, epoch, "public", table, owner, 60)
+    let lease = acquire_lease(&mut **conn, epoch, "public", table, owner, 60)
         .await
         .unwrap()
         .unwrap();
-    ensure_checkpoint(&mut *conn, epoch, "public", table)
+    ensure_checkpoint(&mut **conn, epoch, "public", table)
         .await
         .unwrap();
     let publication = reload::claim_publication(
-        &mut *conn,
+        &mut **conn,
         epoch,
         "public",
         table,
@@ -56,13 +61,12 @@ async fn publish_fenced(conn: &mut PgConnection, epoch: EpochNo, table: &str, re
     .unwrap();
     assert_eq!(publication.reload_id, reload_id);
     assert!(
-        reload::publication_drained(&mut *conn, &publication, owner, lease.fencing_token)
+        reload::seal_publication_if_drained(conn, &publication, owner, lease.fencing_token)
             .await
-            .unwrap(),
-        "bootstrap fixtures have no pending manifest rows"
+            .unwrap()
     );
     assert!(
-        reload::finish_publication(&mut *conn, &publication, owner, lease.fencing_token)
+        reload::finish_publication(&mut **conn, &publication, owner, lease.fencing_token)
             .await
             .unwrap()
     );

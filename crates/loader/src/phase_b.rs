@@ -45,13 +45,44 @@ async fn transform_at_version(
                     source,
                 }
             })?;
-            let plan = TablePlan::from_registry(&rel, &r.descriptors).for_table(physical_table);
+            let plan = TablePlan::from_registry(&rel, &r.descriptors)?.for_table(physical_table);
             Ok(TransformSql::from_plan(&plan))
         }
         None => Ok(TransformSql::from_plan(
             &TablePlan::tier1(&ctx.rel).for_table(physical_table),
         )),
     }
+}
+
+/// Persist the control-plane no-more-manifests-through-H barrier in its own transaction. That
+/// transaction must commit before Duck swaps generations; otherwise a source publisher could land
+/// older work in the gap between an unlocked "drained" read and the swap.
+async fn seal_manifest_prefix(
+    ctx: &TableCtx,
+    publication: &control::ReloadPublication,
+) -> Result<bool, LoaderError> {
+    let mut tx = ctx
+        .pool
+        .begin()
+        .await
+        .map_err(|source| LoaderError::ControlTxn {
+            op: "begin manifest publication seal",
+            source,
+        })?;
+    let sealed = control::reload::seal_publication_if_drained(
+        &mut tx,
+        publication,
+        &ctx.owner_pod,
+        ctx.fencing_token,
+    )
+    .await?;
+    tx.commit()
+        .await
+        .map_err(|source| LoaderError::ControlTxn {
+            op: "commit manifest publication seal",
+            source,
+        })?;
+    Ok(sealed)
 }
 
 /// One Phase-B pass. Returns the max `commit_lsn` applied, or `None` if the tail was empty.
@@ -173,14 +204,7 @@ pub async fn run_phase_b(ctx: &TableCtx) -> Result<Option<Lsn>, LoaderError> {
     };
 
     let publication = publication_for_build(ctx, &build).await?;
-    if !control::reload::publication_drained(
-        &ctx.pool,
-        &publication,
-        &ctx.owner_pod,
-        ctx.fencing_token,
-    )
-    .await?
-    {
+    if !seal_manifest_prefix(ctx, &publication).await? {
         return Ok(applied);
     }
     let current = ctx.db.reload_build()?.ok_or_else(|| {
@@ -229,6 +253,12 @@ async fn finish_published_reload(
     if build.phase != crate::duck::ReloadPhase::Published {
         return Err(LoaderError::Internal(format!(
             "reload {} cannot finish control publication before Duck is published",
+            build.reload_id
+        )));
+    }
+    if !seal_manifest_prefix(ctx, publication).await? {
+        return Err(LoaderError::Internal(format!(
+            "reload {} was published before its manifest prefix through H was sealed",
             build.reload_id
         )));
     }

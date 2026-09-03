@@ -14,7 +14,7 @@
 
 mod support;
 
-use common::{EpochNo, PgColumn, PgRelation, ReplicaIdentity};
+use common::{DdlId, EpochNo, Lsn, PgColumn, PgRelation, ReplicaIdentity, SchemaVersionNo};
 use loader::ddl::{AdditiveChange, CommentTarget, SchemaVersion, apply_additive, diff_additive};
 use loader::duck::{S3Access, TableDb};
 use loader::health::LoaderState;
@@ -359,6 +359,66 @@ fn orders_v2() -> PgRelation {
     )
 }
 
+fn orders_v3() -> PgRelation {
+    rel(
+        "orders",
+        vec![
+            col("id", 23, true),
+            col("status", 25, false),
+            col("note", 25, false),
+            col("extra", 25, false),
+        ],
+    )
+}
+
+async fn publish_additive_schema_barrier(
+    pool: &sqlx::PgPool,
+    epoch: EpochNo,
+    top_xid: u32,
+    source_audit_id: i64,
+    commit_lsn: Lsn,
+    version: SchemaVersionNo,
+    relation: &PgRelation,
+) {
+    let columns = serde_json::to_value(relation).unwrap();
+    let outcome = control::publish_stream_commit(
+        pool,
+        &control::NewStreamCommitPublication {
+            epoch,
+            top_xid,
+            commit_lsn,
+            commit_ts: "2026-09-02T12:00:00Z".parse().unwrap(),
+            ddl_rows: vec![control::DdlRow {
+                id: DdlId(0),
+                epoch,
+                source_audit_id,
+                source_schema: "public".into(),
+                source_table: "orders".into(),
+                c_lsn: commit_lsn,
+                c_event: "ddl_command_end".into(),
+                c_tag: "ALTER TABLE".into(),
+                schema_version: version,
+                c_rel_oid: Some(relation.oid),
+                c_columns: Some(columns.clone()),
+                c_dropped: None,
+                c_ddl_text: Some("ALTER TABLE orders ADD COLUMN ...".into()),
+            }],
+            registry_rows: vec![control::RegistryRow {
+                epoch,
+                source_schema: "public".into(),
+                source_table: "orders".into(),
+                schema_version: version,
+                descriptors: Vec::new(),
+                columns,
+            }],
+            files: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, control::PublishStreamOutcome::Published);
+}
+
 /// A scratch directory for one test's `.duckdb` file. The returned guard deletes it on drop — even
 /// when an assertion panics, which a trailing `remove_dir_all` would skip.
 fn tmpdir(name: &str) -> tempfile::TempDir {
@@ -596,5 +656,159 @@ async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
     assert!(
         view.iter().any(|c| c == "note") && !view.iter().any(|c| c.starts_with("_applied")),
         "view evolved with the mirror, guard cols still hidden: {view:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose up --wait (control PG)"]
+async fn schema_only_barrier_reconciles_and_duck_ahead_retry_retires_without_checkpoint_drift() {
+    let _g = LOCK.lock().await;
+    let epoch = EpochNo(3_800_002);
+    let pool = control::connect(&control_url()).await.unwrap();
+    control::run_migrations(&pool).await.unwrap();
+    support::cleanup_epoch(&pool, epoch).await;
+    for table in ["ddl_manifest", "schema_registry"] {
+        sqlx::query(&format!("DELETE FROM walrus.{table} WHERE epoch = $1"))
+            .bind(epoch.0)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    control::insert_epoch(
+        &pool,
+        &control::ReplicationState {
+            epoch,
+            slot_name: "walrus_slot".into(),
+            created_lsn: Lsn::ZERO,
+            status: control::ReplicationStatus::Streaming,
+        },
+    )
+    .await
+    .unwrap();
+    control::ensure_checkpoint(&pool, epoch, "public", "orders")
+        .await
+        .unwrap();
+
+    let v1 = orders_v1();
+    control::upsert_registry(
+        &pool,
+        &control::RegistryRow {
+            epoch,
+            source_schema: "public".into(),
+            source_table: "orders".into(),
+            schema_version: SchemaVersionNo(1),
+            descriptors: Vec::new(),
+            columns: serde_json::to_value(&v1).unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    publish_additive_schema_barrier(
+        &pool,
+        epoch,
+        8_201,
+        38_002_001,
+        Lsn::new(0x100),
+        SchemaVersionNo(2),
+        &orders_v2(),
+    )
+    .await;
+
+    let dir = tmpdir("schema-barrier");
+    let db = TableDb::open(dir.path().join("orders.duckdb")).unwrap();
+    db.ensure_tables(&v1, SchemaVersionNo(1)).unwrap();
+    let state = LoaderState::new();
+    let (owner_pod, fencing_token) = support::acquire_table(&pool, epoch, "public", "orders").await;
+    let ctx = TableCtx {
+        pool,
+        epoch,
+        epoch_rx: loader::epoch::fixed_epoch_watch(epoch),
+        owner_pod,
+        fencing_token,
+        store: support::store(),
+        staging_bucket: "walrus".into(),
+        schema: "public".into(),
+        table: "orders".into(),
+        series: "public.orders".into(),
+        rel: v1,
+        db,
+        state,
+        max_files: std::num::NonZeroI64::new(100).unwrap(),
+        max_integrity_resnapshots: 1,
+        poll_interval: Duration::from_secs(5),
+        compaction_interval: Duration::from_secs(3600),
+        retention_lsn_lag: 16 << 20,
+        pause_logged: Default::default(),
+    };
+
+    run_phase_a(&ctx).await.unwrap();
+    assert_eq!(ctx.db.schema_version().unwrap(), SchemaVersionNo(2));
+    for table in ["orders", "orders_raw"] {
+        assert!(columns_of(ctx.db.conn(), table).contains(&"note".to_string()));
+    }
+    assert!(
+        control::claim_ready_units(&ctx.pool, epoch, "public", "orders", 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the schema barrier retires only after Duck reaches v2"
+    );
+    let checkpoint = control::read_checkpoint(&ctx.pool, epoch, "public", "orders")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (checkpoint.raw_appended_lsn, checkpoint.transformed_lsn),
+        (Lsn::ZERO, Lsn::ZERO)
+    );
+
+    // Simulate the cross-database crash window for the next barrier: Duck commits v3, then the
+    // process dies before the control parent becomes applied. Phase A must reclaim and retire it
+    // without replaying a mutation or pretending a zero-file commit created raw data.
+    publish_additive_schema_barrier(
+        &ctx.pool,
+        epoch,
+        8_202,
+        38_002_002,
+        Lsn::new(0x200),
+        SchemaVersionNo(3),
+        &orders_v3(),
+    )
+    .await;
+    loader::ddl::reconcile_to_version(
+        &ctx.db,
+        &ctx.pool,
+        epoch,
+        "public",
+        "orders",
+        SchemaVersionNo(3),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ctx.db.schema_version().unwrap(), SchemaVersionNo(3));
+    assert_eq!(
+        control::claim_ready_units(&ctx.pool, epoch, "public", "orders", 10)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "the durable barrier remains ready in the simulated crash window"
+    );
+
+    run_phase_a(&ctx).await.unwrap();
+    assert!(
+        control::claim_ready_units(&ctx.pool, epoch, "public", "orders", 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(columns_of(ctx.db.conn(), "orders").contains(&"extra".to_string()));
+    let checkpoint = control::read_checkpoint(&ctx.pool, epoch, "public", "orders")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (checkpoint.raw_appended_lsn, checkpoint.transformed_lsn),
+        (Lsn::ZERO, Lsn::ZERO)
     );
 }

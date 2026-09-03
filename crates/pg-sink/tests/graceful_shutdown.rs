@@ -303,11 +303,26 @@ async fn sigterm_mid_stream_drains_commits_and_resumes() {
             let _ = store.delete(&Path::from(key)).await;
         }
     }
-    sqlx::query("WITH authorized AS MATERIALIZED (SELECT set_config('walrus.manifest_delete_protocol','2',true) AS protocol) DELETE FROM walrus.file_manifest WHERE epoch = $1 AND (SELECT protocol='2' FROM authorized)")
-        .bind(epoch)
-        .execute(&pool)
+    let mut cleanup = pool.begin().await.unwrap();
+    sqlx::query("SELECT set_config('walrus.manifest_delete_protocol','2',true)")
+        .execute(&mut *cleanup)
         .await
         .unwrap();
+    sqlx::query("SELECT set_config('walrus.manifest_fence_maintenance','2-delete',true)")
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM walrus.file_manifest WHERE epoch = $1")
+        .bind(epoch)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM walrus.manifest_publication_fence WHERE epoch = $1")
+        .bind(epoch)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    cleanup.commit().await.unwrap();
     admin
         .execute(
             "DELETE FROM public.orders WHERE id IN (980001, 980002)",

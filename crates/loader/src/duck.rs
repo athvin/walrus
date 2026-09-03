@@ -14,7 +14,7 @@ use common::sql::SqlStrExt;
 use common::{EpochNo, Kind, Lsn, ManifestId, PgRelation, Redacted, ReloadId, SchemaVersionNo};
 use duckdb::OptionalExt as _;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::Arc;
@@ -137,6 +137,12 @@ pub(crate) struct ManifestAppend<'a> {
     pub(crate) stream_group_id: Option<i64>,
     pub(crate) schema_version: SchemaVersionNo,
     pub(crate) commit_lsn_override: Option<&'a str>,
+    /// Current raw-table destinations corresponding positionally to the verified Parquet columns.
+    /// `None` is the identity mapping used by local single-version fixtures. Production supplies an
+    /// registry-lineage mapping so historical children in an atomic protocol-v2 group can be
+    /// inserted after the destination has reconciled to the group's final additive/drop schema.
+    /// Ambiguous common-position name substitutions are rejected before this append path.
+    pub(crate) destination_columns: Option<&'a [String]>,
     /// Production-only semantic receipt for the rows inside the verified Parquet. The public
     /// local-fixture helper leaves this absent because it has no control manifest to attest against.
     pub(crate) expectation: Option<ManifestExpectation<'a>>,
@@ -193,9 +199,11 @@ pub(crate) enum IngestReceiptState {
 pub struct TableDb {
     conn: duckdb::Connection,
     backend: Backend,
-    /// Expected staged-object schemas by `schema_version`, derived from the destination raw table.
-    /// Every Parquet is still independently DESCRIBEd and compared with this cached expectation;
-    /// trusting the first file would let a later same-version object add a silently ignored column.
+    /// Expected staged-object schemas by `schema_version`. Production seeds each entry from that
+    /// version's immutable registry plan; local fixture helpers can derive the current version from
+    /// the destination raw table. Every Parquet is still independently DESCRIBEd and compared with
+    /// this cached expectation; trusting the first file would let a later same-version object add a
+    /// silently ignored column.
     /// `RefCell` provides interior mutability behind `&self`. `TableDb` is `Send + !Sync`:
     /// duckdb-rs declares `Connection: Send`, but the connection's `RefCell<InnerConnection>` and
     /// this cache's `RefCell` prevent shared access. That `!Sync` makes a future holding `&TableCtx`
@@ -507,28 +515,58 @@ impl TableDb {
                 let uri = common::sql::sql_literal(verified_uri);
                 let file_cols =
                     self.columns_for(table, &uri, file.original_uri, file.schema_version)?;
+                let destination_cols = file
+                    .destination_columns
+                    .unwrap_or_else(|| file_cols.as_ref());
+                if destination_cols.len() != file_cols.len() {
+                    return Err(LoaderError::ManifestInvariant {
+                        message: format!(
+                            "manifest {} maps {} staged columns onto {} raw destinations",
+                            file.manifest_id,
+                            file_cols.len(),
+                            destination_cols.len()
+                        ),
+                    });
+                }
                 if let Some(expectation) = file.expectation {
                     validate_manifest_rows(conn, &uri, file.original_uri, expectation)?;
                 }
-                let quoted = file_cols
+                let quote_columns = |columns: &[String]| {
+                    columns
+                        .iter()
+                        .map(|column| {
+                            common::sql::SqlIdent::new(column)
+                                .map(|ident| ident.to_string())
+                                .map_err(|source| LoaderError::Ident {
+                                    uri: file.original_uri.to_string(),
+                                    source,
+                                })
+                        })
+                        .collect::<Result<Vec<_>, LoaderError>>()
+                        .map(|columns| columns.join(", "))
+                };
+                let source_quoted = quote_columns(&file_cols)?;
+                let destination_quoted = quote_columns(destination_cols)?;
+                let mut unique_destinations = HashSet::with_capacity(destination_cols.len());
+                if destination_cols
                     .iter()
-                    .map(|column| {
-                        common::sql::SqlIdent::new(column)
-                            .map(|ident| ident.to_string())
-                            .map_err(|source| LoaderError::Ident {
-                                uri: file.original_uri.to_string(),
-                                source,
-                            })
-                    })
-                    .collect::<Result<Vec<_>, LoaderError>>()?
-                    .join(", ");
+                    .any(|column| !unique_destinations.insert(column.as_str()))
+                {
+                    return Err(LoaderError::ManifestInvariant {
+                        message: format!(
+                            "manifest {} maps multiple staged columns onto one raw destination",
+                            file.manifest_id
+                        ),
+                    });
+                }
                 let commit_lsn_expr = match file.commit_lsn_override {
                     Some(lsn) => lsn.to_quoted_literal(),
                     None => "json_extract_string(walrus_pg_sink_meta, '$.commit_lsn')".to_string(),
                 };
                 let sql = APPEND_PARQUET
                     .replace("{table}", table)
-                    .replace("{quoted}", &quoted)
+                    .replace("{destination_quoted}", &destination_quoted)
+                    .replace("{source_quoted}", &source_quoted)
                     .replace("{commit_lsn_expr}", &commit_lsn_expr)
                     .replace("{uri}", &uri)
                     .replace("{on_conflict}", on_conflict);
@@ -642,6 +680,7 @@ impl TableDb {
                 stream_group_id: None,
                 schema_version,
                 commit_lsn_override,
+                destination_columns: None,
                 expectation: None,
             }],
         )
@@ -684,8 +723,8 @@ impl TableDb {
             .duck_with(|| format!("inspect replay constraint on {table}_raw"))
     }
 
-    /// Verify one Parquet's complete column name/type sequence against the destination raw table.
-    /// The expected sequence is cached by schema version, but `uri` is DESCRIBEd on every call.
+    /// Verify one Parquet's complete column name/type sequence against its registry-bound staged
+    /// schema. The expected sequence is cached by schema version, but `uri` is DESCRIBEd every call.
     fn columns_for(
         &self,
         table: &str,
@@ -725,6 +764,104 @@ impl TableDb {
             .map(|column| column.name)
             .collect::<Vec<_>>()
             .into())
+    }
+
+    /// Cache the exact staged schema represented by one immutable registry plan.
+    ///
+    /// A protocol-v2 stream group can contain files on both sides of one or more transactional DDL
+    /// boundaries. Phase A must reconcile the destination to the group's newest version before its
+    /// atomic append, so the current raw table is an additive superset and cannot authoritatively
+    /// describe an older child. The versioned registry plan can: it preserves both source order and
+    /// Tier-2 emit expansion. Types are canonicalized through DuckDB before comparison so aliases
+    /// such as `REAL` and `FLOAT` do not manufacture a schema mismatch.
+    pub(crate) fn cache_staged_schema(
+        &self,
+        schema_version: SchemaVersionNo,
+        plan: &TablePlan,
+    ) -> Result<(), LoaderError> {
+        const RESERVED: [&str; 5] = [
+            "walrus_pg_sink_meta",
+            "_walrus_op",
+            "_walrus_commit_lsn",
+            "_walrus_lsn",
+            "_walrus_sink_processed_at",
+        ];
+        let mut staged_names = HashSet::with_capacity(plan.raw_cols.len());
+        for column in &plan.raw_cols {
+            if RESERVED.contains(&column.name.as_str())
+                || !staged_names.insert(column.name.as_str())
+            {
+                return Err(LoaderError::ManifestInvariant {
+                    message: format!(
+                        "registry schema {schema_version} contains duplicate or reserved staged column {:?}",
+                        column.name
+                    ),
+                });
+            }
+        }
+
+        let mut projections = plan
+            .raw_cols
+            .iter()
+            .enumerate()
+            .map(|(index, column)| {
+                format!(
+                    "CAST(NULL AS {}) AS \"_walrus_schema_{index}\"",
+                    column.duckdb_type
+                )
+            })
+            .collect::<Vec<_>>();
+        projections.push("CAST(NULL AS VARCHAR) AS \"_walrus_schema_meta\"".to_string());
+        let mut stmt = self
+            .conn
+            .prepare(&format!("DESCRIBE SELECT {}", projections.join(", ")))
+            .duck_with(|| format!("canonicalize registry schema {schema_version}"))?;
+        let canonical_types = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .duck_with(|| format!("canonicalize registry schema {schema_version}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .duck_with(|| format!("canonicalize registry schema {schema_version}"))?;
+        if canonical_types.len() != plan.raw_cols.len() + 1 {
+            return Err(LoaderError::ManifestInvariant {
+                message: format!(
+                    "registry schema {schema_version} canonicalized to an unexpected column count"
+                ),
+            });
+        }
+        let mut expected = plan
+            .raw_cols
+            .iter()
+            .zip(&canonical_types)
+            .map(|(column, duckdb_type)| StagedColumn {
+                name: column.name.clone(),
+                duckdb_type: duckdb_type.clone(),
+            })
+            .collect::<Vec<_>>();
+        expected.push(StagedColumn {
+            name: "walrus_pg_sink_meta".to_string(),
+            duckdb_type: canonical_types.last().cloned().ok_or_else(|| {
+                LoaderError::ManifestInvariant {
+                    message: format!(
+                        "registry schema {schema_version} lost its staged metadata column"
+                    ),
+                }
+            })?,
+        });
+        let expected: Arc<[StagedColumn]> = expected.into();
+
+        let mut cache = self.parquet_cols.borrow_mut();
+        if let Some(cached) = cache.get(&schema_version) {
+            if cached.as_ref() != expected.as_ref() {
+                return Err(LoaderError::ManifestInvariant {
+                    message: format!(
+                        "registry schema {schema_version} conflicts with its cached staged schema"
+                    ),
+                });
+            }
+            return Ok(());
+        }
+        cache.insert(schema_version, expected);
+        Ok(())
     }
 
     /// Number of distinct `schema_version`s whose column list is cached; exposed only to tests.

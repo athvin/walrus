@@ -295,7 +295,7 @@ pub async fn bootstrap(
                         crate::plan::TablePlan::from_registry(&rel_cur, &r.descriptors)
                     }
                     None => crate::plan::TablePlan::from_registry(&rel, &row.descriptors),
-                };
+                }?;
             db.ensure_tables_planned(&cur_plan, cur)?;
             db.set_built_epoch(epoch)?;
             tracing::warn!(
@@ -309,7 +309,7 @@ pub async fn bootstrap(
             // with no descriptors this is the plain scalar shape. Stamp the built generation, then
             // reconcile a RESUMED file forward to the registered latest version.
             db.ensure_tables_planned(
-                &crate::plan::TablePlan::from_registry(&rel, &row.descriptors),
+                &crate::plan::TablePlan::from_registry(&rel, &row.descriptors)?,
                 version,
             )?;
             db.set_built_epoch(epoch)?;

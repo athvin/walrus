@@ -132,19 +132,98 @@ BEFORE UPDATE OF status, exporter_generation, lease_holder
 ON walrus.table_reload
 FOR EACH ROW EXECUTE FUNCTION walrus.guard_reload_exporter_acquisition_v2();
 
--- SQL is embedded in binaries, so a still-running pre-v2 loader could otherwise execute its old
--- unguarded `export_complete -> complete` statement after this migration. Reject that transition
--- in the database; modern completion must first own `publishing` and its fenced nonce.
+-- Status is durable protocol evidence, not an editable label. Preserve the one-way state machine
+-- while retaining the explicit pristine exporter release (`exporting -> requested`). The legacy
+-- `export_complete -> complete` shape is left to the stronger completion trigger below so it
+-- reports the dedicated seal/checkpoint violation.
+CREATE FUNCTION walrus.guard_table_reload_status_transition()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF NOT (
+    OLD.status = NEW.status
+    OR (OLD.status = 'requested' AND NEW.status IN ('exporting', 'failed'))
+    OR (OLD.status = 'exporting' AND NEW.status IN ('requested', 'export_complete', 'failed'))
+    OR (OLD.status = 'export_complete' AND NEW.status IN ('publishing', 'complete', 'failed'))
+    OR (OLD.status = 'publishing' AND NEW.status = 'complete')
+    OR (
+      OLD.status = 'publishing' AND NEW.status = 'failed'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM walrus.manifest_publication_fence AS seal
+        WHERE seal.epoch = OLD.epoch
+          AND seal.source_schema = OLD.source_schema
+          AND seal.source_table = OLD.source_table
+          AND seal.sealed_reload_id = OLD.reload_id
+          AND seal.sealed_publication_nonce = OLD.publication_nonce
+          AND seal.sealed_through_lsn = OLD.final_lsn
+      )
+    )
+  ) THEN
+    RAISE EXCEPTION 'illegal table reload status transition % -> %', OLD.status, NEW.status
+      USING ERRCODE = '23514', CONSTRAINT = 'table_reload_status_transition';
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER table_reload_status_transition
+BEFORE UPDATE OF status ON walrus.table_reload
+FOR EACH ROW EXECUTE FUNCTION walrus.guard_table_reload_status_transition();
+
+-- SQL is embedded in binaries, so a still-running or buggy loader could otherwise bypass the
+-- publication protocol with a direct status update. Entering `complete` is a database-attested
+-- transition: the exact reload receipt must be publishing, its durable manifest seal must be at
+-- H, and both canonical checkpoints must already equal H. The seal/checkpoint tables are created
+-- later in this migration; PL/pgSQL resolves them when the trigger first executes, after the
+-- migration transaction has committed.
 CREATE FUNCTION walrus.guard_reload_v2_completion()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
-  IF NEW.status = 'complete'
-     AND OLD.status = 'export_complete'
-     AND OLD.exporter_generation > 0 THEN
+  IF NEW.status <> 'complete' THEN
+    RETURN NEW;
+  END IF;
+  IF TG_OP = 'INSERT' THEN
+    RAISE EXCEPTION 'reloads cannot be inserted directly in complete state'
+      USING ERRCODE = '23514', CONSTRAINT = 'table_reload_v2_completion_guard';
+  END IF;
+  IF OLD.status = 'complete' THEN
+    RETURN NEW;
+  END IF;
+  IF OLD.status <> 'publishing'
+     OR NEW.exporter_generation <= 0
+     OR ROW(
+       NEW.reload_id, NEW.epoch, NEW.source_schema, NEW.source_table,
+       NEW.start_lsn, NEW.final_lsn, NEW.schema_version, NEW.publication_nonce,
+       NEW.publisher_owner_pod, NEW.publisher_fencing_token, NEW.publishing_at
+     ) IS DISTINCT FROM ROW(
+       OLD.reload_id, OLD.epoch, OLD.source_schema, OLD.source_table,
+       OLD.start_lsn, OLD.final_lsn, OLD.schema_version, OLD.publication_nonce,
+       OLD.publisher_owner_pod, OLD.publisher_fencing_token, OLD.publishing_at
+     ) THEN
     RAISE EXCEPTION
-      'protocol-v2 reload must pass through fenced publishing before complete'
+      'reload completion requires an unchanged protocol-v2 publishing receipt'
+      USING ERRCODE = '23514', CONSTRAINT = 'table_reload_v2_completion_guard';
+  END IF;
+
+  PERFORM 1
+  FROM walrus.manifest_publication_fence AS seal
+  JOIN walrus.loader_checkpoint AS checkpoint
+    ON checkpoint.epoch = NEW.epoch
+   AND checkpoint.source_schema = NEW.source_schema
+   AND checkpoint.source_table = NEW.source_table
+  WHERE seal.epoch = NEW.epoch
+    AND seal.source_schema = NEW.source_schema
+    AND seal.source_table = NEW.source_table
+    AND seal.sealed_reload_id = NEW.reload_id
+    AND seal.sealed_publication_nonce = NEW.publication_nonce
+    AND seal.sealed_through_lsn = NEW.final_lsn
+    AND checkpoint.raw_appended_lsn = NEW.final_lsn
+    AND checkpoint.transformed_lsn = NEW.final_lsn
+  FOR SHARE OF seal, checkpoint;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION
+      'reload completion requires its exact durable seal and H checkpoints'
       USING ERRCODE = '23514', CONSTRAINT = 'table_reload_v2_completion_guard';
   END IF;
   RETURN NEW;
@@ -152,7 +231,7 @@ END
 $$;
 
 CREATE TRIGGER table_reload_v2_completion_guard
-BEFORE UPDATE OF status ON walrus.table_reload
+BEFORE INSERT OR UPDATE OF status ON walrus.table_reload
 FOR EACH ROW EXECUTE FUNCTION walrus.guard_reload_v2_completion();
 
 CREATE TABLE walrus.table_reload_export_range (
@@ -214,6 +293,24 @@ BEGIN
     RAISE EXCEPTION
       'protocol-v2 migration requires every pre-upgrade reload to be complete or failed';
   END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM walrus.table_reload AS reload
+    LEFT JOIN walrus.loader_checkpoint AS checkpoint
+      ON checkpoint.epoch = reload.epoch
+     AND checkpoint.source_schema = reload.source_schema
+     AND checkpoint.source_table = reload.source_table
+    WHERE reload.status = 'complete'
+      AND (
+        reload.final_lsn IS NULL
+        OR checkpoint.epoch IS NULL
+        OR checkpoint.raw_appended_lsn < reload.final_lsn
+        OR checkpoint.transformed_lsn < reload.final_lsn
+      )
+  ) THEN
+    RAISE EXCEPTION
+      'protocol-v2 migration requires every completed legacy reload to have H and checkpoints through H';
+  END IF;
 END
 $$;
 
@@ -234,7 +331,7 @@ ALTER TABLE walrus.file_manifest
     CHECK ((kind = 'reload') = (reload_id IS NOT NULL)),
   ADD CONSTRAINT file_manifest_stream_group_shape_check
     CHECK (
-      (stream_group_id IS NULL AND stream_group_ordinal IS NULL)
+      (kind <> 'spill' AND stream_group_id IS NULL AND stream_group_ordinal IS NULL)
       OR
       (
         stream_group_id IS NOT NULL
@@ -291,7 +388,7 @@ BEGIN
     AND reload.schema_version = NEW.schema_version
     AND reload.export_snapshot IS NOT NULL
     AND reload.export_sealed_at IS NULL
-  FOR KEY SHARE;
+  FOR UPDATE;
 
   IF NOT FOUND THEN
     RAISE EXCEPTION
@@ -321,7 +418,10 @@ BEGIN
       'file manifests may be retired only by the protocol-v2 grouped/fenced path'
       USING ERRCODE = '23514', CONSTRAINT = 'file_manifest_delete_protocol_v2';
   END IF;
-  RETURN OLD;
+  IF TG_OP = 'DELETE' THEN
+    RETURN OLD;
+  END IF;
+  RETURN NULL;
 END
 $$;
 
@@ -329,9 +429,277 @@ CREATE TRIGGER file_manifest_delete_protocol_v2
 BEFORE DELETE ON walrus.file_manifest
 FOR EACH ROW EXECUTE FUNCTION walrus.guard_manifest_delete_protocol_v2();
 
--- One durable receipt for each protocol-v2 streamed transaction. Keeping the receipt after its
--- child manifests have been consumed makes replay after "publish committed, source ACK lost"
--- idempotent for the lifetime of the slot epoch.
+CREATE TRIGGER file_manifest_truncate_protocol_v2
+BEFORE TRUNCATE ON walrus.file_manifest
+FOR EACH STATEMENT EXECUTE FUNCTION walrus.guard_manifest_delete_protocol_v2();
+
+-- A claimed manifest is an object attestation, not a mutable queue hint. The loader releases the
+-- control transaction while downloading and validating the object, so changing any semantic
+-- field between claim and retirement could otherwise make an id-only delete acknowledge bytes
+-- different from the ones it appended. Integrity handling may move `ready -> failed`; failed is
+-- terminal so old work cannot be resurrected below a later reload seal. Every other column,
+-- including identity and timestamps, is immutable.
+CREATE FUNCTION walrus.guard_file_manifest_semantics()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF (to_jsonb(NEW) - 'status') IS DISTINCT FROM (to_jsonb(OLD) - 'status') THEN
+    RAISE EXCEPTION 'file manifest semantics are immutable'
+      USING ERRCODE = '23514', CONSTRAINT = 'file_manifest_semantics_immutable';
+  END IF;
+  IF OLD.status = 'failed' AND NEW.status IS DISTINCT FROM 'failed' THEN
+    RAISE EXCEPTION 'failed file manifest status is terminal'
+      USING ERRCODE = '23514', CONSTRAINT = 'file_manifest_status_transition';
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER file_manifest_semantics_immutable
+BEFORE UPDATE ON walrus.file_manifest
+FOR EACH ROW EXECUTE FUNCTION walrus.guard_file_manifest_semantics();
+
+-- Publishers and reload cutover serialize on this table-local row. Once a reload proves its
+-- manifest prefix through H is empty, the durable seal prevents a source commit at or below H
+-- from becoming visible after the Duck generation has been swapped. The row remains for the slot
+-- epoch so later commits can be admitted only beyond the greatest completed seal.
+--
+-- Give completed pre-upgrade reloads a durable receipt identity before constructing their seals.
+-- The rollout precondition above proved that each has H and checkpoints through H. Backfilling the
+-- greatest completed H per table closes the lost-source-ACK replay window across the upgrade.
+UPDATE walrus.table_reload
+SET publication_nonce = gen_random_uuid(),
+    publisher_owner_pod = 'protocol-v2-migration',
+    publisher_fencing_token = 0,
+    publishing_at = COALESCE(updated_at, now())
+WHERE status = 'complete' AND publication_nonce IS NULL;
+
+ALTER TABLE walrus.table_reload
+  DROP CONSTRAINT table_reload_v2_complete_identity_check,
+  ADD CONSTRAINT table_reload_v2_complete_identity_check CHECK (
+    status <> 'complete'
+    OR (
+      publication_nonce IS NOT NULL
+      AND publisher_owner_pod IS NOT NULL
+      AND publisher_fencing_token IS NOT NULL
+      AND publishing_at IS NOT NULL
+    )
+  );
+
+ALTER TABLE walrus.table_reload
+  ADD CONSTRAINT table_reload_publication_seal_identity_unique
+  UNIQUE (
+    reload_id, epoch, source_schema, source_table, final_lsn, publication_nonce
+  );
+
+CREATE TABLE walrus.manifest_publication_fence (
+  epoch                    bigint NOT NULL,
+  source_schema            text NOT NULL,
+  source_table             text NOT NULL,
+  sealed_through_lsn       pg_lsn,
+  sealed_reload_id         bigint,
+  sealed_publication_nonce uuid,
+  updated_at               timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (epoch, source_schema, source_table),
+  CONSTRAINT manifest_publication_fence_reload_identity_fk
+    FOREIGN KEY (
+      sealed_reload_id, epoch, source_schema, source_table,
+      sealed_through_lsn, sealed_publication_nonce
+    )
+    REFERENCES walrus.table_reload (
+      reload_id, epoch, source_schema, source_table, final_lsn, publication_nonce
+    )
+    ON DELETE RESTRICT,
+  CHECK (
+    (sealed_through_lsn IS NULL
+      AND sealed_reload_id IS NULL
+      AND sealed_publication_nonce IS NULL)
+    OR
+    (sealed_through_lsn IS NOT NULL
+      AND sealed_reload_id IS NOT NULL
+      AND sealed_publication_nonce IS NOT NULL)
+  )
+);
+
+-- Advisory locks put every normal multi-table publisher in deterministic table-key order before
+-- it touches fence rows. Row triggers cannot block safely when a direct bulk statement chooses the
+-- reverse order, so they take the same key with try-lock and raise retryable serialization failure
+-- instead of entering a database deadlock cycle. Hash collisions only add harmless serialization.
+CREATE FUNCTION walrus.manifest_publication_lock_key(bigint, text, text)
+RETURNS bigint
+LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+AS $$
+  SELECT hashtextextended(
+    $1::text || ':' || octet_length($2)::text || ':' || $2
+      || ':' || octet_length($3)::text || ':' || $3,
+    1469598103934665603
+  )
+$$;
+
+CREATE FUNCTION walrus.try_manifest_publication_lock(bigint, text, text)
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF NOT pg_try_advisory_xact_lock(walrus.manifest_publication_lock_key($1, $2, $3)) THEN
+    RAISE EXCEPTION
+      'manifest publication table lock is busy; retry the transaction in canonical table order'
+      USING ERRCODE = '40001';
+  END IF;
+END
+$$;
+
+CREATE FUNCTION walrus.guard_manifest_publication_fence_monotonic()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP = 'UPDATE' AND (
+       ROW(NEW.epoch, NEW.source_schema, NEW.source_table)
+         IS DISTINCT FROM ROW(OLD.epoch, OLD.source_schema, OLD.source_table)
+       OR (OLD.sealed_through_lsn IS NOT NULL
+           AND (NEW.sealed_through_lsn IS NULL
+                OR NEW.sealed_through_lsn < OLD.sealed_through_lsn))
+     ) THEN
+    RAISE EXCEPTION 'manifest publication fence identity/seal is immutable and monotonic'
+      USING ERRCODE = '23514', CONSTRAINT = 'manifest_publication_fence_monotonic';
+  END IF;
+
+  IF (
+       (TG_OP = 'INSERT' AND NEW.sealed_through_lsn IS NOT NULL)
+       OR
+       (TG_OP = 'UPDATE' AND ROW(
+          NEW.sealed_through_lsn, NEW.sealed_reload_id, NEW.sealed_publication_nonce
+        ) IS DISTINCT FROM ROW(
+          OLD.sealed_through_lsn, OLD.sealed_reload_id, OLD.sealed_publication_nonce
+        ))
+     )
+     AND current_setting('walrus.manifest_seal_protocol', true) IS DISTINCT FROM '2' THEN
+    RAISE EXCEPTION 'manifest publication seals may be set only by the protocol-v2 seal path'
+      USING ERRCODE = '23514', CONSTRAINT = 'manifest_publication_seal_protocol_v2';
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER manifest_publication_fence_monotonic
+BEFORE INSERT OR UPDATE ON walrus.manifest_publication_fence
+FOR EACH ROW EXECUTE FUNCTION walrus.guard_manifest_publication_fence_monotonic();
+
+CREATE FUNCTION walrus.guard_manifest_publication_fence_removal()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF current_setting('walrus.manifest_fence_maintenance', true) IS DISTINCT FROM '2-delete' THEN
+    RAISE EXCEPTION 'manifest publication fences are append-only durable protocol receipts'
+      USING ERRCODE = '23514', CONSTRAINT = 'manifest_publication_fence_removal';
+  END IF;
+  IF TG_OP = 'DELETE' THEN
+    RETURN OLD;
+  END IF;
+  RETURN NULL;
+END $$;
+
+CREATE TRIGGER manifest_publication_fence_delete_guard
+BEFORE DELETE ON walrus.manifest_publication_fence
+FOR EACH ROW EXECUTE FUNCTION walrus.guard_manifest_publication_fence_removal();
+
+CREATE TRIGGER manifest_publication_fence_truncate_guard
+BEFORE TRUNCATE ON walrus.manifest_publication_fence
+FOR EACH STATEMENT EXECUTE FUNCTION walrus.guard_manifest_publication_fence_removal();
+
+-- Preserve the strongest legacy H for every table. The write GUC is transaction-local and exists
+-- solely as an explicit protocol tripwire; the composite FK below remains the relational proof.
+WITH authorized AS MATERIALIZED (
+  SELECT set_config('walrus.manifest_seal_protocol', '2', true) AS protocol
+), legacy_seals AS MATERIALIZED (
+  SELECT DISTINCT ON (epoch, source_schema, source_table)
+         reload_id, epoch, source_schema, source_table, final_lsn, publication_nonce
+  FROM walrus.table_reload
+  WHERE status = 'complete'
+  ORDER BY epoch, source_schema, source_table, final_lsn DESC, reload_id DESC
+)
+INSERT INTO walrus.manifest_publication_fence (
+  epoch, source_schema, source_table,
+  sealed_through_lsn, sealed_reload_id, sealed_publication_nonce
+)
+SELECT legacy.epoch, legacy.source_schema, legacy.source_table,
+       legacy.final_lsn, legacy.reload_id, legacy.publication_nonce
+FROM legacy_seals AS legacy
+CROSS JOIN authorized
+WHERE authorized.protocol = '2';
+
+-- Once claimed, the reload publication identity is a permanent lost-ACK receipt. Status/error
+-- fields may advance, but neither a later seal nor a newer reload may rewrite the completed proof.
+CREATE FUNCTION walrus.guard_reload_publication_identity_immutable()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF OLD.publication_nonce IS NOT NULL AND ROW(
+       NEW.epoch, NEW.source_schema, NEW.source_table, NEW.start_lsn, NEW.final_lsn,
+       NEW.schema_version, NEW.publication_nonce, NEW.publishing_at
+     ) IS DISTINCT FROM ROW(
+       OLD.epoch, OLD.source_schema, OLD.source_table, OLD.start_lsn, OLD.final_lsn,
+       OLD.schema_version, OLD.publication_nonce, OLD.publishing_at
+     ) THEN
+    RAISE EXCEPTION 'reload publication identity is immutable once claimed'
+      USING ERRCODE = '23514', CONSTRAINT = 'table_reload_publication_identity_immutable';
+  END IF;
+  IF OLD.publication_nonce IS NOT NULL
+     AND ROW(NEW.publisher_owner_pod, NEW.publisher_fencing_token)
+       IS DISTINCT FROM ROW(OLD.publisher_owner_pod, OLD.publisher_fencing_token)
+     AND (
+       OLD.status <> 'publishing'
+       OR NEW.status <> 'publishing'
+       OR current_setting('walrus.reload_publication_adopt_protocol', true)
+          IS DISTINCT FROM '2'
+     ) THEN
+    RAISE EXCEPTION 'reload publication ownership may rotate only through fenced adoption'
+      USING ERRCODE = '23514', CONSTRAINT = 'table_reload_publication_owner_transition';
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER table_reload_publication_identity_immutable
+BEFORE UPDATE ON walrus.table_reload
+FOR EACH ROW EXECUTE FUNCTION walrus.guard_reload_publication_identity_immutable();
+
+-- Ungrouped stream/snapshot writers use `insert_ready`, outside the multi-table StreamCommit
+-- publisher. Enforce the same fence in the database so no caller can bypass cutover serialization.
+-- Reload chunks are governed by their attempt/status trigger and are deliberately exempt.
+CREATE FUNCTION walrus.guard_file_manifest_publication_fence()
+RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+  sealed_lsn pg_lsn;
+BEGIN
+  IF NEW.kind = 'reload' THEN
+    RETURN NEW;
+  END IF;
+
+  PERFORM walrus.try_manifest_publication_lock(
+    NEW.epoch, NEW.source_schema, NEW.source_table
+  );
+
+  INSERT INTO walrus.manifest_publication_fence AS fence
+    (epoch, source_schema, source_table)
+  VALUES (NEW.epoch, NEW.source_schema, NEW.source_table)
+  ON CONFLICT (epoch, source_schema, source_table) DO UPDATE
+    SET updated_at = fence.updated_at
+  RETURNING sealed_through_lsn INTO sealed_lsn;
+
+  IF sealed_lsn IS NOT NULL
+     AND (
+       NEW.lsn_end <= sealed_lsn
+       OR (NEW.stream_group_id IS NULL AND NEW.lsn_start <= sealed_lsn)
+     ) THEN
+    RAISE EXCEPTION
+      'manifest LSN range [% - %] overlaps durable reload seal % for %.%',
+      NEW.lsn_start, NEW.lsn_end, sealed_lsn, NEW.source_schema, NEW.source_table
+      USING ERRCODE = '23514', CONSTRAINT = 'file_manifest_publication_sealed';
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER file_manifest_publication_fence
+BEFORE INSERT ON walrus.file_manifest
+FOR EACH ROW EXECUTE FUNCTION walrus.guard_file_manifest_publication_fence();
+
+-- One durable receipt for each protocol-v2 commit publication (a streamed transaction, or an
+-- ordinary structural DDL-only transaction). Keeping the receipt after its work has been consumed
+-- makes replay after "publish committed, source ACK lost" idempotent for the slot epoch.
 CREATE TABLE walrus.stream_txn_publication (
   id          bigserial PRIMARY KEY,
   epoch       bigint NOT NULL,
@@ -341,24 +709,41 @@ CREATE TABLE walrus.stream_txn_publication (
   created_at  timestamptz NOT NULL DEFAULT now(),
   -- A PostgreSQL commit record has one top-level xid. Keying the receipt by the WAL identity makes
   -- a replay that changes top_xid a semantic conflict instead of a second accepted publication.
-  UNIQUE (epoch, commit_lsn)
+  UNIQUE (epoch, commit_lsn),
+  UNIQUE (id, epoch, top_xid, commit_lsn, commit_ts)
 );
+
+CREATE FUNCTION walrus.guard_stream_txn_publication_semantics()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF to_jsonb(NEW) IS DISTINCT FROM to_jsonb(OLD) THEN
+    RAISE EXCEPTION 'stream transaction publication semantics are immutable'
+      USING ERRCODE = '23514', CONSTRAINT = 'stream_txn_publication_semantics_immutable';
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER stream_txn_publication_semantics_immutable
+BEFORE UPDATE ON walrus.stream_txn_publication
+FOR EACH ROW EXECUTE FUNCTION walrus.guard_stream_txn_publication_semantics();
 
 -- A streamed transaction can produce several Parquet objects for one table. The loader must
 -- append that complete per-table set in one DuckLake transaction; an arbitrary claim LIMIT may
 -- never expose only a prefix of it.
 CREATE TABLE walrus.stream_manifest_group (
   id              bigserial PRIMARY KEY,
-  publication_id  bigint NOT NULL
-                  REFERENCES walrus.stream_txn_publication(id) ON DELETE RESTRICT,
+  publication_id  bigint NOT NULL,
   epoch           bigint NOT NULL,
   top_xid         bigint NOT NULL CHECK (top_xid BETWEEN 0 AND 4294967295),
   source_schema   text NOT NULL,
   source_table    text NOT NULL,
   commit_lsn      pg_lsn NOT NULL,
   commit_ts       text NOT NULL,
-  expected_files  bigint NOT NULL CHECK (expected_files > 0),
-  row_count       bigint NOT NULL CHECK (row_count > 0),
+  expected_files  bigint NOT NULL CHECK (expected_files >= 0),
+  row_count       bigint NOT NULL CHECK (row_count >= 0),
+  -- Final structural shape reached by this table in the streamed transaction. This can be newer
+  -- than every child file when the transaction's last operation for the table is DDL.
+  final_schema_version bigint NOT NULL CHECK (final_schema_version > 0),
   -- Stable semantic identity retained after randomized objects/child queue rows are gone. The
   -- producer sorts this array and excludes s3_uri/object bytes deliberately: replay must prove the
   -- same logical files, not reproduce a random object key.
@@ -369,6 +754,12 @@ CREATE TABLE walrus.stream_manifest_group (
   applied_at      timestamptz,
   UNIQUE (publication_id, source_schema, source_table),
   UNIQUE (id, epoch, source_schema, source_table, commit_lsn),
+  CONSTRAINT stream_manifest_group_publication_identity_fk
+    FOREIGN KEY (publication_id, epoch, top_xid, commit_lsn, commit_ts)
+    REFERENCES walrus.stream_txn_publication (id, epoch, top_xid, commit_lsn, commit_ts)
+    ON DELETE RESTRICT,
+  CHECK ((expected_files = 0) = (row_count = 0)),
+  CHECK (jsonb_array_length(file_shape) = expected_files),
   CHECK ((status IN ('applied', 'superseded')) = (applied_at IS NOT NULL))
 );
 
@@ -382,6 +773,115 @@ ALTER TABLE walrus.file_manifest
 CREATE INDEX stream_manifest_group_ready_idx
   ON walrus.stream_manifest_group (epoch, source_schema, source_table, commit_lsn, id)
   WHERE status = 'ready';
+
+-- Group semantics are an epoch-long replay receipt. Claims may release their read snapshot while
+-- DuckDB appends, so no concurrent writer may raise/lower the schema barrier or rewrite the file
+-- shape before the final locked retirement validates it.
+CREATE OR REPLACE FUNCTION walrus.guard_stream_manifest_group_semantics()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF ROW(
+       NEW.publication_id, NEW.epoch, NEW.top_xid, NEW.source_schema, NEW.source_table,
+       NEW.commit_lsn, NEW.commit_ts, NEW.expected_files, NEW.row_count,
+       NEW.final_schema_version, NEW.file_shape, NEW.created_at
+     ) IS DISTINCT FROM ROW(
+       OLD.publication_id, OLD.epoch, OLD.top_xid, OLD.source_schema, OLD.source_table,
+       OLD.commit_lsn, OLD.commit_ts, OLD.expected_files, OLD.row_count,
+       OLD.final_schema_version, OLD.file_shape, OLD.created_at
+     ) THEN
+    RAISE EXCEPTION 'stream manifest group semantics are immutable'
+      USING ERRCODE = '23514', CONSTRAINT = 'stream_manifest_group_semantics_immutable';
+  END IF;
+
+  IF NOT (
+    (OLD.status = NEW.status AND OLD.applied_at IS NOT DISTINCT FROM NEW.applied_at)
+    OR (OLD.status = 'ready' AND NEW.status = 'failed'
+        AND OLD.applied_at IS NULL AND NEW.applied_at IS NULL)
+    OR (OLD.status = 'ready' AND NEW.status IN ('applied', 'superseded')
+        AND OLD.applied_at IS NULL AND NEW.applied_at IS NOT NULL)
+    OR (OLD.status = 'failed' AND NEW.status = 'superseded'
+        AND OLD.applied_at IS NULL AND NEW.applied_at IS NOT NULL)
+  ) THEN
+    RAISE EXCEPTION 'illegal stream manifest group status/applied_at transition'
+      USING ERRCODE = '23514', CONSTRAINT = 'stream_manifest_group_status_transition';
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER stream_manifest_group_semantics_immutable
+BEFORE UPDATE ON walrus.stream_manifest_group
+FOR EACH ROW EXECUTE FUNCTION walrus.guard_stream_manifest_group_semantics();
+
+-- Group parents (including zero-child schema barriers) are themselves ordered manifest work and
+-- therefore must respect the same durable table seal even when no file trigger can fire.
+CREATE FUNCTION walrus.guard_stream_manifest_group_publication_fence()
+RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+  sealed_lsn pg_lsn;
+BEGIN
+  -- Reactivation is rejected by the state-machine trigger as well, but retaining the publication
+  -- fence on every attempted transition into ready makes a future relaxation fail closed below H.
+  IF TG_OP = 'UPDATE'
+     AND NOT (NEW.status = 'ready' AND OLD.status IS DISTINCT FROM 'ready') THEN
+    RETURN NEW;
+  END IF;
+
+  PERFORM walrus.try_manifest_publication_lock(
+    NEW.epoch, NEW.source_schema, NEW.source_table
+  );
+
+  INSERT INTO walrus.manifest_publication_fence AS fence
+    (epoch, source_schema, source_table)
+  VALUES (NEW.epoch, NEW.source_schema, NEW.source_table)
+  ON CONFLICT (epoch, source_schema, source_table) DO UPDATE
+    SET updated_at = fence.updated_at
+  RETURNING sealed_through_lsn INTO sealed_lsn;
+
+  IF sealed_lsn IS NOT NULL AND NEW.commit_lsn <= sealed_lsn THEN
+    RAISE EXCEPTION
+      'manifest group commit % is at or below durable reload seal % for %.%',
+      NEW.commit_lsn, sealed_lsn, NEW.source_schema, NEW.source_table
+      USING ERRCODE = '23514', CONSTRAINT = 'stream_manifest_group_publication_sealed';
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER stream_manifest_group_publication_fence
+BEFORE INSERT OR UPDATE OF status ON walrus.stream_manifest_group
+FOR EACH ROW EXECUTE FUNCTION walrus.guard_stream_manifest_group_publication_fence();
+
+-- Publication and group parents outlive their queue children as epoch-long replay receipts. The
+-- normal protocol never removes them. Tests/explicit administrative teardown must opt in with the
+-- same transaction-local maintenance tripwire used for table seals and delete children/groups in
+-- foreign-key order.
+CREATE FUNCTION walrus.guard_manifest_publication_receipt_removal()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF current_setting('walrus.manifest_fence_maintenance', true) IS DISTINCT FROM '2-delete' THEN
+    RAISE EXCEPTION 'manifest publication receipts are append-only durable protocol evidence'
+      USING ERRCODE = '23514', CONSTRAINT = 'manifest_publication_receipt_removal';
+  END IF;
+  IF TG_OP = 'DELETE' THEN
+    RETURN OLD;
+  END IF;
+  RETURN NULL;
+END $$;
+
+CREATE TRIGGER stream_manifest_group_delete_guard
+BEFORE DELETE ON walrus.stream_manifest_group
+FOR EACH ROW EXECUTE FUNCTION walrus.guard_manifest_publication_receipt_removal();
+
+CREATE TRIGGER stream_manifest_group_truncate_guard
+BEFORE TRUNCATE ON walrus.stream_manifest_group
+FOR EACH STATEMENT EXECUTE FUNCTION walrus.guard_manifest_publication_receipt_removal();
+
+CREATE TRIGGER stream_txn_publication_delete_guard
+BEFORE DELETE ON walrus.stream_txn_publication
+FOR EACH ROW EXECUTE FUNCTION walrus.guard_manifest_publication_receipt_removal();
+
+CREATE TRIGGER stream_txn_publication_truncate_guard
+BEFORE TRUNCATE ON walrus.stream_txn_publication
+FOR EACH STATEMENT EXECUTE FUNCTION walrus.guard_manifest_publication_receipt_removal();
 
 -- Object corruption is a table-level recovery state, not a poison-file skip. The first bounded
 -- incident schedules a fresh full-table reconciliation; another incident before that generation

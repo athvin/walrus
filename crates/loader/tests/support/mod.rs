@@ -62,25 +62,24 @@ pub fn sink_meta(
 /// rerun start either entirely clean or not clean at all; every database error is surfaced.
 pub async fn cleanup_epoch(pool: &sqlx::PgPool, epoch: EpochNo) {
     let mut tx = pool.begin().await.unwrap();
-    sqlx::query(
-        "WITH authorized AS MATERIALIZED (
-             SELECT set_config('walrus.manifest_delete_protocol', '2', true) AS protocol
-         )
-         DELETE FROM walrus.file_manifest
-         WHERE epoch = $1 AND (SELECT protocol = '2' FROM authorized)",
-    )
-    .bind(epoch.0)
-    .execute(&mut *tx)
-    .await
-    .unwrap();
+    sqlx::query("SELECT set_config('walrus.manifest_delete_protocol', '2', true)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("SELECT set_config('walrus.manifest_fence_maintenance', '2-delete', true)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
 
     for table in [
-        "table_integrity_recovery",
-        "table_reload",
+        "file_manifest",
         "stream_manifest_group",
         "stream_txn_publication",
-        "table_ownership",
+        "manifest_publication_fence",
+        "table_integrity_recovery",
         "loader_checkpoint",
+        "table_reload",
+        "table_ownership",
         "replication_state",
     ] {
         let statement = format!("DELETE FROM walrus.{table} WHERE epoch = $1");

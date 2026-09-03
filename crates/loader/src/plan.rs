@@ -16,8 +16,20 @@
 //! tests that pass a [`PgRelation`] are unchanged; the registry path ([`TablePlan::from_registry`])
 //! adds the Tier-2 shapes.
 
+use crate::error::LoaderError;
 use common::oids::{INTERVAL, TIMETZ};
 use common::{PgRelation, TypeDescriptor};
+use std::collections::{HashMap, HashSet};
+
+const RESERVED_PHYSICAL_COLUMNS: [&str; 7] = [
+    "walrus_pg_sink_meta",
+    "_walrus_op",
+    "_walrus_commit_lsn",
+    "_walrus_lsn",
+    "_walrus_sink_processed_at",
+    "_applied_commit_lsn",
+    "_applied_lsn",
+];
 
 /// A `<table>_raw` column: the verbatim emit column the sink wrote to Parquet.
 #[derive(Debug, Clone)]
@@ -122,47 +134,183 @@ impl TablePlan {
         }
     }
 
-    /// The full plan from the registry: descriptors (Tier-1/2/3) aligned with the relation's columns (for
-    /// the key flags). Falls back to the Tier-1 shape for any column without a descriptor.
-    #[must_use]
-    pub(crate) fn from_registry(rel: &PgRelation, descriptors: &[TypeDescriptor]) -> Self {
-        let by_name: std::collections::HashMap<&str, &TypeDescriptor> =
-            descriptors.iter().map(|d| (d.column.as_str(), d)).collect();
+    /// The full plan from the registry: descriptors (Tier-1/2/3) aligned with the relation's columns
+    /// (for key flags). Falls back to the Tier-1 shape for a column without a descriptor, but rejects
+    /// duplicate/unknown/type-mismatched descriptors and physical names that would alias another
+    /// source field or Walrus metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoaderError::ManifestInvariant`] when registry identity or its physical emit plan is
+    /// ambiguous/corrupt.
+    pub(crate) fn from_registry(
+        rel: &PgRelation,
+        descriptors: &[TypeDescriptor],
+    ) -> Result<Self, LoaderError> {
+        let mut columns_by_name = HashMap::with_capacity(rel.columns.len());
+        for column in &rel.columns {
+            if columns_by_name
+                .insert(column.name.as_str(), column.type_oid)
+                .is_some()
+            {
+                return Err(LoaderError::ManifestInvariant {
+                    message: format!(
+                        "schema relation {}.{} contains duplicate column {:?}",
+                        rel.schema, rel.name, column.name
+                    ),
+                });
+            }
+        }
+        let mut by_name = HashMap::with_capacity(descriptors.len());
+        for descriptor in descriptors {
+            if by_name
+                .insert(descriptor.column.as_str(), descriptor)
+                .is_some()
+            {
+                return Err(LoaderError::ManifestInvariant {
+                    message: format!(
+                        "schema relation {}.{} has duplicate descriptors for column {:?}",
+                        rel.schema, rel.name, descriptor.column
+                    ),
+                });
+            }
+            let relation_oid = columns_by_name
+                .get(descriptor.column.as_str())
+                .copied()
+                .ok_or_else(|| LoaderError::ManifestInvariant {
+                    message: format!(
+                        "schema relation {}.{} has a descriptor for unknown column {:?}",
+                        rel.schema, rel.name, descriptor.column
+                    ),
+                })?;
+            if descriptor.pg_type_oid != relation_oid {
+                return Err(LoaderError::ManifestInvariant {
+                    message: format!(
+                        "schema relation {}.{} descriptor for {:?} has type OID {}, relation has {}",
+                        rel.schema,
+                        rel.name,
+                        descriptor.column,
+                        descriptor.pg_type_oid,
+                        relation_oid
+                    ),
+                });
+            }
+            if let Some(entry) = descriptor.emit.iter().find(|entry| {
+                entry
+                    .rsplit_once(':')
+                    .is_none_or(|(name, arrow_type)| name.is_empty() || arrow_type.is_empty())
+            }) {
+                return Err(LoaderError::ManifestInvariant {
+                    message: format!(
+                        "schema relation {}.{} descriptor for {:?} has malformed emit entry {:?}; expected name:ARROW_TYPE",
+                        rel.schema, rel.name, descriptor.column, entry
+                    ),
+                });
+            }
+        }
         // Lower bound because a Tier-2 range fans out to five raw columns.
         let mut raw_cols = Vec::with_capacity(rel.columns.len());
         let mut mirror_cols = Vec::with_capacity(rel.columns.len());
         for c in &rel.columns {
-            match by_name.get(c.name.as_str()) {
-                None => {
-                    // No descriptor — treat as a Tier-1 scalar.
-                    let ty = crate::duck::duck_type(c.type_oid).to_string();
-                    raw_cols.push(RawCol {
-                        name: c.name.clone(),
-                        duckdb_type: ty.clone(),
-                    });
-                    mirror_cols.push(MirrorCol {
-                        name: c.name.clone(),
-                        duckdb_type: ty,
-                        is_key: c.is_key,
-                        toast_source: (!c.is_key).then(|| c.name.as_str().into()),
-                        value: MirrorValue::Passthrough,
-                    });
-                }
-                Some(d) => plan_column(
-                    c.name.as_str(),
-                    c.is_key,
-                    d,
-                    &mut raw_cols,
-                    &mut mirror_cols,
-                ),
-            }
+            append_registry_column(
+                c,
+                by_name.get(c.name.as_str()).copied(),
+                &mut raw_cols,
+                &mut mirror_cols,
+            );
         }
-        TablePlan {
+        let plan = TablePlan {
+            table: rel.name.as_str().into(),
+            raw_cols: raw_cols.into_boxed_slice(),
+            mirror_cols: mirror_cols.into_boxed_slice(),
+        };
+        validate_physical_names(rel, &plan)?;
+        Ok(plan)
+    }
+
+    /// Plan one logical source column while preserving its physical raw/mirror emit boundary.
+    ///
+    /// Full [`TablePlan`]s intentionally flatten Tier-2 siblings. Schema-lineage callers need this
+    /// focused view to rename the exact siblings belonging to one PostgreSQL attnum without
+    /// position-zipping unrelated columns after an ADD or DROP.
+    #[must_use]
+    pub(crate) fn for_registry_column(
+        rel: &PgRelation,
+        column: &common::PgColumn,
+        descriptor: Option<&TypeDescriptor>,
+    ) -> Self {
+        let mut raw_cols = Vec::new();
+        let mut mirror_cols = Vec::new();
+        append_registry_column(column, descriptor, &mut raw_cols, &mut mirror_cols);
+        Self {
             table: rel.name.as_str().into(),
             raw_cols: raw_cols.into_boxed_slice(),
             mirror_cols: mirror_cols.into_boxed_slice(),
         }
     }
+}
+
+fn validate_physical_names(rel: &PgRelation, plan: &TablePlan) -> Result<(), LoaderError> {
+    for (shape, names) in [
+        (
+            "raw",
+            plan.raw_cols
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "mirror",
+            plan.mirror_cols
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        let mut seen = HashSet::with_capacity(names.len());
+        if let Some(name) = names.into_iter().find(|name| {
+            name.is_empty() || RESERVED_PHYSICAL_COLUMNS.contains(name) || !seen.insert(*name)
+        }) {
+            return Err(LoaderError::ManifestInvariant {
+                message: format!(
+                    "schema relation {}.{} has duplicate, empty, or reserved {shape} physical column {name:?}",
+                    rel.schema, rel.name
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn append_registry_column(
+    column: &common::PgColumn,
+    descriptor: Option<&TypeDescriptor>,
+    raw_cols: &mut Vec<RawCol>,
+    mirror_cols: &mut Vec<MirrorCol>,
+) {
+    let Some(descriptor) = descriptor else {
+        // No descriptor — treat as a Tier-1 scalar.
+        let ty = crate::duck::duck_type(column.type_oid).to_string();
+        raw_cols.push(RawCol {
+            name: column.name.clone(),
+            duckdb_type: ty.clone(),
+        });
+        mirror_cols.push(MirrorCol {
+            name: column.name.clone(),
+            duckdb_type: ty,
+            is_key: column.is_key,
+            toast_source: (!column.is_key).then(|| column.name.as_str().into()),
+            value: MirrorValue::Passthrough,
+        });
+        return;
+    };
+    plan_column(
+        column.name.as_str(),
+        column.is_key,
+        descriptor,
+        raw_cols,
+        mirror_cols,
+    );
 }
 
 /// Plan one column from its descriptor, appending to `raw_cols`/`mirror_cols`.

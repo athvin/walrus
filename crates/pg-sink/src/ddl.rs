@@ -14,6 +14,7 @@
 use crate::relcache::RelationCache;
 use common::{
     DdlId, EpochNo, Lsn, PgColumn, PgRelation, ReplicaIdentity, SchemaVersionNo, TupleValue,
+    UtcTimestamp,
 };
 use std::collections::HashMap;
 
@@ -221,6 +222,37 @@ pub(crate) struct PreparedStreamDdl {
     top_xid: u32,
     ddl_rows: Vec<control::DdlRow>,
     registry_rows: Vec<control::RegistryRow>,
+}
+
+/// Validated control-plane payload for one ordinary (non-streamed) transaction commit.
+///
+/// Preparing is read-only for the same reason as [`PreparedStreamDdl`]: a failed control
+/// publication must leave the DDL provisional so WAL replay can retry the exact receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedOrdinaryDdl {
+    ddl_rows: Vec<control::DdlRow>,
+    registry_rows: Vec<control::RegistryRow>,
+}
+
+impl PreparedOrdinaryDdl {
+    #[must_use]
+    pub(crate) fn ddl_rows(&self) -> &[control::DdlRow] {
+        &self.ddl_rows
+    }
+
+    #[must_use]
+    pub(crate) fn registry_rows(&self) -> &[control::RegistryRow] {
+        &self.registry_rows
+    }
+
+    /// Structural DDL needs the durable ordered schema barrier. COMMENT-only transactions retain
+    /// the existing audit-only path and deliberately do not create a data/schema-version barrier.
+    #[must_use]
+    pub(crate) fn has_structural_ddl(&self) -> bool {
+        self.ddl_rows
+            .iter()
+            .any(|row| !row.c_tag.eq_ignore_ascii_case("COMMENT"))
+    }
 }
 
 impl PreparedStreamDdl {
@@ -449,13 +481,26 @@ impl DdlConsumer {
     #[must_use]
     pub fn is_provisional(&self, schema: &str, table: &str, version: SchemaVersionNo) -> bool {
         self.pending.iter().any(|pending| {
-            pending.version == version && table_matches(&pending.event, schema, table)
+            pending.event.is_structural()
+                && pending.version == version
+                && table_matches(&pending.event, schema, table)
         })
     }
 
     /// Stage a registry row in the source transaction that owns it. A later Relation message for the
-    /// same version and transaction replaces the trigger snapshot idempotently before commit.
+    /// same structural version and transaction replaces the trigger snapshot idempotently before
+    /// commit. COMMENT-only audit rows never own registry state.
     pub fn stage_registry(&mut self, scope: TransactionScope, row: control::RegistryRow) {
+        let owned_by_structural_ddl = self.pending.iter().any(|pending| {
+            pending.event.is_structural()
+                && same_transaction(pending.scope, scope)
+                && pending.version == row.schema_version
+                && table_matches(&pending.event, &row.source_schema, &row.source_table)
+        });
+        if !owned_by_structural_ddl {
+            return;
+        }
+
         if let Some(existing) = self.pending_registry.iter_mut().find(|pending| {
             same_transaction(pending.scope, scope)
                 && pending.row.epoch == row.epoch
@@ -469,19 +514,100 @@ impl DdlConsumer {
         self.pending_registry.push(PendingRegistry { scope, row });
     }
 
-    /// Commit the ordinary transaction's DDL and registry state with its actual commit LSN.
+    /// Commit the ordinary transaction's DDL and registry state with its real `Begin` xid and
+    /// `Commit` LSN/timestamp.
+    ///
+    /// A transaction containing structural DDL uses the same atomic protocol-v2 publication
+    /// receipt as a streamed transaction, with no file children. That creates one ordered
+    /// zero-child schema barrier per structurally changed table. COMMENT-only transactions keep the
+    /// metadata audit path and create no schema barrier.
     ///
     /// # Errors
+    ///
+    /// Returns [`DdlError::MixedOrdinaryDataAndStructuralDdl`] when the ordinary transaction also
+    /// contains routed user-table changes: publishing its schema barrier separately from its files
+    /// could expose a partial source commit. The transaction remains unacknowledged for replay.
+    ///
+    /// Returns [`DdlError::MixedOrdinaryReloadEffectsAndStructuralDdl`] when that transaction also
+    /// carries committed reload requests or fence markers, whose control effects cannot be included
+    /// in the schema publication receipt.
     ///
     /// Returns [`DdlError::TrackedTableIdentityChange`] for a committed tracked-table rename,
     /// schema move, or drop, or [`DdlError::Control`] if atomic control persistence fails.
     pub async fn on_commit(
         &mut self,
         pool: &sqlx::PgPool,
+        top_xid: u32,
         commit_lsn: Lsn,
+        commit_ts: UtcTimestamp,
+        has_routed_data: bool,
+        committed_reload_effects: usize,
     ) -> Result<(), DdlError> {
-        self.commit_selected(pool, commit_lsn, CommitSelector::Ordinary)
-            .await
+        let prepared = self.prepare_ordinary_commit(commit_lsn)?;
+        if prepared.ddl_rows().is_empty() && prepared.registry_rows().is_empty() {
+            return Ok(());
+        }
+
+        if prepared.has_structural_ddl() {
+            if has_routed_data {
+                return Err(DdlError::MixedOrdinaryDataAndStructuralDdl {
+                    top_xid,
+                    commit_lsn,
+                });
+            }
+            if committed_reload_effects != 0 {
+                return Err(DdlError::MixedOrdinaryReloadEffectsAndStructuralDdl {
+                    top_xid,
+                    commit_lsn,
+                    committed_reload_effects,
+                });
+            }
+            let publication = control::NewStreamCommitPublication {
+                epoch: self.epoch,
+                top_xid,
+                commit_lsn,
+                commit_ts,
+                ddl_rows: prepared.ddl_rows().to_vec(),
+                registry_rows: prepared.registry_rows().to_vec(),
+                files: Vec::new(),
+            };
+            // `Published` and `AlreadyPublished` both prove the exact atomic receipt is durable.
+            // A changed replay is rejected by control before any in-memory state is finalized.
+            let _outcome = control::publish_stream_commit(pool, &publication).await?;
+            self.finalize_ordinary_commit(prepared);
+            return Ok(());
+        }
+
+        let mut tx = pool.begin().await.map_err(control::ControlError::from)?;
+        for row in &prepared.ddl_rows {
+            control::insert_ddl(&mut *tx, row).await?;
+        }
+        for row in &prepared.registry_rows {
+            control::upsert_registry(&mut *tx, row).await?;
+        }
+        tx.commit().await.map_err(control::ControlError::from)?;
+        self.finalize_ordinary_commit(prepared);
+        Ok(())
+    }
+
+    /// Validate and extract the current ordinary transaction without changing in-memory state.
+    /// This is intentionally retryable across a failed or ambiguously acknowledged publication.
+    pub(crate) fn prepare_ordinary_commit(
+        &self,
+        commit_lsn: Lsn,
+    ) -> Result<PreparedOrdinaryDdl, DdlError> {
+        let (ddl_rows, registry_rows) =
+            self.prepare_selected(commit_lsn, CommitSelector::Ordinary)?;
+        Ok(PreparedOrdinaryDdl {
+            ddl_rows,
+            registry_rows,
+        })
+    }
+
+    /// Make a previously prepared ordinary DDL payload globally visible in this process after its
+    /// control transaction returned success (including an exact lost-ACK replay).
+    pub(crate) fn finalize_ordinary_commit(&mut self, prepared: PreparedOrdinaryDdl) {
+        self.finalize_selected(CommitSelector::Ordinary, prepared.ddl_rows);
     }
 
     /// Validate and extract one streamed top-level transaction's DDL/registry payload without
@@ -548,30 +674,6 @@ impl DdlConsumer {
                 )
             })
             .collect()
-    }
-
-    async fn commit_selected(
-        &mut self,
-        pool: &sqlx::PgPool,
-        commit_lsn: Lsn,
-        selector: CommitSelector,
-    ) -> Result<(), DdlError> {
-        let (rows, registry) = self.prepare_selected(commit_lsn, selector)?;
-        if rows.is_empty() && registry.is_empty() {
-            return Ok(());
-        }
-
-        let mut tx = pool.begin().await.map_err(control::ControlError::from)?;
-        for row in &rows {
-            control::insert_ddl(&mut *tx, row).await?;
-        }
-        for row in &registry {
-            control::upsert_registry(&mut *tx, row).await?;
-        }
-        tx.commit().await.map_err(control::ControlError::from)?;
-
-        self.finalize_selected(selector, rows);
-        Ok(())
     }
 
     fn prepare_selected(
@@ -813,6 +915,30 @@ pub enum DdlError {
     /// A committed DDL transaction changed the durable identity of a tracked relation.
     #[error("tracked table identity change is unsupported: {0}")]
     TrackedTableIdentityChange(TrackedTableIdentityChange),
+    /// An ordinary source transaction mixed structural DDL with routed data files, which cannot be
+    /// published as one atomic control receipt by the ordinary batching path.
+    #[error(
+        "ordinary transaction xid {top_xid} at {commit_lsn} mixes structural DDL with replicated data; refusing to publish a partial source commit"
+    )]
+    MixedOrdinaryDataAndStructuralDdl {
+        /// Top-level xid retained from the matching ordinary Begin.
+        top_xid: u32,
+        /// Commit LSN that must remain unacknowledged.
+        commit_lsn: Lsn,
+    },
+    /// An ordinary source transaction mixed structural DDL with reload-event control effects,
+    /// which are persisted outside the atomic schema publication receipt.
+    #[error(
+        "ordinary transaction xid {top_xid} at {commit_lsn} mixes structural DDL with {committed_reload_effects} committed reload effect(s); refusing to publish a partial source commit"
+    )]
+    MixedOrdinaryReloadEffectsAndStructuralDdl {
+        /// Top-level xid retained from the matching ordinary Begin.
+        top_xid: u32,
+        /// Commit LSN that must remain unacknowledged.
+        commit_lsn: Lsn,
+        /// Number of source reload requests/fence markers committed with the DDL.
+        committed_reload_effects: usize,
+    },
     /// A Relation message could not be assigned to one exact historical schema version without
     /// falling forward to a newer durable shape.
     #[error(

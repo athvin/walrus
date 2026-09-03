@@ -14,7 +14,7 @@
 
 mod support;
 
-use common::{EpochNo, PgColumn, PgRelation, ReplicaIdentity};
+use common::{DdlId, EpochNo, Lsn, PgColumn, PgRelation, ReplicaIdentity, SchemaVersionNo};
 use loader::ddl::{DestructiveChange, apply_destructive, retire_file};
 use loader::duck::{S3Access, TableDb};
 use loader::error::LoaderError;
@@ -235,6 +235,53 @@ fn s3() -> S3Access {
     }
 }
 
+async fn publish_lossy_schema_barrier(
+    pool: &sqlx::PgPool,
+    epoch: EpochNo,
+    commit_lsn: Lsn,
+    relation: &PgRelation,
+) {
+    let columns = serde_json::to_value(relation).unwrap();
+    assert_eq!(
+        control::publish_stream_commit(
+            pool,
+            &control::NewStreamCommitPublication {
+                epoch,
+                top_xid: 8_301,
+                commit_lsn,
+                commit_ts: "2026-09-02T12:05:00Z".parse().unwrap(),
+                ddl_rows: vec![control::DdlRow {
+                    id: DdlId(0),
+                    epoch,
+                    source_audit_id: 39_002_001,
+                    source_schema: "public".into(),
+                    source_table: "orders".into(),
+                    c_lsn: commit_lsn,
+                    c_event: "ddl_command_end".into(),
+                    c_tag: "ALTER TABLE".into(),
+                    schema_version: SchemaVersionNo(2),
+                    c_rel_oid: Some(relation.oid),
+                    c_columns: Some(columns.clone()),
+                    c_dropped: None,
+                    c_ddl_text: Some("ALTER TABLE orders ALTER COLUMN n TYPE smallint".into()),
+                }],
+                registry_rows: vec![control::RegistryRow {
+                    epoch,
+                    source_schema: "public".into(),
+                    source_table: "orders".into(),
+                    schema_version: SchemaVersionNo(2),
+                    descriptors: Vec::new(),
+                    columns,
+                }],
+                files: Vec::new(),
+            },
+        )
+        .await
+        .unwrap(),
+        control::PublishStreamOutcome::Published
+    );
+}
+
 /// Write an (id, n, walrus_pg_sink_meta) Parquet fixture to S3.
 fn write_fixture(
     epoch: EpochNo,
@@ -445,4 +492,106 @@ async fn lossy_cast_failure_quarantines_the_table_and_alerts() {
         )
         .unwrap();
     assert_eq!(raw_type, "VARCHAR", "raw widened to VARCHAR, not re-cast");
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose up --wait (control PG)"]
+async fn lossy_schema_only_barrier_stays_ready_when_reconciliation_quarantines() {
+    let _g = LOCK.lock().await;
+    let epoch = EpochNo(3_900_002);
+    let pool = control::connect(&control_url()).await.unwrap();
+    control::run_migrations(&pool).await.unwrap();
+    support::cleanup_epoch(&pool, epoch).await;
+    for table in ["ddl_manifest", "schema_registry"] {
+        sqlx::query(&format!("DELETE FROM walrus.{table} WHERE epoch = $1"))
+            .bind(epoch.0)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    control::insert_epoch(
+        &pool,
+        &control::ReplicationState {
+            epoch,
+            slot_name: "walrus_slot".into(),
+            created_lsn: Lsn::ZERO,
+            status: control::ReplicationStatus::Streaming,
+        },
+    )
+    .await
+    .unwrap();
+    control::ensure_checkpoint(&pool, epoch, "public", "orders")
+        .await
+        .unwrap();
+
+    let v1 = rel("orders", vec![col("id", 23, true), col("n", 23, false)]);
+    control::upsert_registry(
+        &pool,
+        &control::RegistryRow {
+            epoch,
+            source_schema: "public".into(),
+            source_table: "orders".into(),
+            schema_version: SchemaVersionNo(1),
+            descriptors: Vec::new(),
+            columns: serde_json::to_value(&v1).unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    let v2 = rel("orders", vec![col("id", 23, true), col("n", 21, false)]);
+    publish_lossy_schema_barrier(&pool, epoch, Lsn::new(0x300), &v2).await;
+
+    let dir = tmpdir("lossy-schema-barrier");
+    let db = TableDb::open(dir.path().join("orders.duckdb")).unwrap();
+    db.ensure_tables(&v1, SchemaVersionNo(1)).unwrap();
+    db.conn()
+        .execute("INSERT INTO orders (id, n) VALUES (1, 99999)", [])
+        .unwrap();
+    let state = LoaderState::new();
+    let (owner_pod, fencing_token) = support::acquire_table(&pool, epoch, "public", "orders").await;
+    let ctx = TableCtx {
+        pool,
+        epoch,
+        epoch_rx: loader::epoch::fixed_epoch_watch(epoch),
+        owner_pod,
+        fencing_token,
+        store: support::store(),
+        staging_bucket: "walrus".into(),
+        schema: "public".into(),
+        table: "orders".into(),
+        series: "public.orders".into(),
+        rel: v1,
+        db,
+        state: Arc::clone(&state),
+        max_files: std::num::NonZeroI64::new(100).unwrap(),
+        max_integrity_resnapshots: 1,
+        poll_interval: Duration::from_secs(5),
+        compaction_interval: Duration::from_secs(3600),
+        retention_lsn_lag: 16 << 20,
+        pause_logged: Default::default(),
+    };
+
+    let result = run_phase_a(&ctx).await;
+    assert!(
+        matches!(result, Err(LoaderError::Quarantine { .. })),
+        "lossy zero-file schema reconciliation must quarantine: {result:?}"
+    );
+    assert!(state.is_quarantined());
+    assert_eq!(ctx.db.schema_version().unwrap(), SchemaVersionNo(1));
+    assert!(matches!(
+        control::claim_ready_units(&ctx.pool, epoch, "public", "orders", 10)
+            .await
+            .unwrap()
+            .as_slice(),
+        [control::ReadyManifestUnit::SchemaBarrier(_)]
+    ));
+    let checkpoint = control::read_checkpoint(&ctx.pool, epoch, "public", "orders")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (checkpoint.raw_appended_lsn, checkpoint.transformed_lsn),
+        (Lsn::ZERO, Lsn::ZERO),
+        "a rejected schema-only commit neither retires nor advances data"
+    );
 }

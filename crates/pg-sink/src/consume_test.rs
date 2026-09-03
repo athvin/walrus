@@ -6,10 +6,10 @@ use crate::reload_event::{
 };
 use arrow::array::{Array, Int32Array, StringArray};
 use common::{PgColumn, PgRelation, ReplicaIdentity, SchemaVersionNo, SinkMeta, TupleValue};
-use object_store::path::Path;
+use object_store::{ObjectStore, PutPayload, path::Path};
 use pg_to_arrow::oids;
 use std::num::NonZeroU64;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -43,6 +43,13 @@ fn orders_relation(with_extra: bool) -> PgRelation {
         replica_identity: ReplicaIdentity::Default,
         columns,
     }
+}
+
+fn invoices_relation() -> PgRelation {
+    let mut relation = orders_relation(false);
+    relation.oid = 43;
+    relation.name = "invoices".into();
+    relation
 }
 
 fn wide_key_relation() -> PgRelation {
@@ -145,6 +152,44 @@ fn stream_commit_publication_contains_every_materialised_object_and_real_timesta
     assert_eq!(publication.files[0].kind, control::ManifestKind::Spill);
     assert_eq!(publication.files[1].s3_uri, objects[1].s3_uri);
     assert_eq!(publication.files[1].kind, control::ManifestKind::Stream);
+}
+
+#[tokio::test]
+async fn seal_covered_ordinary_object_cleanup_removes_the_unreferenced_bytes() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let sink = crate::sink::ParquetSink::new(Arc::clone(&store), "walrus", EpochNo(7));
+    let object = crate::sink::WrittenObject {
+        s3_uri: "s3://walrus/7/public/orders/replayed.parquet".into(),
+        key: Path::from("7/public/orders/replayed.parquet"),
+        source_schema: "public".into(),
+        source_table: "orders".into(),
+        lsn_start: Lsn::new(90),
+        lsn_end: Lsn::new(100),
+        row_count: 1,
+        object_size: 1,
+        sha256: [7; 32],
+        schema_version: SchemaVersionNo(1),
+        kind: crate::sink::FileKind::Stream,
+    };
+    store
+        .put(&object.key, PutPayload::from_static(b"x"))
+        .await
+        .unwrap();
+
+    delete_seal_covered_object(&sink, &object, Lsn::new(100)).await;
+
+    assert!(matches!(
+        store.head(&object.key).await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+}
+
+#[test]
+fn explicit_ordinary_flush_rejects_grouped_and_reload_kinds_before_put() {
+    validate_ordinary_flush_kind(crate::sink::FileKind::Stream).unwrap();
+    validate_ordinary_flush_kind(crate::sink::FileKind::Snapshot).unwrap();
+    assert!(validate_ordinary_flush_kind(crate::sink::FileKind::Spill).is_err());
+    assert!(validate_ordinary_flush_kind(crate::sink::FileKind::Reload).is_err());
 }
 
 #[test]
@@ -290,7 +335,7 @@ fn ordinary_ddl_cut_preserves_pre_ddl_rows_and_separates_schema_versions() {
     cache
         .upsert_from_relation(orders_relation(false), SchemaVersionNo(1))
         .unwrap();
-    let mut router = router();
+    let mut router = quiet_router();
     router.bind_relation(42, SchemaVersionNo(1));
 
     router
@@ -305,6 +350,10 @@ fn ordinary_ddl_cut_preserves_pre_ddl_rows_and_separates_schema_versions() {
             SchemaVersionNo(1),
         )
         .unwrap();
+    assert!(
+        !router.has_open_ordinary_data(),
+        "Begin alone carries no data durability work"
+    );
     router
         .route(
             &cache,
@@ -317,6 +366,7 @@ fn ordinary_ddl_cut_preserves_pre_ddl_rows_and_separates_schema_versions() {
             SchemaVersionNo(1),
         )
         .unwrap();
+    assert!(router.has_open_ordinary_data());
 
     assert!(
         router
@@ -326,6 +376,10 @@ fn ordinary_ddl_cut_preserves_pre_ddl_rows_and_separates_schema_versions() {
         "an open transaction cannot be sealed at its DDL event"
     );
     assert_eq!(router.pending_cuts.len(), 1);
+    assert!(
+        router.has_open_ordinary_data(),
+        "a pre-DDL cut must remain visible to the mixed-transaction guard"
+    );
 
     cache
         .upsert_from_relation(orders_relation(true), SchemaVersionNo(2))
@@ -349,16 +403,10 @@ fn ordinary_ddl_cut_preserves_pre_ddl_rows_and_separates_schema_versions() {
         .unwrap();
 
     let sealed = router
-        .route(
-            &cache,
-            &Message::Commit {
-                flags: 0,
-                commit_lsn: Lsn::new(900),
-                end_lsn: Lsn::new(901),
-                commit_ts: 0,
-            },
+        .commit(
             Lsn::new(900),
-            SchemaVersionNo(2),
+            UtcTimestamp::from_pg_micros(0).unwrap(),
+            true,
         )
         .unwrap();
 
@@ -374,6 +422,164 @@ fn ordinary_ddl_cut_preserves_pre_ddl_rows_and_separates_schema_versions() {
         ]
     );
     assert!(router.pending_cuts.is_empty());
+    assert!(
+        !router.has_open_ordinary_data(),
+        "Commit promotion clears the transaction-local data predicate"
+    );
+}
+
+#[test]
+fn ordinary_structural_commit_flushes_prior_prefix_before_replay_stable_children() {
+    let mut cache = RelationCache::default();
+    cache
+        .upsert_from_relation(orders_relation(false), SchemaVersionNo(1))
+        .unwrap();
+    cache
+        .upsert_from_relation(invoices_relation(), SchemaVersionNo(1))
+        .unwrap();
+    let mut router = quiet_router();
+    router.bind_relation(42, SchemaVersionNo(1));
+    router.bind_relation(43, SchemaVersionNo(1));
+
+    // A prior transaction for a different table remains below every normal flush trigger.
+    router
+        .route(
+            &cache,
+            &Message::Begin {
+                final_lsn: Lsn::new(100),
+                commit_ts: 0,
+                xid: 600,
+            },
+            Lsn::new(100),
+            SchemaVersionNo(1),
+        )
+        .unwrap();
+    router
+        .route(
+            &cache,
+            &Message::Insert {
+                xid: None,
+                relation_oid: 43,
+                new: vec![
+                    TupleValue::Text("1".into()),
+                    TupleValue::Text("prior".into()),
+                ],
+            },
+            Lsn::new(110),
+            SchemaVersionNo(1),
+        )
+        .unwrap();
+    assert!(
+        router
+            .route(
+                &cache,
+                &Message::Commit {
+                    flags: 0,
+                    commit_lsn: Lsn::new(200),
+                    end_lsn: Lsn::new(201),
+                    commit_ts: 0,
+                },
+                Lsn::new(200),
+                SchemaVersionNo(1),
+            )
+            .unwrap()
+            .is_empty()
+    );
+
+    // The mixed transaction starts in orders v1. Its DDL cut must return the older committed
+    // invoices prefix too, while preserving this xid's pre-DDL orders row as a pending segment.
+    router
+        .route(
+            &cache,
+            &Message::Begin {
+                final_lsn: Lsn::new(300),
+                commit_ts: 0,
+                xid: 700,
+            },
+            Lsn::new(300),
+            SchemaVersionNo(1),
+        )
+        .unwrap();
+    router
+        .route(
+            &cache,
+            &Message::Insert {
+                xid: None,
+                relation_oid: 42,
+                new: vec![
+                    TupleValue::Text("2".into()),
+                    TupleValue::Text("before-ddl".into()),
+                ],
+            },
+            Lsn::new(310),
+            SchemaVersionNo(1),
+        )
+        .unwrap();
+    let prefixes = router.cut_table(&cache, "public", "orders").unwrap();
+    assert_eq!(
+        prefixes
+            .iter()
+            .map(|batch| (
+                batch.table.as_str(),
+                batch.schema_version,
+                batch.row_count,
+                batch.lsn_start,
+                batch.lsn_end
+            ))
+            .collect::<Vec<_>>(),
+        vec![(
+            "invoices",
+            SchemaVersionNo(1),
+            1,
+            Lsn::new(200),
+            Lsn::new(200)
+        )],
+        "the atomic receipt must never absorb a prior buffered commit"
+    );
+
+    cache
+        .upsert_from_relation(orders_relation(true), SchemaVersionNo(2))
+        .unwrap();
+    router.bind_relation(42, SchemaVersionNo(2));
+    router
+        .route(
+            &cache,
+            &Message::Insert {
+                xid: None,
+                relation_oid: 42,
+                new: vec![
+                    TupleValue::Text("3".into()),
+                    TupleValue::Text("after-ddl".into()),
+                    TupleValue::Text("v2".into()),
+                ],
+            },
+            Lsn::new(320),
+            SchemaVersionNo(2),
+        )
+        .unwrap();
+
+    let commit_lsn = Lsn::new(900);
+    let children = router
+        .commit(commit_lsn, UtcTimestamp::from_pg_micros(0).unwrap(), true)
+        .unwrap();
+    assert_eq!(
+        children
+            .iter()
+            .map(|batch| (
+                batch.schema_version,
+                batch.row_count,
+                batch.lsn_start,
+                batch.lsn_end
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (SchemaVersionNo(1), 1, commit_lsn, commit_lsn),
+            (SchemaVersionNo(2), 1, commit_lsn, commit_lsn),
+        ],
+        "pre- and post-DDL tails must be forced into replay-stable receipt children"
+    );
+    assert!(router.pending_cuts.is_empty());
+    assert_eq!(router.undurable_floor(), None);
 }
 
 #[test]
@@ -396,6 +602,43 @@ fn durable_frontier_waits_for_every_older_or_equal_unsealed_commit() {
         "an older unsealed commit fences the slot"
     );
     assert_eq!(durable_frontier(None, Some(Lsn::new(800))), None);
+}
+
+#[test]
+fn schema_barrier_alone_does_not_advance_data_checkpoint() {
+    let resume_lsn = Lsn::new(700);
+    let mut checkpoint = crate::checkpoint::DurabilityCheckpoint::new(resume_lsn);
+
+    assert_eq!(
+        record_durable_frontier(None, None, &mut checkpoint),
+        None,
+        "a schema publication receipt is not a durable file/control frontier"
+    );
+    assert_eq!(checkpoint.confirmed_flush(), resume_lsn);
+}
+
+#[tokio::test]
+async fn failed_ordinary_schema_publication_never_polls_persistence_or_ack_stage() {
+    let persistence_polled = AtomicBool::new(false);
+
+    let result = persist_after_ordinary_schema_publication(
+        async {
+            Err::<(), crate::ddl::DdlError>(crate::ddl::DdlError::MissingColumn(
+                "publication failed",
+            ))
+        },
+        async {
+            persistence_polled.store(true, Ordering::Relaxed);
+            Ok::<(), anyhow::Error>(())
+        },
+    )
+    .await;
+
+    assert!(result.is_err());
+    assert!(
+        !persistence_polled.load(Ordering::Relaxed),
+        "file persistence and its downstream checkpoint/ACK stage must remain unpolled"
+    );
 }
 
 #[test]

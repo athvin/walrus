@@ -72,6 +72,32 @@ async fn drop_slot(admin: &tokio_postgres::Client, slot: &str) {
         .await;
 }
 
+async fn clear_control_epoch(pool: &sqlx::PgPool, epoch: EpochNo) {
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SELECT set_config('walrus.manifest_delete_protocol','2',true)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("SELECT set_config('walrus.manifest_fence_maintenance','2-delete',true)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    for table in [
+        "file_manifest",
+        "stream_manifest_group",
+        "stream_txn_publication",
+        "manifest_publication_fence",
+    ] {
+        let statement = format!("DELETE FROM walrus.{table} WHERE epoch = $1");
+        sqlx::query(&statement)
+            .bind(epoch)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+}
+
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (logical_decoding_work_mem=64kB)"]
 async fn savepoint_rollback_ready_file_has_exactly_6000_rows() {
@@ -93,11 +119,7 @@ async fn savepoint_rollback_ready_file_has_exactly_6000_rows() {
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     // Start clean: a prior failed run may have left ready rows for this epoch.
-    sqlx::query("WITH authorized AS MATERIALIZED (SELECT set_config('walrus.manifest_delete_protocol','2',true) AS protocol) DELETE FROM walrus.file_manifest WHERE epoch = $1 AND (SELECT protocol='2' FROM authorized)")
-        .bind(epoch)
-        .execute(&pool)
-        .await
-        .unwrap();
+    clear_control_epoch(&pool, epoch).await;
     let mut demux = StreamDemux::new(
         BatchTriggers {
             max_rows: std::num::NonZeroU64::new(100_000).unwrap(),
@@ -250,10 +272,7 @@ async fn savepoint_rollback_ready_file_has_exactly_6000_rows() {
             let _ = store.delete(&object_store::path::Path::from(key)).await;
         }
     }
-    let _ = sqlx::query("WITH authorized AS MATERIALIZED (SELECT set_config('walrus.manifest_delete_protocol','2',true) AS protocol) DELETE FROM walrus.file_manifest WHERE epoch = $1 AND (SELECT protocol='2' FROM authorized)")
-        .bind(epoch)
-        .execute(&pool)
-        .await;
+    clear_control_epoch(&pool, epoch).await;
     let _ = admin
         .execute(
             "DELETE FROM public.orders WHERE id BETWEEN 810000 AND 839999",

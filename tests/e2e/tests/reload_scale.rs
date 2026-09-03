@@ -211,8 +211,8 @@ async fn one_worker_honors_the_configured_record_chunk_size() {
     h.await_transformed_past("rl1", floor, Duration::from_secs(90))
         .await
         .unwrap();
-    let initial: (String, i64) = sqlx::query_as(
-        "SELECT status, chunk_no FROM walrus.table_reload \
+    let initial: (i64, String, i64) = sqlx::query_as(
+        "SELECT reload_id, status, chunk_no FROM walrus.table_reload \
          WHERE epoch = $1 AND source_schema = 'public' AND source_table = 'rl1' \
          ORDER BY reload_id DESC LIMIT 1",
     )
@@ -221,13 +221,11 @@ async fn one_worker_honors_the_configured_record_chunk_size() {
     .await
     .unwrap();
     assert_eq!(
-        initial.0, "complete",
+        initial.1, "complete",
         "non-empty first startup reached cutover"
     );
-    assert_eq!(
-        initial.1, 28,
-        "first startup honored the same 37-record object size"
-    );
+    let initial_ranges = completed_export_ranges(&h, initial.0).await;
+    assert_range_chunking(&initial_ranges, 37, 1001, initial.2);
 
     // Hold the loader so exported manifests remain inspectable instead of being claimed/deleted.
     // This lets the test assert the record-count contract on every remote object, not merely the
@@ -287,10 +285,8 @@ async fn one_worker_honors_the_configured_record_chunk_size() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    assert_eq!(
-        completed.1, 28,
-        "1001 rows must produce 27 full objects plus one tail"
-    );
+    let completed_ranges = completed_export_ranges(&h, completed.0).await;
+    let mut expected_tail_rows = assert_range_chunking(&completed_ranges, 37, 1001, completed.1);
     let object_rows: Vec<i64> = sqlx::query_scalar(
         "SELECT row_count FROM walrus.file_manifest \
          WHERE reload_id = $1 AND kind = 'reload' ORDER BY id",
@@ -299,9 +295,27 @@ async fn one_worker_honors_the_configured_record_chunk_size() {
     .fetch_all(h.control_pool())
     .await
     .unwrap();
-    assert_eq!(object_rows.len(), 28);
-    assert_eq!(object_rows.iter().filter(|rows| **rows == 37).count(), 27);
-    assert_eq!(object_rows.iter().filter(|rows| **rows == 2).count(), 1);
+    assert_eq!(
+        i64::try_from(object_rows.len()).unwrap(),
+        completed.1,
+        "every recorded reload object has one manifest"
+    );
+    assert_eq!(object_rows.iter().sum::<i64>(), 1001);
+    assert!(
+        object_rows.iter().all(|rows| (1..=37).contains(rows)),
+        "37 is a strict per-object row maximum: {object_rows:?}"
+    );
+    let mut actual_tail_rows: Vec<i64> = object_rows
+        .iter()
+        .copied()
+        .filter(|rows| *rows < 37)
+        .collect();
+    expected_tail_rows.sort_unstable();
+    actual_tail_rows.sort_unstable();
+    assert_eq!(
+        actual_tail_rows, expected_tail_rows,
+        "each independently receipted physical range has exactly one final partial object"
+    );
 
     h.restart_loader().await.unwrap();
     let cutover_deadline = tokio::time::Instant::now() + Duration::from_secs(90);
@@ -473,10 +487,8 @@ async fn sink_crash_mid_reload_starts_a_correct_successor_on_one_slot() {
             .fetch_one(h.control_pool())
             .await
             .unwrap();
-    assert!(
-        (401..=402).contains(&successor_files),
-        "20,001 rows at 50 rows/object must produce the 401-object minimum plus at most one extra worker tail (got {successor_files})"
-    );
+    let successor_ranges = completed_export_ranges(&h, successor_id).await;
+    assert_range_chunking(&successor_ranges, 50, 20_001, successor_files);
     assert_one_slot_and_at_most_one_walsender(&h).await;
 
     h.stop_loader().await.unwrap();
@@ -497,4 +509,78 @@ async fn assert_one_slot_and_at_most_one_walsender(h: &Harness) {
         walsenders <= 1,
         "reload recovery opened {walsenders} walsenders"
     );
+}
+
+async fn completed_export_ranges(h: &Harness, reload_id: i64) -> Vec<(i64, i64, i64)> {
+    let ranges: Vec<(i64, String, Option<i64>, Option<i64>)> = sqlx::query_as(
+        "SELECT range_no, status, file_count, row_count \
+         FROM walrus.table_reload_export_range \
+         WHERE reload_id = $1 ORDER BY range_no",
+    )
+    .bind(reload_id)
+    .fetch_all(h.control_pool())
+    .await
+    .unwrap();
+    assert!(!ranges.is_empty(), "reload {reload_id} has no range plan");
+    ranges
+        .into_iter()
+        .enumerate()
+        .map(
+            |(expected_range_no, (range_no, status, file_count, row_count))| {
+                assert_eq!(
+                    range_no,
+                    i64::try_from(expected_range_no).unwrap(),
+                    "reload {reload_id} range plan is not contiguous"
+                );
+                assert_eq!(
+                    status, "complete",
+                    "reload {reload_id} range {range_no} is not complete"
+                );
+                (
+                    range_no,
+                    file_count.expect("complete range has a file count"),
+                    row_count.expect("complete range has a row count"),
+                )
+            },
+        )
+        .collect()
+}
+
+/// A reload object never crosses a physical range boundary: sealing the range's final object before
+/// recording its durable receipt is what makes the range plan auditable after a crash. Consequently,
+/// the configured row count is a strict object maximum and each non-divisible range has its own
+/// partial tail; it is not a global or per-worker chunking promise.
+fn assert_range_chunking(
+    ranges: &[(i64, i64, i64)],
+    chunk_rows: i64,
+    expected_rows: i64,
+    expected_files: i64,
+) -> Vec<i64> {
+    assert!(chunk_rows > 0);
+    let mut total_files = 0_i64;
+    let mut total_rows = 0_i64;
+    let mut tail_rows = Vec::new();
+    for &(range_no, file_count, row_count) in ranges {
+        assert!(row_count >= 0, "range {range_no} has a negative row count");
+        let remainder = row_count % chunk_rows;
+        let range_files = row_count / chunk_rows + i64::from(remainder != 0);
+        assert_eq!(
+            file_count, range_files,
+            "range {range_no} did not use the configured {chunk_rows}-row object maximum"
+        );
+        if remainder != 0 {
+            tail_rows.push(remainder);
+        }
+        total_files += file_count;
+        total_rows += row_count;
+    }
+    assert_eq!(
+        total_rows, expected_rows,
+        "range receipts lost or added rows"
+    );
+    assert_eq!(
+        total_files, expected_files,
+        "range receipts disagree with the reload's durable file count"
+    );
+    tail_rows
 }

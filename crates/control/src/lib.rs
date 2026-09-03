@@ -34,9 +34,11 @@ pub use integrity::{
 };
 pub use manifest::{
     ManifestGroupId, ManifestKind, ManifestRow, ManifestStatus, NewManifestFile,
-    NewStreamCommitPublication, PublishStreamOutcome, claim_ready, delete_claimed,
-    delete_publication_superseded, insert_ready, list_manifest_uris, max_ready_lsn_end,
-    publish_stream_commit, validate_claimed_groups,
+    NewStreamCommitPublication, PublishManifestOutcome, PublishStreamOutcome, ReadyManifestUnit,
+    StreamSchemaBarrier, claim_ready, claim_ready_units, complete_schema_barriers, delete_claimed,
+    delete_publication_superseded, insert_ready, list_manifest_uris,
+    lock_manifest_publication_table, lock_manifest_work_groups, manifest_work_exists,
+    max_ready_lsn_end, publish_ready_manifest, publish_stream_commit, validate_claimed_groups,
 };
 pub use parse::ParseEnumError;
 // The reload transition functions stay module-qualified (`reload::request`, `reload::fail`, …):
@@ -54,6 +56,6 @@ pub use replication_state::{
 };
 pub use schema_registry::{
     RegistryRow, read_all_latest_registry, read_all_registry, read_latest_version, read_registry,
-    upsert_registry,
+    read_registry_range, upsert_registry,
 };
 pub use table_ownership::{Lease, acquire_lease, release_lease, renew_lease};

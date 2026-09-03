@@ -8,7 +8,7 @@ WITH authorized AS MATERIALIZED (
   JOIN walrus.file_manifest AS manifest ON manifest.id = requested.id
   WHERE manifest.stream_group_id IS NOT NULL
 ), locked_groups AS MATERIALIZED (
-  SELECT g.id, g.expected_files, g.row_count, g.file_shape, g.status
+  SELECT g.id, g.expected_files, g.row_count, g.final_schema_version, g.file_shape, g.status
   FROM walrus.stream_manifest_group AS g
   JOIN requested_group_ids AS requested ON requested.id = g.id
   ORDER BY g.id
@@ -22,7 +22,7 @@ WITH authorized AS MATERIALIZED (
   ORDER BY child.id
   FOR UPDATE OF child
 ), group_stats AS MATERIALIZED (
-  SELECT g.id, g.expected_files, g.row_count, g.file_shape, g.status,
+  SELECT g.id, g.expected_files, g.row_count, g.final_schema_version, g.file_shape, g.status,
          count(child.id)::bigint AS actual_files,
          count(child.id) FILTER (WHERE requested.id IS NOT NULL)::bigint AS requested_files,
          COALESCE(sum(child.row_count), 0)::bigint AS actual_rows,
@@ -31,6 +31,7 @@ WITH authorized AS MATERIALIZED (
          max(child.stream_group_ordinal) AS max_ordinal,
          bool_and(child.kind IN ('stream', 'spill')) AS kinds_valid,
          bool_and(child.status = 'ready') AS statuses_valid,
+         max(child.schema_version) AS max_child_schema_version,
          jsonb_agg(
            jsonb_build_object(
              'kind', child.kind,
@@ -45,7 +46,7 @@ WITH authorized AS MATERIALIZED (
   FROM locked_groups AS g
   LEFT JOIN locked_children AS child ON child.stream_group_id = g.id
   LEFT JOIN requested ON requested.id = child.id
-  GROUP BY g.id, g.expected_files, g.row_count, g.file_shape, g.status
+  GROUP BY g.id, g.expected_files, g.row_count, g.final_schema_version, g.file_shape, g.status
 ), invalid_group AS MATERIALIZED (
   SELECT 1
   FROM group_stats
@@ -58,6 +59,8 @@ WITH authorized AS MATERIALIZED (
      OR max_ordinal <> expected_files - 1
      OR kinds_valid IS NOT TRUE
      OR statuses_valid IS NOT TRUE
+     OR final_schema_version <= 0
+     OR max_child_schema_version > final_schema_version
      OR file_shape <> actual_shape
   LIMIT 1
 ), applied_groups AS (
@@ -73,6 +76,7 @@ WITH authorized AS MATERIALIZED (
   WHERE manifest.id = requested.id
     AND (SELECT protocol = '2' FROM authorized)
     AND NOT EXISTS (SELECT 1 FROM invalid_group)
+    AND manifest.status = 'ready'
     AND (
       manifest.stream_group_id IS NULL
       OR manifest.stream_group_id IN (SELECT id FROM applied_groups)

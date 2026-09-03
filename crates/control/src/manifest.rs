@@ -13,7 +13,7 @@ use crate::{
 };
 use common::string_enum;
 use common::{EpochNo, Lsn, ManifestId, ReloadId, SchemaVersionNo, UtcTimestamp};
-use sqlx::{PgExecutor, PgPool, Row};
+use sqlx::{PgExecutor, PgPool, Postgres, Row, Transaction, postgres::PgRow};
 use std::collections::{BTreeMap, BTreeSet};
 
 // Each table below is the exact persisted string contract for its `file_manifest` text column.
@@ -99,12 +99,44 @@ pub struct ManifestRow {
     pub stream_group_expected_files: Option<i64>,
     /// Sum of all child row counts recorded by the atomic publication transaction.
     pub stream_group_row_count: Option<i64>,
+    /// Final structural schema reached by this table in the streamed transaction. This may be newer
+    /// than every child file when the transaction ends with DDL and emits no post-DDL row.
+    pub stream_group_final_schema_version: Option<SchemaVersionNo>,
 }
 
 /// One per-table atomic publication group produced by a protocol-v2 streamed transaction.
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ManifestGroupId(pub i64);
+
+/// A protocol-v2 source commit that advances one table's structural schema but emits no data file
+/// for that table. This covers streamed and ordinary structural DDL-only transactions. It
+/// participates in the same commit-LSN ordering as manifest units and is retired only after the
+/// loader has durably reconciled through `final_schema_version`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamSchemaBarrier {
+    /// Durable stream-group receipt id used to retire exactly this barrier.
+    pub id: ManifestGroupId,
+    /// Slot generation that owns the source commit.
+    pub epoch: EpochNo,
+    /// Source schema whose table must reconcile before this work item is retired.
+    pub source_schema: String,
+    /// Source table whose table must reconcile before this work item is retired.
+    pub source_table: String,
+    /// Authoritative source commit LSN and work-order key.
+    pub commit_lsn: Lsn,
+    /// Structural registry version the loader must reach before retirement.
+    pub final_schema_version: SchemaVersionNo,
+}
+
+/// One indivisible table-local item returned by the ordered protocol-v2 work claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadyManifestUnit {
+    /// One legacy/snapshot singleton or every child of one streamed transaction group.
+    Files(Vec<ManifestRow>),
+    /// A structural source commit for this table with no data-file child.
+    SchemaBarrier(StreamSchemaBarrier),
+}
 
 /// What the sink inserts after its Parquet is durable in S3.
 ///
@@ -138,13 +170,14 @@ pub struct NewManifestFile {
     pub reload_id: Option<ReloadId>,
 }
 
-/// Every object materialised for one `StreamCommit`. The control layer groups these by table and
-/// publishes the transaction receipt, group parents, and child manifests in one PostgreSQL commit.
+/// One protocol-v2 source commit publication. Large transactions supply their `StreamCommit`;
+/// ordinary structural DDL-only transactions use the same atomic receipt with no files. The
+/// control layer groups table work and publishes its schema history in one PostgreSQL commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewStreamCommitPublication {
     /// Slot generation that owns the receipt and every child row.
     pub epoch: EpochNo,
-    /// Protocol-v2 top-level transaction id.
+    /// Protocol-v2 top-level transaction id (`StreamCommit` xid or ordinary `Begin` final xid).
     pub top_xid: u32,
     /// Authoritative source commit LSN shared by DDL and every file.
     pub commit_lsn: Lsn,
@@ -154,7 +187,9 @@ pub struct NewStreamCommitPublication {
     pub ddl_rows: Vec<DdlRow>,
     /// Provisional relation shapes made globally visible by this same `StreamCommit`.
     pub registry_rows: Vec<RegistryRow>,
-    /// Every object materialised for the transaction, grouped per table during publication.
+    /// Every object materialised for the transaction, grouped per table during publication. A table
+    /// represented only by structural DDL plus its registry row receives a zero-child schema-barrier
+    /// group.
     pub files: Vec<NewManifestFile>,
 }
 
@@ -164,6 +199,20 @@ pub struct NewStreamCommitPublication {
 pub enum PublishStreamOutcome {
     Published,
     AlreadyPublished,
+}
+
+/// Result of atomically publishing one ordinary, ungrouped manifest file against the table's
+/// durable reload seal.
+///
+/// A source replay at or below a committed seal needs no new queue row: the sealed reload shadow
+/// already owns that source prefix. The caller may therefore discard its newly written object and
+/// count the file's `lsn_end` as durable. Files above the seal are inserted normally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishManifestOutcome {
+    /// A fresh queue row was committed.
+    Published(ManifestId),
+    /// No queue row was inserted because the durable reload seal covers this file's commit LSN.
+    CoveredBySeal(Lsn),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -202,6 +251,119 @@ fn stream_file_shape_json(files: &[StreamFileReplayShape]) -> serde_json::Value 
             })
             .collect(),
     )
+}
+
+/// Final per-table schema barrier for every publication table represented by a file or structural
+/// registry row. Starting from the child maximum makes the barrier total for data-only
+/// transactions. Only registry versions backed by an exact non-COMMENT DDL key may advance or seed
+/// a barrier.
+fn stream_group_final_versions(
+    publication: &NewStreamCommitPublication,
+) -> BTreeMap<(&str, &str), SchemaVersionNo> {
+    let mut versions = BTreeMap::new();
+    for file in &publication.files {
+        versions
+            .entry((file.source_schema.as_str(), file.source_table.as_str()))
+            .and_modify(|version: &mut SchemaVersionNo| {
+                *version = (*version).max(file.schema_version);
+            })
+            .or_insert(file.schema_version);
+    }
+    let structural_versions = publication
+        .ddl_rows
+        .iter()
+        .filter(|row| !row.c_tag.eq_ignore_ascii_case("COMMENT"))
+        .map(|row| {
+            (
+                row.source_schema.as_str(),
+                row.source_table.as_str(),
+                row.schema_version,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    for row in &publication.registry_rows {
+        let version_key = (
+            row.source_schema.as_str(),
+            row.source_table.as_str(),
+            row.schema_version,
+        );
+        if structural_versions.contains(&version_key) {
+            let key = (row.source_schema.as_str(), row.source_table.as_str());
+            versions
+                .entry(key)
+                .and_modify(|version| *version = (*version).max(row.schema_version))
+                .or_insert(row.schema_version);
+        }
+    }
+
+    versions
+}
+
+/// Acquire the transaction-scoped advisory lock shared by manifest publishers and reload seals
+/// for one table. Callers publishing several tables must invoke this in sorted table-key order and
+/// acquire every advisory lock before touching any `manifest_publication_fence` row.
+///
+/// # Errors
+///
+/// Returns the underlying typed database error if the blocking lock statement fails.
+pub async fn lock_manifest_publication_table(
+    tx: &mut Transaction<'_, Postgres>,
+    epoch: EpochNo,
+    source_schema: &str,
+    source_table: &str,
+) -> Result<(), ControlError> {
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(\
+           walrus.manifest_publication_lock_key($1,$2,$3))",
+    )
+    .bind(epoch.0)
+    .bind(source_schema)
+    .bind(source_table)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Acquire every table-local publication fence for a fresh multi-table commit in deterministic
+/// order. A committed reload seal is a hard boundary: accepting an older source commit after that
+/// cutover would make the replacement generation incomplete. Existing receipt replays call this
+/// only after their exact durable identity has been recognized and therefore bypass the fresh-work
+/// rejection safely.
+async fn lock_fresh_publication_fences<'a>(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    publication: &NewStreamCommitPublication,
+    tables: impl Iterator<Item = (&'a str, &'a str)>,
+) -> Result<(), ControlError> {
+    let tables = tables.collect::<Vec<_>>();
+    for &(source_schema, source_table) in &tables {
+        lock_manifest_publication_table(tx, publication.epoch, source_schema, source_table).await?;
+    }
+    for (source_schema, source_table) in tables {
+        let sealed_through: Option<Lsn> = sqlx::query_scalar(
+            "INSERT INTO walrus.manifest_publication_fence AS fence
+               (epoch, source_schema, source_table)
+             VALUES ($1,$2,$3)
+             ON CONFLICT (epoch, source_schema, source_table) DO UPDATE
+               SET updated_at = fence.updated_at
+             RETURNING sealed_through_lsn",
+        )
+        .bind(publication.epoch.0)
+        .bind(source_schema)
+        .bind(source_table)
+        .fetch_one(&mut **tx)
+        .await?;
+        if let Some(sealed) = sealed_through
+            && publication.commit_lsn <= sealed
+        {
+            return Err(ControlError::ManifestInvariant {
+                message: format!(
+                    "fresh source commit {} for {source_schema}.{source_table} is at or below durable reload seal {}",
+                    publication.commit_lsn, sealed
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,12 +432,18 @@ async fn validate_existing_stream_publication(
     publication: &NewStreamCommitPublication,
 ) -> Result<(), ControlError> {
     let expected_commit_ts = publication.commit_ts.to_string();
+    let expected_final_versions = stream_group_final_versions(publication);
     let mut expected_groups = BTreeMap::<(String, String), Vec<StreamFileReplayShape>>::new();
     for file in &publication.files {
         expected_groups
             .entry((file.source_schema.clone(), file.source_table.clone()))
             .or_default()
             .push(file.into());
+    }
+    for schema_table in expected_final_versions.keys() {
+        expected_groups
+            .entry((schema_table.0.to_string(), schema_table.1.to_string()))
+            .or_default();
     }
     for files in expected_groups.values_mut() {
         files.sort();
@@ -286,7 +454,7 @@ async fn validate_existing_stream_publication(
     // ready/failed child set or the durable applied aggregate, never a torn transition.
     let durable_groups = sqlx::query(
         "SELECT id, epoch, top_xid, source_schema, source_table, commit_lsn, commit_ts, \
-                expected_files, row_count, file_shape, status \
+                expected_files, row_count, final_schema_version, file_shape, status \
          FROM walrus.stream_manifest_group WHERE publication_id = $1 \
          ORDER BY source_schema, source_table FOR SHARE",
     )
@@ -327,14 +495,17 @@ async fn validate_existing_stream_publication(
         let durable_commit_ts: String = group.try_get("commit_ts")?;
         let durable_count: i64 = group.try_get("expected_files")?;
         let durable_rows: i64 = group.try_get("row_count")?;
+        let durable_final_version = SchemaVersionNo(group.try_get("final_schema_version")?);
         let durable_shape: serde_json::Value = group.try_get("file_shape")?;
         let status: String = group.try_get("status")?;
+        let expected_final_version = expected_final_versions.get(&(key.0.as_str(), key.1.as_str()));
         if durable_epoch != publication.epoch.0
             || durable_top_xid != i64::from(publication.top_xid)
             || durable_commit_lsn != publication.commit_lsn
             || durable_commit_ts != expected_commit_ts
             || durable_count != expected_count
             || durable_rows != expected_rows
+            || Some(&durable_final_version) != expected_final_version
             || durable_shape != stream_file_shape_json(expected_files)
         {
             return Err(stream_publication_conflict(publication));
@@ -480,11 +651,13 @@ pub fn validate_claimed_groups(rows: &[ManifestRow]) -> Result<(), ControlError>
         match row.stream_group_id {
             Some(group_id) => groups.entry(group_id).or_default().push(row),
             None => {
-                if row.stream_group_ordinal.is_some()
+                if row.status != ManifestStatus::Ready
+                    || row.stream_group_ordinal.is_some()
                     || row.stream_commit_ts.is_some()
                     || row.stream_top_xid.is_some()
                     || row.stream_group_expected_files.is_some()
                     || row.stream_group_row_count.is_some()
+                    || row.stream_group_final_schema_version.is_some()
                 {
                     return Err(ControlError::ManifestInvariant {
                         message: format!(
@@ -503,6 +676,11 @@ pub fn validate_claimed_groups(rows: &[ManifestRow]) -> Result<(), ControlError>
                 message: format!("stream group {} has no children", group_id.0),
             });
         };
+        if first.status != ManifestStatus::Ready {
+            return Err(ControlError::ManifestInvariant {
+                message: format!("stream group {} is not ready", group_id.0),
+            });
+        }
         let expected =
             first
                 .stream_group_expected_files
@@ -515,6 +693,11 @@ pub fn validate_claimed_groups(rows: &[ManifestRow]) -> Result<(), ControlError>
                 .ok_or_else(|| ControlError::ManifestInvariant {
                     message: format!("stream group {} has no expected row count", group_id.0),
                 })?;
+        let final_schema_version = first.stream_group_final_schema_version.ok_or_else(|| {
+            ControlError::ManifestInvariant {
+                message: format!("stream group {} has no final schema version", group_id.0),
+            }
+        })?;
         let top_xid = first
             .stream_top_xid
             .ok_or_else(|| ControlError::ManifestInvariant {
@@ -544,9 +727,12 @@ pub fn validate_claimed_groups(rows: &[ManifestRow]) -> Result<(), ControlError>
         let mut actual_rows = 0_i64;
         for child in children {
             if !matches!(child.kind, ManifestKind::Stream | ManifestKind::Spill)
+                || child.status != ManifestStatus::Ready
                 || child.reload_id.is_some()
                 || child.stream_group_expected_files != Some(expected)
                 || child.stream_group_row_count != Some(group_rows)
+                || child.stream_group_final_schema_version != Some(final_schema_version)
+                || child.schema_version > final_schema_version
                 || child.stream_top_xid != Some(top_xid)
                 || child.stream_commit_ts.as_deref() != Some(commit_ts)
                 || child.lsn_end != first.lsn_end
@@ -596,9 +782,111 @@ pub fn validate_claimed_groups(rows: &[ManifestRow]) -> Result<(), ControlError>
     Ok(())
 }
 
-/// Atomically publish all DDL, registry rows, and per-table file groups belonging to one
-/// protocol-v2 `StreamCommit`. The unique transaction receipt is retained for epoch-long replay
-/// idempotency, and a replay must match its durable semantic shape before it is accepted.
+fn manifest_row_from_pg(row: &PgRow) -> Result<ManifestRow, ControlError> {
+    let kind: String = row.try_get("kind")?;
+    let status: String = row.try_get("status")?;
+    Ok(ManifestRow {
+        id: ManifestId(row.try_get("id")?),
+        epoch: EpochNo(row.try_get("epoch")?),
+        source_schema: row.try_get("source_schema")?,
+        source_table: row.try_get("source_table")?,
+        s3_uri: row.try_get("s3_uri")?,
+        kind: kind.parse()?,
+        row_count: row.try_get("row_count")?,
+        object_size: row.try_get("object_size")?,
+        sha256: row.try_get("sha256")?,
+        lsn_start: row.try_get("lsn_start")?,
+        lsn_end: row.try_get("lsn_end")?,
+        schema_version: SchemaVersionNo(row.try_get("schema_version")?),
+        status: status.parse()?,
+        reload_id: row.try_get::<Option<i64>, _>("reload_id")?.map(ReloadId),
+        stream_group_id: row
+            .try_get::<Option<i64>, _>("stream_group_id")?
+            .map(ManifestGroupId),
+        stream_group_ordinal: row.try_get("stream_group_ordinal")?,
+        stream_commit_ts: row.try_get("stream_commit_ts")?,
+        stream_top_xid: row.try_get("stream_top_xid")?,
+        stream_group_expected_files: row.try_get("stream_group_expected_files")?,
+        stream_group_row_count: row.try_get("stream_group_row_count")?,
+        stream_group_final_schema_version: row
+            .try_get::<Option<i64>, _>("stream_group_final_schema_version")?
+            .map(SchemaVersionNo),
+    })
+}
+
+pub(crate) fn ready_manifest_units_from_pg(
+    rows: Vec<PgRow>,
+) -> Result<Vec<ReadyManifestUnit>, ControlError> {
+    let mut units = Vec::<ReadyManifestUnit>::new();
+    for row in rows {
+        if !row.try_get::<bool, _>("unit_valid")? {
+            let group_id = row.try_get::<Option<i64>, _>("stream_group_id")?;
+            return Err(ControlError::ManifestInvariant {
+                message: group_id.map_or_else(
+                    || "non-ready ungrouped manifest blocks ordered work".to_string(),
+                    |id| format!("stream group {id} is non-ready, incomplete, or inconsistent"),
+                ),
+            });
+        }
+        if row.try_get::<bool, _>("is_schema_barrier")? {
+            let group_id = row
+                .try_get::<Option<i64>, _>("stream_group_id")?
+                .map(ManifestGroupId)
+                .ok_or_else(|| ControlError::ManifestInvariant {
+                    message: "schema barrier has no stream group id".to_string(),
+                })?;
+            let expected_files: Option<i64> = row.try_get("stream_group_expected_files")?;
+            let row_count: Option<i64> = row.try_get("stream_group_row_count")?;
+            let final_schema_version = row
+                .try_get::<Option<i64>, _>("stream_group_final_schema_version")?
+                .map(SchemaVersionNo)
+                .filter(|version| version.0 > 0)
+                .ok_or_else(|| ControlError::ManifestInvariant {
+                    message: format!("schema barrier {} has no valid final version", group_id.0),
+                })?;
+            if row.try_get::<Option<i64>, _>("id")?.is_some()
+                || expected_files != Some(0)
+                || row_count != Some(0)
+            {
+                return Err(ControlError::ManifestInvariant {
+                    message: format!("schema barrier {} has file payload", group_id.0),
+                });
+            }
+            units.push(ReadyManifestUnit::SchemaBarrier(StreamSchemaBarrier {
+                id: group_id,
+                epoch: EpochNo(row.try_get("epoch")?),
+                source_schema: row.try_get("source_schema")?,
+                source_table: row.try_get("source_table")?,
+                commit_lsn: row.try_get("lsn_end")?,
+                final_schema_version,
+            }));
+            continue;
+        }
+
+        let manifest = manifest_row_from_pg(&row)?;
+        if let Some(group_id) = manifest.stream_group_id
+            && let Some(ReadyManifestUnit::Files(files)) = units.last_mut()
+            && files
+                .first()
+                .is_some_and(|first| first.stream_group_id == Some(group_id))
+        {
+            files.push(manifest);
+        } else {
+            units.push(ReadyManifestUnit::Files(vec![manifest]));
+        }
+    }
+    for unit in &units {
+        if let ReadyManifestUnit::Files(files) = unit {
+            validate_claimed_groups(files)?;
+        }
+    }
+    Ok(units)
+}
+
+/// Atomically publish all DDL, registry rows, and per-table file/barrier groups belonging to one
+/// protocol-v2 source commit. This covers both `StreamCommit` and ordinary structural DDL-only
+/// commits. The unique transaction receipt is retained for epoch-long replay idempotency, and a
+/// replay must match its durable semantic shape before it is accepted.
 ///
 /// # Errors
 ///
@@ -612,10 +900,11 @@ pub async fn publish_stream_commit(
     publication: &NewStreamCommitPublication,
 ) -> Result<PublishStreamOutcome, ControlError> {
     let mut ddl_audit_ids = BTreeSet::new();
-    let mut ddl_versions = BTreeSet::new();
+    let mut structural_ddl_versions = BTreeSet::new();
     for row in &publication.ddl_rows {
         if row.epoch != publication.epoch
             || row.c_lsn != publication.commit_lsn
+            || row.schema_version.0 <= 0
             || !ddl_audit_ids.insert(row.source_audit_id)
         {
             return Err(ControlError::ManifestInvariant {
@@ -625,11 +914,13 @@ pub async fn publish_stream_commit(
                 ),
             });
         }
-        ddl_versions.insert((
-            row.source_schema.as_str(),
-            row.source_table.as_str(),
-            row.schema_version,
-        ));
+        if !row.c_tag.eq_ignore_ascii_case("COMMENT") {
+            structural_ddl_versions.insert((
+                row.source_schema.as_str(),
+                row.source_table.as_str(),
+                row.schema_version,
+            ));
+        }
     }
     let mut registry_versions = BTreeSet::new();
     for row in &publication.registry_rows {
@@ -639,8 +930,9 @@ pub async fn publish_stream_commit(
             row.schema_version,
         );
         if row.epoch != publication.epoch
+            || row.schema_version.0 <= 0
             || !registry_versions.insert(key)
-            || !ddl_versions.contains(&key)
+            || !structural_ddl_versions.contains(&key)
         {
             return Err(ControlError::ManifestInvariant {
                 message: format!(
@@ -654,14 +946,32 @@ pub async fn publish_stream_commit(
             });
         }
     }
+    if let Some(row) = publication.ddl_rows.iter().find(|row| {
+        !row.c_tag.eq_ignore_ascii_case("COMMENT")
+            && !registry_versions.contains(&(
+                row.source_schema.as_str(),
+                row.source_table.as_str(),
+                row.schema_version,
+            ))
+    }) {
+        return Err(ControlError::ManifestInvariant {
+            message: format!(
+                "stream xid {} contains structural DDL audit {} without an exact registry row",
+                publication.top_xid, row.source_audit_id
+            ),
+        });
+    }
+    let mut replay_uris = BTreeSet::new();
     for file in &publication.files {
         if file.epoch != publication.epoch
             || !matches!(file.kind, ManifestKind::Stream | ManifestKind::Spill)
             || file.reload_id.is_some()
             || file.lsn_end != publication.commit_lsn
+            || file.schema_version.0 <= 0
             || file.row_count <= 0
             || file.object_size <= 0
             || file.sha256.len() != 32
+            || !replay_uris.insert(file.s3_uri.clone())
         {
             return Err(ControlError::ManifestInvariant {
                 message: format!(
@@ -671,7 +981,9 @@ pub async fn publish_stream_commit(
             });
         }
     }
+    let replay_uris = replay_uris.into_iter().collect::<Vec<_>>();
 
+    let final_schema_versions = stream_group_final_versions(publication);
     let commit_ts = publication.commit_ts.to_string();
     let mut tx = pool.begin().await?;
     let inserted: Option<i64> = sqlx::query_scalar(
@@ -710,9 +1022,29 @@ pub async fn publish_stream_commit(
             });
         }
         validate_existing_stream_publication(&mut tx, publication_id, publication).await?;
+        let referenced_replay_uri: Option<String> = sqlx::query_scalar(
+            "SELECT s3_uri FROM walrus.file_manifest \
+             WHERE s3_uri = ANY($1::text[]) ORDER BY s3_uri LIMIT 1",
+        )
+        .bind(&replay_uris)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(s3_uri) = referenced_replay_uri {
+            return Err(ControlError::ManifestInvariant {
+                message: format!(
+                    "already-published stream replay URI {s3_uri} is still referenced by live manifest work"
+                ),
+            });
+        }
         tx.rollback().await?;
         return Ok(PublishStreamOutcome::AlreadyPublished);
     };
+
+    // Only a fresh receipt reaches this point. Serialize its complete table set with reload
+    // cutover before making any history or queue child visible. BTreeMap keys provide the global
+    // `(schema, table)` lock order for multi-table transactions.
+    lock_fresh_publication_fences(&mut tx, publication, final_schema_versions.keys().copied())
+        .await?;
 
     // The receipt, schema history, provisional relation shapes, and every data object become
     // visible in one control transaction. In particular, no loader can observe a streamed DDL
@@ -731,8 +1063,17 @@ pub async fn publish_stream_commit(
             .or_default()
             .push(file);
     }
+    for schema_table in final_schema_versions.keys() {
+        by_table.entry(*schema_table).or_default();
+    }
 
     for ((schema, table), files) in by_table {
+        let final_schema_version = final_schema_versions
+            .get(&(schema, table))
+            .copied()
+            .ok_or_else(|| ControlError::ManifestInvariant {
+                message: format!("stream group {schema}.{table} has no final schema version"),
+            })?;
         let expected_files =
             i64::try_from(files.len()).map_err(|_| ControlError::ManifestInvariant {
                 message: format!("too many files in stream group {schema}.{table}"),
@@ -752,8 +1093,8 @@ pub async fn publish_stream_commit(
         let group_id: i64 = sqlx::query_scalar(
             "INSERT INTO walrus.stream_manifest_group \
              (publication_id, epoch, top_xid, source_schema, source_table, commit_lsn, \
-              commit_ts, expected_files, row_count, file_shape, status) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'ready') RETURNING id",
+              commit_ts, expected_files, row_count, final_schema_version, file_shape, status) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'ready') RETURNING id",
         )
         .bind(publication_id)
         .bind(publication.epoch.0)
@@ -764,6 +1105,7 @@ pub async fn publish_stream_commit(
         .bind(&commit_ts)
         .bind(expected_files)
         .bind(row_count)
+        .bind(final_schema_version.0)
         .bind(replay_shape)
         .fetch_one(&mut *tx)
         .await?;
@@ -820,6 +1162,92 @@ pub async fn list_manifest_uris(
     )
 }
 
+fn validate_ordinary_manifest(f: &NewManifestFile) -> Result<(), ControlError> {
+    let kind_is_ordinary = matches!(f.kind, ManifestKind::Snapshot | ManifestKind::Stream);
+    if !kind_is_ordinary
+        || f.reload_id.is_some()
+        || f.row_count <= 0
+        || f.object_size <= 0
+        || f.sha256.len() != 32
+        || f.lsn_start > f.lsn_end
+        || f.schema_version.0 <= 0
+    {
+        return Err(ControlError::ManifestInvariant {
+            message: format!(
+                "ordinary manifest {} for {}.{} has invalid kind/reload identity, size, fingerprint, LSN range, or schema version",
+                f.s3_uri, f.source_schema, f.source_table
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Atomically publish one ordinary ungrouped file, or recognize that a durable reload seal already
+/// covers its source commit. This is the sink-facing crash-replay path; reload chunks and callers
+/// that require a strict INSERT continue to use [`insert_ready`].
+///
+/// The transaction-scoped table lock and fence row serialize the decision with both reload cutover
+/// and protocol-v2 grouped publication. Static manifest semantics are validated before consulting
+/// the seal so malformed replay payloads can never become ACK-eligible merely by being old.
+///
+/// # Errors
+///
+/// Returns [`ControlError::ManifestInvariant`] for a malformed/non-ordinary file, or the underlying
+/// database error when the table lock, fence operation, manifest insert, or commit fails.
+pub async fn publish_ready_manifest<'a>(
+    acquire: impl sqlx::Acquire<'a, Database = sqlx::Postgres>,
+    f: &NewManifestFile,
+) -> Result<PublishManifestOutcome, ControlError> {
+    validate_ordinary_manifest(f)?;
+
+    let mut tx = acquire.begin().await?;
+    lock_manifest_publication_table(&mut tx, f.epoch, &f.source_schema, &f.source_table).await?;
+    let sealed_through: Option<Lsn> = sqlx::query_scalar(
+        "INSERT INTO walrus.manifest_publication_fence AS fence
+           (epoch, source_schema, source_table)
+         VALUES ($1,$2,$3)
+         ON CONFLICT (epoch, source_schema, source_table) DO UPDATE
+           SET updated_at = fence.updated_at
+         RETURNING sealed_through_lsn",
+    )
+    .bind(f.epoch.0)
+    .bind(&f.source_schema)
+    .bind(&f.source_table)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    let outcome = match sealed_through {
+        Some(sealed) if f.lsn_end <= sealed => {
+            let uri_referenced: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM walrus.file_manifest WHERE s3_uri=$1)",
+            )
+            .bind(&f.s3_uri)
+            .fetch_one(&mut *tx)
+            .await?;
+            if uri_referenced {
+                return Err(ControlError::ManifestInvariant {
+                    message: format!(
+                        "seal-covered ordinary manifest URI {} is still referenced by live queue work",
+                        f.s3_uri
+                    ),
+                });
+            }
+            PublishManifestOutcome::CoveredBySeal(sealed)
+        }
+        Some(sealed) if f.lsn_start <= sealed => {
+            return Err(ControlError::ManifestInvariant {
+                message: format!(
+                    "ordinary manifest {} range [{}, {}] straddles durable reload seal {}",
+                    f.s3_uri, f.lsn_start, f.lsn_end, sealed
+                ),
+            });
+        }
+        _ => PublishManifestOutcome::Published(insert_ready(&mut *tx, f).await?),
+    };
+    tx.commit().await?;
+    Ok(outcome)
+}
+
 /// Insert a `status='ready'` row with `lsn_end` set to the commit LSN; returns the new `id`.
 ///
 /// # Errors
@@ -853,6 +1281,8 @@ pub async fn insert_ready(
 ///
 /// `ORDER BY lsn_end, id` — `id` breaks equal-`lsn_end` ties. There is deliberately **no**
 /// `lsn_end > raw_appended_lsn` predicate: that would skip equal-`lsn_end` legacy snapshot files.
+/// This file-only compatibility view stops before the first zero-child schema barrier; new loader
+/// code must use [`claim_ready_units`] to reconcile and retire that typed work item.
 ///
 /// **The pause predicate (reload §2/H8):** while either persisted reload flavor is
 /// `requested|exporting|export_complete|publishing`, this generic live-table claim remains closed.
@@ -873,54 +1303,189 @@ pub async fn claim_ready(
     source_table: &str,
     limit: i64,
 ) -> Result<Vec<ManifestRow>, ControlError> {
-    // The `kind`/`status` text columns decode to `String` here, then parse into the typed enums.
-    // A value outside the known set is a data-integrity bug (the sink only ever writes `as_str()`),
-    // so it maps to the terminal `Decode`.
-    let rows = sqlx::query(include_str!("../sql/postgres/queries/claim_ready.sql"))
-        .bind(epoch.0)
-        .bind(source_schema)
-        .bind(source_table)
-        .bind(limit)
-        .fetch_all(executor)
-        .await?;
-    let rows = rows
-        .into_iter()
-        .map(|r| {
-            let kind: String = r.try_get("kind")?;
-            let status: String = r.try_get("status")?;
-            Ok(ManifestRow {
-                id: ManifestId(r.try_get("id")?),
-                epoch: EpochNo(r.try_get("epoch")?),
-                source_schema: r.try_get("source_schema")?,
-                source_table: r.try_get("source_table")?,
-                s3_uri: r.try_get("s3_uri")?,
-                kind: kind.parse()?,
-                row_count: r.try_get("row_count")?,
-                object_size: r.try_get("object_size")?,
-                sha256: r.try_get("sha256")?,
-                lsn_start: r.try_get("lsn_start")?,
-                lsn_end: r.try_get("lsn_end")?,
-                schema_version: SchemaVersionNo(r.try_get("schema_version")?),
-                status: status.parse()?,
-                reload_id: r.try_get::<Option<i64>, _>("reload_id")?.map(ReloadId),
-                stream_group_id: r
-                    .try_get::<Option<i64>, _>("stream_group_id")?
-                    .map(ManifestGroupId),
-                stream_group_ordinal: r.try_get("stream_group_ordinal")?,
-                stream_commit_ts: r.try_get("stream_commit_ts")?,
-                stream_top_xid: r.try_get("stream_top_xid")?,
-                stream_group_expected_files: r.try_get("stream_group_expected_files")?,
-                stream_group_row_count: r.try_get("stream_group_row_count")?,
-            })
-        })
-        .collect::<Result<Vec<_>, ControlError>>()?;
-    validate_claimed_groups(&rows)?;
-    Ok(rows)
+    let units = claim_ready_units(executor, epoch, source_schema, source_table, limit).await?;
+    let mut files = Vec::new();
+    for unit in units {
+        match unit {
+            ReadyManifestUnit::Files(mut unit_files) => files.append(&mut unit_files),
+            // This compatibility API cannot acknowledge a typed barrier. Returning only the file
+            // prefix prevents an older caller from processing work after an unapplied schema cut.
+            ReadyManifestUnit::SchemaBarrier(_) => break,
+        }
+    }
+    Ok(files)
 }
 
-/// The newest `ready` file's commit LSN for a table — the head of the Phase-A backlog — or `None`
-/// when the queue is empty. Powers the `walrus_loader_raw_append_lag_bytes` gauge: the lag
-/// is this minus `raw_appended_lsn`. `MAX` over an empty set is SQL `NULL` → `None`.
+/// Claim the next table-local work units in commit order, including streamed structural commits
+/// that emitted no data files. File groups remain indivisible and a schema barrier consumes one
+/// scheduling slot. The generic reload/integrity pause gates are evaluated in the claim statement.
+///
+/// # Errors
+///
+/// Returns a typed database/decode error or [`ControlError::ManifestInvariant`] when a selected
+/// file group or zero-child barrier is incomplete or inconsistent.
+pub async fn claim_ready_units(
+    executor: impl PgExecutor<'_>,
+    epoch: EpochNo,
+    source_schema: &str,
+    source_table: &str,
+    limit: i64,
+) -> Result<Vec<ReadyManifestUnit>, ControlError> {
+    let rows = sqlx::query(include_str!(
+        "../sql/postgres/queries/claim_ready_units.sql"
+    ))
+    .bind(epoch.0)
+    .bind(source_schema)
+    .bind(source_table)
+    .bind(limit)
+    .fetch_all(executor)
+    .await?;
+    ready_manifest_units_from_pg(rows)
+}
+
+/// Atomically retire a batch of zero-child schema barriers after their local schema reconciliation
+/// is durable. Callers may pass an open control transaction so barrier retirement, file deletion,
+/// and any actual data-file frontier advancement commit together. A barrier itself carries no raw
+/// row and does not advance a data checkpoint. Every persisted identity and zero-child invariant
+/// is revalidated under a parent-row lock before any status changes.
+///
+/// # Errors
+///
+/// Returns [`ControlError::ManifestInvariant`] for duplicate, stale, non-ready, non-empty, or
+/// otherwise changed barriers, or the underlying database error.
+pub async fn complete_schema_barriers(
+    executor: impl PgExecutor<'_>,
+    barriers: &[StreamSchemaBarrier],
+) -> Result<u64, ControlError> {
+    let mut seen = BTreeSet::new();
+    if let Some(barrier) = barriers
+        .iter()
+        .find(|barrier| barrier.final_schema_version.0 <= 0 || !seen.insert(barrier.id))
+    {
+        return Err(ControlError::ManifestInvariant {
+            message: format!("invalid or duplicate schema barrier {}", barrier.id.0),
+        });
+    }
+
+    let ids = barriers
+        .iter()
+        .map(|barrier| barrier.id.0)
+        .collect::<Vec<_>>();
+    let epochs = barriers
+        .iter()
+        .map(|barrier| barrier.epoch.0)
+        .collect::<Vec<_>>();
+    let schemas = barriers
+        .iter()
+        .map(|barrier| barrier.source_schema.clone())
+        .collect::<Vec<_>>();
+    let tables = barriers
+        .iter()
+        .map(|barrier| barrier.source_table.clone())
+        .collect::<Vec<_>>();
+    let commit_lsns = barriers
+        .iter()
+        .map(|barrier| {
+            let raw = barrier.commit_lsn.as_u64();
+            format!("{:X}/{:X}", raw >> 32, raw & u64::from(u32::MAX))
+        })
+        .collect::<Vec<_>>();
+    let final_versions = barriers
+        .iter()
+        .map(|barrier| barrier.final_schema_version.0)
+        .collect::<Vec<_>>();
+    let row = sqlx::query(include_str!(
+        "../sql/postgres/queries/complete_schema_barriers.sql"
+    ))
+    .bind(&ids)
+    .bind(&epochs)
+    .bind(&schemas)
+    .bind(&tables)
+    .bind(&commit_lsns)
+    .bind(&final_versions)
+    .fetch_one(executor)
+    .await?;
+    if row.try_get::<bool, _>("invalid")? {
+        return Err(ControlError::ManifestInvariant {
+            message: "schema barrier batch is stale, non-ready, non-empty, or changed".to_string(),
+        });
+    }
+    let completed: i64 = row.try_get("completed_count")?;
+    if usize::try_from(completed).ok() != Some(barriers.len()) {
+        return Err(ControlError::ManifestInvariant {
+            message: format!(
+                "schema barrier completion changed {completed} rows, expected {}",
+                barriers.len()
+            ),
+        });
+    }
+    u64::try_from(completed).map_err(|_| ControlError::ManifestInvariant {
+        message: format!("schema barrier completion returned invalid count {completed}"),
+    })
+}
+
+/// Lock the union of every stream-group parent touched by a file/barrier retirement in ascending
+/// group-id order. Call this first in the open control transaction, before [`delete_claimed`] and
+/// [`complete_schema_barriers`], so supersession, integrity fencing, and ordinary retirement share
+/// one global parent-lock order.
+///
+/// # Errors
+///
+/// Returns [`ControlError::ManifestInvariant`] for duplicate/missing input rows or parents, or the
+/// underlying database error.
+pub async fn lock_manifest_work_groups(
+    executor: impl PgExecutor<'_>,
+    file_ids: &[ManifestId],
+    barriers: &[StreamSchemaBarrier],
+) -> Result<(), ControlError> {
+    let mut seen_files = BTreeSet::new();
+    if let Some(id) = file_ids.iter().find(|id| !seen_files.insert(**id)) {
+        return Err(ControlError::ManifestInvariant {
+            message: format!("duplicate manifest {} in work-group lock", id.0),
+        });
+    }
+    let mut seen_barriers = BTreeSet::new();
+    if let Some(barrier) = barriers
+        .iter()
+        .find(|barrier| !seen_barriers.insert(barrier.id))
+    {
+        return Err(ControlError::ManifestInvariant {
+            message: format!(
+                "duplicate schema barrier {} in work-group lock",
+                barrier.id.0
+            ),
+        });
+    }
+    let raw_files = file_ids.iter().map(|id| id.0).collect::<Vec<_>>();
+    let raw_barriers = barriers
+        .iter()
+        .map(|barrier| barrier.id.0)
+        .collect::<Vec<_>>();
+    let row = sqlx::query(include_str!(
+        "../sql/postgres/queries/lock_manifest_work_groups.sql"
+    ))
+    .bind(&raw_files)
+    .bind(&raw_barriers)
+    .fetch_one(executor)
+    .await?;
+    let requested_files: i64 = row.try_get("requested_file_count")?;
+    let found_files: i64 = row.try_get("found_file_count")?;
+    let target_groups: i64 = row.try_get("target_group_count")?;
+    let locked_groups: i64 = row.try_get("locked_group_count")?;
+    if requested_files != found_files || target_groups != locked_groups {
+        return Err(ControlError::ManifestInvariant {
+            message: format!(
+                "work-group lock found {found_files}/{requested_files} files and {locked_groups}/{target_groups} parents"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// The newest `ready` file or zero-child schema barrier's commit LSN for a table — the head of the
+/// Phase-A backlog — or `None` when the queue is empty. Powers the
+/// `walrus_loader_raw_append_lag_bytes` gauge: the lag is this minus `raw_appended_lsn`. `MAX` over
+/// an empty set is SQL `NULL` → `None`.
 ///
 /// # Errors
 ///
@@ -940,6 +1505,31 @@ pub async fn max_ready_lsn_end(
     .fetch_one(executor)
     .await?;
     Ok(row.max_lsn_end)
+}
+
+/// Return whether any table-local manifest work or corrupt active receipt still exists, regardless
+/// of queue status. Unlike [`max_ready_lsn_end`], this is an emptiness proof: failed singletons,
+/// incomplete ready groups, and terminal groups that incorrectly retain children all count as
+/// work. Loader replay-fence migration uses it so corruption can never masquerade as a drained
+/// queue.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the authoritative manifest inventory cannot be read.
+pub async fn manifest_work_exists(
+    executor: impl PgExecutor<'_>,
+    epoch: EpochNo,
+    source_schema: &str,
+    source_table: &str,
+) -> Result<bool, ControlError> {
+    Ok(sqlx::query_scalar(include_str!(
+        "../sql/postgres/queries/manifest_work_exists.sql"
+    ))
+    .bind(epoch.0)
+    .bind(source_schema)
+    .bind(source_table)
+    .fetch_one(executor)
+    .await?)
 }
 
 /// Retire claimed rows — the queue's "done" is a `DELETE`, not a status flip. Returns the count.
@@ -985,6 +1575,23 @@ pub async fn delete_publication_superseded(
 ) -> Result<u64, ControlError> {
     let mut tx = pool.begin().await?;
     crate::reload::lock_publication(&mut *tx, publication, owner_pod, fencing_token).await?;
+    // Lock every candidate protocol-v2 parent before any child. This is deliberately a separate
+    // statement: under READ COMMITTED, if we wait behind ordinary apply/integrity work, the purge
+    // statement below receives a fresh snapshot and sees the parent's committed terminal state
+    // instead of validating stale pre-wait children against a post-wait parent row.
+    let group_rows = sqlx::query(include_str!(
+        "../sql/postgres/queries/lock_superseded_groups.sql"
+    ))
+    .bind(publication.epoch.0)
+    .bind(&publication.source_schema)
+    .bind(&publication.source_table)
+    .bind(publication.start_lsn)
+    .fetch_all(&mut *tx)
+    .await?;
+    let group_ids = group_rows
+        .iter()
+        .map(|row| row.try_get::<i64, _>("id"))
+        .collect::<Result<Vec<_>, _>>()?;
     let row = sqlx::query(include_str!(
         "../sql/postgres/queries/delete_superseded.sql"
     ))
@@ -992,6 +1599,7 @@ pub async fn delete_publication_superseded(
     .bind(&publication.source_schema)
     .bind(&publication.source_table)
     .bind(publication.start_lsn)
+    .bind(&group_ids)
     .fetch_one(&mut *tx)
     .await?;
     let invalid_groups: i64 = row.try_get("invalid_groups")?;

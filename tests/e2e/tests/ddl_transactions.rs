@@ -93,6 +93,53 @@ async fn ordinary_transaction_keeps_rows_on_both_sides_of_ddl() {
     assert_eq!(manifest.2, 2);
     assert_eq!(manifest.3.as_deref(), Some(audit.2.as_str()));
     assert!(manifest.1.parse::<common::Lsn>().unwrap() > audit.1.parse().unwrap());
+    let commit_lsn = manifest.1.parse::<common::Lsn>().unwrap();
+    let (top_xid, expected_files, row_count, final_schema_version, file_shape): (
+        i64,
+        i64,
+        i64,
+        i64,
+        serde_json::Value,
+    ) = sqlx::query_as(
+        "SELECT publication.top_xid, grouped.expected_files, grouped.row_count, \
+                grouped.final_schema_version, grouped.file_shape \
+         FROM walrus.stream_txn_publication publication \
+         JOIN walrus.stream_manifest_group grouped \
+           ON grouped.publication_id = publication.id \
+         WHERE publication.epoch = $1 AND publication.commit_lsn = $2 \
+           AND grouped.source_schema = 'public' AND grouped.source_table = 'orders'",
+    )
+    .bind(h.epoch)
+    .bind(commit_lsn)
+    .fetch_one(h.control_pool())
+    .await
+    .unwrap();
+    assert!(top_xid > 0, "the receipt retains the ordinary Begin xid");
+    assert_eq!(
+        (expected_files, row_count, final_schema_version),
+        (2, 2, 2),
+        "both sides of the DDL must be one indivisible v2-final group"
+    );
+    let shapes = file_shape
+        .as_array()
+        .expect("group replay shape is a JSON array");
+    assert_eq!(shapes.len(), 2);
+    let mut child_versions = shapes
+        .iter()
+        .map(|shape| {
+            assert_eq!(
+                shape["lsn_start"].as_u64(),
+                Some(commit_lsn.as_u64()),
+                "a grouped child cannot absorb an older buffered commit"
+            );
+            assert_eq!(shape["lsn_end"].as_u64(), Some(commit_lsn.as_u64()));
+            shape["schema_version"]
+                .as_i64()
+                .expect("child schema version")
+        })
+        .collect::<Vec<_>>();
+    child_versions.sort_unstable();
+    assert_eq!(child_versions, vec![1, 2]);
     let versions: Vec<i64> = sqlx::query_scalar(
         "SELECT schema_version FROM walrus.schema_registry \
          WHERE epoch = $1 AND source_schema = 'public' AND source_table = 'orders' \

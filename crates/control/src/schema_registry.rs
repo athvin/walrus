@@ -120,6 +120,42 @@ pub async fn read_registry(
     }))
 }
 
+/// Read one table's immutable registry history across an inclusive version range in version order.
+/// The primary-key prefix `(epoch, source_schema, source_table)` keeps this a single bounded index
+/// scan; callers can validate contiguity without issuing one query per claimed version number.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Connect`] if the range query fails or a row cannot be decoded.
+pub async fn read_registry_range(
+    ex: impl PgExecutor<'_>,
+    epoch: EpochNo,
+    schema: &str,
+    table: &str,
+    first: SchemaVersionNo,
+    last: SchemaVersionNo,
+) -> Result<Vec<RegistryRow>, ControlError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT epoch, source_schema, source_table, schema_version, descriptors, columns
+        FROM walrus.schema_registry
+        WHERE epoch = $1
+          AND source_schema = $2
+          AND source_table = $3
+          AND schema_version BETWEEN $4 AND $5
+        ORDER BY schema_version
+        "#,
+    )
+    .bind(epoch.0)
+    .bind(schema)
+    .bind(table)
+    .bind(first.0)
+    .bind(last.0)
+    .fetch_all(ex)
+    .await?;
+    rows.into_iter().map(registry_from_row).collect()
+}
+
 /// The current (max) `schema_version` for a table, or `None` if it has no registry rows yet.
 ///
 /// # Errors

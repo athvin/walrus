@@ -5,13 +5,14 @@
 )]
 //! Compose-gated integration tests for the `table_reload` state machine.
 //!
-//! Same discipline as the manifest tests: every test runs inside a rolled-back transaction and
-//! namespaces its rows by a unique `epoch`, so runs are isolated and idempotent. Statements that
-//! provoke a real SQL error (the duplicate-request unique violation) run under a nested
-//! savepoint, because a failed statement aborts the enclosing Postgres transaction.
+//! Same discipline as the manifest tests: tests normally run inside a rolled-back transaction and
+//! namespace rows by a unique `epoch`, so runs are isolated and idempotent. The immediate
+//! pool-reuse regression commits deliberately and deletes its epoch before/after. Statements that
+//! provoke a real SQL error (the duplicate-request unique violation) run under a nested savepoint,
+//! because a failed statement aborts the enclosing Postgres transaction.
 #![cfg(feature = "integration")]
 
-use common::{EpochNo, FailureClass, Lsn, ReloadId, SchemaVersionNo, UtcTimestamp};
+use common::{EpochNo, FailureClass, Lsn, ManifestId, ReloadId, SchemaVersionNo, UtcTimestamp};
 use control::reload::{
     self, ExportRangePlan, ExportSnapshot, ExporterLease, ReloadFenceIdentity, ReloadFlavor,
     ReloadMarkerKind, ReloadScope, ReloadStatus, SourceReloadRequest,
@@ -22,7 +23,7 @@ use control::{
     publish_stream_commit, run_migrations,
 };
 use sqlx::Connection;
-use sqlx::postgres::{PgConnection, PgPool};
+use sqlx::postgres::{PgConnection, PgPool, PgPoolOptions};
 use std::fmt::Write as _;
 use std::time::Duration;
 use uuid::Uuid;
@@ -179,21 +180,21 @@ async fn begin_full_scan_plan(
 /// Exercise the loader's fenced publication path for a marker-complete attempt and return the
 /// manifest rows it retired through H.
 async fn publish_fenced(
-    conn: &mut PgConnection,
+    conn: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     epoch: EpochNo,
     table: &str,
     reload_id: ReloadId,
 ) -> Vec<ManifestRow> {
     let owner = "loader-test";
-    let lease = acquire_lease(&mut *conn, epoch, "public", table, owner, 60)
+    let lease = acquire_lease(&mut **conn, epoch, "public", table, owner, 60)
         .await
         .unwrap()
         .unwrap();
-    ensure_checkpoint(&mut *conn, epoch, "public", table)
+    ensure_checkpoint(&mut **conn, epoch, "public", table)
         .await
         .unwrap();
     let publication = reload::claim_publication(
-        &mut *conn,
+        &mut **conn,
         epoch,
         "public",
         table,
@@ -205,25 +206,143 @@ async fn publish_fenced(
     .unwrap();
     assert_eq!(publication.reload_id, reload_id);
     let claimed =
-        reload::claim_publication_ready(&mut *conn, &publication, owner, lease.fencing_token, 100)
+        reload::claim_publication_ready(&mut **conn, &publication, owner, lease.fencing_token, 100)
             .await
             .unwrap();
     let ids = claimed.iter().map(|row| row.id).collect::<Vec<_>>();
     assert_eq!(
-        delete_claimed(&mut *conn, &ids).await.unwrap(),
+        delete_claimed(&mut **conn, &ids).await.unwrap(),
         ids.len() as u64
     );
     assert!(
-        reload::publication_drained(&mut *conn, &publication, owner, lease.fencing_token)
+        reload::seal_publication_if_drained(conn, &publication, owner, lease.fencing_token)
             .await
             .unwrap()
     );
     assert!(
-        reload::finish_publication(&mut *conn, &publication, owner, lease.fencing_token)
+        reload::finish_publication(&mut **conn, &publication, owner, lease.fencing_token)
             .await
             .unwrap()
     );
     claimed
+}
+
+#[tokio::test]
+async fn logical_export_rejection_is_rolled_back_before_connection_reuse() {
+    let dsn = control_dsn();
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&dsn)
+        .await
+        .unwrap();
+    run_migrations(&pool).await.unwrap();
+    let observer = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&dsn)
+        .await
+        .unwrap();
+    let epoch = EpochNo(910_017);
+    sqlx::query("DELETE FROM walrus.table_reload WHERE epoch = $1")
+        .bind(epoch.0)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let predecessor_id = reload::request(
+        &pool,
+        epoch,
+        "public",
+        "rollback_predecessor",
+        ReloadFlavor::Reload,
+    )
+    .await
+    .unwrap();
+    let successor_id = reload::request(
+        &pool,
+        epoch,
+        "public",
+        "rollback_successor",
+        ReloadFlavor::Reload,
+    )
+    .await
+    .unwrap();
+    reload::claim_requested(&pool, epoch, "sink-a", 60, 2)
+        .await
+        .unwrap();
+    let predecessor = reload::get(&pool, predecessor_id).await.unwrap().unwrap();
+    let successor = reload::get(&pool, successor_id).await.unwrap().unwrap();
+    let predecessor_lease = predecessor.exporter_lease("sink-a").unwrap();
+    let predecessor_f = Lsn::new(0x100);
+    let version = SchemaVersionNo(1);
+    reload::record_start_fence(
+        &pool,
+        predecessor_id,
+        predecessor_f,
+        ReloadFenceIdentity {
+            request_id: predecessor.parent_request_id,
+            source_schema: &predecessor.source_schema,
+            source_table: &predecessor.source_table,
+            schema_version: version,
+        },
+    )
+    .await
+    .unwrap();
+
+    let stale_lease = ExporterLease {
+        generation: predecessor_lease.generation.checked_add(1).unwrap(),
+        ..predecessor_lease
+    };
+    let mut conn = pool.acquire().await.unwrap();
+    let err = reload::begin_export_plan(
+        &mut conn,
+        &stale_lease,
+        predecessor_f,
+        version,
+        ExportSnapshot {
+            identity: "10:20:",
+            xmin: 10,
+            xmax: 20,
+        },
+        &[ExportRangePlan {
+            range_no: 0,
+            full_scan: true,
+            start_block: None,
+            end_block: None,
+        }],
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, ControlError::ReloadTransition { .. }));
+
+    // Reuse the exact backend immediately. The rejected plan's rollback must reach
+    // `ReadyForQuery` before this statement, otherwise F remains trapped in its old transaction.
+    let successor_f = Lsn::new(0x200);
+    reload::record_start_fence(
+        &mut *conn,
+        successor_id,
+        successor_f,
+        ReloadFenceIdentity {
+            request_id: successor.parent_request_id,
+            source_schema: &successor.source_schema,
+            source_table: &successor.source_table,
+            schema_version: version,
+        },
+    )
+    .await
+    .unwrap();
+    let visible = reload::get(&observer, successor_id).await.unwrap().unwrap();
+    assert_eq!(
+        visible.start_lsn,
+        Some(successor_f),
+        "an independent connection sees the successor fence before backend reuse returns"
+    );
+
+    drop(conn);
+    sqlx::query("DELETE FROM walrus.table_reload WHERE epoch = $1")
+        .bind(epoch.0)
+        .execute(&pool)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -457,6 +576,59 @@ async fn superseded_stream_group_keeps_an_exact_lost_ack_replay_receipt() {
     .await
     .unwrap()
     .unwrap();
+    assert!(matches!(
+        reload::claim_publication_ready_units(
+            &pool,
+            &reload_publication,
+            owner,
+            table_lease.fencing_token + 1,
+            100,
+        )
+        .await,
+        Err(ControlError::ReloadTransition { .. })
+    ));
+    assert!(matches!(
+        reload::claim_publication_ready(
+            &pool,
+            &reload_publication,
+            owner,
+            table_lease.fencing_token + 1,
+            100,
+        )
+        .await,
+        Err(ControlError::ReloadTransition { .. })
+    ));
+    sqlx::query(
+        "UPDATE walrus.table_ownership
+         SET lease_expiry = statement_timestamp() - interval '1 second'
+         WHERE epoch=$1 AND source_schema='public' AND source_table=$2",
+    )
+    .bind(epoch.0)
+    .bind(table)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(matches!(
+        reload::claim_publication_ready_units(
+            &pool,
+            &reload_publication,
+            owner,
+            table_lease.fencing_token,
+            100,
+        )
+        .await,
+        Err(ControlError::ReloadTransition { .. })
+    ));
+    sqlx::query(
+        "UPDATE walrus.table_ownership
+         SET lease_expiry = statement_timestamp() + interval '60 seconds'
+         WHERE epoch=$1 AND source_schema='public' AND source_table=$2",
+    )
+    .bind(epoch.0)
+    .bind(table)
+    .execute(&pool)
+    .await
+    .unwrap();
     assert_eq!(
         control::delete_publication_superseded(
             &pool,
@@ -490,41 +662,230 @@ async fn superseded_stream_group_keeps_an_exact_lost_ack_replay_receipt() {
         Err(ControlError::StreamPublicationConflict { .. })
     ));
 
+    let mut seal_tx = pool.begin().await.unwrap();
     assert!(
-        reload::publication_drained(&pool, &reload_publication, owner, table_lease.fencing_token,)
-            .await
-            .unwrap()
+        reload::seal_publication_if_drained(
+            &mut seal_tx,
+            &reload_publication,
+            owner,
+            table_lease.fencing_token,
+        )
+        .await
+        .unwrap()
     );
+    seal_tx.commit().await.unwrap();
+    assert_eq!(
+        publish_stream_commit(&pool, &publication).await.unwrap(),
+        PublishStreamOutcome::AlreadyPublished,
+        "an exact lost-ACK replay remains valid after its table is sealed"
+    );
+    let mut late = publication.clone();
+    late.top_xid += 1;
+    late.commit_lsn = Lsn::new(0x80);
+    late.files[0].lsn_start = late.commit_lsn;
+    late.files[0].lsn_end = late.commit_lsn;
+    late.files[0].s3_uri.push_str("-fresh-after-seal");
+    late.files.truncate(1);
+    assert!(matches!(
+        publish_stream_commit(&pool, &late).await,
+        Err(ControlError::ManifestInvariant { .. })
+    ));
     assert!(
         reload::finish_publication(&pool, &reload_publication, owner, table_lease.fencing_token,)
             .await
             .unwrap()
     );
+    let mut cleanup = pool.begin().await.unwrap();
+    sqlx::query("SELECT set_config('walrus.manifest_fence_maintenance','2-delete',true)")
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
     sqlx::query("DELETE FROM walrus.stream_manifest_group WHERE epoch = $1")
         .bind(epoch.0)
-        .execute(&pool)
+        .execute(&mut *cleanup)
         .await
         .unwrap();
     sqlx::query("DELETE FROM walrus.stream_txn_publication WHERE epoch = $1")
         .bind(epoch.0)
-        .execute(&pool)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM walrus.manifest_publication_fence WHERE epoch = $1")
+        .bind(epoch.0)
+        .execute(&mut *cleanup)
         .await
         .unwrap();
     sqlx::query("DELETE FROM walrus.loader_checkpoint WHERE epoch = $1")
         .bind(epoch.0)
-        .execute(&pool)
+        .execute(&mut *cleanup)
         .await
         .unwrap();
     sqlx::query("DELETE FROM walrus.table_reload WHERE epoch = $1")
         .bind(epoch.0)
-        .execute(&pool)
+        .execute(&mut *cleanup)
         .await
         .unwrap();
     sqlx::query("DELETE FROM walrus.table_ownership WHERE epoch = $1")
         .bind(epoch.0)
-        .execute(&pool)
+        .execute(&mut *cleanup)
         .await
         .unwrap();
+    cleanup.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn superseded_purge_refreshes_snapshot_after_waiting_on_an_applied_parent() {
+    let pool = pool().await;
+    let epoch_bytes: [u8; 8] = Uuid::new_v4().as_bytes()[..8].try_into().unwrap();
+    let epoch = EpochNo(i64::from_be_bytes(epoch_bytes) & i64::MAX);
+    let table = "supersede_lock_wait";
+    let mut first = stream_file(epoch, table, "0/50");
+    first.s3_uri.push_str("-a");
+    let mut second = first.clone();
+    second.s3_uri.pop();
+    second.s3_uri.push('b');
+    publish_stream_commit(
+        &pool,
+        &NewStreamCommitPublication {
+            epoch,
+            top_xid: 902,
+            commit_lsn: Lsn::new(0x50),
+            commit_ts: "2026-09-02T12:01:00Z".parse::<UtcTimestamp>().unwrap(),
+            ddl_rows: Vec::new(),
+            registry_rows: Vec::new(),
+            files: vec![first, second],
+        },
+    )
+    .await
+    .unwrap();
+
+    let reload_id = reload::request(&pool, epoch, "public", table, ReloadFlavor::Reload)
+        .await
+        .unwrap();
+    let claimed = reload::claim_requested(&pool, epoch, "sink-a", 60, 1)
+        .await
+        .unwrap();
+    let request_id = claimed[0].parent_request_id.unwrap();
+    let f = Lsn::new(0x100);
+    let h = Lsn::new(0x200);
+    reload::record_start_fence(
+        &pool,
+        reload_id,
+        f,
+        ReloadFenceIdentity {
+            request_id: Some(request_id),
+            source_schema: "public",
+            source_table: table,
+            schema_version: SchemaVersionNo(1),
+        },
+    )
+    .await
+    .unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    finish_fenced(&mut conn, reload_id, h).await;
+    drop(conn);
+
+    let owner = "loader-supersede-lock";
+    let table_lease = acquire_lease(&pool, epoch, "public", table, owner, 60)
+        .await
+        .unwrap()
+        .unwrap();
+    let reload_publication = reload::claim_publication(
+        &pool,
+        epoch,
+        "public",
+        table,
+        owner,
+        table_lease.fencing_token,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let child_ids = sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM walrus.file_manifest WHERE epoch = $1 ORDER BY id",
+    )
+    .bind(epoch.0)
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(ManifestId)
+    .collect::<Vec<_>>();
+
+    // Model ordinary apply winning the parent lock. The reload purge starts its statement while
+    // this transaction still sees the group ready, then must refresh its READ COMMITTED snapshot
+    // after the winner atomically marks the parent applied and removes every child.
+    let mut apply_tx = pool.begin().await.unwrap();
+    control::lock_manifest_work_groups(&mut *apply_tx, &child_ids, &[])
+        .await
+        .unwrap();
+    let purge = control::delete_publication_superseded(
+        &pool,
+        &reload_publication,
+        owner,
+        table_lease.fencing_token,
+    );
+    tokio::pin!(purge);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), purge.as_mut())
+            .await
+            .is_err(),
+        "the purge should wait behind the already-locked stream parent"
+    );
+    assert_eq!(
+        delete_claimed(&mut *apply_tx, &child_ids).await.unwrap(),
+        child_ids.len() as u64
+    );
+    apply_tx.commit().await.unwrap();
+    assert_eq!(
+        purge.await.unwrap(),
+        0,
+        "the fresh post-wait snapshot treats the applied childless parent as an idempotent no-op"
+    );
+
+    let (status, children): (String, i64) = sqlx::query_as(
+        "SELECT g.status, count(m.id)::bigint
+         FROM walrus.stream_manifest_group g
+         LEFT JOIN walrus.file_manifest m ON m.stream_group_id = g.id
+         WHERE g.epoch = $1 GROUP BY g.id",
+    )
+    .bind(epoch.0)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((status.as_str(), children), ("applied", 0));
+
+    let mut cleanup = pool.begin().await.unwrap();
+    sqlx::query("SELECT set_config('walrus.manifest_fence_maintenance','2-delete',true)")
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM walrus.stream_manifest_group WHERE epoch = $1")
+        .bind(epoch.0)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM walrus.stream_txn_publication WHERE epoch = $1")
+        .bind(epoch.0)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM walrus.manifest_publication_fence WHERE epoch = $1")
+        .bind(epoch.0)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM walrus.table_reload WHERE epoch = $1")
+        .bind(epoch.0)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM walrus.table_ownership WHERE epoch = $1")
+        .bind(epoch.0)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    cleanup.commit().await.unwrap();
 }
 
 #[tokio::test]

@@ -47,7 +47,7 @@ pub async fn run(cfg: SinkConfig) -> anyhow::Result<()> {
         token.clone(),
     ));
 
-    let result = shutdown::cancel_on_exit(&token, pipeline(&cfg, &token, &state)).await;
+    let result = shutdown::cancel_on_exit(&token, Box::pin(pipeline(&cfg, &token, &state))).await;
     tracing::info!("draining health server");
     server
         .await

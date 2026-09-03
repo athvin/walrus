@@ -16,7 +16,7 @@
 use crate::{ControlError, parse::ParseEnumError};
 use common::string_enum;
 use common::{EpochNo, Lsn, ReloadId, SchemaVersionNo};
-use sqlx::{Connection, PgConnection, PgExecutor, Row, postgres::PgRow};
+use sqlx::{Connection, PgConnection, PgExecutor, Postgres, Row, postgres::PgRow};
 use uuid::Uuid;
 
 string_enum! {
@@ -477,6 +477,17 @@ const fn export_transition(reload_id: ReloadId) -> ControlError {
     }
 }
 
+/// Finish a known logical-rejection path before returning its typed error. `Transaction::drop`
+/// only queues a rollback; awaiting it here guarantees PostgreSQL has reached `ReadyForQuery`
+/// before a pooled connection can be reused by a successor exporter.
+async fn rollback_rejection<T>(
+    tx: sqlx::Transaction<'_, sqlx::Postgres>,
+    error: ControlError,
+) -> Result<T, ControlError> {
+    tx.rollback().await?;
+    Err(error)
+}
+
 fn valid_export_ranges(ranges: &[ExportRangePlan]) -> bool {
     if ranges.len() == 1 && ranges[0].full_scan {
         return ranges[0].range_no == 0
@@ -551,10 +562,12 @@ pub async fn begin_export_plan(
     .bind(start_lsn)
     .bind(schema_version.0)
     .fetch_optional(&mut *tx)
-    .await?
-    .ok_or_else(|| export_transition(lease.reload_id))?;
+    .await?;
+    let Some(row) = row else {
+        return rollback_rejection(tx, export_transition(lease.reload_id)).await;
+    };
     if !row.try_get::<bool, _>("owned")? {
-        return Err(export_transition(lease.reload_id));
+        return rollback_rejection(tx, export_transition(lease.reload_id)).await;
     }
 
     let existing_snapshot = row.try_get::<Option<String>, _>("export_snapshot")?;
@@ -582,7 +595,7 @@ pub async fn begin_export_plan(
                     && row.try_get::<Option<i64>, _>("end_block").ok() == Some(expected.end_block)
             });
         if !header_matches || !ranges_match {
-            return Err(export_transition(lease.reload_id));
+            return rollback_rejection(tx, export_transition(lease.reload_id)).await;
         }
         tx.commit().await?;
         return Ok(());
@@ -615,7 +628,7 @@ pub async fn begin_export_plan(
     .execute(&mut *tx)
     .await?;
     if updated.rows_affected() != 1 {
-        return Err(export_transition(lease.reload_id));
+        return rollback_rejection(tx, export_transition(lease.reload_id)).await;
     }
     for range in ranges {
         sqlx::query(
@@ -703,7 +716,7 @@ pub async fn seal_export(
     .await?
     .unwrap_or(false);
     if !owned {
-        return Err(export_transition(lease.reload_id));
+        return rollback_rejection(tx, export_transition(lease.reload_id)).await;
     }
     let row = sqlx::query(include_str!("../sql/postgres/queries/seal_export.sql"))
         .bind(lease.reload_id.0)
@@ -712,8 +725,10 @@ pub async fn seal_export(
         .bind(start_lsn)
         .bind(schema_version.0)
         .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| export_transition(lease.reload_id))?;
+        .await?;
+    let Some(row) = row else {
+        return rollback_rejection(tx, export_transition(lease.reload_id)).await;
+    };
     let seal = ExportSeal {
         file_count: row.try_get("file_count")?,
         row_count: row.try_get("row_count")?,
@@ -985,11 +1000,14 @@ pub async fn fail(
         .execute(&mut *tx)
         .await?;
     if done.rows_affected() == 0 {
-        // Dropping `tx` rolls the savepoint/transaction back.
-        return Err(ControlError::ReloadTransition {
-            reload_id,
-            expected: "exporting",
-        });
+        return rollback_rejection(
+            tx,
+            ControlError::ReloadTransition {
+                reload_id,
+                expected: "exporting",
+            },
+        )
+        .await;
     }
     sqlx::query(include_str!("../sql/postgres/queries/fail_purge_files.sql"))
         .bind(reload_id.0)
@@ -1031,12 +1049,18 @@ pub async fn fail_owned(
     .await?
     .unwrap_or(false);
     if !owned {
-        return Err(ControlError::ReloadTransition {
-            reload_id: lease.reload_id,
-            expected: "exporting under the caller's live exporter generation",
-        });
+        return rollback_rejection(
+            tx,
+            ControlError::ReloadTransition {
+                reload_id: lease.reload_id,
+                expected: "exporting under the caller's live exporter generation",
+            },
+        )
+        .await;
     }
-    fail(&mut tx, lease.reload_id, reason).await?;
+    if let Err(error) = fail(&mut tx, lease.reload_id, reason).await {
+        return rollback_rejection(tx, error).await;
+    }
     tx.commit().await?;
     Ok(())
 }
@@ -1128,15 +1152,21 @@ async fn restart_attempt(
     .await?
     .unwrap_or(false);
     if !owns_attempt {
-        return Err(ControlError::ReloadTransition {
-            reload_id: old.reload_id,
-            expected: "exporting under the caller's live exporter generation",
-        });
+        return rollback_rejection(
+            tx,
+            ControlError::ReloadTransition {
+                reload_id: old.reload_id,
+                expected: "exporting under the caller's live exporter generation",
+            },
+        )
+        .await;
     }
     // Reuse fail() (a savepoint inside this tx): one place owns "terminal ⇒ no claimable files".
     // The Transaction auto-derefs to the PgConnection fail() wants; its inner begin() nests as a
     // savepoint under this transaction.
-    fail(&mut tx, old.reload_id, &reason).await?;
+    if let Err(error) = fail(&mut tx, old.reload_id, &reason).await {
+        return rollback_rejection(tx, error).await;
+    }
     if capped {
         // Fail-only: the reload is abandoned, its chunk files already purged by fail().
         tx.commit().await?;
@@ -1235,17 +1265,24 @@ pub async fn restart_pristine_adoption(
     .await?
     .unwrap_or(false);
     if !owns_attempt {
-        return Err(ControlError::ReloadTransition {
-            reload_id: old.reload_id,
-            expected: "pristine attempt under the caller's live exporter generation",
-        });
+        return rollback_rejection(
+            tx,
+            ControlError::ReloadTransition {
+                reload_id: old.reload_id,
+                expected: "pristine attempt under the caller's live exporter generation",
+            },
+        )
+        .await;
     }
-    fail(
+    if let Err(error) = fail(
         &mut tx,
         old.reload_id,
         "superseded: adopted pristine attempt gets a fresh source fence identity",
     )
-    .await?;
+    .await
+    {
+        return rollback_rejection(tx, error).await;
+    }
     let successor = sqlx::query(
         "INSERT INTO walrus.table_reload
              (epoch, source_schema, source_table, flavor, status, restart_count,
@@ -1263,10 +1300,14 @@ pub async fn restart_pristine_adoption(
     .fetch_optional(&mut *tx)
     .await?;
     let Some(successor) = successor else {
-        return Err(ControlError::ReloadTransition {
-            reload_id: old.reload_id,
-            expected: "exporting with no durable chunk progress",
-        });
+        return rollback_rejection(
+            tx,
+            ControlError::ReloadTransition {
+                reload_id: old.reload_id,
+                expected: "exporting with no durable chunk progress",
+            },
+        )
+        .await;
     };
     let successor_id = ReloadId(successor.try_get("reload_id")?);
     crate::integrity::relink_recovery_reload(&mut *tx, old.reload_id, successor_id).await?;
@@ -1584,6 +1625,8 @@ pub async fn read_publication(
 /// Claim the next complete manifest units through this publication's H without consulting the
 /// ordinary reload pause predicate. A protocol-v2 stream group is indivisible: if its first child
 /// fits the file budget, every child is returned (so one large head group may exceed `limit`).
+/// This compatibility view stops before a zero-child schema barrier; new loader code must use
+/// [`claim_publication_ready_units`] to process those ordered work items.
 ///
 /// # Errors
 ///
@@ -1596,8 +1639,36 @@ pub async fn claim_publication_ready(
     fencing_token: i64,
     limit: i64,
 ) -> Result<Vec<crate::manifest::ManifestRow>, ControlError> {
+    let units =
+        claim_publication_ready_units(ex, publication, owner_pod, fencing_token, limit).await?;
+    let mut files = Vec::new();
+    for unit in units {
+        match unit {
+            crate::manifest::ReadyManifestUnit::Files(mut unit_files) => {
+                files.append(&mut unit_files);
+            }
+            crate::manifest::ReadyManifestUnit::SchemaBarrier(_) => break,
+        }
+    }
+    Ok(files)
+}
+
+/// Claim the next complete manifest or zero-child schema-barrier units through a fenced reload
+/// publication's H. Units are commit ordered and streamed file groups remain indivisible.
+///
+/// # Errors
+///
+/// Returns a typed database/decode error, [`ControlError::ReloadTransition`] when the publication
+/// fence is no longer live, or [`ControlError::ManifestInvariant`] for inconsistent grouped work.
+pub async fn claim_publication_ready_units(
+    ex: impl PgExecutor<'_>,
+    publication: &ReloadPublication,
+    owner_pod: &str,
+    fencing_token: i64,
+    limit: i64,
+) -> Result<Vec<crate::manifest::ReadyManifestUnit>, ControlError> {
     let rows = sqlx::query(include_str!(
-        "../sql/postgres/queries/claim_publication_ready.sql"
+        "../sql/postgres/queries/claim_publication_ready_units.sql"
     ))
     .bind(publication.reload_id.0)
     .bind(publication.publication_nonce)
@@ -1606,50 +1677,38 @@ pub async fn claim_publication_ready(
     .bind(limit)
     .fetch_all(ex)
     .await?;
-    let manifests = rows
-        .into_iter()
-        .map(|row| {
-            let kind: String = row.try_get("kind")?;
-            let status: String = row.try_get("status")?;
-            Ok(crate::manifest::ManifestRow {
-                id: common::ManifestId(row.try_get("id")?),
-                epoch: EpochNo(row.try_get("epoch")?),
-                source_schema: row.try_get("source_schema")?,
-                source_table: row.try_get("source_table")?,
-                s3_uri: row.try_get("s3_uri")?,
-                kind: kind.parse()?,
-                row_count: row.try_get("row_count")?,
-                object_size: row.try_get("object_size")?,
-                sha256: row.try_get("sha256")?,
-                lsn_start: row.try_get("lsn_start")?,
-                lsn_end: row.try_get("lsn_end")?,
-                schema_version: SchemaVersionNo(row.try_get("schema_version")?),
-                status: status.parse()?,
-                reload_id: row.try_get::<Option<i64>, _>("reload_id")?.map(ReloadId),
-                stream_group_id: row
-                    .try_get::<Option<i64>, _>("stream_group_id")?
-                    .map(crate::manifest::ManifestGroupId),
-                stream_group_ordinal: row.try_get("stream_group_ordinal")?,
-                stream_commit_ts: row.try_get("stream_commit_ts")?,
-                stream_top_xid: row.try_get("stream_top_xid")?,
-                stream_group_expected_files: row.try_get("stream_group_expected_files")?,
-                stream_group_row_count: row.try_get("stream_group_row_count")?,
-            })
-        })
-        .collect::<Result<Vec<_>, ControlError>>()?;
-    crate::manifest::validate_claimed_groups(&manifests)?;
-    Ok(manifests)
+    let authorized = rows
+        .first()
+        .ok_or(ControlError::ReloadTransition {
+            reload_id: publication.reload_id,
+            expected: "publication claim returned no authorization result",
+        })?
+        .try_get::<bool, _>("claim_authorized")?;
+    if !authorized {
+        return Err(ControlError::ReloadTransition {
+            reload_id: publication.reload_id,
+            expected: "publishing with the current live table-ownership fence",
+        });
+    }
+    let mut work = Vec::new();
+    for row in rows {
+        if row.try_get::<bool, _>("claim_has_work")? {
+            work.push(row);
+        }
+    }
+    crate::manifest::ready_manifest_units_from_pg(work)
 }
 
-/// Return true only when *no manifest row in any status* remains through H. Failed/corrupt rows
-/// deliberately block publication; an invalid or expired ownership fence is an error, never an
-/// empty-queue answer.
+/// Observational sub-check used only while [`seal_publication_if_drained`] holds the table's
+/// publication fence. It returns true only when no manifest row in any status and no active/corrupt
+/// group remains through H. It is deliberately private: an unlocked drained observation is not a
+/// cutover proof.
 ///
 /// # Errors
 ///
 /// Returns [`ControlError::ReloadTransition`] for an invalid publication/ownership fence, or the
 /// underlying typed database error when the pending-row count cannot be read.
-pub async fn publication_drained(
+async fn publication_drained(
     ex: impl PgExecutor<'_>,
     publication: &ReloadPublication,
     owner_pod: &str,
@@ -1670,6 +1729,109 @@ pub async fn publication_drained(
             reload_id: publication.reload_id,
             expected: "publishing with the current live table-ownership fence",
         })
+}
+
+/// Atomically seal this table's manifest publication prefix through the reload's H after proving
+/// that prefix is drained. The caller must commit `tx` before publishing the Duck shadow. Source
+/// publishers serialize on the same table row, so after commit no fresh manifest/group at or below
+/// H can appear. Repeating the exact seal is idempotent.
+///
+/// Lock order is global and deliberate: table ownership, reload receipt, table-key advisory lock,
+/// then manifest fence. The pending-work read is a later statement in the same transaction, so if
+/// fence acquisition waited for a publisher it receives a fresh READ COMMITTED snapshot containing
+/// that publisher's work.
+///
+/// # Errors
+///
+/// Returns [`ControlError::ReloadTransition`] for a stale publication/ownership identity,
+/// [`ControlError::ManifestInvariant`] if a newer incompatible seal already exists, or the
+/// underlying database error.
+pub async fn seal_publication_if_drained(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    publication: &ReloadPublication,
+    owner_pod: &str,
+    fencing_token: i64,
+) -> Result<bool, ControlError> {
+    lock_publication(&mut **tx, publication, owner_pod, fencing_token).await?;
+    crate::manifest::lock_manifest_publication_table(
+        tx,
+        publication.epoch,
+        &publication.source_schema,
+        &publication.source_table,
+    )
+    .await?;
+
+    let existing: (Option<Lsn>, Option<i64>, Option<Uuid>) = sqlx::query_as(
+        "INSERT INTO walrus.manifest_publication_fence AS fence
+           (epoch, source_schema, source_table)
+         VALUES ($1,$2,$3)
+         ON CONFLICT (epoch, source_schema, source_table) DO UPDATE
+           SET updated_at = fence.updated_at
+         RETURNING sealed_through_lsn, sealed_reload_id, sealed_publication_nonce",
+    )
+    .bind(publication.epoch.0)
+    .bind(&publication.source_schema)
+    .bind(&publication.source_table)
+    .fetch_one(&mut **tx)
+    .await?;
+
+    let exact_existing = existing.0 == Some(publication.final_lsn)
+        && existing.1 == Some(publication.reload_id.0)
+        && existing.2 == Some(publication.publication_nonce);
+    if existing
+        .0
+        .is_some_and(|sealed| sealed > publication.final_lsn)
+    {
+        return Err(ControlError::ManifestInvariant {
+            message: format!(
+                "reload {} cannot replace newer manifest seal {:?}",
+                publication.reload_id, existing.0
+            ),
+        });
+    }
+    if !publication_drained(&mut **tx, publication, owner_pod, fencing_token).await? {
+        if exact_existing {
+            return Err(ControlError::ManifestInvariant {
+                message: format!(
+                    "reload {} has pending manifest work at or below its durable seal",
+                    publication.reload_id
+                ),
+            });
+        }
+        return Ok(false);
+    }
+    if exact_existing {
+        return Ok(true);
+    }
+
+    sqlx::query("SELECT set_config('walrus.manifest_seal_protocol', '2', true)")
+        .execute(&mut **tx)
+        .await?;
+
+    let changed = sqlx::query(
+        "UPDATE walrus.manifest_publication_fence
+         SET sealed_through_lsn=$4, sealed_reload_id=$5,
+             sealed_publication_nonce=$6, updated_at=now()
+         WHERE epoch=$1 AND source_schema=$2 AND source_table=$3
+           AND (sealed_through_lsn IS NULL OR sealed_through_lsn <= $4)",
+    )
+    .bind(publication.epoch.0)
+    .bind(&publication.source_schema)
+    .bind(&publication.source_table)
+    .bind(publication.final_lsn)
+    .bind(publication.reload_id.0)
+    .bind(publication.publication_nonce)
+    .execute(&mut **tx)
+    .await?;
+    if changed.rows_affected() != 1 {
+        return Err(ControlError::ManifestInvariant {
+            message: format!(
+                "reload {} failed to persist its manifest publication seal",
+                publication.reload_id
+            ),
+        });
+    }
+    Ok(true)
 }
 
 /// Lock and verify the publication plus ownership rows. Call this inside the same control
@@ -1693,6 +1855,9 @@ pub async fn lock_publication(
     .bind(publication.publication_nonce)
     .bind(owner_pod)
     .bind(fencing_token)
+    .bind(publication.epoch.0)
+    .bind(&publication.source_schema)
+    .bind(&publication.source_table)
     .fetch_optional(ex)
     .await?;
     let exact = row.is_some_and(|row| {
@@ -1724,37 +1889,94 @@ pub async fn lock_publication(
 }
 
 /// After the Duck shadow is durably `published`, atomically set both canonical checkpoints to H
-/// and transition `publishing → complete`. A retry after an ambiguous commit succeeds only when an
-/// exact complete receipt and exact-H checkpoints already exist.
+/// and transition `publishing → complete`. The exact durable manifest seal created by
+/// [`seal_publication_if_drained`] is mandatory. A retry after an ambiguous commit is validated by
+/// a later READ COMMITTED statement, so a concurrent finisher cannot cause a stale-snapshot false
+/// failure. Once complete, the immutable reload receipt is the durable attestation that an exact-H
+/// seal/checkpoint proof existed; later checkpoint progress or a newer reload seal remains valid.
 ///
 /// # Errors
 ///
 /// Returns [`ControlError::ReloadTransition`] when neither the fenced transition nor its exact
 /// committed replay is valid, or the underlying typed database/decode error.
-pub async fn finish_publication(
-    ex: impl PgExecutor<'_>,
+pub async fn finish_publication<'a>(
+    ex: impl sqlx::Acquire<'a, Database = Postgres>,
     publication: &ReloadPublication,
     owner_pod: &str,
     fencing_token: i64,
 ) -> Result<bool, ControlError> {
-    let row = sqlx::query(include_str!(
+    let mut connection = sqlx::Acquire::acquire(ex).await?;
+    let mut tx = Connection::begin(&mut *connection).await?;
+    let prepared: bool = sqlx::query_scalar(include_str!(
         "../sql/postgres/queries/finish_reload_publication.sql"
     ))
     .bind(publication.reload_id.0)
     .bind(publication.publication_nonce)
     .bind(owner_pod)
     .bind(fencing_token)
-    .fetch_one(ex)
+    .bind(publication.epoch.0)
+    .bind(&publication.source_schema)
+    .bind(&publication.source_table)
+    .bind(publication.start_lsn)
+    .bind(publication.final_lsn)
+    .bind(publication.schema_version.0)
+    .bind(&publication.publisher_owner_pod)
+    .bind(publication.publisher_fencing_token)
+    .fetch_one(&mut *tx)
     .await?;
-    let transitioned: bool = row.try_get("transitioned")?;
-    let already_complete: bool = row.try_get("already_complete")?;
-    if !transitioned && !already_complete {
+
+    if prepared {
+        let transitioned: bool = sqlx::query_scalar(include_str!(
+            "../sql/postgres/queries/complete_reload_publication.sql"
+        ))
+        .bind(publication.reload_id.0)
+        .bind(publication.epoch.0)
+        .bind(&publication.source_schema)
+        .bind(&publication.source_table)
+        .bind(publication.publication_nonce)
+        .bind(publication.start_lsn)
+        .bind(publication.final_lsn)
+        .bind(publication.schema_version.0)
+        .bind(&publication.publisher_owner_pod)
+        .bind(publication.publisher_fencing_token)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !transitioned {
+            tx.rollback().await?;
+            return Err(ControlError::ReloadTransition {
+                reload_id: publication.reload_id,
+                expected: "the row-locked publishing receipt to complete after its exact seal/checkpoint proof",
+            });
+        }
+        tx.commit().await?;
+        return Ok(true);
+    }
+
+    // End the attempted transition before validating a replay. At READ COMMITTED this next
+    // statement takes a fresh snapshot after any lock wait in the preparation statement.
+    tx.rollback().await?;
+    let already_complete: bool = sqlx::query_scalar(include_str!(
+        "../sql/postgres/queries/read_completed_reload_publication.sql"
+    ))
+    .bind(publication.reload_id.0)
+    .bind(publication.epoch.0)
+    .bind(&publication.source_schema)
+    .bind(&publication.source_table)
+    .bind(publication.publication_nonce)
+    .bind(publication.start_lsn)
+    .bind(publication.final_lsn)
+    .bind(publication.schema_version.0)
+    .bind(&publication.publisher_owner_pod)
+    .bind(publication.publisher_fencing_token)
+    .fetch_one(&mut *connection)
+    .await?;
+    if !already_complete {
         return Err(ControlError::ReloadTransition {
             reload_id: publication.reload_id,
-            expected: "published Duck receipt with publishing ownership and canonical checkpoint not past H",
+            expected: "exact publishing transition with live ownership/seal, or its immutable completed receipt with checkpoints through H",
         });
     }
-    Ok(transitioned)
+    Ok(false)
 }
 
 #[cfg(test)]

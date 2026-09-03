@@ -18,6 +18,7 @@ use control::{connect, run_migrations};
 use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 use pg_sink::batch::SealedBatch;
+use pg_sink::checkpoint::DurabilityCheckpoint;
 use pg_sink::consume::flush_batch;
 use pg_sink::sink::ParquetSink;
 use pg_to_arrow::{BatchBuilder, oids};
@@ -191,4 +192,89 @@ async fn row_is_ready_kind_stream_and_epoch_stamped() {
 
     tx.rollback().await.unwrap();
     let _ = store.delete(&obj.key).await;
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose up --wait (MinIO + control PG)"]
+async fn sealed_replay_deletes_object_and_remains_clamped_by_an_open_stream() {
+    let store = minio_store();
+    let pool = control_pool().await;
+    let mut tx = pool.begin().await.unwrap();
+    let epoch = EpochNo(2_250_004);
+    let seal: Lsn = "0/B000".parse().unwrap();
+    let sink = ParquetSink::new(Arc::clone(&store), "walrus", epoch);
+    let publication_nonce = uuid::Uuid::new_v4();
+
+    let reload_id: i64 = sqlx::query_scalar(
+        "INSERT INTO walrus.table_reload
+           (epoch, source_schema, source_table, flavor, status, start_lsn, final_lsn,
+            schema_version, publication_nonce, publisher_owner_pod,
+            publisher_fencing_token, publishing_at)
+         VALUES ($1, 'public', 'orders', 'reload', 'publishing', '0/100', $2,
+                 1, $3, 'manifest-insert-test', 1, now())
+         RETURNING reload_id",
+    )
+    .bind(epoch.0)
+    .bind(seal)
+    .bind(publication_nonce)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query("SELECT set_config('walrus.manifest_seal_protocol', '2', true)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+    sqlx::query(
+        "INSERT INTO walrus.manifest_publication_fence
+           (epoch, source_schema, source_table, sealed_through_lsn,
+            sealed_reload_id, sealed_publication_nonce)
+         VALUES ($1, 'public', 'orders', $2, $3, $4)",
+    )
+    .bind(epoch.0)
+    .bind(seal)
+    .bind(reload_id)
+    .bind(publication_nonce)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    // Model the reachable lost-ACK schedule: another protocol-v2 transaction keeps the global slot
+    // feedback behind this ordinary commit even though its object/control disposition is durable.
+    let resume: Lsn = "0/100".parse().unwrap();
+    let mut checkpoint = DurabilityCheckpoint::new(resume);
+    let ceiling = checkpoint.capture_pre_stream_start_ceiling();
+    checkpoint.on_stream_start(77, ceiling).unwrap();
+
+    let obj = flush_batch(&sink, &mut tx, epoch, sealed("0/A100"))
+        .await
+        .unwrap();
+    assert!(
+        store.head(&obj.key).await.is_err(),
+        "CoveredBySeal must best-effort delete the new unreferenced object"
+    );
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM walrus.file_manifest
+         WHERE epoch=$1 AND source_schema='public' AND source_table='orders'",
+    )
+    .bind(epoch.0)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(rows, 0, "covered replay must not recreate manifest work");
+
+    checkpoint.on_batch_durable(obj.lsn_end);
+    assert_eq!(
+        checkpoint.confirmed_flush(),
+        resume,
+        "covered ordinary work is durable, but the unrelated open stream still clamps global ACK"
+    );
+    assert!(checkpoint.on_stream_end(77).unwrap());
+    assert_eq!(
+        checkpoint.confirmed_flush(),
+        obj.lsn_end,
+        "once the stream ends, the remembered covered frontier becomes ACK-eligible"
+    );
+
+    tx.rollback().await.unwrap();
 }

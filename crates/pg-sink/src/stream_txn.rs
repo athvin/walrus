@@ -105,7 +105,7 @@ struct StreamedTxn {
 pub enum StreamProtocolError {
     /// A second segment began before the active one stopped.
     #[error(
-        "StreamStart for top xid {incoming_top} while top xid {active_top} already has an active segment"
+        "stream start for top xid {incoming_top} while top xid {active_top} already has an active segment"
     )]
     SegmentAlreadyActive { active_top: u32, incoming_top: u32 },
     /// `first_segment=true` was repeated for an already-open transaction.
@@ -115,7 +115,7 @@ pub enum StreamProtocolError {
     #[error("continuation StreamStart for unknown top xid {top_xid}")]
     UnknownContinuation { top_xid: u32 },
     /// A stop has no segment to close.
-    #[error("StreamStop arrived without an active segment")]
+    #[error("stream stop arrived without an active segment")]
     StopWithoutStart,
     /// Transaction outcome messages are top-level and must follow `StreamStop`.
     #[error(
@@ -127,10 +127,10 @@ pub enum StreamProtocolError {
         active_top: u32,
     },
     /// A commit for an unknown xid must never be treated as an empty transaction.
-    #[error("StreamCommit for unknown top xid {top_xid}")]
+    #[error("stream commit for unknown top xid {top_xid}")]
     UnknownCommit { top_xid: u32 },
     /// An abort for an unknown xid cannot safely alter any other open transaction.
-    #[error("StreamAbort for unknown top xid {top_xid} (sub xid {sub_xid})")]
+    #[error("stream abort for unknown top xid {top_xid} (sub xid {sub_xid})")]
     UnknownAbort { top_xid: u32, sub_xid: u32 },
 }
 

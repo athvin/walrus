@@ -8,7 +8,7 @@ WITH active AS MATERIALIZED (
     ORDER BY r.reload_id DESC
     LIMIT 1
 ),
-owned AS MATERIALIZED (
+locked_ownership AS MATERIALIZED (
     SELECT o.owner_pod, o.fencing_token
     FROM walrus.table_ownership o
     WHERE o.epoch = $1
@@ -17,10 +17,13 @@ owned AS MATERIALIZED (
       AND o.owner_pod = $4
       AND o.fencing_token = $5
       AND o.lease_expiry > statement_timestamp()
+    FOR UPDATE OF o
 ),
 eligible AS MATERIALIZED (
-    SELECT r.*
+    SELECT r.*, o.owner_pod AS claiming_owner_pod,
+           o.fencing_token AS claiming_fencing_token
     FROM active r
+    CROSS JOIN locked_ownership o
     WHERE r.start_lsn IS NOT NULL
       AND r.final_lsn IS NOT NULL
       AND r.schema_version IS NOT NULL
@@ -40,23 +43,29 @@ eligible AS MATERIALIZED (
           )
       ) = 2
 ),
+adoption_protocol AS MATERIALIZED (
+    SELECT set_config('walrus.reload_publication_adopt_protocol', '2', true) AS protocol
+    WHERE EXISTS (SELECT 1 FROM eligible)
+),
 claimed AS (
     UPDATE walrus.table_reload r
     SET status = 'publishing',
         publication_nonce = COALESCE(r.publication_nonce, gen_random_uuid()),
-        publisher_owner_pod = o.owner_pod,
-        publisher_fencing_token = o.fencing_token,
+        publisher_owner_pod = e.claiming_owner_pod,
+        publisher_fencing_token = e.claiming_fencing_token,
         publishing_at = COALESCE(r.publishing_at, now()),
         updated_at = now()
-    FROM eligible e, owned o
+    FROM eligible e
+    CROSS JOIN adoption_protocol protocol
     WHERE r.reload_id = e.reload_id
       AND r.status IN ('export_complete', 'publishing')
+      AND protocol.protocol = '2'
     RETURNING r.reload_id, r.epoch, r.source_schema, r.source_table, r.status,
               r.start_lsn, r.final_lsn, r.schema_version,
               r.publication_nonce, r.publisher_owner_pod, r.publisher_fencing_token
 )
 SELECT active.reload_id AS candidate_reload_id,
-       EXISTS (SELECT 1 FROM owned) AS ownership_valid,
+       EXISTS (SELECT 1 FROM locked_ownership) AS ownership_valid,
        EXISTS (SELECT 1 FROM eligible) AS boundaries_valid,
        claimed.reload_id, claimed.epoch, claimed.source_schema, claimed.source_table,
        claimed.status, claimed.start_lsn, claimed.final_lsn, claimed.schema_version,

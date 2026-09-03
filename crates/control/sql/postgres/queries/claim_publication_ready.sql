@@ -21,7 +21,8 @@ candidates AS MATERIALIZED (
            m.stream_group_ordinal, g.commit_ts AS stream_commit_ts,
            g.top_xid AS stream_top_xid,
            g.expected_files AS stream_group_expected_files,
-           g.row_count AS stream_group_row_count
+           g.row_count AS stream_group_row_count,
+           g.final_schema_version AS stream_group_final_schema_version
     FROM walrus.file_manifest m
     JOIN publication p
       ON p.epoch = m.epoch

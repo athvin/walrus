@@ -63,6 +63,10 @@ async fn own(pool: &PgPool, epoch: EpochNo, table: &str) -> i64 {
 
 async fn cleanup(pool: &PgPool, epoch: EpochNo) {
     let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SELECT set_config('walrus.manifest_fence_maintenance','2-delete',true)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     sqlx::query("DELETE FROM walrus.table_integrity_recovery WHERE epoch = $1")
         .bind(epoch.0)
         .execute(&mut *tx)
@@ -79,6 +83,11 @@ async fn cleanup(pool: &PgPool, epoch: EpochNo) {
         .await
         .unwrap();
     sqlx::query("DELETE FROM walrus.stream_txn_publication WHERE epoch = $1")
+        .bind(epoch.0)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM walrus.manifest_publication_fence WHERE epoch = $1")
         .bind(epoch.0)
         .execute(&mut *tx)
         .await
