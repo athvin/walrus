@@ -338,8 +338,9 @@ async fn one_worker_honors_the_configured_record_chunk_size() {
 }
 
 /// A process crash loses every PostgreSQL exported snapshot, even though some baseline objects may
-/// already be durable. Restart must therefore fail/purge the abandoned attempt, open a successor
-/// with a fresh snapshot, and converge without creating a second replication slot or walsender.
+/// already be durable. A replacement process must therefore epoch-isolate the abandoned attempt,
+/// open a newly fenced all-table reconciliation, and converge without creating a second replication
+/// slot or walsender.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires docker compose up --wait (source PG + control PG + MinIO)"]
 async fn sink_crash_mid_reload_starts_a_correct_successor_on_one_slot() {
@@ -352,6 +353,7 @@ async fn sink_crash_mid_reload_starts_a_correct_successor_on_one_slot() {
     })
     .await
     .expect("bring up sink + loader");
+    let old_epoch = h.epoch;
 
     // Do not race the source-backed request against the empty bootstrap reconciliation for rl1.
     let bootstrap_deadline = tokio::time::Instant::now() + Duration::from_secs(90);
@@ -429,58 +431,49 @@ async fn sink_crash_mid_reload_starts_a_correct_successor_on_one_slot() {
     .unwrap();
     h.restart_sink()
         .await
-        .expect("sink restarts and adopts the abandoned reload");
+        .expect("sink restarts into a newly fenced generation");
+    let new_epoch = h
+        .await_epoch_past(old_epoch, Duration::from_secs(60))
+        .await
+        .expect("replacement sink opens a successor generation");
+    assert_eq!(new_epoch, old_epoch + 1);
+    h.refresh_epoch().await.unwrap();
 
     let recovery_deadline = tokio::time::Instant::now() + Duration::from_secs(240);
     let successor_id = loop {
         let row: Option<(i64, String)> = sqlx::query_as(
-            "SELECT reload_id, status FROM walrus.table_reload \
-             WHERE epoch = $1 \
-               AND (source_request_id = $2 OR parent_request_id = $2) \
-             ORDER BY reload_id DESC LIMIT 1",
+            "SELECT tr.reload_id, tr.status \
+             FROM walrus.table_reload tr \
+             JOIN walrus.replication_state rs \
+               ON rs.epoch = tr.epoch \
+              AND rs.bootstrap_request_id = tr.parent_request_id \
+             WHERE tr.epoch = $1 \
+               AND tr.source_schema = 'public' \
+               AND tr.source_table = 'rl1' \
+               AND tr.request_scope = 'all_published' \
+             ORDER BY tr.reload_id DESC LIMIT 1",
         )
         .bind(h.epoch)
-        .bind(request_id)
         .fetch_optional(h.control_pool())
         .await
         .unwrap();
         if let Some((reload_id, status)) = row {
-            if reload_id != predecessor_id && status == "complete" {
+            if status == "complete" {
                 break reload_id;
             }
             assert!(
-                reload_id == predecessor_id || status != "failed",
-                "successor reload {reload_id} failed"
+                status != "failed",
+                "successor bootstrap reload {reload_id} failed"
             );
         }
         assert_one_slot_and_at_most_one_walsender(&h).await;
         assert!(
             tokio::time::Instant::now() < recovery_deadline,
-            "no successor reload completed after the process crash"
+            "no successor-generation bootstrap reload completed after the process crash"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     assert!(successor_id > predecessor_id);
-    let predecessor_status: String =
-        sqlx::query_scalar("SELECT status FROM walrus.table_reload WHERE reload_id = $1")
-            .bind(predecessor_id)
-            .fetch_one(h.control_pool())
-            .await
-            .unwrap();
-    assert_eq!(
-        predecessor_status, "failed",
-        "the lost-snapshot attempt must be made terminal"
-    );
-    let predecessor_files: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM walrus.file_manifest WHERE reload_id = $1")
-            .bind(predecessor_id)
-            .fetch_one(h.control_pool())
-            .await
-            .unwrap();
-    assert_eq!(
-        predecessor_files, 0,
-        "every durable object manifest from the lost snapshot must be purged"
-    );
     let successor_files: i64 =
         sqlx::query_scalar("SELECT chunk_no FROM walrus.table_reload WHERE reload_id = $1")
             .bind(successor_id)
@@ -491,6 +484,19 @@ async fn sink_crash_mid_reload_starts_a_correct_successor_on_one_slot() {
     assert_range_chunking(&successor_ranges, 50, 20_001, successor_files);
     assert_one_slot_and_at_most_one_walsender(&h).await;
 
+    // The old loader is fenced out by the epoch bump. Start its replacement only after the full
+    // successor snapshot is durable, then cross a post-snapshot WAL watermark before comparing.
+    h.stop_loader().await.unwrap();
+    h.restart_loader()
+        .await
+        .expect("loader rebuilds under the successor generation");
+    let before = h.source_wal_lsn().await.unwrap();
+    h.source_exec("UPDATE public.rl1 SET status = 'after-restart' WHERE id = 20001")
+        .await
+        .unwrap();
+    h.await_transformed_past("rl1", before, Duration::from_secs(240))
+        .await
+        .expect("successor generation converges after the process crash");
     h.stop_loader().await.unwrap();
     h.assert_mirror_equals_source("rl1").await.unwrap();
 }

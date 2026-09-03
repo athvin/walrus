@@ -147,6 +147,14 @@ impl DdlEvent {
         self.c_event.eq_ignore_ascii_case("sql_drop")
     }
 
+    /// Whether the command creates a new table identity rather than changing the frozen relation.
+    #[must_use]
+    fn is_table_creation(&self) -> bool {
+        self.c_tag.eq_ignore_ascii_case("CREATE TABLE")
+            || self.c_tag.eq_ignore_ascii_case("CREATE TABLE AS")
+            || self.c_tag.eq_ignore_ascii_case("SELECT INTO")
+    }
+
     /// Build the authoritative post-change relation described by this event.
     ///
     /// The source snapshot deliberately contains a little more than [`PgColumn`] (`attnum`, nullability);
@@ -204,6 +212,7 @@ struct PendingDdl {
     event: DdlEvent,
     version: SchemaVersionNo,
     identity_change: Option<TrackedTableIdentityChange>,
+    identity_unresolved: bool,
     replay: bool,
 }
 
@@ -264,6 +273,15 @@ impl PreparedStreamDdl {
     #[must_use]
     pub(crate) fn registry_rows(&self) -> &[control::RegistryRow] {
         &self.registry_rows
+    }
+
+    /// Structural DDL must not become visible separately from other control effects owned by the
+    /// same streamed source transaction. COMMENT-only transactions carry no schema barrier.
+    #[must_use]
+    pub(crate) fn has_structural_ddl(&self) -> bool {
+        self.ddl_rows
+            .iter()
+            .any(|row| !row.c_tag.eq_ignore_ascii_case("COMMENT"))
     }
 }
 
@@ -365,19 +383,21 @@ impl DdlConsumer {
     ///
     /// A restart can replay WAL older than the newest durable registry row. Falling back to the
     /// committed maximum would then bind old tuples to a future shape. A transaction-local DDL
-    /// version wins when present; otherwise the durable DDL history is cut at this Relation frame's
-    /// WAL position and that exact registry version must match the wire shape. An unseen relation is
-    /// admitted only when neither its OID nor qualified name has any durable history (fresh bootstrap).
+    /// version wins when present; otherwise the durable DDL history is cut at the last source commit
+    /// successfully processed by this decode pass and that exact registry version must match the wire
+    /// shape. The XLogData `wal_start` is deliberately not used: PostgreSQL may emit zero for a
+    /// Relation transport frame, so it is not a valid history cursor. An unseen relation is admitted
+    /// only when neither its OID nor qualified name has any durable history (fresh bootstrap).
     ///
     /// # Errors
     ///
     /// Returns [`DdlError::RelationVersionBinding`] when a relation conflicts with its scoped DDL
-    /// version or does not match the registry version valid at `frame_lsn`.
+    /// version or does not match the registry version valid at `committed_through_lsn`.
     pub fn relation_version_for(
         &self,
         scope: TransactionScope,
         relation: &PgRelation,
-        frame_lsn: Lsn,
+        committed_through_lsn: Lsn,
         cache: &RelationCache,
     ) -> Result<SchemaVersionNo, DdlError> {
         let exact_versions = cache
@@ -387,7 +407,7 @@ impl DdlConsumer {
             .collect::<Vec<_>>();
         let scoped_version = self.pending_version_for(scope, &relation.schema, &relation.name);
         let expected = scoped_version.unwrap_or_else(|| {
-            self.historical_version_through(&relation.schema, &relation.name, frame_lsn)
+            self.historical_version_through(&relation.schema, &relation.name, committed_through_lsn)
         });
         let expected_cached = cache.get(relation.oid, expected);
         if expected_cached
@@ -411,7 +431,7 @@ impl DdlConsumer {
             relation_oid: relation.oid,
             schema: relation.schema.clone(),
             table: relation.name.clone(),
-            frame_lsn,
+            committed_through_lsn,
             expected_version: expected,
             scoped_version,
             exact_versions,
@@ -420,15 +440,38 @@ impl DdlConsumer {
 
     /// Stage one decoded DDL event. No control-DB side effect occurs before commit.
     ///
-    /// `previous_for_oid` must be the relation already tracked for `event.c_rel_oid`, if any. A
-    /// rename, schema move, or drop is recorded as provisional transaction state here, but is not
-    /// rejected yet: a streamed transaction can still abort. The matching [`Self::on_commit`] or
-    /// [`Self::prepare_stream_commit`] returns the typed error before opening a control transaction.
+    /// `previous_for_oid` must be the relation already tracked for `event.c_rel_oid`, or the one
+    /// unique frozen qualified-name match used to resolve either a legacy null-OID event or an
+    /// explicit new OID at the tracked name. A rename, schema move, drop, or recreation is recorded
+    /// as provisional transaction state here, but is not rejected yet: a streamed transaction can
+    /// still abort. The matching [`Self::on_commit`] or [`Self::prepare_stream_commit`] returns the
+    /// typed error before opening a control transaction.
     pub fn observe(
         &mut self,
         scope: TransactionScope,
         event: DdlEvent,
         previous_for_oid: Option<&PgRelation>,
+    ) -> DdlObservation {
+        self.observe_inner(scope, event, previous_for_oid, false)
+    }
+
+    /// Stage structural DDL whose legacy audit row omitted the relation OID and could not be tied to
+    /// one frozen identity. The ambiguity is commit-gated so a streamed abort can discard it; a real
+    /// commit fails closed before any control publication or source acknowledgement.
+    pub(crate) fn observe_unresolved_identity(
+        &mut self,
+        scope: TransactionScope,
+        event: DdlEvent,
+    ) -> DdlObservation {
+        self.observe_inner(scope, event, None, true)
+    }
+
+    fn observe_inner(
+        &mut self,
+        scope: TransactionScope,
+        event: DdlEvent,
+        previous_for_oid: Option<&PgRelation>,
+        identity_unresolved: bool,
     ) -> DdlObservation {
         if let Some(existing) = self.processed.get(&event.source_audit_id).cloned() {
             self.set_committed(
@@ -445,6 +488,7 @@ impl DdlConsumer {
                     event: event.clone(),
                     version: existing.schema_version,
                     identity_change: None,
+                    identity_unresolved: false,
                     replay: true,
                 });
             }
@@ -453,6 +497,8 @@ impl DdlConsumer {
                 replay: true,
             };
         }
+        let identity_unresolved = identity_unresolved
+            || (event.is_structural() && event.c_rel_oid.is_none() && previous_for_oid.is_none());
         let current = self.version_for(scope, &event.source_schema, &event.source_table);
         let version = if event.is_structural() {
             SchemaVersionNo(current.0 + 1)
@@ -467,6 +513,7 @@ impl DdlConsumer {
             event,
             version,
             identity_change,
+            identity_unresolved,
             replay: false,
         });
         DdlObservation {
@@ -533,7 +580,8 @@ impl DdlConsumer {
     /// in the schema publication receipt.
     ///
     /// Returns [`DdlError::TrackedTableIdentityChange`] for a committed tracked-table rename,
-    /// schema move, or drop, or [`DdlError::Control`] if atomic control persistence fails.
+    /// schema move, drop, or recreation; [`DdlError::UnresolvedRelationIdentity`] when identity
+    /// cannot be proven; or [`DdlError::Control`] if atomic control persistence fails.
     pub async fn on_commit(
         &mut self,
         pool: &sqlx::PgPool,
@@ -616,8 +664,9 @@ impl DdlConsumer {
     /// # Errors
     ///
     /// Returns [`DdlError::TrackedTableIdentityChange`] for a committed tracked-table rename,
-    /// schema move, or drop. The caller must include the returned rows in the same durable control
-    /// transaction as the streamed data manifests, then call [`Self::finalize_stream_commit`].
+    /// schema move, drop, or recreation, and [`DdlError::UnresolvedRelationIdentity`] when an audit
+    /// row cannot be tied to one frozen identity. The caller must include returned rows in the same
+    /// durable control transaction as streamed data, then call [`Self::finalize_stream_commit`].
     pub(crate) fn prepare_stream_commit(
         &self,
         top_xid: u32,
@@ -694,6 +743,16 @@ impl DdlConsumer {
             .map(|pending| pending.row.clone())
             .collect::<Vec<_>>();
 
+        if let Some(unresolved) = pending.iter().find(|pending| pending.identity_unresolved) {
+            return Err(DdlError::UnresolvedRelationIdentity {
+                source_audit_id: unresolved.event.source_audit_id,
+                schema: unresolved.event.source_schema.clone(),
+                table: unresolved.event.source_table.clone(),
+                c_tag: unresolved.event.c_tag.clone(),
+                relation_oid: unresolved.event.c_rel_oid,
+            });
+        }
+
         // Identity is part of a loader worker's durable routing key. Fail before any control row is
         // written; the replication Commit/StreamCommit consequently remains unacknowledged and an
         // operator cannot mistake an old canonical table for the renamed/recreated relation.
@@ -768,12 +827,14 @@ impl DdlConsumer {
         &self,
         schema: &str,
         table: &str,
-        frame_lsn: Lsn,
+        committed_through_lsn: Lsn,
     ) -> SchemaVersionNo {
         self.processed
             .values()
             .filter(|row| {
-                row.source_schema == schema && row.source_table == table && row.c_lsn <= frame_lsn
+                row.source_schema == schema
+                    && row.source_table == table
+                    && row.c_lsn <= committed_through_lsn
             })
             .max_by_key(|row| (row.c_lsn, row.schema_version))
             .map_or(SchemaVersionNo(1), |row| row.schema_version)
@@ -799,12 +860,17 @@ pub struct TrackedTableIdentityChange {
 
 impl TrackedTableIdentityChange {
     fn from_event(previous: &PgRelation, event: &DdlEvent) -> Option<Self> {
-        if event.c_rel_oid != Some(previous.oid) {
+        let supplied_different_oid = event.c_rel_oid.is_some_and(|oid| oid != previous.oid);
+        if supplied_different_oid
+            && (previous.schema != event.source_schema || previous.name != event.source_table)
+        {
             return None;
         }
 
         let dropped = event.is_table_drop();
-        let kind = if dropped {
+        let kind = if supplied_different_oid || event.is_table_creation() {
+            TrackedTableIdentityChangeKind::Recreated
+        } else if dropped {
             TrackedTableIdentityChangeKind::Dropped
         } else if event.c_tag.eq_ignore_ascii_case("ALTER TABLE")
             && previous.schema != event.source_schema
@@ -860,6 +926,8 @@ pub enum TrackedTableIdentityChangeKind {
     SchemaMoved,
     /// The tracked relation was dropped.
     Dropped,
+    /// A different relation identity appeared at the same frozen qualified name.
+    Recreated,
 }
 
 impl std::fmt::Display for TrackedTableIdentityChangeKind {
@@ -868,6 +936,7 @@ impl std::fmt::Display for TrackedTableIdentityChangeKind {
             Self::Renamed => "renamed",
             Self::SchemaMoved => "moved",
             Self::Dropped => "dropped",
+            Self::Recreated => "recreated",
         })
     }
 }
@@ -915,6 +984,23 @@ pub enum DdlError {
     /// A committed DDL transaction changed the durable identity of a tracked relation.
     #[error("tracked table identity change is unsupported: {0}")]
     TrackedTableIdentityChange(TrackedTableIdentityChange),
+    /// A structural audit row could not be matched uniquely to the frozen epoch inventory. This is
+    /// normally an older null-OID row, but also covers conflicting frozen same-name identities.
+    #[error(
+        "cannot prove relation identity for DDL audit {source_audit_id}: {c_tag} on {schema}.{table}, relation_oid={relation_oid:?}"
+    )]
+    UnresolvedRelationIdentity {
+        /// Stable source audit-row identity.
+        source_audit_id: i64,
+        /// Post-command schema reported by the source trigger.
+        schema: String,
+        /// Post-command table reported by the source trigger.
+        table: String,
+        /// PostgreSQL command tag.
+        c_tag: String,
+        /// Supplied relation OID, absent on the legacy rows this guard primarily protects.
+        relation_oid: Option<u32>,
+    },
     /// An ordinary source transaction mixed structural DDL with routed data files, which cannot be
     /// published as one atomic control receipt by the ordinary batching path.
     #[error(
@@ -939,10 +1025,23 @@ pub enum DdlError {
         /// Number of source reload requests/fence markers committed with the DDL.
         committed_reload_effects: usize,
     },
+    /// A streamed source transaction mixed structural DDL with reload-event control effects, which
+    /// are not members of the atomic files-and-schema publication receipt.
+    #[error(
+        "streamed transaction xid {top_xid} at {commit_lsn} mixes structural DDL with {committed_reload_effects} committed reload effect(s); refusing to publish a partial source commit"
+    )]
+    MixedStreamedReloadEffectsAndStructuralDdl {
+        /// Top-level xid named by StreamCommit.
+        top_xid: u32,
+        /// Commit LSN that must remain unacknowledged.
+        commit_lsn: Lsn,
+        /// Number of source reload requests/fence markers committed with the DDL.
+        committed_reload_effects: usize,
+    },
     /// A Relation message could not be assigned to one exact historical schema version without
     /// falling forward to a newer durable shape.
     #[error(
-        "cannot bind relation {schema}.{table} (OID {relation_oid}) at WAL {frame_lsn} to expected schema version {expected_version}: scoped={scoped_version:?}, matching historical shapes={exact_versions:?}"
+        "cannot bind relation {schema}.{table} (OID {relation_oid}) at committed decode frontier {committed_through_lsn} to expected schema version {expected_version}: scoped={scoped_version:?}, matching historical shapes={exact_versions:?}"
     )]
     RelationVersionBinding {
         /// Source relation identity carried by pgoutput.
@@ -951,8 +1050,8 @@ pub enum DdlError {
         schema: String,
         /// Qualified source table carried by pgoutput.
         table: String,
-        /// WAL position of the Relation frame used to cut durable DDL history.
-        frame_lsn: Lsn,
+        /// Last successfully processed source commit used to cut durable DDL history.
+        committed_through_lsn: Lsn,
         /// Version the transaction-local state or durable history requires at this position.
         expected_version: SchemaVersionNo,
         /// Exact transaction-local DDL version, when one exists.

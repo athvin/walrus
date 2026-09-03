@@ -35,16 +35,25 @@ const OTHERS: [&str; 2] = ["rl1", "rl2"];
 
 /// Write a one-row `(id, status, n)` v2 Parquet to MinIO (the reconcile trigger's file — its data is
 /// never appended, the quarantine fires on the reconcile before the append). DuckDB writes it.
-fn write_v2_file(epoch: i64, uri_key: &str) -> String {
+fn write_v2_file(epoch: i64, uri_key: &str, commit_lsn: Lsn) -> String {
     let w = duckdb::Connection::open_in_memory().unwrap();
     w.execute_batch(
         "INSTALL httpfs; LOAD httpfs; SET s3_region='us-east-1'; SET s3_endpoint='localhost:9000'; \
          SET s3_url_style='path'; SET s3_use_ssl=false; \
          SET s3_access_key_id='minioadmin'; SET s3_secret_access_key='minioadmin'; \
-         CREATE TABLE fixture (id INTEGER, status VARCHAR, n VARCHAR, walrus_pg_sink_meta VARCHAR); \
-         INSERT INTO fixture VALUES (2, 'x', '5', \
-           '{\"op\":\"Insert\",\"commit_lsn\":\"00000000000000C8\",\"lsn\":\"00000000000000C8\",\
-             \"sink_processed_at\":\"2026-07-16T00:00:00Z\"}');",
+         CREATE TABLE fixture (id INTEGER, status VARCHAR, n VARCHAR, walrus_pg_sink_meta VARCHAR);",
+    )
+    .unwrap();
+    let meta = serde_json::json!({
+        "op": "Insert",
+        "commit_lsn": commit_lsn,
+        "lsn": commit_lsn,
+        "sink_processed_at": "2026-07-16T00:00:00Z",
+    })
+    .to_string();
+    w.execute(
+        "INSERT INTO fixture VALUES (2, 'x', '5', ?)",
+        duckdb::params![meta],
     )
     .unwrap();
     let uri = format!("s3://walrus/{epoch}/public/q_target/{uri_key}.parquet");
@@ -185,9 +194,12 @@ async fn quarantined_table_recovers_via_reload_without_stalling_others() {
     )
     .await
     .unwrap();
-    let uri = write_v2_file(epoch, "inject-v2");
+    // The bootstrap reload permanently sealed q_target through H. Synthetic work must therefore
+    // use a fresh position above that cutover, just as a real post-reload source commit would.
+    let injection_lsn = h.source_wal_lsn().await.unwrap();
+    let uri = write_v2_file(epoch, "inject-v2", injection_lsn);
     let (object_size, sha256) = fingerprint(&uri).await;
-    control::insert_ready(
+    let outcome = control::publish_ready_manifest(
         &pool,
         &control::NewManifestFile {
             epoch: epoch.into(),
@@ -198,14 +210,18 @@ async fn quarantined_table_recovers_via_reload_without_stalling_others() {
             row_count: 1,
             object_size,
             sha256,
-            lsn_start: "0/C8".parse().unwrap(),
-            lsn_end: "0/C8".parse().unwrap(),
+            lsn_start: injection_lsn,
+            lsn_end: injection_lsn,
             schema_version: common::SchemaVersionNo(2),
             reload_id: None,
         },
     )
     .await
     .unwrap();
+    assert!(
+        matches!(outcome, control::PublishManifestOutcome::Published(_)),
+        "the post-seal synthetic commit must become live queue work"
+    );
 
     let loader_status = h
         .await_loader_exited(Duration::from_secs(60))

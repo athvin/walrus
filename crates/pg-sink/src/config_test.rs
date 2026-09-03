@@ -198,6 +198,24 @@ fn a_fully_valid_config_passes() {
     assert!(valid().validate().is_ok());
 }
 
+#[test]
+fn lenient_key_mode_is_rejected_until_exclusion_is_durable() {
+    let mut cfg = valid();
+    cfg.strict_keys = false;
+
+    let err = cfg.validate().unwrap_err();
+    let ConfigError::OutOfBounds { field, detail } = &err else {
+        panic!("expected strict_keys OutOfBounds rejection, got {err:?}");
+    };
+    assert_eq!(*field, "strict_keys");
+    assert!(detail.contains("cannot durably exclude"), "{detail}");
+    assert!(detail.contains("add primary keys"), "{detail}");
+    assert_eq!(
+        common::Error::from(err).exit_code(),
+        common::ExitCode::Config
+    );
+}
+
 /// Both DSNs carry a password inline, and `source_db_url` carries the replication role's — the most
 /// privileged credential the sink holds. `SinkConfig` derives `Debug`, so a single `?cfg` anywhere
 /// would ship both to the log aggregator; the wrappers are what make that impossible.

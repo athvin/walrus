@@ -92,6 +92,7 @@ pub async fn run_shared(cfg: &SinkConfig, deadline: Instant) -> Result<Bootstrap
     pf.assert_reload_signal().await?;
     pf.assert_reload_event().await?;
     pf.assert_publication_covers().await?;
+    pf.assert_table_lock_privileges().await?;
     pf.assert_ddl_capture().await?;
     let pk = pf.assert_tables_have_pk(cfg.pk_mode()).await?;
     tracing::info!(

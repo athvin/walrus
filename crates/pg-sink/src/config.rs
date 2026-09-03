@@ -178,9 +178,9 @@ pub struct SinkConfig {
     /// If true, the sink creates/alters `publication_name` to cover the required tables; else a gap
     /// is terminal (the operator owns the source setup in `migrations/source`).
     pub manage_publication: bool,
-    /// `true` (default) = **strict** keys: a published user table with no usable replica identity is
-    /// terminal. `false` = **lenient**: quarantine + alert + continue (surfaced in the
-    /// [`PkReport`](crate::preflight::PkReport)).
+    /// Must remain `true`: every published user table needs a real primary key. `false` retains its
+    /// wire shape for compatibility but validation rejects it until keyless tables can be excluded
+    /// from a generation durably; the low-level preflight API's lenient mode is diagnostic only.
     pub strict_keys: bool,
 }
 
@@ -330,7 +330,9 @@ impl SinkConfig {
         }
     }
 
-    /// The keyless-table policy for the source preflight (§1.1).
+    /// The keyless-table policy for the source preflight (§1.1). A validated production config
+    /// always returns [`crate::preflight::PkMode::Strict`]; the lenient branch remains available to
+    /// low-level diagnostic callers operating on a manually constructed, unvalidated config.
     #[must_use]
     pub const fn pk_mode(&self) -> crate::preflight::PkMode {
         if self.strict_keys {
@@ -364,6 +366,15 @@ impl SinkConfig {
         // The same gate slot creation demands, run at the edge: an illegal name fails here rather
         // than at `CREATE_REPLICATION_SLOT`, after bootstrap has connected and preflighted a source.
         self.slot()?;
+        if !self.strict_keys {
+            return Err(ConfigError::OutOfBounds {
+                field: "strict_keys",
+                detail: "must be true: false can report keyless tables but cannot durably exclude \
+                         them from a generation; add primary keys or remove those tables from the \
+                         publication"
+                    .to_string(),
+            });
+        }
         common::runtime::validate_worker_threads(self.worker_threads).map_err(|e| {
             ConfigError::OutOfBounds {
                 field: "worker_threads",

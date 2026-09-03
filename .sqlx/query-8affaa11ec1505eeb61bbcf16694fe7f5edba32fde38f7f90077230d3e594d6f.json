@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "INSERT INTO walrus.replication_state (epoch, slot_name, created_lsn, status)\nSELECT COALESCE(MAX(epoch), 0) + 1, $1, $2, $3\nFROM walrus.replication_state\nRETURNING epoch\n",
+  "query": "INSERT INTO walrus.replication_state\n  (epoch, slot_name, created_lsn, status, catalog_fence_version)\nSELECT COALESCE(MAX(epoch), 0) + 1, $1, $2, $3, 0\nFROM walrus.replication_state\nRETURNING epoch\n",
   "describe": {
     "columns": [
       {
@@ -25,5 +25,5 @@
       false
     ]
   },
-  "hash": "95f01230d299b6711ff0cc8079a0dda7cc1aae8ffb704b9ff9d9164aafeca9ae"
+  "hash": "8affaa11ec1505eeb61bbcf16694fe7f5edba32fde38f7f90077230d3e594d6f"
 }

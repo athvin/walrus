@@ -83,6 +83,10 @@ async fn clear_control_epoch(pool: &sqlx::PgPool, epoch: EpochNo) {
         .execute(&mut *tx)
         .await
         .unwrap();
+    sqlx::query("SELECT set_config('walrus.schema_registry_maintenance','1-delete',true)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     for table in [
         "file_manifest",
         "stream_manifest_group",

@@ -6,13 +6,17 @@ use common::{EpochNo, Lsn};
 use sqlx::{PgExecutor, Row};
 use uuid::Uuid;
 
+/// Catalog-fence protocol understood by this binary. Version zero denotes generations created
+/// before the source-table lock/LSN fence was introduced and is deliberately not resumable by the
+/// sink: startup opens a reconciled successor instead.
+pub const CURRENT_CATALOG_FENCE_VERSION: i32 = 1;
+
 string_enum! {
     /// Where a generation stands — the canonical enum for the `status` text column.
     ///
-    /// Alone among the control plane's text-column enums this one has **no** SQL `CHECK` behind it:
-    /// the vocabulary lives only in the migration's trailing comment, so this variant table is the
-    /// only thing standing between a typo and a generation row nothing can classify. Every
-    /// A fresh generation is born `Bootstrapping` and moves to `Streaming` only after its bound
+    /// The migration carries the same three-value `CHECK`, while this type keeps invalid database
+    /// values from crossing the Rust boundary. A fresh generation is born `Bootstrapping` and moves
+    /// to `Streaming` only after its bound
     /// all-table reconciliation publishes every child. `TotalRestart` is the durable intent written
     /// before replacing a lost source slot; a process that finds that intent must open a successor
     /// generation instead of resuming this one.
@@ -34,8 +38,10 @@ pub struct ReplicationState {
     pub epoch: EpochNo,
     /// The replication slot whose lifetime *is* this generation.
     pub slot_name: String,
-    /// The WAL retention/start LSN at slot creation (no exported snapshot is required).
+    /// The generation's writer-drained catalog/start LSN (no exported snapshot is required).
     pub created_lsn: Lsn,
+    /// Provenance for the catalog/LSN boundary used to open this generation. Zero is legacy/racy.
+    pub catalog_fence_version: i32,
     /// Where the generation stands; see [`ReplicationStatus`].
     pub status: ReplicationStatus,
 }
@@ -76,11 +82,9 @@ impl BootstrapProgress {
 pub async fn read_current_epoch(
     ex: impl PgExecutor<'_>,
 ) -> Result<Option<ReplicationState>, ControlError> {
-    // The `status` text column decodes to `String` here, then parses into the typed enum — the same
-    // shape as `manifest::claim_ready`, and for the same two reasons: a value outside the known set
-    // is a data-integrity bug (the sink only ever writes `as_str()`) that belongs in the terminal
-    // `Decode`, and the SQL text is unchanged, so the committed `.sqlx` offline cache stays valid
-    // without a regenerate.
+    // The `status` text column decodes to `String` here, then parses into the typed enum: a value
+    // outside the known set is a data-integrity bug (the sink only ever writes `as_str()`) that
+    // belongs in the terminal `Decode`.
     let current = sqlx::query_file!("sql/postgres/queries/read_current_epoch.sql")
         .fetch_optional(ex)
         .await?;
@@ -91,6 +95,7 @@ pub async fn read_current_epoch(
         epoch: current.epoch.into(),
         slot_name: current.slot_name,
         created_lsn: current.created_lsn,
+        catalog_fence_version: current.catalog_fence_version,
         status: current.status.parse()?,
     };
     Ok(Some(state))
@@ -126,7 +131,11 @@ pub async fn mark_total_restart(
     Ok(result.rows_affected() == 1)
 }
 
-/// Insert a new generation row for a newly created slot during bootstrap or total restart.
+/// Insert a legacy, provenance-zero generation row.
+///
+/// This helper exists for historical/test callers that do not own the source catalog-fence
+/// protocol. It deliberately cannot assert [`CURRENT_CATALOG_FENCE_VERSION`]; production opens a
+/// resumable generation only through [`bump_bootstrap_epoch`].
 ///
 /// # Errors
 ///
@@ -134,22 +143,28 @@ pub async fn mark_total_restart(
 /// the proposed generation violates a database invariant.
 pub async fn insert_epoch(
     ex: impl PgExecutor<'_>,
-    s: &ReplicationState,
+    epoch: EpochNo,
+    slot_name: &str,
+    created_lsn: Lsn,
+    status: ReplicationStatus,
 ) -> Result<(), ControlError> {
     sqlx::query_file!(
         "sql/postgres/queries/insert_epoch.sql",
-        s.epoch.0,
-        s.slot_name,
-        s.created_lsn as Lsn,
-        s.status.as_str(),
+        epoch.0,
+        slot_name,
+        created_lsn as Lsn,
+        status.as_str(),
     )
     .execute(ex)
     .await?;
     Ok(())
 }
 
-/// Open a new generation (§1.8 total-restart): insert `MAX(epoch) + 1` with the given slot + start
-/// `created_lsn`, returning the **new epoch**. Atomic (the `SELECT MAX … RETURNING` is one statement),
+/// Open a legacy, provenance-zero generation at `MAX(epoch) + 1`.
+///
+/// This compatibility helper cannot assert catalog-fence provenance. Production total restart
+/// uses [`bump_bootstrap_epoch`] after capturing the source fence. The insert is atomic (the
+/// `SELECT MAX … RETURNING` is one statement),
 /// and monotonic by construction — the new epoch strictly exceeds every prior one, so it cleanly
 /// re-namespaces all state (S3 prefix, manifest, checkpoints, registry). On an empty table it yields
 /// `1`, so first-bootstrap and total-restart share this one path; the caller distinguishes them (a prior
@@ -197,19 +212,32 @@ pub async fn bump_bootstrap_epoch(
     targets: &serde_json::Value,
 ) -> Result<Option<EpochNo>, ControlError> {
     let row = sqlx::query(
-        "WITH current_state AS (
+        "WITH authorized AS MATERIALIZED (
+           SELECT pg_catalog.set_config('walrus.catalog_fence_protocol', '1', true) AS protocol
+         ), current_state AS (
            SELECT MAX(epoch) AS epoch
            FROM walrus.replication_state
+         ), inserted AS MATERIALIZED (
+           INSERT INTO walrus.replication_state
+           (epoch, slot_name, created_lsn, status, bootstrap_request_id,
+            bootstrap_expected_tables, bootstrap_targets, catalog_fence_version)
+           SELECT COALESCE(current_state.epoch, 0) + 1,
+                  $1, $2, 'bootstrapping', $3, $4, $5, $7
+           FROM current_state
+           CROSS JOIN authorized
+           WHERE current_state.epoch IS NOT DISTINCT FROM $6
+             AND authorized.protocol = '1'
+           ON CONFLICT (epoch) DO NOTHING
+           RETURNING epoch
+         ), deauthorized AS MATERIALIZED (
+           SELECT pg_catalog.set_config('walrus.catalog_fence_protocol', '', true) AS protocol
+           FROM (SELECT count(*) AS inserted_count FROM inserted) AS consumed
+           WHERE consumed.inserted_count >= 0
          )
-         INSERT INTO walrus.replication_state
-         (epoch, slot_name, created_lsn, status, bootstrap_request_id,
-          bootstrap_expected_tables, bootstrap_targets)
-         SELECT COALESCE(current_state.epoch, 0) + 1,
-                $1, $2, 'bootstrapping', $3, $4, $5
-         FROM current_state
-         WHERE current_state.epoch IS NOT DISTINCT FROM $6
-         ON CONFLICT (epoch) DO NOTHING
-         RETURNING epoch",
+         SELECT inserted.epoch
+         FROM deauthorized
+         LEFT JOIN inserted ON true
+         WHERE deauthorized.protocol = ''",
     )
     .bind(slot_name)
     .bind(created_lsn)
@@ -217,12 +245,11 @@ pub async fn bump_bootstrap_epoch(
     .bind(expected_tables)
     .bind(targets)
     .bind(expected_current.map(|epoch| epoch.0))
-    .fetch_optional(ex)
+    .bind(CURRENT_CATALOG_FENCE_VERSION)
+    .fetch_one(ex)
     .await?;
-    match row {
-        Some(row) => Ok(Some(EpochNo(row.try_get("epoch")?))),
-        None => Ok(None),
-    }
+    let epoch = row.try_get::<Option<i64>, _>("epoch")?;
+    Ok(epoch.map(EpochNo))
 }
 
 /// Read progress for an epoch that is still waiting on its bound all-table reconciliation.
@@ -279,11 +306,13 @@ pub async fn read_bootstrap_progress(
     .map_err(Into::into)
 }
 
-/// Promote a bootstrapping epoch only if every child of its bound request is complete.
+/// Promote a bootstrapping epoch only if every exact frozen target's latest child is complete.
 ///
-/// The readiness predicate is repeated in this guarded update rather than trusting a prior Rust
-/// read, making promotion atomic with respect to child transitions. Returns `false` when the group
-/// is incomplete or another actor already promoted it.
+/// The migration-owned readiness function validates the target JSON, rejects duplicate identities,
+/// selects the latest DDL-restart child for each table, and requires exact bidirectional equality
+/// for both the child and schema-registry table sets. The row trigger calls the same function, so a
+/// direct status update cannot bypass this guarded path. Returns `false` when the group is
+/// incomplete or another actor already promoted it.
 ///
 /// # Errors
 ///
@@ -294,28 +323,17 @@ pub async fn complete_bootstrap(
     request_id: Uuid,
 ) -> Result<bool, ControlError> {
     let done = sqlx::query(
-        "WITH latest_child AS (
-           SELECT DISTINCT ON (tr.source_schema, tr.source_table)
-                  tr.reload_id, tr.epoch, tr.parent_request_id, tr.request_scope, tr.status
-           FROM walrus.table_reload tr
-           WHERE tr.epoch = $1
-             AND tr.parent_request_id = $2
-           ORDER BY tr.source_schema, tr.source_table, tr.reload_id DESC
-         )
-         UPDATE walrus.replication_state rs
+        "UPDATE walrus.replication_state rs
          SET status = 'streaming'
          WHERE rs.epoch = $1
            AND rs.status = 'bootstrapping'
            AND rs.bootstrap_request_id = $2
-           AND (
-             SELECT count(*) = rs.bootstrap_expected_tables
-                AND count(*) FILTER (WHERE tr.status = 'complete') =
-                    rs.bootstrap_expected_tables
-                AND count(*) FILTER (WHERE tr.status = 'failed') = 0
-             FROM latest_child tr
-             WHERE tr.epoch = rs.epoch
-               AND tr.parent_request_id = rs.bootstrap_request_id
-               AND tr.request_scope = 'all_published'
+           AND walrus.bootstrap_generation_ready(
+             rs.epoch,
+             rs.bootstrap_request_id,
+             rs.bootstrap_expected_tables,
+             rs.bootstrap_targets,
+             rs.catalog_fence_version
            )",
     )
     .bind(epoch.0)

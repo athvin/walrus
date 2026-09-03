@@ -381,6 +381,23 @@ pub async fn handle_integrity_failure(
                 });
             }
         }
+        // The row lock above serializes this purge with reload-manifest insertion. Purge before
+        // the terminal flip so the database's immediate terminal-with-no-children invariant is
+        // independently true; a later failure rolls the entire transaction back.
+        sqlx::query(
+            "WITH authorized AS MATERIALIZED (
+               SELECT set_config('walrus.manifest_delete_protocol', '2', true) AS protocol
+             )
+             DELETE FROM walrus.file_manifest
+             WHERE reload_id = $1
+               AND (SELECT protocol = '2' FROM authorized)",
+        )
+        .bind(reload_id.0)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("SELECT pg_catalog.set_config('walrus.manifest_delete_protocol', '', true)")
+            .execute(&mut *tx)
+            .await?;
         let aborted = sqlx::query(
             "UPDATE walrus.table_reload
              SET status = 'failed', error = $2,
@@ -399,17 +416,6 @@ pub async fn handle_integrity_failure(
                 expected: "the row-locked active reload being aborted for integrity recovery",
             });
         }
-        sqlx::query(
-            "WITH authorized AS MATERIALIZED (
-               SELECT set_config('walrus.manifest_delete_protocol', '2', true) AS protocol
-             )
-             DELETE FROM walrus.file_manifest
-             WHERE reload_id = $1
-               AND (SELECT protocol = '2' FROM authorized)",
-        )
-        .bind(reload_id.0)
-        .execute(&mut *tx)
-        .await?;
     } else if let Some(publication) = failure.publication {
         return Err(ControlError::ReloadTransition {
             reload_id: publication.reload_id,

@@ -63,14 +63,14 @@ WITH authorized AS MATERIALIZED (
      OR max_child_schema_version > final_schema_version
      OR file_shape <> actual_shape
   LIMIT 1
-), applied_groups AS (
+), applied_groups AS MATERIALIZED (
   UPDATE walrus.stream_manifest_group AS g
   SET status = 'applied', applied_at = now()
   WHERE g.id IN (SELECT id FROM locked_groups)
     AND g.status = 'ready'
     AND NOT EXISTS (SELECT 1 FROM invalid_group)
   RETURNING g.id
-), deleted AS (
+), deleted AS MATERIALIZED (
   DELETE FROM walrus.file_manifest AS manifest
   USING requested
   WHERE manifest.id = requested.id
@@ -82,5 +82,11 @@ WITH authorized AS MATERIALIZED (
       OR manifest.stream_group_id IN (SELECT id FROM applied_groups)
     )
   RETURNING manifest.id
+), deauthorized AS MATERIALIZED (
+  SELECT pg_catalog.set_config('walrus.manifest_delete_protocol', '', true) AS protocol
+  FROM (SELECT count(*) FROM applied_groups) AS applied_result
+  CROSS JOIN (SELECT count(*) FROM deleted) AS deleted_result
 )
-SELECT count(*)::bigint AS deleted_count FROM deleted
+SELECT (SELECT count(*)::bigint FROM deleted) AS deleted_count
+FROM deauthorized
+WHERE deauthorized.protocol = ''

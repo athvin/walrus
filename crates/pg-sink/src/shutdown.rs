@@ -12,10 +12,12 @@
 //! and calls [`drain`] — which runs **after** the `select!` loop exits, so a slow S3 PUT is never
 //! aborted mid-flight; the grace period bounds it externally, not cancellation.
 //!
-//! **Why the drain never drops the slot:** the slot persists across the connection, so a graceful
-//! shutdown is just a *resume* — the drain only minimises the replay the loader would de-duplicate
-//! anyway (at-least-once → effectively-once). An ungraceful `SIGKILL` is therefore still correct: the
-//! replacement pod resumes from `confirmed_flush_lsn` and re-streams the uncommitted tail.
+//! **Why the drain never drops the slot:** the physical WAL stream remains resumable from the slot's
+//! `confirmed_flush_lsn`; the drain only minimises the tail that can replay. Because a session guard
+//! cannot prove publication continuity across process lifetimes, the replacement service opens a
+//! reconciled successor epoch at that retained floor and rebuilds every frozen target while it
+//! streams the tail. An ungraceful `SIGKILL` is therefore still correct without trusting the old
+//! generation's catalog inventory.
 //!
 //! The signal task also selects on the token so it exits if cancellation comes from elsewhere — it
 //! never outlives the token as a leaked handle.
@@ -98,7 +100,7 @@ pub async fn drain<C: Clock + Clone>(
     if let Some(frontier) = max_durable {
         // (c) only after every sibling batch has a durable object + manifest. A crash during the
         // loop therefore replays the whole unacknowledged tail instead of losing later siblings.
-        checkpoint.on_batch_durable(frontier);
+        checkpoint.on_commit_durable(frontier)?;
     }
     // (3) The final standby update carries the durable confirmed_flush (clamped to the open-txn floor).
     checkpoint

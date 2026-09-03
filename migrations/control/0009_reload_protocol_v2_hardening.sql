@@ -92,9 +92,14 @@ RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
-  IF NEW.status = 'exporting' AND NEW.exporter_generation <= 0 THEN
+  IF NEW.status = 'exporting'
+     AND (
+       NEW.exporter_generation <= 0
+       OR NEW.lease_holder IS NULL
+       OR NEW.lease_expiry IS NULL
+     ) THEN
     RAISE EXCEPTION
-      'reload export requires a protocol-v2 exporter fencing generation'
+      'reload export requires a protocol-v2 exporter fencing generation and lease identity'
       USING ERRCODE = '23514', CONSTRAINT = 'table_reload_exporter_protocol_v2';
   END IF;
   RETURN NEW;
@@ -103,7 +108,8 @@ $$;
 
 CREATE TRIGGER table_reload_exporter_protocol_v2
 BEFORE INSERT OR UPDATE OF status, exporter_generation, chunk_no, cursor_pk,
-                           start_lsn, schema_version, export_snapshot, export_sealed_at
+                           start_lsn, schema_version, export_snapshot, export_sealed_at,
+                           lease_holder, lease_expiry
 ON walrus.table_reload
 FOR EACH ROW EXECUTE FUNCTION walrus.guard_reload_exporter_protocol_v2();
 
@@ -142,7 +148,40 @@ BEGIN
   IF NOT (
     OLD.status = NEW.status
     OR (OLD.status = 'requested' AND NEW.status IN ('exporting', 'failed'))
-    OR (OLD.status = 'exporting' AND NEW.status IN ('requested', 'export_complete', 'failed'))
+    OR (
+      OLD.status = 'exporting' AND NEW.status = 'requested'
+      AND OLD.start_lsn IS NULL
+      AND OLD.first_lsn IS NULL
+      AND OLD.final_lsn IS NULL
+      AND OLD.schema_version IS NULL
+      AND OLD.chunk_no = 0
+      AND OLD.cursor_pk IS NULL
+      AND OLD.export_snapshot IS NULL
+      AND OLD.export_snapshot_xmin IS NULL
+      AND OLD.export_snapshot_xmax IS NULL
+      AND OLD.export_range_count IS NULL
+      AND OLD.export_sealed_at IS NULL
+      AND OLD.export_file_count IS NULL
+      AND OLD.export_row_count IS NULL
+      AND NEW.lease_holder IS NULL
+      AND NEW.lease_expiry IS NULL
+      AND (to_jsonb(NEW) - ARRAY['status', 'lease_holder', 'lease_expiry', 'updated_at']::text[])
+          IS NOT DISTINCT FROM
+          (to_jsonb(OLD) - ARRAY['status', 'lease_holder', 'lease_expiry', 'updated_at']::text[])
+      AND NOT EXISTS (
+        SELECT 1 FROM walrus.table_reload_marker AS marker
+        WHERE marker.reload_id = OLD.reload_id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM walrus.table_reload_export_range AS export_range
+        WHERE export_range.reload_id = OLD.reload_id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM walrus.file_manifest AS manifest
+        WHERE manifest.reload_id = OLD.reload_id
+      )
+    )
+    OR (OLD.status = 'exporting' AND NEW.status IN ('export_complete', 'failed'))
     OR (OLD.status = 'export_complete' AND NEW.status IN ('publishing', 'complete', 'failed'))
     OR (OLD.status = 'publishing' AND NEW.status = 'complete')
     OR (
@@ -161,6 +200,16 @@ BEGIN
   ) THEN
     RAISE EXCEPTION 'illegal table reload status transition % -> %', OLD.status, NEW.status
       USING ERRCODE = '23514', CONSTRAINT = 'table_reload_status_transition';
+  END IF;
+  IF NEW.status = 'failed'
+     AND OLD.status IS DISTINCT FROM 'failed'
+     AND EXISTS (
+       SELECT 1 FROM walrus.file_manifest AS manifest
+       WHERE manifest.reload_id = OLD.reload_id
+     ) THEN
+    RAISE EXCEPTION
+      'reloads cannot become terminal while staged manifests remain'
+      USING ERRCODE = '23514', CONSTRAINT = 'table_reload_failure_requires_purge';
   END IF;
   RETURN NEW;
 END $$;
@@ -269,6 +318,89 @@ CREATE TABLE walrus.table_reload_export_range (
 CREATE INDEX table_reload_export_range_generation_idx
   ON walrus.table_reload_export_range (reload_id, exporter_generation, status, range_no);
 
+-- The physical COPY partition is a durable receipt, not scheduler scratch space. The exporter may
+-- insert the frozen plan once and turn each row from `planned` into one exact `complete` receipt;
+-- every plan coordinate and every completed count is immutable. Administrative teardown uses the
+-- same explicit maintenance tripwire as the other append-only publication evidence.
+CREATE FUNCTION walrus.guard_reload_export_range_semantics()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP IN ('DELETE', 'TRUNCATE') THEN
+    IF current_setting('walrus.manifest_fence_maintenance', true) IS DISTINCT FROM '2-delete' THEN
+      RAISE EXCEPTION 'reload export range receipts are append-only durable protocol evidence'
+        USING ERRCODE = '23514', CONSTRAINT = 'table_reload_export_range_removal';
+    END IF;
+    IF TG_OP = 'DELETE' THEN
+      RETURN OLD;
+    END IF;
+    RETURN NULL;
+  END IF;
+
+  IF TG_OP = 'INSERT' THEN
+    IF current_setting('walrus.reload_export_plan_protocol', true) IS DISTINCT FROM '2' THEN
+      RAISE EXCEPTION 'reload export ranges may be inserted only by the live frozen-plan path'
+        USING ERRCODE = '23514', CONSTRAINT = 'table_reload_export_range_insert_protocol';
+    END IF;
+    PERFORM 1
+    FROM walrus.table_reload AS reload
+    WHERE reload.reload_id = NEW.reload_id
+      AND reload.status = 'exporting'
+      AND reload.exporter_generation = NEW.exporter_generation
+      AND reload.export_snapshot IS NOT NULL
+      AND reload.export_sealed_at IS NULL
+      AND NEW.range_no < reload.export_range_count
+    FOR UPDATE;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'reload export ranges may be inserted only by the live frozen-plan path'
+        USING ERRCODE = '23514', CONSTRAINT = 'table_reload_export_range_insert_protocol';
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  IF ROW(
+       NEW.reload_id, NEW.exporter_generation, NEW.range_no, NEW.full_scan,
+       NEW.start_block, NEW.end_block, NEW.planned_at
+     ) IS DISTINCT FROM ROW(
+       OLD.reload_id, OLD.exporter_generation, OLD.range_no, OLD.full_scan,
+       OLD.start_block, OLD.end_block, OLD.planned_at
+     ) THEN
+    RAISE EXCEPTION 'reload export range plan semantics are immutable'
+      USING ERRCODE = '23514', CONSTRAINT = 'table_reload_export_range_semantics_immutable';
+  END IF;
+
+  IF ROW(NEW.status, NEW.file_count, NEW.row_count, NEW.completed_at)
+       IS NOT DISTINCT FROM
+     ROW(OLD.status, OLD.file_count, OLD.row_count, OLD.completed_at) THEN
+    RETURN NEW;
+  END IF;
+
+  IF OLD.status = 'planned' AND NEW.status = 'complete'
+     AND current_setting('walrus.reload_export_plan_protocol', true) = '2' THEN
+    PERFORM 1
+    FROM walrus.table_reload AS reload
+    WHERE reload.reload_id = OLD.reload_id
+      AND reload.status = 'exporting'
+      AND reload.exporter_generation = OLD.exporter_generation
+      AND reload.export_snapshot IS NOT NULL
+      AND reload.export_sealed_at IS NULL
+    FOR UPDATE;
+    IF FOUND THEN
+      RETURN NEW;
+    END IF;
+  END IF;
+
+  RAISE EXCEPTION 'illegal reload export range receipt transition'
+    USING ERRCODE = '23514', CONSTRAINT = 'table_reload_export_range_status_transition';
+END $$;
+
+CREATE TRIGGER table_reload_export_range_semantics
+BEFORE INSERT OR UPDATE OR DELETE ON walrus.table_reload_export_range
+FOR EACH ROW EXECUTE FUNCTION walrus.guard_reload_export_range_semantics();
+
+CREATE TRIGGER table_reload_export_range_truncate_guard
+BEFORE TRUNCATE ON walrus.table_reload_export_range
+FOR EACH STATEMENT EXECUTE FUNCTION walrus.guard_reload_export_range_semantics();
+
 -- A queued source request must not enter `exporting` while the loader is reconciling or recovering
 -- publication of its predecessor. Terminal rows leave this fence as before.
 DROP INDEX walrus.table_reload_one_live;
@@ -345,6 +477,14 @@ ALTER TABLE walrus.file_manifest
   ADD CONSTRAINT file_manifest_group_ordinal_unique
     UNIQUE (stream_group_id, stream_group_ordinal);
 
+-- Publication drain/seal inspects every status, not only the ready rows covered by the legacy claim
+-- index. Keeping ungrouped ranges together makes both the <= H drain and the straddler attestation
+-- bounded by this table's live queue slice.
+CREATE INDEX file_manifest_ungrouped_range_idx
+  ON walrus.file_manifest
+    (epoch, source_schema, source_table, lsn_end, lsn_start, id)
+  WHERE stream_group_id IS NULL;
+
 -- A reload object is meaningful only for the exact table/epoch attempt that exported it. A
 -- reload_id-only reference would allow an incorrectly labelled object to pass the export seal and
 -- later be routed into another table. Ordinary stream rows keep reload_id NULL and therefore do
@@ -360,10 +500,11 @@ ALTER TABLE walrus.file_manifest
     ON DELETE RESTRICT;
 
 -- Cross-row timing cannot be expressed as a CHECK/FK: reload objects may be inserted only while
--- the exact attempt's exported snapshot is live and unsealed. Taking a key-share lock lets
--- parallel workers update their completed-file count without deadlocking one another. The seal
--- takes an explicit FOR UPDATE lock in a first statement, then validates manifests under the next
--- READ COMMITTED snapshot, so it both waits for these inserts and prevents later ones.
+-- the exact attempt's exported snapshot is live and unsealed. Taking a FOR UPDATE row lock
+-- serializes each manifest validation with fail/seal/complete while still allowing parallel
+-- workers to do their remote upload work concurrently. The seal takes the same explicit lock in a
+-- first statement, then validates manifests under the next READ COMMITTED snapshot, so it both
+-- waits for these inserts and prevents later ones.
 -- The trigger serializes the insert with fail/seal/complete, closing the otherwise possible
 -- "late object after seal" window. Status-only integrity updates do not invoke this identity
 -- trigger.
@@ -561,6 +702,32 @@ BEGIN
       USING ERRCODE = '23514', CONSTRAINT = 'manifest_publication_fence_monotonic';
   END IF;
 
+  -- A normal end-fence force-flush prevents one ordinary file from spanning H, but the durable
+  -- cutover must attest that invariant itself. Otherwise a buggy/direct publisher could leave a
+  -- pre-existing ungrouped file invisible to the <= H drain and make it claimable only after swap.
+  IF NEW.sealed_through_lsn IS NOT NULL
+     AND (
+       TG_OP = 'INSERT'
+       OR (
+         TG_OP = 'UPDATE'
+         AND NEW.sealed_through_lsn IS DISTINCT FROM OLD.sealed_through_lsn
+       )
+     )
+     AND EXISTS (
+       SELECT 1
+       FROM walrus.file_manifest AS manifest
+       WHERE manifest.epoch = NEW.epoch
+         AND manifest.source_schema = NEW.source_schema
+         AND manifest.source_table = NEW.source_table
+         AND manifest.stream_group_id IS NULL
+         AND manifest.lsn_start <= NEW.sealed_through_lsn
+         AND manifest.lsn_end > NEW.sealed_through_lsn
+     ) THEN
+    RAISE EXCEPTION
+      'cannot seal manifest publication while an ungrouped manifest straddles the boundary'
+      USING ERRCODE = '23514', CONSTRAINT = 'manifest_publication_fence_ungrouped_straddler';
+  END IF;
+
   IF (
        (TG_OP = 'INSERT' AND NEW.sealed_through_lsn IS NOT NULL)
        OR
@@ -622,6 +789,8 @@ SELECT legacy.epoch, legacy.source_schema, legacy.source_table,
 FROM legacy_seals AS legacy
 CROSS JOIN authorized
 WHERE authorized.protocol = '2';
+
+SELECT set_config('walrus.manifest_seal_protocol', '', true);
 
 -- Once claimed, the reload publication identity is a permanent lost-ACK receipt. Status/error
 -- fields may advance, but neither a later seal nor a newer reload may rewrite the completed proof.

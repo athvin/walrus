@@ -150,12 +150,10 @@ async fn setup(epoch: EpochNo) -> (TableCtx, tempfile::TempDir) {
     support::cleanup_epoch(&pool, epoch).await;
     control::insert_epoch(
         &pool,
-        &control::ReplicationState {
-            epoch,
-            slot_name: "walrus_slot".into(),
-            created_lsn: "0/0".parse().unwrap(),
-            status: control::ReplicationStatus::Streaming,
-        },
+        epoch,
+        "walrus_slot",
+        "0/0".parse().unwrap(),
+        control::ReplicationStatus::Streaming,
     )
     .await
     .unwrap();
@@ -297,11 +295,17 @@ async fn pause_withholds_claims_and_lifts_on_failed() {
     let uri = write_fixture(epoch);
     let (ctx, _dir) = setup(epoch).await;
     seed_manifest(&ctx.pool, epoch, &uri).await;
-    sqlx::query("DELETE FROM walrus.table_reload WHERE epoch = $1")
-        .bind(epoch)
-        .execute(&ctx.pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "WITH authorized AS MATERIALIZED (
+           SELECT set_config('walrus.manifest_fence_maintenance','2-delete',true) AS protocol
+         )
+         DELETE FROM walrus.table_reload
+         WHERE epoch = $1 AND (SELECT protocol = '2-delete' FROM authorized)",
+    )
+    .bind(epoch)
+    .execute(&ctx.pool)
+    .await
+    .unwrap();
 
     // A live reload: Phase A must treat the table as PAUSED, not idle.
     let reload_id = control::reload::request(
@@ -363,9 +367,15 @@ async fn pause_withholds_claims_and_lifts_on_failed() {
         "the latch clears when claiming resumes"
     );
 
-    sqlx::query("DELETE FROM walrus.table_reload WHERE epoch = $1")
-        .bind(epoch)
-        .execute(&ctx.pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "WITH authorized AS MATERIALIZED (
+           SELECT set_config('walrus.manifest_fence_maintenance','2-delete',true) AS protocol
+         )
+         DELETE FROM walrus.table_reload
+         WHERE epoch = $1 AND (SELECT protocol = '2-delete' FROM authorized)",
+    )
+    .bind(epoch)
+    .execute(&ctx.pool)
+    .await
+    .unwrap();
 }

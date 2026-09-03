@@ -97,23 +97,35 @@ fn s3() -> S3Access {
 
 /// Seed a fresh epoch as the current one + register `orders`, cleaning any prior control state.
 async fn seed(pool: &sqlx::PgPool, epoch: EpochNo) {
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SELECT set_config('walrus.schema_registry_maintenance', '1-delete', true)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("SELECT set_config('walrus.replication_state_maintenance', '1-delete', true)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     for tbl in [
         "table_ownership",
         "loader_checkpoint",
         "schema_registry",
         "replication_state",
     ] {
-        let sql = cleanup_sql(tbl);
-        let _ = sqlx::query(&sql).bind(epoch).execute(pool).await;
+        let sql = format!("DELETE FROM walrus.{tbl} WHERE epoch = $1");
+        sqlx::query(&sql)
+            .bind(epoch.0)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
     }
+    tx.commit().await.unwrap();
     control::insert_epoch(
         pool,
-        &control::ReplicationState {
-            epoch,
-            slot_name: "walrus_slot".into(),
-            created_lsn: "0/0".parse().unwrap(),
-            status: control::ReplicationStatus::Streaming,
-        },
+        epoch,
+        "walrus_slot",
+        "0/0".parse().unwrap(),
+        control::ReplicationStatus::Streaming,
     )
     .await
     .unwrap();
@@ -131,16 +143,6 @@ async fn seed(pool: &sqlx::PgPool, epoch: EpochNo) {
     )
     .await
     .unwrap();
-}
-
-fn cleanup_sql(table: &str) -> String {
-    if table == "file_manifest" {
-        format!(
-            "WITH authorized AS MATERIALIZED (SELECT set_config('walrus.manifest_delete_protocol','2',true) AS protocol) DELETE FROM walrus.{table} WHERE epoch = $1 AND (SELECT protocol = '2' FROM authorized)"
-        )
-    } else {
-        format!("DELETE FROM walrus.{table} WHERE epoch = $1")
-    }
 }
 
 async fn next_epoch(pool: &sqlx::PgPool) -> EpochNo {

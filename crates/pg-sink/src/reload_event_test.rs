@@ -127,6 +127,11 @@ fn abort_drops_only_the_matching_streamed_event() {
         });
     }
     pending.on_stream_abort(10, 11);
+    assert_eq!(
+        pending.stream_effect_count(10),
+        1,
+        "the mixed-DDL guard counts only surviving subtransactions"
+    );
     let committed = pending.on_stream_commit(10, "0/30".parse().unwrap());
     assert_eq!(committed.len(), 1);
     assert_eq!(committed[0].event.xid, Some(10));
@@ -155,6 +160,10 @@ fn stream_commit_promotes_only_its_top_level_transaction() {
             top_xid: Some(top_xid),
         });
     }
+
+    assert_eq!(pending.stream_effect_count(10), 1);
+    assert_eq!(pending.stream_effect_count(20), 1);
+    assert_eq!(pending.ordinary_effect_count(), 0);
 
     let first = pending.on_stream_commit(10, "0/30".parse().unwrap());
     assert_eq!(first.len(), 1);

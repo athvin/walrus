@@ -11,6 +11,7 @@
 #![cfg(feature = "integration")]
 
 use common::{EpochNo, Lsn, SchemaVersionNo};
+use control::reload::{self, ExportRangePlan, ExportSnapshot, ReloadFenceIdentity, ReloadFlavor};
 use control::{
     ManifestKind, NewManifestFile, claim_ready, connect, delete_claimed, insert_ready,
     run_migrations,
@@ -66,6 +67,257 @@ async fn migrations_create_all_tables() {
         .unwrap();
         assert!(exists, "walrus.{table} must exist after migration");
     }
+}
+
+#[tokio::test]
+async fn catalog_fence_migration_marks_legacy_epochs_and_guards_provenance() {
+    let pool = migrated_pool().await;
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE walrus.replication_state IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let default_version: i32 = sqlx::query_scalar(
+        "INSERT INTO walrus.replication_state (epoch, slot_name, created_lsn, status)
+         VALUES ((SELECT COALESCE(MAX(epoch), 0) + 1 FROM walrus.replication_state),
+                 'legacy-catalog-fence-test', '0/0', 'streaming')
+         RETURNING catalog_fence_version",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(
+        default_version, 0,
+        "unproven generations must remain legacy"
+    );
+
+    for mutation in [
+        "UPDATE walrus.replication_state SET slot_name = 'rewritten-slot' WHERE slot_name = 'legacy-catalog-fence-test'",
+        "UPDATE walrus.replication_state SET created_lsn = '0/10' WHERE slot_name = 'legacy-catalog-fence-test'",
+        "UPDATE walrus.replication_state SET catalog_fence_version = 1 WHERE slot_name = 'legacy-catalog-fence-test'",
+        "UPDATE walrus.replication_state SET bootstrap_request_id = '00000000-0000-0000-0000-000000000001' WHERE slot_name = 'legacy-catalog-fence-test'",
+        "UPDATE walrus.replication_state SET created_at = created_at + interval '1 second' WHERE slot_name = 'legacy-catalog-fence-test'",
+    ] {
+        let mut savepoint = Connection::begin(&mut *tx).await.unwrap();
+        let error = sqlx::query(mutation)
+            .execute(&mut *savepoint)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::constraint),
+            Some("replication_state_identity_immutable"),
+            "mutation must not rewrite generation provenance: {mutation}"
+        );
+        savepoint.rollback().await.unwrap();
+    }
+
+    sqlx::query(
+        "UPDATE walrus.replication_state
+         SET status = 'total_restart'
+         WHERE slot_name = 'legacy-catalog-fence-test'",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    let mut savepoint = Connection::begin(&mut *tx).await.unwrap();
+    let illegal_status = sqlx::query(
+        "UPDATE walrus.replication_state
+         SET status = 'streaming'
+         WHERE slot_name = 'legacy-catalog-fence-test'",
+    )
+    .execute(&mut *savepoint)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        illegal_status
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::constraint),
+        Some("replication_state_status_transition")
+    );
+    savepoint.rollback().await.unwrap();
+
+    let legacy_bootstrap_epoch: i64 = sqlx::query_scalar(
+        "INSERT INTO walrus.replication_state (
+           epoch, slot_name, created_lsn, status,
+           bootstrap_request_id, bootstrap_expected_tables, bootstrap_targets
+         ) VALUES (
+           (SELECT COALESCE(MAX(epoch), 0) + 1 FROM walrus.replication_state),
+           'legacy-bootstrap-promotion-test', '0/0', 'bootstrapping',
+           '00000000-0000-0000-0000-000000000002', 0, '[]'::jsonb
+         )
+         RETURNING epoch",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    let mut savepoint = Connection::begin(&mut *tx).await.unwrap();
+    let legacy_promotion = sqlx::query(
+        "UPDATE walrus.replication_state
+         SET status = 'streaming'
+         WHERE epoch = $1",
+    )
+    .bind(legacy_bootstrap_epoch)
+    .execute(&mut *savepoint)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        legacy_promotion
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::constraint),
+        Some("replication_state_bootstrap_promotion_guard"),
+        "catalog-fence protocol 0 must not satisfy the exact v1 promotion proof"
+    );
+    savepoint.rollback().await.unwrap();
+
+    // Even a perfectly shaped direct v1 insert lacks evidence that created_lsn came from the
+    // writer-drained source transaction. Only bump_bootstrap_epoch sets the statement tripwire.
+    let mut savepoint = Connection::begin(&mut *tx).await.unwrap();
+    let unfenced_v1 = sqlx::query(
+        "INSERT INTO walrus.replication_state (
+           epoch, slot_name, created_lsn, status,
+           bootstrap_request_id, bootstrap_expected_tables, bootstrap_targets,
+           catalog_fence_version
+         ) VALUES (
+           (SELECT COALESCE(MAX(epoch), 0) + 1 FROM walrus.replication_state),
+           'direct-v1-insert-test', '0/10', 'bootstrapping',
+           '00000000-0000-0000-0000-000000000003', 0, '[]'::jsonb, 1
+         )",
+    )
+    .execute(&mut *savepoint)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        unfenced_v1
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::constraint),
+        Some("replication_state_catalog_fence_insert_protocol")
+    );
+    savepoint.rollback().await.unwrap();
+
+    for (case_name, status, expected_tables, targets, created_lsn) in [
+        ("streaming", "streaming", 0_i64, "[]", "0/10"),
+        (
+            "duplicate-target",
+            "bootstrapping",
+            2,
+            r#"[{"schema":"public","table":"orders"},{"schema":"public","table":"orders"}]"#,
+            "0/10",
+        ),
+        ("zero-lsn", "bootstrapping", 0, "[]", "0/0"),
+    ] {
+        let mut savepoint = Connection::begin(&mut *tx).await.unwrap();
+        sqlx::query("SELECT set_config('walrus.catalog_fence_protocol', '1', true)")
+            .execute(&mut *savepoint)
+            .await
+            .unwrap();
+        let malformed_v1 = sqlx::query(
+            "INSERT INTO walrus.replication_state (
+               epoch, slot_name, created_lsn, status,
+               bootstrap_request_id, bootstrap_expected_tables, bootstrap_targets,
+               catalog_fence_version
+             ) VALUES (
+               (SELECT COALESCE(MAX(epoch), 0) + 1 FROM walrus.replication_state),
+               $1, $2, $3,
+               '00000000-0000-0000-0000-000000000004', $4, $5::jsonb, 1
+             )",
+        )
+        .bind(format!("invalid-v1-{case_name}"))
+        .bind(created_lsn.parse::<Lsn>().unwrap())
+        .bind(status)
+        .bind(expected_tables)
+        .bind(targets)
+        .execute(&mut *savepoint)
+        .await
+        .unwrap_err();
+        assert_eq!(
+            malformed_v1
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::constraint),
+            Some("replication_state_catalog_fence_shape"),
+            "protocol-v1 shape case {case_name} must be rejected"
+        );
+        savepoint.rollback().await.unwrap();
+    }
+
+    for (case_name, catalog_fence_version, status, constraint) in [
+        (
+            "future-version",
+            2,
+            "bootstrapping",
+            "replication_state_catalog_fence_version_supported",
+        ),
+        (
+            "unknown-status",
+            0,
+            "typo",
+            "replication_state_status_check",
+        ),
+    ] {
+        let mut savepoint = Connection::begin(&mut *tx).await.unwrap();
+        let unsupported = sqlx::query(
+            "INSERT INTO walrus.replication_state (
+               epoch, slot_name, created_lsn, status, catalog_fence_version
+             ) VALUES (
+               (SELECT COALESCE(MAX(epoch), 0) + 1 FROM walrus.replication_state),
+               $1, '0/10', $2, $3
+             )",
+        )
+        .bind(format!("invalid-{case_name}"))
+        .bind(status)
+        .bind(catalog_fence_version)
+        .execute(&mut *savepoint)
+        .await
+        .unwrap_err();
+        assert_eq!(
+            unsupported
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::constraint),
+            Some(constraint),
+            "replication-state insert case {case_name} must be rejected"
+        );
+        savepoint.rollback().await.unwrap();
+    }
+
+    for (removal, sql) in [
+        (
+            "delete",
+            "DELETE FROM walrus.replication_state WHERE slot_name = 'legacy-catalog-fence-test'",
+        ),
+        ("truncate", "TRUNCATE TABLE walrus.replication_state"),
+    ] {
+        let mut savepoint = Connection::begin(&mut *tx).await.unwrap();
+        let error = sqlx::query(sql).execute(&mut *savepoint).await.unwrap_err();
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::constraint),
+            Some("replication_state_removal_guard"),
+            "{removal} must not remove durable generation provenance"
+        );
+        savepoint.rollback().await.unwrap();
+    }
+
+    for (removal, sql) in [
+        (
+            "delete",
+            "DELETE FROM walrus.replication_state WHERE slot_name = 'legacy-catalog-fence-test'",
+        ),
+        ("truncate", "TRUNCATE TABLE walrus.replication_state"),
+    ] {
+        let mut maintenance = Connection::begin(&mut *tx).await.unwrap();
+        sqlx::query("SELECT set_config('walrus.replication_state_maintenance', '1-delete', true)")
+            .execute(&mut *maintenance)
+            .await
+            .unwrap();
+        sqlx::query(sql)
+            .execute(&mut *maintenance)
+            .await
+            .unwrap_or_else(|error| panic!("authorized {removal} must succeed: {error}"));
+        maintenance.rollback().await.unwrap();
+    }
+    tx.rollback().await.unwrap();
 }
 
 #[tokio::test]
@@ -206,10 +458,28 @@ async fn protocol_v2_migration_installs_export_publication_and_integrity_fences(
     }
 
     for trigger in [
+        "replication_state_insert_provenance",
+        "replication_state_catalog_registry_inventory",
+        "replication_state_identity_immutable",
+        "replication_state_delete_guard",
+        "replication_state_truncate_guard",
+        "schema_registry_semantics_immutable",
+        "schema_registry_delete_guard",
+        "schema_registry_truncate_guard",
+        "schema_registry_catalog_membership",
+        "ddl_manifest_semantics_immutable",
+        "ddl_manifest_delete_guard",
+        "ddl_manifest_truncate_guard",
         "table_reload_exporter_protocol_v2",
         "table_reload_exporter_acquisition_v2",
         "table_reload_status_transition",
         "table_reload_v2_completion_guard",
+        "table_reload_initial_evidence",
+        "table_reload_durable_evidence",
+        "table_reload_marker_evidence",
+        "table_reload_marker_truncate_guard",
+        "table_reload_export_range_semantics",
+        "table_reload_export_range_truncate_guard",
         "table_reload_publication_identity_immutable",
         "file_manifest_reload_attempt_guard",
         "file_manifest_delete_protocol_v2",
@@ -241,6 +511,21 @@ async fn protocol_v2_migration_installs_export_publication_and_integrity_fences(
         .unwrap();
         assert!(exists, "rollout/integrity trigger {trigger} must exist");
     }
+
+    let deferred_registry_guard: (bool, bool) = sqlx::query_as(
+        "SELECT tgdeferrable, tginitdeferred
+         FROM pg_trigger
+         WHERE tgname = 'replication_state_catalog_registry_inventory'
+           AND NOT tgisinternal",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        deferred_registry_guard,
+        (true, true),
+        "the initial registry proof must run after the bootstrap transaction inserts its children"
+    );
 
     let composite_receipt_fk: bool = sqlx::query_scalar(
         "SELECT EXISTS (
@@ -535,26 +820,73 @@ async fn publication_seal_and_completion_are_database_attested() {
     let epoch = EpochNo(i64::from_be_bytes(epoch_bytes) & i64::MAX);
     let nonce = Uuid::new_v4();
     let h: Lsn = "0/100".parse().unwrap();
-    let reload_id: i64 = sqlx::query_scalar(
-        "INSERT INTO walrus.table_reload (
-           epoch, source_schema, source_table, flavor, status,
-           start_lsn, final_lsn, schema_version, exporter_generation,
-           export_snapshot, export_snapshot_xmin, export_snapshot_xmax,
-           export_range_count, export_sealed_at, export_file_count, export_row_count,
-           publication_nonce, publisher_owner_pod, publisher_fencing_token, publishing_at
-         ) VALUES (
-           $1, 'public', 'db_attested_seal', 'reload', 'publishing',
-           $2, $2, 1, 1,
-           '1:2:', 1, 2, 1, now(), 0, 0,
-           $3, 'loader-attestation', 7, now()
-         ) RETURNING reload_id",
+    let reload = reload::request(
+        &mut *tx,
+        epoch,
+        "public",
+        "db_attested_seal",
+        ReloadFlavor::Reload,
     )
-    .bind(epoch.0)
-    .bind(h)
-    .bind(nonce)
-    .fetch_one(&mut *tx)
     .await
     .unwrap();
+    let claimed = reload::claim_requested(&mut *tx, epoch, "sink-attestation", 60, 1)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let lease = claimed.exporter_lease("sink-attestation").unwrap();
+    let schema_version = SchemaVersionNo(1);
+    let identity = ReloadFenceIdentity {
+        request_id: claimed.parent_request_id,
+        source_schema: "public",
+        source_table: "db_attested_seal",
+        schema_version,
+    };
+    reload::record_start_fence(&mut *tx, reload, h, identity)
+        .await
+        .unwrap();
+    reload::begin_export_plan(
+        &mut tx,
+        &lease,
+        h,
+        schema_version,
+        ExportSnapshot {
+            identity: "1:2:",
+            xmin: 1,
+            xmax: 2,
+        },
+        &[ExportRangePlan {
+            range_no: 0,
+            full_scan: true,
+            start_block: None,
+            end_block: None,
+        }],
+    )
+    .await
+    .unwrap();
+    reload::record_export_range(&mut *tx, &lease, 0, 0, 0)
+        .await
+        .unwrap();
+    reload::seal_export(&mut tx, &lease, h, schema_version)
+        .await
+        .unwrap();
+    reload::record_end_marker(&mut *tx, reload, h, identity)
+        .await
+        .unwrap();
+    reload::complete_export(&mut *tx, &lease, h).await.unwrap();
+    sqlx::query(
+        "UPDATE walrus.table_reload
+         SET status = 'publishing', publication_nonce = $2,
+             publisher_owner_pod = 'loader-attestation', publisher_fencing_token = 7,
+             publishing_at = now()
+         WHERE reload_id = $1",
+    )
+    .bind(reload.0)
+    .bind(nonce)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    let reload_id = reload.0;
     let mut savepoint = Connection::begin(&mut *tx).await.unwrap();
     let direct_complete_insert = sqlx::query(
         "INSERT INTO walrus.table_reload (
@@ -580,7 +912,7 @@ async fn publication_seal_and_completion_are_database_attested() {
         direct_complete_insert
             .as_database_error()
             .and_then(sqlx::error::DatabaseError::constraint),
-        Some("table_reload_v2_completion_guard")
+        Some("table_reload_initial_evidence_pristine")
     );
     savepoint.rollback().await.unwrap();
 
@@ -1029,6 +1361,98 @@ async fn checkpoint_check_rejects_transformed_ahead_of_raw() {
 }
 
 #[tokio::test]
+async fn reload_evidence_upgrade_rejects_v2_headers_missing_exact_markers() {
+    let pool = connect(&control_dsn())
+        .await
+        .expect("connect to control PG for isolated reload-evidence upgrade fixtures");
+    let mut tx = pool.begin().await.unwrap();
+
+    for case_name in ["missing_baseline", "missing_end", "unsealed_end"] {
+        let mut case = Connection::begin(&mut *tx).await.unwrap();
+        let schema = format!("walrus_evidence_{}", Uuid::new_v4().simple());
+        let qualify = |sql: &str| {
+            sql.replace(
+                "CREATE SCHEMA IF NOT EXISTS walrus;",
+                &format!("CREATE SCHEMA {schema};"),
+            )
+            .replace("walrus.", &format!("{schema}."))
+        };
+        for migration in [
+            include_str!("../../../migrations/control/0001_control_schema.sql"),
+            include_str!("../../../migrations/control/0002_registry_ddl.sql"),
+            include_str!("../../../migrations/control/0003_table_ownership.sql"),
+            include_str!("../../../migrations/control/0004_table_reload.sql"),
+            include_str!("../../../migrations/control/0005_transactional_ddl.sql"),
+            include_str!("../../../migrations/control/0006_unified_reconcile.sql"),
+            include_str!("../../../migrations/control/0007_bootstrap_reconcile.sql"),
+            include_str!("../../../migrations/control/0008_retire_markerless_reload.sql"),
+            include_str!("../../../migrations/control/0009_reload_protocol_v2_hardening.sql"),
+            include_str!("../../../migrations/control/0010_catalog_fence_provenance.sql"),
+        ] {
+            sqlx::raw_sql(&qualify(migration))
+                .execute(&mut *case)
+                .await
+                .unwrap();
+        }
+
+        let has_final_lsn = case_name != "missing_baseline";
+        let reload_id: i64 = sqlx::query_scalar(&format!(
+            "INSERT INTO {schema}.table_reload
+               (epoch, source_schema, source_table, flavor, status,
+                exporter_generation, start_lsn, final_lsn, schema_version)
+             VALUES (1, 'public', $1, 'reload', 'failed', 1, '0/100',
+                     CASE WHEN $2 THEN '0/200'::pg_lsn ELSE NULL END, 1)
+             RETURNING reload_id"
+        ))
+        .bind(case_name)
+        .bind(has_final_lsn)
+        .fetch_one(&mut *case)
+        .await
+        .unwrap();
+        if case_name != "missing_baseline" {
+            sqlx::query(&format!(
+                "INSERT INTO {schema}.table_reload_marker
+                   (reload_id, marker_kind, lsn, schema_version)
+                 VALUES ($1, 'baseline', '0/100', 1)"
+            ))
+            .bind(reload_id)
+            .execute(&mut *case)
+            .await
+            .unwrap();
+        }
+        if case_name == "unsealed_end" {
+            sqlx::query(&format!(
+                "INSERT INTO {schema}.table_reload_marker
+                   (reload_id, marker_kind, lsn, schema_version)
+                 VALUES ($1, 'end', '0/200', 1)"
+            ))
+            .bind(reload_id)
+            .execute(&mut *case)
+            .await
+            .unwrap();
+        }
+
+        let error = sqlx::raw_sql(&qualify(include_str!(
+            "../../../migrations/control/0011_reload_evidence_immutability.sql"
+        )))
+        .execute(&mut *case)
+        .await
+        .unwrap_err();
+        let expected = if case_name == "unsealed_end" {
+            "marker that contradicts its reload header"
+        } else {
+            "protocol-v2 header without its exact durable marker"
+        };
+        assert!(
+            error.to_string().contains(expected),
+            "{case_name} must stop the reload-evidence upgrade: {error}"
+        );
+        case.rollback().await.unwrap();
+    }
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
 async fn markerless_upgrade_attempts_fail_and_purge_only_their_files() {
     let pool = migrated_pool().await;
     let mut tx = pool.begin().await.unwrap();
@@ -1038,7 +1462,11 @@ async fn markerless_upgrade_attempts_fail_and_purge_only_their_files() {
     // Protocol-v2's later insert/delete guards must be suspended while seeding and running that
     // historical migration; the enclosing transaction restores them even if the test fails.
     sqlx::raw_sql(
-        "ALTER TABLE walrus.file_manifest
+        "ALTER TABLE walrus.table_reload
+           DISABLE TRIGGER table_reload_status_transition;
+         ALTER TABLE walrus.table_reload
+           DISABLE TRIGGER table_reload_initial_evidence;
+         ALTER TABLE walrus.file_manifest
            DISABLE TRIGGER file_manifest_reload_attempt_guard;
          ALTER TABLE walrus.file_manifest
            DISABLE TRIGGER file_manifest_delete_protocol_v2;",
@@ -1097,7 +1525,11 @@ async fn markerless_upgrade_attempts_fail_and_purge_only_their_files() {
     .await
     .expect("0008 upgrade cleanup applies to an existing v7-shaped fixture");
     sqlx::raw_sql(
-        "ALTER TABLE walrus.file_manifest
+        "ALTER TABLE walrus.table_reload
+           ENABLE TRIGGER table_reload_status_transition;
+         ALTER TABLE walrus.table_reload
+           ENABLE TRIGGER table_reload_initial_evidence;
+         ALTER TABLE walrus.file_manifest
            ENABLE TRIGGER file_manifest_reload_attempt_guard;
          ALTER TABLE walrus.file_manifest
            ENABLE TRIGGER file_manifest_delete_protocol_v2;",

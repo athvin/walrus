@@ -70,6 +70,10 @@ pub async fn cleanup_epoch(pool: &sqlx::PgPool, epoch: EpochNo) {
         .execute(&mut *tx)
         .await
         .unwrap();
+    sqlx::query("SELECT set_config('walrus.replication_state_maintenance', '1-delete', true)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
 
     for table in [
         "file_manifest",

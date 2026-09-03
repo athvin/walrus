@@ -40,12 +40,16 @@ pub fn code_for(err: &anyhow::Error) -> ExitCode {
             // The rest of the taxonomy shares exit 13, listed rather than absorbed by a wildcard.
             crate::preflight::PreflightError::WalLevel { .. }
             | crate::preflight::PreflightError::ServerTooOld { .. }
+            | crate::preflight::PreflightError::UnsupportedGeneratedColumnPublication { .. }
             | crate::preflight::PreflightError::NoHeadroom { .. }
             | crate::preflight::PreflightError::SlotNameDrift { .. }
             | crate::preflight::PreflightError::PublicationMissing { .. }
             | crate::preflight::PreflightError::PublicationGap { .. }
             | crate::preflight::PreflightError::PublicationCoverage(_)
             | crate::preflight::PreflightError::NoReplicationPriv
+            | crate::preflight::PreflightError::NoSchemaUsagePrivilege { .. }
+            | crate::preflight::PreflightError::NoTableLockPrivilege { .. }
+            | crate::preflight::PreflightError::NoTableSelectPrivilege { .. }
             | crate::preflight::PreflightError::DdlCaptureMissing { .. }
             | crate::preflight::PreflightError::ReloadSignalMissing { .. }
             | crate::preflight::PreflightError::ReloadEventMissing { .. }

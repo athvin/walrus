@@ -4,11 +4,21 @@
 //! advertise. They do not read table data or open a PostgreSQL snapshot.
 
 use anyhow::Context;
-use common::{PgColumn, PgRelation, ReplicaIdentity};
+use common::{Lsn, PgColumn, PgRelation, ReplicaIdentity};
+use std::time::Duration;
 
 /// Session/xact advisory-lock key shared with `walrus.guard_publication_ddl()` in source migration
 /// 0002. The bytes spell `walruspb`; changing either side would silently remove serialization.
 pub const PUBLICATION_DDL_GUARD_KEY: i64 = 0x7761_6c72_7573_7062;
+
+/// Frozen source facts that must describe one side of the same writer-drained boundary.
+#[derive(Debug)]
+pub struct CatalogFence {
+    /// WAL insert position sampled only after every target's prior writers have committed or aborted.
+    pub start_lsn: Lsn,
+    /// Exact ordered target shapes held stable by the same table locks as `start_lsn`.
+    pub relations: Vec<PgRelation>,
+}
 
 /// The four row-change families a PostgreSQL publication may emit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +56,7 @@ pub struct PublicationTargetOptions {
     published: bool,
     row_filter: bool,
     column_list: bool,
+    row_level_security: bool,
     topology_stable: bool,
 }
 
@@ -91,6 +102,17 @@ pub enum PublicationCoverageIssue {
         publication: String,
         schema: String,
         table: String,
+    },
+    /// The SQL snapshot could be policy-filtered even though logical decoding sees all row changes.
+    #[error(
+        "table {schema}.{table} in publication {publication} has row-level security enabled or \
+         forced; a complete snapshot cannot be attested (fix: {remediation_sql})"
+    )]
+    RowLevelSecurity {
+        publication: String,
+        schema: String,
+        table: String,
+        remediation_sql: String,
     },
     /// Table topology or indirect membership can change the visible row set without publication DDL.
     #[error(
@@ -157,9 +179,11 @@ pub async fn try_acquire_publication_ddl_guard(
 /// The recursive ancestor walk matters for partitions: a leaf can inherit the effective entry from
 /// an explicitly-published partition root. `pg_publication_tables.rowfilter` catches the effective
 /// predicate; `pg_publication_rel.prattrs` catches even an explicit list that happens to name every
-/// current column and would otherwise look identical to an unrestricted `attnames` array. Reading
-/// those PostgreSQL-15 additions through `to_jsonb(record)` keeps the same query valid on supported
-/// PostgreSQL 14 sources, where the keys are simply absent and neither restriction exists.
+/// current column and would otherwise look identical to an unrestricted `attnames` array. The
+/// target's `relrowsecurity`/`relforcerowsecurity` flags are also part of coverage: pgoutput sees row
+/// changes independently of SQL policies, while the snapshot COPY is policy-sensitive. Reading the
+/// PostgreSQL-15 publication additions through `to_jsonb(record)` keeps the same query valid on
+/// supported PostgreSQL 14 sources, where those keys are simply absent.
 ///
 /// # Errors
 ///
@@ -213,6 +237,12 @@ pub async fn publication_target_options<C: tokio_postgres::GenericClient + Sync>
                  SELECT 1
                  FROM target t
                  JOIN pg_catalog.pg_class c ON c.oid = t.relid
+                 WHERE c.relrowsecurity OR c.relforcerowsecurity
+               ) AS row_level_security,
+               EXISTS (
+                 SELECT 1
+                 FROM target t
+                 JOIN pg_catalog.pg_class c ON c.oid = t.relid
                  WHERE c.relkind = 'r'
                    AND NOT c.relispartition
                    AND NOT EXISTS (
@@ -239,7 +269,8 @@ pub async fn publication_target_options<C: tokio_postgres::GenericClient + Sync>
         published: row.get(0),
         row_filter: row.get(1),
         column_list: row.get(2),
-        topology_stable: row.get(3),
+        row_level_security: row.get(3),
+        topology_stable: row.get(4),
     })
 }
 
@@ -267,7 +298,7 @@ pub fn require_publication_actions(
     Ok(())
 }
 
-/// Require exact membership with neither a row filter nor a column list.
+/// Require exact membership with no row/column restriction, RLS, or unstable topology.
 ///
 /// # Errors
 ///
@@ -299,6 +330,18 @@ pub fn require_full_target(
             table: table.to_string(),
         });
     }
+    if schema != "walrus" && options.row_level_security {
+        let qualified = format!("{}.{}", quote_identifier(schema), quote_identifier(table));
+        return Err(PublicationCoverageIssue::RowLevelSecurity {
+            publication: publication.to_string(),
+            schema: schema.to_string(),
+            table: table.to_string(),
+            remediation_sql: format!(
+                "ALTER TABLE {qualified} DISABLE ROW LEVEL SECURITY; \
+                 ALTER TABLE {qualified} NO FORCE ROW LEVEL SECURITY"
+            ),
+        });
+    }
     if !options.topology_stable {
         return Err(PublicationCoverageIssue::TopologyDependent {
             publication: publication.to_string(),
@@ -320,8 +363,8 @@ fn catalog_oid(raw: i64) -> anyhow::Result<u32> {
 /// # Errors
 ///
 /// Returns [`anyhow::Error`] if publication membership cannot be queried or decoded.
-pub async fn published_user_tables(
-    client: &tokio_postgres::Client,
+pub async fn published_user_tables<C: tokio_postgres::GenericClient + Sync>(
+    client: &C,
     publication: &str,
 ) -> anyhow::Result<Vec<(String, String)>> {
     let rows = client
@@ -337,6 +380,135 @@ pub async fn published_user_tables(
         .iter()
         .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
         .collect())
+}
+
+/// Quote a PostgreSQL identifier for the deterministic `LOCK TABLE` statement.
+fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+/// Capture a new generation's catalog and start LSN at one writer-drained source boundary.
+///
+/// The publication inventory is sorted before constructing a single `LOCK TABLE ... IN SHARE
+/// MODE` statement. `SHARE` conflicts with row writers and structural DDL, so when the statement
+/// returns every transaction that had already modified a target has finished, and no new target
+/// writer can begin until this transaction commits. Sampling the WAL insert LSN (not the flush LSN,
+/// which can trail a catalog-visible asynchronous commit) and relation shapes inside that interval
+/// makes them one coherent generation boundary. A bounded lock timeout makes contention fail closed
+/// instead of leaving startup hung indefinitely.
+///
+/// The caller must already hold the long-lived publication-DDL advisory guard; it prevents the
+/// inventory itself from changing while these per-table locks are acquired.
+///
+/// # Errors
+///
+/// Returns an error if the transaction cannot acquire every target lock within `lock_timeout`, the
+/// inventory changes unexpectedly, a catalog shape cannot be decoded, or the WAL LSN is invalid.
+pub async fn capture_catalog_fence(
+    client: &mut tokio_postgres::Client,
+    publication: &str,
+    lock_timeout: Duration,
+) -> anyhow::Result<CatalogFence> {
+    let tx = client
+        .transaction()
+        .await
+        .context("begin source catalog-fence transaction")?;
+    let timeout_ms = u64::try_from(lock_timeout.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    tx.query_one(
+        "SELECT pg_catalog.set_config('lock_timeout', $1, true)",
+        &[&format!("{timeout_ms}ms")],
+    )
+    .await
+    .context("bound source catalog-fence lock wait")?;
+
+    let tables = published_user_tables(&tx, publication)
+        .await
+        .context("list targets before source catalog fence")?;
+    if !tables.is_empty() {
+        let targets = tables
+            .iter()
+            .map(|(schema, table)| {
+                format!("{}.{}", quote_identifier(schema), quote_identifier(table))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        tx.batch_execute(&format!("LOCK TABLE {targets} IN SHARE MODE"))
+            .await
+            .context("drain published-table writers at source catalog fence")?;
+    }
+
+    let locked_tables = published_user_tables(&tx, publication)
+        .await
+        .context("verify targets under source catalog fence")?;
+    anyhow::ensure!(
+        locked_tables == tables,
+        "publication inventory changed while acquiring source catalog fence: before={tables:?}, after={locked_tables:?}"
+    );
+
+    // Validate keys only after SHARE has frozen every target. The earlier source preflight can race
+    // a DDL transaction that began before the pipeline acquired its session guard; this locked
+    // catalog read is the final authority for the exact shapes about to become a generation.
+    let unusable = tx
+        .query_opt(
+            "SELECT pt.schemaname, pt.tablename, c.relreplident::text
+             FROM pg_catalog.pg_publication_tables pt
+             JOIN pg_catalog.pg_namespace n ON n.nspname = pt.schemaname
+             JOIN pg_catalog.pg_class c
+               ON c.relnamespace = n.oid AND c.relname = pt.tablename
+             WHERE pt.pubname = $1
+               AND pt.schemaname <> 'walrus'
+               AND (
+                 c.relreplident = 'n'
+                 OR NOT EXISTS (
+                   SELECT 1
+                   FROM pg_catalog.pg_index i
+                   WHERE i.indrelid = c.oid
+                     AND i.indisprimary
+                     AND i.indisvalid
+                     AND i.indisready
+                     AND i.indislive
+                 )
+               )
+             ORDER BY pt.schemaname, pt.tablename
+             LIMIT 1",
+            &[&publication],
+        )
+        .await
+        .context("validate source-table keys under catalog fence")?;
+    if let Some(row) = unusable {
+        let schema: String = row.get(0);
+        let table: String = row.get(1);
+        let identity: String = row.get(2);
+        anyhow::bail!(
+            "source catalog fence rejected {schema}.{table}: a valid, ready, live primary key and usable replica identity are required (relreplident={identity})"
+        );
+    }
+
+    let lsn_text: String = tx
+        .query_one("SELECT pg_catalog.pg_current_wal_insert_lsn()::text", &[])
+        .await
+        .context("sample source WAL position under catalog fence")?
+        .get(0);
+    let start_lsn = lsn_text
+        .parse::<Lsn>()
+        .context("parse source catalog-fence WAL position")?;
+    let mut relations = Vec::with_capacity(tables.len());
+    for (schema, table) in &tables {
+        relations.push(
+            describe_source_relation(&tx, schema, table)
+                .await
+                .with_context(|| format!("describe {schema}.{table} under source catalog fence"))?,
+        );
+    }
+    tx.commit()
+        .await
+        .context("commit source catalog-fence transaction")?;
+    Ok(CatalogFence {
+        start_lsn,
+        relations,
+    })
 }
 
 /// Build a [`PgRelation`] shape from the source catalog (`pg_class`/`pg_attribute`/`pg_index`).
@@ -367,9 +539,11 @@ pub async fn describe_source_relation<C: tokio_postgres::GenericClient + Sync>(
                 .with_context(|| format!("describe {schema}.{table}: relation not found"))
         },
         async {
-            // Reproduce pgoutput's Relation-column set and key flags exactly. Generated
-            // columns are absent from Relation/tuple messages, so including them here would
-            // make a live catalog check disagree with the same-version registry shape.
+            // Reproduce supported PG14–17 pgoutput's Relation-column set and key flags exactly.
+            // Generated columns are absent from Relation/tuple messages on those versions, so
+            // including them here would make a live catalog check disagree with the same-version
+            // registry shape. Source preflight rejects PG18+ until its configurable generated-
+            // column publication semantics are attested explicitly.
             // DEFAULT marks the primary key, INDEX marks only the chosen replica-identity
             // index, FULL marks every published column, and NOTHING marks none.
             client
@@ -391,6 +565,7 @@ pub async fn describe_source_relation<C: tokio_postgres::GenericClient + Sync>(
                      LEFT JOIN pg_index i
                          ON i.indrelid = c.oid
                          AND (i.indisprimary OR i.indisreplident)
+                         AND i.indisvalid AND i.indisready AND i.indislive
                          AND EXISTS (
                            SELECT 1
                            FROM unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord)

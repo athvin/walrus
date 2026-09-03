@@ -26,6 +26,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_postgres::NoTls;
 
+#[path = "support/stream_commit.rs"]
+mod stream_commit_support;
+
 static SOURCE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const SOURCE_MIGRATION: &str = include_str!("../../../migrations/source/0001_publication.sql");
 
@@ -208,9 +211,9 @@ async fn large_txn_single_ready_file_only_after_stream_commit() {
 
     let mut streamed_changes = 0u64;
     let mut mid_checked = false;
-    let mut commit_lsn: Option<Lsn> = None;
+    let mut commit_boundary: Option<(Lsn, Lsn)> = None;
     tokio::time::timeout(Duration::from_secs(45), async {
-        while commit_lsn.is_none() {
+        while commit_boundary.is_none() {
             let frame = stream.next().await.unwrap().unwrap();
             let frame_lsn = match &frame {
                 ReplicationMessage::XLogData { wal_start, .. } => *wal_start,
@@ -270,27 +273,33 @@ async fn large_txn_single_ready_file_only_after_stream_commit() {
                 Message::StreamCommit {
                     xid,
                     commit_lsn: clsn,
+                    end_lsn,
                     commit_ts,
                     ..
                 } => {
+                    checkpoint.observe_commit(*clsn, *end_lsn).unwrap();
+                    let commit_timestamp =
+                        common::UtcTimestamp::from_pg_micros(*commit_ts).unwrap();
                     let objs = demux
-                        .on_stream_commit(
-                            *xid,
-                            *clsn,
-                            common::UtcTimestamp::from_pg_micros(*commit_ts).unwrap(),
-                            &cache,
-                            &sink,
-                        )
+                        .on_stream_commit(*xid, *clsn, commit_timestamp, &cache, &sink)
                         .await
                         .unwrap();
-                    for obj in &objs {
-                        pg_sink::manifest::record_ready(&pool, epoch, obj)
-                            .await
-                            .unwrap();
-                    }
+                    assert_eq!(
+                        stream_commit_support::publish(
+                            &pool,
+                            epoch,
+                            *xid,
+                            *clsn,
+                            commit_timestamp,
+                            &objs,
+                        )
+                        .await
+                        .unwrap(),
+                        control::PublishStreamOutcome::Published,
+                    );
                     checkpoint.on_stream_end(*xid).unwrap();
-                    checkpoint.on_batch_durable(*clsn);
-                    commit_lsn = Some(*clsn);
+                    checkpoint.on_commit_durable(*clsn).unwrap();
+                    commit_boundary = Some((*clsn, *end_lsn));
                 }
                 _ => {}
             }
@@ -303,31 +312,60 @@ async fn large_txn_single_ready_file_only_after_stream_commit() {
         mid_checked,
         "the txn actually streamed (>=1000 changes before commit)"
     );
-    let clsn = commit_lsn.unwrap();
-    // Only AFTER Stream Commit do ready rows exist — all kind='stream', lsn_end = commit_lsn.
-    let files: Vec<(String, String)> =
-        sqlx::query_as("SELECT kind, lsn_end::text FROM walrus.file_manifest WHERE epoch = $1")
-            .bind(epoch)
-            .fetch_all(&pool)
-            .await
-            .unwrap();
+    let (clsn, end_lsn) = commit_boundary.unwrap();
+    // Only AFTER Stream Commit does one complete group become ready. Both speculative `spill`
+    // children and commit-time `stream` children share the authoritative commit LSN.
+    let files: Vec<(String, String, Option<i64>, Option<i64>)> = sqlx::query_as(
+        "SELECT kind, lsn_end::text, stream_group_id, stream_group_ordinal \
+         FROM walrus.file_manifest WHERE epoch = $1 ORDER BY stream_group_ordinal",
+    )
+    .bind(epoch)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
     assert!(
         !files.is_empty(),
         "Stream Commit promoted the speculative files to ready"
     );
     assert!(
-        files.iter().all(|(k, _)| k == "stream"),
-        "streamed files are kind='stream'"
+        files
+            .iter()
+            .all(|(kind, _, _, _)| matches!(kind.as_str(), "stream" | "spill")),
+        "a streamed commit contains only stream/spill children"
     );
     assert!(
-        files.iter().all(|(_, e)| e.parse::<Lsn>().unwrap() == clsn),
+        files
+            .iter()
+            .all(|(_, end, _, _)| end.parse::<Lsn>().unwrap() == clsn),
         "every ready file's lsn_end is the commit LSN"
     );
+    let group_id = files[0].2.expect("stream child has a group");
+    assert!(
+        files
+            .iter()
+            .enumerate()
+            .all(|(ordinal, (_, _, child_group, child_ordinal))| {
+                *child_group == Some(group_id) && *child_ordinal == i64::try_from(ordinal).ok()
+            }),
+        "all children belong to one complete, ordinally contiguous group"
+    );
+    let (expected_files, group_rows, group_lsn): (i64, i64, String) = sqlx::query_as(
+        "SELECT expected_files, row_count, commit_lsn::text \
+         FROM walrus.stream_manifest_group WHERE id = $1 AND status = 'ready'",
+    )
+    .bind(group_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(expected_files, i64::try_from(files.len()).unwrap());
+    assert_eq!(group_rows, 8000);
+    assert_eq!(group_lsn.parse::<Lsn>().unwrap(), clsn);
     assert_eq!(
         checkpoint.confirmed_flush(),
-        clsn,
-        "confirmed_flush advances on commit"
+        end_lsn,
+        "manifest ordering stays at commit_lsn while confirmed_flush advances to end_lsn"
     );
+    assert!(end_lsn > clsn);
 
     drop(stream);
     cleanup(&pool, &admin, epoch, slot).await;

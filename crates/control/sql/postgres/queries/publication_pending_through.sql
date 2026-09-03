@@ -18,7 +18,17 @@ SELECT
        OR EXISTS (
          SELECT 1 FROM walrus.file_manifest child WHERE child.stream_group_id = g.id
        )
-     )) AS pending
+     )) AS pending,
+  EXISTS (
+    SELECT 1
+    FROM walrus.file_manifest m
+    WHERE m.epoch = r.epoch
+      AND m.source_schema = r.source_schema
+      AND m.source_table = r.source_table
+      AND m.stream_group_id IS NULL
+      AND m.lsn_start <= r.final_lsn
+      AND m.lsn_end > r.final_lsn
+  ) AS ungrouped_straddler
 FROM walrus.table_reload r
 JOIN walrus.table_ownership o
   ON o.epoch = r.epoch

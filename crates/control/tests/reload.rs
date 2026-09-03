@@ -82,6 +82,49 @@ async fn expiry_epoch(ex: impl sqlx::PgExecutor<'_>, reload_id: ReloadId) -> f64
     .unwrap()
 }
 
+async fn assert_protocol_deauthorized(ex: impl sqlx::PgExecutor<'_>, setting: &str) {
+    let value: Option<String> = sqlx::query_scalar("SELECT pg_catalog.current_setting($1, true)")
+        .bind(setting)
+        .fetch_one(ex)
+        .await
+        .unwrap();
+    assert!(
+        value.as_deref().unwrap_or_default().is_empty(),
+        "protocol capability {setting} leaked with value {value:?}"
+    );
+}
+
+async fn prime_protocol(ex: impl sqlx::PgExecutor<'_>, setting: &str) {
+    let value: String = sqlx::query_scalar("SELECT pg_catalog.set_config($1, '2', true)")
+        .bind(setting)
+        .fetch_one(ex)
+        .await
+        .unwrap();
+    assert_eq!(value, "2");
+}
+
+async fn assert_reload_evidence_rejected(
+    conn: &mut PgConnection,
+    reload_id: ReloadId,
+    statement: &str,
+    expected_constraint: &str,
+) {
+    let mut savepoint = conn.begin().await.unwrap();
+    let error = sqlx::query(statement)
+        .bind(reload_id.0)
+        .execute(&mut *savepoint)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::constraint),
+        Some(expected_constraint),
+        "unexpected database guard for statement: {statement}"
+    );
+    savepoint.rollback().await.unwrap();
+}
+
 /// Complete an ordinary test attempt through the same explicit F/baseline/H protocol used by the
 /// exporter. Tests that exercise invalid or mismatched markers call the lower-level functions
 /// directly instead.
@@ -177,6 +220,397 @@ async fn begin_full_scan_plan(
     .unwrap();
 }
 
+#[tokio::test]
+async fn protocol_capabilities_do_not_escape_a_caller_owned_transaction() {
+    let pool = pool().await;
+    let mut tx = pool.begin().await.unwrap();
+    let missing = ReloadId(i64::MAX - 10);
+    let lease = exporter(missing, "missing-exporter", 1);
+    let fence = ReloadFenceIdentity {
+        request_id: None,
+        source_schema: "public",
+        source_table: "missing_table",
+        schema_version: SchemaVersionNo(1),
+    };
+    let f = Lsn::new(0x100);
+
+    prime_protocol(&mut *tx, "walrus.reload_marker_protocol").await;
+    reload::record_start_fence(&mut *tx, missing, f, fence)
+        .await
+        .unwrap_err();
+    assert_protocol_deauthorized(&mut *tx, "walrus.reload_marker_protocol").await;
+
+    prime_protocol(&mut *tx, "walrus.reload_marker_protocol").await;
+    reload::record_end_marker(&mut *tx, missing, f, fence)
+        .await
+        .unwrap_err();
+    assert_protocol_deauthorized(&mut *tx, "walrus.reload_marker_protocol").await;
+
+    prime_protocol(&mut *tx, "walrus.reload_export_plan_protocol").await;
+    reload::record_export_range(&mut *tx, &lease, 0, 0, 0)
+        .await
+        .unwrap_err();
+    assert_protocol_deauthorized(&mut *tx, "walrus.reload_export_plan_protocol").await;
+
+    prime_protocol(&mut *tx, "walrus.reload_export_complete_protocol").await;
+    reload::complete_export(&mut *tx, &lease, f)
+        .await
+        .unwrap_err();
+    assert_protocol_deauthorized(&mut *tx, "walrus.reload_export_complete_protocol").await;
+
+    prime_protocol(&mut *tx, "walrus.manifest_delete_protocol").await;
+    assert_eq!(delete_claimed(&mut *tx, &[]).await.unwrap(), 0);
+    assert_protocol_deauthorized(&mut *tx, "walrus.manifest_delete_protocol").await;
+
+    prime_protocol(&mut *tx, "walrus.manifest_delete_protocol").await;
+    let deleted_count: i64 =
+        sqlx::query_scalar(include_str!("../sql/postgres/queries/fail_purge_files.sql"))
+            .bind(missing.0)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    assert_eq!(deleted_count, 0);
+    assert_protocol_deauthorized(&mut *tx, "walrus.manifest_delete_protocol").await;
+
+    prime_protocol(&mut *tx, "walrus.reload_publication_adopt_protocol").await;
+    assert!(
+        reload::claim_publication(
+            &mut *tx,
+            EpochNo(i64::MAX - 10),
+            "public",
+            "missing_table",
+            "missing-owner",
+            1,
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert_protocol_deauthorized(&mut *tx, "walrus.reload_publication_adopt_protocol").await;
+
+    tx.rollback().await.unwrap();
+}
+
+/// Build a zero-file attempt with a valid plan of `range_count` rows. Tests below then replace the
+/// plan through the explicit maintenance tripwire to model corrupted durable evidence without
+/// disabling the production triggers.
+async fn begin_empty_range_plan_fixture(
+    conn: &mut PgConnection,
+    epoch: EpochNo,
+    table: &str,
+    range_count: usize,
+) -> (ReloadId, ExporterLease, Lsn, SchemaVersionNo) {
+    assert!(range_count > 0);
+    let id = reload::request(&mut *conn, epoch, "public", table, ReloadFlavor::Reload)
+        .await
+        .unwrap();
+    let claimed = reload::claim_requested(&mut *conn, epoch, "sink-plan-attestation", 600, 1)
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].reload_id, id);
+    let lease = claimed[0].exporter_lease("sink-plan-attestation").unwrap();
+    let f = Lsn::new(0x100);
+    let schema_version = SchemaVersionNo(1);
+    reload::record_start_fence(
+        &mut *conn,
+        id,
+        f,
+        ReloadFenceIdentity {
+            request_id: claimed[0].parent_request_id,
+            source_schema: "public",
+            source_table: table,
+            schema_version,
+        },
+    )
+    .await
+    .unwrap();
+
+    let seed = if range_count == 1 {
+        vec![ExportRangePlan {
+            range_no: 0,
+            full_scan: true,
+            start_block: None,
+            end_block: None,
+        }]
+    } else {
+        (0..range_count)
+            .map(|index| {
+                let range_no = i64::try_from(index).unwrap();
+                ExportRangePlan {
+                    range_no,
+                    full_scan: false,
+                    start_block: Some(range_no * 64),
+                    end_block: (index + 1 < range_count).then_some((range_no + 1) * 64),
+                }
+            })
+            .collect()
+    };
+    let snapshot = format!("{}:{}:", id.0, id.0 + 1);
+    reload::begin_export_plan(
+        conn,
+        &lease,
+        f,
+        schema_version,
+        ExportSnapshot {
+            identity: &snapshot,
+            xmin: id.0,
+            xmax: id.0 + 1,
+        },
+        &seed,
+    )
+    .await
+    .unwrap();
+    (id, lease, f, schema_version)
+}
+
+async fn replace_empty_range_plan_fixture(
+    conn: &mut PgConnection,
+    lease: &ExporterLease,
+    ranges: &[ExportRangePlan],
+) {
+    sqlx::query("SELECT set_config('walrus.manifest_fence_maintenance', '2-delete', true)")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM walrus.table_reload_export_range WHERE reload_id = $1")
+        .bind(lease.reload_id.0)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query("SELECT set_config('walrus.manifest_fence_maintenance', '', true)")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    for range in ranges {
+        sqlx::query("SELECT set_config('walrus.reload_export_plan_protocol', '2', true)")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO walrus.table_reload_export_range
+               (reload_id, exporter_generation, range_no, full_scan, start_block, end_block)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(lease.reload_id.0)
+        .bind(lease.generation)
+        .bind(range.range_no)
+        .bind(range.full_scan)
+        .bind(range.start_block)
+        .bind(range.end_block)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        reload::record_export_range(&mut *conn, lease, range.range_no, 0, 0)
+            .await
+            .unwrap();
+    }
+}
+
+async fn export_plan_is_attested(conn: &mut PgConnection, lease: &ExporterLease) -> bool {
+    sqlx::query_scalar(
+        "SELECT walrus.reload_export_plan_is_attested(
+           reload_id, exporter_generation, export_range_count)
+         FROM walrus.table_reload WHERE reload_id = $1",
+    )
+    .bind(lease.reload_id.0)
+    .fetch_one(conn)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn reload_boundaries_headers_and_markers_are_durable_immutable_evidence() {
+    let pool = pool().await;
+    let mut tx = pool.begin().await.unwrap();
+    let epoch = EpochNo(910_011);
+    let mut fabricated = tx.begin().await.unwrap();
+    let error = sqlx::query(
+        "INSERT INTO walrus.table_reload
+           (epoch, source_schema, source_table, flavor, status,
+            lease_holder, lease_expiry, exporter_generation, start_lsn, schema_version)
+         VALUES ($1, 'public', 'fabricated_evidence', 'reload', 'exporting',
+                 'sink-a', now() + interval '1 minute', 1, '0/100', 1)",
+    )
+    .bind(epoch.0)
+    .execute(&mut *fabricated)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::constraint),
+        Some("table_reload_initial_evidence_pristine")
+    );
+    fabricated.rollback().await.unwrap();
+
+    let mut fabricated_terminal = tx.begin().await.unwrap();
+    let error = sqlx::query(
+        "INSERT INTO walrus.table_reload
+           (epoch, source_schema, source_table, flavor, status)
+         VALUES ($1, 'public', 'fabricated_terminal', 'reload', 'failed')",
+    )
+    .bind(epoch.0)
+    .execute(&mut *fabricated_terminal)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::constraint),
+        Some("table_reload_initial_evidence_pristine")
+    );
+    fabricated_terminal.rollback().await.unwrap();
+
+    let reload_id = reload::request(
+        &mut *tx,
+        epoch,
+        "public",
+        "immutable_evidence",
+        ReloadFlavor::Reload,
+    )
+    .await
+    .unwrap();
+    let row = reload::claim_requested(&mut *tx, epoch, "sink-a", 60, 1)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let lease = row.exporter_lease("sink-a").unwrap();
+    let f: Lsn = "0/100".parse().unwrap();
+    let h: Lsn = "0/200".parse().unwrap();
+    let schema_version = SchemaVersionNo(1);
+    let identity = ReloadFenceIdentity {
+        request_id: row.parent_request_id,
+        source_schema: "public",
+        source_table: "immutable_evidence",
+        schema_version,
+    };
+
+    assert_reload_evidence_rejected(
+        &mut tx,
+        reload_id,
+        "UPDATE walrus.table_reload
+         SET start_lsn = '0/100', schema_version = 1
+         WHERE reload_id = $1",
+        "table_reload_start_fence_protocol_v2",
+    )
+    .await;
+    reload::record_start_fence(&mut *tx, reload_id, f, identity)
+        .await
+        .unwrap();
+    assert_protocol_deauthorized(&mut *tx, "walrus.reload_marker_protocol").await;
+
+    for (statement, constraint) in [
+        (
+            "UPDATE walrus.table_reload SET source_table = 'rewritten' WHERE reload_id = $1",
+            "table_reload_request_identity_immutable",
+        ),
+        (
+            "UPDATE walrus.table_reload SET start_lsn = '0/101' WHERE reload_id = $1",
+            "table_reload_start_lsn_immutable",
+        ),
+        (
+            "UPDATE walrus.table_reload SET schema_version = 2 WHERE reload_id = $1",
+            "table_reload_schema_version_immutable",
+        ),
+        (
+            "UPDATE walrus.table_reload SET first_lsn = '0/101' WHERE reload_id = $1",
+            "table_reload_first_lsn_matches_start",
+        ),
+        (
+            "UPDATE walrus.table_reload_marker SET lsn = '0/101'
+             WHERE reload_id = $1 AND marker_kind = 'baseline'",
+            "table_reload_marker_immutable",
+        ),
+        (
+            "DELETE FROM walrus.table_reload_marker
+             WHERE reload_id = $1 AND marker_kind = 'baseline'",
+            "table_reload_marker_removal",
+        ),
+        (
+            "INSERT INTO walrus.table_reload_marker
+               (reload_id, marker_kind, lsn, schema_version)
+             VALUES ($1, 'end', '0/200', 1)",
+            "table_reload_marker_insert_protocol_v2",
+        ),
+    ] {
+        assert_reload_evidence_rejected(&mut tx, reload_id, statement, constraint).await;
+    }
+
+    begin_full_scan_plan(&mut tx, &lease, f, schema_version).await;
+    assert_protocol_deauthorized(&mut *tx, "walrus.reload_export_plan_protocol").await;
+    assert_reload_evidence_rejected(
+        &mut tx,
+        reload_id,
+        "UPDATE walrus.table_reload SET export_snapshot_xmax = export_snapshot_xmax + 1
+         WHERE reload_id = $1",
+        "table_reload_snapshot_header_immutable",
+    )
+    .await;
+
+    reload::record_export_range(&mut *tx, &lease, 0, 0, 0)
+        .await
+        .unwrap();
+    assert_protocol_deauthorized(&mut *tx, "walrus.reload_export_plan_protocol").await;
+    reload::seal_export(&mut tx, &lease, f, schema_version)
+        .await
+        .unwrap();
+    assert_protocol_deauthorized(&mut *tx, "walrus.reload_export_seal_protocol").await;
+    for (statement, constraint) in [
+        (
+            "UPDATE walrus.table_reload SET export_row_count = export_row_count + 1
+             WHERE reload_id = $1",
+            "table_reload_export_seal_immutable",
+        ),
+        (
+            "UPDATE walrus.table_reload SET chunk_no = chunk_no + 1 WHERE reload_id = $1",
+            "table_reload_sealed_progress_immutable",
+        ),
+    ] {
+        assert_reload_evidence_rejected(&mut tx, reload_id, statement, constraint).await;
+    }
+
+    reload::record_end_marker(&mut *tx, reload_id, h, identity)
+        .await
+        .unwrap();
+    assert_protocol_deauthorized(&mut *tx, "walrus.reload_marker_protocol").await;
+    reload::complete_export(&mut *tx, &lease, h).await.unwrap();
+    assert_protocol_deauthorized(&mut *tx, "walrus.reload_export_complete_protocol").await;
+    assert_reload_evidence_rejected(
+        &mut tx,
+        reload_id,
+        "UPDATE walrus.table_reload SET final_lsn = '0/201' WHERE reload_id = $1",
+        "table_reload_final_lsn_immutable",
+    )
+    .await;
+
+    // Explicit administrative teardown remains possible, but only inside its transaction-local
+    // maintenance capability. Roll the deletion back so the enclosing lifecycle remains intact.
+    let mut maintenance = tx.begin().await.unwrap();
+    sqlx::query("SELECT set_config('walrus.manifest_fence_maintenance','2-delete',true)")
+        .execute(&mut *maintenance)
+        .await
+        .unwrap();
+    let deleted = sqlx::query("DELETE FROM walrus.table_reload_marker WHERE reload_id = $1")
+        .bind(reload_id.0)
+        .execute(&mut *maintenance)
+        .await
+        .unwrap();
+    assert_eq!(deleted.rows_affected(), 2);
+    maintenance.rollback().await.unwrap();
+
+    reload::record_start_fence(&mut *tx, reload_id, f, identity)
+        .await
+        .expect("exact baseline replay remains valid after export completion");
+    assert_protocol_deauthorized(&mut *tx, "walrus.reload_marker_protocol").await;
+    reload::record_end_marker(&mut *tx, reload_id, h, identity)
+        .await
+        .expect("exact end-marker replay remains valid after export completion");
+    assert_protocol_deauthorized(&mut *tx, "walrus.reload_marker_protocol").await;
+    tx.rollback().await.unwrap();
+}
+
 /// Exercise the loader's fenced publication path for a marker-complete attempt and return the
 /// manifest rows it retired through H.
 async fn publish_fenced(
@@ -205,6 +639,7 @@ async fn publish_fenced(
     .unwrap()
     .unwrap();
     assert_eq!(publication.reload_id, reload_id);
+    assert_protocol_deauthorized(&mut **conn, "walrus.reload_publication_adopt_protocol").await;
     let claimed =
         reload::claim_publication_ready(&mut **conn, &publication, owner, lease.fencing_token, 100)
             .await
@@ -214,11 +649,13 @@ async fn publish_fenced(
         delete_claimed(&mut **conn, &ids).await.unwrap(),
         ids.len() as u64
     );
+    assert_protocol_deauthorized(&mut **conn, "walrus.manifest_delete_protocol").await;
     assert!(
         reload::seal_publication_if_drained(conn, &publication, owner, lease.fencing_token)
             .await
             .unwrap()
     );
+    assert_protocol_deauthorized(&mut **conn, "walrus.manifest_seal_protocol").await;
     assert!(
         reload::finish_publication(&mut **conn, &publication, owner, lease.fencing_token)
             .await
@@ -242,11 +679,17 @@ async fn logical_export_rejection_is_rolled_back_before_connection_reuse() {
         .await
         .unwrap();
     let epoch = EpochNo(910_017);
-    sqlx::query("DELETE FROM walrus.table_reload WHERE epoch = $1")
-        .bind(epoch.0)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "WITH authorized AS MATERIALIZED (
+           SELECT set_config('walrus.manifest_fence_maintenance','2-delete',true) AS protocol
+         )
+         DELETE FROM walrus.table_reload
+         WHERE epoch = $1 AND (SELECT protocol = '2-delete' FROM authorized)",
+    )
+    .bind(epoch.0)
+    .execute(&pool)
+    .await
+    .unwrap();
 
     let predecessor_id = reload::request(
         &pool,
@@ -338,11 +781,235 @@ async fn logical_export_rejection_is_rolled_back_before_connection_reuse() {
     );
 
     drop(conn);
-    sqlx::query("DELETE FROM walrus.table_reload WHERE epoch = $1")
-        .bind(epoch.0)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "WITH authorized AS MATERIALIZED (
+           SELECT set_config('walrus.manifest_fence_maintenance','2-delete',true) AS protocol
+         )
+         DELETE FROM walrus.table_reload
+         WHERE epoch = $1 AND (SELECT protocol = '2-delete' FROM authorized)",
+    )
+    .bind(epoch.0)
+    .execute(&pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn seal_attests_the_exact_physical_range_partition_in_postgres() {
+    let pool = pool().await;
+    let mut tx = pool.begin().await.unwrap();
+    let epoch = EpochNo(910_019);
+
+    let invalid_plans = [
+        (
+            "gap",
+            vec![
+                ExportRangePlan {
+                    range_no: 0,
+                    full_scan: false,
+                    start_block: Some(0),
+                    end_block: Some(64),
+                },
+                ExportRangePlan {
+                    range_no: 1,
+                    full_scan: false,
+                    start_block: Some(65),
+                    end_block: None,
+                },
+            ],
+        ),
+        (
+            "overlap",
+            vec![
+                ExportRangePlan {
+                    range_no: 0,
+                    full_scan: false,
+                    start_block: Some(0),
+                    end_block: Some(64),
+                },
+                ExportRangePlan {
+                    range_no: 1,
+                    full_scan: false,
+                    start_block: Some(63),
+                    end_block: None,
+                },
+            ],
+        ),
+        (
+            "swapped_order",
+            vec![
+                ExportRangePlan {
+                    range_no: 0,
+                    full_scan: false,
+                    start_block: Some(64),
+                    end_block: Some(128),
+                },
+                ExportRangePlan {
+                    range_no: 1,
+                    full_scan: false,
+                    start_block: Some(0),
+                    end_block: None,
+                },
+            ],
+        ),
+        (
+            "early_open_end",
+            vec![
+                ExportRangePlan {
+                    range_no: 0,
+                    full_scan: false,
+                    start_block: Some(0),
+                    end_block: None,
+                },
+                ExportRangePlan {
+                    range_no: 1,
+                    full_scan: false,
+                    start_block: Some(64),
+                    end_block: None,
+                },
+            ],
+        ),
+        (
+            "finite_final_end",
+            vec![
+                ExportRangePlan {
+                    range_no: 0,
+                    full_scan: false,
+                    start_block: Some(0),
+                    end_block: Some(64),
+                },
+                ExportRangePlan {
+                    range_no: 1,
+                    full_scan: false,
+                    start_block: Some(64),
+                    end_block: Some(128),
+                },
+            ],
+        ),
+        (
+            "mixed_full_scan",
+            vec![
+                ExportRangePlan {
+                    range_no: 0,
+                    full_scan: true,
+                    start_block: None,
+                    end_block: None,
+                },
+                ExportRangePlan {
+                    range_no: 1,
+                    full_scan: false,
+                    start_block: Some(0),
+                    end_block: None,
+                },
+            ],
+        ),
+    ];
+
+    for (case_index, (case_name, ranges)) in invalid_plans.into_iter().enumerate() {
+        let table = format!("seal_plan_invalid_{case_index}_{case_name}");
+        let (id, lease, f, version) =
+            begin_empty_range_plan_fixture(&mut tx, epoch, &table, ranges.len()).await;
+        replace_empty_range_plan_fixture(&mut tx, &lease, &ranges).await;
+        assert!(
+            !export_plan_is_attested(&mut tx, &lease).await,
+            "{case_name} must fail the database plan proof"
+        );
+
+        if case_index == 0 {
+            let mut bypass = Connection::begin(&mut *tx).await.unwrap();
+            sqlx::query("SELECT set_config('walrus.reload_export_seal_protocol', '2', true)")
+                .execute(&mut *bypass)
+                .await
+                .unwrap();
+            let error = sqlx::query(
+                "UPDATE walrus.table_reload
+                 SET export_sealed_at = now(), export_file_count = 0, export_row_count = 0
+                 WHERE reload_id = $1",
+            )
+            .bind(id.0)
+            .execute(&mut *bypass)
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error
+                    .as_database_error()
+                    .and_then(sqlx::error::DatabaseError::constraint),
+                Some("table_reload_export_plan_attestation"),
+                "even a direct protocol-GUC update must not bypass plan attestation"
+            );
+            bypass.rollback().await.unwrap();
+        }
+
+        assert!(
+            matches!(
+                reload::seal_export(&mut tx, &lease, f, version)
+                    .await
+                    .unwrap_err(),
+                ControlError::ReloadTransition { .. }
+            ),
+            "{case_name} must not receive an export seal"
+        );
+    }
+
+    let valid_plans = [
+        (
+            "full_scan",
+            vec![ExportRangePlan {
+                range_no: 0,
+                full_scan: true,
+                start_block: None,
+                end_block: None,
+            }],
+        ),
+        (
+            "single_ctid_range",
+            vec![ExportRangePlan {
+                range_no: 0,
+                full_scan: false,
+                start_block: Some(0),
+                end_block: None,
+            }],
+        ),
+        (
+            "contiguous_ctid_ranges",
+            vec![
+                ExportRangePlan {
+                    range_no: 0,
+                    full_scan: false,
+                    start_block: Some(0),
+                    end_block: Some(64),
+                },
+                ExportRangePlan {
+                    range_no: 1,
+                    full_scan: false,
+                    start_block: Some(64),
+                    end_block: Some(128),
+                },
+                ExportRangePlan {
+                    range_no: 2,
+                    full_scan: false,
+                    start_block: Some(128),
+                    end_block: None,
+                },
+            ],
+        ),
+    ];
+    for (case_index, (case_name, ranges)) in valid_plans.into_iter().enumerate() {
+        let table = format!("seal_plan_valid_{case_index}_{case_name}");
+        let (_id, lease, f, version) =
+            begin_empty_range_plan_fixture(&mut tx, epoch, &table, ranges.len()).await;
+        replace_empty_range_plan_fixture(&mut tx, &lease, &ranges).await;
+        assert!(
+            export_plan_is_attested(&mut tx, &lease).await,
+            "{case_name} must satisfy the database plan proof"
+        );
+        let seal = reload::seal_export(&mut tx, &lease, f, version)
+            .await
+            .unwrap();
+        assert_eq!((seal.file_count, seal.row_count), (0, 0));
+    }
+
+    tx.rollback().await.unwrap();
 }
 
 #[tokio::test]
@@ -401,6 +1068,43 @@ async fn parallel_export_seals_only_the_exact_durable_plan() {
     reload::begin_export_plan(&mut tx, &lease, f, version, snapshot, &ranges)
         .await
         .expect("the same generation can replay its exact durable plan");
+    {
+        let mut savepoint = Connection::begin(&mut *tx).await.unwrap();
+        let error = sqlx::query(
+            "UPDATE walrus.table_reload_export_range
+             SET end_block = 64
+             WHERE reload_id = $1 AND range_no = 0",
+        )
+        .bind(id.0)
+        .execute(&mut *savepoint)
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::constraint),
+            Some("table_reload_export_range_semantics_immutable")
+        );
+        savepoint.rollback().await.unwrap();
+    }
+    {
+        let mut savepoint = Connection::begin(&mut *tx).await.unwrap();
+        let error = sqlx::query(
+            "DELETE FROM walrus.table_reload_export_range
+             WHERE reload_id = $1 AND range_no = 1",
+        )
+        .bind(id.0)
+        .execute(&mut *savepoint)
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::constraint),
+            Some("table_reload_export_range_removal")
+        );
+        savepoint.rollback().await.unwrap();
+    }
     let changed = [
         ExportRangePlan {
             end_block: Some(64),
@@ -1180,26 +1884,28 @@ async fn parallel_file_progress_is_atomic_out_of_order_and_mode_safe() {
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query("DELETE FROM walrus.table_reload_marker WHERE reload_id = $1")
-        .bind(id.0)
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM walrus.table_reload WHERE reload_id = $1")
-        .bind(id.0)
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM walrus.table_reload_marker WHERE reload_id = $1")
-        .bind(legacy_id.0)
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM walrus.table_reload WHERE reload_id = $1")
-        .bind(legacy_id.0)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "WITH authorized AS MATERIALIZED (
+           SELECT set_config('walrus.manifest_fence_maintenance','2-delete',true) AS protocol
+         )
+         DELETE FROM walrus.table_reload
+         WHERE reload_id = $1 AND (SELECT protocol = '2-delete' FROM authorized)",
+    )
+    .bind(id.0)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "WITH authorized AS MATERIALIZED (
+           SELECT set_config('walrus.manifest_fence_maintenance','2-delete',true) AS protocol
+         )
+         DELETE FROM walrus.table_reload
+         WHERE reload_id = $1 AND (SELECT protocol = '2-delete' FROM authorized)",
+    )
+    .bind(legacy_id.0)
+    .execute(&pool)
+    .await
+    .unwrap();
 }
 
 /// An ordinary stream file — `reload_id` stays NULL, exactly like every pre-6.1 row.
@@ -2103,6 +2809,25 @@ async fn release_claim_returns_the_row_to_the_queue() {
     )
     .await
     .unwrap();
+    {
+        let mut savepoint = Connection::begin(&mut *tx).await.unwrap();
+        let error = sqlx::query(
+            "UPDATE walrus.table_reload
+             SET status = 'requested', lease_holder = NULL, lease_expiry = NULL
+             WHERE reload_id = $1",
+        )
+        .bind(id.0)
+        .execute(&mut *savepoint)
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::constraint),
+            Some("table_reload_status_transition")
+        );
+        savepoint.rollback().await.unwrap();
+    }
     assert!(
         !reload::release_claim(&mut *tx, &exporter(id, "sink-b", 2))
             .await
@@ -2219,6 +2944,26 @@ async fn fail_purges_this_reloads_manifest_rows_only() {
     let keep_stream = insert_ready(&mut *tx, &stream_file(epoch, "orders", "0/30"))
         .await
         .unwrap();
+
+    {
+        let mut savepoint = Connection::begin(&mut *tx).await.unwrap();
+        let error = sqlx::query(
+            "UPDATE walrus.table_reload
+             SET status = 'failed', error = 'unsafe direct failure'
+             WHERE reload_id = $1",
+        )
+        .bind(r1.0)
+        .execute(&mut *savepoint)
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::constraint),
+            Some("table_reload_failure_requires_purge")
+        );
+        savepoint.rollback().await.unwrap();
+    }
 
     reload::fail(
         &mut tx,
@@ -2515,11 +3260,17 @@ async fn concurrent_claimers_partition_the_queue_via_skip_locked() {
     // (unlike the rolled-back-txn discipline above). Clean up leftovers from any crashed prior
     // run first — a stale non-terminal row would trip the one_live index — and again at the end.
     let cleanup = || async {
-        sqlx::query("DELETE FROM walrus.table_reload WHERE epoch = $1")
-            .bind(epoch)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "WITH authorized AS MATERIALIZED (
+               SELECT set_config('walrus.manifest_fence_maintenance','2-delete',true) AS protocol
+             )
+             DELETE FROM walrus.table_reload
+             WHERE epoch = $1 AND (SELECT protocol = '2-delete' FROM authorized)",
+        )
+        .bind(epoch)
+        .execute(&pool)
+        .await
+        .unwrap();
     };
     cleanup().await;
     let r1 = reload::request(&pool, epoch, "public", "orders", ReloadFlavor::Reload)
@@ -2561,11 +3312,17 @@ async fn concurrent_claimer_cannot_skip_a_locked_fifo_head_for_the_same_table() 
     // This lock-order property needs committed fixtures and two connections. As in the general
     // SKIP LOCKED test, clean this test-owned epoch before and after in case an earlier run died.
     let cleanup = || async {
-        sqlx::query("DELETE FROM walrus.table_reload WHERE epoch = $1")
-            .bind(epoch)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "WITH authorized AS MATERIALIZED (
+               SELECT set_config('walrus.manifest_fence_maintenance','2-delete',true) AS protocol
+             )
+             DELETE FROM walrus.table_reload
+             WHERE epoch = $1 AND (SELECT protocol = '2-delete' FROM authorized)",
+        )
+        .bind(epoch)
+        .execute(&pool)
+        .await
+        .unwrap();
     };
     cleanup().await;
     let first_request = SourceReloadRequest {

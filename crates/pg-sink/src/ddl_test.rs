@@ -421,6 +421,7 @@ fn lost_ack_streamed_ddl_rebuilds_exact_pending_state_without_future_version_fal
     let prepared = consumer
         .prepare_stream_commit(857, durable_v2.c_lsn)
         .unwrap();
+    assert!(prepared.has_structural_ddl());
     assert_eq!(prepared.ddl_rows().len(), 1);
     assert_eq!(prepared.ddl_rows()[0].source_audit_id, 55);
     assert_eq!(prepared.ddl_rows()[0].schema_version, SchemaVersionNo(2));
@@ -551,6 +552,13 @@ fn relation_binding_uses_exact_historical_shape_and_rejects_future_fallback() {
             .relation_version_for(neighbour, &v1, Lsn::new(950), &cache)
             .unwrap(),
         SchemaVersionNo(2)
+    );
+    assert_eq!(
+        consumer
+            .relation_version_for(neighbour, &v2, Lsn::new(900), &cache)
+            .unwrap(),
+        SchemaVersionNo(2),
+        "the decode commit frontier binds v2 even when its Relation transport frame had wal_start=0"
     );
 }
 
@@ -700,6 +708,85 @@ async fn committed_tracked_table_rename_fails_before_control_persistence() {
     assert_eq!(change.previous_table, "orders");
     assert_eq!(change.new_schema.as_deref(), Some("public"));
     assert_eq!(change.new_table.as_deref(), Some("orders_v2"));
+}
+
+#[test]
+fn legacy_null_oid_drop_is_commit_gated_as_a_tracked_identity_change() {
+    let mut consumer = DdlConsumer::new(EpochNo(1));
+    let previous = tracked_orders();
+    let mut dropped = event(1, "public", "orders", "DROP TABLE");
+    dropped.c_event = "sql_drop".into();
+    dropped.c_rel_oid = None;
+
+    consumer.observe(TransactionScope::Ordinary, dropped, Some(&previous));
+    let error = consumer.prepare_ordinary_commit(Lsn::new(10)).unwrap_err();
+    assert!(matches!(
+        error,
+        DdlError::TrackedTableIdentityChange(TrackedTableIdentityChange {
+            kind: TrackedTableIdentityChangeKind::Dropped,
+            relation_oid: 42,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn same_name_new_identity_is_commit_gated_as_recreation() {
+    let previous = tracked_orders();
+    for tag in ["CREATE TABLE AS", "SELECT INTO"] {
+        for incoming_oid in [Some(43), None] {
+            let mut consumer = DdlConsumer::new(EpochNo(1));
+            let mut recreated = event(1, "public", "orders", tag);
+            recreated.c_rel_oid = incoming_oid;
+
+            consumer.observe(TransactionScope::Ordinary, recreated, Some(&previous));
+            let error = consumer.prepare_ordinary_commit(Lsn::new(10)).unwrap_err();
+            assert!(matches!(
+                error,
+                DdlError::TrackedTableIdentityChange(TrackedTableIdentityChange {
+                    kind: TrackedTableIdentityChangeKind::Recreated,
+                    relation_oid: 42,
+                    ..
+                })
+            ));
+        }
+    }
+}
+
+#[test]
+fn unresolved_legacy_identity_fails_on_commit_but_stream_abort_discards_it() {
+    let mut consumer = DdlConsumer::new(EpochNo(1));
+    let scope = TransactionScope::Streamed {
+        top_xid: 100,
+        sub_xid: 101,
+    };
+    let mut ambiguous = event(7, "archive", "orders", "ALTER TABLE");
+    ambiguous.c_rel_oid = None;
+    consumer.observe_unresolved_identity(scope, ambiguous);
+
+    let error = consumer
+        .prepare_stream_commit(100, Lsn::new(10))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        DdlError::UnresolvedRelationIdentity {
+            source_audit_id: 7,
+            ref schema,
+            ref table,
+            ref c_tag,
+            relation_oid: None,
+        } if schema == "archive" && table == "orders" && c_tag == "ALTER TABLE"
+    ));
+
+    assert_eq!(
+        consumer.on_stream_abort(100, 101),
+        vec![("archive".into(), "orders".into(), SchemaVersionNo(2))]
+    );
+    let prepared = consumer
+        .prepare_stream_commit(100, Lsn::new(20))
+        .expect("an aborted unresolved legacy event cannot poison replay");
+    assert!(prepared.ddl_rows().is_empty());
+    assert!(prepared.registry_rows().is_empty());
 }
 
 #[tokio::test]

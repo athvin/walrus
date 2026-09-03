@@ -522,6 +522,84 @@ async fn ungrouped_publish_racing_the_reload_seal_is_observed_before_cutover() {
 }
 
 #[tokio::test]
+async fn preexisting_ungrouped_straddler_blocks_the_reload_seal() {
+    let pool = pool().await;
+    let mut tx = pool.begin().await.unwrap();
+    let epoch = EpochNo(920_011);
+    let table = "ungrouped_preexisting_straddler";
+    let h = Lsn::new(0x100);
+
+    let reload_id = reload::request(&mut *tx, epoch, "public", table, ReloadFlavor::Reload)
+        .await
+        .unwrap();
+    reload::claim_requested(&mut *tx, epoch, "sink-straddler", 60, 1)
+        .await
+        .unwrap();
+    finish_fenced(&mut tx, reload_id, h).await;
+
+    let mut straddler = stream_file(epoch, table, "0/120");
+    straddler.lsn_start = Lsn::new(0x80);
+    insert_ready(&mut *tx, &straddler).await.unwrap();
+
+    let owner = "loader-straddler";
+    let lease = acquire_lease(&mut *tx, epoch, "public", table, owner, 60)
+        .await
+        .unwrap()
+        .unwrap();
+    ensure_checkpoint(&mut *tx, epoch, "public", table)
+        .await
+        .unwrap();
+    let publication =
+        reload::claim_publication(&mut *tx, epoch, "public", table, owner, lease.fencing_token)
+            .await
+            .unwrap()
+            .unwrap();
+
+    assert!(
+        reload::claim_publication_ready(&mut *tx, &publication, owner, lease.fencing_token, 10,)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a post-H file is not part of the bounded publication drain"
+    );
+    assert!(matches!(
+        reload::seal_publication_if_drained(&mut tx, &publication, owner, lease.fencing_token,)
+            .await,
+        Err(ControlError::ManifestInvariant { .. })
+    ));
+
+    // The database trigger independently protects the receipt from a caller that knows the
+    // transaction-local protocol setting and bypasses the Rust drain check.
+    sqlx::query("SELECT set_config('walrus.manifest_seal_protocol','2',true)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let error = sqlx::query(
+        "UPDATE walrus.manifest_publication_fence
+         SET sealed_through_lsn=$4, sealed_reload_id=$5,
+             sealed_publication_nonce=$6, updated_at=now()
+         WHERE epoch=$1 AND source_schema=$2 AND source_table=$3",
+    )
+    .bind(epoch.0)
+    .bind("public")
+    .bind(table)
+    .bind(h)
+    .bind(publication.reload_id.0)
+    .bind(publication.publication_nonce)
+    .execute(&mut *tx)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::constraint),
+        Some("manifest_publication_fence_ungrouped_straddler")
+    );
+
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
 async fn publishing_reload_can_be_fenced_and_adopted_after_owner_loss() {
     let pool = pool().await;
     let epoch_bytes: [u8; 8] = Uuid::new_v4().as_bytes()[..8].try_into().unwrap();

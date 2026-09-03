@@ -122,12 +122,10 @@ async fn setup(epoch: EpochNo) -> (TableCtx, tempfile::TempDir) {
     support::cleanup_epoch(&pool, epoch).await;
     control::insert_epoch(
         &pool,
-        &control::ReplicationState {
-            epoch,
-            slot_name: "walrus_slot".into(),
-            created_lsn: "0/0".parse().unwrap(),
-            status: control::ReplicationStatus::Streaming,
-        },
+        epoch,
+        "walrus_slot",
+        "0/0".parse().unwrap(),
+        control::ReplicationStatus::Streaming,
     )
     .await
     .unwrap();

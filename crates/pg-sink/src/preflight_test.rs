@@ -20,6 +20,7 @@ fn preflight_errors_map_to_exit_codes() {
             found: "replica".into(),
         },
         PreflightError::ServerTooOld { found: 130000 },
+        PreflightError::UnsupportedGeneratedColumnPublication { found: 180000 },
         PreflightError::NoHeadroom {
             kind: "wal_senders",
             used: 10,
@@ -41,6 +42,23 @@ fn preflight_errors_map_to_exit_codes() {
             },
         ),
         PreflightError::NoReplicationPriv,
+        PreflightError::NoSchemaUsagePrivilege {
+            role: "walrus_sink".into(),
+            schema: "public".into(),
+            grant_sql: "GRANT USAGE ON SCHEMA \"public\" TO \"walrus_sink\"".into(),
+        },
+        PreflightError::NoTableLockPrivilege {
+            role: "walrus_sink".into(),
+            schema: "public".into(),
+            table: "orders".into(),
+            grant_sql: "GRANT UPDATE ON TABLE \"public\".\"orders\" TO \"walrus_sink\"".into(),
+        },
+        PreflightError::NoTableSelectPrivilege {
+            role: "walrus_sink".into(),
+            schema: "public".into(),
+            table: "orders".into(),
+            grant_sql: "GRANT SELECT ON TABLE \"public\".\"orders\" TO \"walrus_sink\"".into(),
+        },
         PreflightError::ReloadSignalMissing {
             detail: "walrus.reload_signal table absent",
         },
@@ -87,6 +105,30 @@ fn unified_export_requires_a_real_primary_key() {
 }
 
 #[test]
+fn source_version_range_fails_closed_before_pg18_generated_publication_semantics() {
+    for version in [140_000, 140_999, 170_000, 179_999] {
+        require_supported_server_version(version).unwrap();
+    }
+
+    assert!(matches!(
+        require_supported_server_version(139_999),
+        Err(PreflightError::ServerTooOld { found: 139_999 })
+    ));
+    for version in [180_000, 180_001, 190_000] {
+        let error = require_supported_server_version(version).unwrap_err();
+        assert!(matches!(
+            &error,
+            PreflightError::UnsupportedGeneratedColumnPublication { found } if *found == version
+        ));
+        let message = error.to_string();
+        assert!(
+            message.contains("generated-column") && message.contains("PostgreSQL 14–17"),
+            "PG18+ rejection must identify the unsafe semantic and supported range: {error}"
+        );
+    }
+}
+
+#[test]
 fn gap_and_signal_errors_name_their_remediation() {
     // An operator reading the crash log must be able to copy-paste the fix (reload H11).
     let gap = PreflightError::PublicationGap {
@@ -115,5 +157,42 @@ fn gap_and_signal_errors_name_their_remediation() {
         missing
             .to_string()
             .contains("migrations/source/0004_reload_event.sql")
+    );
+
+    let missing = PreflightError::NoSchemaUsagePrivilege {
+        role: "odd\"role".into(),
+        schema: "odd\"schema".into(),
+        grant_sql: "GRANT USAGE ON SCHEMA \"odd\"\"schema\" TO \"odd\"\"role\"".into(),
+    };
+    assert!(
+        missing
+            .to_string()
+            .contains("GRANT USAGE ON SCHEMA \"odd\"\"schema\" TO \"odd\"\"role\"")
+    );
+
+    let missing = PreflightError::NoTableLockPrivilege {
+        role: "walrus_sink".into(),
+        schema: "odd\"schema".into(),
+        table: "order lines".into(),
+        grant_sql: "GRANT UPDATE ON TABLE \"odd\"\"schema\".\"order lines\" TO \"walrus_sink\""
+            .into(),
+    };
+    assert!(
+        missing
+            .to_string()
+            .contains("GRANT UPDATE ON TABLE \"odd\"\"schema\".\"order lines\" TO \"walrus_sink\"")
+    );
+
+    let missing = PreflightError::NoTableSelectPrivilege {
+        role: "walrus_sink".into(),
+        schema: "odd\"schema".into(),
+        table: "order lines".into(),
+        grant_sql: "GRANT SELECT ON TABLE \"odd\"\"schema\".\"order lines\" TO \"walrus_sink\""
+            .into(),
+    };
+    assert!(
+        missing
+            .to_string()
+            .contains("GRANT SELECT ON TABLE \"odd\"\"schema\".\"order lines\" TO \"walrus_sink\"")
     );
 }

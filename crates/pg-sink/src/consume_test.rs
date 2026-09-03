@@ -193,7 +193,7 @@ fn explicit_ordinary_flush_rejects_grouped_and_reload_kinds_before_put() {
 }
 
 #[test]
-fn ddl_tracking_uses_oid_and_never_qualified_name_aliasing() {
+fn ddl_tracking_uses_oid_and_only_unique_legacy_name_resolution() {
     let mut cache = RelationCache::default();
     cache
         .upsert_from_relation(orders_relation(false), SchemaVersionNo(1))
@@ -214,15 +214,75 @@ fn ddl_tracking_uses_oid_and_never_qualified_name_aliasing() {
     };
 
     assert!(
-        tracked_relation_for_ddl(&cache, &event).is_none(),
-        "a same-name relation with a different OID is not this epoch's tracked table"
+        matches!(
+            tracked_relation_for_ddl(&cache, &event),
+            TrackedDdlResolution::Tracked(relation) if relation.oid == 42
+        ),
+        "a different OID at the same frozen name must reach commit-gated recreation validation"
     );
 
     event.c_rel_oid = Some(42);
-    assert_eq!(
-        tracked_relation_for_ddl(&cache, &event).unwrap().oid,
-        42,
+    assert!(
+        matches!(
+            tracked_relation_for_ddl(&cache, &event),
+            TrackedDdlResolution::Tracked(relation) if relation.oid == 42
+        ),
         "the exact frozen relation identity remains tracked"
+    );
+
+    event.c_rel_oid = None;
+    assert!(
+        matches!(
+            tracked_relation_for_ddl(&cache, &event),
+            TrackedDdlResolution::Tracked(relation) if relation.oid == 42
+        ),
+        "a legacy null OID resolves only through one unique frozen qualified name"
+    );
+
+    event.source_table = "orders_v2".into();
+    assert_eq!(
+        tracked_relation_for_ddl(&cache, &event),
+        TrackedDdlResolution::Unresolved,
+        "a null-OID rename cannot be mistaken for unrelated DDL"
+    );
+
+    event.c_rel_oid = Some(43);
+    assert_eq!(
+        tracked_relation_for_ddl(&cache, &event),
+        TrackedDdlResolution::Unrelated,
+        "a different explicit OID and name proves the table is outside the frozen epoch"
+    );
+}
+
+#[test]
+fn legacy_name_resolution_rejects_multiple_frozen_oids() {
+    let mut cache = RelationCache::default();
+    cache
+        .upsert_from_relation(orders_relation(false), SchemaVersionNo(1))
+        .unwrap();
+    let mut replacement = orders_relation(false);
+    replacement.oid = 43;
+    cache
+        .upsert_from_relation(replacement, SchemaVersionNo(2))
+        .unwrap();
+    let event = crate::ddl::DdlEvent {
+        source_audit_id: 1,
+        capture_lsn: Lsn::new(100),
+        c_event: "ddl_command_end".into(),
+        c_tag: "ALTER TABLE".into(),
+        source_schema: "public".into(),
+        source_table: "orders".into(),
+        c_rel_oid: None,
+        c_replica_identity: Some(ReplicaIdentity::Default),
+        c_columns: Some(serde_json::json!([])),
+        c_dropped: None,
+        c_ddl_text: None,
+    };
+
+    assert_eq!(
+        tracked_relation_for_ddl(&cache, &event),
+        TrackedDdlResolution::Unresolved,
+        "qualified name is not identity proof when two frozen OIDs share it"
     );
 }
 
@@ -326,6 +386,127 @@ async fn recreated_branch_loses_progress() {
         progress.load(Ordering::Relaxed),
         0,
         "recreating the future loses progress"
+    );
+}
+
+#[test]
+fn committed_structural_ddl_promotes_the_ordinary_binding() {
+    let mut cache = RelationCache::default();
+    cache
+        .upsert_from_relation(orders_relation(true), SchemaVersionNo(2))
+        .unwrap();
+    let mut router = quiet_router();
+    router.bind_relation(42, SchemaVersionNo(1));
+    let structural = control::DdlRow {
+        id: common::DdlId(1),
+        epoch: EpochNo(1),
+        source_audit_id: 10,
+        source_schema: "public".into(),
+        source_table: "orders".into(),
+        c_lsn: Lsn::new(900),
+        c_event: "ddl_command_end".into(),
+        c_tag: "ALTER TABLE".into(),
+        schema_version: SchemaVersionNo(2),
+        c_rel_oid: Some(42),
+        c_columns: Some(serde_json::json!([])),
+        c_dropped: None,
+        c_ddl_text: Some("ALTER TABLE public.orders ADD COLUMN extra text".into()),
+    };
+    let comment = control::DdlRow {
+        id: common::DdlId(2),
+        source_audit_id: 11,
+        c_tag: "COMMENT".into(),
+        schema_version: SchemaVersionNo(9),
+        c_rel_oid: Some(99),
+        ..structural.clone()
+    };
+
+    let bindings = ddl_relation_bindings(&[structural.clone(), comment], &cache).unwrap();
+    assert_eq!(bindings, vec![(42, SchemaVersionNo(2))]);
+    assert_eq!(router.bindings.get(&42), Some(&SchemaVersionNo(1)));
+    router.commit_ddl_bindings(&bindings);
+    assert_eq!(router.bindings.get(&42), Some(&SchemaVersionNo(2)));
+    assert_eq!(
+        router.bindings.get(&99),
+        None,
+        "metadata-only events must not invent a new routing version"
+    );
+
+    let legacy = control::DdlRow {
+        c_rel_oid: None,
+        ..structural
+    };
+    assert_eq!(
+        ddl_relation_bindings(&[legacy], &cache).unwrap(),
+        vec![(42, SchemaVersionNo(2))],
+        "the unique legacy name resolver reaches the null-OID commit binding path"
+    );
+}
+
+#[test]
+fn explicit_ordinary_binding_never_falls_forward_when_its_cache_entry_is_missing() {
+    let mut cache = RelationCache::default();
+    cache
+        .upsert_from_relation(orders_relation(true), SchemaVersionNo(2))
+        .unwrap();
+    let mut router = quiet_router();
+    router.bind_relation(42, SchemaVersionNo(1));
+
+    let error = router.cached_relation(&cache, 42).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "bound ordinary change relation version is not cached: oid=42 version=1"
+    );
+}
+
+#[test]
+fn decode_commit_frontier_rejects_regression_without_mutating() {
+    let mut frontier = Lsn::new(900);
+    advance_processed_through(&mut frontier, Lsn::new(900), Lsn::new(910)).unwrap();
+    assert_eq!(
+        frontier,
+        Lsn::new(910),
+        "an exact legacy commit replay repairs the cursor to end_lsn"
+    );
+
+    let error = advance_processed_through(&mut frontier, Lsn::new(909), Lsn::new(920)).unwrap_err();
+    assert!(error.to_string().contains("source commit LSN regressed"));
+    assert_eq!(
+        frontier,
+        Lsn::new(910),
+        "a rejected commit cannot move schema history backward"
+    );
+
+    let error = advance_processed_through(&mut frontier, Lsn::new(910), Lsn::new(910)).unwrap_err();
+    assert!(error.to_string().contains("end LSN did not follow"));
+    assert_eq!(
+        frontier,
+        Lsn::new(910),
+        "an invalid end position cannot mutate the history cursor"
+    );
+}
+
+#[test]
+fn relation_history_is_strictly_before_both_resume_and_ordinary_commit_boundaries() {
+    assert_eq!(
+        relation_history_cutoff(Lsn::new(900), None),
+        Lsn::new(899),
+        "streamed replay at a legacy commit_lsn must exclude that commit's future history"
+    );
+    assert_eq!(
+        relation_history_cutoff(Lsn::new(910), None),
+        Lsn::new(909),
+        "a normal end_lsn cursor retains history committed before the end position"
+    );
+    assert_eq!(
+        relation_history_cutoff(Lsn::new(1_000), Some(Lsn::new(950))),
+        Lsn::new(949),
+        "ordinary Begin.final_lsn remains the tighter bound"
+    );
+    assert_eq!(
+        relation_history_cutoff(Lsn::ZERO, None),
+        Lsn::ZERO,
+        "the initial cursor subtraction saturates"
     );
 }
 
@@ -610,7 +791,7 @@ fn schema_barrier_alone_does_not_advance_data_checkpoint() {
     let mut checkpoint = crate::checkpoint::DurabilityCheckpoint::new(resume_lsn);
 
     assert_eq!(
-        record_durable_frontier(None, None, &mut checkpoint),
+        record_durable_frontier(None, None, &mut checkpoint).unwrap(),
         None,
         "a schema publication receipt is not a durable file/control frontier"
     );
@@ -622,11 +803,7 @@ async fn failed_ordinary_schema_publication_never_polls_persistence_or_ack_stage
     let persistence_polled = AtomicBool::new(false);
 
     let result = persist_after_ordinary_schema_publication(
-        async {
-            Err::<(), crate::ddl::DdlError>(crate::ddl::DdlError::MissingColumn(
-                "publication failed",
-            ))
-        },
+        Err::<(), anyhow::Error>(crate::ddl::DdlError::MissingColumn("publication failed").into()),
         async {
             persistence_polled.store(true, Ordering::Relaxed);
             Ok::<(), anyhow::Error>(())

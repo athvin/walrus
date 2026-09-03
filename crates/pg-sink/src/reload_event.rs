@@ -786,6 +786,26 @@ impl PendingReloadEvents {
         self.pending.push(event);
     }
 
+    /// Number of control effects owned by the currently committing ordinary transaction. This is a
+    /// read-only preflight so a mixed DDL/effect commit can fail before consuming replay state.
+    #[must_use]
+    pub fn ordinary_effect_count(&self) -> usize {
+        self.pending
+            .iter()
+            .filter(|event| event.xid.is_none())
+            .count()
+    }
+
+    /// Number of surviving control effects owned by one streamed top-level transaction. Savepoint
+    /// abort handling removes doomed entries before this preflight is queried at StreamCommit.
+    #[must_use]
+    pub fn stream_effect_count(&self, top_xid: u32) -> usize {
+        self.pending
+            .iter()
+            .filter(|event| event.top_xid == Some(top_xid))
+            .count()
+    }
+
     /// Promote ordinary-transaction events at commit.
     pub fn on_commit(&mut self, commit_lsn: Lsn) -> Vec<CommittedReloadEvent> {
         promote(&mut self.pending, commit_lsn, |event| event.xid.is_none())

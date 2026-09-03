@@ -47,7 +47,7 @@ adoption_protocol AS MATERIALIZED (
     SELECT set_config('walrus.reload_publication_adopt_protocol', '2', true) AS protocol
     WHERE EXISTS (SELECT 1 FROM eligible)
 ),
-claimed AS (
+claimed AS MATERIALIZED (
     UPDATE walrus.table_reload r
     SET status = 'publishing',
         publication_nonce = COALESCE(r.publication_nonce, gen_random_uuid()),
@@ -63,6 +63,9 @@ claimed AS (
     RETURNING r.reload_id, r.epoch, r.source_schema, r.source_table, r.status,
               r.start_lsn, r.final_lsn, r.schema_version,
               r.publication_nonce, r.publisher_owner_pod, r.publisher_fencing_token
+), deauthorized AS MATERIALIZED (
+    SELECT pg_catalog.set_config('walrus.reload_publication_adopt_protocol', '', true) AS protocol
+    FROM (SELECT count(*) FROM claimed) AS operation_result
 )
 SELECT active.reload_id AS candidate_reload_id,
        EXISTS (SELECT 1 FROM locked_ownership) AS ownership_valid,
@@ -70,6 +73,7 @@ SELECT active.reload_id AS candidate_reload_id,
        claimed.reload_id, claimed.epoch, claimed.source_schema, claimed.source_table,
        claimed.status, claimed.start_lsn, claimed.final_lsn, claimed.schema_version,
        claimed.publication_nonce, claimed.publisher_owner_pod, claimed.publisher_fencing_token
-FROM (SELECT 1) singleton
+FROM deauthorized
 LEFT JOIN active ON true
-LEFT JOIN claimed ON true;
+LEFT JOIN claimed ON true
+WHERE deauthorized.protocol = '';

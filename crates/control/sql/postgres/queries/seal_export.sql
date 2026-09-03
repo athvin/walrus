@@ -42,6 +42,11 @@ WITH range_stats AS MATERIALIZED (
     AND reload.export_range_count = ranges.range_count
     AND ranges.range_count = ranges.complete_count
     AND ranges.stale_count = 0
+    AND walrus.reload_export_plan_is_attested(
+      reload.reload_id,
+      reload.exporter_generation,
+      reload.export_range_count
+    )
     AND ranges.file_count = manifests.file_count
     AND ranges.row_count = manifests.row_count
     AND manifests.invalid_count = 0

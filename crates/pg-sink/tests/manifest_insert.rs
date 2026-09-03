@@ -14,6 +14,7 @@ use common::{
     EpochNo, Kind, Lsn, Op, PgColumn, PgRelation, ReplicaIdentity, SinkMeta, TupleValue,
     UtcTimestamp,
 };
+use control::reload::{self, ExportRangePlan, ExportSnapshot, ReloadFenceIdentity, ReloadFlavor};
 use control::{connect, run_migrations};
 use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
@@ -22,7 +23,7 @@ use pg_sink::checkpoint::DurabilityCheckpoint;
 use pg_sink::consume::flush_batch;
 use pg_sink::sink::ParquetSink;
 use pg_to_arrow::{BatchBuilder, oids};
-use sqlx::postgres::PgPool;
+use sqlx::postgres::{PgConnection, PgPool};
 use std::sync::Arc;
 
 fn minio_store() -> Arc<dyn ObjectStore> {
@@ -51,6 +52,79 @@ async fn control_pool() -> PgPool {
         .expect("connect to control PG");
     run_migrations(&pool).await.expect("migrations apply");
     pool
+}
+
+async fn publishing_reload(
+    conn: &mut PgConnection,
+    epoch: EpochNo,
+    table: &str,
+    final_lsn: Lsn,
+    publication_nonce: uuid::Uuid,
+) -> i64 {
+    let reload_id = reload::request(&mut *conn, epoch, "public", table, ReloadFlavor::Reload)
+        .await
+        .unwrap();
+    let claimed = reload::claim_requested(&mut *conn, epoch, "manifest-insert-test", 60, 1)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let lease = claimed.exporter_lease("manifest-insert-test").unwrap();
+    let start_lsn: Lsn = "0/100".parse().unwrap();
+    let schema_version = common::SchemaVersionNo(1);
+    let identity = ReloadFenceIdentity {
+        request_id: claimed.parent_request_id,
+        source_schema: "public",
+        source_table: table,
+        schema_version,
+    };
+    reload::record_start_fence(&mut *conn, reload_id, start_lsn, identity)
+        .await
+        .unwrap();
+    reload::begin_export_plan(
+        &mut *conn,
+        &lease,
+        start_lsn,
+        schema_version,
+        ExportSnapshot {
+            identity: "1:2:",
+            xmin: 1,
+            xmax: 2,
+        },
+        &[ExportRangePlan {
+            range_no: 0,
+            full_scan: true,
+            start_block: None,
+            end_block: None,
+        }],
+    )
+    .await
+    .unwrap();
+    reload::record_export_range(&mut *conn, &lease, 0, 0, 0)
+        .await
+        .unwrap();
+    reload::seal_export(&mut *conn, &lease, start_lsn, schema_version)
+        .await
+        .unwrap();
+    reload::record_end_marker(&mut *conn, reload_id, final_lsn, identity)
+        .await
+        .unwrap();
+    reload::complete_export(&mut *conn, &lease, final_lsn)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE walrus.table_reload
+         SET status = 'publishing', publication_nonce = $2,
+             publisher_owner_pod = 'manifest-insert-test', publisher_fencing_token = 1,
+             publishing_at = now()
+         WHERE reload_id = $1",
+    )
+    .bind(reload_id.0)
+    .bind(publication_nonce)
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+    reload_id.0
 }
 
 fn orders() -> PgRelation {
@@ -205,21 +279,7 @@ async fn sealed_replay_deletes_object_and_remains_clamped_by_an_open_stream() {
     let sink = ParquetSink::new(Arc::clone(&store), "walrus", epoch);
     let publication_nonce = uuid::Uuid::new_v4();
 
-    let reload_id: i64 = sqlx::query_scalar(
-        "INSERT INTO walrus.table_reload
-           (epoch, source_schema, source_table, flavor, status, start_lsn, final_lsn,
-            schema_version, publication_nonce, publisher_owner_pod,
-            publisher_fencing_token, publishing_at)
-         VALUES ($1, 'public', 'orders', 'reload', 'publishing', '0/100', $2,
-                 1, $3, 'manifest-insert-test', 1, now())
-         RETURNING reload_id",
-    )
-    .bind(epoch.0)
-    .bind(seal)
-    .bind(publication_nonce)
-    .fetch_one(&mut *tx)
-    .await
-    .unwrap();
+    let reload_id = publishing_reload(&mut tx, epoch, "orders", seal, publication_nonce).await;
     sqlx::query("SELECT set_config('walrus.manifest_seal_protocol', '2', true)")
         .execute(&mut *tx)
         .await
@@ -263,7 +323,11 @@ async fn sealed_replay_deletes_object_and_remains_clamped_by_an_open_stream() {
     .unwrap();
     assert_eq!(rows, 0, "covered replay must not recreate manifest work");
 
-    checkpoint.on_batch_durable(obj.lsn_end);
+    let feedback_end = Lsn::new(obj.lsn_end.as_u64().saturating_add(8));
+    checkpoint
+        .observe_commit(obj.lsn_end, feedback_end)
+        .unwrap();
+    checkpoint.on_commit_durable(obj.lsn_end).unwrap();
     assert_eq!(
         checkpoint.confirmed_flush(),
         resume,
@@ -272,8 +336,8 @@ async fn sealed_replay_deletes_object_and_remains_clamped_by_an_open_stream() {
     assert!(checkpoint.on_stream_end(77).unwrap());
     assert_eq!(
         checkpoint.confirmed_flush(),
-        obj.lsn_end,
-        "once the stream ends, the remembered covered frontier becomes ACK-eligible"
+        feedback_end,
+        "once the stream ends, the covered commit's end_lsn becomes ACK-eligible"
     );
 
     tx.rollback().await.unwrap();

@@ -4,8 +4,9 @@
     clippy::let_underscore_must_use,
     reason = "integration test — unwrap/expect fine in setup + helpers"
 )]
-//! The durability checkpoint against compose (`#[ignore]` — needs source PG + MinIO + control PG). The
-//! slot's `confirmed_flush_lsn` reaches a batch's `lsn_end` only *after* the S3 PUT + manifest commit;
+//! The durability checkpoint against compose (`#[ignore]` — needs source PG + MinIO + control PG).
+//! The slot's `confirmed_flush_lsn` reaches the matching pgoutput `end_lsn` only *after* the S3 PUT +
+//! manifest commit at the batch's commit-order `lsn_end`;
 //! and a crash between the PUT and the standby update re-streams the batch (at-least-once, no loss).
 //! The two-distinct-LSN rule is unit-tested in `src/checkpoint.rs`.
 //!
@@ -104,7 +105,6 @@ async fn slot_advances_only_after_s3_and_manifest_durable() {
     let epoch = EpochNo(2_260_001);
     let sink = ParquetSink::new(minio(), "walrus", epoch);
     let pool = control_pool().await;
-    let mut tx = pool.begin().await.unwrap();
     let mut checkpoint = DurabilityCheckpoint::new(resume.start_lsn());
     let mut router = BatchRouter::new(
         BatchTriggers {
@@ -137,7 +137,9 @@ async fn slot_advances_only_after_s3_and_manifest_durable() {
         .unwrap();
 
     let mut lsn_end: Option<Lsn> = None;
+    let mut feedback_end: Option<Lsn> = None;
     let mut key = None;
+    let mut manifest_uri = None;
     tokio::time::timeout(Duration::from_secs(15), async {
         while lsn_end.is_none() {
             let frame = stream.next().await.unwrap().unwrap();
@@ -153,14 +155,27 @@ async fn slot_advances_only_after_s3_and_manifest_durable() {
                             .unwrap();
                     }
                     other => {
+                        if let Message::Commit {
+                            commit_lsn,
+                            end_lsn,
+                            ..
+                        } = other
+                        {
+                            checkpoint.observe_commit(*commit_lsn, *end_lsn).unwrap();
+                            feedback_end = Some(*end_lsn);
+                        }
                         for sealed in router
                             .route(&cache, other, frame_lsn, common::SchemaVersionNo(1))
                             .unwrap()
                         {
-                            let obj = flush_batch(&sink, &mut *tx, epoch, sealed).await.unwrap(); // (a)+(b)
-                            checkpoint.on_batch_durable(obj.lsn_end); // (c)
+                            // Use the production-style pool path so (b)'s manifest transaction is
+                            // committed before (c) can release source WAL. Keeping an outer test
+                            // transaction here would make the assertion prove the unsafe inverse.
+                            let obj = flush_batch(&sink, &pool, epoch, sealed).await.unwrap(); // (a)+(b)
+                            checkpoint.on_commit_durable(obj.lsn_end).unwrap(); // (c)
                             checkpoint.send(&mut stream, false).await.unwrap();
                             lsn_end = Some(obj.lsn_end);
+                            manifest_uri = Some(obj.s3_uri.clone());
                             key = Some(obj.key);
                         }
                     }
@@ -172,10 +187,17 @@ async fn slot_advances_only_after_s3_and_manifest_durable() {
     .expect("a durable batch within 15s");
 
     let target = lsn_end.unwrap();
-    // The server confirms the flush after a round-trip — poll until it reaches lsn_end.
+    let feedback_target = feedback_end.expect("the durable batch has a matching Commit end_lsn");
+    assert!(
+        feedback_target > target,
+        "pgoutput end_lsn is strictly past the manifest commit_lsn"
+    );
+    assert_eq!(checkpoint.confirmed_flush(), feedback_target);
+    // The server confirms the flush after a round-trip — poll until it reaches the end of the commit
+    // record, not merely the manifest's commit-order LSN.
     let mut reached = false;
     for _ in 0..40 {
-        if confirmed_flush(&admin, slot).await >= target {
+        if confirmed_flush(&admin, slot).await >= feedback_target {
             reached = true;
             break;
         }
@@ -183,10 +205,23 @@ async fn slot_advances_only_after_s3_and_manifest_durable() {
     }
     assert!(
         reached,
-        "confirmed_flush_lsn reached the batch's lsn_end only after S3 + manifest were durable"
+        "confirmed_flush_lsn reached the Commit end_lsn only after S3 + manifest were durable"
     );
 
-    tx.rollback().await.unwrap();
+    if let Some(uri) = manifest_uri {
+        let mut cleanup = pool.begin().await.unwrap();
+        sqlx::query("SELECT set_config('walrus.manifest_delete_protocol', '2', true)")
+            .execute(&mut *cleanup)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM walrus.file_manifest WHERE epoch = $1 AND s3_uri = $2")
+            .bind(epoch.0)
+            .bind(uri)
+            .execute(&mut *cleanup)
+            .await
+            .unwrap();
+        cleanup.commit().await.unwrap();
+    }
     if let Some(k) = key {
         let _ = minio().delete(&k).await;
     }

@@ -50,9 +50,9 @@ pub use reload::{
     SourceReloadRequest,
 };
 pub use replication_state::{
-    BootstrapProgress, ReplicationState, ReplicationStatus, bump_bootstrap_epoch, bump_epoch,
-    complete_bootstrap, insert_epoch, mark_total_restart, read_bootstrap_progress,
-    read_current_epoch,
+    BootstrapProgress, CURRENT_CATALOG_FENCE_VERSION, ReplicationState, ReplicationStatus,
+    bump_bootstrap_epoch, bump_epoch, complete_bootstrap, insert_epoch, mark_total_restart,
+    read_bootstrap_progress, read_current_epoch,
 };
 pub use schema_registry::{
     RegistryRow, read_all_latest_registry, read_all_registry, read_latest_version, read_registry,

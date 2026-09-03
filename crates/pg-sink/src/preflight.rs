@@ -1,9 +1,11 @@
 //! Source-side preflight (§1.1, architecture "Startup & bootstrap" steps 1–3, 6).
 //!
 //! Assert every server-side precondition before a single byte of WAL is read: the connecting role has
-//! the `REPLICATION` privilege, `wal_level = logical`, server ≥ 14, wal-sender headroom, the
-//! publication covers `walrus.ddl_audit` + `walrus.heartbeat`, and every published **user** table has
-//! a usable replica identity (a PK for `DEFAULT`). Any mismatch is **terminal** — a
+//! the `REPLICATION` privilege, `wal_level = logical`, server 14–17, wal-sender headroom, the
+//! publication covers `walrus.ddl_audit`, `walrus.heartbeat`, `walrus.reload_signal`, and
+//! `walrus.reload_event`, and every published **user** table has schema `USAGE`, whole-table
+//! `SELECT`, a privilege that permits the consistent-export locks, and a usable replica identity
+//! (a PK for `DEFAULT`). Any mismatch is **terminal** — a
 //! [`PreflightError`] mapped to a distinct, greppable [`common::ExitCode`] (`CrashLoopBackOff`, not
 //! a silent slow failure).
 //!
@@ -39,22 +41,25 @@ pub struct ServerInfo {
     pub wal_level: String,
 }
 
-/// Strict rejects a keyless table; lenient quarantines and continues.
+/// Strict rejects a keyless table; lenient reports it for diagnostics without granting admission.
+/// Production [`SinkConfig::validate`](crate::config::SinkConfig::validate) rejects lenient mode
+/// until the resulting exclusion can be bound durably to a generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PkMode {
     /// A keyless published table fails preflight, so the sink refuses to start.
     Strict,
-    /// A keyless table is quarantined and the sink starts without it, so one bad table does not
-    /// block every other one.
+    /// Report keyless tables without returning an error. This is a low-level diagnostic mode only:
+    /// it does not remove those tables from publication, catalog fencing, or logical decoding.
     Lenient,
 }
 
 /// Outcome of the per-table PK preflight.
 #[derive(Debug, Default, Clone)]
 pub struct PkReport {
-    /// Tables with a usable replica-identity key — the set that will be replicated.
+    /// Tables whose catalog inspection found a usable replica-identity key.
     pub ok: Vec<TableId>,
-    /// Keyless tables skipped under [`PkMode::Lenient`]. Always empty under
+    /// Keyless tables reported under [`PkMode::Lenient`]. They are not automatically excluded from
+    /// replication; production configuration rejects this diagnostic-only mode. Always empty under
     /// [`PkMode::Strict`], which errors instead of reporting.
     pub quarantined: Vec<TableId>,
 }
@@ -73,6 +78,15 @@ pub enum PreflightError {
     /// streamed transactions.
     #[error("server_version_num {found} < 140000 (proto v2 needs PG14+)")]
     ServerTooOld { found: i32 },
+    /// PostgreSQL 18 added configurable generated-column publication semantics. Walrus's catalog
+    /// and DDL shapes intentionally follow the PG14–17 pgoutput shape, which omits generated
+    /// columns. Until the PG18 publication option can be attested for the full online lifetime,
+    /// starting on PG18+ could silently disagree with the wire relation shape.
+    #[error(
+        "server_version_num {found} >= 180000; PostgreSQL 18+ generated-column logical-publication \
+         semantics are not safely supported (supported source versions: PostgreSQL 14–17)"
+    )]
+    UnsupportedGeneratedColumnPublication { found: i32 },
     /// The source is already at its `max_replication_slots` or `max_wal_senders` limit, so creating
     /// walrus's slot would fail later, in a worse place.
     #[error("no headroom: {kind} {used}/{max}")]
@@ -109,12 +123,60 @@ pub enum PreflightError {
     #[error(transparent)]
     PublicationCoverage(#[from] crate::source_catalog::PublicationCoverageIssue),
     /// A published table has no key, so its updates and deletes could not be applied downstream.
-    /// Raised only under [`PkMode::Strict`]; [`PkMode::Lenient`] reports it in a [`PkReport`].
+    /// Raised only under [`PkMode::Strict`]; diagnostic [`PkMode::Lenient`] reports it in a
+    /// [`PkReport`] without admitting that configuration to production startup.
     #[error("table {schema}.{table} has no PRIMARY KEY / usable replica identity")]
     NoPrimaryKey { schema: String, table: String },
     /// The connecting role lacks `REPLICATION`, so it cannot open a replication connection.
     #[error("missing REPLICATION privilege")]
     NoReplicationPriv,
+    /// Table grants alone do not let a role resolve a relation through its containing schema.
+    #[error(
+        "source role {role:?} has no USAGE privilege on published target schema {schema}; \
+         grant schema USAGE (recommended fix: {grant_sql})"
+    )]
+    NoSchemaUsagePrivilege {
+        /// Connected source role whose effective grants were inspected.
+        role: String,
+        /// Published target schema.
+        schema: String,
+        /// Safely quoted recommended grant for an administrator.
+        grant_sql: String,
+    },
+    /// Consistent bootstrap/reload fences use source-table lock modes stronger than ACCESS SHARE.
+    /// PostgreSQL requires a table-level UPDATE, DELETE, or TRUNCATE grant (or ownership/superuser)
+    /// for those modes; SELECT and REPLICATION alone are insufficient.
+    #[error(
+        "source role {role:?} cannot acquire consistent-export locks on table {schema}.{table}; \
+         grant a table-level UPDATE, DELETE, or TRUNCATE privilege \
+         (recommended fix: {grant_sql})"
+    )]
+    NoTableLockPrivilege {
+        /// Connected source role whose effective grants were inspected.
+        role: String,
+        /// Published target schema.
+        schema: String,
+        /// Published target table.
+        table: String,
+        /// Safely quoted recommended grant for an administrator.
+        grant_sql: String,
+    },
+    /// The role has no table-level SELECT grant. Column grants are not enough for Walrus's
+    /// arbitrary full-row `COPY (SELECT ...)` export and can change meaning as columns are added.
+    #[error(
+        "source role {role:?} cannot COPY the complete table {schema}.{table}; \
+         grant table-level SELECT (recommended fix: {grant_sql})"
+    )]
+    NoTableSelectPrivilege {
+        /// Connected source role whose effective grants were inspected.
+        role: String,
+        /// Published target schema.
+        schema: String,
+        /// Published target table.
+        table: String,
+        /// Safely quoted recommended grant for an administrator.
+        grant_sql: String,
+    },
     /// The `walrus.ddl_audit` tap is absent or incomplete, so schema changes would drift silently.
     /// `detail` names which half is missing (the table or an event trigger).
     #[error("DDL capture not installed: {detail} (apply migrations/source/0002_ddl_triggers.sql)")]
@@ -165,12 +227,16 @@ impl From<PreflightError> for common::Error {
             },
             PreflightError::WalLevel { .. }
             | PreflightError::ServerTooOld { .. }
+            | PreflightError::UnsupportedGeneratedColumnPublication { .. }
             | PreflightError::NoHeadroom { .. }
             | PreflightError::SlotNameDrift { .. }
             | PreflightError::PublicationMissing { .. }
             | PreflightError::PublicationGap { .. }
             | PreflightError::PublicationCoverage(_)
             | PreflightError::NoReplicationPriv
+            | PreflightError::NoSchemaUsagePrivilege { .. }
+            | PreflightError::NoTableLockPrivilege { .. }
+            | PreflightError::NoTableSelectPrivilege { .. }
             | PreflightError::DdlCaptureMissing { .. }
             | PreflightError::ReloadSignalMissing { .. }
             | PreflightError::ReloadEventMissing { .. }
@@ -225,9 +291,10 @@ impl<'a> SourcePreflight<'a> {
         SourcePreflight { client, cfg }
     }
 
-    /// The DDL-capture tap is installed: the `walrus.ddl_audit` table has the sink's columns
-    /// and all three event triggers exist with the required guarded command tags. Missing → terminal
-    /// (schema changes would silently drift).
+    /// The DDL-capture tap is installed: the `walrus.ddl_audit` table has the sink's columns, both
+    /// event-trigger functions attest the current protocol, and all three event triggers exist with
+    /// the required guarded command tags. Missing/stale → terminal (schema changes would silently
+    /// drift).
     ///
     /// # Errors
     ///
@@ -247,6 +314,27 @@ impl<'a> SourcePreflight<'a> {
             return Err(PreflightError::DdlCaptureMissing {
                 detail: "walrus.ddl_audit table/columns absent",
             });
+        }
+        // Protocol 3 adds the online key/replica-identity guard on top of protocol 2's topology
+        // guard. Trigger names and command tags alone cannot distinguish an older 0002 installation.
+        // The marker is stored in pg_proc.proconfig on each implementation function: it is durable,
+        // and an older CREATE OR REPLACE clears it together with the guarded implementation.
+        for function in ["walrus.intercept_ddl()", "walrus.guard_publication_ddl()"] {
+            let current = self
+                .first_text(&format!(
+                    "SELECT EXISTS (
+                       SELECT 1
+                       FROM pg_proc
+                       WHERE oid = to_regprocedure('{function}')
+                         AND proconfig @> ARRAY['walrus.ddl_capture_protocol=3']::text[]
+                     )::text",
+                ))
+                .await?;
+            if current != "true" {
+                return Err(PreflightError::DdlCaptureMissing {
+                    detail: "DDL guard protocol 3 attestation absent or stale",
+                });
+            }
         }
         for (name, event, function, tags) in [
             (
@@ -287,7 +375,7 @@ impl<'a> SourcePreflight<'a> {
         Ok(())
     }
 
-    /// The role has `REPLICATION`, `wal_level = logical`, `server_version_num ≥ 140000`, and free
+    /// The role has `REPLICATION`, `wal_level = logical`, `140000 ≤ server_version_num < 180000`, and free
     /// wal-sender headroom. Replication-slot headroom is intentionally deferred until slot
     /// classification: resuming a healthy slot needs no additional slot, and replacing an
     /// invalidated same-name slot frees its own capacity before recreating it.
@@ -295,9 +383,11 @@ impl<'a> SourcePreflight<'a> {
     /// # Errors
     ///
     /// Returns [`PreflightError::NoReplicationPriv`], [`PreflightError::WalLevel`],
-    /// [`PreflightError::ServerTooOld`], or [`PreflightError::NoHeadroom`] for a terminal prerequisite
-    /// mismatch; catalog failures return [`PreflightError::Query`], and a setting that is missing or
-    /// non-numeric returns [`PreflightError::UnusableResult`].
+    /// [`PreflightError::ServerTooOld`],
+    /// [`PreflightError::UnsupportedGeneratedColumnPublication`], or
+    /// [`PreflightError::NoHeadroom`] for a terminal prerequisite mismatch; catalog failures return
+    /// [`PreflightError::Query`], and a setting that is missing or non-numeric returns
+    /// [`PreflightError::UnusableResult`].
     pub async fn assert_server_prereqs(&self) -> Result<ServerInfo, PreflightError> {
         // The role must be able to start a WAL sender (rolreplication, or a superuser).
         let can_replicate = self
@@ -313,9 +403,7 @@ impl<'a> SourcePreflight<'a> {
             return Err(PreflightError::WalLevel { found: wal_level });
         }
         let version_num = self.setting_i32("server_version_num").await?;
-        if version_num < 140_000 {
-            return Err(PreflightError::ServerTooOld { found: version_num });
-        }
+        require_supported_server_version(version_num)?;
         self.assert_headroom(
             "wal_senders",
             "max_wal_senders",
@@ -471,10 +559,11 @@ impl<'a> SourcePreflight<'a> {
     }
 
     /// The publication emits INSERT/UPDATE/DELETE/TRUNCATE, covers the walrus-internal tables, and
-    /// applies no row filters or column lists to any user target (create/extend/fix global flags
-    /// when `manage_publication`, else a mismatch is terminal). `pg_publication_tables` expands
-    /// `FOR ALL TABLES` and partition roots; [`crate::source_catalog`] additionally inspects the
-    /// underlying membership rows so an explicit all-current-columns list is still rejected.
+    /// applies no row filters, column lists, row-level security, or topology-dependent membership
+    /// to any user target (create/extend/fix global flags when `manage_publication`, else a mismatch
+    /// is terminal). `pg_publication_tables` expands `FOR ALL TABLES` and partition roots;
+    /// [`crate::source_catalog`] additionally inspects the underlying membership and table rows so
+    /// an explicit all-current-columns list or a policy-filterable snapshot is still rejected.
     ///
     /// # Errors
     ///
@@ -571,9 +660,90 @@ impl<'a> SourcePreflight<'a> {
         Ok(())
     }
 
-    /// Every published **user** table (schema ≠ `walrus`) has a usable replica identity: `DEFAULT`
-    /// requires a PRIMARY KEY; `FULL`/`INDEX` are fine; `NOTHING` is never usable. Strict → terminal on
-    /// the first offender; lenient → quarantine + alert + continue.
+    /// Every published user table's schema grants the connected role `USAGE`, and every table grants
+    /// whole-table `SELECT` plus a table-level privilege that permits `LOCK TABLE ... IN SHARE
+    /// [UPDATE EXCLUSIVE] MODE`. Table grants do not imply schema `USAGE`, and column-only SELECT is
+    /// not sufficient for arbitrary full-row COPY. PostgreSQL does not expose a standalone LOCK
+    /// grant: UPDATE is the recommended least-broad portable grant; an existing DELETE/TRUNCATE
+    /// grant, table ownership, or superuser also works.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PreflightError::NoSchemaUsagePrivilege`],
+    /// [`PreflightError::NoTableSelectPrivilege`], or [`PreflightError::NoTableLockPrivilege`] for
+    /// the first uncovered target, with a quoted remediation statement, or the normal
+    /// query/identifier errors. A missing schema grant is reported before any table grant gap.
+    pub async fn assert_table_lock_privileges(&self) -> Result<(), PreflightError> {
+        let sql = format!(
+            "SELECT current_user::text AS role_name, pt.schemaname, pt.tablename,
+                    pg_catalog.has_schema_privilege(current_user, n.oid, 'USAGE')::text
+                      AS can_use_schema,
+                    pg_catalog.has_table_privilege(current_user, c.oid, 'SELECT')::text
+                      AS can_select,
+                    (pg_catalog.has_table_privilege(current_user, c.oid, 'UPDATE')
+                     OR pg_catalog.has_table_privilege(current_user, c.oid, 'DELETE')
+                     OR pg_catalog.has_table_privilege(current_user, c.oid, 'TRUNCATE'))::text
+                      AS can_lock
+             FROM pg_publication_tables AS pt
+             JOIN pg_namespace AS n ON n.nspname = pt.schemaname
+             JOIN pg_class AS c ON c.relnamespace = n.oid AND c.relname = pt.tablename
+             WHERE pt.pubname = {}
+               AND pt.schemaname <> 'walrus'
+               AND NOT (
+                 pg_catalog.has_schema_privilege(current_user, n.oid, 'USAGE')
+                 AND pg_catalog.has_table_privilege(current_user, c.oid, 'SELECT')
+                 AND (
+                   pg_catalog.has_table_privilege(current_user, c.oid, 'UPDATE')
+                   OR pg_catalog.has_table_privilege(current_user, c.oid, 'DELETE')
+                   OR pg_catalog.has_table_privilege(current_user, c.oid, 'TRUNCATE')
+                 )
+               )
+             ORDER BY pg_catalog.has_schema_privilege(current_user, n.oid, 'USAGE'),
+                      pt.schemaname, pt.tablename
+             LIMIT 1",
+            self.cfg.publication_name.to_quoted_literal()
+        );
+        for message in self.query(&sql).await? {
+            let SimpleQueryMessage::Row(row) = message else {
+                continue;
+            };
+            let role = row.get("role_name").unwrap_or_default().to_string();
+            let schema = row.get("schemaname").unwrap_or_default().to_string();
+            let table = row.get("tablename").unwrap_or_default().to_string();
+            let schema_ident = ident(&schema)?;
+            let grantee = ident(&role)?;
+            if row.get("can_use_schema") != Some("true") {
+                return Err(PreflightError::NoSchemaUsagePrivilege {
+                    grant_sql: format!("GRANT USAGE ON SCHEMA {schema_ident} TO {grantee}"),
+                    role,
+                    schema,
+                });
+            }
+            let qualified = format!("{schema_ident}.{}", ident(&table)?);
+            if row.get("can_select") != Some("true") {
+                return Err(PreflightError::NoTableSelectPrivilege {
+                    grant_sql: format!("GRANT SELECT ON TABLE {qualified} TO {grantee}"),
+                    role,
+                    schema,
+                    table,
+                });
+            }
+            debug_assert_eq!(row.get("can_lock"), Some("false"));
+            return Err(PreflightError::NoTableLockPrivilege {
+                grant_sql: format!("GRANT UPDATE ON TABLE {qualified} TO {grantee}"),
+                role,
+                schema,
+                table,
+            });
+        }
+        Ok(())
+    }
+
+    /// Every published **user** table (schema ≠ `walrus`) has a valid, ready, live PRIMARY KEY and a
+    /// usable replica identity. The real PK is required by the snapshot export's stable keyset cursor;
+    /// `NOTHING` is unusable for WAL changes even when that PK exists. Strict → terminal on the first
+    /// offender; diagnostic lenient mode returns the complete report without implying that the
+    /// reported tables have been excluded from replication.
     ///
     /// # Errors
     ///
@@ -584,7 +754,11 @@ impl<'a> SourcePreflight<'a> {
         let sql = format!(
             r#"SELECT pt.schemaname, pt.tablename, c.relreplident::text AS relreplident,
                       (EXISTS (SELECT 1 FROM pg_index i
-                               WHERE i.indrelid = c.oid AND i.indisprimary))::text AS has_pk
+                               WHERE i.indrelid = c.oid
+                                 AND i.indisprimary
+                                 AND i.indisvalid
+                                 AND i.indisready
+                                 AND i.indislive))::text AS has_pk
                FROM pg_publication_tables pt
                JOIN pg_namespace n ON n.nspname = pt.schemaname
                JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = pt.tablename
@@ -623,7 +797,7 @@ impl<'a> SourcePreflight<'a> {
                     PkMode::Lenient => {
                         tracing::warn!(
                             schema = %id.schema, table = %id.table,
-                            "ALERT: published table has no usable replica identity — quarantined (lenient)"
+                            "ALERT: published table has no usable replica identity — reported by diagnostic lenient mode, not excluded"
                         );
                         report.quarantined.push(id);
                     }
@@ -707,6 +881,20 @@ impl<'a> SourcePreflight<'a> {
         }
         Ok(set)
     }
+}
+
+/// Bound source compatibility explicitly. PG18's generated-column publication option changes the
+/// relation/tuple contract that the PG14–17 catalog-shape code intentionally mirrors. Rejecting the
+/// whole new server family is conservative but remains correct across startup and later online DDL:
+/// no unknown publication option can begin emitting a column Walrus omitted from its registry.
+const fn require_supported_server_version(found: i32) -> Result<(), PreflightError> {
+    if found < 140_000 {
+        return Err(PreflightError::ServerTooOld { found });
+    }
+    if found >= 180_000 {
+        return Err(PreflightError::UnsupportedGeneratedColumnPublication { found });
+    }
+    Ok(())
 }
 
 /// Can a published table participate in the unified resumable exporter? Every supported table

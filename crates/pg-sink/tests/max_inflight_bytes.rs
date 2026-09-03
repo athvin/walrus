@@ -26,6 +26,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_postgres::NoTls;
 
+#[path = "support/stream_commit.rs"]
+mod stream_commit_support;
+
 static SOURCE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const SOURCE_MIGRATION: &str = include_str!("../../../migrations/source/0001_publication.sql");
 
@@ -209,26 +212,32 @@ async fn large_txn_low_ceiling_spills_and_stays_bounded() {
                 Message::StreamCommit {
                     xid,
                     commit_lsn,
+                    end_lsn,
                     commit_ts,
                     ..
                 } => {
+                    checkpoint.observe_commit(*commit_lsn, *end_lsn).unwrap();
+                    let commit_timestamp =
+                        common::UtcTimestamp::from_pg_micros(*commit_ts).unwrap();
                     let objs = demux
-                        .on_stream_commit(
-                            *xid,
-                            *commit_lsn,
-                            common::UtcTimestamp::from_pg_micros(*commit_ts).unwrap(),
-                            &cache,
-                            &sink,
-                        )
+                        .on_stream_commit(*xid, *commit_lsn, commit_timestamp, &cache, &sink)
                         .await
                         .unwrap();
-                    for obj in &objs {
-                        pg_sink::manifest::record_ready(&pool, epoch, obj)
-                            .await
-                            .unwrap();
-                    }
+                    assert_eq!(
+                        stream_commit_support::publish(
+                            &pool,
+                            epoch,
+                            *xid,
+                            *commit_lsn,
+                            commit_timestamp,
+                            &objs,
+                        )
+                        .await
+                        .unwrap(),
+                        control::PublishStreamOutcome::Published,
+                    );
                     checkpoint.on_stream_end(*xid).unwrap();
-                    checkpoint.on_batch_durable(*commit_lsn);
+                    checkpoint.on_commit_durable(*commit_lsn).unwrap();
                     committed = true;
                 }
                 _ => {}

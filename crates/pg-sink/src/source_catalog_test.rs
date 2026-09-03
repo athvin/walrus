@@ -39,6 +39,7 @@ fn target_restrictions_are_rejected_independently() {
         published: true,
         row_filter: false,
         column_list: false,
+        row_level_security: false,
         topology_stable: true,
     };
     assert!(require_full_target("walrus_pub", "public", "orders", full).is_ok());
@@ -60,6 +61,22 @@ fn target_restrictions_are_rejected_independently() {
         require_full_target("walrus_pub", "public", "orders", projected),
         Err(PublicationCoverageIssue::ColumnList { .. })
     ));
+
+    let policy_filtered = PublicationTargetOptions {
+        row_level_security: true,
+        ..full
+    };
+    let err = require_full_target("walrus_pub", "odd\"schema", "order lines", policy_filtered)
+        .unwrap_err();
+    assert!(matches!(
+        &err,
+        PublicationCoverageIssue::RowLevelSecurity { .. }
+    ));
+    assert!(
+        err.to_string()
+            .contains("ALTER TABLE \"odd\"\"schema\".\"order lines\" DISABLE ROW LEVEL SECURITY"),
+        "RLS rejection carries safely quoted remediation: {err}"
+    );
 
     let absent = PublicationTargetOptions {
         published: false,
@@ -83,4 +100,14 @@ fn target_restrictions_are_rejected_independently() {
 #[test]
 fn advisory_key_matches_the_source_migration_literal() {
     assert_eq!(PUBLICATION_DDL_GUARD_KEY, 8_602_276_002_106_929_250);
+}
+
+#[test]
+fn catalog_fence_lock_identifiers_are_quoted_not_interpolated_raw() {
+    assert_eq!(quote_identifier("ordinary"), "\"ordinary\"");
+    assert_eq!(quote_identifier("odd\"name"), "\"odd\"\"name\"");
+    assert_eq!(
+        quote_identifier("public; DROP TABLE orders"),
+        "\"public; DROP TABLE orders\""
+    );
 }

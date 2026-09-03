@@ -78,21 +78,27 @@ WITH authorized AS MATERIALIZED (
        )
   )::bigint AS invalid_groups
   FROM group_stats
-), superseded_groups AS (
+), superseded_groups AS MATERIALIZED (
   UPDATE walrus.stream_manifest_group AS group_receipt
   SET status = 'superseded', applied_at = now()
   WHERE group_receipt.id IN (SELECT id FROM candidate_groups)
     AND group_receipt.status IN ('ready', 'failed')
     AND (SELECT invalid_groups FROM validation) = 0
   RETURNING group_receipt.id
-), deleted AS (
+), deleted AS MATERIALIZED (
   DELETE FROM walrus.file_manifest AS manifest
   USING locked_files AS locked
   WHERE manifest.id = locked.id
     AND (SELECT protocol = '2' FROM authorized)
     AND (SELECT invalid_groups FROM validation) = 0
   RETURNING manifest.id
+), deauthorized AS MATERIALIZED (
+  SELECT pg_catalog.set_config('walrus.manifest_delete_protocol', '', true) AS protocol
+  FROM (SELECT count(*) FROM superseded_groups) AS superseded_result
+  CROSS JOIN (SELECT count(*) FROM deleted) AS deleted_result
 )
 SELECT (SELECT invalid_groups FROM validation) AS invalid_groups,
        (SELECT count(*)::bigint FROM deleted) AS deleted_count,
        (SELECT count(*)::bigint FROM superseded_groups) AS superseded_group_count
+FROM deauthorized
+WHERE deauthorized.protocol = ''

@@ -541,6 +541,9 @@ pub async fn begin_export_plan(
     let range_count =
         i64::try_from(ranges.len()).map_err(|_| export_transition(lease.reload_id))?;
     let mut tx = conn.begin().await?;
+    sqlx::query("SELECT set_config('walrus.reload_export_plan_protocol', '2', true)")
+        .execute(&mut *tx)
+        .await?;
     let row = sqlx::query(
         "SELECT export_snapshot, export_snapshot_xmin, export_snapshot_xmax,
                 export_range_count,
@@ -597,6 +600,9 @@ pub async fn begin_export_plan(
         if !header_matches || !ranges_match {
             return rollback_rejection(tx, export_transition(lease.reload_id)).await;
         }
+        sqlx::query("SELECT pg_catalog.set_config('walrus.reload_export_plan_protocol', '', true)")
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         return Ok(());
     }
@@ -645,6 +651,9 @@ pub async fn begin_export_plan(
         .execute(&mut *tx)
         .await?;
     }
+    sqlx::query("SELECT pg_catalog.set_config('walrus.reload_export_plan_protocol', '', true)")
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(())
 }
@@ -676,9 +685,9 @@ pub async fn record_export_range(
     .bind(range_no)
     .bind(file_count)
     .bind(row_count)
-    .fetch_optional(ex)
+    .fetch_one(ex)
     .await?;
-    if row.is_none() {
+    if row.try_get::<Option<i64>, _>("range_no")?.is_none() {
         return Err(export_transition(lease.reload_id));
     }
     Ok(())
@@ -698,6 +707,9 @@ pub async fn seal_export(
     schema_version: SchemaVersionNo,
 ) -> Result<ExportSeal, ControlError> {
     let mut tx = conn.begin().await?;
+    sqlx::query("SELECT set_config('walrus.reload_export_seal_protocol', '2', true)")
+        .execute(&mut *tx)
+        .await?;
     let owned = sqlx::query_scalar::<_, bool>(
         "SELECT true FROM walrus.table_reload
          WHERE reload_id = $1 AND status = 'exporting'
@@ -733,6 +745,9 @@ pub async fn seal_export(
         file_count: row.try_get("file_count")?,
         row_count: row.try_get("row_count")?,
     };
+    sqlx::query("SELECT pg_catalog.set_config('walrus.reload_export_seal_protocol', '', true)")
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(seal)
 }
@@ -763,9 +778,9 @@ pub async fn record_start_fence(
         identity.source_schema,
         identity.source_table,
     )
-    .fetch_optional(ex)
+    .fetch_one(ex)
     .await?;
-    if row.is_none() {
+    if row.reload_id.is_none() {
         return Err(ControlError::ReloadTransition {
             reload_id,
             expected: "exporting (same start_lsn and schema_version)",
@@ -800,9 +815,9 @@ pub async fn record_end_marker(
         identity.source_schema,
         identity.source_table,
     )
-    .fetch_optional(ex)
+    .fetch_one(ex)
     .await?;
-    if row.is_none() {
+    if row.reload_id.is_none() {
         return Err(ControlError::ReloadTransition {
             reload_id,
             expected: "exporting (frozen baseline, H >= F, same end marker)",
@@ -935,14 +950,14 @@ pub async fn complete_export(
     lease: &ExporterLease,
     final_lsn: Lsn,
 ) -> Result<(), ControlError> {
-    let done = sqlx::query(include_str!("../sql/postgres/queries/complete_export.sql"))
+    let row = sqlx::query(include_str!("../sql/postgres/queries/complete_export.sql"))
         .bind(lease.reload_id.0)
         .bind(final_lsn)
         .bind(&lease.holder)
         .bind(lease.generation)
-        .execute(ex)
+        .fetch_one(ex)
         .await?;
-    if done.rows_affected() == 0 {
+    if row.try_get::<Option<i64>, _>("reload_id")?.is_none() {
         return Err(ControlError::ReloadTransition {
             reload_id: lease.reload_id,
             expected: "live exporter generation with matching sealed snapshot and F/H markers",
@@ -978,7 +993,7 @@ pub async fn complete(ex: impl PgExecutor<'_>, reload_id: ReloadId) -> Result<()
 /// staged manifest rows. A failed reload must leave nothing for the loader to claim (H9), and
 /// coupling the purge to the flip means no crash window can separate them.
 ///
-/// Takes a connection (not an executor) because this is two statements under one transaction;
+/// Takes a connection (not an executor) because this is a locked multi-statement transaction;
 /// inside an outer transaction it nests as a savepoint, so fail-and-reissue callers can wrap it
 /// with the successor INSERT atomically. The purge needs no `kind`
 /// filter — only reload files carry a `reload_id` (that is the point of the nullable column).
@@ -994,12 +1009,19 @@ pub async fn fail(
     reason: &str,
 ) -> Result<(), ControlError> {
     let mut tx = conn.begin().await?;
-    let done = sqlx::query(include_str!("../sql/postgres/queries/fail.sql"))
-        .bind(reload_id.0)
-        .bind(reason)
-        .execute(&mut *tx)
-        .await?;
-    if done.rows_affected() == 0 {
+    // Lock the parent before deleting its children. Reload-manifest insertion takes the same
+    // parent lock, so no late worker can commit a child between this purge and the terminal flip.
+    let failable = sqlx::query_scalar::<_, bool>(
+        "SELECT true
+         FROM walrus.table_reload
+         WHERE reload_id = $1 AND status = 'exporting'
+         FOR UPDATE",
+    )
+    .bind(reload_id.0)
+    .fetch_optional(&mut *tx)
+    .await?
+    .unwrap_or(false);
+    if !failable {
         return rollback_rejection(
             tx,
             ControlError::ReloadTransition {
@@ -1013,6 +1035,21 @@ pub async fn fail(
         .bind(reload_id.0)
         .execute(&mut *tx)
         .await?;
+    let done = sqlx::query(include_str!("../sql/postgres/queries/fail.sql"))
+        .bind(reload_id.0)
+        .bind(reason)
+        .execute(&mut *tx)
+        .await?;
+    if done.rows_affected() != 1 {
+        return rollback_rejection(
+            tx,
+            ControlError::ReloadTransition {
+                reload_id,
+                expected: "the row-locked exporting attempt",
+            },
+        )
+        .await;
+    }
     crate::integrity::note_recovery_reload_failed(&mut *tx, reload_id, reason).await?;
     tx.commit().await?;
     Ok(())
@@ -1714,7 +1751,7 @@ async fn publication_drained(
     owner_pod: &str,
     fencing_token: i64,
 ) -> Result<bool, ControlError> {
-    let pending = sqlx::query_scalar::<_, i64>(include_str!(
+    let pending = sqlx::query_as::<_, (i64, bool)>(include_str!(
         "../sql/postgres/queries/publication_pending_through.sql"
     ))
     .bind(publication.reload_id.0)
@@ -1723,12 +1760,19 @@ async fn publication_drained(
     .bind(fencing_token)
     .fetch_optional(ex)
     .await?;
-    pending
-        .map(|count| count == 0)
-        .ok_or(ControlError::ReloadTransition {
-            reload_id: publication.reload_id,
-            expected: "publishing with the current live table-ownership fence",
-        })
+    let (pending, ungrouped_straddler) = pending.ok_or(ControlError::ReloadTransition {
+        reload_id: publication.reload_id,
+        expected: "publishing with the current live table-ownership fence",
+    })?;
+    if ungrouped_straddler {
+        return Err(ControlError::ManifestInvariant {
+            message: format!(
+                "reload {} cannot seal while an ungrouped manifest straddles H {}",
+                publication.reload_id, publication.final_lsn
+            ),
+        });
+    }
+    Ok(pending == 0)
 }
 
 /// Atomically seal this table's manifest publication prefix through the reload's H after proving
@@ -1823,6 +1867,11 @@ pub async fn seal_publication_if_drained(
     .bind(publication.publication_nonce)
     .execute(&mut **tx)
     .await?;
+    // The caller owns `tx`; keep the trigger capability scoped to the guarded write instead of
+    // accidentally authorizing arbitrary later statements in the same transaction.
+    sqlx::query("SELECT pg_catalog.set_config('walrus.manifest_seal_protocol', '', true)")
+        .execute(&mut **tx)
+        .await?;
     if changed.rows_affected() != 1 {
         return Err(ControlError::ManifestInvariant {
             message: format!(

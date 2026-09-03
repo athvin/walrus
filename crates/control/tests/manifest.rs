@@ -12,13 +12,17 @@
 
 use common::{DdlId, EpochNo, Lsn, SchemaVersionNo, UtcTimestamp};
 use control::NewManifestFile;
+use control::reload::{self, ExportRangePlan, ExportSnapshot, ReloadFenceIdentity, ReloadFlavor};
 use control::{
     DdlRow, NewStreamCommitPublication, PublishManifestOutcome, PublishStreamOutcome, RegistryRow,
     claim_ready, claim_ready_units, complete_schema_barriers, connect, delete_claimed,
     insert_ready, list_manifest_uris, manifest_work_exists, max_ready_lsn_end,
     publish_ready_manifest, publish_stream_commit, run_migrations,
 };
-use sqlx::{Connection, postgres::PgPool};
+use sqlx::{
+    Connection,
+    postgres::{PgConnection, PgPool},
+};
 use uuid::Uuid;
 
 fn control_dsn() -> String {
@@ -33,6 +37,79 @@ async fn pool() -> PgPool {
         .expect("connect to control PG");
     run_migrations(&pool).await.expect("migrations apply");
     pool
+}
+
+async fn publishing_reload(
+    conn: &mut PgConnection,
+    epoch: EpochNo,
+    table: &str,
+    final_lsn: Lsn,
+    publication_nonce: Uuid,
+) -> i64 {
+    let reload_id = reload::request(&mut *conn, epoch, "public", table, ReloadFlavor::Reload)
+        .await
+        .unwrap();
+    let claimed = reload::claim_requested(&mut *conn, epoch, "manifest-test", 60, 1)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let lease = claimed.exporter_lease("manifest-test").unwrap();
+    let start_lsn = Lsn::new(0x100);
+    let schema_version = SchemaVersionNo(1);
+    let identity = ReloadFenceIdentity {
+        request_id: claimed.parent_request_id,
+        source_schema: "public",
+        source_table: table,
+        schema_version,
+    };
+    reload::record_start_fence(&mut *conn, reload_id, start_lsn, identity)
+        .await
+        .unwrap();
+    reload::begin_export_plan(
+        &mut *conn,
+        &lease,
+        start_lsn,
+        schema_version,
+        ExportSnapshot {
+            identity: "1:2:",
+            xmin: 1,
+            xmax: 2,
+        },
+        &[ExportRangePlan {
+            range_no: 0,
+            full_scan: true,
+            start_block: None,
+            end_block: None,
+        }],
+    )
+    .await
+    .unwrap();
+    reload::record_export_range(&mut *conn, &lease, 0, 0, 0)
+        .await
+        .unwrap();
+    reload::seal_export(&mut *conn, &lease, start_lsn, schema_version)
+        .await
+        .unwrap();
+    reload::record_end_marker(&mut *conn, reload_id, final_lsn, identity)
+        .await
+        .unwrap();
+    reload::complete_export(&mut *conn, &lease, final_lsn)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE walrus.table_reload
+         SET status = 'publishing', publication_nonce = $2,
+             publisher_owner_pod = 'manifest-test', publisher_fencing_token = 1,
+             publishing_at = now()
+         WHERE reload_id = $1",
+    )
+    .bind(reload_id.0)
+    .bind(publication_nonce)
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+    reload_id.0
 }
 
 fn file(epoch: EpochNo, table: &str, lsn_end: &str) -> NewManifestFile {
@@ -85,22 +162,7 @@ async fn ordinary_replay_at_or_below_seal_is_covered_without_recreating_work() {
     let seal = Lsn::new(0x500);
     let publication_nonce = Uuid::new_v4();
 
-    let reload_id: i64 = sqlx::query_scalar(
-        "INSERT INTO walrus.table_reload
-           (epoch, source_schema, source_table, flavor, status, start_lsn, final_lsn,
-            schema_version, publication_nonce, publisher_owner_pod,
-            publisher_fencing_token, publishing_at)
-         VALUES ($1, 'public', $2, 'reload', 'publishing', '0/100', $3,
-                 1, $4, 'manifest-test', 1, now())
-         RETURNING reload_id",
-    )
-    .bind(epoch.0)
-    .bind(table)
-    .bind(seal)
-    .bind(publication_nonce)
-    .fetch_one(&mut *tx)
-    .await
-    .unwrap();
+    let reload_id = publishing_reload(&mut tx, epoch, table, seal, publication_nonce).await;
     sqlx::query("SELECT set_config('walrus.manifest_seal_protocol', '2', true)")
         .execute(&mut *tx)
         .await
@@ -333,11 +395,19 @@ async fn clear_stream_publication_epoch(pool: &PgPool, epoch: EpochNo) {
         .execute(&mut *tx)
         .await
         .unwrap();
-    sqlx::query("DELETE FROM walrus.schema_registry WHERE epoch = $1")
-        .bind(epoch.0)
-        .execute(&mut *tx)
-        .await
-        .unwrap();
+    sqlx::query(
+        "WITH authorized AS MATERIALIZED (
+           SELECT pg_catalog.set_config(
+             'walrus.schema_registry_maintenance', '1-delete', true
+           ) AS protocol
+         )
+         DELETE FROM walrus.schema_registry
+         WHERE epoch = $1 AND (SELECT protocol = '1-delete' FROM authorized)",
+    )
+    .bind(epoch.0)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
     tx.commit().await.unwrap();
 }
 

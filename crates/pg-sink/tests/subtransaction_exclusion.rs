@@ -27,6 +27,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_postgres::NoTls;
 
+#[path = "support/stream_commit.rs"]
+mod stream_commit_support;
+
 static SOURCE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const SOURCE_MIGRATION: &str = include_str!("../../../migrations/source/0001_publication.sql");
 
@@ -208,21 +211,25 @@ async fn savepoint_rollback_ready_file_has_exactly_6000_rows() {
                     commit_ts,
                     ..
                 } => {
+                    let commit_timestamp =
+                        common::UtcTimestamp::from_pg_micros(*commit_ts).unwrap();
                     let objs = demux
-                        .on_stream_commit(
-                            *xid,
-                            *commit_lsn,
-                            common::UtcTimestamp::from_pg_micros(*commit_ts).unwrap(),
-                            &cache,
-                            &sink,
-                        )
+                        .on_stream_commit(*xid, *commit_lsn, commit_timestamp, &cache, &sink)
                         .await
                         .unwrap();
-                    for obj in &objs {
-                        pg_sink::manifest::record_ready(&pool, epoch, obj)
-                            .await
-                            .unwrap();
-                    }
+                    assert_eq!(
+                        stream_commit_support::publish(
+                            &pool,
+                            epoch,
+                            *xid,
+                            *commit_lsn,
+                            commit_timestamp,
+                            &objs,
+                        )
+                        .await
+                        .unwrap(),
+                        control::PublishStreamOutcome::Published,
+                    );
                     committed = true;
                 }
                 _ => {}
@@ -249,15 +256,41 @@ async fn savepoint_rollback_ready_file_has_exactly_6000_rows() {
         total_rows, 6000,
         "the ready file has EXACTLY 6000 rows (3000 kept-A + 3000 kept-B); the rolled-back savepoint's rows are excluded"
     );
-    // Every file is kind='stream' (the top-level txn still committed).
-    let non_stream: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM walrus.file_manifest WHERE epoch = $1 AND kind <> 'stream'",
+    // Every child is grouped streamed work. A transaction may contain both speculative `spill`
+    // objects and commit-time `stream` objects; neither is legal as an ungrouped manifest.
+    let invalid_children: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM walrus.file_manifest \
+         WHERE epoch = $1 AND (kind NOT IN ('stream', 'spill') OR stream_group_id IS NULL)",
     )
     .bind(epoch)
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(non_stream, 0, "the committed survivors are kind='stream'");
+    assert_eq!(
+        invalid_children, 0,
+        "all committed survivors are grouped stream/spill children"
+    );
+    let groups: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT expected_files, row_count FROM walrus.stream_manifest_group \
+         WHERE epoch = $1 AND source_schema = 'public' AND source_table = 'orders' \
+           AND status = 'ready'",
+    )
+    .bind(epoch)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        groups.len(),
+        1,
+        "one source commit publishes one table group"
+    );
+    let child_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM walrus.file_manifest WHERE epoch = $1")
+            .bind(epoch)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(groups[0], (child_count, 6000));
 
     // Cleanup.
     let uris: Vec<String> =

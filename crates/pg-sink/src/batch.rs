@@ -6,8 +6,9 @@
 //! become flush-eligible only at `Commit`, so a batch may span many small txns but never a fraction of
 //! one (§1.6). The sealed in-memory [`RecordBatch`] is then written to Parquet and S3.
 //!
-//! `lsn_end` is the **commit LSN** of the batch's last transaction — the load-bearing key for the
-//! manifest and checkpoint, and deliberately *not* the max per-row LSN.
+//! `lsn_end` is the **commit LSN** of the batch's last transaction — the load-bearing manifest key
+//! and the commit-domain input the checkpoint translates to pgoutput `end_lsn`; it is deliberately
+//! *not* the max per-row LSN or the replication-feedback cursor.
 //!
 //! ## Dynamic dispatch in `pg-sink` — the deliberate list
 //!

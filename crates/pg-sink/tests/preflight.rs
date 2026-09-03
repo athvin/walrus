@@ -9,12 +9,14 @@
 //! After `docker compose up --wait`:
 //!   cargo test -p pg-sink --test preflight -- --ignored
 //!
-//! The tests mutate shared source-pg state (a keyless table, the walrus schema), so they hold a
-//! process-wide async lock to run serially; each sets up its own preconditions under that lock.
+//! The tests mutate shared source-pg state (a keyless table, the walrus schema), so a process-wide
+//! async lock serializes the tests in this binary; the compose runner must also run integration-test
+//! binaries serially. Each test establishes its own preconditions while holding the local lock.
 
 use common::FailureClass;
 use pg_sink::config::SinkConfig;
 use pg_sink::preflight::{PkMode, PreflightError, SourcePreflight, connect_source};
+use std::time::Duration;
 use tokio_postgres::NoTls;
 
 const SOURCE_MIGRATION: &str = include_str!("../../../migrations/source/0001_publication.sql");
@@ -78,7 +80,10 @@ async fn good_source_passes_all_assertions() {
 
     let info = pf.assert_server_prereqs().await.expect("server prereqs");
     assert_eq!(info.wal_level, "logical");
-    assert!(info.version_num >= 140_000, "PG {info:?} must be ≥14");
+    assert!(
+        (140_000..180_000).contains(&info.version_num),
+        "PG {info:?} must be in the supported 14–17 range"
+    );
 
     pf.assert_reload_signal()
         .await
@@ -93,6 +98,9 @@ async fn good_source_passes_all_assertions() {
     pf.assert_publication_covers()
         .await
         .expect("publication covers ddl_audit + heartbeat + reload internals");
+    pf.assert_table_lock_privileges()
+        .await
+        .expect("source role can take writer-draining locks on every user target");
 
     let report = pf
         .assert_tables_have_pk(PkMode::Strict)
@@ -103,6 +111,238 @@ async fn good_source_passes_all_assertions() {
         !report.ok.is_empty(),
         "orders/customers/items are published"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose up --wait (source PG)"]
+async fn ddl_guard_protocol_attestation_rejects_stale_or_absent_installations() {
+    let _guard = SOURCE_LOCK.lock().await;
+    let url = source_url();
+    let setup = plain(&url).await;
+    setup.batch_execute(SOURCE_MIGRATION).await.unwrap();
+    setup.batch_execute(SOURCE_DDL_MIGRATION).await.unwrap();
+
+    let cfg = cfg_for(&url);
+    let client = connect_source(cfg.source_db_url.expose()).await.unwrap();
+    let pf = SourcePreflight::new(&client, &cfg);
+    pf.assert_ddl_capture()
+        .await
+        .expect("the current 0002 attests DDL guard protocol 3");
+
+    setup
+        .batch_execute(
+            "ALTER FUNCTION walrus.intercept_ddl()
+               SET walrus.ddl_capture_protocol = '2'",
+        )
+        .await
+        .unwrap();
+    let stale = pf.assert_ddl_capture().await.unwrap_err();
+    assert!(
+        matches!(
+            &stale,
+            PreflightError::DdlCaptureMissing {
+                detail: "DDL guard protocol 3 attestation absent or stale"
+            }
+        ),
+        "a stale protocol marker must fail closed: {stale:?}"
+    );
+
+    // Make the first half current so the second assertion specifically exercises an absent marker
+    // on the command-start half, as an old 0002 installation would expose.
+    setup
+        .batch_execute(
+            "ALTER FUNCTION walrus.intercept_ddl()
+               SET walrus.ddl_capture_protocol = '3';
+             ALTER FUNCTION walrus.guard_publication_ddl()
+               RESET walrus.ddl_capture_protocol;",
+        )
+        .await
+        .unwrap();
+    let absent = pf.assert_ddl_capture().await.unwrap_err();
+    assert!(
+        matches!(
+            &absent,
+            PreflightError::DdlCaptureMissing {
+                detail: "DDL guard protocol 3 attestation absent or stale"
+            }
+        ),
+        "an absent protocol marker must fail closed: {absent:?}"
+    );
+
+    setup
+        .batch_execute(SOURCE_DDL_MIGRATION)
+        .await
+        .expect("reapplying source migration 0002 restores both attestations atomically");
+    pf.assert_ddl_capture()
+        .await
+        .expect("preflight passes after reapplying current source migration 0002");
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose up --wait (source PG)"]
+async fn missing_schema_select_and_table_lock_privileges_fail_preflight_in_order() {
+    let _guard = SOURCE_LOCK.lock().await;
+    let url = source_url();
+    let setup = plain(&url).await;
+    setup
+        .batch_execute(
+            "DROP PUBLICATION IF EXISTS walrus_pf_lock_priv;
+             DROP SCHEMA IF EXISTS _walrus_pf_lock_schema CASCADE;
+             DO $cleanup$
+             BEGIN
+               IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'walrus_pf_lock_role') THEN
+                 EXECUTE 'DROP OWNED BY walrus_pf_lock_role';
+                 EXECUTE 'DROP ROLE walrus_pf_lock_role';
+               END IF;
+             END
+             $cleanup$;
+             CREATE ROLE walrus_pf_lock_role LOGIN REPLICATION PASSWORD 'walrus-lock-test';
+             CREATE SCHEMA _walrus_pf_lock_schema;
+             CREATE TABLE _walrus_pf_lock_schema._walrus_pf_lock_priv (
+               id int PRIMARY KEY,
+               payload text NOT NULL DEFAULT ''
+             );
+             CREATE PUBLICATION walrus_pf_lock_priv
+               FOR TABLE _walrus_pf_lock_schema._walrus_pf_lock_priv
+             WITH (publish_via_partition_root = true);
+             GRANT SELECT (id) ON TABLE _walrus_pf_lock_schema._walrus_pf_lock_priv
+               TO walrus_pf_lock_role;",
+        )
+        .await
+        .unwrap();
+
+    let mut role_config = url.parse::<tokio_postgres::Config>().unwrap();
+    role_config
+        .user("walrus_pf_lock_role")
+        .password("walrus-lock-test");
+    let (mut client, connection) = role_config.connect(NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let mut cfg = cfg_for(&url);
+    cfg.publication_name = "walrus_pf_lock_priv".to_string();
+    let pf = SourcePreflight::new(&client, &cfg);
+    let schema_error = pf.assert_table_lock_privileges().await.unwrap_err();
+    match &schema_error {
+        PreflightError::NoSchemaUsagePrivilege {
+            role,
+            schema,
+            grant_sql,
+        } => {
+            assert_eq!(role, "walrus_pf_lock_role");
+            assert_eq!(schema, "_walrus_pf_lock_schema");
+            assert_eq!(
+                grant_sql,
+                "GRANT USAGE ON SCHEMA \"_walrus_pf_lock_schema\" TO \"walrus_pf_lock_role\""
+            );
+        }
+        other => panic!("expected NoSchemaUsagePrivilege, got {other:?}"),
+    }
+    assert!(common::Error::from(schema_error).is_terminal());
+    let Err(schema_copy_error) = client
+        .copy_out("COPY _walrus_pf_lock_schema._walrus_pf_lock_priv TO STDOUT (FORMAT binary)")
+        .await
+    else {
+        panic!("table grants must not bypass the containing schema's USAGE privilege");
+    };
+    assert_eq!(
+        schema_copy_error.code(),
+        Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE),
+        "the schema preflight must agree with PostgreSQL's COPY privilege check"
+    );
+
+    setup
+        .batch_execute("GRANT USAGE ON SCHEMA _walrus_pf_lock_schema TO walrus_pf_lock_role")
+        .await
+        .unwrap();
+    let select_error = pf.assert_table_lock_privileges().await.unwrap_err();
+    match &select_error {
+        PreflightError::NoTableSelectPrivilege {
+            role,
+            schema,
+            table,
+            grant_sql,
+        } => {
+            assert_eq!(role, "walrus_pf_lock_role");
+            assert_eq!(schema, "_walrus_pf_lock_schema");
+            assert_eq!(table, "_walrus_pf_lock_priv");
+            assert_eq!(
+                grant_sql,
+                "GRANT SELECT ON TABLE \"_walrus_pf_lock_schema\".\"_walrus_pf_lock_priv\" TO \"walrus_pf_lock_role\""
+            );
+        }
+        other => panic!("expected NoTableSelectPrivilege, got {other:?}"),
+    }
+    assert!(common::Error::from(select_error).is_terminal());
+    let Err(copy_error) = client
+        .copy_out("COPY _walrus_pf_lock_schema._walrus_pf_lock_priv TO STDOUT (FORMAT binary)")
+        .await
+    else {
+        panic!("column-only SELECT must not permit an arbitrary full-table COPY");
+    };
+    assert_eq!(
+        copy_error.code(),
+        Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE),
+        "the catalog preflight must agree with PostgreSQL's COPY privilege check"
+    );
+
+    setup
+        .batch_execute(
+            "GRANT SELECT ON TABLE _walrus_pf_lock_schema._walrus_pf_lock_priv
+             TO walrus_pf_lock_role",
+        )
+        .await
+        .unwrap();
+    let error = pf.assert_table_lock_privileges().await.unwrap_err();
+    match &error {
+        PreflightError::NoTableLockPrivilege {
+            role,
+            schema,
+            table,
+            grant_sql,
+        } => {
+            assert_eq!(role, "walrus_pf_lock_role");
+            assert_eq!(schema, "_walrus_pf_lock_schema");
+            assert_eq!(table, "_walrus_pf_lock_priv");
+            assert_eq!(
+                grant_sql,
+                "GRANT UPDATE ON TABLE \"_walrus_pf_lock_schema\".\"_walrus_pf_lock_priv\" TO \"walrus_pf_lock_role\""
+            );
+        }
+        other => panic!("expected NoTableLockPrivilege, got {other:?}"),
+    }
+    assert!(common::Error::from(error).is_terminal());
+
+    setup
+        .batch_execute(
+            "GRANT UPDATE ON TABLE _walrus_pf_lock_schema._walrus_pf_lock_priv
+             TO walrus_pf_lock_role",
+        )
+        .await
+        .unwrap();
+    SourcePreflight::new(&client, &cfg)
+        .assert_table_lock_privileges()
+        .await
+        .expect("a table-level UPDATE grant admits both fence lock modes");
+    let tx = client.transaction().await.unwrap();
+    tx.batch_execute(
+        "LOCK TABLE _walrus_pf_lock_schema._walrus_pf_lock_priv IN SHARE MODE;
+         LOCK TABLE _walrus_pf_lock_schema._walrus_pf_lock_priv IN SHARE UPDATE EXCLUSIVE MODE;",
+    )
+    .await
+    .expect("the preflight capability maps to the actual catalog and reload fence locks");
+    tx.rollback().await.unwrap();
+    drop(client);
+
+    setup
+        .batch_execute(
+            "DROP PUBLICATION walrus_pf_lock_priv;
+             DROP SCHEMA _walrus_pf_lock_schema CASCADE;
+             DROP OWNED BY walrus_pf_lock_role;
+             DROP ROLE walrus_pf_lock_role;",
+        )
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -384,6 +624,130 @@ async fn publication_must_emit_every_action_and_unrestricted_rows() {
 
 #[tokio::test]
 #[ignore = "requires docker compose up --wait (source PG)"]
+async fn row_level_security_is_rejected_at_preflight_and_while_online() {
+    let _guard = SOURCE_LOCK.lock().await;
+    let url = source_url();
+    let setup = plain(&url).await;
+    setup.batch_execute(SOURCE_MIGRATION).await.unwrap();
+    setup.batch_execute(SOURCE_DDL_MIGRATION).await.unwrap();
+    setup.batch_execute(SOURCE_MIGRATION_0003).await.unwrap();
+    setup.batch_execute(SOURCE_MIGRATION_0004).await.unwrap();
+    setup
+        .batch_execute(
+            "DROP PUBLICATION IF EXISTS walrus_pf_rls;
+             DROP TABLE IF EXISTS public._walrus_pf_rls;
+             CREATE TABLE public._walrus_pf_rls (
+               id bigint PRIMARY KEY,
+               payload text NOT NULL
+             );
+             CREATE PUBLICATION walrus_pf_rls
+               FOR TABLE walrus.heartbeat, walrus.ddl_audit, walrus.reload_signal,
+                         walrus.reload_event, public._walrus_pf_rls
+               WITH (publish = 'insert, update, delete, truncate');
+             ALTER TABLE public._walrus_pf_rls ENABLE ROW LEVEL SECURITY;",
+        )
+        .await
+        .unwrap();
+
+    let mut cfg = cfg_for(&url);
+    cfg.publication_name = "walrus_pf_rls".to_string();
+    let client = connect_source(cfg.source_db_url.expose()).await.unwrap();
+    let issue = SourcePreflight::new(&client, &cfg)
+        .assert_publication_covers()
+        .await
+        .unwrap_err();
+    match &issue {
+        PreflightError::PublicationCoverage(
+            pg_sink::source_catalog::PublicationCoverageIssue::RowLevelSecurity {
+                publication,
+                schema,
+                table,
+                remediation_sql,
+            },
+        ) => {
+            assert_eq!(publication, "walrus_pf_rls");
+            assert_eq!(schema, "public");
+            assert_eq!(table, "_walrus_pf_rls");
+            assert_eq!(
+                remediation_sql,
+                "ALTER TABLE \"public\".\"_walrus_pf_rls\" DISABLE ROW LEVEL SECURITY; \
+                 ALTER TABLE \"public\".\"_walrus_pf_rls\" NO FORCE ROW LEVEL SECURITY"
+            );
+        }
+        other => panic!("expected RowLevelSecurity coverage rejection, got {other:?}"),
+    }
+    assert!(common::Error::from(issue).is_terminal());
+
+    setup
+        .batch_execute(
+            "ALTER TABLE public._walrus_pf_rls DISABLE ROW LEVEL SECURITY;
+             ALTER TABLE public._walrus_pf_rls NO FORCE ROW LEVEL SECURITY;",
+        )
+        .await
+        .unwrap();
+    SourcePreflight::new(&client, &cfg)
+        .assert_publication_covers()
+        .await
+        .expect("disabling RLS restores complete publication coverage");
+
+    let holder = plain(&url).await;
+    assert!(
+        pg_sink::source_catalog::try_acquire_publication_ddl_guard(&holder)
+            .await
+            .unwrap(),
+        "test owns the online pipeline's shared DDL guard"
+    );
+    let ddl = plain(&url).await;
+    for command in [
+        "ALTER TABLE public._walrus_pf_rls ENABLE ROW LEVEL SECURITY",
+        "ALTER TABLE public._walrus_pf_rls FORCE ROW LEVEL SECURITY",
+    ] {
+        let error = ddl.batch_execute(command).await.unwrap_err();
+        assert_eq!(
+            error.code(),
+            Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE),
+            "online RLS transition must be rejected immediately: {command}: {error}"
+        );
+        assert!(
+            error
+                .as_db_error()
+                .is_some_and(|db| db.message().contains("row-level security change rejected")),
+            "the rejection identifies the RLS guard: {error}"
+        );
+    }
+    let flags = setup
+        .query_one(
+            "SELECT relrowsecurity, relforcerowsecurity
+             FROM pg_catalog.pg_class
+             WHERE oid = 'public._walrus_pf_rls'::regclass",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(!flags.get::<_, bool>(0), "ENABLE RLS was rolled back");
+    assert!(!flags.get::<_, bool>(1), "FORCE RLS was rolled back");
+
+    let released: bool = holder
+        .query_one(
+            "SELECT pg_catalog.pg_advisory_unlock_shared($1)",
+            &[&pg_sink::source_catalog::PUBLICATION_DDL_GUARD_KEY],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(released, "the test-owned shared guard was released");
+    drop(holder);
+    setup
+        .batch_execute(
+            "DROP PUBLICATION walrus_pf_rls;
+             DROP TABLE public._walrus_pf_rls;",
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose up --wait (source PG)"]
 async fn publication_ddl_is_rejected_by_the_shared_pipeline_guard() {
     let _guard = SOURCE_LOCK.lock().await;
     let url = source_url();
@@ -392,13 +756,21 @@ async fn publication_ddl_is_rejected_by_the_shared_pipeline_guard() {
     setup
         .batch_execute(
             "DROP TABLE IF EXISTS public._walrus_pf_guard_create;
+             DROP TABLE IF EXISTS public._walrus_pf_guard_keyed;
+             DROP TABLE IF EXISTS public._walrus_pf_guard_inherit_child;
+             DROP TABLE IF EXISTS public._walrus_pf_guard_partition_child;
              DROP TABLE IF EXISTS public._walrus_pf_guard_root CASCADE;
              DROP TABLE IF EXISTS public._walrus_pf_guard_leaf;
+             DROP TABLE IF EXISTS public._walrus_pf_guard_inherit_candidate;
+             DROP TABLE IF EXISTS public._walrus_pf_guard_inherit_parent CASCADE;
              DROP SCHEMA IF EXISTS _walrus_pf_guard_schema CASCADE;
              DROP SCHEMA IF EXISTS _walrus_pf_guard_schema_v2 CASCADE;
              CREATE TABLE public._walrus_pf_guard_root (id int NOT NULL)
                PARTITION BY RANGE (id);
              CREATE TABLE public._walrus_pf_guard_leaf (id int NOT NULL);
+             CREATE TABLE public._walrus_pf_guard_inherit_parent (id int NOT NULL);
+             CREATE TABLE public._walrus_pf_guard_inherit_candidate (id int NOT NULL);
+             CREATE TABLE public._walrus_pf_guard_keyed (id int PRIMARY KEY, payload text);
              CREATE SCHEMA _walrus_pf_guard_schema;
              CREATE TABLE _walrus_pf_guard_schema.tracked (id int PRIMARY KEY);",
         )
@@ -457,6 +829,44 @@ async fn publication_ddl_is_rejected_by_the_shared_pipeline_guard() {
         "rejected CREATE TABLE must leave no relation behind"
     );
 
+    for command in [
+        "ALTER TABLE public._walrus_pf_guard_keyed
+           DROP CONSTRAINT _walrus_pf_guard_keyed_pkey",
+        "ALTER TABLE public._walrus_pf_guard_keyed REPLICA IDENTITY NOTHING",
+    ] {
+        let error = ddl.batch_execute(command).await.unwrap_err();
+        assert_eq!(
+            error.code(),
+            Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE),
+            "an online published table must retain both its real primary key and replica identity: {command}: {error}"
+        );
+        assert!(
+            error.as_db_error().is_some_and(|db| db
+                .message()
+                .contains("published table key or replica identity change rejected")),
+            "the rejection identifies the key/identity guard: {command}: {error}"
+        );
+    }
+    let key_shape = setup
+        .query_one(
+            "SELECT c.relreplident::text,
+                    EXISTS (
+                      SELECT 1 FROM pg_catalog.pg_index i
+                      WHERE i.indrelid = c.oid
+                        AND i.indisprimary AND i.indisvalid AND i.indisready AND i.indislive
+                    )
+             FROM pg_catalog.pg_class c
+             WHERE c.oid = 'public._walrus_pf_guard_keyed'::regclass",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(key_shape.get::<_, String>(0), "d");
+    assert!(
+        key_shape.get::<_, bool>(1),
+        "both rejected commands must roll the source key shape back"
+    );
+
     ddl.batch_execute("CREATE TEMP TABLE _walrus_pf_guard_temp (id int PRIMARY KEY)")
         .await
         .expect("an unpublished temporary table must not contend on the coverage guard");
@@ -469,6 +879,86 @@ async fn publication_ddl_is_rejected_by_the_shared_pipeline_guard() {
         .unwrap()
         .get(0);
     assert!(temp_exists, "the allowed temporary CREATE must commit");
+
+    let err = ddl
+        .batch_execute(
+            "CREATE TABLE public._walrus_pf_guard_inherit_child (payload text)
+             INHERITS (public._walrus_pf_guard_inherit_parent)",
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.code(),
+        Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE),
+        "CREATE TABLE INHERITS must not silently make a published plain table a parent: {err}"
+    );
+    assert!(
+        err.as_db_error().is_some_and(|db| db
+            .message()
+            .contains("published table topology change rejected")),
+        "CREATE TABLE INHERITS must be rejected by the topology guard, not only incidental FOR ALL membership: {err}"
+    );
+    let inheritance_create_rolled_back: bool = setup
+        .query_one(
+            "SELECT to_regclass('public._walrus_pf_guard_inherit_child') IS NULL",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        inheritance_create_rolled_back,
+        "rejected CREATE TABLE INHERITS must leave no child behind"
+    );
+
+    let err = ddl
+        .batch_execute(
+            "ALTER TABLE public._walrus_pf_guard_inherit_candidate
+             INHERIT public._walrus_pf_guard_inherit_parent",
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.code(),
+        Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE),
+        "ALTER TABLE INHERIT must keep published topology fixed: {err}"
+    );
+    let inheritance_alter_rolled_back: bool = setup
+        .query_one(
+            "SELECT NOT EXISTS (
+               SELECT 1
+               FROM pg_catalog.pg_inherits
+               WHERE inhrelid = 'public._walrus_pf_guard_inherit_candidate'::regclass
+                 AND inhparent = 'public._walrus_pf_guard_inherit_parent'::regclass
+             )",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        inheritance_alter_rolled_back,
+        "rejected ALTER TABLE INHERIT must leave no catalog edge behind"
+    );
+
+    let err = ddl
+        .batch_execute(
+            "CREATE TABLE public._walrus_pf_guard_partition_child
+             PARTITION OF public._walrus_pf_guard_root FOR VALUES FROM (100) TO (200)",
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.code(),
+        Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE),
+        "CREATE TABLE PARTITION OF must keep published topology fixed: {err}"
+    );
+    assert!(
+        err.as_db_error().is_some_and(|db| db
+            .message()
+            .contains("published table topology change rejected")),
+        "CREATE TABLE PARTITION OF must take the topology rejection path: {err}"
+    );
 
     let err = ddl
         .batch_execute(
@@ -509,11 +999,25 @@ async fn publication_ddl_is_rejected_by_the_shared_pipeline_guard() {
         "the rejected schema rename must roll back atomically"
     );
 
+    // Release the session guard explicitly before cleanup needs the migration's
+    // matching exclusive guard; dropping a client does not synchronously close its backend.
+    let released: bool = holder
+        .query_one(
+            "SELECT pg_catalog.pg_advisory_unlock_shared($1)",
+            &[&pg_sink::source_catalog::PUBLICATION_DDL_GUARD_KEY],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(released, "the test-owned shared guard was released");
     drop(holder);
     setup
         .batch_execute(
-            "DROP TABLE public._walrus_pf_guard_root CASCADE;
+            "DROP TABLE public._walrus_pf_guard_keyed;
+             DROP TABLE public._walrus_pf_guard_root CASCADE;
              DROP TABLE public._walrus_pf_guard_leaf;
+             DROP TABLE public._walrus_pf_guard_inherit_candidate;
+             DROP TABLE public._walrus_pf_guard_inherit_parent CASCADE;
              DROP SCHEMA _walrus_pf_guard_schema CASCADE;",
         )
         .await
@@ -821,6 +1325,186 @@ async fn concurrent_table_ddl_waits_for_an_inflight_writer_and_captures_only_aft
 
     writer
         .batch_execute("DROP TABLE public._walrus_ddl_lock_test")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose up --wait (source PG)"]
+async fn catalog_fence_times_out_on_open_writer_then_freezes_committed_inventory() {
+    let _guard = SOURCE_LOCK.lock().await;
+    let url = source_url();
+    let setup = plain(&url).await;
+    setup.batch_execute(SOURCE_MIGRATION).await.unwrap();
+    setup.batch_execute(SOURCE_DDL_MIGRATION).await.unwrap();
+    setup
+        .batch_execute(
+            "DROP PUBLICATION IF EXISTS walrus_pf_catalog_fence;
+             DROP TABLE IF EXISTS public._walrus_pf_catalog_fence;
+             CREATE TABLE public._walrus_pf_catalog_fence (
+               id bigint PRIMARY KEY,
+               payload text NOT NULL
+             );
+             CREATE PUBLICATION walrus_pf_catalog_fence
+               FOR TABLE public._walrus_pf_catalog_fence
+               WITH (publish = 'insert, update, delete, truncate');",
+        )
+        .await
+        .unwrap();
+
+    let writer = plain(&url).await;
+    let mut capture = plain(&url).await;
+    assert!(
+        pg_sink::source_catalog::try_acquire_publication_ddl_guard(&capture)
+            .await
+            .unwrap(),
+        "catalog capture must hold the same shared publication guard as pipeline startup"
+    );
+
+    writer
+        .batch_execute(
+            "BEGIN;
+             INSERT INTO public._walrus_pf_catalog_fence (id, payload)
+             VALUES (1, 'held open');",
+        )
+        .await
+        .unwrap();
+
+    let blocked = pg_sink::source_catalog::capture_catalog_fence(
+        &mut capture,
+        "walrus_pf_catalog_fence",
+        Duration::from_millis(100),
+    )
+    .await
+    .unwrap_err();
+    let pg_error = blocked
+        .downcast_ref::<tokio_postgres::Error>()
+        .expect("catalog-fence timeout retains the source PostgreSQL error");
+    assert_eq!(
+        pg_error.code(),
+        Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE),
+        "an open RowExclusive writer must make the bounded SHARE-lock capture fail closed: {blocked:#}"
+    );
+    assert!(
+        blocked
+            .chain()
+            .any(|cause| cause.to_string().contains("drain published-table writers")),
+        "the failure must identify the writer-drain boundary: {blocked:#}"
+    );
+
+    writer.batch_execute("COMMIT").await.unwrap();
+    let committed_lsn: String = writer
+        .query_one("SELECT pg_catalog.pg_current_wal_insert_lsn()::text", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let committed_lsn: common::Lsn = committed_lsn.parse().unwrap();
+
+    let fence = pg_sink::source_catalog::capture_catalog_fence(
+        &mut capture,
+        "walrus_pf_catalog_fence",
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("catalog capture succeeds after the prior writer commits");
+    assert!(
+        fence.start_lsn >= committed_lsn,
+        "the frozen boundary must be sampled after the writer drained: commit={committed_lsn}, fence={}",
+        fence.start_lsn
+    );
+    let relation = fence
+        .relations
+        .iter()
+        .find(|relation| relation.schema == "public" && relation.name == "_walrus_pf_catalog_fence")
+        .expect("the published table is present in the frozen inventory");
+    assert_eq!(
+        relation
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.is_key))
+            .collect::<Vec<_>>(),
+        vec![("id", true), ("payload", false)],
+        "the successful fence freezes the exact keyed relation shape"
+    );
+
+    // Release the session guard explicitly before publication cleanup needs the migration's
+    // matching exclusive guard; dropping a client delegates socket shutdown to its background task.
+    let released: bool = capture
+        .query_one(
+            "SELECT pg_catalog.pg_advisory_unlock_shared($1)",
+            &[&pg_sink::source_catalog::PUBLICATION_DDL_GUARD_KEY],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(released, "the test-owned shared guard was released");
+    drop(capture);
+    setup
+        .batch_execute(
+            "DROP PUBLICATION walrus_pf_catalog_fence;
+             DROP TABLE public._walrus_pf_catalog_fence;",
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose up --wait (source PG)"]
+async fn catalog_fence_rejects_an_unusable_key_shape_after_tables_are_locked() {
+    let _guard = SOURCE_LOCK.lock().await;
+    let url = source_url();
+    let setup = plain(&url).await;
+    setup.batch_execute(SOURCE_MIGRATION).await.unwrap();
+    setup.batch_execute(SOURCE_DDL_MIGRATION).await.unwrap();
+    setup
+        .batch_execute(
+            "DROP PUBLICATION IF EXISTS walrus_pf_key_fence;
+             DROP TABLE IF EXISTS public._walrus_pf_key_fence;
+             CREATE TABLE public._walrus_pf_key_fence (id bigint, payload text);
+             ALTER TABLE public._walrus_pf_key_fence REPLICA IDENTITY FULL;
+             CREATE PUBLICATION walrus_pf_key_fence
+               FOR TABLE public._walrus_pf_key_fence
+               WITH (publish = 'insert, update, delete, truncate');",
+        )
+        .await
+        .unwrap();
+
+    let mut capture = plain(&url).await;
+    assert!(
+        pg_sink::source_catalog::try_acquire_publication_ddl_guard(&capture)
+            .await
+            .unwrap(),
+        "the test owns the publication guard before freezing the catalog"
+    );
+    let error = pg_sink::source_catalog::capture_catalog_fence(
+        &mut capture,
+        "walrus_pf_key_fence",
+        Duration::from_secs(2),
+    )
+    .await
+    .expect_err("REPLICA IDENTITY FULL cannot replace the exporter's real primary key");
+    assert!(
+        error
+            .chain()
+            .any(|cause| cause.to_string().contains("valid, ready, live primary key")),
+        "the locked catalog fence must identify the unusable key shape: {error:#}"
+    );
+
+    let released: bool = capture
+        .query_one(
+            "SELECT pg_catalog.pg_advisory_unlock_shared($1)",
+            &[&pg_sink::source_catalog::PUBLICATION_DDL_GUARD_KEY],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(released, "the test-owned shared guard was released");
+    drop(capture);
+    setup
+        .batch_execute(
+            "DROP PUBLICATION walrus_pf_key_fence;
+             DROP TABLE public._walrus_pf_key_fence;",
+        )
         .await
         .unwrap();
 }

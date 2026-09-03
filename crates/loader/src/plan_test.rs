@@ -197,7 +197,7 @@ fn a_column_with_no_descriptor_keeps_the_tier1_shape() {
 
 #[test]
 fn a_tier2_interval_collapses_its_emit_columns_into_one_mirror_column() {
-    let rel = relation(vec![key("id"), text("elapsed")]);
+    let rel = relation(vec![key("id"), col("elapsed", INTERVAL, false)]);
     let elapsed = TypeDescriptor {
         pg_type_oid: INTERVAL,
         tier: Tier::Two,
@@ -268,7 +268,7 @@ fn a_tier2_range_fans_out_to_flat_mirror_columns() {
     // column. They are not independent scalar sentinels: every sibling resolves against the
     // original source-column name recorded in metadata. The descriptor's `duckdb` is never read on
     // this path — the emit types are.
-    let rel = relation(vec![key("id"), text("span")]);
+    let rel = relation(vec![key("id"), col("span", oids::INT4RANGE, false)]);
     let span = TypeDescriptor {
         pg_type_oid: oids::INT4RANGE,
         tier: Tier::Two,
@@ -295,7 +295,7 @@ fn the_dispatch_reads_the_emit_shape_not_the_declared_tier() {
     // A Tier-2 `point` stays NESTED — one struct emit column — so it must take the single-column
     // arm beside Tier-1 and Tier-3 rather than fan out. Dispatching on `d.tier` would split it
     // into siblings the sink never wrote to the Parquet file.
-    let rel = relation(vec![key("id"), text("loc")]);
+    let rel = relation(vec![key("id"), col("loc", oids::POINT, false)]);
     let loc = TypeDescriptor {
         pg_type_oid: oids::POINT,
         tier: Tier::Two,
@@ -314,7 +314,7 @@ fn the_dispatch_reads_the_emit_shape_not_the_declared_tier() {
 fn a_numerics_precise_decimal_comes_from_the_emit_type_not_the_descriptor() {
     // The descriptor's `duckdb` for a numeric is the bare `DECIMAL`; the precision and scale live
     // only in the emit type, and dropping them would silently round every stored amount.
-    let rel = relation(vec![key("id"), text("amount")]);
+    let rel = relation(vec![key("id"), col("amount", oids::NUMERIC, false)]);
     let amount = TypeDescriptor {
         pg_type_oid: oids::NUMERIC,
         duckdb: "DECIMAL".into(),

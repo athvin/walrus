@@ -525,19 +525,25 @@ async fn both_tables_evolve_at_the_correct_lsn_relative_to_data() {
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     support::cleanup_epoch(&pool, epoch).await;
-    sqlx::query("DELETE FROM walrus.schema_registry WHERE epoch = $1")
-        .bind(epoch.0)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "WITH authorized AS MATERIALIZED (
+           SELECT pg_catalog.set_config(
+             'walrus.schema_registry_maintenance', '1-delete', true
+           ) AS protocol
+         )
+         DELETE FROM walrus.schema_registry
+         WHERE epoch = $1 AND (SELECT protocol = '1-delete' FROM authorized)",
+    )
+    .bind(epoch.0)
+    .execute(&pool)
+    .await
+    .unwrap();
     control::insert_epoch(
         &pool,
-        &control::ReplicationState {
-            epoch,
-            slot_name: "walrus_slot".into(),
-            created_lsn: "0/0".parse().unwrap(),
-            status: control::ReplicationStatus::Streaming,
-        },
+        epoch,
+        "walrus_slot",
+        "0/0".parse().unwrap(),
+        control::ReplicationStatus::Streaming,
     )
     .await
     .unwrap();
@@ -667,21 +673,29 @@ async fn schema_only_barrier_reconciles_and_duck_ahead_retry_retires_without_che
     let pool = control::connect(&control_url()).await.unwrap();
     control::run_migrations(&pool).await.unwrap();
     support::cleanup_epoch(&pool, epoch).await;
+    let mut cleanup = pool.begin().await.unwrap();
+    sqlx::query("SELECT set_config('walrus.manifest_fence_maintenance', '2-delete', true)")
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("SELECT set_config('walrus.schema_registry_maintenance', '1-delete', true)")
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
     for table in ["ddl_manifest", "schema_registry"] {
         sqlx::query(&format!("DELETE FROM walrus.{table} WHERE epoch = $1"))
             .bind(epoch.0)
-            .execute(&pool)
+            .execute(&mut *cleanup)
             .await
             .unwrap();
     }
+    cleanup.commit().await.unwrap();
     control::insert_epoch(
         &pool,
-        &control::ReplicationState {
-            epoch,
-            slot_name: "walrus_slot".into(),
-            created_lsn: Lsn::ZERO,
-            status: control::ReplicationStatus::Streaming,
-        },
+        epoch,
+        "walrus_slot",
+        Lsn::ZERO,
+        control::ReplicationStatus::Streaming,
     )
     .await
     .unwrap();
