@@ -19,7 +19,7 @@ services:
       # ignores the credential. Never use `trust` outside the harness.
       POSTGRES_HOST_AUTH_METHOD: trust
     ports:
-      - "5432:5432"
+      - "127.0.0.1:${SOURCE_PG_HOST_PORT:-5432}:5432"
     command:
       - postgres
       - -c
@@ -48,7 +48,7 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: walrus_control
     ports:
-      - "5433:5432"
+      - "127.0.0.1:${CONTROL_PG_HOST_PORT:-5433}:5432"
     volumes:
       - ./initdb/control:/docker-entrypoint-initdb.d:ro
     healthcheck:
@@ -64,8 +64,8 @@ services:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "127.0.0.1:${MINIO_API_HOST_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_HOST_PORT:-9001}:9001"
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:9000/minio/health/live || exit 1"]
       interval: 2s

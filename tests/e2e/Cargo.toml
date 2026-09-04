@@ -9,8 +9,8 @@ publish.workspace = true # a test driver, not a registry package — see the wor
 # The end-to-end integration crate drives both binaries (`walrus-pg-sink`, `walrus-loader`) as black
 # boxes over the compose stack. Its one library edge to `pg-sink` invokes the production
 # source-request API, so that test cannot accidentally substitute a direct control-pg insert. All
-# tests are `#[ignore]` and gated behind `--features it`, so `cargo build/test --workspace` (no `it`)
-# compiles this crate with zero active tests and never needs docker.
+# live tests are `#[ignore]` and gated behind `--features it`, so `cargo build/test --workspace`
+# (no `it`) runs only hermetic verifier tests and never needs docker.
 [features]
 it = []
 

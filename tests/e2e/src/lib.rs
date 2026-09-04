@@ -10,23 +10,27 @@
               observe out-of-process services, not walrus runtime I/O"
 )]
 //! The walrus end-to-end harness brings up **both binaries** — `walrus-pg-sink` and `walrus-loader` —
-//! as child processes against the already-running compose stack (source PG :5432, control PG :5433,
-//! MinIO :9000), drives the *source* database, and lets a test assert the full two-hop contract:
+//! as child processes against a compose stack (source PG, control/catalog PG, and MinIO), drives the
+//! *source* database, and lets a test assert the full two-hop contract:
 //! Parquet in MinIO → verbatim `<table>_raw` → the `<table>` mirror equals the current source.
-//! Everything is `#[ignore]` and gated behind `--features it`, so a plain `cargo build/test
-//! --workspace` compiles this crate with zero active tests and never needs docker.
+//! Live scenarios are `#[ignore]` and gated behind `--features it`, so a plain `cargo test
+//! --workspace` runs only hermetic verifier tests and never needs Docker.
 
 use anyhow::{Context, Result};
+use common::sql::SqlStrExt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::process::{Child, Command};
 
-const SOURCE_URL: &str = "postgres://postgres:postgres@localhost:5432/walrus";
-const CONTROL_URL: &str = "postgres://postgres:postgres@localhost:5433/walrus_control";
-const CATALOG_URL: &str = "postgres://postgres:postgres@localhost:5433/walrus_ducklake";
+mod parity;
+pub use parity::{CompareField, Projection, ScenarioStep, TableExpectation, TableId, TableParity};
+
+const DEFAULT_SOURCE_URL: &str = "postgres://postgres:postgres@localhost:5432/walrus";
+const DEFAULT_CONTROL_URL: &str = "postgres://postgres:postgres@localhost:5433/walrus_control";
+const DEFAULT_CATALOG_URL: &str = "postgres://postgres:postgres@localhost:5433/walrus_ducklake";
 const DUCKLAKE_SCHEMA: &str = "walrus_e2e";
 const DUCKLAKE_DATA: &str = "s3://walrus/ducklake/e2e/";
-const S3_ENDPOINT: &str = "http://localhost:9000";
+const DEFAULT_S3_ENDPOINT: &str = "http://localhost:9000";
 const BUCKET: &str = "walrus";
 const SLOT: &str = "walrus_e2e_slot";
 /// The standard PostgreSQL build limit for columns participating in one index.
@@ -40,7 +44,50 @@ const TABLE_NAMESPACE: uuid::Uuid =
     uuid::Uuid::from_u128(0x4f02_efc2_39b3_4d9d_a860_22af_7291_8cc8);
 /// The MinIO container name (`<compose project>-<service>-1`) — `docker pause`d to stall the sink's S3
 /// durability in the WAL-runaway / keepalive chaos tests.
-const MINIO: &str = "walrus-minio-1";
+const DEFAULT_MINIO_CONTAINER: &str = "walrus-minio-1";
+
+/// Connection and process-listener settings for an E2E run. The defaults preserve the historical
+/// `just up` workflow; the self-contained acceptance runner supplies isolated, dynamically mapped
+/// endpoints through the `WALRUS_E2E_*` variables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessConfig {
+    pub source_url: String,
+    pub control_url: String,
+    pub catalog_url: String,
+    pub s3_endpoint: String,
+    pub sink_health_addr: String,
+    pub loader_health_addr: String,
+    pub minio_container: String,
+}
+
+impl Default for HarnessConfig {
+    fn default() -> Self {
+        Self {
+            source_url: env_or("WALRUS_E2E_SOURCE_URL", DEFAULT_SOURCE_URL),
+            control_url: env_or("WALRUS_E2E_CONTROL_URL", DEFAULT_CONTROL_URL),
+            catalog_url: env_or("WALRUS_E2E_CATALOG_URL", DEFAULT_CATALOG_URL),
+            s3_endpoint: env_or("WALRUS_E2E_S3_ENDPOINT", DEFAULT_S3_ENDPOINT),
+            sink_health_addr: env_or("WALRUS_E2E_SINK_HEALTH_ADDR", "127.0.0.1:8130"),
+            loader_health_addr: env_or("WALRUS_E2E_LOADER_HEALTH_ADDR", "127.0.0.1:8131"),
+            minio_container: env_or("WALRUS_E2E_MINIO_CONTAINER", DEFAULT_MINIO_CONTAINER),
+        }
+    }
+}
+
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// Keep harness-only `WALRUS_E2E_*` settings out of the real binaries. Their configuration parser
+/// deliberately rejects unknown `WALRUS_*` keys, while the test process needs these keys to select
+/// its isolated backing services.
+fn remove_harness_env(command: &mut Command) {
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("WALRUS_E2E_") {
+            command.env_remove(key);
+        }
+    }
+}
 
 fn wide_primary_key_table_ddl() -> String {
     let columns = (1..=WIDE_PRIMARY_KEY_COLUMNS)
@@ -75,6 +122,7 @@ pub struct Harness {
     reload_extraction: ReloadExtractionConfig,
     /// Process-wide memory ceiling supplied to every sink process, including restarts.
     max_inflight_bytes: u64,
+    config: HarnessConfig,
     /// The epoch the sink established (always 1 after the clean reset).
     pub epoch: i64,
 }
@@ -140,18 +188,30 @@ impl Harness {
         .await
     }
 
+    /// Start a clean stack with scenario-owned source setup applied before the replication slot is
+    /// created. Tables created here participate in the initial consistent bootstrap snapshot.
+    pub async fn start_scenario(source_setup: &str) -> Result<Self> {
+        Self::start_inner(
+            ReloadExtractionConfig::default(),
+            Some(source_setup),
+            DEFAULT_E2E_MAX_INFLIGHT_BYTES,
+        )
+        .await
+    }
+
     async fn start_inner(
         reload_extraction: ReloadExtractionConfig,
         source_seed: Option<&str>,
         max_inflight_bytes: u64,
     ) -> Result<Self> {
+        let config = HarnessConfig::default();
         anyhow::ensure!(
             reload_extraction.max_concurrent_reloads > 0
                 && reload_extraction.reload_workers_per_table > 0
                 && reload_extraction.reload_chunk_rows > 0,
             "reload extraction controls must all be non-zero"
         );
-        let control = control::connect(CONTROL_URL)
+        let control = control::connect(&config.control_url)
             .await
             .context("connect control PG")?;
         // Fully reset control so `read_current_epoch` (MAX) yields a fresh epoch 1 — a leftover higher
@@ -166,7 +226,7 @@ impl Harness {
             .await
             .context("control migrations")?;
 
-        let source = control::connect(SOURCE_URL)
+        let source = control::connect(&config.source_url)
             .await
             .context("connect source PG")?;
         // Idempotent source-side setup (walrus.heartbeat / ddl_audit + DDL triggers), a clean `orders`,
@@ -246,16 +306,22 @@ impl Harness {
             .execute(&source)
             .await
             .context("normalize q_target quarantine-test type")?;
-        sqlx::raw_sql(&format!(
+        sqlx::raw_sql(
             "TRUNCATE public.orders; TRUNCATE public.types_matrix; \
              TRUNCATE public.wide_keys; \
-             TRUNCATE public.q_target; TRUNCATE public.rl1; TRUNCATE public.rl2; TRUNCATE public.rl3; \
-             SELECT pg_drop_replication_slot('{SLOT}') \
-                FROM pg_replication_slots WHERE slot_name = '{SLOT}';"
-        ))
+             TRUNCATE public.q_target; TRUNCATE public.rl1; TRUNCATE public.rl2; TRUNCATE public.rl3;",
+        )
         .execute(&source)
         .await
-        .context("reset source tables + slot")?;
+        .context("reset source tables")?;
+        sqlx::query(
+            "SELECT pg_drop_replication_slot(slot_name) \
+             FROM pg_replication_slots WHERE slot_name = $1",
+        )
+        .bind(SLOT)
+        .execute(&source)
+        .await
+        .context("reset source slot")?;
         if let Some(source_seed) = source_seed {
             sqlx::raw_sql(source_seed)
                 .execute(&source)
@@ -264,27 +330,43 @@ impl Harness {
         }
 
         let bins = target_dir()?;
-        build_bins(&bins).await?;
-        let catalog = control::connect(CATALOG_URL)
+        if env_or("WALRUS_E2E_SKIP_BUILD", "0") == "1" {
+            for binary in ["walrus-pg-sink", "walrus-loader"] {
+                anyhow::ensure!(
+                    bins.join(binary).is_file(),
+                    "WALRUS_E2E_SKIP_BUILD=1 but {} is missing",
+                    bins.join(binary).display()
+                );
+            }
+        } else {
+            build_bins(&bins).await?;
+        }
+        let catalog = control::connect(&config.catalog_url)
             .await
             .context("connect DuckLake catalog PG")?;
         sqlx::raw_sql("DROP SCHEMA IF EXISTS walrus_e2e CASCADE")
             .execute(&catalog)
             .await
             .context("reset DuckLake e2e metadata schema")?;
-        migrate_ducklake(&bins).await?;
+        migrate_ducklake(&bins, &config).await?;
 
         let runtime_dir = std::env::temp_dir().join(format!("walrus-e2e-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&runtime_dir);
         std::fs::create_dir_all(&runtime_dir)?;
         let sink_log = runtime_dir.join("sink.log");
 
-        let sink = spawn_sink(&bins, &sink_log, reload_extraction, max_inflight_bytes)?;
-        wait_ready("http://127.0.0.1:8130", Duration::from_secs(45))
+        let sink = spawn_sink(
+            &bins,
+            &sink_log,
+            reload_extraction,
+            max_inflight_bytes,
+            &config,
+        )?;
+        wait_ready(&config.sink_health_addr, Duration::from_secs(45))
             .await
             .context("sink /ready")?;
-        let loader = spawn_loader(&bins)?;
-        wait_ready("http://127.0.0.1:8131", Duration::from_secs(90))
+        let loader = spawn_loader(&bins, &config)?;
+        wait_ready(&config.loader_health_addr, Duration::from_secs(90))
             .await
             .context("loader /ready")?;
 
@@ -298,6 +380,7 @@ impl Harness {
             bins,
             reload_extraction,
             max_inflight_bytes,
+            config,
             epoch: 1,
         })
     }
@@ -380,9 +463,10 @@ impl Harness {
         source_schema: &str,
         source_table: &str,
     ) -> Result<()> {
-        let (client, connection) = tokio_postgres::connect(SOURCE_URL, tokio_postgres::NoTls)
-            .await
-            .context("connect source PG for reload request")?;
+        let (client, connection) =
+            tokio_postgres::connect(&self.config.source_url, tokio_postgres::NoTls)
+                .await
+                .context("connect source PG for reload request")?;
         let driver = tokio::spawn(connection);
         let requested =
             pg_sink::reload_event::request_table(&client, request_id, source_schema, source_table)
@@ -401,7 +485,7 @@ impl Harness {
         let store = AmazonS3Builder::new()
             .with_bucket_name(BUCKET)
             .with_region("us-east-1")
-            .with_endpoint(S3_ENDPOINT)
+            .with_endpoint(&self.config.s3_endpoint)
             .with_access_key_id("minioadmin")
             .with_secret_access_key("minioadmin")
             .with_allow_http(true)
@@ -436,17 +520,32 @@ impl Harness {
         target: common::Lsn,
         deadline: Duration,
     ) -> Result<()> {
+        self.await_table_transformed_past("public", table, target, deadline)
+            .await
+    }
+
+    /// Schema-qualified form of [`Harness::await_transformed_past`] used by reusable acceptance
+    /// scenarios. The queue and checkpoint predicates include both identity components.
+    pub async fn await_table_transformed_past(
+        &self,
+        schema: &str,
+        table: &str,
+        target: common::Lsn,
+        deadline: Duration,
+    ) -> Result<()> {
         let start = Instant::now();
         loop {
             let pending: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM walrus.file_manifest WHERE epoch = $1 AND source_table = $2",
+                "SELECT count(*) FROM walrus.file_manifest \
+                 WHERE epoch = $1 AND source_schema = $2 AND source_table = $3",
             )
             .bind(self.epoch)
+            .bind(schema)
             .bind(table)
             .fetch_one(&self.control)
             .await?;
             let cp =
-                control::read_checkpoint(&self.control, self.epoch.into(), "public", table).await?;
+                control::read_checkpoint(&self.control, self.epoch.into(), schema, table).await?;
             if let Some(cp) = cp.as_ref()
                 && pending == 0
                 && cp.transformed_lsn > target
@@ -464,7 +563,7 @@ impl Harness {
                     .collect::<Vec<_>>();
                 sink_tail.reverse();
                 anyhow::bail!(
-                    "transformed_lsn for {table} never passed {target} within {deadline:?}; \
+                    "transformed_lsn for {schema}.{table} never passed {target} within {deadline:?}; \
                      pending={pending}, checkpoint={cp:?}; sink log tail:\n{}",
                     sink_tail.join("\n")
                 );
@@ -517,8 +616,9 @@ impl Harness {
             &self.sink_log,
             self.reload_extraction,
             self.max_inflight_bytes,
+            &self.config,
         )?;
-        wait_ready("http://127.0.0.1:8130", Duration::from_secs(45))
+        wait_ready(&self.config.sink_health_addr, Duration::from_secs(45))
             .await
             .context("sink /ready after restart")
     }
@@ -543,8 +643,8 @@ impl Harness {
     /// Respawn the loader with a caller-selected readiness deadline. Scale tests use this without
     /// weakening the ordinary 90-second startup bound for every other scenario.
     pub async fn restart_loader_with_deadline(&mut self, deadline: Duration) -> Result<()> {
-        self.loader = spawn_loader(&self.bins)?;
-        let Err(source) = wait_ready("http://127.0.0.1:8131", deadline).await else {
+        self.loader = spawn_loader(&self.bins, &self.config)?;
+        let Err(source) = wait_ready(&self.config.loader_health_addr, deadline).await else {
             return Ok(());
         };
         let child_status = match self.loader.try_wait() {
@@ -552,10 +652,11 @@ impl Harness {
             Ok(Some(status)) => format!("exited ({status})"),
             Err(error) => format!("unknown ({error})"),
         };
-        let ready_probe = match http_get("http://127.0.0.1:8131/ready").await {
-            Ok((ok, body)) => format!("http_200={ok}, body={body}"),
-            Err(error) => format!("failed: {error:#}"),
-        };
+        let ready_probe =
+            match http_get(&health_url(&self.config.loader_health_addr, "/ready")).await {
+                Ok((ok, body)) => format!("http_200={ok}, body={body}"),
+                Err(error) => format!("failed: {error:#}"),
+            };
         Err(source).with_context(|| {
             format!(
                 "loader /ready after restart; child={child_status}; final /ready probe: {ready_probe}"
@@ -658,7 +759,7 @@ impl Harness {
 
     /// Read `(id, status)` pairs through a direct read-only DuckLake attachment.
     fn duckdb_pairs(&self, table: &str, sql: &str) -> Result<Vec<(i32, Option<String>)>> {
-        let conn = ducklake_reader(table)?;
+        let conn = ducklake_reader(&self.config, table)?;
         let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map([], |r| {
             Ok((r.get::<_, i32>(0)?, r.get::<_, Option<String>>(1)?))
@@ -668,7 +769,7 @@ impl Harness {
 
     /// Attach DuckLake read-only and collect the first column of each row as a string.
     pub fn duckdb_rows(&self, table: &str, sql: &str) -> Result<Vec<String>> {
-        let conn = ducklake_reader(table)?;
+        let conn = ducklake_reader(&self.config, table)?;
         let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -676,7 +777,7 @@ impl Harness {
 
     /// A single integer scalar from a direct read-only DuckLake attachment.
     pub fn duckdb_scalar(&self, table: &str, sql: &str) -> Result<i64> {
-        let conn = ducklake_reader(table)?;
+        let conn = ducklake_reader(&self.config, table)?;
         Ok(conn.query_row(sql, [], |r| r.get(0))?)
     }
 
@@ -689,12 +790,12 @@ impl Harness {
     /// so stalling S3 is the only thing that retains source WAL. The keepalive fix keeps the
     /// walsender connected throughout.
     pub async fn stall_s3(&self) -> Result<()> {
-        docker(&["pause", MINIO]).await
+        docker(&["pause", &self.config.minio_container]).await
     }
 
     /// Resume S3 (`docker unpause` MinIO) — the stalled PUT completes and the sink drains the backlog.
     pub async fn unstall_s3(&self) -> Result<()> {
-        docker(&["unpause", MINIO]).await
+        docker(&["unpause", &self.config.minio_container]).await
     }
 
     /// The slot's `confirmed_flush_lsn` — the durable, slot-advancing LSN (moves only after S3 + manifest
@@ -833,7 +934,7 @@ impl Harness {
     /// is a FIELD, never a readiness gate — a catching-up sink is `degraded` yet still `ready` (HTTP 200).
     /// `ready` is the HTTP-200 status (equals the body's `ready`); `degraded` is the body's field.
     pub async fn sink_ready(&self) -> Result<(bool, bool)> {
-        let (ok, body) = http_get("http://127.0.0.1:8130/ready").await?;
+        let (ok, body) = http_get(&health_url(&self.config.sink_health_addr, "/ready")).await?;
         let v: serde_json::Value =
             serde_json::from_str(body.trim()).context("parse /ready JSON body")?;
         Ok((ok, v["degraded"].as_bool().unwrap_or(false)))
@@ -922,7 +1023,7 @@ impl Drop for Harness {
         // hangs on a paused MinIO.
         // Quiet: `unpause` errors harmlessly when the container is not paused (the common case).
         let _ = std::process::Command::new("docker")
-            .args(["unpause", MINIO])
+            .args(["unpause", &self.config.minio_container])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
@@ -962,20 +1063,23 @@ async fn build_bins(_target: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-async fn migrate_ducklake(bins: &std::path::Path) -> Result<()> {
-    let status = Command::new(bins.join("walrus-loader"))
+async fn migrate_ducklake(bins: &std::path::Path, config: &HarnessConfig) -> Result<()> {
+    let mut command = Command::new(bins.join("walrus-loader"));
+    command
         .arg("--migrate-ducklake-catalog")
-        .env("WALRUS_CONTROL_DB_URL", CONTROL_URL)
+        .env("WALRUS_CONTROL_DB_URL", &config.control_url)
         .env("WALRUS_OBJECT_STORE__BUCKET", BUCKET)
-        .env("WALRUS_OBJECT_STORE__ENDPOINT", S3_ENDPOINT)
+        .env("WALRUS_OBJECT_STORE__ENDPOINT", &config.s3_endpoint)
         .env("WALRUS_OBJECT_STORE__REGION", "us-east-1")
         .env("WALRUS_INSTANCE", "e2e-loader-0")
-        .env("WALRUS_DUCKLAKE__CATALOG_URL", CATALOG_URL)
+        .env("WALRUS_DUCKLAKE__CATALOG_URL", &config.catalog_url)
         .env("WALRUS_DUCKLAKE__METADATA_SCHEMA", DUCKLAKE_SCHEMA)
         .env("WALRUS_DUCKLAKE__DATA_PATH", DUCKLAKE_DATA)
         .env("WALRUS_DUCKLAKE__INSTALL_EXTENSIONS", "true")
         .env("AWS_ACCESS_KEY_ID", "minioadmin")
-        .env("AWS_SECRET_ACCESS_KEY", "minioadmin")
+        .env("AWS_SECRET_ACCESS_KEY", "minioadmin");
+    remove_harness_env(&mut command);
+    let status = command
         .status()
         .await
         .context("run DuckLake catalog migration")?;
@@ -983,26 +1087,33 @@ async fn migrate_ducklake(bins: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn ducklake_reader(table: &str) -> Result<duckdb::Connection> {
+fn ducklake_reader(config: &HarnessConfig, table: &str) -> Result<duckdb::Connection> {
     let conn = duckdb::Connection::open_in_memory().context("open DuckLake reader")?;
-    conn.execute_batch(
+    let s3_endpoint = config
+        .s3_endpoint
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
+    let use_ssl = config.s3_endpoint.starts_with("https://");
+    conn.execute_batch(&format!(
         r#"
         INSTALL json; INSTALL httpfs; INSTALL aws; INSTALL postgres; INSTALL ducklake;
         LOAD json; LOAD httpfs; LOAD aws; LOAD postgres; LOAD ducklake;
         CREATE OR REPLACE SECRET e2e_s3 (
             TYPE s3, PROVIDER config, KEY_ID 'minioadmin', SECRET 'minioadmin',
-            REGION 'us-east-1', ENDPOINT 'localhost:9000', URL_STYLE 'path', USE_SSL false
+            REGION 'us-east-1', ENDPOINT {s3_endpoint}, URL_STYLE 'path', USE_SSL {use_ssl}
         );
         CREATE OR REPLACE SECRET e2e_catalog (
             TYPE postgres,
-            URI 'postgres://postgres:postgres@localhost:5433/walrus_ducklake'
+            URI {catalog_url}
         );
         ATTACH 'ducklake:postgres:' AS walrus (
             META_SECRET 'e2e_catalog', METADATA_SCHEMA 'walrus_e2e',
             META_SCHEMA 'walrus_e2e', CREATE_IF_NOT_EXISTS false, READ_ONLY
         );
         "#,
-    )
+        s3_endpoint = s3_endpoint.to_quoted_literal(),
+        catalog_url = config.catalog_url.to_quoted_literal(),
+    ))
     .context("attach DuckLake reader")?;
     let key = format!("public\0{table}");
     let schema = format!(
@@ -1019,18 +1130,20 @@ fn spawn_sink(
     log: &std::path::Path,
     reload_extraction: ReloadExtractionConfig,
     max_inflight_bytes: u64,
+    config: &HarnessConfig,
 ) -> Result<Child> {
     // The sink's `tracing` fmt layer writes to STDOUT (its spill/durability events live there); config
     // errors + panics go to STDERR. Capture BOTH into `sink.log` (two handles onto one file) so
     // [`Harness::sink_spill_count`] can scrape the spill events AND a startup failure is still visible.
     let stdout = std::fs::File::create(log).context("create sink log")?;
     let stderr = stdout.try_clone().context("clone sink log handle")?;
-    Command::new(bins.join("walrus-pg-sink"))
+    let mut command = Command::new(bins.join("walrus-pg-sink"));
+    command
         .stdout(std::process::Stdio::from(stdout))
-        .env("WALRUS_SOURCE_DB_URL", SOURCE_URL)
-        .env("WALRUS_CONTROL_DB_URL", CONTROL_URL)
+        .env("WALRUS_SOURCE_DB_URL", &config.source_url)
+        .env("WALRUS_CONTROL_DB_URL", &config.control_url)
         .env("WALRUS_OBJECT_STORE__BUCKET", BUCKET)
-        .env("WALRUS_OBJECT_STORE__ENDPOINT", S3_ENDPOINT)
+        .env("WALRUS_OBJECT_STORE__ENDPOINT", &config.s3_endpoint)
         .env("WALRUS_OBJECT_STORE__REGION", "us-east-1")
         .env("WALRUS_INSTANCE", "e2e-sink")
         .env("WALRUS_SLOT_NAME", SLOT)
@@ -1057,46 +1170,51 @@ fn spawn_sink(
         )
         .env("WALRUS_HEARTBEAT_IDLE_AFTER", "1s")
         .env("WALRUS_STARTUP_DEADLINE", "30s")
-        .env("WALRUS_HEALTH_ADDR", "127.0.0.1:8130")
+        .env("WALRUS_HEALTH_ADDR", &config.sink_health_addr)
         .env("AWS_ACCESS_KEY_ID", "minioadmin")
         .env("AWS_SECRET_ACCESS_KEY", "minioadmin")
         .stderr(std::process::Stdio::from(stderr))
-        .kill_on_drop(true)
-        .spawn()
-        .context("spawn walrus-pg-sink")
+        .kill_on_drop(true);
+    remove_harness_env(&mut command);
+    command.spawn().context("spawn walrus-pg-sink")
 }
 
-fn spawn_loader(bins: &std::path::Path) -> Result<Child> {
+fn spawn_loader(bins: &std::path::Path, config: &HarnessConfig) -> Result<Child> {
     // Inherit the test's stdout/stderr (the loader's `tracing` log) so a bootstrap failure is
     // visible — cargo test surfaces a failed test's captured output, which is how a CI failure is
     // diagnosed. (An earlier `loader.log` file-redirect hid the reason from the CI job log.)
-    Command::new(bins.join("walrus-loader"))
-        .env("WALRUS_CONTROL_DB_URL", CONTROL_URL)
+    let mut command = Command::new(bins.join("walrus-loader"));
+    command
+        .env("WALRUS_CONTROL_DB_URL", &config.control_url)
         .env("WALRUS_OBJECT_STORE__BUCKET", BUCKET)
-        .env("WALRUS_OBJECT_STORE__ENDPOINT", S3_ENDPOINT)
+        .env("WALRUS_OBJECT_STORE__ENDPOINT", &config.s3_endpoint)
         .env("WALRUS_OBJECT_STORE__REGION", "us-east-1")
         .env("WALRUS_INSTANCE", "e2e-loader-0")
-        .env("WALRUS_DUCKLAKE__CATALOG_URL", CATALOG_URL)
+        .env("WALRUS_DUCKLAKE__CATALOG_URL", &config.catalog_url)
         .env("WALRUS_DUCKLAKE__METADATA_SCHEMA", DUCKLAKE_SCHEMA)
         .env("WALRUS_DUCKLAKE__DATA_PATH", DUCKLAKE_DATA)
         .env("WALRUS_DUCKLAKE__INSTALL_EXTENSIONS", "true")
         .env("WALRUS_POLL_INTERVAL", "1s")
         // Generous for a cold CI runner (a dev-profile binary bootstrapping 6 tables).
         .env("WALRUS_STARTUP_DEADLINE", "90s")
-        .env("WALRUS_HEALTH_ADDR", "127.0.0.1:8131")
+        .env("WALRUS_HEALTH_ADDR", &config.loader_health_addr)
         .env("AWS_ACCESS_KEY_ID", "minioadmin")
         .env("AWS_SECRET_ACCESS_KEY", "minioadmin")
-        .kill_on_drop(true)
-        .spawn()
-        .context("spawn walrus-loader")
+        .kill_on_drop(true);
+    remove_harness_env(&mut command);
+    command.spawn().context("spawn walrus-loader")
 }
 
 /// Poll a `/ready` endpoint until it answers 200 or the deadline elapses.
 async fn wait_ready(base: &str, deadline: Duration) -> Result<()> {
-    let url = format!("{base}/ready");
+    let socket = base
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_end_matches('/');
+    let url = health_url(base, "/ready");
     let start = Instant::now();
     loop {
-        if let Ok(conn) = tokio::net::TcpStream::connect(base.trim_start_matches("http://")).await {
+        if let Ok(conn) = tokio::net::TcpStream::connect(socket).await {
             drop(conn);
             // Minimal HTTP GET; treat "200" in the status line as ready.
             if http_get_ok(&url).await {
@@ -1107,6 +1225,15 @@ async fn wait_ready(base: &str, deadline: Duration) -> Result<()> {
             anyhow::bail!("{url} never became ready within {deadline:?}");
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+fn health_url(base: &str, path: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if base.starts_with("http://") || base.starts_with("https://") {
+        format!("{base}{path}")
+    } else {
+        format!("http://{base}{path}")
     }
 }
 
