@@ -90,7 +90,7 @@ impl TableParity {
         }
     }
 
-    pub fn explicit(id: TableId, fields: Vec<CompareField>) -> Self {
+    pub const fn explicit(id: TableId, fields: Vec<CompareField>) -> Self {
         Self {
             id,
             projection: Projection::Explicit(fields),
@@ -98,6 +98,7 @@ impl TableParity {
         }
     }
 
+    #[must_use]
     pub const fn without_comments(mut self) -> Self {
         self.compare_comments = false;
         self
@@ -136,11 +137,13 @@ impl ScenarioStep {
         }
     }
 
+    #[must_use]
     pub fn converge_on(mut self, table: TableId) -> Self {
         self.convergence_tables.push(table);
         self
     }
 
+    #[must_use]
     pub fn expect(mut self, expectation: TableExpectation) -> Self {
         self.expectations.push(expectation);
         self
@@ -214,12 +217,22 @@ impl Harness {
         );
         let registry = latest_registry(self, &spec.id).await?;
         assert_registry_matches_source(&spec.id, &source_columns, &registry)?;
+        let source_table_comment = if spec.compare_comments {
+            Some(source_table_comment(self, &spec.id).await?)
+        } else {
+            None
+        };
 
         let conn = parity_reader(&self.config)?;
         let fields = comparison_fields(spec, &source_columns, &registry)?;
         assert_view_schema(&conn, &spec.id, &fields)?;
-        if spec.compare_comments {
-            assert_comments(self, &conn, &spec.id, &source_columns).await?;
+        if let Some(source_table_comment) = source_table_comment {
+            assert_comments(
+                &conn,
+                &spec.id,
+                source_table_comment.as_deref(),
+                &source_columns,
+            )?;
         }
         assert_rows_equal(&conn, &spec.id, &fields)
     }
@@ -527,13 +540,8 @@ fn assert_view_schema(
     Ok(())
 }
 
-async fn assert_comments(
-    harness: &Harness,
-    conn: &duckdb::Connection,
-    table: &TableId,
-    source_columns: &[SourceColumn],
-) -> Result<()> {
-    let source_table_comment: Option<String> = sqlx::query_scalar(
+async fn source_table_comment(harness: &Harness, table: &TableId) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar(
         "SELECT obj_description(c.oid, 'pg_class') \
          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
          WHERE n.nspname = $1 AND c.relname = $2",
@@ -541,7 +549,15 @@ async fn assert_comments(
     .bind(&table.schema)
     .bind(&table.table)
     .fetch_one(&harness.source)
-    .await?;
+    .await?)
+}
+
+fn assert_comments(
+    conn: &duckdb::Connection,
+    table: &TableId,
+    source_table_comment: Option<&str>,
+    source_columns: &[SourceColumn],
+) -> Result<()> {
     let internal = internal_schema(table);
     let lake_table_comment: Option<String> = conn
         .query_row(
@@ -552,7 +568,7 @@ async fn assert_comments(
         )
         .with_context(|| format!("read DuckLake table comment for {table}"))?;
     anyhow::ensure!(
-        source_table_comment == lake_table_comment,
+        source_table_comment == lake_table_comment.as_deref(),
         "table comment mismatch for {table}: source={source_table_comment:?}, \
          DuckLake={lake_table_comment:?}"
     );
