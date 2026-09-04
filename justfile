@@ -29,6 +29,11 @@ test:
 it:
     cargo test --workspace --features it
 
+# Self-contained logical-parity acceptance suite. It owns an isolated Compose project, launches the
+# real sink/loader binaries through the Rust harness, and tears down its containers and volumes.
+acceptance:
+    bash scripts/run-acceptance.sh
+
 # Create or migrate the local PostgreSQL-backed DuckLake catalog. Normal loader startup refuses
 # automatic catalog migrations; production runs the same binary command as an explicit release step.
 ducklake-migrate:
